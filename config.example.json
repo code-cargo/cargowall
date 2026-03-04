@@ -1,0 +1,40 @@
+{
+  "defaultAction": "deny",
+  "rules": [
+    {
+      "type": "hostname",
+      "value": "github.com",
+      "ports": [443],
+      "action": "allow"
+    },
+    {
+      "type": "hostname",
+      "value": "registry.npmjs.org",
+      "ports": [443],
+      "action": "allow"
+    },
+    {
+      "type": "cidr",
+      "value": "8.8.8.8/32",
+      "ports": [53],
+      "action": "allow"
+    },
+    {
+      "type": "cidr",
+      "value": "8.8.4.4/32",
+      "ports": [53],
+      "action": "allow"
+    },
+    {
+      "type": "cidr",
+      "value": "192.168.1.0/24",
+      "action": "allow"
+    },
+    {
+      "type": "hostname",
+      "value": "api.example.com",
+      "ports": [80, 443],
+      "action": "allow"
+    }
+  ]
+}

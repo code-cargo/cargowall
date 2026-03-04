@@ -1,0 +1,12 @@
+with-expecter: true
+
+packages:
+  github.com/code-cargo/cargowall/pkg/firewall:
+    config:
+      filename: "{{.InterfaceName | snakecase }}_mock.go"
+      dir: "{{.InterfaceDir}}"
+      mockname: "Mock{{.InterfaceName}}"
+      outpkg: "{{.PackageName}}"
+      inpackage: True
+    interfaces:
+      Firewall:

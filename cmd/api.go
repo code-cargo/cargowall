@@ -11,8 +11,9 @@ import (
 	"strings"
 	"time"
 
-	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+
+	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
 )
 
 // fetchPolicyFromAPI fetches the resolved CargoWall policy from the CodeCargo

@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 

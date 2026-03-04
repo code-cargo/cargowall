@@ -4,12 +4,13 @@ package cmd
 
 import (
 	"context"
-	"log/slog"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
 	"github.com/alecthomas/kong"
+
 	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
 	"github.com/code-cargo/cargowall/pkg/events"
 )

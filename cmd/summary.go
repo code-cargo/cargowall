@@ -15,11 +15,11 @@ import (
 	"strings"
 	"time"
 
-	cargowallv1 "github.com/code-cargo/cargowall/pb/cargowall/v1"
-	"github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	cargowallv1 "github.com/code-cargo/cargowall/pb/cargowall/v1"
+	"github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 

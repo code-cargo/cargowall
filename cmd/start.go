@@ -19,10 +19,10 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
-	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/code-cargo/cargowall/bpf"
+	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/dns"
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"

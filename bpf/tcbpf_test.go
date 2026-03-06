@@ -3,6 +3,7 @@
 package bpf
 
 import (
+	"bytes"
 	"encoding/binary"
 	"log"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/stretchr/testify/require"
 )
@@ -772,6 +774,133 @@ func TestTcEgressPortSpecificRules(t *testing.T) {
 			require.Equal(t, tt.wantRet, ret, "unexpected return value")
 		})
 	}
+}
+
+func TestCgroupProgramsLoad(t *testing.T) {
+	objs := loadBPFObjects(t)
+
+	require.NotNil(t, objs.CgConnect4, "cg_connect4 program should be loaded")
+	require.NotNil(t, objs.CgConnect6, "cg_connect6 program should be loaded")
+	require.NotNil(t, objs.CgSendmsg4, "cg_sendmsg4 program should be loaded")
+	require.NotNil(t, objs.CgSendmsg6, "cg_sendmsg6 program should be loaded")
+	require.NotNil(t, objs.MapSockPid, "map_sock_pid should be loaded")
+
+	// Verify program types
+	require.Equal(t, ebpf.CGroupSockAddr, objs.CgConnect4.Type(), "cg_connect4 should be CGroupSockAddr type")
+	require.Equal(t, ebpf.CGroupSockAddr, objs.CgConnect6.Type(), "cg_connect6 should be CGroupSockAddr type")
+	require.Equal(t, ebpf.CGroupSockAddr, objs.CgSendmsg4.Type(), "cg_sendmsg4 should be CGroupSockAddr type")
+	require.Equal(t, ebpf.CGroupSockAddr, objs.CgSendmsg6.Type(), "cg_sendmsg6 should be CGroupSockAddr type")
+
+	// Verify map type
+	info, err := objs.MapSockPid.Info()
+	require.NoError(t, err)
+	require.Equal(t, ebpf.LRUHash, info.Type, "map_sock_pid should be LRU_HASH type")
+}
+
+func TestMapSockPidReadWrite(t *testing.T) {
+	objs := loadBPFObjects(t)
+
+	// Write a cookie→PID mapping
+	var cookie uint64 = 12345
+	var pid uint32 = 42
+	err := objs.MapSockPid.Update(&cookie, &pid, ebpf.UpdateAny)
+	require.NoError(t, err)
+
+	// Read it back
+	var got uint32
+	err = objs.MapSockPid.Lookup(&cookie, &got)
+	require.NoError(t, err)
+	require.Equal(t, pid, got)
+
+	// Verify a missing key returns an error
+	var missingCookie uint64 = 99999
+	err = objs.MapSockPid.Lookup(&missingCookie, &got)
+	require.Error(t, err, "lookup of missing cookie should fail")
+
+	// Overwrite with a new PID
+	var newPid uint32 = 100
+	err = objs.MapSockPid.Update(&cookie, &newPid, ebpf.UpdateAny)
+	require.NoError(t, err)
+	err = objs.MapSockPid.Lookup(&cookie, &got)
+	require.NoError(t, err)
+	require.Equal(t, newPid, got)
+
+	// Delete and verify it's gone
+	err = objs.MapSockPid.Delete(&cookie)
+	require.NoError(t, err)
+	err = objs.MapSockPid.Lookup(&cookie, &got)
+	require.Error(t, err)
+}
+
+// bpfBlockedEvent matches the C struct blocked_event for decoding ring buffer records.
+type bpfBlockedEvent struct {
+	IpVersion uint8
+	Allowed   uint8
+	Pad1      [2]uint8
+	SrcIp     uint32
+	DstIp     uint32
+	SrcPort   uint16
+	DstPort   uint16
+	SrcIp6    [16]byte
+	DstIp6    [16]byte
+	Timestamp uint64
+	Pid       uint32
+	Pad2      uint32
+}
+
+func TestEventPidZeroWhenNoCookieMapping(t *testing.T) {
+	objs := loadBPFObjects(t)
+	setupTestRules(t, objs)
+
+	// Do NOT populate map_sock_pid — PID should be 0
+
+	rd, err := ringbuf.NewReader(objs.MapEvents)
+	require.NoError(t, err)
+	defer rd.Close()
+
+	// Send a blocked TCP SYN to trigger an event
+	pkt := craftIPv4TCP(t, "93.184.216.34", 80)
+	ret, _, err := objs.TcEgress.Test(pkt)
+	require.NoError(t, err)
+	require.Equal(t, uint32(tcActShot), ret)
+
+	record, err := rd.Read()
+	require.NoError(t, err)
+
+	var evt bpfBlockedEvent
+	err = binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &evt)
+	require.NoError(t, err)
+
+	require.Equal(t, uint8(4), evt.IpVersion)
+	require.Equal(t, uint8(0), evt.Allowed)
+	require.Equal(t, uint32(0), evt.Pid, "PID should be 0 when no cookie mapping exists")
+}
+
+func TestEventPidZeroWhenNoCookieMappingIPv6(t *testing.T) {
+	objs := loadBPFObjects(t)
+	setupTestRules(t, objs)
+
+	rd, err := ringbuf.NewReader(objs.MapEvents)
+	require.NoError(t, err)
+	defer rd.Close()
+
+	// Send a blocked IPv6 TCP SYN
+	pkt := craftIPv6TCP(t, "2001:db8::1", 80)
+	ret, _, err := objs.TcEgress.Test(pkt)
+	require.NoError(t, err)
+	require.Equal(t, uint32(tcActShot), ret)
+
+	record, err := rd.Read()
+	require.NoError(t, err)
+
+	var evt bpfBlockedEvent
+	err = binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &evt)
+	require.NoError(t, err)
+
+	require.Equal(t, uint8(6), evt.IpVersion, "should be IPv6 event")
+	require.Equal(t, uint8(0), evt.Allowed, "should be a blocked event")
+	require.Equal(t, uint32(0), evt.Pid, "PID should be 0 when no cookie mapping exists")
+	require.Equal(t, uint16(80), evt.DstPort)
 }
 
 // setupTestRules configures the BPF maps with test rules.

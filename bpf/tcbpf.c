@@ -164,7 +164,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, __u64);
     __type(value, __u32);
-    __uint(max_entries, 16384);
+    __uint(max_entries, 65536);
 } map_sock_pid SEC(".maps");
 
 
@@ -573,6 +573,24 @@ int cg_connect4(struct bpf_sock_addr *ctx) {
 
 SEC("cgroup/connect6")
 int cg_connect6(struct bpf_sock_addr *ctx) {
+    __u64 cookie = bpf_get_socket_cookie(ctx);
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
+    return 1;
+}
+
+// sendmsg hooks for UDP sockets that use sendto()/sendmsg() without connect().
+// Without these, connectionless UDP traffic won't have a cookie→PID entry.
+SEC("cgroup/sendmsg4")
+int cg_sendmsg4(struct bpf_sock_addr *ctx) {
+    __u64 cookie = bpf_get_socket_cookie(ctx);
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
+    return 1;
+}
+
+SEC("cgroup/sendmsg6")
+int cg_sendmsg6(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);

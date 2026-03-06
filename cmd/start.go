@@ -313,9 +313,13 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	}{
 		{objs.CgConnect4, ebpf.AttachCGroupInet4Connect, "connect4"},
 		{objs.CgConnect6, ebpf.AttachCGroupInet6Connect, "connect6"},
+		{objs.CgSendmsg4, ebpf.AttachCGroupUDP4Sendmsg, "sendmsg4"},
+		{objs.CgSendmsg6, ebpf.AttachCGroupUDP6Sendmsg, "sendmsg6"},
 	}
 	for _, cp := range cgroupProgs {
 		l, err := link.AttachCgroup(link.CgroupOptions{
+			// Root cgroup: cargowall is a host-level firewall, so we attach to the
+			// root cgroup to capture PID info for all processes on the machine.
 			Path:    "/sys/fs/cgroup",
 			Attach:  cp.attach,
 			Program: cp.prog,

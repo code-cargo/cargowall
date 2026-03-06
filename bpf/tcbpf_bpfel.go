@@ -96,6 +96,8 @@ type TcBpfSpecs struct {
 type TcBpfProgramSpecs struct {
 	CgConnect4 *ebpf.ProgramSpec `ebpf:"cg_connect4"`
 	CgConnect6 *ebpf.ProgramSpec `ebpf:"cg_connect6"`
+	CgSendmsg4 *ebpf.ProgramSpec `ebpf:"cg_sendmsg4"`
+	CgSendmsg6 *ebpf.ProgramSpec `ebpf:"cg_sendmsg6"`
 	TcEgress   *ebpf.ProgramSpec `ebpf:"tc_egress"`
 	TcIngress  *ebpf.ProgramSpec `ebpf:"tc_ingress"`
 }
@@ -175,6 +177,8 @@ type TcBpfVariables struct {
 type TcBpfPrograms struct {
 	CgConnect4 *ebpf.Program `ebpf:"cg_connect4"`
 	CgConnect6 *ebpf.Program `ebpf:"cg_connect6"`
+	CgSendmsg4 *ebpf.Program `ebpf:"cg_sendmsg4"`
+	CgSendmsg6 *ebpf.Program `ebpf:"cg_sendmsg6"`
 	TcEgress   *ebpf.Program `ebpf:"tc_egress"`
 	TcIngress  *ebpf.Program `ebpf:"tc_ingress"`
 }
@@ -183,6 +187,8 @@ func (p *TcBpfPrograms) Close() error {
 	return _TcBpfClose(
 		p.CgConnect4,
 		p.CgConnect6,
+		p.CgSendmsg4,
+		p.CgSendmsg6,
 		p.TcEgress,
 		p.TcIngress,
 	)

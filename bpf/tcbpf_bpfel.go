@@ -94,8 +94,10 @@ type TcBpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TcBpfProgramSpecs struct {
-	TcEgress  *ebpf.ProgramSpec `ebpf:"tc_egress"`
-	TcIngress *ebpf.ProgramSpec `ebpf:"tc_ingress"`
+	CgConnect4 *ebpf.ProgramSpec `ebpf:"cg_connect4"`
+	CgConnect6 *ebpf.ProgramSpec `ebpf:"cg_connect6"`
+	TcEgress   *ebpf.ProgramSpec `ebpf:"tc_egress"`
+	TcIngress  *ebpf.ProgramSpec `ebpf:"tc_ingress"`
 }
 
 // TcBpfMapSpecs contains maps before they are loaded into the kernel.
@@ -109,6 +111,7 @@ type TcBpfMapSpecs struct {
 	MapEvents        *ebpf.MapSpec `ebpf:"map_events"`
 	MapPorts         *ebpf.MapSpec `ebpf:"map_ports"`
 	MapPortsV6       *ebpf.MapSpec `ebpf:"map_ports_v6"`
+	MapSockPid       *ebpf.MapSpec `ebpf:"map_sock_pid"`
 }
 
 // TcBpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -144,6 +147,7 @@ type TcBpfMaps struct {
 	MapEvents        *ebpf.Map `ebpf:"map_events"`
 	MapPorts         *ebpf.Map `ebpf:"map_ports"`
 	MapPortsV6       *ebpf.Map `ebpf:"map_ports_v6"`
+	MapSockPid       *ebpf.Map `ebpf:"map_sock_pid"`
 }
 
 func (m *TcBpfMaps) Close() error {
@@ -155,6 +159,7 @@ func (m *TcBpfMaps) Close() error {
 		m.MapEvents,
 		m.MapPorts,
 		m.MapPortsV6,
+		m.MapSockPid,
 	)
 }
 
@@ -168,12 +173,16 @@ type TcBpfVariables struct {
 //
 // It can be passed to LoadTcBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TcBpfPrograms struct {
-	TcEgress  *ebpf.Program `ebpf:"tc_egress"`
-	TcIngress *ebpf.Program `ebpf:"tc_ingress"`
+	CgConnect4 *ebpf.Program `ebpf:"cg_connect4"`
+	CgConnect6 *ebpf.Program `ebpf:"cg_connect6"`
+	TcEgress   *ebpf.Program `ebpf:"tc_egress"`
+	TcIngress  *ebpf.Program `ebpf:"tc_ingress"`
 }
 
 func (p *TcBpfPrograms) Close() error {
 	return _TcBpfClose(
+		p.CgConnect4,
+		p.CgConnect6,
 		p.TcEgress,
 		p.TcIngress,
 	)

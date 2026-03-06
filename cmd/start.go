@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -302,6 +303,29 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		return fmt.Errorf("failed to load TC eBPF objects: %w", err)
 	}
 	defer objs.Close()
+
+	// Attach cgroup programs for PID tracking via socket cookie.
+	// Best-effort: if attachment fails, TC filtering still works but PID will be 0.
+	cgroupProgs := []struct {
+		prog   *ebpf.Program
+		attach ebpf.AttachType
+		name   string
+	}{
+		{objs.CgConnect4, ebpf.AttachCGroupInet4Connect, "connect4"},
+		{objs.CgConnect6, ebpf.AttachCGroupInet6Connect, "connect6"},
+	}
+	for _, cp := range cgroupProgs {
+		l, err := link.AttachCgroup(link.CgroupOptions{
+			Path:    "/sys/fs/cgroup",
+			Attach:  cp.attach,
+			Program: cp.prog,
+		})
+		if err != nil {
+			logger.Warn("Failed to attach cgroup program (PID tracking disabled)", "program", cp.name, "error", err)
+		} else {
+			defer l.Close()
+		}
+	}
 
 	// Create firewall instance that owns the BPF maps
 	fw := firewall.NewFirewall(objs.MapCidrs, objs.MapPorts, objs.MapCidrsV6, objs.MapPortsV6, objs.MapDefaultAction, objs.MapAuditMode, logger)

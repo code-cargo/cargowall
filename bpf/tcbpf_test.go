@@ -14,16 +14,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TODO: TestMain silently skips all tests when not running as root.
-// This means CI will report a pass even when no BPF tests actually run.
-// Consider using t.Skip() in individual tests or a build tag instead.
+// bpfAvailable is set by TestMain to indicate whether BPF is available.
+var bpfAvailable bool
+
 func TestMain(m *testing.M) {
-	// Remove MEMLOCK limit for BPF map creation
 	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Printf("skipping eBPF tests: failed to remove memlock (run with sudo): %v", err)
-		os.Exit(0)
+		// BPF not available — tests will skip individually with visible output
+		log.Printf("BPF not available (run with sudo for full test coverage): %v", err)
+		bpfAvailable = false
+	} else {
+		bpfAvailable = true
 	}
 	os.Exit(m.Run())
+}
+
+// requireBPF skips the test with a visible message if BPF is not available.
+func requireBPF(t *testing.T) {
+	t.Helper()
+	if !bpfAvailable {
+		t.Skip("BPF not available (requires root/CAP_BPF)")
+	}
 }
 
 const (
@@ -50,6 +60,7 @@ const (
 
 func loadBPFObjects(t *testing.T) *TcBpfObjects {
 	t.Helper()
+	requireBPF(t)
 	var objs TcBpfObjects
 	if err := LoadTcBpfObjects(&objs, nil); err != nil {
 		t.Fatalf("loading objects: %v", err)

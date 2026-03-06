@@ -16,7 +16,7 @@ GREEN := \033[32m
 RED := \033[31m
 RESET := \033[0m
 
-.PHONY: all build ci install-tools vet fmt fmt-check generate generate-proto test test-ci tidy clean
+.PHONY: all build ci install-tools vet fmt fmt-check generate generate-proto test test-bpf test-ci tidy clean
 
 .DEFAULT_GOAL := build
 
@@ -63,9 +63,15 @@ test:
 	@printf "${GREEN}Running tests...${RESET}\n"
 	go test ./...
 
+test-bpf:
+	@printf "${GREEN}Running BPF tests (requires root)...${RESET}\n"
+	sudo go test -v -count=1 ./bpf/
+
 test-ci:
 	@printf "${GREEN}Running CI tests...${RESET}\n"
 	go run gotest.tools/gotestsum@latest --junitfile test-results.xml --format testdox -- ./...
+	@printf "${GREEN}Running BPF tests with sudo...${RESET}\n"
+	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/
 
 vet:
 	$(call check_tool,staticcheck)

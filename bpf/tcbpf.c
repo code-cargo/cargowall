@@ -159,6 +159,14 @@ struct {
     __uint(max_entries, 1);
 } map_audit_mode SEC(".maps");
 
+// LRU hash map: socket cookie → PID (populated by cgroup programs, read by TC)
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u64);
+    __type(value, __u32);
+    __uint(max_entries, 16384);
+} map_sock_pid SEC(".maps");
+
 
 // Helper: check audit mode and return appropriate action
 static __always_inline int check_audit_or_block(void) {
@@ -171,7 +179,7 @@ static __always_inline int check_audit_or_block(void) {
 }
 
 // Helper: submit an event for IPv4
-static __always_inline void submit_event_v4(__u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 is_allowed) {
+static __always_inline void submit_event_v4(struct __sk_buff *skb, __u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 is_allowed) {
     struct blocked_event *evt = bpf_ringbuf_reserve(&map_events, sizeof(*evt), 0);
     if (evt) {
         __builtin_memset(evt, 0, sizeof(*evt));
@@ -182,7 +190,9 @@ static __always_inline void submit_event_v4(__u32 src_ip, __u32 dst_ip, __u16 sr
         evt->src_port = src_port;
         evt->dst_port = dst_port;
         evt->timestamp = bpf_ktime_get_ns();
-        evt->pid = bpf_get_current_pid_tgid() >> 32;
+        __u64 cookie = bpf_get_socket_cookie(skb);
+        __u32 *pid = bpf_map_lookup_elem(&map_sock_pid, &cookie);
+        evt->pid = pid ? *pid : 0;
         bpf_ringbuf_submit(evt, 0);
     }
 }
@@ -197,7 +207,7 @@ static __always_inline int is_ipv6_ext_hdr(__u8 nexthdr) {
 }
 
 // Helper: submit an event for IPv6
-static __always_inline void submit_event_v6(__u8 src_ip6[16], __u8 dst_ip6[16], __u16 src_port, __u16 dst_port, __u8 is_allowed) {
+static __always_inline void submit_event_v6(struct __sk_buff *skb, __u8 src_ip6[16], __u8 dst_ip6[16], __u16 src_port, __u16 dst_port, __u8 is_allowed) {
     struct blocked_event *evt = bpf_ringbuf_reserve(&map_events, sizeof(*evt), 0);
     if (evt) {
         __builtin_memset(evt, 0, sizeof(*evt));
@@ -208,7 +218,9 @@ static __always_inline void submit_event_v6(__u8 src_ip6[16], __u8 dst_ip6[16], 
         __builtin_memcpy(evt->src_ip6, src_ip6, 16);
         __builtin_memcpy(evt->dst_ip6, dst_ip6, 16);
         evt->timestamp = bpf_ktime_get_ns();
-        evt->pid = bpf_get_current_pid_tgid() >> 32;
+        __u64 cookie = bpf_get_socket_cookie(skb);
+        __u32 *pid = bpf_map_lookup_elem(&map_sock_pid, &cookie);
+        evt->pid = pid ? *pid : 0;
         bpf_ringbuf_submit(evt, 0);
     }
 }
@@ -231,7 +243,7 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
     // Only allow TCP and UDP protocols - block everything else
     if (ip_proto != IPPROTO_TCP && ip_proto != IPPROTO_UDP) {
         // Log blocked non-TCP/UDP protocol (store protocol number in dst_port)
-        submit_event_v4(src_ip, dst_ip, 0, ip_proto, 0);
+        submit_event_v4(skb, src_ip, dst_ip, 0, ip_proto, 0);
         return check_audit_or_block();
     }
 
@@ -357,13 +369,13 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
 
     if (!allowed) {
         if (is_tcp_syn || ip_proto == IPPROTO_UDP) {
-            submit_event_v4(src_ip, dst_ip, src_port, dst_port, 0);
+            submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, 0);
         }
         return check_audit_or_block();
     }
 
     if (is_tcp_syn) {
-        submit_event_v4(src_ip, dst_ip, src_port, dst_port, 1);
+        submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, 1);
     }
     return TC_ACT_OK;
 }
@@ -437,7 +449,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
 
     // Only allow TCP and UDP - block other protocols
     if (nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP) {
-        submit_event_v6(src_ip6, dst_ip6, 0, nexthdr, 0);
+        submit_event_v6(skb, src_ip6, dst_ip6, 0, nexthdr, 0);
         return check_audit_or_block();
     }
 
@@ -538,15 +550,33 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
 
     if (!allowed) {
         if (is_tcp_syn || nexthdr == IPPROTO_UDP) {
-            submit_event_v6(src_ip6, dst_ip6, src_port, dst_port, 0);
+            submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, 0);
         }
         return check_audit_or_block();
     }
 
     if (is_tcp_syn) {
-        submit_event_v6(src_ip6, dst_ip6, src_port, dst_port, 1);
+        submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, 1);
     }
     return TC_ACT_OK;
+}
+
+// Cgroup programs to track socket cookie → PID mapping
+// These fire on connect() and have process context available
+SEC("cgroup/connect4")
+int cg_connect4(struct bpf_sock_addr *ctx) {
+    __u64 cookie = bpf_get_socket_cookie(ctx);
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
+    return 1;
+}
+
+SEC("cgroup/connect6")
+int cg_connect6(struct bpf_sock_addr *ctx) {
+    __u64 cookie = bpf_get_socket_cookie(ctx);
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
+    return 1;
 }
 
 SEC("classifier/egress")

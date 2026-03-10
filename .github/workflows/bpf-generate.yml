@@ -1,0 +1,42 @@
+name: verify-bpf-generated-code
+
+on:
+  pull_request:
+    paths:
+      - "bpf/tcbpf.c"
+      - "bpf/vmlinux.h"
+      - ".github/workflows/bpf-generate.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify generated files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install eBPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Run go generate
+        run: go generate ./...
+
+      - name: Check for uncommitted changes
+        run: |
+          changed=$(git diff --name-only)
+          if [ -n "$changed" ]; then
+            echo "::error::Generated files are out of date. Run 'go generate ./...' and commit the changes."
+            echo "Changed files:"
+            echo "$changed"
+            git diff --stat
+            exit 1
+          fi
+          echo "Generated files are up to date."

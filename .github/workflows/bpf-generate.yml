@@ -26,17 +26,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev
 
+      - name: Checksum existing BPF objects
+        run: |
+          find bpf -name '*.o' -exec sha256sum {} \; | sort > /tmp/bpf-objects-before.txt
+
       - name: Run go generate
         run: go generate ./...
 
       - name: Check for uncommitted changes
         run: |
-          changed=$(git diff --name-only)
-          if [ -n "$changed" ]; then
+          # Check generated .go files via git diff
+          go_changed=$(git diff --name-only -- '*.go')
+
+          # Check .o files via checksum comparison — git diff is unreliable for
+          # BPF objects because clang can embed non-deterministic metadata even
+          # when the actual bytecode is identical.
+          find bpf -name '*.o' -exec sha256sum {} \; | sort > /tmp/bpf-objects-after.txt
+          o_changed=$(diff /tmp/bpf-objects-before.txt /tmp/bpf-objects-after.txt || true)
+
+          if [ -n "$go_changed" ] || [ -n "$o_changed" ]; then
             echo "::error::Generated files are out of date. Run 'go generate ./...' and commit the changes."
-            echo "Changed files:"
-            echo "$changed"
-            git diff --stat
+            [ -n "$go_changed" ] && echo "Changed Go files:" && echo "$go_changed"
+            [ -n "$o_changed" ] && echo "Changed BPF objects:" && echo "$o_changed"
             exit 1
           fi
           echo "Generated files are up to date."

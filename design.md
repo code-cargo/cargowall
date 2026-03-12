@@ -28,34 +28,21 @@ graph TB
         UC[CargoWall Controller]
         CM[Config Manager]
         FW[Firewall Manager]
-        DNS["DNS Proxy Server<br/>127.0.0.1:53"]
+        DNS["DNS Proxy<br/>LRU Cache · Query Filter<br/>127.0.0.1:53"]
         EH[Event Handler]
         NT[Notification Tracker]
         AL[Audit Logger]
-        LC[DNS LRU Cache<br/>10K entries]
-        QF[DNS Query Filter]
     end
 
     subgraph "Kernel Space"
-        subgraph "TC Programs"
-            EG[tc_egress<br/>Egress Classifier]
-            IG["tc_ingress<br/>(defined, not attached)"]
-        end
-        subgraph "Cgroup Programs"
-            C4[cg_connect4]
-            C6[cg_connect6]
-            S4[cg_sendmsg4]
-            S6[cg_sendmsg6]
-        end
+        EG[tc_egress<br/>Egress Classifier]
+        CG["Cgroup Hooks<br/>connect4/6, sendmsg4/6"]
     end
 
     subgraph "eBPF Maps"
-        LPM[map_cidrs<br/>IPv4 LPM Trie]
-        LPM6[map_cidrs_v6<br/>IPv6 LPM Trie]
-        PM[map_ports<br/>IPv4 Port Map]
-        PM6[map_ports_v6<br/>IPv6 Port Map]
-        DA[map_default_action]
-        AM[map_audit_mode]
+        CIDRS["CIDR LPM Tries<br/>IPv4 + IPv6"]
+        PORTS["Port Maps<br/>IPv4 + IPv6"]
+        CFG["Config Maps<br/>default action, audit mode"]
         SP[map_sock_pid<br/>Socket→PID LRU]
         RB[map_events<br/>Ring Buffer]
     end
@@ -67,32 +54,24 @@ graph TB
     end
 
     APP -->|DNS Query| DNS
-    DNS --> QF
-    QF -->|Check| CM
-    DNS -->|Cache Miss| LC
-    LC -->|Miss| UP
-    UP -->|Response| LC
+    DNS -->|Check Domain| CM
+    DNS -->|Cache Miss| UP
+    UP -->|Response| DNS
     DNS -->|JIT Update| FW
     DNS -->|Response| APP
 
     UC --> CM
     UC --> FW
     CM --> FW
-    FW -.->|Update| LPM
-    FW -.->|Update| LPM6
-    FW -.->|Update| PM
-    FW -.->|Update| PM6
-    UC -.->|Set| DA
-    UC -.->|Set| AM
+    FW -.->|Update| CIDRS
+    FW -.->|Update| PORTS
+    UC -.->|Set| CFG
 
-    C4 & C6 & S4 & S6 -.->|Write| SP
+    CG -.->|Write| SP
     EG -->|Read| SP
-    EG -->|Lookup| LPM
-    EG -->|Lookup| LPM6
-    EG -->|Lookup| PM
-    EG -->|Lookup| PM6
-    EG -->|Lookup| DA
-    EG -->|Lookup| AM
+    EG -->|Lookup| CIDRS
+    EG -->|Lookup| PORTS
+    EG -->|Lookup| CFG
     EG -->|Emit| RB
 
     EH <-.->|Read| RB

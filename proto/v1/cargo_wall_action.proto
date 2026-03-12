@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+import "google/api/annotations.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "data/cargo_wall_action_type_enum.proto";
+import "data/cargo_wall_event_category_enum.proto";
+import "data/cargo_wall_job_status_enum.proto";
+import "data/cargo_wall_mode_enum.proto";
+import "cargo_wall.proto";
+
+option csharp_namespace = "Controller.ApiService.Pb.CargoWall.V1";
+option go_package = "github.com/code-cargo/cargowall/pb/cargowall/v1";
+
+package grpc.cargowall.v1;
+
+service CargoWallActionJobService {
+  // Publish CargoWall action job results from a GitHub Actions workflow run
+  rpc CreateCargoWallActionJob(CreateCargoWallActionJobRequest) returns (CreateCargoWallActionJobResponse) {
+    option (google.api.http) = {
+      post: "/api/cargowall/v1/action/job"
+      body: "*"
+    };
+  };
+
+  // Get the effective CargoWall policy for the calling workflow run
+  rpc GetCargoWallActionJobRunPolicy(google.protobuf.Empty) returns (CargoWallPolicy){
+    option (google.api.http) = {
+      get: "/api/cargowall/v1/action/policy"
+    };
+  }
+}
+
+message CargoWallActionJobSummary {
+  uint32 total_connections = 1;
+  uint32 allowed_connections = 2;
+  uint32 denied_connections = 3;
+  uint32 unique_hostnames = 4;
+  uint32 would_deny_connections = 5;
+}
+
+message CargoWallActionStep {
+  string id = 1;
+  google.protobuf.Timestamp created_at = 2;
+  string name = 3;
+  int32 number = 4;
+  optional google.protobuf.Timestamp started_at = 5;
+  optional google.protobuf.Timestamp completed_at = 6;
+
+  repeated CargoWallActionEvent events = 100;
+}
+
+message CargoWallActionEvent {
+  google.protobuf.Timestamp timestamp = 1;
+  CargoWallActionType action = 2;
+  optional string hostname = 3;
+  optional string ip = 4;
+  optional uint32 port = 5;
+  optional string protocol = 6;
+  optional string matched_rule = 7;
+  optional string process = 8;
+  CargoWallEventCategory category = 9;
+}
+
+message CreateCargoWallActionJobRequest {
+  string job_name = 1;
+  string job_key = 2;
+  CargoWallMode mode = 3;
+  CargoWallActionType default_action = 4;
+  CargoWallActionJobSummary summary = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Timestamp completed_at = 7;
+  CargoWallJobStatus status = 8;
+
+  repeated CreateCargoWallActionStep steps = 100;
+}
+
+// Input-only step message (no id/created_at — server-generated)
+message CreateCargoWallActionStep {
+  string name = 1;
+  int32 number = 2;
+  optional google.protobuf.Timestamp started_at = 3;
+  optional google.protobuf.Timestamp completed_at = 4;
+  repeated CargoWallActionEvent events = 5;
+}
+
+message CreateCargoWallActionJobResponse {
+  string job_id = 1;
+  string workflow_run_id = 2;
+}
+

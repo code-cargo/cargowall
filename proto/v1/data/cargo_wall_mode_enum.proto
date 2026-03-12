@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+option csharp_namespace = "Controller.Data.Pb.CargoWall.V1";
+option go_package = "github.com/code-cargo/cargowall/pb/cargowall/v1/data";
+
+package grpc.cargowall.v1;
+
+enum CargoWallMode {
+  CARGO_WALL_MODE_UNSPECIFIED = 0;
+  CARGO_WALL_MODE_ENFORCE = 1;
+  CARGO_WALL_MODE_AUDIT = 2;
+}

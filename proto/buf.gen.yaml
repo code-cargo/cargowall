@@ -1,0 +1,8 @@
+version: v2
+inputs:
+  - directory: v1
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.36.11
+    out: ../pb/cargowall/v1
+    opt:
+      - paths=source_relative

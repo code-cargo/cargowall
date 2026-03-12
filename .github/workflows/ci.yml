@@ -1,0 +1,304 @@
+name: build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+
+jobs:
+  checks:
+    name: Lint & Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Cache Go tools
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: go-tools-${{ hashFiles('Makefile') }}
+
+      - name: Install tools
+        run: make install-tools
+
+      - name: Format check
+        run: make fmt-check
+
+      - name: Vet
+        run: make vet
+
+      - name: Build
+        run: make build
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install eBPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Generate BPF objects
+        run: go generate ./...
+
+      - name: Run tests
+        run: make test-ci
+
+      - name: Fix test result permissions
+        if: always()
+        run: sudo chmod 644 test-results*.xml
+
+      - name: Test Report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test Results
+          path: test-results*.xml
+          reporter: java-junit
+
+  build-binary:
+    name: Build Binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install eBPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Generate BPF objects
+        run: go generate ./...
+
+      - name: Build cargowall
+        run: make build
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargowall-binary
+          path: bin/cargowall
+          retention-days: 1
+
+  test-cargowall-enforce:
+    name: Integration Test (Enforce Mode)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
+
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
+
+      - name: Start CargoWall via Action
+        uses: code-cargo/cargowall-action@main
+        with:
+          mode: enforce
+          default-action: deny
+          allowed-hosts: "api.github.com,github.com,actions.githubusercontent.com,githubusercontent.com,docker.io,docker.com"
+          binary-path: ./bin/cargowall
+          debug: true
+
+      - name: Test allowed connection
+        run: |
+          curl -sf --connect-timeout 10 --max-time 30 https://github.com > /dev/null
+          echo "✅ github.com allowed"
+
+      - name: Test blocked connection
+        run: |
+          if curl -sf --connect-timeout 5 --max-time 10 https://example.com > /dev/null 2>&1; then
+            echo "❌ example.com should be blocked"
+            exit 1
+          fi
+          echo "✅ example.com blocked"
+
+      - name: Test blocked direct IP connection
+        run: |
+          echo "Testing direct IP connection (bypassing DNS): 93.184.216.34 (example.com)"
+          if curl -s --connect-timeout 5 --max-time 10 -o /dev/null http://93.184.216.34 2>&1; then
+            echo "❌ Direct IP connection succeeded (should have been blocked)"
+            exit 1
+          fi
+          echo "✅ Direct IP connection blocked"
+
+      - name: Test Docker pull through cargowall
+        run: |
+          docker pull alpine:latest
+          echo "✅ Docker pull succeeded through cargowall"
+
+      - name: Test Docker container filtering
+        run: |
+          # Test container can reach allowed host
+          docker run --rm alpine:latest sh -c "
+            wget -q --spider --timeout=15 https://github.com && echo 'CONNECTION_SUCCESS' || echo 'CONNECTION_FAILED'
+          " 2>&1 | grep -q "CONNECTION_SUCCESS"
+          echo "✅ Docker container reached github.com"
+
+          # Test container is blocked from non-allowed host
+          RESULT=$(docker run --rm alpine:latest sh -c "
+            wget -q --spider --timeout=5 https://example.com && echo 'CONNECTION_SUCCESS' || echo 'CONNECTION_BLOCKED'
+          " 2>&1) || true
+          if echo "$RESULT" | grep -q "CONNECTION_SUCCESS"; then
+            echo "❌ Docker container should not reach example.com"
+            exit 1
+          fi
+          echo "✅ Docker container blocked from example.com"
+
+      - name: Validate audit log events
+        run: |
+          AUDIT_LOG=/tmp/cargowall-audit.json
+
+          if [ ! -f "$AUDIT_LOG" ] || [ ! -s "$AUDIT_LOG" ]; then
+            echo "❌ Audit log file not found or empty"
+            exit 1
+          fi
+          echo "✅ Audit log exists ($(wc -l < "$AUDIT_LOG") lines)"
+
+          EVENTS_VALID=true
+
+          BLOCKED_COUNT=$(jq -s '[.[] | select(.event_type == "connection_blocked" and .blocked == true)] | length' "$AUDIT_LOG")
+          echo "connection_blocked events (blocked=true): $BLOCKED_COUNT"
+          if [ "$BLOCKED_COUNT" -eq 0 ]; then
+            echo "❌ No connection_blocked events found"
+            EVENTS_VALID=false
+          fi
+
+          DNS_BLOCKED_COUNT=$(jq -s '[.[] | select(.event_type == "dns_blocked")] | length' "$AUDIT_LOG")
+          echo "dns_blocked events: $DNS_BLOCKED_COUNT"
+          if [ "$DNS_BLOCKED_COUNT" -eq 0 ]; then
+            echo "❌ No dns_blocked events found"
+            EVENTS_VALID=false
+          fi
+
+          if [ "$EVENTS_VALID" = true ]; then
+            echo "✅ Audit log contains expected event types"
+          else
+            echo "❌ Audit log missing expected event types"
+            echo "Sample entries:"
+            head -5 "$AUDIT_LOG" | jq .
+            exit 1
+          fi
+
+      - name: Test summary command
+        run: |
+          SUMMARY_OUTPUT=$(./bin/cargowall summary --audit-log /tmp/cargowall-audit.json --steps '[]' 2>&1)
+
+          echo "Summary output:"
+          echo "$SUMMARY_OUTPUT"
+
+          SUMMARY_VALID=true
+
+          if ! echo "$SUMMARY_OUTPUT" | grep -q "Enforce Mode"; then
+            echo "❌ Missing 'Enforce Mode' header"
+            SUMMARY_VALID=false
+          fi
+
+          if ! echo "$SUMMARY_OUTPUT" | grep -q "### Summary"; then
+            echo "❌ Missing '### Summary' section"
+            SUMMARY_VALID=false
+          fi
+
+          if ! echo "$SUMMARY_OUTPUT" | grep -q "Connections blocked"; then
+            echo "❌ Missing 'Connections blocked' metric"
+            SUMMARY_VALID=false
+          fi
+
+          if [ "$SUMMARY_VALID" = true ]; then
+            echo "✅ Summary command produces valid markdown"
+          else
+            echo "❌ Summary command output missing expected content"
+            exit 1
+          fi
+
+  test-cargowall-audit:
+    name: Integration Test (Audit Mode)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
+
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
+
+      - name: Start CargoWall via Action
+        uses: code-cargo/cargowall-action@main
+        with:
+          mode: audit
+          allowed-hosts: "api.github.com,github.com,actions.githubusercontent.com,githubusercontent.com"
+          binary-path: ./bin/cargowall
+          debug: true
+
+      - name: Test audit mode allows connections
+        run: |
+          curl -sf --connect-timeout 10 --max-time 30 https://example.com > /dev/null
+          echo "✅ example.com allowed in audit mode"
+
+  test-cargowall-saas:
+    name: Integration Test (SaaS)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
+
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
+
+      - uses: code-cargo/cargowall-action@main
+        with:
+          binary-path: ./bin/cargowall
+          api-url: https://app.dev.codecargo.dev
+          github-token: ${{ secrets.CARGOWALL_ACTION_TOKEN }}

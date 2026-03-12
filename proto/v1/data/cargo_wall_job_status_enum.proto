@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+option csharp_namespace = "Controller.Data.Pb.CargoWall.V1";
+option go_package = "github.com/code-cargo/cargowall/pb/cargowall/v1/data";
+
+package grpc.cargowall.v1;
+
+enum CargoWallJobStatus {
+  CARGO_WALL_JOB_STATUS_UNSPECIFIED = 0;
+  CARGO_WALL_JOB_STATUS_SUCCESS = 1;
+  CARGO_WALL_JOB_STATUS_FAILURE = 2;
+  CARGO_WALL_JOB_STATUS_CANCELED = 3;
+  CARGO_WALL_JOB_STATUS_TIMED_OUT = 4;
+}

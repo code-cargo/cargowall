@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "dependencies": {
+    "@bufbuild/buf": "^1.62.1",
+    "@bufbuild/protobuf": "^2.10.2"
+  },
+  "scripts": {
+    "generate": "buf generate --clean",
+    "dep-update": "buf dep update"
+  }
+}

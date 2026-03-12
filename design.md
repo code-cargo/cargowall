@@ -23,12 +23,15 @@ Dual-stack (IPv4/IPv6) L4 firewall using TC eBPF egress filtering, cgroup socket
 ## Architecture Overview
 
 ```mermaid
-graph TB
+flowchart TD
+    APP[Application]
+    UP[Upstream DNS]
+
     subgraph "User Space"
+        DNS["DNS Proxy<br/>LRU Cache · Query Filter<br/>127.0.0.1:53"]
         UC[CargoWall Controller]
         CM[Config Manager]
         FW[Firewall Manager]
-        DNS["DNS Proxy<br/>LRU Cache · Query Filter<br/>127.0.0.1:53"]
         EH[Event Handler]
         NT[Notification Tracker]
         AL[Audit Logger]
@@ -47,18 +50,14 @@ graph TB
         RB[map_events<br/>Ring Buffer]
     end
 
-    subgraph "External"
-        APP[Application]
-        UP[Configurable<br/>Upstream DNS]
-        SM[State Machine]
-    end
+    SM[State Machine]
 
     APP -->|DNS Query| DNS
-    DNS -->|Check Domain| CM
+    DNS -->|Response| APP
     DNS -->|Cache Miss| UP
     UP -->|Response| DNS
+    DNS -->|Check Domain| CM
     DNS -->|JIT Update| FW
-    DNS -->|Response| APP
 
     UC --> CM
     UC --> FW

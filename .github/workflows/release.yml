@@ -8,6 +8,10 @@ on:
       tag:
         description: "Release tag (e.g. v1.0.0)"
         required: true
+      ref:
+        description: "Source ref to build from - commit SHA, branch, or tag (defaults to main)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -21,6 +25,8 @@ jobs:
         arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - uses: actions/setup-go@v6
         with:
@@ -83,7 +89,14 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ steps.tag.outputs.tag }}" --repo "${{ github.repository }}" --title "${{ steps.tag.outputs.tag }}" --generate-notes --prerelease
+        run: |
+          TARGET="${{ inputs.ref || github.sha }}"
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --target "$TARGET" \
+            --generate-notes \
+            --prerelease
 
       - name: Upload release assets
         env:

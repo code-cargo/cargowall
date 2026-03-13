@@ -79,6 +79,12 @@ jobs:
             echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Create release (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ steps.tag.outputs.tag }}" --repo "${{ github.repository }}" --title "${{ steps.tag.outputs.tag }}" --generate-notes --prerelease
+
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}

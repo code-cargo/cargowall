@@ -167,6 +167,21 @@ For more complex policies, use a JSON config file (see `config.example.json`):
 
 ---
 
+# Centralized Policy Management
+
+With the **CodeCargo Freemium or Paid** editions, you can create and assign CargoWall policies entirely from the CodeCargo SaaS — no workflow files or runner configuration needed. Just keep the CargoWall Action in your workflow and manage everything else from the dashboard.
+
+Policies are resolved using a **hierarchical inheritance model**:
+
+* **Organization** — set baseline network rules across all repos
+* **Repository** — override or extend the org policy for specific repos
+* **Workflow** — refine rules for individual workflows
+* **Job** — apply the most specific policy at the job level
+
+Each level can **extend** the parent policy (merge rules) or **replace** it entirely. The CargoWall Action automatically fetches the resolved policy from the CodeCargo API at runtime.
+
+---
+
 # Editions
 
 CargoWall is available in three editions.
@@ -178,8 +193,8 @@ CargoWall is available in three editions.
 Free and open source.
 
 * Works with **public repositories**
-* Network monitoring
-* Local enforcement
+* Network monitoring and enforcement
+* Configure via environment variables or JSON config file
 * GitHub Action integration
 
 Perfect for:
@@ -198,7 +213,7 @@ Includes:
 
 * up to **10 repositories**
 * **7 days** workflow run retention
-* centralized CargoWall policy control
+* **Centralized policy management** — create, assign, and inherit policies from the CodeCargo dashboard
 * all users are **admins**
 * CodeCargo **non-AI features**
 
@@ -213,9 +228,9 @@ Includes:
 * unlimited repositories
 * unlimited retention
 * role-based access control
-* organization-wide policies
+* **Organization-wide policies** with repo/workflow/job-level overrides
 * CI/CD governance platform
-* **AI-powered CodeCargo capabilities**
+* **AI-powered CodeCargo capabilities Multi-repo AI Editor, Self-service, AI Service Catalog, and Actions Insights**
 
 ---
 
@@ -265,7 +280,9 @@ CargoWall provides the **network firewall protecting workflow execution**.
 
 # Security
 
-If you discover a vulnerability, please report it responsibly via [security@codecargo.com](mailto:security@codecargo.com).
+If you discover a vulnerability, please report it responsibly.
+
+See [`SECURITY.md`](SECURITY.md) for details.
 
 ---
 

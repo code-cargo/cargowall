@@ -1,0 +1,23 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Generated BPF objects (binary)
+bpf/*.o binary linguist-generated
+
+# Generated BPF Go bindings (bpf2go output)
+bpf/tcbpf_bpfeb.go linguist-generated
+bpf/tcbpf_bpfel.go linguist-generated
+
+# Generated BPF kernel header
+bpf/vmlinux.h linguist-generated
+
+# Generated protobuf Go files
+pb/**/*.go linguist-generated
+
+# Lock files
+go.sum linguist-generated
+package-lock.json linguist-generated
+proto/package-lock.json linguist-generated
+
+# Mock files
+**/mock_*.go linguist-generated

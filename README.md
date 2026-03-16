@@ -182,55 +182,15 @@ Each level can **extend** the parent policy (merge rules) or **replace** it enti
 
 ---
 
-# Editions
+# CodeCargo Platform
 
-CargoWall is available in three editions.
+Sign up for the [CodeCargo platform](https://www.codecargo.com) for enterprise features like:
 
----
-
-## Community (Open Source)
-
-Free and open source.
-
-* Works with **public repositories**
-* Network monitoring and enforcement
-* Configure via environment variables or JSON config file
-* GitHub Action integration
-
-Perfect for:
-
-* open source maintainers
-* public projects
-* security experimentation
-
----
-
-## CodeCargo Freemium
-
-Requires installing the CodeCargo GitHub App.
-
-Includes:
-
-* up to **10 repositories**
-* **7 days** workflow run retention
-* **Centralized policy management** — create, assign, and inherit policies from the CodeCargo dashboard
-* all users are **admins**
-* CodeCargo **non-AI features**
-
----
-
-## CodeCargo Paid
-
-Full platform access.
-
-Includes:
-
-* unlimited repositories
-* unlimited retention
-* role-based access control
-* **Organization-wide policies** with repo/workflow/job-level overrides
-* CI/CD governance platform
-* **AI-powered CodeCargo capabilities Multi-repo AI Editor, Self-service, AI Service Catalog, and Actions Insights**
+* **Centralized policy management** — create, assign, and inherit CargoWall policies from a dashboard
+* **Organization-wide policies** with repo, workflow, and job-level overrides
+* Role-based access control
+* CI/CD governance and workflow run retention
+* AI-powered capabilities including Multi-repo AI Editor, Self-service, AI Service Catalog, and Actions Insights
 
 ---
 

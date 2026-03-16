@@ -2,9 +2,7 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in CargoWall, please report it responsibly.
-
-**Email:** [security@codecargo.com](mailto:security@codecargo.com)
+If you discover a security vulnerability in CargoWall, please report it through [GitHub Security Advisories](https://github.com/code-cargo/cargowall/security/advisories/new).
 
 Please include:
 

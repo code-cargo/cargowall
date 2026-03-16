@@ -76,47 +76,47 @@ CargoWall protects the pipeline **while it is running**.
 
 ---
 
-# Quick Start
+# Get Started
 
-Add CargoWall to your workflow.
+Add the [CargoWall GitHub Action](https://github.com/code-cargo/cargowall-action) to your workflow:
 
 ```yaml
-steps:
-  - uses: actions/checkout@v4
-
-  - name: Run CargoWall
-    uses: code-cargo/cargowall-action@v1
-    with:
-      audit_mode: false
-    env:
-      CARGOWALL_DEFAULT_ACTION: deny
-      CARGOWALL_ALLOWED_HOSTS: "github.com:443,registry.npmjs.org:443"
-      CARGOWALL_ALLOWED_CIDRS: "8.8.8.8/32:53,8.8.4.4/32:53"
-
-  - name: Build
-    run: make build
+- uses: code-cargo/cargowall-action@v1
+  with:
+    default-action: deny
+    allowed-hosts: |
+      github.com,
+      registry.npmjs.org
 ```
 
-CargoWall will immediately begin monitoring and enforcing network policy during the run.
-
----
-
-# Example: Detecting Unexpected Network Access
-
-CargoWall writes NDJSON audit logs with full connection details:
-
-```json
-{"timestamp":"2026-03-16T12:00:01Z","event_type":"connection_allowed","dst_ip":"104.16.3.35","dst_hostname":"registry.npmjs.org","dst_port":443,"protocol":"TCP","process":"node","pid":1234,"would_deny":false,"blocked":false}
-{"timestamp":"2026-03-16T12:00:02Z","event_type":"connection_blocked","dst_ip":"203.0.113.50","dst_hostname":"evil-exfil.example.com","dst_port":443,"protocol":"TCP/UDP","process":"curl","pid":1337,"matched_rule":"","would_deny":false,"blocked":true}
-```
-
-If a dependency attempts to connect to an unexpected host, CargoWall will detect and block it.
-
-In **audit mode**, denied connections are logged with `"would_deny": true` but not blocked — useful for building your allowlist before switching to enforce mode.
+See the [cargowall-action README](https://github.com/code-cargo/cargowall-action) for full usage, inputs, outputs, and examples.
 
 ---
 
 # How It Works
+
+```mermaid
+flowchart LR
+    subgraph runner["GitHub Actions Runner"]
+        subgraph steps["Workflow Steps"]
+            S1["npm ci / docker build / etc."]
+        end
+
+        subgraph cw["CargoWall"]
+            DNS["DNS Proxy<br/>127.0.0.1:53"]
+            BPF["TC eBPF<br/>on eth0"]
+            Rules["Rule Engine"]
+        end
+
+        S1 -- "DNS query" --> DNS
+        DNS -- "resolve & update rules" --> Rules
+        Rules -- "allow/deny IPs" --> BPF
+        S1 -- "network traffic" --> BPF
+    end
+
+    BPF -- "allowed" --> Internet(("Internet"))
+    BPF -. "blocked" .-x Denied(("Denied"))
+```
 
 1. The CargoWall GitHub Action installs the CargoWall runtime on the runner.
 2. CargoWall attaches **eBPF TC (Traffic Control) egress filters** to the runner's network interface using [cilium/ebpf](https://github.com/cilium/ebpf).
@@ -131,63 +131,12 @@ All enforcement happens **inside the runner at the kernel level** — no iptable
 
 ---
 
-# Configuration
-
-CargoWall can be configured via **environment variables** or a **JSON config file**.
-
-## Environment Variables
-
-| Variable | Description |
-| --- | --- |
-| `CARGOWALL_DEFAULT_ACTION` | `allow` or `deny` (default: `deny`) |
-| `CARGOWALL_ALLOWED_HOSTS` | Comma-separated hostnames with optional ports (e.g. `github.com:443`) |
-| `CARGOWALL_BLOCKED_HOSTS` | Comma-separated hostnames to block |
-| `CARGOWALL_ALLOWED_CIDRS` | Comma-separated CIDR blocks with optional ports (e.g. `10.0.0.0/8:443`) |
-| `CARGOWALL_BLOCKED_CIDRS` | Comma-separated CIDR blocks to block |
-| `CARGOWALL_AUDIT_MODE` | Set to `true` for log-only mode (no blocking) |
-| `CARGOWALL_AUDIT_LOG` | Path to the NDJSON audit log file |
-
-Port syntax: `hostname:port1;port2` or `cidr:port1;port2`. Omit ports to allow all.
-
-## JSON Config File
-
-For more complex policies, use a JSON config file (see `config.example.json`):
-
-```json
-{
-  "defaultAction": "deny",
-  "rules": [
-    { "type": "hostname", "value": "github.com", "ports": [443], "action": "allow" },
-    { "type": "hostname", "value": "registry.npmjs.org", "ports": [443], "action": "allow" },
-    { "type": "cidr", "value": "8.8.8.8/32", "ports": [53], "action": "allow" },
-    { "type": "cidr", "value": "192.168.1.0/24", "action": "allow" }
-  ]
-}
-```
-
----
-
-# Centralized Policy Management
-
-With the **CodeCargo Freemium or Paid** editions, you can create and assign CargoWall policies entirely from the CodeCargo SaaS — no workflow files or runner configuration needed. Just keep the CargoWall Action in your workflow and manage everything else from the dashboard.
-
-Policies are resolved using a **hierarchical inheritance model**:
-
-* **Organization** — set baseline network rules across all repos
-* **Repository** — override or extend the org policy for specific repos
-* **Workflow** — refine rules for individual workflows
-* **Job** — apply the most specific policy at the job level
-
-Each level can **extend** the parent policy (merge rules) or **replace** it entirely. The CargoWall Action automatically fetches the resolved policy from the CodeCargo API at runtime.
-
----
-
 # CodeCargo Platform
 
 Sign up for the [CodeCargo platform](https://www.codecargo.com) for enterprise features like:
 
-* **Centralized policy management** — create, assign, and inherit CargoWall policies from a dashboard
-* **Organization-wide policies** with repo, workflow, and job-level overrides
+* **Centralized policy management** — create, assign, and inherit CargoWall policies from a dashboard without touching workflow files
+* **Organization-wide policies** with hierarchical overrides at the repo, workflow, and job level
 * Role-based access control
 * CI/CD governance and workflow run retention
 * AI-powered capabilities including Multi-repo AI Editor, Self-service, AI Service Catalog, and Actions Insights
@@ -211,22 +160,6 @@ CargoWall is especially valuable if you:
 * need **SOC2 / FedRAMP evidence for pipeline controls**
 * want to prevent **CI/CD supply chain attacks**
 * want visibility into **network activity during builds**
-
----
-
-# The Bigger Picture
-
-CargoWall is the **runtime security layer** of the CodeCargo platform.
-
-CodeCargo adds:
-
-* CI/CD governance
-* workflow policy enforcement
-* service catalog visibility
-* developer self-service workflows
-* AI-powered pipeline automation
-
-CargoWall provides the **network firewall protecting workflow execution**.
 
 ---
 

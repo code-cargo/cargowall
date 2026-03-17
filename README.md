@@ -12,6 +12,8 @@ It protects your pipelines from **malicious actions, dependency supply chain att
 
 CargoWall is open source and built by the team behind CodeCargo.
 
+**Get started with the [CargoWall GitHub Action](https://github.com/code-cargo/cargowall-action).**
+
 ---
 
 # Why This Exists

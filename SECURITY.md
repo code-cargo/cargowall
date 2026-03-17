@@ -21,8 +21,6 @@ This policy applies to the CargoWall open source project and its components:
 * DNS proxy (`pkg/dns/`)
 * Configuration handling (`pkg/config/`)
 
-For vulnerabilities in the CodeCargo platform or GitHub Action, please use the same email address.
-
 ## Supported Versions
 
 Security fixes are applied to the latest release only.

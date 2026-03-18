@@ -1,7 +1,6 @@
 syntax = "proto3";
 
 import "google/api/annotations.proto";
-import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 import "data/cargo_wall_action_type_enum.proto";
 import "data/cargo_wall_event_category_enum.proto";
@@ -24,11 +23,15 @@ service CargoWallActionJobService {
   };
 
   // Get the effective CargoWall policy for the calling workflow run
-  rpc GetCargoWallActionJobRunPolicy(google.protobuf.Empty) returns (CargoWallPolicy){
+  rpc GetCargoWallActionJobRunPolicy(GetCargoWallActionJobRunPolicyRequest) returns (CargoWallPolicy){
     option (google.api.http) = {
       get: "/api/cargowall/v1/action/policy"
     };
   }
+}
+
+message GetCargoWallActionJobRunPolicyRequest {
+  optional string job_key = 1;
 }
 
 message CargoWallActionJobSummary {

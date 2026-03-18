@@ -588,8 +588,8 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 	slog.Info("Audit results pushed to API",
 		"job_id", result.JobId,
 		"workflow_run_id", result.WorkflowRunId,
-		"workflow_run_link", result.WorkflowRunLink)
-	return result.WorkflowRunLink, nil
+		"workflow_run_link", result.WorkflowRunUrl)
+	return result.WorkflowRunUrl, nil
 }
 
 func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {

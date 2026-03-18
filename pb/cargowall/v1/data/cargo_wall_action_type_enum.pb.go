@@ -24,19 +24,22 @@ const (
 type CargoWallActionType int32
 
 const (
-	CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW CargoWallActionType = 0
-	CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY  CargoWallActionType = 1
+	CargoWallActionType_CARGO_WALL_ACTION_TYPE_UNSPECIFIED CargoWallActionType = 0
+	CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW       CargoWallActionType = 1
+	CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY        CargoWallActionType = 2
 )
 
 // Enum value maps for CargoWallActionType.
 var (
 	CargoWallActionType_name = map[int32]string{
-		0: "CARGO_WALL_ACTION_TYPE_ALLOW",
-		1: "CARGO_WALL_ACTION_TYPE_DENY",
+		0: "CARGO_WALL_ACTION_TYPE_UNSPECIFIED",
+		1: "CARGO_WALL_ACTION_TYPE_ALLOW",
+		2: "CARGO_WALL_ACTION_TYPE_DENY",
 	}
 	CargoWallActionType_value = map[string]int32{
-		"CARGO_WALL_ACTION_TYPE_ALLOW": 0,
-		"CARGO_WALL_ACTION_TYPE_DENY":  1,
+		"CARGO_WALL_ACTION_TYPE_UNSPECIFIED": 0,
+		"CARGO_WALL_ACTION_TYPE_ALLOW":       1,
+		"CARGO_WALL_ACTION_TYPE_DENY":        2,
 	}
 )
 
@@ -71,10 +74,11 @@ var File_data_cargo_wall_action_type_enum_proto protoreflect.FileDescriptor
 
 const file_data_cargo_wall_action_type_enum_proto_rawDesc = "" +
 	"\n" +
-	"&data/cargo_wall_action_type_enum.proto\x12\x11grpc.cargowall.v1*X\n" +
-	"\x13CargoWallActionType\x12 \n" +
-	"\x1cCARGO_WALL_ACTION_TYPE_ALLOW\x10\x00\x12\x1f\n" +
-	"\x1bCARGO_WALL_ACTION_TYPE_DENY\x10\x01BXZ4github.com/code-cargo/cargowall/pb/cargowall/v1/data\xaa\x02\x1fController.Data.Pb.CargoWall.V1b\x06proto3"
+	"&data/cargo_wall_action_type_enum.proto\x12\x11grpc.cargowall.v1*\x80\x01\n" +
+	"\x13CargoWallActionType\x12&\n" +
+	"\"CARGO_WALL_ACTION_TYPE_UNSPECIFIED\x10\x00\x12 \n" +
+	"\x1cCARGO_WALL_ACTION_TYPE_ALLOW\x10\x01\x12\x1f\n" +
+	"\x1bCARGO_WALL_ACTION_TYPE_DENY\x10\x02BXZ4github.com/code-cargo/cargowall/pb/cargowall/v1/data\xaa\x02\x1fController.Data.Pb.CargoWall.V1b\x06proto3"
 
 var (
 	file_data_cargo_wall_action_type_enum_proto_rawDescOnce sync.Once

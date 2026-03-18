@@ -90,5 +90,6 @@ message CreateCargoWallActionStep {
 message CreateCargoWallActionJobResponse {
   string job_id = 1;
   string workflow_run_id = 2;
+  string workflow_run_link = 3;
 }
 

@@ -8,7 +8,7 @@
 
 CargoWall is an **eBPF-based network firewall for GitHub Actions runners** that monitors and controls outbound connections during CI/CD runs.
 
-It protects your pipelines from **malicious actions, dependency supply chain attacks, and secret exfiltration** — without requiring changes to your workflows.
+It protects your pipelines from **malicious actions, dependency supply chain attacks, and secret exfiltration** — with just a single step added to your workflows.
 
 CargoWall is open source and built by the team behind CodeCargo.
 

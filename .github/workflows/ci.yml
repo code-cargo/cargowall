@@ -301,4 +301,3 @@ jobs:
         with:
           binary-path: ./bin/cargowall
           api-url: https://app.dev.codecargo.dev
-          github-token: ${{ secrets.CARGOWALL_ACTION_TOKEN }}

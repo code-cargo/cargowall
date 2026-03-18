@@ -80,16 +80,23 @@ func (c *SummaryCmd) Run() error {
 	}
 
 	if len(auditEvents) == 0 {
-		fmt.Println("## CargoWall Network Audit")
-		fmt.Println()
-		fmt.Println("No network events were logged during this workflow run.")
-
 		// Best-effort API push — log warning on failure but don't fail the summary
+		var workflowRunLink string
 		if c.ApiUrl != "" {
-			if err := c.pushToApi(nil, steps); err != nil {
+			var err error
+			workflowRunLink, err = c.pushToApi(nil, steps)
+			if err != nil {
 				slog.Warn("Best-effort API push failed", "error", err)
 			}
 		}
+
+		if workflowRunLink != "" {
+			fmt.Printf("## CargoWall Network Audit ([view on CodeCargo](%s))\n", workflowRunLink)
+		} else {
+			fmt.Println("## CargoWall Network Audit")
+		}
+		fmt.Println()
+		fmt.Println("No network events were logged during this workflow run.")
 		return nil
 	}
 
@@ -123,15 +130,18 @@ func (c *SummaryCmd) Run() error {
 	stepEvents := c.correlateEventsToSteps(regularEvents, steps)
 	deduplicateStepEvents(stepEvents)
 
-	// Generate summary
-	c.generateSummary(stepEvents, existingConnEvents, auditMode)
-
-	// Best-effort API push — log warning on failure but don't fail the summary
+	// Best-effort API push before summary so the link is available for the header
+	var workflowRunLink string
 	if c.ApiUrl != "" {
-		if err := c.pushToApi(stepEvents, steps); err != nil {
+		var err error
+		workflowRunLink, err = c.pushToApi(stepEvents, steps)
+		if err != nil {
 			slog.Warn("Best-effort API push failed", "error", err)
 		}
 	}
+
+	// Generate summary
+	c.generateSummary(stepEvents, existingConnEvents, auditMode, workflowRunLink)
 
 	return nil
 }
@@ -265,7 +275,7 @@ func deduplicateStepEvents(stepEvents []StepEvents) {
 	}
 }
 
-func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents []events.AuditEvent, auditMode bool) {
+func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents []events.AuditEvent, auditMode bool, workflowRunLink string) {
 	// Count totals
 	var totalBlocked, totalConnectionsAllowed, totalDNSBlocked, totalProtocolBlocked int
 	for _, se := range stepEvents {
@@ -284,13 +294,17 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 	}
 
 	// Print header
+	linkSuffix := ""
+	if workflowRunLink != "" {
+		linkSuffix = fmt.Sprintf(" ([view on CodeCargo](%s))", workflowRunLink)
+	}
 	if auditMode {
-		fmt.Println("## CargoWall Network Audit (Audit Mode - No Blocking)")
+		fmt.Printf("## CargoWall Network Audit (Audit Mode - No Blocking)%s\n", linkSuffix)
 		fmt.Println()
 		fmt.Println("> Running in audit mode. Connections shown below were **logged but NOT blocked**.")
 		fmt.Println("> Switch to `mode: enforce` to block these connections.")
 	} else {
-		fmt.Println("## CargoWall Network Audit (Enforce Mode)")
+		fmt.Printf("## CargoWall Network Audit (Enforce Mode)%s\n", linkSuffix)
 	}
 	fmt.Println()
 
@@ -438,12 +452,12 @@ func computeSummary(allEvents []events.AuditEvent, mode data.CargoWallMode) *car
 	}
 }
 
-func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) error {
+func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (string, error) {
 	if c.Token == "" {
-		return fmt.Errorf("no token provided, skipping API push")
+		return "", fmt.Errorf("no token provided, skipping API push")
 	}
 	if c.JobName == "" {
-		return fmt.Errorf("no job-name provided, skipping API push")
+		return "", fmt.Errorf("no job-name provided, skipping API push")
 	}
 
 	// Map mode string to proto enum
@@ -543,38 +557,39 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) erro
 	marshaler := protojson.MarshalOptions{UseProtoNames: true}
 	jsonBytes, err := marshaler.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("failed to marshal API request: %w", err)
+		return "", fmt.Errorf("failed to marshal API request: %w", err)
 	}
 
 	url := strings.TrimRight(c.ApiUrl, "/") + "/api/cargowall/v1/action/job"
 	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(jsonBytes))
 	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
+		return "", fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.Token)
 
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("failed to push audit results to API: %w", err)
+		return "", fmt.Errorf("failed to push audit results to API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("API returned non-OK status %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("API returned non-OK status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result cargowallv1.CreateCargoWallActionJobResponse
 	if err := protojson.Unmarshal(body, &result); err != nil {
 		slog.Info("Audit results pushed to API", "response", string(body))
-		return nil
+		return "", nil
 	}
 
 	slog.Info("Audit results pushed to API",
 		"job_id", result.JobId,
-		"workflow_run_id", result.WorkflowRunId)
-	return nil
+		"workflow_run_id", result.WorkflowRunId,
+		"workflow_run_link", result.WorkflowRunLink)
+	return result.WorkflowRunLink, nil
 }
 
 func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {

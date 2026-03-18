@@ -530,11 +530,12 @@ func (x *CreateCargoWallActionStep) GetEvents() []*CargoWallActionEvent {
 }
 
 type CreateCargoWallActionJobResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	WorkflowRunId string                 `protobuf:"bytes,2,opt,name=workflow_run_id,json=workflowRunId,proto3" json:"workflow_run_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	JobId           string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	WorkflowRunId   string                 `protobuf:"bytes,2,opt,name=workflow_run_id,json=workflowRunId,proto3" json:"workflow_run_id,omitempty"`
+	WorkflowRunLink string                 `protobuf:"bytes,3,opt,name=workflow_run_link,json=workflowRunLink,proto3" json:"workflow_run_link,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *CreateCargoWallActionJobResponse) Reset() {
@@ -577,6 +578,13 @@ func (x *CreateCargoWallActionJobResponse) GetJobId() string {
 func (x *CreateCargoWallActionJobResponse) GetWorkflowRunId() string {
 	if x != nil {
 		return x.WorkflowRunId
+	}
+	return ""
+}
+
+func (x *CreateCargoWallActionJobResponse) GetWorkflowRunLink() string {
+	if x != nil {
+		return x.WorkflowRunLink
 	}
 	return ""
 }
@@ -644,10 +652,11 @@ const file_cargo_wall_action_proto_rawDesc = "" +
 	"\fcompleted_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampH\x01R\vcompletedAt\x88\x01\x01\x12?\n" +
 	"\x06events\x18\x05 \x03(\v2'.grpc.cargowall.v1.CargoWallActionEventR\x06eventsB\r\n" +
 	"\v_started_atB\x0f\n" +
-	"\r_completed_at\"a\n" +
+	"\r_completed_at\"\x8d\x01\n" +
 	" CreateCargoWallActionJobResponse\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12&\n" +
-	"\x0fworkflow_run_id\x18\x02 \x01(\tR\rworkflowRunId2\xf4\x02\n" +
+	"\x0fworkflow_run_id\x18\x02 \x01(\tR\rworkflowRunId\x12*\n" +
+	"\x11workflow_run_link\x18\x03 \x01(\tR\x0fworkflowRunLink2\xf4\x02\n" +
 	"\x19CargoWallActionJobService\x12\xac\x01\n" +
 	"\x18CreateCargoWallActionJob\x122.grpc.cargowall.v1.CreateCargoWallActionJobRequest\x1a3.grpc.cargowall.v1.CreateCargoWallActionJobResponse\"'\x82\xd3\xe4\x93\x02!:\x01*\"\x1c/api/cargowall/v1/action/job\x12\xa7\x01\n" +
 	"\x1eGetCargoWallActionJobRunPolicy\x128.grpc.cargowall.v1.GetCargoWallActionJobRunPolicyRequest\x1a\".grpc.cargowall.v1.CargoWallPolicy\"'\x82\xd3\xe4\x93\x02!\x12\x1f/api/cargowall/v1/action/policyBYZ/github.com/code-cargo/cargowall/pb/cargowall/v1\xaa\x02%Controller.ApiService.Pb.CargoWall.V1b\x06proto3"

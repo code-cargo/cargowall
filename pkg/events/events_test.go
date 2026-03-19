@@ -634,3 +634,67 @@ func TestProcessEvent_TooShortBuffer(t *testing.T) {
 	// Should not panic — processEvent should return early for short buffers
 	processEvent([]byte{0x04}, cm, nil, nil, nil, newTestLogger())
 }
+
+func TestProcessEvent_AutoAllowedType(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+	// Add a DNS auto-allow rule for 8.8.8.8:53
+	cm.EnsureDNSAllowed([]string{"8.8.8.8"})
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   1,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("8.8.8.8"),
+		SrcPort:   54321,
+		DstPort:   53,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionAllowed, events[0].EventType)
+	assert.Equal(t, "dns", events[0].AutoAllowedType)
+}
+
+func TestProcessEvent_NoAutoAllowedTypeForUserRule(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeCIDR, Value: "93.184.216.0/24", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   1,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionAllowed, events[0].EventType)
+	assert.Empty(t, events[0].AutoAllowedType, "user-configured rules should not have auto_allowed_type")
+}

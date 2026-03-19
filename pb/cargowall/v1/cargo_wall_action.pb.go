@@ -69,14 +69,15 @@ func (x *GetCargoWallActionJobRunPolicyRequest) GetJobKey() string {
 }
 
 type CargoWallActionJobSummary struct {
-	state                protoimpl.MessageState `protogen:"open.v1"`
-	TotalConnections     uint32                 `protobuf:"varint,1,opt,name=total_connections,json=totalConnections,proto3" json:"total_connections,omitempty"`
-	AllowedConnections   uint32                 `protobuf:"varint,2,opt,name=allowed_connections,json=allowedConnections,proto3" json:"allowed_connections,omitempty"`
-	DeniedConnections    uint32                 `protobuf:"varint,3,opt,name=denied_connections,json=deniedConnections,proto3" json:"denied_connections,omitempty"`
-	UniqueHostnames      uint32                 `protobuf:"varint,4,opt,name=unique_hostnames,json=uniqueHostnames,proto3" json:"unique_hostnames,omitempty"`
-	WouldDenyConnections uint32                 `protobuf:"varint,5,opt,name=would_deny_connections,json=wouldDenyConnections,proto3" json:"would_deny_connections,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	state                  protoimpl.MessageState `protogen:"open.v1"`
+	TotalConnections       uint32                 `protobuf:"varint,1,opt,name=total_connections,json=totalConnections,proto3" json:"total_connections,omitempty"`
+	AllowedConnections     uint32                 `protobuf:"varint,2,opt,name=allowed_connections,json=allowedConnections,proto3" json:"allowed_connections,omitempty"`
+	DeniedConnections      uint32                 `protobuf:"varint,3,opt,name=denied_connections,json=deniedConnections,proto3" json:"denied_connections,omitempty"`
+	UniqueHostnames        uint32                 `protobuf:"varint,4,opt,name=unique_hostnames,json=uniqueHostnames,proto3" json:"unique_hostnames,omitempty"`
+	WouldDenyConnections   uint32                 `protobuf:"varint,5,opt,name=would_deny_connections,json=wouldDenyConnections,proto3" json:"would_deny_connections,omitempty"`
+	AutoAllowedConnections uint32                 `protobuf:"varint,6,opt,name=auto_allowed_connections,json=autoAllowedConnections,proto3" json:"auto_allowed_connections,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *CargoWallActionJobSummary) Reset() {
@@ -140,6 +141,13 @@ func (x *CargoWallActionJobSummary) GetUniqueHostnames() uint32 {
 func (x *CargoWallActionJobSummary) GetWouldDenyConnections() uint32 {
 	if x != nil {
 		return x.WouldDenyConnections
+	}
+	return 0
+}
+
+func (x *CargoWallActionJobSummary) GetAutoAllowedConnections() uint32 {
+	if x != nil {
+		return x.AutoAllowedConnections
 	}
 	return 0
 }
@@ -237,18 +245,19 @@ func (x *CargoWallActionStep) GetEvents() []*CargoWallActionEvent {
 }
 
 type CargoWallActionEvent struct {
-	state         protoimpl.MessageState      `protogen:"open.v1"`
-	Timestamp     *timestamppb.Timestamp      `protobuf:"bytes,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	Action        data.CargoWallActionType    `protobuf:"varint,2,opt,name=action,proto3,enum=grpc.cargowall.v1.CargoWallActionType" json:"action,omitempty"`
-	Hostname      *string                     `protobuf:"bytes,3,opt,name=hostname,proto3,oneof" json:"hostname,omitempty"`
-	Ip            *string                     `protobuf:"bytes,4,opt,name=ip,proto3,oneof" json:"ip,omitempty"`
-	Port          *uint32                     `protobuf:"varint,5,opt,name=port,proto3,oneof" json:"port,omitempty"`
-	Protocol      *string                     `protobuf:"bytes,6,opt,name=protocol,proto3,oneof" json:"protocol,omitempty"`
-	MatchedRule   *string                     `protobuf:"bytes,7,opt,name=matched_rule,json=matchedRule,proto3,oneof" json:"matched_rule,omitempty"`
-	Process       *string                     `protobuf:"bytes,8,opt,name=process,proto3,oneof" json:"process,omitempty"`
-	Category      data.CargoWallEventCategory `protobuf:"varint,9,opt,name=category,proto3,enum=grpc.cargowall.v1.CargoWallEventCategory" json:"category,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState         `protogen:"open.v1"`
+	Timestamp       *timestamppb.Timestamp         `protobuf:"bytes,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Action          data.CargoWallActionType       `protobuf:"varint,2,opt,name=action,proto3,enum=grpc.cargowall.v1.CargoWallActionType" json:"action,omitempty"`
+	Hostname        *string                        `protobuf:"bytes,3,opt,name=hostname,proto3,oneof" json:"hostname,omitempty"`
+	Ip              *string                        `protobuf:"bytes,4,opt,name=ip,proto3,oneof" json:"ip,omitempty"`
+	Port            *uint32                        `protobuf:"varint,5,opt,name=port,proto3,oneof" json:"port,omitempty"`
+	Protocol        *string                        `protobuf:"bytes,6,opt,name=protocol,proto3,oneof" json:"protocol,omitempty"`
+	MatchedRule     *string                        `protobuf:"bytes,7,opt,name=matched_rule,json=matchedRule,proto3,oneof" json:"matched_rule,omitempty"`
+	Process         *string                        `protobuf:"bytes,8,opt,name=process,proto3,oneof" json:"process,omitempty"`
+	Category        data.CargoWallEventCategory    `protobuf:"varint,9,opt,name=category,proto3,enum=grpc.cargowall.v1.CargoWallEventCategory" json:"category,omitempty"`
+	AutoAllowedType *data.CargoWallAutoAllowedType `protobuf:"varint,10,opt,name=auto_allowed_type,json=autoAllowedType,proto3,enum=grpc.cargowall.v1.CargoWallAutoAllowedType,oneof" json:"auto_allowed_type,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *CargoWallActionEvent) Reset() {
@@ -342,6 +351,13 @@ func (x *CargoWallActionEvent) GetCategory() data.CargoWallEventCategory {
 		return x.Category
 	}
 	return data.CargoWallEventCategory(0)
+}
+
+func (x *CargoWallActionEvent) GetAutoAllowedType() data.CargoWallAutoAllowedType {
+	if x != nil && x.AutoAllowedType != nil {
+		return *x.AutoAllowedType
+	}
+	return data.CargoWallAutoAllowedType(0)
 }
 
 type CreateCargoWallActionJobRequest struct {
@@ -593,17 +609,18 @@ var File_cargo_wall_action_proto protoreflect.FileDescriptor
 
 const file_cargo_wall_action_proto_rawDesc = "" +
 	"\n" +
-	"\x17cargo_wall_action.proto\x12\x11grpc.cargowall.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a&data/cargo_wall_action_type_enum.proto\x1a)data/cargo_wall_event_category_enum.proto\x1a%data/cargo_wall_job_status_enum.proto\x1a\x1fdata/cargo_wall_mode_enum.proto\x1a\x10cargo_wall.proto\"Q\n" +
+	"\x17cargo_wall_action.proto\x12\x11grpc.cargowall.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a&data/cargo_wall_action_type_enum.proto\x1a,data/cargo_wall_auto_allowed_type_enum.proto\x1a)data/cargo_wall_event_category_enum.proto\x1a%data/cargo_wall_job_status_enum.proto\x1a\x1fdata/cargo_wall_mode_enum.proto\x1a\x10cargo_wall.proto\"Q\n" +
 	"%GetCargoWallActionJobRunPolicyRequest\x12\x1c\n" +
 	"\ajob_key\x18\x01 \x01(\tH\x00R\x06jobKey\x88\x01\x01B\n" +
 	"\n" +
-	"\b_job_key\"\x89\x02\n" +
+	"\b_job_key\"\xc3\x02\n" +
 	"\x19CargoWallActionJobSummary\x12+\n" +
 	"\x11total_connections\x18\x01 \x01(\rR\x10totalConnections\x12/\n" +
 	"\x13allowed_connections\x18\x02 \x01(\rR\x12allowedConnections\x12-\n" +
 	"\x12denied_connections\x18\x03 \x01(\rR\x11deniedConnections\x12)\n" +
 	"\x10unique_hostnames\x18\x04 \x01(\rR\x0funiqueHostnames\x124\n" +
-	"\x16would_deny_connections\x18\x05 \x01(\rR\x14wouldDenyConnections\"\xf1\x02\n" +
+	"\x16would_deny_connections\x18\x05 \x01(\rR\x14wouldDenyConnections\x128\n" +
+	"\x18auto_allowed_connections\x18\x06 \x01(\rR\x16autoAllowedConnections\"\xf1\x02\n" +
 	"\x13CargoWallActionStep\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x129\n" +
 	"\n" +
@@ -615,7 +632,7 @@ const file_cargo_wall_action_proto_rawDesc = "" +
 	"\fcompleted_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampH\x01R\vcompletedAt\x88\x01\x01\x12?\n" +
 	"\x06events\x18d \x03(\v2'.grpc.cargowall.v1.CargoWallActionEventR\x06eventsB\r\n" +
 	"\v_started_atB\x0f\n" +
-	"\r_completed_at\"\xd5\x03\n" +
+	"\r_completed_at\"\xc9\x04\n" +
 	"\x14CargoWallActionEvent\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12>\n" +
 	"\x06action\x18\x02 \x01(\x0e2&.grpc.cargowall.v1.CargoWallActionTypeR\x06action\x12\x1f\n" +
@@ -625,14 +642,17 @@ const file_cargo_wall_action_proto_rawDesc = "" +
 	"\bprotocol\x18\x06 \x01(\tH\x03R\bprotocol\x88\x01\x01\x12&\n" +
 	"\fmatched_rule\x18\a \x01(\tH\x04R\vmatchedRule\x88\x01\x01\x12\x1d\n" +
 	"\aprocess\x18\b \x01(\tH\x05R\aprocess\x88\x01\x01\x12E\n" +
-	"\bcategory\x18\t \x01(\x0e2).grpc.cargowall.v1.CargoWallEventCategoryR\bcategoryB\v\n" +
+	"\bcategory\x18\t \x01(\x0e2).grpc.cargowall.v1.CargoWallEventCategoryR\bcategory\x12\\\n" +
+	"\x11auto_allowed_type\x18\n" +
+	" \x01(\x0e2+.grpc.cargowall.v1.CargoWallAutoAllowedTypeH\x06R\x0fautoAllowedType\x88\x01\x01B\v\n" +
 	"\t_hostnameB\x05\n" +
 	"\x03_ipB\a\n" +
 	"\x05_portB\v\n" +
 	"\t_protocolB\x0f\n" +
 	"\r_matched_ruleB\n" +
 	"\n" +
-	"\b_process\"\x9f\x04\n" +
+	"\b_processB\x14\n" +
+	"\x12_auto_allowed_type\"\x9f\x04\n" +
 	"\x1fCreateCargoWallActionJobRequest\x12\x19\n" +
 	"\bjob_name\x18\x01 \x01(\tR\ajobName\x12\x17\n" +
 	"\ajob_key\x18\x02 \x01(\tR\x06jobKey\x124\n" +
@@ -685,9 +705,10 @@ var file_cargo_wall_action_proto_goTypes = []any{
 	(*timestamppb.Timestamp)(nil),                 // 7: google.protobuf.Timestamp
 	(data.CargoWallActionType)(0),                 // 8: grpc.cargowall.v1.CargoWallActionType
 	(data.CargoWallEventCategory)(0),              // 9: grpc.cargowall.v1.CargoWallEventCategory
-	(data.CargoWallMode)(0),                       // 10: grpc.cargowall.v1.CargoWallMode
-	(data.CargoWallJobStatus)(0),                  // 11: grpc.cargowall.v1.CargoWallJobStatus
-	(*CargoWallPolicy)(nil),                       // 12: grpc.cargowall.v1.CargoWallPolicy
+	(data.CargoWallAutoAllowedType)(0),            // 10: grpc.cargowall.v1.CargoWallAutoAllowedType
+	(data.CargoWallMode)(0),                       // 11: grpc.cargowall.v1.CargoWallMode
+	(data.CargoWallJobStatus)(0),                  // 12: grpc.cargowall.v1.CargoWallJobStatus
+	(*CargoWallPolicy)(nil),                       // 13: grpc.cargowall.v1.CargoWallPolicy
 }
 var file_cargo_wall_action_proto_depIdxs = []int32{
 	7,  // 0: grpc.cargowall.v1.CargoWallActionStep.created_at:type_name -> google.protobuf.Timestamp
@@ -697,25 +718,26 @@ var file_cargo_wall_action_proto_depIdxs = []int32{
 	7,  // 4: grpc.cargowall.v1.CargoWallActionEvent.timestamp:type_name -> google.protobuf.Timestamp
 	8,  // 5: grpc.cargowall.v1.CargoWallActionEvent.action:type_name -> grpc.cargowall.v1.CargoWallActionType
 	9,  // 6: grpc.cargowall.v1.CargoWallActionEvent.category:type_name -> grpc.cargowall.v1.CargoWallEventCategory
-	10, // 7: grpc.cargowall.v1.CreateCargoWallActionJobRequest.mode:type_name -> grpc.cargowall.v1.CargoWallMode
-	8,  // 8: grpc.cargowall.v1.CreateCargoWallActionJobRequest.default_action:type_name -> grpc.cargowall.v1.CargoWallActionType
-	1,  // 9: grpc.cargowall.v1.CreateCargoWallActionJobRequest.summary:type_name -> grpc.cargowall.v1.CargoWallActionJobSummary
-	7,  // 10: grpc.cargowall.v1.CreateCargoWallActionJobRequest.started_at:type_name -> google.protobuf.Timestamp
-	7,  // 11: grpc.cargowall.v1.CreateCargoWallActionJobRequest.completed_at:type_name -> google.protobuf.Timestamp
-	11, // 12: grpc.cargowall.v1.CreateCargoWallActionJobRequest.status:type_name -> grpc.cargowall.v1.CargoWallJobStatus
-	5,  // 13: grpc.cargowall.v1.CreateCargoWallActionJobRequest.steps:type_name -> grpc.cargowall.v1.CreateCargoWallActionStep
-	7,  // 14: grpc.cargowall.v1.CreateCargoWallActionStep.started_at:type_name -> google.protobuf.Timestamp
-	7,  // 15: grpc.cargowall.v1.CreateCargoWallActionStep.completed_at:type_name -> google.protobuf.Timestamp
-	3,  // 16: grpc.cargowall.v1.CreateCargoWallActionStep.events:type_name -> grpc.cargowall.v1.CargoWallActionEvent
-	4,  // 17: grpc.cargowall.v1.CargoWallActionJobService.CreateCargoWallActionJob:input_type -> grpc.cargowall.v1.CreateCargoWallActionJobRequest
-	0,  // 18: grpc.cargowall.v1.CargoWallActionJobService.GetCargoWallActionJobRunPolicy:input_type -> grpc.cargowall.v1.GetCargoWallActionJobRunPolicyRequest
-	6,  // 19: grpc.cargowall.v1.CargoWallActionJobService.CreateCargoWallActionJob:output_type -> grpc.cargowall.v1.CreateCargoWallActionJobResponse
-	12, // 20: grpc.cargowall.v1.CargoWallActionJobService.GetCargoWallActionJobRunPolicy:output_type -> grpc.cargowall.v1.CargoWallPolicy
-	19, // [19:21] is the sub-list for method output_type
-	17, // [17:19] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	10, // 7: grpc.cargowall.v1.CargoWallActionEvent.auto_allowed_type:type_name -> grpc.cargowall.v1.CargoWallAutoAllowedType
+	11, // 8: grpc.cargowall.v1.CreateCargoWallActionJobRequest.mode:type_name -> grpc.cargowall.v1.CargoWallMode
+	8,  // 9: grpc.cargowall.v1.CreateCargoWallActionJobRequest.default_action:type_name -> grpc.cargowall.v1.CargoWallActionType
+	1,  // 10: grpc.cargowall.v1.CreateCargoWallActionJobRequest.summary:type_name -> grpc.cargowall.v1.CargoWallActionJobSummary
+	7,  // 11: grpc.cargowall.v1.CreateCargoWallActionJobRequest.started_at:type_name -> google.protobuf.Timestamp
+	7,  // 12: grpc.cargowall.v1.CreateCargoWallActionJobRequest.completed_at:type_name -> google.protobuf.Timestamp
+	12, // 13: grpc.cargowall.v1.CreateCargoWallActionJobRequest.status:type_name -> grpc.cargowall.v1.CargoWallJobStatus
+	5,  // 14: grpc.cargowall.v1.CreateCargoWallActionJobRequest.steps:type_name -> grpc.cargowall.v1.CreateCargoWallActionStep
+	7,  // 15: grpc.cargowall.v1.CreateCargoWallActionStep.started_at:type_name -> google.protobuf.Timestamp
+	7,  // 16: grpc.cargowall.v1.CreateCargoWallActionStep.completed_at:type_name -> google.protobuf.Timestamp
+	3,  // 17: grpc.cargowall.v1.CreateCargoWallActionStep.events:type_name -> grpc.cargowall.v1.CargoWallActionEvent
+	4,  // 18: grpc.cargowall.v1.CargoWallActionJobService.CreateCargoWallActionJob:input_type -> grpc.cargowall.v1.CreateCargoWallActionJobRequest
+	0,  // 19: grpc.cargowall.v1.CargoWallActionJobService.GetCargoWallActionJobRunPolicy:input_type -> grpc.cargowall.v1.GetCargoWallActionJobRunPolicyRequest
+	6,  // 20: grpc.cargowall.v1.CargoWallActionJobService.CreateCargoWallActionJob:output_type -> grpc.cargowall.v1.CreateCargoWallActionJobResponse
+	13, // 21: grpc.cargowall.v1.CargoWallActionJobService.GetCargoWallActionJobRunPolicy:output_type -> grpc.cargowall.v1.CargoWallPolicy
+	20, // [20:22] is the sub-list for method output_type
+	18, // [18:20] is the sub-list for method input_type
+	18, // [18:18] is the sub-list for extension type_name
+	18, // [18:18] is the sub-list for extension extendee
+	0,  // [0:18] is the sub-list for field type_name
 }
 
 func init() { file_cargo_wall_action_proto_init() }

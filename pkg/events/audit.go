@@ -37,18 +37,19 @@ const (
 
 // AuditEvent represents a network event for audit logging
 type AuditEvent struct {
-	Timestamp   time.Time      `json:"timestamp"`
-	EventType   AuditEventType `json:"event_type"`
-	SrcIP       string         `json:"src_ip,omitempty"`
-	DstIP       string         `json:"dst_ip,omitempty"`
-	DstHostname string         `json:"dst_hostname,omitempty"`
-	DstPort     uint16         `json:"dst_port,omitempty"`
-	Protocol    string         `json:"protocol,omitempty"`
-	Process     string         `json:"process,omitempty"`
-	PID         uint32         `json:"pid,omitempty"`
-	MatchedRule string         `json:"matched_rule,omitempty"`
-	WouldDeny   bool           `json:"would_deny"` // true in audit mode (would have been denied)
-	Blocked     bool           `json:"blocked"`    // true in enforce mode (actually blocked)
+	Timestamp       time.Time      `json:"timestamp"`
+	EventType       AuditEventType `json:"event_type"`
+	SrcIP           string         `json:"src_ip,omitempty"`
+	DstIP           string         `json:"dst_ip,omitempty"`
+	DstHostname     string         `json:"dst_hostname,omitempty"`
+	DstPort         uint16         `json:"dst_port,omitempty"`
+	Protocol        string         `json:"protocol,omitempty"`
+	Process         string         `json:"process,omitempty"`
+	PID             uint32         `json:"pid,omitempty"`
+	MatchedRule     string         `json:"matched_rule,omitempty"`
+	AutoAllowedType string         `json:"auto_allowed_type,omitempty"`
+	WouldDeny       bool           `json:"would_deny"` // true in audit mode (would have been denied)
+	Blocked         bool           `json:"blocked"`    // true in enforce mode (actually blocked)
 }
 
 // AuditLogger writes audit events to a JSON file (one event per line)
@@ -121,17 +122,18 @@ func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPor
 }
 
 // LogConnectionAllowed logs an allowed TCP connection event
-func (a *AuditLogger) LogConnectionAllowed(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32) error {
+func (a *AuditLogger) LogConnectionAllowed(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, autoAllowedType string) error {
 	return a.LogEvent(AuditEvent{
-		Timestamp:   time.Now(),
-		EventType:   EventConnectionAllowed,
-		SrcIP:       srcIP,
-		DstIP:       dstIP,
-		DstHostname: hostname,
-		DstPort:     dstPort,
-		Protocol:    "TCP",
-		Process:     process,
-		PID:         pid,
+		Timestamp:       time.Now(),
+		EventType:       EventConnectionAllowed,
+		SrcIP:           srcIP,
+		DstIP:           dstIP,
+		DstHostname:     hostname,
+		DstPort:         dstPort,
+		Protocol:        "TCP",
+		Process:         process,
+		PID:             pid,
+		AutoAllowedType: autoAllowedType,
 	})
 }
 
@@ -159,15 +161,16 @@ func (a *AuditLogger) LogDNSBlocked(domain string) error {
 }
 
 // LogExistingConnection logs a pre-existing connection that was found at startup
-func (a *AuditLogger) LogExistingConnection(ip, hostname, matchedRule string, allowed bool) error {
+func (a *AuditLogger) LogExistingConnection(ip, hostname, matchedRule string, allowed bool, autoAllowedType string) error {
 	return a.LogEvent(AuditEvent{
-		Timestamp:   time.Now(),
-		EventType:   EventExistingConnection,
-		DstIP:       ip,
-		DstHostname: hostname,
-		MatchedRule: matchedRule,
-		Blocked:     !allowed,
-		WouldDeny:   !allowed,
+		Timestamp:       time.Now(),
+		EventType:       EventExistingConnection,
+		DstIP:           ip,
+		DstHostname:     hostname,
+		MatchedRule:     matchedRule,
+		AutoAllowedType: autoAllowedType,
+		Blocked:         !allowed,
+		WouldDeny:       !allowed,
 	})
 }
 

@@ -283,7 +283,7 @@ func deduplicateStepEvents(stepEvents []StepEvents) {
 
 func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents []events.AuditEvent, auditMode bool, workflowRunLink string) {
 	// Count totals
-	var totalBlocked, totalConnectionsAllowed, totalDNSBlocked, totalProtocolBlocked int
+	var totalBlocked, totalConnectionsAllowed, totalDNSBlocked, totalProtocolBlocked, totalAutoAllowed int
 	for _, se := range stepEvents {
 		for _, event := range se.Events {
 			switch event.EventType {
@@ -291,6 +291,9 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 				totalBlocked++
 			case events.EventConnectionAllowed:
 				totalConnectionsAllowed++
+				if event.AutoAllowedType != "" {
+					totalAutoAllowed++
+				}
 			case events.EventProtocolBlocked:
 				totalProtocolBlocked++
 			case events.EventDNSBlocked:
@@ -330,6 +333,9 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 		fmt.Fprintf(c.output, "| DNS queries blocked | %d |\n", totalDNSBlocked)
 	}
 	fmt.Fprintf(c.output, "| Connections allowed | %d |\n", totalConnectionsAllowed)
+	if totalAutoAllowed > 0 {
+		fmt.Fprintf(c.output, "| Auto-allowed connections | %d |\n", totalAutoAllowed)
+	}
 	if len(existingConnEvents) > 0 {
 		fmt.Fprintf(c.output, "| Pre-existing connections | %d |\n", len(existingConnEvents))
 	}
@@ -365,10 +371,11 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 			process   string
 		}
 		type summaryEntry struct {
-			dest      string
-			typeLabel string
-			blocked   bool
-			process   string
+			dest        string
+			typeLabel   string
+			blocked     bool
+			autoAllowed bool
+			process     string
 		}
 
 		entries := make(map[entryKey]*summaryEntry)
@@ -378,10 +385,11 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 			key := entryKey{dest: dest, eventType: event.EventType, process: event.Process}
 			if _, ok := entries[key]; !ok {
 				e := &summaryEntry{
-					dest:      dest,
-					typeLabel: c.eventTypeLabel(event.EventType),
-					blocked:   event.EventType != events.EventConnectionAllowed,
-					process:   event.Process,
+					dest:        dest,
+					typeLabel:   c.eventTypeLabel(event.EventType),
+					blocked:     event.EventType != events.EventConnectionAllowed,
+					autoAllowed: event.AutoAllowedType != "",
+					process:     event.Process,
 				}
 				entries[key] = e
 				sorted = append(sorted, e)
@@ -407,6 +415,8 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 					} else {
 						status = ":x: Blocked"
 					}
+				} else if e.autoAllowed {
+					status = ":white_check_mark: Allowed (auto)"
 				} else {
 					status = ":white_check_mark: Allowed"
 				}
@@ -430,12 +440,15 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 }
 
 func computeSummary(allEvents []events.AuditEvent, mode data.CargoWallMode) *cargowallv1.CargoWallActionJobSummary {
-	var allowed, blocked uint32
+	var allowed, blocked, autoAllowed uint32
 	hostnames := make(map[string]struct{})
 	for _, e := range allEvents {
 		switch e.EventType {
 		case events.EventConnectionAllowed:
 			allowed++
+			if e.AutoAllowedType != "" {
+				autoAllowed++
+			}
 		case events.EventConnectionBlocked, events.EventDNSBlocked, events.EventProtocolBlocked:
 			blocked++
 		}
@@ -452,11 +465,12 @@ func computeSummary(allEvents []events.AuditEvent, mode data.CargoWallMode) *car
 	}
 
 	return &cargowallv1.CargoWallActionJobSummary{
-		TotalConnections:     allowed + blocked,
-		AllowedConnections:   allowed,
-		DeniedConnections:    denied,
-		WouldDenyConnections: wouldDeny,
-		UniqueHostnames:      uint32(len(hostnames)),
+		TotalConnections:       allowed + blocked,
+		AllowedConnections:     allowed,
+		DeniedConnections:      denied,
+		WouldDenyConnections:   wouldDeny,
+		UniqueHostnames:        uint32(len(hostnames)),
+		AutoAllowedConnections: autoAllowed,
 	}
 }
 
@@ -641,7 +655,24 @@ func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {
 	if e.Process != "" {
 		event.Process = &e.Process
 	}
+	if e.AutoAllowedType != "" {
+		autoType := mapAutoAllowedType(e.AutoAllowedType)
+		event.AutoAllowedType = &autoType
+	}
 	return event
+}
+
+func mapAutoAllowedType(s string) data.CargoWallAutoAllowedType {
+	switch s {
+	case "dns":
+		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_DNS
+	case "azure_infrastructure":
+		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE
+	case "github_service":
+		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE
+	default:
+		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_UNSPECIFIED
+	}
 }
 
 func (c *SummaryCmd) eventDestination(event events.AuditEvent) string {

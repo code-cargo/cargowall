@@ -3,6 +3,7 @@ syntax = "proto3";
 import "google/api/annotations.proto";
 import "google/protobuf/timestamp.proto";
 import "data/cargo_wall_action_type_enum.proto";
+import "data/cargo_wall_auto_allowed_type_enum.proto";
 import "data/cargo_wall_event_category_enum.proto";
 import "data/cargo_wall_job_status_enum.proto";
 import "data/cargo_wall_mode_enum.proto";
@@ -40,6 +41,7 @@ message CargoWallActionJobSummary {
   uint32 denied_connections = 3;
   uint32 unique_hostnames = 4;
   uint32 would_deny_connections = 5;
+  uint32 auto_allowed_connections = 6;
 }
 
 message CargoWallActionStep {
@@ -63,6 +65,7 @@ message CargoWallActionEvent {
   optional string matched_rule = 7;
   optional string process = 8;
   CargoWallEventCategory category = 9;
+  optional CargoWallAutoAllowedType auto_allowed_type = 10;
 }
 
 message CreateCargoWallActionJobRequest {

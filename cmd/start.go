@@ -196,7 +196,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			// allowed through DNS filtering for the policy fetch to succeed.
 			if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
 				configMgr.LoadConfigFromRules(nil, config.ActionDeny)
-				configMgr.EnsureHostnameAllowed(u.Hostname())
+				configMgr.EnsureHostnameAllowed(u.Hostname(), []uint16{443}, config.AutoAddedTypeGitHubService)
 			}
 
 			logger.Info("Fetching policy from CodeCargo API", "api_url", cmd.ApiUrl, "job_key", cmd.JobKey)
@@ -429,11 +429,30 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			// Azure VMs and GitHub-hosted runners and must not be blocked.
 			configMgr.EnsureInfraAllowed([]string{"169.254.169.254"}, []uint16{80})
 
-			// Auto-allow GitHub Actions infrastructure. The runner communicates
-			// with *.actions.githubusercontent.com for job control, log upload,
-			// and token refresh. Subdomain matching covers pipelines., vstoken.,
-			// results-receiver., etc.
-			configMgr.EnsureHostnameAllowed("actions.githubusercontent.com")
+			// Auto-allow GitHub service hostnames on port 443.
+			// Defaults cover core GitHub domains; overridable via
+			// CARGOWALL_GITHUB_SERVICE_HOSTS env var (comma-separated).
+			githubHosts := []string{
+				"github.com", "api.github.com", "githubapp.com",
+				"actions.githubusercontent.com", "github.githubassets.com",
+			}
+			if env := os.Getenv("CARGOWALL_GITHUB_SERVICE_HOSTS"); env != "" {
+				githubHosts = splitAndTrimCSV(env)
+			}
+			for _, h := range githubHosts {
+				configMgr.EnsureHostnameAllowed(h, []uint16{443}, config.AutoAddedTypeGitHubService)
+			}
+
+			// Auto-allow Azure infrastructure hostnames on port 443.
+			// Defaults cover blob storage and traffic manager; overridable
+			// via CARGOWALL_AZURE_INFRA_HOSTS env var (comma-separated).
+			azureHosts := []string{"trafficmanager.net", "blob.core.windows.net"}
+			if env := os.Getenv("CARGOWALL_AZURE_INFRA_HOSTS"); env != "" {
+				azureHosts = splitAndTrimCSV(env)
+			}
+			for _, h := range azureHosts {
+				configMgr.EnsureHostnameAllowed(h, []uint16{443}, config.AutoAddedTypeAzureInfrastructure)
+			}
 
 			// Auto-discover hostnames from GitHub Actions runtime environment
 			// variables. The runner communicates with specific subdomains like
@@ -449,7 +468,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			} {
 				if val := os.Getenv(envVar); val != "" {
 					if u, err := url.Parse(val); err == nil && u.Hostname() != "" {
-						configMgr.EnsureHostnameAllowed(u.Hostname())
+						configMgr.EnsureHostnameAllowed(u.Hostname(), []uint16{443}, config.AutoAddedTypeGitHubService)
 						logger.Info("Auto-allowed Actions runtime hostname", "env", envVar, "hostname", u.Hostname())
 					}
 				}
@@ -459,7 +478,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			// (which runs while the firewall is active) is not blocked.
 			if cmd.ApiUrl != "" {
 				if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
-					configMgr.EnsureHostnameAllowed(u.Hostname())
+					configMgr.EnsureHostnameAllowed(u.Hostname(), []uint16{443}, config.AutoAddedTypeGitHubService)
 					logger.Info("Auto-allowed CodeCargo API hostname", "hostname", u.Hostname())
 				}
 			}
@@ -567,11 +586,13 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 				trackedHost := configMgr.FindTrackedHostname(hostname)
 				action := configMgr.GetTrackedHostnameAction(hostname)
 
+				autoAllowedType := string(configMgr.GetAutoAllowedTypeForHostname(hostname))
+
 				if trackedHost != "" && action == config.ActionDeny {
 					// Positively matches a denied hostname — do NOT allow
 					logger.Info("Blocked pre-existing connection (denied hostname)", "ip", ipStr, "hostname", hostname, "trackedHost", trackedHost)
 					if auditLogger != nil {
-						auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, false)
+						auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, false, autoAllowedType)
 					}
 				} else {
 					// Either matches an allowed hostname, or unresolvable — allow it
@@ -580,7 +601,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 					} else if wasAdded {
 						logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname)
 						if auditLogger != nil {
-							auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, true)
+							auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, true, autoAllowedType)
 						}
 					}
 				}
@@ -782,6 +803,19 @@ func scanProcTCP(path string, isIPv6 bool, seen map[string]bool) error {
 	}
 
 	return scanner.Err()
+}
+
+// splitAndTrimCSV splits a comma-separated string and trims whitespace from
+// each element, discarding empty entries.
+func splitAndTrimCSV(s string) []string {
+	var result []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }
 
 // parseHexIP converts a little-endian hex-encoded IPv4 address from /proc/net/tcp

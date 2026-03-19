@@ -85,7 +85,7 @@ func TestAuditLogger_AllowedEventDoesNotOverrideFlags(t *testing.T) {
 	require.NoError(t, err)
 	defer logger.Close()
 
-	err = logger.LogConnectionAllowed("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1)
+	err = logger.LogConnectionAllowed("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1, "")
 	require.NoError(t, err)
 
 	events := readAuditEvents(t, path)
@@ -94,6 +94,22 @@ func TestAuditLogger_AllowedEventDoesNotOverrideFlags(t *testing.T) {
 	// Allowed events should NOT have their flags overridden by enforce/audit mode
 	assert.False(t, events[0].Blocked)
 	assert.False(t, events[0].WouldDeny)
+	assert.Empty(t, events[0].AutoAllowedType)
+}
+
+func TestAuditLogger_AllowedEventAutoAllowedType(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := NewAuditLogger(path, false)
+	require.NoError(t, err)
+	defer logger.Close()
+
+	err = logger.LogConnectionAllowed("10.0.0.1", "8.8.8.8", "", 53, "dns", 1, "dns")
+	require.NoError(t, err)
+
+	events := readAuditEvents(t, path)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionAllowed, events[0].EventType)
+	assert.Equal(t, "dns", events[0].AutoAllowedType)
 }
 
 func TestAuditLogger_DNSBlocked(t *testing.T) {
@@ -118,12 +134,12 @@ func TestAuditLogger_ExistingConnection(t *testing.T) {
 	require.NoError(t, err)
 	defer logger.Close()
 
-	// Allowed existing connection
-	err = logger.LogExistingConnection("1.2.3.4", "example.com", "hostname:example.com", true)
+	// Allowed existing connection with auto-allowed type
+	err = logger.LogExistingConnection("1.2.3.4", "example.com", "hostname:example.com", true, "github_service")
 	require.NoError(t, err)
 
-	// Blocked existing connection
-	err = logger.LogExistingConnection("5.6.7.8", "bad.com", "hostname:bad.com", false)
+	// Blocked existing connection (no auto-allowed type)
+	err = logger.LogExistingConnection("5.6.7.8", "bad.com", "hostname:bad.com", false, "")
 	require.NoError(t, err)
 
 	events := readAuditEvents(t, path)
@@ -132,10 +148,12 @@ func TestAuditLogger_ExistingConnection(t *testing.T) {
 	assert.Equal(t, EventExistingConnection, events[0].EventType)
 	assert.False(t, events[0].Blocked)
 	assert.False(t, events[0].WouldDeny)
+	assert.Equal(t, "github_service", events[0].AutoAllowedType)
 
 	assert.Equal(t, EventExistingConnection, events[1].EventType)
 	assert.True(t, events[1].Blocked)
 	assert.True(t, events[1].WouldDeny)
+	assert.Empty(t, events[1].AutoAllowedType)
 }
 
 func TestAuditLogger_ProtocolBlocked(t *testing.T) {

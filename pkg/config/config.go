@@ -39,6 +39,16 @@ const (
 	ActionDeny  Action = "deny"
 )
 
+// AutoAddedType indicates why a rule was auto-added by CargoWall infrastructure.
+type AutoAddedType string
+
+const (
+	AutoAddedTypeNone                AutoAddedType = ""
+	AutoAddedTypeDNS                 AutoAddedType = "dns"
+	AutoAddedTypeAzureInfrastructure AutoAddedType = "azure_infrastructure"
+	AutoAddedTypeGitHubService       AutoAddedType = "github_service"
+)
+
 // RuleType represents the type of a firewall rule.
 type RuleType string
 
@@ -64,16 +74,19 @@ type Rule struct {
 	Ports []uint16 `json:"ports,omitempty"`
 	// Action is "allow" or "deny"
 	Action Action `json:"action"`
+	// AutoAddedType indicates why this rule was auto-added (empty for user-configured rules)
+	AutoAddedType AutoAddedType `json:"autoAddedType,omitempty"`
 }
 
 // ResolvedRule represents a Rule with resolved IP addresses or CIDR blocks
 type ResolvedRule struct {
-	Type   RuleType   // "hostname" or "cidr"
-	Value  string     // Original value (hostname or CIDR string)
-	IPs    []net.IP   // For hostnames: resolved IPs. For CIDR: empty
-	IPNet  *net.IPNet // For CIDR blocks only
-	Ports  []uint16
-	Action Action
+	Type          RuleType   // "hostname" or "cidr"
+	Value         string     // Original value (hostname or CIDR string)
+	IPs           []net.IP   // For hostnames: resolved IPs. For CIDR: empty
+	IPNet         *net.IPNet // For CIDR blocks only
+	Ports         []uint16
+	Action        Action
+	AutoAddedType AutoAddedType // Why this rule was auto-added (empty for user-configured rules)
 }
 
 // Manager manages the firewall configuration and hostname resolution
@@ -637,19 +650,19 @@ func (cm *Manager) ForwardMatchIP(ip string) string {
 // EnsureDNSAllowed adds CIDR allow rules on port 53 for the given IPs
 // so DNS infrastructure traffic is never blocked by the firewall.
 func (cm *Manager) EnsureDNSAllowed(ips []string) {
-	cm.ensureAllowed(ips, []uint16{53})
+	cm.ensureAllowed(ips, []uint16{53}, AutoAddedTypeDNS)
 }
 
 // EnsureInfraAllowed adds CIDR allow rules for the given IPs on the specified
 // ports, so infrastructure traffic (e.g. Azure wireserver/IMDS) is allowed
 // only on the ports it actually needs.
 func (cm *Manager) EnsureInfraAllowed(ips []string, ports []uint16) {
-	cm.ensureAllowed(ips, ports)
+	cm.ensureAllowed(ips, ports, AutoAddedTypeAzureInfrastructure)
 }
 
 // ensureAllowed adds CIDR allow rules for the given IPs with the specified ports.
 // If ports is nil, traffic on all ports is allowed.
-func (cm *Manager) ensureAllowed(ips []string, ports []uint16) {
+func (cm *Manager) ensureAllowed(ips []string, ports []uint16, autoAddedType AutoAddedType) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -693,23 +706,25 @@ func (cm *Manager) ensureAllowed(ips []string, ports []uint16) {
 
 		cidr := ip + "/32"
 		cm.config.Rules = append(cm.config.Rules, Rule{
-			Type:   RuleTypeCIDR,
-			Value:  cidr,
-			Ports:  ports,
-			Action: ActionAllow,
+			Type:          RuleTypeCIDR,
+			Value:         cidr,
+			Ports:         ports,
+			Action:        ActionAllow,
+			AutoAddedType: autoAddedType,
 		})
 		cm.resolvedRules = append(cm.resolvedRules, ResolvedRule{
-			Type:   RuleTypeCIDR,
-			Value:  cidr,
-			Ports:  ports,
-			Action: ActionAllow,
+			Type:          RuleTypeCIDR,
+			Value:         cidr,
+			Ports:         ports,
+			Action:        ActionAllow,
+			AutoAddedType: autoAddedType,
 			IPNet: &net.IPNet{
 				IP:   ip4,
 				Mask: net.CIDRMask(32, 32),
 			},
 		})
 
-		slog.Info("Auto-added allow rule", "cidr", cidr, "ports", ports)
+		slog.Info("Auto-added allow rule", "cidr", cidr, "ports", ports, "autoAddedType", autoAddedType)
 	}
 }
 
@@ -785,7 +800,7 @@ func (cm *Manager) hasCIDRRule(ipStr string, port uint16) bool {
 // EnsureHostnameAllowed adds an allow rule for a hostname so that it (and
 // its subdomains) are permitted through the firewall. This is used in
 // GitHub Actions mode to auto-allow infrastructure like the Actions service.
-func (cm *Manager) EnsureHostnameAllowed(hostname string) {
+func (cm *Manager) EnsureHostnameAllowed(hostname string, ports []uint16, autoAddedType AutoAddedType) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -799,21 +814,43 @@ func (cm *Manager) EnsureHostnameAllowed(hostname string) {
 	}
 
 	rule := Rule{
-		Type:   RuleTypeHostname,
-		Value:  hostname,
-		Action: ActionAllow,
+		Type:          RuleTypeHostname,
+		Value:         hostname,
+		Ports:         ports,
+		Action:        ActionAllow,
+		AutoAddedType: autoAddedType,
 	}
 	cm.config.Rules = append(cm.config.Rules, rule)
 	cm.trackedHostnames[hostname] = ActionAllow
 	cm.hostnameCache[hostname] = []net.IP{}
 	cm.resolvedRules = append(cm.resolvedRules, ResolvedRule{
-		Type:   RuleTypeHostname,
-		Value:  hostname,
-		IPs:    []net.IP{},
-		Action: ActionAllow,
+		Type:          RuleTypeHostname,
+		Value:         hostname,
+		Ports:         ports,
+		IPs:           []net.IP{},
+		Action:        ActionAllow,
+		AutoAddedType: autoAddedType,
 	})
 
-	slog.Info("Auto-added infrastructure hostname allow rule", "hostname", hostname)
+	slog.Info("Auto-added infrastructure hostname allow rule", "hostname", hostname, "ports", ports, "autoAddedType", autoAddedType)
+}
+
+// GetAutoAllowedTypeForHostname checks if a hostname matches a hostname-based
+// auto-added rule, ignoring port restrictions. This is used for tagging existing
+// connections from /proc/net/tcp where port info is lost after deduplication.
+func (cm *Manager) GetAutoAllowedTypeForHostname(hostname string) AutoAddedType {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	for _, rule := range cm.resolvedRules {
+		if rule.Type != RuleTypeHostname || rule.AutoAddedType == AutoAddedTypeNone || rule.Action != ActionAllow {
+			continue
+		}
+		if hostname == rule.Value || strings.HasSuffix(hostname, "."+rule.Value) {
+			return rule.AutoAddedType
+		}
+	}
+	return AutoAddedTypeNone
 }
 
 // GetIPToHostnameMap returns a copy of the IP to hostname mapping
@@ -828,6 +865,48 @@ func (cm *Manager) GetIPToHostnameMap() map[string]string {
 		result[ip] = hostname
 	}
 	return result
+}
+
+// GetAutoAllowedType checks if a connection (ip, port, hostname) matches an
+// auto-added rule and returns the AutoAddedType. Hostname rules are checked
+// first, then CIDR rules. Returns AutoAddedTypeNone if no auto-added rule matches.
+func (cm *Manager) GetAutoAllowedType(ip string, port uint16, hostname string) AutoAddedType {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	parsedIP := net.ParseIP(ip)
+
+	for _, rule := range cm.resolvedRules {
+		if rule.AutoAddedType == AutoAddedTypeNone || rule.Action != ActionAllow {
+			continue
+		}
+
+		// Check port restriction
+		if len(rule.Ports) > 0 {
+			portMatch := false
+			for _, p := range rule.Ports {
+				if p == port {
+					portMatch = true
+					break
+				}
+			}
+			if !portMatch {
+				continue
+			}
+		}
+
+		switch rule.Type {
+		case RuleTypeHostname:
+			if hostname == rule.Value || strings.HasSuffix(hostname, "."+rule.Value) {
+				return rule.AutoAddedType
+			}
+		case RuleTypeCIDR:
+			if parsedIP != nil && rule.IPNet != nil && rule.IPNet.Contains(parsedIP) {
+				return rule.AutoAddedType
+			}
+		}
+	}
+	return AutoAddedTypeNone
 }
 
 // resolveRules resolves all hostname rules to IP addresses
@@ -845,10 +924,11 @@ func (cm *Manager) resolveRules() error {
 
 	for _, rule := range cm.config.Rules {
 		resolved := ResolvedRule{
-			Type:   rule.Type,
-			Value:  rule.Value,
-			Ports:  rule.Ports,
-			Action: rule.Action,
+			Type:          rule.Type,
+			Value:         rule.Value,
+			Ports:         rule.Ports,
+			Action:        rule.Action,
+			AutoAddedType: rule.AutoAddedType,
 		}
 
 		switch rule.Type {

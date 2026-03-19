@@ -111,6 +111,16 @@ func (c *StartCmd) Run(globals *Globals) error {
 		logger, shutdown, err := c.Hooks.InitLogger(initCtx, c.Version, globals.Debug)
 		if err != nil {
 			slog.Warn("failed to initialize logger via hook", "error", err)
+			// Fall back to a simple JSON logger so c.Logger is never nil
+			level := slog.LevelInfo
+			if globals.Debug {
+				level = slog.LevelDebug
+			}
+			fallback := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+				Level: level,
+			}))
+			slog.SetDefault(fallback)
+			c.Logger = fallback
 		} else {
 			slog.SetDefault(logger)
 			c.Logger = logger

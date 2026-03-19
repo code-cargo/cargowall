@@ -50,6 +50,8 @@ type SummaryCmd struct {
 	Mode          string `help:"CargoWall mode (enforce/audit)"`
 	DefaultAction string `help:"Default action type (allow/deny)" name:"default-action"`
 	JobStatus     string `help:"GitHub Actions job status (success/failure/canceled/cancelled/timed_out)" name:"job-status"`
+
+	output io.Writer // overridable for testing; defaults to os.Stdout
 }
 
 // GitHubStep represents a step from the GitHub API
@@ -67,6 +69,10 @@ type StepEvents struct {
 }
 
 func (c *SummaryCmd) Run() error {
+	if c.output == nil {
+		c.output = os.Stdout
+	}
+
 	// Parse steps JSON
 	var steps []GitHubStep
 	if err := json.Unmarshal([]byte(c.Steps), &steps); err != nil {
@@ -90,13 +96,13 @@ func (c *SummaryCmd) Run() error {
 			}
 		}
 
+		fmt.Fprintln(c.output, "## CargoWall")
+		fmt.Fprintln(c.output)
 		if workflowRunLink != "" {
-			fmt.Printf("## CargoWall Network Audit ([view on CodeCargo](%s))\n", workflowRunLink)
+			fmt.Fprintf(c.output, "[View full details on CodeCargo](%s)\n", workflowRunLink)
 		} else {
-			fmt.Println("## CargoWall Network Audit")
+			fmt.Fprintln(c.output, "No network events were logged during this workflow run.")
 		}
-		fmt.Println()
-		fmt.Println("No network events were logged during this workflow run.")
 		return nil
 	}
 
@@ -294,38 +300,40 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 	}
 
 	// Print header
-	linkSuffix := ""
-	if workflowRunLink != "" {
-		linkSuffix = fmt.Sprintf(" ([view on CodeCargo](%s))", workflowRunLink)
-	}
 	if auditMode {
-		fmt.Printf("## CargoWall Network Audit (Audit Mode - No Blocking)%s\n", linkSuffix)
-		fmt.Println()
-		fmt.Println("> Running in audit mode. Connections shown below were **logged but NOT blocked**.")
-		fmt.Println("> Switch to `mode: enforce` to block these connections.")
+		fmt.Fprintln(c.output, "## CargoWall (Audit Mode - No Blocking)")
+		fmt.Fprintln(c.output)
+		fmt.Fprintln(c.output, "> Running in audit mode. Connections shown below were **logged but NOT blocked**.")
+		fmt.Fprintln(c.output, "> Switch to `mode: enforce` to block these connections.")
 	} else {
-		fmt.Printf("## CargoWall Network Audit (Enforce Mode)%s\n", linkSuffix)
+		fmt.Fprintln(c.output, "## CargoWall (Enforce Mode)")
 	}
-	fmt.Println()
+	fmt.Fprintln(c.output)
 
 	// Print summary table
-	fmt.Println("### Summary")
-	fmt.Println("| Metric | Count |")
-	fmt.Println("|--------|-------|")
+	fmt.Fprintln(c.output, "### Summary")
+	fmt.Fprintln(c.output, "| Metric | Count |")
+	fmt.Fprintln(c.output, "|--------|-------|")
 	if auditMode {
-		fmt.Printf("| Connections that would be denied | %d |\n", totalBlocked)
-		fmt.Printf("| Protocols that would be denied | %d |\n", totalProtocolBlocked)
-		fmt.Printf("| DNS queries that would be denied | %d |\n", totalDNSBlocked)
+		fmt.Fprintf(c.output, "| Connections that would be denied | %d |\n", totalBlocked)
+		fmt.Fprintf(c.output, "| Protocols that would be denied | %d |\n", totalProtocolBlocked)
+		fmt.Fprintf(c.output, "| DNS queries that would be denied | %d |\n", totalDNSBlocked)
 	} else {
-		fmt.Printf("| Connections blocked | %d |\n", totalBlocked)
-		fmt.Printf("| Protocols blocked | %d |\n", totalProtocolBlocked)
-		fmt.Printf("| DNS queries blocked | %d |\n", totalDNSBlocked)
+		fmt.Fprintf(c.output, "| Connections blocked | %d |\n", totalBlocked)
+		fmt.Fprintf(c.output, "| Protocols blocked | %d |\n", totalProtocolBlocked)
+		fmt.Fprintf(c.output, "| DNS queries blocked | %d |\n", totalDNSBlocked)
 	}
-	fmt.Printf("| Connections allowed | %d |\n", totalConnectionsAllowed)
+	fmt.Fprintf(c.output, "| Connections allowed | %d |\n", totalConnectionsAllowed)
 	if len(existingConnEvents) > 0 {
-		fmt.Printf("| Pre-existing connections | %d |\n", len(existingConnEvents))
+		fmt.Fprintf(c.output, "| Pre-existing connections | %d |\n", len(existingConnEvents))
 	}
-	fmt.Println()
+	fmt.Fprintln(c.output)
+
+	// When a SaaS link is available, condense output: skip detailed sections
+	if workflowRunLink != "" {
+		fmt.Fprintf(c.output, "[View full details on CodeCargo](%s)\n", workflowRunLink)
+		return
+	}
 
 	// Print pre-existing connections section if any
 	if len(existingConnEvents) > 0 {
@@ -333,8 +341,8 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 	}
 
 	// Print events by step (only steps with events for the markdown summary)
-	fmt.Println("### Events by Step")
-	fmt.Println()
+	fmt.Fprintln(c.output, "### Events by Step")
+	fmt.Fprintln(c.output)
 
 	for _, se := range stepEvents {
 		if len(se.Events) == 0 {
@@ -347,8 +355,8 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 				se.Step.StartedAt.Format("15:04:05"),
 				se.Step.CompletedAt.Format("15:04:05"))
 		}
-		fmt.Printf("#### Step: \"%s\"%s\n", se.Step.Name, timeRange)
-		fmt.Println()
+		fmt.Fprintf(c.output, "#### Step: \"%s\"%s\n", se.Step.Name, timeRange)
+		fmt.Fprintln(c.output)
 
 		// Build unique entries keyed by (destination, event_type, process)
 		type entryKey struct {
@@ -389,8 +397,8 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 		})
 
 		if len(sorted) > 0 {
-			fmt.Println("| Destination | Type | Status | Process |")
-			fmt.Println("|-------------|------|--------|---------|")
+			fmt.Fprintln(c.output, "| Destination | Type | Status | Process |")
+			fmt.Fprintln(c.output, "|-------------|------|--------|---------|")
 			for _, e := range sorted {
 				var status string
 				if e.blocked {
@@ -406,12 +414,12 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 				if process == "" {
 					process = "-"
 				}
-				fmt.Printf("| %s | %s | %s | %s |\n", e.dest, e.typeLabel, status, process)
+				fmt.Fprintf(c.output, "| %s | %s | %s | %s |\n", e.dest, e.typeLabel, status, process)
 			}
-			fmt.Println()
+			fmt.Fprintln(c.output)
 		} else {
-			fmt.Println("No network events recorded")
-			fmt.Println()
+			fmt.Fprintln(c.output, "No network events recorded")
+			fmt.Fprintln(c.output)
 		}
 	}
 
@@ -702,43 +710,43 @@ func (c *SummaryCmd) generateAllowlistSuggestions(stepEvents []StepEvents) {
 		return sorted[i].count > sorted[j].count
 	})
 
-	fmt.Println("### Recommended Allowlist Additions")
-	fmt.Println("Based on this audit, consider adding these hosts if they are legitimate:")
-	fmt.Println()
+	fmt.Fprintln(c.output, "### Recommended Allowlist Additions")
+	fmt.Fprintln(c.output, "Based on this audit, consider adding these hosts if they are legitimate:")
+	fmt.Fprintln(c.output)
 	for _, dc := range sorted {
 		attempts := "attempt"
 		if dc.count > 1 {
 			attempts = "attempts"
 		}
-		fmt.Printf("- `%s` (%d connection %s)\n", dc.dest, dc.count, attempts)
+		fmt.Fprintf(c.output, "- `%s` (%d connection %s)\n", dc.dest, dc.count, attempts)
 	}
-	fmt.Println()
-	fmt.Println("Add these to your workflow with:")
-	fmt.Println("```yaml")
-	fmt.Println("- uses: code-cargo/cargowall-action@latest")
-	fmt.Println("  with:")
-	fmt.Println("    allowed-hosts: |")
+	fmt.Fprintln(c.output)
+	fmt.Fprintln(c.output, "Add these to your workflow with:")
+	fmt.Fprintln(c.output, "```yaml")
+	fmt.Fprintln(c.output, "- uses: code-cargo/cargowall-action@latest")
+	fmt.Fprintln(c.output, "  with:")
+	fmt.Fprintln(c.output, "    allowed-hosts: |")
 	for i, dc := range sorted {
 		if i >= 5 {
-			fmt.Println("      # ... and more")
+			fmt.Fprintln(c.output, "      # ... and more")
 			break
 		}
 		// Check if it looks like an IP
 		if strings.Count(dc.dest, ".") == 3 && !strings.Contains(dc.dest, "/") {
 			continue // Skip raw IPs in example
 		}
-		fmt.Printf("      %s\n", dc.dest)
+		fmt.Fprintf(c.output, "      %s\n", dc.dest)
 	}
-	fmt.Println("```")
+	fmt.Fprintln(c.output, "```")
 }
 
 func (c *SummaryCmd) generateExistingConnectionsSection(existingConnEvents []events.AuditEvent) {
-	fmt.Println("### Pre-Existing Connections")
-	fmt.Println()
-	fmt.Println("These connections were already established when CargoWall started:")
-	fmt.Println()
-	fmt.Println("| IP | Hostname | Status |")
-	fmt.Println("|----|----------|--------|")
+	fmt.Fprintln(c.output, "### Pre-Existing Connections")
+	fmt.Fprintln(c.output)
+	fmt.Fprintln(c.output, "These connections were already established when CargoWall started:")
+	fmt.Fprintln(c.output)
+	fmt.Fprintln(c.output, "| IP | Hostname | Status |")
+	fmt.Fprintln(c.output, "|----|----------|--------|")
 
 	// Sort: connections matching rules first, then by hostname
 	sort.Slice(existingConnEvents, func(i, j int) bool {
@@ -767,7 +775,7 @@ func (c *SummaryCmd) generateExistingConnectionsSection(existingConnEvents []eve
 			status = ":white_check_mark: Allowed"
 		}
 
-		fmt.Printf("| %s | %s | %s |\n", ip, hostname, status)
+		fmt.Fprintf(c.output, "| %s | %s | %s |\n", ip, hostname, status)
 	}
-	fmt.Println()
+	fmt.Fprintln(c.output)
 }

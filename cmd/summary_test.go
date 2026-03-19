@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -478,4 +479,89 @@ func TestSummary_EventTypeLabel(t *testing.T) {
 			assert.Equal(t, tt.want, cmd.eventTypeLabel(tt.eventType))
 		})
 	}
+}
+
+// --- generateSummary condensed/full output ---
+
+func buildTestStepEvents(t *testing.T) ([]StepEvents, []events.AuditEvent) {
+	t.Helper()
+	ts := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	blocked := makeEvent(t, events.EventConnectionBlocked, "evil.com", "6.6.6.6", "curl", 443, ts)
+	blocked.WouldDeny = true
+	allowed := makeEvent(t, events.EventConnectionAllowed, "good.com", "1.1.1.1", "wget", 80, ts.Add(time.Second))
+	stepEvents := []StepEvents{
+		{
+			Step:   GitHubStep{Name: "build", Number: 1, StartedAt: ts, CompletedAt: ts.Add(10 * time.Second)},
+			Events: []events.AuditEvent{blocked, allowed},
+		},
+	}
+	existing := []events.AuditEvent{
+		{EventType: events.EventExistingConnection, DstIP: "10.0.0.1", DstHostname: "internal.svc"},
+	}
+	return stepEvents, existing
+}
+
+func TestSummary_GenerateSummary_CondensedWithLink(t *testing.T) {
+	stepEvents, existing := buildTestStepEvents(t)
+	var buf bytes.Buffer
+	cmd := &SummaryCmd{output: &buf}
+
+	cmd.generateSummary(stepEvents, existing, false, "https://app.codecargo.io/run/123")
+
+	out := buf.String()
+	// Header present without parenthetical link
+	assert.Contains(t, out, "## CargoWall (Enforce Mode)")
+	// Summary table present
+	assert.Contains(t, out, "### Summary")
+	assert.Contains(t, out, "| Connections blocked |")
+	// CTA link present
+	assert.Contains(t, out, "[View full details on CodeCargo](https://app.codecargo.io/run/123)")
+	// Detailed sections skipped
+	assert.NotContains(t, out, "### Events by Step")
+	assert.NotContains(t, out, "### Pre-Existing Connections")
+	assert.NotContains(t, out, "### Recommended Allowlist")
+}
+
+func TestSummary_GenerateSummary_FullWithoutLink(t *testing.T) {
+	stepEvents, existing := buildTestStepEvents(t)
+	var buf bytes.Buffer
+	cmd := &SummaryCmd{output: &buf}
+
+	cmd.generateSummary(stepEvents, existing, false, "")
+
+	out := buf.String()
+	// Detailed sections present
+	assert.Contains(t, out, "### Events by Step")
+	assert.Contains(t, out, "### Pre-Existing Connections")
+	// No CTA link
+	assert.NotContains(t, out, "[View full details on CodeCargo]")
+	// No parenthetical link in header
+	assert.NotContains(t, out, "[view on CodeCargo]")
+}
+
+func TestSummary_GenerateSummary_CondensedAuditMode(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	blocked := makeEvent(t, events.EventConnectionBlocked, "evil.com", "6.6.6.6", "curl", 443, ts)
+	blocked.WouldDeny = true
+	stepEvents := []StepEvents{
+		{
+			Step:   GitHubStep{Name: "build", Number: 1, StartedAt: ts, CompletedAt: ts.Add(10 * time.Second)},
+			Events: []events.AuditEvent{blocked},
+		},
+	}
+	var buf bytes.Buffer
+	cmd := &SummaryCmd{output: &buf}
+
+	cmd.generateSummary(stepEvents, nil, true, "https://app.codecargo.io/run/456")
+
+	out := buf.String()
+	// Audit mode header and banner
+	assert.Contains(t, out, "## CargoWall (Audit Mode - No Blocking)")
+	assert.Contains(t, out, "Running in audit mode")
+	// Summary table uses audit wording
+	assert.Contains(t, out, "Connections that would be denied")
+	// CTA link
+	assert.Contains(t, out, "[View full details on CodeCargo](https://app.codecargo.io/run/456)")
+	// No allowlist suggestions (skipped by early return)
+	assert.NotContains(t, out, "### Recommended Allowlist Additions")
 }

@@ -509,14 +509,12 @@ func TestSummary_GenerateSummary_CondensedWithLink(t *testing.T) {
 	cmd.generateSummary(stepEvents, existing, false, "https://app.codecargo.io/run/123")
 
 	out := buf.String()
-	// Header present without parenthetical link
+	// Header present
 	assert.Contains(t, out, "## CargoWall (Enforce Mode)")
-	// Summary table present
-	assert.Contains(t, out, "### Summary")
-	assert.Contains(t, out, "| Connections blocked |")
 	// CTA link present
 	assert.Contains(t, out, "[View full details on CodeCargo](https://app.codecargo.io/run/123)")
-	// Detailed sections skipped
+	// Summary table and detailed sections skipped
+	assert.NotContains(t, out, "### Summary")
 	assert.NotContains(t, out, "### Events by Step")
 	assert.NotContains(t, out, "### Pre-Existing Connections")
 	assert.NotContains(t, out, "### Recommended Allowlist")
@@ -558,10 +556,9 @@ func TestSummary_GenerateSummary_CondensedAuditMode(t *testing.T) {
 	// Audit mode header and banner
 	assert.Contains(t, out, "## CargoWall (Audit Mode - No Blocking)")
 	assert.Contains(t, out, "Running in audit mode")
-	// Summary table uses audit wording
-	assert.Contains(t, out, "Connections that would be denied")
 	// CTA link
 	assert.Contains(t, out, "[View full details on CodeCargo](https://app.codecargo.io/run/456)")
-	// No allowlist suggestions (skipped by early return)
+	// Summary table and detailed sections skipped
+	assert.NotContains(t, out, "### Summary")
 	assert.NotContains(t, out, "### Recommended Allowlist Additions")
 }

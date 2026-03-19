@@ -310,6 +310,12 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 	}
 	fmt.Fprintln(c.output)
 
+	// When a SaaS link is available, condense output: just header + link
+	if workflowRunLink != "" {
+		fmt.Fprintf(c.output, "[View full details on CodeCargo](%s)\n", workflowRunLink)
+		return
+	}
+
 	// Print summary table
 	fmt.Fprintln(c.output, "### Summary")
 	fmt.Fprintln(c.output, "| Metric | Count |")
@@ -328,12 +334,6 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 		fmt.Fprintf(c.output, "| Pre-existing connections | %d |\n", len(existingConnEvents))
 	}
 	fmt.Fprintln(c.output)
-
-	// When a SaaS link is available, condense output: skip detailed sections
-	if workflowRunLink != "" {
-		fmt.Fprintf(c.output, "[View full details on CodeCargo](%s)\n", workflowRunLink)
-		return
-	}
 
 	// Print pre-existing connections section if any
 	if len(existingConnEvents) > 0 {

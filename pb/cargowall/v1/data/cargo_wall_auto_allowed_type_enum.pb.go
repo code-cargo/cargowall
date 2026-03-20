@@ -25,24 +25,27 @@ type CargoWallAutoAllowedType int32
 
 const (
 	CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_UNSPECIFIED          CargoWallAutoAllowedType = 0
-	CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_DNS                  CargoWallAutoAllowedType = 1
-	CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE CargoWallAutoAllowedType = 2
-	CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE       CargoWallAutoAllowedType = 3
+	CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_CODECARGO            CargoWallAutoAllowedType = 1
+	CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_DNS                  CargoWallAutoAllowedType = 2
+	CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE CargoWallAutoAllowedType = 3
+	CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE       CargoWallAutoAllowedType = 4
 )
 
 // Enum value maps for CargoWallAutoAllowedType.
 var (
 	CargoWallAutoAllowedType_name = map[int32]string{
 		0: "CARGO_WALL_AUTO_ALLOWED_TYPE_UNSPECIFIED",
-		1: "CARGO_WALL_AUTO_ALLOWED_TYPE_DNS",
-		2: "CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE",
-		3: "CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE",
+		1: "CARGO_WALL_AUTO_ALLOWED_TYPE_CODECARGO",
+		2: "CARGO_WALL_AUTO_ALLOWED_TYPE_DNS",
+		3: "CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE",
+		4: "CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE",
 	}
 	CargoWallAutoAllowedType_value = map[string]int32{
 		"CARGO_WALL_AUTO_ALLOWED_TYPE_UNSPECIFIED":          0,
-		"CARGO_WALL_AUTO_ALLOWED_TYPE_DNS":                  1,
-		"CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE": 2,
-		"CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE":       3,
+		"CARGO_WALL_AUTO_ALLOWED_TYPE_CODECARGO":            1,
+		"CARGO_WALL_AUTO_ALLOWED_TYPE_DNS":                  2,
+		"CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE": 3,
+		"CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE":       4,
 	}
 )
 
@@ -77,12 +80,13 @@ var File_data_cargo_wall_auto_allowed_type_enum_proto protoreflect.FileDescripto
 
 const file_data_cargo_wall_auto_allowed_type_enum_proto_rawDesc = "" +
 	"\n" +
-	",data/cargo_wall_auto_allowed_type_enum.proto\x12\x11grpc.cargowall.v1*\xd6\x01\n" +
+	",data/cargo_wall_auto_allowed_type_enum.proto\x12\x11grpc.cargowall.v1*\x82\x02\n" +
 	"\x18CargoWallAutoAllowedType\x12,\n" +
-	"(CARGO_WALL_AUTO_ALLOWED_TYPE_UNSPECIFIED\x10\x00\x12$\n" +
-	" CARGO_WALL_AUTO_ALLOWED_TYPE_DNS\x10\x01\x125\n" +
-	"1CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE\x10\x02\x12/\n" +
-	"+CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE\x10\x03BXZ4github.com/code-cargo/cargowall/pb/cargowall/v1/data\xaa\x02\x1fController.Data.Pb.CargoWall.V1b\x06proto3"
+	"(CARGO_WALL_AUTO_ALLOWED_TYPE_UNSPECIFIED\x10\x00\x12*\n" +
+	"&CARGO_WALL_AUTO_ALLOWED_TYPE_CODECARGO\x10\x01\x12$\n" +
+	" CARGO_WALL_AUTO_ALLOWED_TYPE_DNS\x10\x02\x125\n" +
+	"1CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE\x10\x03\x12/\n" +
+	"+CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE\x10\x04BXZ4github.com/code-cargo/cargowall/pb/cargowall/v1/data\xaa\x02\x1fController.Data.Pb.CargoWall.V1b\x06proto3"
 
 var (
 	file_data_cargo_wall_auto_allowed_type_enum_proto_rawDescOnce sync.Once

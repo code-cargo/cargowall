@@ -47,6 +47,7 @@ const (
 	AutoAddedTypeDNS                 AutoAddedType = "dns"
 	AutoAddedTypeAzureInfrastructure AutoAddedType = "azure_infrastructure"
 	AutoAddedTypeGitHubService       AutoAddedType = "github_service"
+	AutoAddedTypeCodeCargoService    AutoAddedType = "codecargo_service"
 )
 
 // RuleType represents the type of a firewall rule.

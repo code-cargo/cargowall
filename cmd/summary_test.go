@@ -390,6 +390,7 @@ func TestSummary_ComputeSummary_EnforceMode(t *testing.T) {
 	assert.Equal(t, uint32(2), summary.DeniedConnections, "enforce mode should count blocked as denied")
 	assert.Equal(t, uint32(0), summary.WouldDenyConnections, "enforce mode should have zero would_deny")
 	assert.Equal(t, uint32(4), summary.UniqueHostnames)
+	assert.Equal(t, uint32(0), summary.AutoAllowedConnections)
 }
 
 func TestSummary_ComputeSummary_AuditMode(t *testing.T) {
@@ -442,6 +443,24 @@ func TestSummary_ComputeSummary_AllAllowed(t *testing.T) {
 	assert.Equal(t, uint32(0), summaryEnforce.WouldDenyConnections)
 }
 
+func TestSummary_ComputeSummary_AutoAllowed(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	autoEvent := makeEvent(t, events.EventConnectionAllowed, "dns.server", "8.8.8.8", "dns", 53, ts)
+	autoEvent.AutoAllowedType = "dns"
+	evts := []events.AuditEvent{
+		autoEvent,
+		makeEvent(t, events.EventConnectionAllowed, "github.com", "1.1.1.1", "curl", 443, ts),
+		makeEvent(t, events.EventConnectionBlocked, "evil.com", "6.6.6.6", "curl", 443, ts),
+	}
+
+	summary := computeSummary(evts, data.CargoWallMode_CARGO_WALL_MODE_ENFORCE)
+
+	assert.Equal(t, uint32(3), summary.TotalConnections)
+	assert.Equal(t, uint32(2), summary.AllowedConnections)
+	assert.Equal(t, uint32(1), summary.AutoAllowedConnections)
+	assert.Equal(t, uint32(1), summary.DeniedConnections)
+}
+
 func TestSummary_ComputeSummary_UnspecifiedModeFallsBackToEnforce(t *testing.T) {
 	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	evts := []events.AuditEvent{
@@ -457,6 +476,55 @@ func TestSummary_ComputeSummary_UnspecifiedModeFallsBackToEnforce(t *testing.T) 
 	assert.Equal(t, uint32(2), summary.DeniedConnections, "unspecified mode should fall back to enforce (blocked counted as denied)")
 	assert.Equal(t, uint32(0), summary.WouldDenyConnections, "unspecified mode should have zero would_deny")
 	assert.Equal(t, uint32(3), summary.UniqueHostnames)
+}
+
+func TestSummary_AuditEventToProto_AutoAllowedType(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("dns", func(t *testing.T) {
+		ev := makeEvent(t, events.EventConnectionAllowed, "", "8.8.8.8", "dns", 53, ts)
+		ev.AutoAllowedType = "dns"
+		proto := auditEventToProto(ev)
+		require.NotNil(t, proto.AutoAllowedType)
+		assert.Equal(t, data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_DNS, *proto.AutoAllowedType)
+	})
+
+	t.Run("azure_infrastructure", func(t *testing.T) {
+		ev := makeEvent(t, events.EventConnectionAllowed, "", "169.254.169.254", "curl", 80, ts)
+		ev.AutoAllowedType = "azure_infrastructure"
+		proto := auditEventToProto(ev)
+		require.NotNil(t, proto.AutoAllowedType)
+		assert.Equal(t, data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE, *proto.AutoAllowedType)
+	})
+
+	t.Run("github_service", func(t *testing.T) {
+		ev := makeEvent(t, events.EventConnectionAllowed, "github.com", "1.1.1.1", "curl", 443, ts)
+		ev.AutoAllowedType = "github_service"
+		proto := auditEventToProto(ev)
+		require.NotNil(t, proto.AutoAllowedType)
+		assert.Equal(t, data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE, *proto.AutoAllowedType)
+	})
+
+	t.Run("codecargo_service", func(t *testing.T) {
+		ev := makeEvent(t, events.EventConnectionAllowed, "api.codecargo.io", "1.2.3.4", "curl", 443, ts)
+		ev.AutoAllowedType = "codecargo_service"
+		proto := auditEventToProto(ev)
+		require.NotNil(t, proto.AutoAllowedType)
+		assert.Equal(t, data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_CODECARGO_SERVICE, *proto.AutoAllowedType)
+	})
+
+	t.Run("empty_not_set", func(t *testing.T) {
+		ev := makeEvent(t, events.EventConnectionAllowed, "github.com", "1.1.1.1", "curl", 443, ts)
+		proto := auditEventToProto(ev)
+		assert.Nil(t, proto.AutoAllowedType)
+	})
+
+	t.Run("unrecognized_not_set", func(t *testing.T) {
+		ev := makeEvent(t, events.EventConnectionAllowed, "unknown.com", "1.1.1.1", "curl", 443, ts)
+		ev.AutoAllowedType = "some_future_type"
+		proto := auditEventToProto(ev)
+		assert.Nil(t, proto.AutoAllowedType, "unrecognized auto_allowed_type should leave field unset, not UNSPECIFIED")
+	})
 }
 
 func TestSummary_EventTypeLabel(t *testing.T) {

@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+option csharp_namespace = "Controller.Data.Pb.CargoWall.V1";
+option go_package = "github.com/code-cargo/cargowall/pb/cargowall/v1/data";
+
+package grpc.cargowall.v1;
+
+enum CargoWallAutoAllowedType {
+  CARGO_WALL_AUTO_ALLOWED_TYPE_UNSPECIFIED = 0;
+  CARGO_WALL_AUTO_ALLOWED_TYPE_CODECARGO_SERVICE = 1;
+  CARGO_WALL_AUTO_ALLOWED_TYPE_DNS = 2;
+  CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE = 3;
+  CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE = 4;
+}

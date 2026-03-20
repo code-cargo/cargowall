@@ -293,6 +293,9 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	comm := lookupProcessName(pid)
 
 	if event.Allowed == 1 {
+		// Check if this connection was allowed by an auto-added rule
+		autoAllowedType := string(configMgr.GetAutoAllowedType(dstIP, event.DstPort, hostname))
+
 		// Allowed TCP SYN connection
 		logger.Info("Connection allowed",
 			"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
@@ -303,7 +306,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			"pid", pid)
 
 		if auditLogger != nil {
-			if err := auditLogger.LogConnectionAllowed(srcIP, dstIP, hostname, event.DstPort, comm, pid); err != nil {
+			if err := auditLogger.LogConnectionAllowed(srcIP, dstIP, hostname, event.DstPort, comm, pid, autoAllowedType); err != nil {
 				logger.Error("Failed to write audit log", "error", err)
 			}
 		}

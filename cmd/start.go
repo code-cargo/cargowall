@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -186,80 +187,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
 	var apiPolicyLoaded bool
 	if cmd.GithubAction {
-		// GitHub Actions mode: load from environment variables or file, no NATS
-		logger.Info("Running in GitHub Actions mode")
-
-		// Priority 1: SaaS API (when api-url + token are set)
-		if cmd.ApiUrl != "" && cmd.Token != "" {
-			// Bootstrap an empty config so EnsureHostnameAllowed can add rules
-			// before the real policy is loaded. The API hostname must be
-			// allowed through DNS filtering for the policy fetch to succeed.
-			if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
-				configMgr.LoadConfigFromRules(nil, config.ActionDeny)
-				configMgr.EnsureHostnameAllowed(u.Hostname())
-			}
-
-			logger.Info("Fetching policy from CodeCargo API", "api_url", cmd.ApiUrl, "job_key", cmd.JobKey)
-			policy, err := fetchPolicyFromAPI(ctx, cmd.ApiUrl, cmd.Token, cmd.JobKey)
-			if err != nil {
-				logger.Warn("API policy fetch failed, falling back to env/file config", "error", err)
-			} else {
-				if policyJSON, jsonErr := protojson.Marshal(policy); jsonErr == nil {
-					logger.Info("Raw policy from API", "policy", string(policyJSON))
-				}
-				if err := configMgr.LoadConfigFromCargoWall(policy); err != nil {
-					logger.Warn("Failed to load API policy into config, falling back to env/file config", "error", err)
-				} else {
-					// Override audit mode from the API response's mode field
-					switch policy.Mode {
-					case datapb.CargoWallMode_CARGO_WALL_MODE_AUDIT:
-						cmd.AuditMode = true
-					case datapb.CargoWallMode_CARGO_WALL_MODE_ENFORCE:
-						cmd.AuditMode = false
-					}
-					// Update the audit logger with the mode from the SaaS policy,
-					// since it was created before the policy was fetched.
-					if auditLogger != nil {
-						auditLogger.SetAuditMode(cmd.AuditMode)
-					}
-					// Write effective mode to a state file so the summary
-					// step picks up the SaaS-overridden value.
-					modeStr := "enforce"
-					if cmd.AuditMode {
-						modeStr = "audit"
-					}
-					_ = os.WriteFile("/tmp/cargowall-mode", []byte(modeStr), 0o644)
-
-					apiPolicyLoaded = true
-					logger.Info("Policy loaded from CodeCargo API",
-						"mode", policy.Mode.String(),
-						"default_action", policy.DefaultAction.String(),
-						"rules", len(policy.Rules))
-				}
-			}
-		}
-
-		// Priority 2: env vars, Priority 3: config file
-		if !apiPolicyLoaded {
-			if err := configMgr.LoadFromEnv(); err != nil {
-				logger.Debug("No environment config found, trying file", "error", err)
-				if err := configMgr.LoadConfig(cmd.Config); err != nil {
-					logger.Warn("No config loaded — defaulting to deny-all. Infrastructure hosts will be auto-allowed.",
-						"error", err, "path", cmd.Config)
-				}
-			}
-		}
-
-		// Auto-allow DNS infrastructure IPs on port 53 so the DNS proxy
-		// can reach the upstream and local processes/containers can resolve.
-		dnsIPs := []string{"127.0.0.1"}
-		if dnsUpstreamHost, _, err := net.SplitHostPort(cmd.DNSUpstream); err == nil {
-			dnsIPs = append(dnsIPs, dnsUpstreamHost)
-		}
-		if dockerBridgeIP != "" {
-			dnsIPs = append(dnsIPs, dockerBridgeIP)
-		}
-		configMgr.EnsureDNSAllowed(dnsIPs)
+		apiPolicyLoaded = loadGitHubActionsConfig(ctx, cmd, configMgr, auditLogger, dockerBridgeIP, logger)
 	} else if hooks != nil && hooks.LoadPolicy != nil {
 		// Extension hook: load policy from external source (e.g., NATS state machine)
 		policy, hookSmClient, cleanup, err := hooks.LoadPolicy(ctx, cmd)
@@ -402,71 +330,8 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			logger.Info("Applied firewall rules to tracked hostnames")
 		}
 
-		// Before querying systemd-resolved's cache, ensure its upstream DNS
-		// servers are allowed through the firewall (needed for cache misses).
 		if cmd.GithubAction {
-			if resolvedUpstreams, err := detectSystemdResolvedUpstreams(); err == nil {
-				if len(resolvedUpstreams) > 0 {
-					configMgr.EnsureDNSAllowed(resolvedUpstreams)
-
-					// Auto-allow Azure wireserver on ports 53 (DNS), 80 (HTTP),
-					// and 32526 (health) for every Azure VM / GitHub-hosted runner.
-					// The upstream IPs from systemd-resolved on Azure are
-					// typically 168.63.129.16.
-					configMgr.EnsureInfraAllowed(resolvedUpstreams, []uint16{53, 80, 32526})
-
-					if err := fw.UpdateAllowlistTC(configMgr); err != nil {
-						logger.Warn("Failed to update allowlist with resolved upstreams", "error", err)
-					}
-					logger.Info("Allowed systemd-resolved upstream DNS servers", "ips", resolvedUpstreams)
-				}
-			} else {
-				logger.Debug("Could not detect systemd-resolved upstreams", "error", err)
-			}
-
-			// Also pre-allow Azure IMDS metadata endpoint (169.254.169.254).
-			// This link-local IP serves instance metadata over HTTP on all
-			// Azure VMs and GitHub-hosted runners and must not be blocked.
-			configMgr.EnsureInfraAllowed([]string{"169.254.169.254"}, []uint16{80})
-
-			// Auto-allow GitHub Actions infrastructure. The runner communicates
-			// with *.actions.githubusercontent.com for job control, log upload,
-			// and token refresh. Subdomain matching covers pipelines., vstoken.,
-			// results-receiver., etc.
-			configMgr.EnsureHostnameAllowed("actions.githubusercontent.com")
-
-			// Auto-discover hostnames from GitHub Actions runtime environment
-			// variables. The runner communicates with specific subdomains like
-			// pipelines.actions.githubusercontent.com and results-receiver-service.
-			// actions.githubusercontent.com whose IPs differ from the parent
-			// domain's DNS resolution. Tracking them explicitly ensures Phase 1/2
-			// resolves their IPs into the BPF allowlist.
-			for _, envVar := range []string{
-				"ACTIONS_RUNTIME_URL",
-				"ACTIONS_RESULTS_URL",
-				"ACTIONS_CACHE_URL",
-				"ACTIONS_ID_TOKEN_REQUEST_URL",
-			} {
-				if val := os.Getenv(envVar); val != "" {
-					if u, err := url.Parse(val); err == nil && u.Hostname() != "" {
-						configMgr.EnsureHostnameAllowed(u.Hostname())
-						logger.Info("Auto-allowed Actions runtime hostname", "env", envVar, "hostname", u.Hostname())
-					}
-				}
-			}
-
-			// Auto-allow the CodeCargo API hostname so the summary push
-			// (which runs while the firewall is active) is not blocked.
-			if cmd.ApiUrl != "" {
-				if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
-					configMgr.EnsureHostnameAllowed(u.Hostname())
-					logger.Info("Auto-allowed CodeCargo API hostname", "hostname", u.Hostname())
-				}
-			}
-
-			if err := fw.UpdateAllowlistTC(configMgr); err != nil {
-				logger.Warn("Failed to update allowlist with infra rules", "error", err)
-			}
+			autoAllowInfraHosts(cmd, configMgr, fw, logger)
 		}
 
 		// Shared resolver that uses the systemd-resolved stub listener for
@@ -479,113 +344,17 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			},
 		}
 
-		// Scan existing TCP connections and do reverse DNS lookups so that
-		// IPs like 140.82.112.22 (github.com) show hostnames in the audit
-		// log instead of raw IPs. This covers connections established before
-		// cargowall started that aren't in the tracked hostnames list.
 		var existingIPs []string
 		if cmd.GithubAction {
-			if scannedIPs, err := scanExistingConnections(); err == nil && len(scannedIPs) > 0 {
-				existingIPs = scannedIPs
-				lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				for _, ip := range existingIPs {
-					rCtx, rCancel := context.WithTimeout(lookupCtx, 1*time.Second)
-					if names, err := cacheResolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
-						hostname := strings.TrimSuffix(names[0], ".")
-						configMgr.UpdateDNSMapping(hostname, ip)
-						logger.Debug("Reverse DNS for existing connection", "ip", ip, "hostname", hostname)
-					}
-					rCancel()
-				}
-				lookupCancel()
-				logger.Info("Populated reverse DNS cache from existing connections", "ips", len(existingIPs))
-			} else if err != nil {
-				logger.Debug("Could not scan existing connections", "error", err)
-			}
+			existingIPs = reverseDNSExistingConnections(configMgr, cacheResolver, logger)
 		}
 
-		// In GitHub Actions mode, pre-populate the BPF allowlist and reverse
-		// lookup cache so that connections established before cargowall started
-		// (using cached DNS IPs) are not incorrectly blocked.
-		//
-		// Phase 1: Query systemd-resolved's stub listener (127.0.0.53) to get
-		// the CACHED IPs — the exact IPs running processes are currently using.
-		// This is loopback traffic so the BPF TC filter on eth0 doesn't touch it.
 		if cmd.GithubAction {
-			cacheCtx, cacheCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			for hostname := range configMgr.GetTrackedHostnames() {
-				lookupCtx, lookupCancel := context.WithTimeout(cacheCtx, 2*time.Second)
-				if ips, err := cacheResolver.LookupHost(lookupCtx, hostname); err == nil {
-					for _, ip := range ips {
-						configMgr.UpdateDNSMapping(hostname, ip)
-					}
-				} else {
-					logger.Debug("System DNS cache miss", "hostname", hostname, "error", err)
-				}
-				lookupCancel()
-			}
-			cacheCancel()
-
-			// Push cached IPs into BPF maps
-			dnsServer.ApplyRulesToTrackedHostnames()
-			logger.Info("Applied system DNS cache entries to firewall")
-
-			// Phase 2: Also resolve through our DNS proxy to capture any fresh
-			// round-robin IPs and ensure the reverse lookup cache is fully populated.
-			resolver := &net.Resolver{
-				PreferGo: true,
-				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-					d := net.Dialer{}
-					return d.DialContext(ctx, "udp", "127.0.0.1:53")
-				},
-			}
-			resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			for hostname := range configMgr.GetTrackedHostnames() {
-				lookupCtx, lookupCancel := context.WithTimeout(resolveCtx, 3*time.Second)
-				if _, err := resolver.LookupHost(lookupCtx, hostname); err != nil {
-					logger.Debug("Failed to pre-resolve hostname", "hostname", hostname, "error", err)
-				}
-				lookupCancel()
-			}
-			resolveCancel()
-			logger.Info("Pre-resolved tracked hostnames via DNS proxy")
+			prePopulateDNSCache(configMgr, dnsServer, cacheResolver, logger)
 		}
 
-		// Now that Phase 1/2 DNS resolution has populated the full
-		// hostname→IP cache, gate pre-existing connections on denied hostnames.
-		// Block IPs that resolve to a denied tracked hostname; allow everything
-		// else (allowed hostnames and unresolvable IPs) to avoid breaking
-		// legitimate connections where PTR records are unavailable.
 		if cmd.AllowExistingConnections && fw != nil && len(existingIPs) > 0 {
-			for _, ipStr := range existingIPs {
-				ip := net.ParseIP(ipStr)
-				if ip == nil {
-					continue
-				}
-
-				hostname := configMgr.LookupHostnameByIP(ipStr)
-				trackedHost := configMgr.FindTrackedHostname(hostname)
-				action := configMgr.GetTrackedHostnameAction(hostname)
-
-				if trackedHost != "" && action == config.ActionDeny {
-					// Positively matches a denied hostname — do NOT allow
-					logger.Info("Blocked pre-existing connection (denied hostname)", "ip", ipStr, "hostname", hostname, "trackedHost", trackedHost)
-					if auditLogger != nil {
-						auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, false)
-					}
-				} else {
-					// Either matches an allowed hostname, or unresolvable — allow it
-					if wasAdded, err := fw.AddIP(ip, config.ActionAllow, nil); err != nil {
-						logger.Debug("Failed to allow existing connection IP", "ip", ipStr, "error", err)
-					} else if wasAdded {
-						logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname)
-						if auditLogger != nil {
-							auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, true)
-						}
-					}
-				}
-			}
-			logger.Info("Processed pre-existing connections against allowlist", "count", len(existingIPs))
+			gateExistingConnections(existingIPs, configMgr, fw, auditLogger, logger)
 		}
 	}
 
@@ -616,25 +385,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	var sudoLockdownEnabled bool
 	var lockdownCfg *lockdown.SudoLockdownConfig
 	if cmd.SudoLockdown {
-		var allowCmds []string
-		if cmd.SudoAllowCommands != "" {
-			for _, c := range strings.Split(cmd.SudoAllowCommands, ",") {
-				c = strings.TrimSpace(c)
-				if c != "" {
-					allowCmds = append(allowCmds, c)
-				}
-			}
-		}
-		lockdownCfg = &lockdown.SudoLockdownConfig{
-			AllowCommands: allowCmds,
-			Username:      "", // Auto-detect
-		}
-		if err := lockdown.EnableSudoLockdown(lockdownCfg, logger); err != nil {
-			logger.Warn("Failed to enable sudo lockdown", "error", err)
-			// Continue without lockdown - it's a hardening feature, not critical
-		} else {
-			sudoLockdownEnabled = true
-		}
+		sudoLockdownEnabled, lockdownCfg = enableSudoLockdown(cmd, logger)
 	}
 
 	// Restart Docker daemon so containers pick up the DNS configuration
@@ -682,6 +433,319 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	}
 
 	return nil
+}
+
+// loadGitHubActionsConfig handles GitHub Actions config priority:
+// (1) SaaS API fetch + bootstrap + mode override + state file,
+// (2) env vars, (3) config file. Calls EnsureDNSAllowed at end.
+// Returns true if SaaS API policy was loaded. Mutates cmd.AuditMode in place.
+func loadGitHubActionsConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, dockerBridgeIP string, logger *slog.Logger) bool {
+	logger.Info("Running in GitHub Actions mode")
+
+	var apiPolicyLoaded bool
+
+	// Priority 1: SaaS API (when api-url + token are set)
+	if cmd.ApiUrl != "" && cmd.Token != "" {
+		// Bootstrap an empty config so EnsureHostnameAllowed can add rules
+		// before the real policy is loaded. The API hostname must be
+		// allowed through DNS filtering for the policy fetch to succeed.
+		if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
+			configMgr.LoadConfigFromRules(nil, config.ActionDeny)
+			configMgr.EnsureHostnameAllowed(u.Hostname(), []uint16{443}, config.AutoAddedTypeCodeCargoService)
+		}
+
+		logger.Info("Fetching policy from CodeCargo API", "api_url", cmd.ApiUrl, "job_key", cmd.JobKey)
+		policy, err := fetchPolicyFromAPI(ctx, cmd.ApiUrl, cmd.Token, cmd.JobKey)
+		if err != nil {
+			logger.Warn("API policy fetch failed, falling back to env/file config", "error", err)
+		} else {
+			if policyJSON, jsonErr := protojson.Marshal(policy); jsonErr == nil {
+				logger.Info("Raw policy from API", "policy", string(policyJSON))
+			}
+			if err := configMgr.LoadConfigFromCargoWall(policy); err != nil {
+				logger.Warn("Failed to load API policy into config, falling back to env/file config", "error", err)
+			} else {
+				// Override audit mode from the API response's mode field
+				switch policy.Mode {
+				case datapb.CargoWallMode_CARGO_WALL_MODE_AUDIT:
+					cmd.AuditMode = true
+				case datapb.CargoWallMode_CARGO_WALL_MODE_ENFORCE:
+					cmd.AuditMode = false
+				}
+				// Update the audit logger with the mode from the SaaS policy,
+				// since it was created before the policy was fetched.
+				if auditLogger != nil {
+					auditLogger.SetAuditMode(cmd.AuditMode)
+				}
+				// Write effective mode to a state file so the summary
+				// step picks up the SaaS-overridden value.
+				modeStr := "enforce"
+				if cmd.AuditMode {
+					modeStr = "audit"
+				}
+				_ = os.WriteFile("/tmp/cargowall-mode", []byte(modeStr), 0o644)
+
+				apiPolicyLoaded = true
+				logger.Info("Policy loaded from CodeCargo API",
+					"mode", policy.Mode.String(),
+					"default_action", policy.DefaultAction.String(),
+					"rules", len(policy.Rules))
+			}
+		}
+	}
+
+	// Priority 2: env vars, Priority 3: config file
+	if !apiPolicyLoaded {
+		if err := configMgr.LoadFromEnv(); err != nil {
+			logger.Debug("No environment config found, trying file", "error", err)
+			if err := configMgr.LoadConfig(cmd.Config); err != nil {
+				logger.Warn("No config loaded — defaulting to deny-all. Infrastructure hosts will be auto-allowed.",
+					"error", err, "path", cmd.Config)
+			}
+		}
+	}
+
+	// Auto-allow DNS infrastructure IPs on port 53 so the DNS proxy
+	// can reach the upstream and local processes/containers can resolve.
+	dnsIPs := []string{"127.0.0.1"}
+	if dnsUpstreamHost, _, err := net.SplitHostPort(cmd.DNSUpstream); err == nil {
+		dnsIPs = append(dnsIPs, dnsUpstreamHost)
+	}
+	if dockerBridgeIP != "" {
+		dnsIPs = append(dnsIPs, dockerBridgeIP)
+	}
+	configMgr.EnsureDNSAllowed(dnsIPs)
+
+	return apiPolicyLoaded
+}
+
+// autoAllowInfraHosts detects and allows infrastructure hosts needed for
+// GitHub Actions: systemd-resolved upstreams, Azure wireserver, IMDS,
+// GitHub service hosts, Azure infra hosts, Actions runtime env vars,
+// and the CodeCargo API hostname.
+func autoAllowInfraHosts(cmd *StartCmd, configMgr *config.Manager, fw firewall.Firewall, logger *slog.Logger) {
+	// Ensure systemd-resolved upstream DNS servers are allowed through the
+	// firewall (needed for cache misses).
+	if resolvedUpstreams, err := detectSystemdResolvedUpstreams(); err == nil {
+		if len(resolvedUpstreams) > 0 {
+			configMgr.EnsureDNSAllowed(resolvedUpstreams)
+
+			// Auto-allow Azure wireserver on ports 53 (DNS), 80 (HTTP),
+			// and 32526 (health) for every Azure VM / GitHub-hosted runner.
+			// The upstream IPs from systemd-resolved on Azure are
+			// typically 168.63.129.16.
+			configMgr.EnsureInfraAllowed(resolvedUpstreams, []uint16{53, 80, 32526})
+
+			if err := fw.UpdateAllowlistTC(configMgr); err != nil {
+				logger.Warn("Failed to update allowlist with resolved upstreams", "error", err)
+			}
+			logger.Info("Allowed systemd-resolved upstream DNS servers", "ips", resolvedUpstreams)
+		}
+	} else {
+		logger.Debug("Could not detect systemd-resolved upstreams", "error", err)
+	}
+
+	// Also pre-allow Azure IMDS metadata endpoint (169.254.169.254).
+	// This link-local IP serves instance metadata over HTTP on all
+	// Azure VMs and GitHub-hosted runners and must not be blocked.
+	configMgr.EnsureInfraAllowed([]string{"169.254.169.254"}, []uint16{80})
+
+	// Auto-allow GitHub service hostnames on port 443.
+	// Defaults cover core GitHub domains; overridable via
+	// CARGOWALL_GITHUB_SERVICE_HOSTS env var (comma-separated).
+	githubHosts := []string{
+		"github.com", "api.github.com", "githubapp.com",
+		"actions.githubusercontent.com", "github.githubassets.com",
+	}
+	if env := os.Getenv("CARGOWALL_GITHUB_SERVICE_HOSTS"); env != "" {
+		githubHosts = splitAndTrimCSV(env)
+	}
+	for _, h := range githubHosts {
+		configMgr.EnsureHostnameAllowed(h, []uint16{443}, config.AutoAddedTypeGitHubService)
+	}
+
+	// Auto-allow Azure infrastructure hostnames on port 443.
+	// Defaults cover blob storage and traffic manager; overridable
+	// via CARGOWALL_AZURE_INFRA_HOSTS env var (comma-separated).
+	azureHosts := []string{"trafficmanager.net", "blob.core.windows.net"}
+	if env := os.Getenv("CARGOWALL_AZURE_INFRA_HOSTS"); env != "" {
+		azureHosts = splitAndTrimCSV(env)
+	}
+	for _, h := range azureHosts {
+		configMgr.EnsureHostnameAllowed(h, []uint16{443}, config.AutoAddedTypeAzureInfrastructure)
+	}
+
+	// Auto-discover hostnames from GitHub Actions runtime environment
+	// variables. The runner communicates with specific subdomains like
+	// pipelines.actions.githubusercontent.com and results-receiver-service.
+	// actions.githubusercontent.com whose IPs differ from the parent
+	// domain's DNS resolution. Tracking them explicitly ensures Phase 1/2
+	// resolves their IPs into the BPF allowlist.
+	for _, envVar := range []string{
+		"ACTIONS_RUNTIME_URL",
+		"ACTIONS_RESULTS_URL",
+		"ACTIONS_CACHE_URL",
+		"ACTIONS_ID_TOKEN_REQUEST_URL",
+	} {
+		if val := os.Getenv(envVar); val != "" {
+			if u, err := url.Parse(val); err == nil && u.Hostname() != "" {
+				configMgr.EnsureHostnameAllowed(u.Hostname(), []uint16{443}, config.AutoAddedTypeGitHubService)
+				logger.Info("Auto-allowed Actions runtime hostname", "env", envVar, "hostname", u.Hostname())
+			}
+		}
+	}
+
+	// Auto-allow the CodeCargo API hostname so the summary push
+	// (which runs while the firewall is active) is not blocked.
+	if cmd.ApiUrl != "" {
+		if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
+			configMgr.EnsureHostnameAllowed(u.Hostname(), []uint16{443}, config.AutoAddedTypeCodeCargoService)
+			logger.Info("Auto-allowed CodeCargo API hostname", "hostname", u.Hostname())
+		}
+	}
+
+	if err := fw.UpdateAllowlistTC(configMgr); err != nil {
+		logger.Warn("Failed to update allowlist with infra rules", "error", err)
+	}
+}
+
+// reverseDNSExistingConnections scans existing TCP connections from
+// /proc/net/tcp{,6} and performs reverse DNS lookups for each IP via the
+// cache resolver, updating the config manager's DNS mappings.
+// Returns the list of scanned IPs.
+func reverseDNSExistingConnections(configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) []string {
+	scannedIPs, err := scanExistingConnections()
+	if err != nil {
+		logger.Debug("Could not scan existing connections", "error", err)
+		return nil
+	}
+	if len(scannedIPs) == 0 {
+		return nil
+	}
+
+	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	for _, ip := range scannedIPs {
+		rCtx, rCancel := context.WithTimeout(lookupCtx, 1*time.Second)
+		if names, err := cacheResolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
+			hostname := strings.TrimSuffix(names[0], ".")
+			configMgr.UpdateDNSMapping(hostname, ip)
+			logger.Debug("Reverse DNS for existing connection", "ip", ip, "hostname", hostname)
+		}
+		rCancel()
+	}
+	lookupCancel()
+	logger.Info("Populated reverse DNS cache from existing connections", "ips", len(scannedIPs))
+
+	return scannedIPs
+}
+
+// prePopulateDNSCache pre-populates the BPF allowlist and reverse lookup cache
+// so that connections established before cargowall started are not incorrectly
+// blocked. Phase 1 queries systemd-resolved's stub for cached IPs and pushes
+// them into BPF maps. Phase 2 resolves through the DNS proxy for round-robin IPs.
+func prePopulateDNSCache(configMgr *config.Manager, dnsServer *dns.Server, cacheResolver *net.Resolver, logger *slog.Logger) {
+	// Phase 1: Query systemd-resolved's stub listener (127.0.0.53) to get
+	// the CACHED IPs — the exact IPs running processes are currently using.
+	// This is loopback traffic so the BPF TC filter on eth0 doesn't touch it.
+	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	for hostname := range configMgr.GetTrackedHostnames() {
+		lookupCtx, lookupCancel := context.WithTimeout(cacheCtx, 2*time.Second)
+		if ips, err := cacheResolver.LookupHost(lookupCtx, hostname); err == nil {
+			for _, ip := range ips {
+				configMgr.UpdateDNSMapping(hostname, ip)
+			}
+		} else {
+			logger.Debug("System DNS cache miss", "hostname", hostname, "error", err)
+		}
+		lookupCancel()
+	}
+	cacheCancel()
+
+	// Push cached IPs into BPF maps
+	dnsServer.ApplyRulesToTrackedHostnames()
+	logger.Info("Applied system DNS cache entries to firewall")
+
+	// Phase 2: Also resolve through our DNS proxy to capture any fresh
+	// round-robin IPs and ensure the reverse lookup cache is fully populated.
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{}
+			return d.DialContext(ctx, "udp", "127.0.0.1:53")
+		},
+	}
+	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	for hostname := range configMgr.GetTrackedHostnames() {
+		lookupCtx, lookupCancel := context.WithTimeout(resolveCtx, 3*time.Second)
+		if _, err := resolver.LookupHost(lookupCtx, hostname); err != nil {
+			logger.Debug("Failed to pre-resolve hostname", "hostname", hostname, "error", err)
+		}
+		lookupCancel()
+	}
+	resolveCancel()
+	logger.Info("Pre-resolved tracked hostnames via DNS proxy")
+}
+
+// gateExistingConnections iterates pre-existing IPs, blocks those that resolve
+// to a denied tracked hostname, and allows everything else (allowed hostnames
+// and unresolvable IPs).
+func gateExistingConnections(existingIPs []string, configMgr *config.Manager, fw firewall.Firewall, auditLogger *events.AuditLogger, logger *slog.Logger) {
+	for _, ipStr := range existingIPs {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			continue
+		}
+
+		hostname := configMgr.LookupHostnameByIP(ipStr)
+		trackedHost := configMgr.FindTrackedHostname(hostname)
+		action := configMgr.GetTrackedHostnameAction(hostname)
+
+		autoAllowedType := string(configMgr.GetAutoAllowedTypeForHostname(hostname))
+
+		if trackedHost != "" && action == config.ActionDeny {
+			// Positively matches a denied hostname — do NOT allow
+			logger.Info("Blocked pre-existing connection (denied hostname)", "ip", ipStr, "hostname", hostname, "trackedHost", trackedHost)
+			if auditLogger != nil {
+				auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, false, autoAllowedType)
+			}
+		} else {
+			// Either matches an allowed hostname, or unresolvable — allow it
+			if wasAdded, err := fw.AddIP(ip, config.ActionAllow, nil); err != nil {
+				logger.Debug("Failed to allow existing connection IP", "ip", ipStr, "error", err)
+			} else if wasAdded {
+				logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname)
+				if auditLogger != nil {
+					auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, true, autoAllowedType)
+				}
+			}
+		}
+	}
+	logger.Info("Processed pre-existing connections against allowlist", "count", len(existingIPs))
+}
+
+// enableSudoLockdown parses allowed commands from cmd.SudoAllowCommands,
+// builds a lockdown config, and enables sudo lockdown. Returns whether
+// lockdown was successfully enabled and the config (for cleanup).
+func enableSudoLockdown(cmd *StartCmd, logger *slog.Logger) (bool, *lockdown.SudoLockdownConfig) {
+	var allowCmds []string
+	if cmd.SudoAllowCommands != "" {
+		for _, c := range strings.Split(cmd.SudoAllowCommands, ",") {
+			c = strings.TrimSpace(c)
+			if c != "" {
+				allowCmds = append(allowCmds, c)
+			}
+		}
+	}
+	cfg := &lockdown.SudoLockdownConfig{
+		AllowCommands: allowCmds,
+		Username:      "", // Auto-detect
+	}
+	if err := lockdown.EnableSudoLockdown(cfg, logger); err != nil {
+		logger.Warn("Failed to enable sudo lockdown", "error", err)
+		// Continue without lockdown - it's a hardening feature, not critical
+		return false, cfg
+	}
+	return true, cfg
 }
 
 // detectSystemdResolvedUpstreams reads /run/systemd/resolve/resolv.conf
@@ -782,6 +846,19 @@ func scanProcTCP(path string, isIPv6 bool, seen map[string]bool) error {
 	}
 
 	return scanner.Err()
+}
+
+// splitAndTrimCSV splits a comma-separated string and trims whitespace from
+// each element, discarding empty entries.
+func splitAndTrimCSV(s string) []string {
+	var result []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }
 
 // parseHexIP converts a little-endian hex-encoded IPv4 address from /proc/net/tcp

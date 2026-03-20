@@ -560,6 +560,9 @@ func TestEnsureDNSAllowed(t *testing.T) {
 		if !reflect.DeepEqual(rule.Ports, []uint16{53}) {
 			t.Errorf("rule[%d].Ports = %v, want [53]", initialRuleCount+i, rule.Ports)
 		}
+		if rule.AutoAddedType != AutoAddedTypeDNS {
+			t.Errorf("rule[%d].AutoAddedType = %q, want %q", initialRuleCount+i, rule.AutoAddedType, AutoAddedTypeDNS)
+		}
 	}
 
 	// Resolved rules should also have been updated
@@ -567,6 +570,9 @@ func TestEnsureDNSAllowed(t *testing.T) {
 	found := 0
 	for _, r := range resolvedRules {
 		if r.Type == RuleTypeCIDR && r.Action == ActionAllow && len(r.Ports) == 1 && r.Ports[0] == 53 {
+			if r.AutoAddedType != AutoAddedTypeDNS {
+				t.Errorf("resolved rule AutoAddedType = %q, want %q", r.AutoAddedType, AutoAddedTypeDNS)
+			}
 			found++
 		}
 	}
@@ -617,5 +623,142 @@ func TestEnsureDNSAllowed_CoveredByCIDR(t *testing.T) {
 	// Both should be covered by the existing wildcard CIDR rule
 	if len(cm.config.Rules) != initialRuleCount {
 		t.Fatalf("expected %d rules (no additions), got %d", initialRuleCount, len(cm.config.Rules))
+	}
+}
+
+func TestEnsureInfraAllowed_SetsAutoAddedType(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules(nil, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []uint16{80})
+
+	if len(cm.config.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(cm.config.Rules))
+	}
+	if cm.config.Rules[0].AutoAddedType != AutoAddedTypeAzureInfrastructure {
+		t.Errorf("AutoAddedType = %q, want %q", cm.config.Rules[0].AutoAddedType, AutoAddedTypeAzureInfrastructure)
+	}
+}
+
+func TestEnsureHostnameAllowed_SetsAutoAddedType(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules(nil, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	cm.EnsureHostnameAllowed("github.com", []uint16{443}, AutoAddedTypeGitHubService)
+
+	if len(cm.config.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(cm.config.Rules))
+	}
+	if cm.config.Rules[0].AutoAddedType != AutoAddedTypeGitHubService {
+		t.Errorf("AutoAddedType = %q, want %q", cm.config.Rules[0].AutoAddedType, AutoAddedTypeGitHubService)
+	}
+	if !reflect.DeepEqual(cm.config.Rules[0].Ports, []uint16{443}) {
+		t.Errorf("Ports = %v, want [443]", cm.config.Rules[0].Ports)
+	}
+
+	resolvedRules := cm.GetResolvedRules()
+	if len(resolvedRules) != 1 {
+		t.Fatalf("expected 1 resolved rule, got %d", len(resolvedRules))
+	}
+	if resolvedRules[0].AutoAddedType != AutoAddedTypeGitHubService {
+		t.Errorf("resolved AutoAddedType = %q, want %q", resolvedRules[0].AutoAddedType, AutoAddedTypeGitHubService)
+	}
+	if !reflect.DeepEqual(resolvedRules[0].Ports, []uint16{443}) {
+		t.Errorf("resolved Ports = %v, want [443]", resolvedRules[0].Ports)
+	}
+}
+
+func TestEnsureHostnameAllowed_AzureInfrastructureType(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules(nil, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	cm.EnsureHostnameAllowed("blob.core.windows.net", []uint16{443}, AutoAddedTypeAzureInfrastructure)
+
+	if len(cm.config.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(cm.config.Rules))
+	}
+	if cm.config.Rules[0].AutoAddedType != AutoAddedTypeAzureInfrastructure {
+		t.Errorf("AutoAddedType = %q, want %q", cm.config.Rules[0].AutoAddedType, AutoAddedTypeAzureInfrastructure)
+	}
+}
+
+func TestGetAutoAllowedTypeForHostname(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules(nil, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	cm.EnsureHostnameAllowed("github.com", []uint16{443}, AutoAddedTypeGitHubService)
+	cm.EnsureHostnameAllowed("blob.core.windows.net", []uint16{443}, AutoAddedTypeAzureInfrastructure)
+
+	// Exact match
+	if got := cm.GetAutoAllowedTypeForHostname("github.com"); got != AutoAddedTypeGitHubService {
+		t.Errorf("GetAutoAllowedTypeForHostname(github.com) = %q, want %q", got, AutoAddedTypeGitHubService)
+	}
+	// Subdomain match
+	if got := cm.GetAutoAllowedTypeForHostname("api.github.com"); got != AutoAddedTypeGitHubService {
+		t.Errorf("GetAutoAllowedTypeForHostname(api.github.com) = %q, want %q", got, AutoAddedTypeGitHubService)
+	}
+	// Azure match
+	if got := cm.GetAutoAllowedTypeForHostname("myaccount.blob.core.windows.net"); got != AutoAddedTypeAzureInfrastructure {
+		t.Errorf("GetAutoAllowedTypeForHostname(myaccount.blob.core.windows.net) = %q, want %q", got, AutoAddedTypeAzureInfrastructure)
+	}
+	// Unknown hostname
+	if got := cm.GetAutoAllowedTypeForHostname("example.com"); got != AutoAddedTypeNone {
+		t.Errorf("GetAutoAllowedTypeForHostname(example.com) = %q, want %q", got, AutoAddedTypeNone)
+	}
+}
+
+func TestGetAutoAllowedType(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "github.com", Action: ActionAllow},
+	}, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	// Add auto-added rules
+	cm.EnsureDNSAllowed([]string{"8.8.8.8"})
+	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []uint16{80})
+	cm.EnsureHostnameAllowed("actions.githubusercontent.com", []uint16{443}, AutoAddedTypeGitHubService)
+
+	// DNS rule should match on port 53
+	if got := cm.GetAutoAllowedType("8.8.8.8", 53, ""); got != AutoAddedTypeDNS {
+		t.Errorf("GetAutoAllowedType(8.8.8.8:53) = %q, want %q", got, AutoAddedTypeDNS)
+	}
+	// DNS rule should NOT match on port 443
+	if got := cm.GetAutoAllowedType("8.8.8.8", 443, ""); got != AutoAddedTypeNone {
+		t.Errorf("GetAutoAllowedType(8.8.8.8:443) = %q, want %q", got, AutoAddedTypeNone)
+	}
+	// Infra rule should match
+	if got := cm.GetAutoAllowedType("169.254.169.254", 80, ""); got != AutoAddedTypeAzureInfrastructure {
+		t.Errorf("GetAutoAllowedType(169.254.169.254:80) = %q, want %q", got, AutoAddedTypeAzureInfrastructure)
+	}
+	// Hostname rule should match
+	if got := cm.GetAutoAllowedType("1.2.3.4", 443, "actions.githubusercontent.com"); got != AutoAddedTypeGitHubService {
+		t.Errorf("GetAutoAllowedType(actions.githubusercontent.com) = %q, want %q", got, AutoAddedTypeGitHubService)
+	}
+	// Subdomain match
+	if got := cm.GetAutoAllowedType("1.2.3.4", 443, "sub.actions.githubusercontent.com"); got != AutoAddedTypeGitHubService {
+		t.Errorf("GetAutoAllowedType(sub.actions.githubusercontent.com) = %q, want %q", got, AutoAddedTypeGitHubService)
+	}
+	// User-configured rule should NOT match
+	if got := cm.GetAutoAllowedType("1.2.3.4", 443, "github.com"); got != AutoAddedTypeNone {
+		t.Errorf("GetAutoAllowedType(github.com) = %q, want %q (user-configured, not auto-added)", got, AutoAddedTypeNone)
+	}
+	// Unknown IP should NOT match
+	if got := cm.GetAutoAllowedType("10.0.0.1", 443, ""); got != AutoAddedTypeNone {
+		t.Errorf("GetAutoAllowedType(10.0.0.1:443) = %q, want %q", got, AutoAddedTypeNone)
 	}
 }

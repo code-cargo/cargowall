@@ -505,10 +505,25 @@ func TestSummary_AuditEventToProto_AutoAllowedType(t *testing.T) {
 		assert.Equal(t, data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE, *proto.AutoAllowedType)
 	})
 
+	t.Run("codecargo_service", func(t *testing.T) {
+		ev := makeEvent(t, events.EventConnectionAllowed, "api.codecargo.io", "1.2.3.4", "curl", 443, ts)
+		ev.AutoAllowedType = "codecargo_service"
+		proto := auditEventToProto(ev)
+		require.NotNil(t, proto.AutoAllowedType)
+		assert.Equal(t, data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_CODECARGO_SERVICE, *proto.AutoAllowedType)
+	})
+
 	t.Run("empty_not_set", func(t *testing.T) {
 		ev := makeEvent(t, events.EventConnectionAllowed, "github.com", "1.1.1.1", "curl", 443, ts)
 		proto := auditEventToProto(ev)
 		assert.Nil(t, proto.AutoAllowedType)
+	})
+
+	t.Run("unrecognized_not_set", func(t *testing.T) {
+		ev := makeEvent(t, events.EventConnectionAllowed, "unknown.com", "1.1.1.1", "curl", 443, ts)
+		ev.AutoAllowedType = "some_future_type"
+		proto := auditEventToProto(ev)
+		assert.Nil(t, proto.AutoAllowedType, "unrecognized auto_allowed_type should leave field unset, not UNSPECIFIED")
 	})
 }
 

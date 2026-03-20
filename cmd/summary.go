@@ -656,22 +656,25 @@ func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {
 		event.Process = &e.Process
 	}
 	if e.AutoAllowedType != "" {
-		autoType := mapAutoAllowedType(e.AutoAllowedType)
-		event.AutoAllowedType = &autoType
+		if autoType, ok := mapAutoAllowedType(e.AutoAllowedType); ok {
+			event.AutoAllowedType = &autoType
+		}
 	}
 	return event
 }
 
-func mapAutoAllowedType(s string) data.CargoWallAutoAllowedType {
+func mapAutoAllowedType(s string) (data.CargoWallAutoAllowedType, bool) {
 	switch s {
 	case "dns":
-		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_DNS
+		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_DNS, true
 	case "azure_infrastructure":
-		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE
+		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_AZURE_INFRASTRUCTURE, true
 	case "github_service":
-		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE
+		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE, true
+	case "codecargo_service":
+		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_CODECARGO_SERVICE, true
 	default:
-		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_UNSPECIFIED
+		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_UNSPECIFIED, false
 	}
 }
 

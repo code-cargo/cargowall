@@ -23,10 +23,11 @@ const (
 )
 
 type CargoWallPolicy struct {
-	state         protoimpl.MessageState   `protogen:"open.v1"`
-	Mode          data.CargoWallMode       `protobuf:"varint,1,opt,name=mode,proto3,enum=grpc.cargowall.v1.CargoWallMode" json:"mode,omitempty"`
-	DefaultAction data.CargoWallActionType `protobuf:"varint,2,opt,name=default_action,json=defaultAction,proto3,enum=grpc.cargowall.v1.CargoWallActionType" json:"default_action,omitempty"`
-	Rules         []*CargoWallPolicy_Rule  `protobuf:"bytes,3,rep,name=rules,proto3" json:"rules,omitempty"`
+	state         protoimpl.MessageState        `protogen:"open.v1"`
+	Mode          data.CargoWallMode            `protobuf:"varint,1,opt,name=mode,proto3,enum=grpc.cargowall.v1.CargoWallMode" json:"mode,omitempty"`
+	DefaultAction data.CargoWallActionType      `protobuf:"varint,2,opt,name=default_action,json=defaultAction,proto3,enum=grpc.cargowall.v1.CargoWallActionType" json:"default_action,omitempty"`
+	SudoLockdown  *CargoWallPolicy_SudoLockdown `protobuf:"bytes,3,opt,name=sudo_lockdown,json=sudoLockdown,proto3" json:"sudo_lockdown,omitempty"`
+	Rules         []*CargoWallPolicy_Rule       `protobuf:"bytes,100,rep,name=rules,proto3" json:"rules,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -75,6 +76,13 @@ func (x *CargoWallPolicy) GetDefaultAction() data.CargoWallActionType {
 	return data.CargoWallActionType(0)
 }
 
+func (x *CargoWallPolicy) GetSudoLockdown() *CargoWallPolicy_SudoLockdown {
+	if x != nil {
+		return x.SudoLockdown
+	}
+	return nil
+}
+
 func (x *CargoWallPolicy) GetRules() []*CargoWallPolicy_Rule {
 	if x != nil {
 		return x.Rules
@@ -87,7 +95,7 @@ type CargoWallPolicy_Rule struct {
 	Type          data.CargoWallRuleType   `protobuf:"varint,1,opt,name=type,proto3,enum=grpc.cargowall.v1.CargoWallRuleType" json:"type,omitempty"`
 	Value         string                   `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
 	Action        data.CargoWallActionType `protobuf:"varint,3,opt,name=action,proto3,enum=grpc.cargowall.v1.CargoWallActionType" json:"action,omitempty"`
-	Ports         []uint32                 `protobuf:"varint,4,rep,packed,name=ports,proto3" json:"ports,omitempty"`
+	Ports         []*CargoWallPolicy_Port  `protobuf:"bytes,4,rep,name=ports,proto3" json:"ports,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -143,9 +151,113 @@ func (x *CargoWallPolicy_Rule) GetAction() data.CargoWallActionType {
 	return data.CargoWallActionType(0)
 }
 
-func (x *CargoWallPolicy_Rule) GetPorts() []uint32 {
+func (x *CargoWallPolicy_Rule) GetPorts() []*CargoWallPolicy_Port {
 	if x != nil {
 		return x.Ports
+	}
+	return nil
+}
+
+type CargoWallPolicy_Port struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Port          uint32                 `protobuf:"varint,1,opt,name=port,proto3" json:"port,omitempty"`
+	Protocol      data.CargoWallProtocol `protobuf:"varint,2,opt,name=protocol,proto3,enum=grpc.cargowall.v1.CargoWallProtocol" json:"protocol,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CargoWallPolicy_Port) Reset() {
+	*x = CargoWallPolicy_Port{}
+	mi := &file_cargo_wall_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CargoWallPolicy_Port) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CargoWallPolicy_Port) ProtoMessage() {}
+
+func (x *CargoWallPolicy_Port) ProtoReflect() protoreflect.Message {
+	mi := &file_cargo_wall_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CargoWallPolicy_Port.ProtoReflect.Descriptor instead.
+func (*CargoWallPolicy_Port) Descriptor() ([]byte, []int) {
+	return file_cargo_wall_proto_rawDescGZIP(), []int{0, 1}
+}
+
+func (x *CargoWallPolicy_Port) GetPort() uint32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+func (x *CargoWallPolicy_Port) GetProtocol() data.CargoWallProtocol {
+	if x != nil {
+		return x.Protocol
+	}
+	return data.CargoWallProtocol(0)
+}
+
+type CargoWallPolicy_SudoLockdown struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Enable        bool                   `protobuf:"varint,1,opt,name=enable,proto3" json:"enable,omitempty"`
+	AllowCommands []string               `protobuf:"bytes,2,rep,name=allow_commands,json=allowCommands,proto3" json:"allow_commands,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CargoWallPolicy_SudoLockdown) Reset() {
+	*x = CargoWallPolicy_SudoLockdown{}
+	mi := &file_cargo_wall_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CargoWallPolicy_SudoLockdown) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CargoWallPolicy_SudoLockdown) ProtoMessage() {}
+
+func (x *CargoWallPolicy_SudoLockdown) ProtoReflect() protoreflect.Message {
+	mi := &file_cargo_wall_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CargoWallPolicy_SudoLockdown.ProtoReflect.Descriptor instead.
+func (*CargoWallPolicy_SudoLockdown) Descriptor() ([]byte, []int) {
+	return file_cargo_wall_proto_rawDescGZIP(), []int{0, 2}
+}
+
+func (x *CargoWallPolicy_SudoLockdown) GetEnable() bool {
+	if x != nil {
+		return x.Enable
+	}
+	return false
+}
+
+func (x *CargoWallPolicy_SudoLockdown) GetAllowCommands() []string {
+	if x != nil {
+		return x.AllowCommands
 	}
 	return nil
 }
@@ -154,16 +266,23 @@ var File_cargo_wall_proto protoreflect.FileDescriptor
 
 const file_cargo_wall_proto_rawDesc = "" +
 	"\n" +
-	"\x10cargo_wall.proto\x12\x11grpc.cargowall.v1\x1a\x1fdata/cargo_wall_mode_enum.proto\x1a&data/cargo_wall_action_type_enum.proto\x1a$data/cargo_wall_rule_type_enum.proto\"\x84\x03\n" +
+	"\x10cargo_wall.proto\x12\x11grpc.cargowall.v1\x1a\x1fdata/cargo_wall_mode_enum.proto\x1a&data/cargo_wall_action_type_enum.proto\x1a$data/cargo_wall_rule_type_enum.proto\x1a#data/cargo_wall_protocol_enum.proto\"\xb0\x05\n" +
 	"\x0fCargoWallPolicy\x124\n" +
 	"\x04mode\x18\x01 \x01(\x0e2 .grpc.cargowall.v1.CargoWallModeR\x04mode\x12M\n" +
-	"\x0edefault_action\x18\x02 \x01(\x0e2&.grpc.cargowall.v1.CargoWallActionTypeR\rdefaultAction\x12=\n" +
-	"\x05rules\x18\x03 \x03(\v2'.grpc.cargowall.v1.CargoWallPolicy.RuleR\x05rules\x1a\xac\x01\n" +
+	"\x0edefault_action\x18\x02 \x01(\x0e2&.grpc.cargowall.v1.CargoWallActionTypeR\rdefaultAction\x12T\n" +
+	"\rsudo_lockdown\x18\x03 \x01(\v2/.grpc.cargowall.v1.CargoWallPolicy.SudoLockdownR\fsudoLockdown\x12=\n" +
+	"\x05rules\x18d \x03(\v2'.grpc.cargowall.v1.CargoWallPolicy.RuleR\x05rules\x1a\xd5\x01\n" +
 	"\x04Rule\x128\n" +
 	"\x04type\x18\x01 \x01(\x0e2$.grpc.cargowall.v1.CargoWallRuleTypeR\x04type\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value\x12>\n" +
-	"\x06action\x18\x03 \x01(\x0e2&.grpc.cargowall.v1.CargoWallActionTypeR\x06action\x12\x14\n" +
-	"\x05ports\x18\x04 \x03(\rR\x05portsBYZ/github.com/code-cargo/cargowall/pb/cargowall/v1\xaa\x02%Controller.ApiService.Pb.CargoWall.V1b\x06proto3"
+	"\x06action\x18\x03 \x01(\x0e2&.grpc.cargowall.v1.CargoWallActionTypeR\x06action\x12=\n" +
+	"\x05ports\x18\x04 \x03(\v2'.grpc.cargowall.v1.CargoWallPolicy.PortR\x05ports\x1a\\\n" +
+	"\x04Port\x12\x12\n" +
+	"\x04port\x18\x01 \x01(\rR\x04port\x12@\n" +
+	"\bprotocol\x18\x02 \x01(\x0e2$.grpc.cargowall.v1.CargoWallProtocolR\bprotocol\x1aM\n" +
+	"\fSudoLockdown\x12\x16\n" +
+	"\x06enable\x18\x01 \x01(\bR\x06enable\x12%\n" +
+	"\x0eallow_commands\x18\x02 \x03(\tR\rallowCommandsBYZ/github.com/code-cargo/cargowall/pb/cargowall/v1\xaa\x02%Controller.ApiService.Pb.CargoWall.V1b\x06proto3"
 
 var (
 	file_cargo_wall_proto_rawDescOnce sync.Once
@@ -177,25 +296,31 @@ func file_cargo_wall_proto_rawDescGZIP() []byte {
 	return file_cargo_wall_proto_rawDescData
 }
 
-var file_cargo_wall_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_cargo_wall_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_cargo_wall_proto_goTypes = []any{
-	(*CargoWallPolicy)(nil),       // 0: grpc.cargowall.v1.CargoWallPolicy
-	(*CargoWallPolicy_Rule)(nil),  // 1: grpc.cargowall.v1.CargoWallPolicy.Rule
-	(data.CargoWallMode)(0),       // 2: grpc.cargowall.v1.CargoWallMode
-	(data.CargoWallActionType)(0), // 3: grpc.cargowall.v1.CargoWallActionType
-	(data.CargoWallRuleType)(0),   // 4: grpc.cargowall.v1.CargoWallRuleType
+	(*CargoWallPolicy)(nil),              // 0: grpc.cargowall.v1.CargoWallPolicy
+	(*CargoWallPolicy_Rule)(nil),         // 1: grpc.cargowall.v1.CargoWallPolicy.Rule
+	(*CargoWallPolicy_Port)(nil),         // 2: grpc.cargowall.v1.CargoWallPolicy.Port
+	(*CargoWallPolicy_SudoLockdown)(nil), // 3: grpc.cargowall.v1.CargoWallPolicy.SudoLockdown
+	(data.CargoWallMode)(0),              // 4: grpc.cargowall.v1.CargoWallMode
+	(data.CargoWallActionType)(0),        // 5: grpc.cargowall.v1.CargoWallActionType
+	(data.CargoWallRuleType)(0),          // 6: grpc.cargowall.v1.CargoWallRuleType
+	(data.CargoWallProtocol)(0),          // 7: grpc.cargowall.v1.CargoWallProtocol
 }
 var file_cargo_wall_proto_depIdxs = []int32{
-	2, // 0: grpc.cargowall.v1.CargoWallPolicy.mode:type_name -> grpc.cargowall.v1.CargoWallMode
-	3, // 1: grpc.cargowall.v1.CargoWallPolicy.default_action:type_name -> grpc.cargowall.v1.CargoWallActionType
-	1, // 2: grpc.cargowall.v1.CargoWallPolicy.rules:type_name -> grpc.cargowall.v1.CargoWallPolicy.Rule
-	4, // 3: grpc.cargowall.v1.CargoWallPolicy.Rule.type:type_name -> grpc.cargowall.v1.CargoWallRuleType
-	3, // 4: grpc.cargowall.v1.CargoWallPolicy.Rule.action:type_name -> grpc.cargowall.v1.CargoWallActionType
-	5, // [5:5] is the sub-list for method output_type
-	5, // [5:5] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	4, // 0: grpc.cargowall.v1.CargoWallPolicy.mode:type_name -> grpc.cargowall.v1.CargoWallMode
+	5, // 1: grpc.cargowall.v1.CargoWallPolicy.default_action:type_name -> grpc.cargowall.v1.CargoWallActionType
+	3, // 2: grpc.cargowall.v1.CargoWallPolicy.sudo_lockdown:type_name -> grpc.cargowall.v1.CargoWallPolicy.SudoLockdown
+	1, // 3: grpc.cargowall.v1.CargoWallPolicy.rules:type_name -> grpc.cargowall.v1.CargoWallPolicy.Rule
+	6, // 4: grpc.cargowall.v1.CargoWallPolicy.Rule.type:type_name -> grpc.cargowall.v1.CargoWallRuleType
+	5, // 5: grpc.cargowall.v1.CargoWallPolicy.Rule.action:type_name -> grpc.cargowall.v1.CargoWallActionType
+	2, // 6: grpc.cargowall.v1.CargoWallPolicy.Rule.ports:type_name -> grpc.cargowall.v1.CargoWallPolicy.Port
+	7, // 7: grpc.cargowall.v1.CargoWallPolicy.Port.protocol:type_name -> grpc.cargowall.v1.CargoWallProtocol
+	8, // [8:8] is the sub-list for method output_type
+	8, // [8:8] is the sub-list for method input_type
+	8, // [8:8] is the sub-list for extension type_name
+	8, // [8:8] is the sub-list for extension extendee
+	0, // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_cargo_wall_proto_init() }
@@ -209,7 +334,7 @@ func file_cargo_wall_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cargo_wall_proto_rawDesc), len(file_cargo_wall_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

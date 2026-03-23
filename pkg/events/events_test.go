@@ -193,8 +193,8 @@ func TestConflictHandling(t *testing.T) {
 			name:          "hostname_allow_vs_cidr_deny_with_ports",
 			defaultAction: config.ActionAllow,
 			rules: []config.Rule{
-				{Type: config.RuleTypeHostname, Value: "app.com", Action: config.ActionAllow, Ports: []uint16{443}},
-				{Type: config.RuleTypeCIDR, Value: "172.16.0.0/16", Action: config.ActionDeny, Ports: []uint16{80}},
+				{Type: config.RuleTypeHostname, Value: "app.com", Action: config.ActionAllow, Ports: []config.Port{{Value: 443, Protocol: config.ProtocolAll}}},
+				{Type: config.RuleTypeCIDR, Value: "172.16.0.0/16", Action: config.ActionDeny, Ports: []config.Port{{Value: 80, Protocol: config.ProtocolAll}}},
 			},
 			dnsHostname:      "app.com",
 			dnsIP:            "172.16.0.100",
@@ -221,7 +221,7 @@ func TestConflictHandling(t *testing.T) {
 			}
 
 			// Get ports for hostname rule
-			var hostnamePorts []uint16
+			var hostnamePorts []config.Port
 			for _, rule := range cm.GetResolvedRules() {
 				if rule.Type == config.RuleTypeHostname && rule.Value == tt.dnsHostname {
 					hostnamePorts = rule.Ports
@@ -420,10 +420,10 @@ type mockFirewallUpdater struct {
 type mockAddIPCall struct {
 	ip     net.IP
 	action config.Action
-	ports  []uint16
+	ports  []config.Port
 }
 
-func (m *mockFirewallUpdater) AddIP(ip net.IP, action config.Action, ports []uint16) (bool, error) {
+func (m *mockFirewallUpdater) AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error) {
 	m.addedIPs = append(m.addedIPs, mockAddIPCall{ip: ip, action: action, ports: ports})
 	return true, nil
 }

@@ -33,17 +33,19 @@ type TcBpfLpmVal struct {
 }
 
 type TcBpfPortKey struct {
-	_    structs.HostLayout
-	Ip   uint32
-	Port uint16
-	Pad  uint16
+	_     structs.HostLayout
+	Ip    uint32
+	Port  uint16
+	Proto uint8
+	Pad   uint8
 }
 
 type TcBpfPortKeyV6 struct {
-	_    structs.HostLayout
-	Ip   [16]uint8
-	Port uint16
-	Pad  uint16
+	_     structs.HostLayout
+	Ip    [16]uint8
+	Port  uint16
+	Proto uint8
+	Pad   uint8
 }
 
 type TcBpfPortVal struct {

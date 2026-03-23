@@ -80,7 +80,7 @@ func newTestFirewall() (*FirewallImpl, map[string]*mockMap) {
 		defaultActionMap: mocks["defaultAction"],
 		auditModeMap:     mocks["auditMode"],
 		logger:           slog.Default(),
-		ipPorts:          make(map[string][]uint16),
+		ipPorts:          make(map[string][]portProto),
 	}
 	return fw, mocks
 }
@@ -150,12 +150,15 @@ func TestAddIP_SameIPDifferentAction(t *testing.T) {
 func TestAddIP_WithPorts_TracksIPPorts(t *testing.T) {
 	fw, _ := newTestFirewall()
 	ip := net.ParseIP("10.0.0.1")
-	ports := []uint16{80, 443}
+	ports := []config.Port{
+		{Value: 80, Protocol: config.ProtocolTCP},
+		{Value: 443, Protocol: config.ProtocolTCP},
+	}
 
 	added, err := fw.AddIP(ip, config.ActionAllow, ports)
 	require.NoError(t, err)
 	assert.True(t, added)
-	assert.Equal(t, ports, fw.ipPorts[ip.String()])
+	assert.Equal(t, []portProto{{Port: 80, Proto: 6}, {Port: 443, Proto: 6}}, fw.ipPorts[ip.String()])
 }
 
 func TestAddIP_WithoutPorts_CleansUpIPPorts(t *testing.T) {
@@ -163,7 +166,7 @@ func TestAddIP_WithoutPorts_CleansUpIPPorts(t *testing.T) {
 	ip := net.ParseIP("10.0.0.1")
 
 	// Pre-populate ipPorts as if a previous call added ports
-	fw.ipPorts[ip.String()] = []uint16{80}
+	fw.ipPorts[ip.String()] = []portProto{{Port: 80, Proto: 6}}
 
 	added, err := fw.AddIP(ip, config.ActionAllow, nil)
 	require.NoError(t, err)
@@ -177,7 +180,7 @@ func TestRemoveIP_WithTrackedPorts(t *testing.T) {
 	ip := net.ParseIP("10.0.0.1")
 
 	// Pre-populate ipPorts
-	fw.ipPorts[ip.String()] = []uint16{80, 443}
+	fw.ipPorts[ip.String()] = []portProto{{Port: 80, Proto: 6}, {Port: 443, Proto: 6}}
 
 	err := fw.RemoveIP(ip)
 	require.NoError(t, err)
@@ -198,14 +201,14 @@ func TestUpdateAllowlistTC_IPv4Wildcard_OnlyPortsMap(t *testing.T) {
 
 	cm := config.NewConfigManager()
 	err := cm.LoadConfigFromRules([]config.Rule{
-		{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []uint16{80, 443}, Action: config.ActionAllow},
+		{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []config.Port{{Value: 80, Protocol: config.ProtocolAll}, {Value: 443, Protocol: config.ProtocolAll}}, Action: config.ActionAllow},
 	}, config.ActionDeny)
 	require.NoError(t, err)
 
 	err = fw.UpdateAllowlistTC(cm)
 	require.NoError(t, err)
 
-	assert.Len(t, mocks["ports"].updates, 2, "should update portsMap for each port")
+	assert.Len(t, mocks["ports"].updates, 4, "should update portsMap for each port+protocol combo")
 	assert.Empty(t, mocks["cidrs"].updates, "should NOT update cidrsMap for wildcard with ports")
 }
 
@@ -214,14 +217,14 @@ func TestUpdateAllowlistTC_IPv6Wildcard_OnlyPortsV6Map(t *testing.T) {
 
 	cm := config.NewConfigManager()
 	err := cm.LoadConfigFromRules([]config.Rule{
-		{Type: config.RuleTypeCIDR, Value: "::/0", Ports: []uint16{53}, Action: config.ActionAllow},
+		{Type: config.RuleTypeCIDR, Value: "::/0", Ports: []config.Port{{Value: 53, Protocol: config.ProtocolAll}}, Action: config.ActionAllow},
 	}, config.ActionDeny)
 	require.NoError(t, err)
 
 	err = fw.UpdateAllowlistTC(cm)
 	require.NoError(t, err)
 
-	assert.Len(t, mocks["portsV6"].updates, 1, "should update portsV6Map for each port")
+	assert.Len(t, mocks["portsV6"].updates, 2, "should update portsV6Map for each port+protocol combo")
 	assert.Empty(t, mocks["cidrsV6"].updates, "should NOT update cidrsV6Map for wildcard with ports")
 }
 
@@ -249,7 +252,7 @@ func TestUpdateAllowlistTC_Hostname_CreatesPerIPEntries(t *testing.T) {
 	fw, mocks := newTestFirewall()
 
 	rules := []config.Rule{
-		{Type: config.RuleTypeHostname, Value: "example.com", Ports: []uint16{443}, Action: config.ActionAllow},
+		{Type: config.RuleTypeHostname, Value: "example.com", Ports: []config.Port{{Value: 443, Protocol: config.ProtocolAll}}, Action: config.ActionAllow},
 	}
 
 	cm := config.NewConfigManager()
@@ -270,5 +273,5 @@ func TestUpdateAllowlistTC_Hostname_CreatesPerIPEntries(t *testing.T) {
 
 	// Each resolved IP gets a cidrsMap entry + a portsMap entry (one port per IP)
 	assert.Len(t, mocks["cidrs"].updates, 2, "should add /32 LPM entry per resolved IP")
-	assert.Len(t, mocks["ports"].updates, 2, "should add port entry per resolved IP")
+	assert.Len(t, mocks["ports"].updates, 4, "should add port+protocol entry per resolved IP (1 port × 2 protocols × 2 IPs)")
 }

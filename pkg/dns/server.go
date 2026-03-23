@@ -515,7 +515,7 @@ func (s *Server) extractIPsFromResponse(msg *dns.Msg) ([]net.IP, uint32) {
 }
 
 // addIPToBPFMaps adds an IP to the BPF allow/deny maps
-func (s *Server) addIPToBPFMaps(ip net.IP, hostname string, action config.Action, ports []uint16) error {
+func (s *Server) addIPToBPFMaps(ip net.IP, hostname string, action config.Action, ports []config.Port) error {
 	ipStr := ip.String()
 
 	// Use firewall to add IP
@@ -547,7 +547,7 @@ func (s *Server) removeIPFromBPFMaps(ip net.IP) error {
 }
 
 // getHostnamePorts retrieves port configuration for a hostname
-func (s *Server) getHostnamePorts(hostname string) []uint16 {
+func (s *Server) getHostnamePorts(hostname string) []config.Port {
 	rules := s.config.GetResolvedRules()
 
 	// First try exact match

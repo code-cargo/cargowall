@@ -21,12 +21,12 @@ message CargoWallPolicy {
     CargoWallRuleType type = 1;
     string value = 2;
     CargoWallActionType action = 3;
-    repeated Port ports = 4;
+    repeated PortRule ports = 4;
   }
 
-  message Port {
-    uint32 port = 1;
-    CargoWallProtocol protocol = 2;
+  message PortRule {
+    CargoWallProtocol protocol = 1;
+    uint32 port = 2;
   }
 
   message SudoLockdown {

@@ -151,8 +151,8 @@ func TestAddIP_WithPorts_TracksIPPorts(t *testing.T) {
 	fw, _ := newTestFirewall()
 	ip := net.ParseIP("10.0.0.1")
 	ports := []config.Port{
-		{Value: 80, Protocol: config.ProtocolTCP},
-		{Value: 443, Protocol: config.ProtocolTCP},
+		{Port: 80, Protocol: config.ProtocolTCP},
+		{Port: 443, Protocol: config.ProtocolTCP},
 	}
 
 	added, err := fw.AddIP(ip, config.ActionAllow, ports)
@@ -201,7 +201,7 @@ func TestUpdateAllowlistTC_IPv4Wildcard_OnlyPortsMap(t *testing.T) {
 
 	cm := config.NewConfigManager()
 	err := cm.LoadConfigFromRules([]config.Rule{
-		{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []config.Port{{Value: 80, Protocol: config.ProtocolAll}, {Value: 443, Protocol: config.ProtocolAll}}, Action: config.ActionAllow},
+		{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}, Action: config.ActionAllow},
 	}, config.ActionDeny)
 	require.NoError(t, err)
 
@@ -217,7 +217,7 @@ func TestUpdateAllowlistTC_IPv6Wildcard_OnlyPortsV6Map(t *testing.T) {
 
 	cm := config.NewConfigManager()
 	err := cm.LoadConfigFromRules([]config.Rule{
-		{Type: config.RuleTypeCIDR, Value: "::/0", Ports: []config.Port{{Value: 53, Protocol: config.ProtocolAll}}, Action: config.ActionAllow},
+		{Type: config.RuleTypeCIDR, Value: "::/0", Ports: []config.Port{{Port: 53, Protocol: config.ProtocolAll}}, Action: config.ActionAllow},
 	}, config.ActionDeny)
 	require.NoError(t, err)
 
@@ -252,7 +252,7 @@ func TestUpdateAllowlistTC_Hostname_CreatesPerIPEntries(t *testing.T) {
 	fw, mocks := newTestFirewall()
 
 	rules := []config.Rule{
-		{Type: config.RuleTypeHostname, Value: "example.com", Ports: []config.Port{{Value: 443, Protocol: config.ProtocolAll}}, Action: config.ActionAllow},
+		{Type: config.RuleTypeHostname, Value: "example.com", Ports: []config.Port{{Port: 443, Protocol: config.ProtocolAll}}, Action: config.ActionAllow},
 	}
 
 	cm := config.NewConfigManager()

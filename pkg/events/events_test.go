@@ -193,8 +193,8 @@ func TestConflictHandling(t *testing.T) {
 			name:          "hostname_allow_vs_cidr_deny_with_ports",
 			defaultAction: config.ActionAllow,
 			rules: []config.Rule{
-				{Type: config.RuleTypeHostname, Value: "app.com", Action: config.ActionAllow, Ports: []config.Port{{Value: 443, Protocol: config.ProtocolAll}}},
-				{Type: config.RuleTypeCIDR, Value: "172.16.0.0/16", Action: config.ActionDeny, Ports: []config.Port{{Value: 80, Protocol: config.ProtocolAll}}},
+				{Type: config.RuleTypeHostname, Value: "app.com", Action: config.ActionAllow, Ports: []config.Port{{Port: 443, Protocol: config.ProtocolAll}}},
+				{Type: config.RuleTypeCIDR, Value: "172.16.0.0/16", Action: config.ActionDeny, Ports: []config.Port{{Port: 80, Protocol: config.ProtocolAll}}},
 			},
 			dnsHostname:      "app.com",
 			dnsIP:            "172.16.0.100",

@@ -313,14 +313,14 @@ func expandPorts(ports []config.Port) []portProto {
 	for _, p := range ports {
 		switch p.Protocol {
 		case config.ProtocolTCP:
-			result = append(result, portProto{Port: p.Value, Proto: protoTCP})
+			result = append(result, portProto{Port: p.Port, Proto: protoTCP})
 		case config.ProtocolUDP:
-			result = append(result, portProto{Port: p.Value, Proto: protoUDP})
+			result = append(result, portProto{Port: p.Port, Proto: protoUDP})
 		case config.ProtocolAll:
-			result = append(result, portProto{Port: p.Value, Proto: protoTCP})
-			result = append(result, portProto{Port: p.Value, Proto: protoUDP})
+			result = append(result, portProto{Port: p.Port, Proto: protoTCP})
+			result = append(result, portProto{Port: p.Port, Proto: protoUDP})
 		default:
-			slog.Warn("Unknown protocol in port rule, skipping", "port", p.Value, "protocol", p.Protocol)
+			slog.Warn("Unknown protocol in port rule, skipping", "port", p.Port, "protocol", p.Protocol)
 		}
 	}
 	return result

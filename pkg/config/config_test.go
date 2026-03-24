@@ -43,7 +43,7 @@ func TestResolveRules_CIDR(t *testing.T) {
 				Rules: []Rule{
 					{Type: RuleTypeCIDR, Value: "192.168.1.0/24", Action: ActionAllow},
 					{Type: RuleTypeCIDR, Value: "10.0.0.0/8", Action: ActionDeny},
-					{Type: RuleTypeCIDR, Value: "172.16.0.0/16", Ports: []Port{{Value: 80, Protocol: ProtocolAll}, {Value: 443, Protocol: ProtocolAll}}, Action: ActionAllow},
+					{Type: RuleTypeCIDR, Value: "172.16.0.0/16", Ports: []Port{{Port: 80, Protocol: ProtocolAll}, {Port: 443, Protocol: ProtocolAll}}, Action: ActionAllow},
 				},
 			},
 			expected: []struct {
@@ -62,7 +62,7 @@ func TestResolveRules_CIDR(t *testing.T) {
 			config: FirewallConfig{
 				Rules: []Rule{
 					{Type: RuleTypeCIDR, Value: "192.168.1.1", Action: ActionAllow},
-					{Type: RuleTypeCIDR, Value: "10.0.0.1", Ports: []Port{{Value: 22, Protocol: ProtocolAll}}, Action: ActionDeny},
+					{Type: RuleTypeCIDR, Value: "10.0.0.1", Ports: []Port{{Port: 22, Protocol: ProtocolAll}}, Action: ActionDeny},
 				},
 			},
 			expected: []struct {
@@ -79,7 +79,7 @@ func TestResolveRules_CIDR(t *testing.T) {
 			name: "wildcard CIDR",
 			config: FirewallConfig{
 				Rules: []Rule{
-					{Type: RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []Port{{Value: 80, Protocol: ProtocolAll}, {Value: 443, Protocol: ProtocolAll}}, Action: ActionAllow},
+					{Type: RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []Port{{Port: 80, Protocol: ProtocolAll}, {Port: 443, Protocol: ProtocolAll}}, Action: ActionAllow},
 				},
 			},
 			expected: []struct {
@@ -154,7 +154,7 @@ func TestResolveRules_Mixed(t *testing.T) {
 		Rules: []Rule{
 			{Type: RuleTypeCIDR, Value: "192.168.0.0/16", Action: ActionAllow},
 			{Type: RuleTypeHostname, Value: "localhost", Action: ActionAllow},
-			{Type: RuleTypeCIDR, Value: "10.0.0.1", Ports: []Port{{Value: 22, Protocol: ProtocolAll}}, Action: ActionDeny},
+			{Type: RuleTypeCIDR, Value: "10.0.0.1", Ports: []Port{{Port: 22, Protocol: ProtocolAll}}, Action: ActionDeny},
 		},
 		DefaultAction: ActionDeny,
 	}
@@ -208,7 +208,7 @@ func TestResolveRules_Mixed(t *testing.T) {
 			t.Errorf("Rule[2].IPNet.IP = %v, want 10.0.0.1", cm.resolvedRules[2].IPNet.IP)
 		}
 	}
-	expectedPort := Port{Value: 22, Protocol: ProtocolAll}
+	expectedPort := Port{Port: 22, Protocol: ProtocolAll}
 	if len(cm.resolvedRules[2].Ports) != 1 || cm.resolvedRules[2].Ports[0] != expectedPort {
 		t.Errorf("Rule[2].Ports = %v, want [%v]", cm.resolvedRules[2].Ports, expectedPort)
 	}
@@ -335,11 +335,11 @@ func TestParseHostWithPorts(t *testing.T) {
 		wantPorts []Port
 	}{
 		{"github.com", "github.com", nil},
-		{"github.com:443", "github.com", []Port{{Value: 443, Protocol: ProtocolAll}}},
-		{"github.com:443;80", "github.com", []Port{{Value: 443, Protocol: ProtocolAll}, {Value: 80, Protocol: ProtocolAll}}},
-		{"10.0.0.0/8:443;80", "10.0.0.0/8", []Port{{Value: 443, Protocol: ProtocolAll}, {Value: 80, Protocol: ProtocolAll}}},
+		{"github.com:443", "github.com", []Port{{Port: 443, Protocol: ProtocolAll}}},
+		{"github.com:443;80", "github.com", []Port{{Port: 443, Protocol: ProtocolAll}, {Port: 80, Protocol: ProtocolAll}}},
+		{"10.0.0.0/8:443;80", "10.0.0.0/8", []Port{{Port: 443, Protocol: ProtocolAll}, {Port: 80, Protocol: ProtocolAll}}},
 		{"10.0.0.0/8", "10.0.0.0/8", nil},
-		{"example.com:443;80;8080", "example.com", []Port{{Value: 443, Protocol: ProtocolAll}, {Value: 80, Protocol: ProtocolAll}, {Value: 8080, Protocol: ProtocolAll}}},
+		{"example.com:443;80;8080", "example.com", []Port{{Port: 443, Protocol: ProtocolAll}, {Port: 80, Protocol: ProtocolAll}, {Port: 8080, Protocol: ProtocolAll}}},
 	}
 
 	for _, tt := range tests {
@@ -420,7 +420,7 @@ func TestLoadFromEnv_WithPorts(t *testing.T) {
 	if r.Value != "github.com" || r.Type != RuleTypeHostname || r.Action != ActionAllow {
 		t.Errorf("rule[0] = %+v, want hostname/github.com/allow", r)
 	}
-	if !reflect.DeepEqual(r.Ports, []Port{{Value: 443, Protocol: ProtocolAll}, {Value: 80, Protocol: ProtocolAll}}) {
+	if !reflect.DeepEqual(r.Ports, []Port{{Port: 443, Protocol: ProtocolAll}, {Port: 80, Protocol: ProtocolAll}}) {
 		t.Errorf("rule[0].Ports = %v, want [{443 all} {80 all}]", r.Ports)
 	}
 
@@ -429,7 +429,7 @@ func TestLoadFromEnv_WithPorts(t *testing.T) {
 	if r.Value != "npmjs.org" || r.Type != RuleTypeHostname || r.Action != ActionAllow {
 		t.Errorf("rule[1] = %+v, want hostname/npmjs.org/allow", r)
 	}
-	if !reflect.DeepEqual(r.Ports, []Port{{Value: 443, Protocol: ProtocolAll}}) {
+	if !reflect.DeepEqual(r.Ports, []Port{{Port: 443, Protocol: ProtocolAll}}) {
 		t.Errorf("rule[1].Ports = %v, want [{443 all}]", r.Ports)
 	}
 
@@ -438,7 +438,7 @@ func TestLoadFromEnv_WithPorts(t *testing.T) {
 	if r.Value != "10.0.0.0/8" || r.Type != RuleTypeCIDR || r.Action != ActionAllow {
 		t.Errorf("rule[2] = %+v, want cidr/10.0.0.0/8/allow", r)
 	}
-	if !reflect.DeepEqual(r.Ports, []Port{{Value: 443, Protocol: ProtocolAll}, {Value: 80, Protocol: ProtocolAll}}) {
+	if !reflect.DeepEqual(r.Ports, []Port{{Port: 443, Protocol: ProtocolAll}, {Port: 80, Protocol: ProtocolAll}}) {
 		t.Errorf("rule[2].Ports = %v, want [{443 all} {80 all}]", r.Ports)
 	}
 }
@@ -487,7 +487,7 @@ func TestLoadFromEnv_WildcardNormalization(t *testing.T) {
 	if cm.config.Rules[0].Value != "github.com" {
 		t.Errorf("rule[0].Value = %q, want %q (wildcard should be normalized)", cm.config.Rules[0].Value, "github.com")
 	}
-	if !reflect.DeepEqual(cm.config.Rules[0].Ports, []Port{{Value: 443, Protocol: ProtocolAll}}) {
+	if !reflect.DeepEqual(cm.config.Rules[0].Ports, []Port{{Port: 443, Protocol: ProtocolAll}}) {
 		t.Errorf("rule[0].Ports = %v, want [{443 all}]", cm.config.Rules[0].Ports)
 	}
 
@@ -501,7 +501,7 @@ func TestGetTrackedHostnames(t *testing.T) {
 	cm := NewConfigManager()
 	err := cm.LoadConfigFromRules([]Rule{
 		{Type: RuleTypeHostname, Value: "github.com", Action: ActionAllow},
-		{Type: RuleTypeHostname, Value: "npmjs.org", Ports: []Port{{Value: 443, Protocol: ProtocolAll}}, Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "npmjs.org", Ports: []Port{{Port: 443, Protocol: ProtocolAll}}, Action: ActionAllow},
 		{Type: RuleTypeCIDR, Value: "10.0.0.0/8", Action: ActionDeny},
 	}, ActionDeny)
 	if err != nil {
@@ -561,7 +561,7 @@ func TestEnsureDNSAllowed(t *testing.T) {
 		if rule.Action != ActionAllow {
 			t.Errorf("rule[%d].Action = %q, want allow", initialRuleCount+i, rule.Action)
 		}
-		if !reflect.DeepEqual(rule.Ports, []Port{{Value: 53, Protocol: ProtocolUDP}}) {
+		if !reflect.DeepEqual(rule.Ports, []Port{{Port: 53, Protocol: ProtocolUDP}}) {
 			t.Errorf("rule[%d].Ports = %v, want [{53 udp}]", initialRuleCount+i, rule.Ports)
 		}
 		if rule.AutoAddedType != AutoAddedTypeDNS {
@@ -573,7 +573,7 @@ func TestEnsureDNSAllowed(t *testing.T) {
 	resolvedRules := cm.GetResolvedRules()
 	found := 0
 	for _, r := range resolvedRules {
-		if r.Type == RuleTypeCIDR && r.Action == ActionAllow && len(r.Ports) == 1 && r.Ports[0] == (Port{Value: 53, Protocol: ProtocolUDP}) {
+		if r.Type == RuleTypeCIDR && r.Action == ActionAllow && len(r.Ports) == 1 && r.Ports[0] == (Port{Port: 53, Protocol: ProtocolUDP}) {
 			if r.AutoAddedType != AutoAddedTypeDNS {
 				t.Errorf("resolved rule AutoAddedType = %q, want %q", r.AutoAddedType, AutoAddedTypeDNS)
 			}
@@ -588,7 +588,7 @@ func TestEnsureDNSAllowed(t *testing.T) {
 func TestEnsureDNSAllowed_NoDuplicates(t *testing.T) {
 	cm := NewConfigManager()
 	err := cm.LoadConfigFromRules([]Rule{
-		{Type: RuleTypeCIDR, Value: "8.8.8.8/32", Ports: []Port{{Value: 53, Protocol: ProtocolUDP}}, Action: ActionAllow},
+		{Type: RuleTypeCIDR, Value: "8.8.8.8/32", Ports: []Port{{Port: 53, Protocol: ProtocolUDP}}, Action: ActionAllow},
 	}, ActionDeny)
 	if err != nil {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
@@ -614,7 +614,7 @@ func TestEnsureDNSAllowed_CoveredByCIDR(t *testing.T) {
 	cm := NewConfigManager()
 	// 0.0.0.0/0:53 covers everything on port 53
 	err := cm.LoadConfigFromRules([]Rule{
-		{Type: RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []Port{{Value: 53, Protocol: ProtocolUDP}}, Action: ActionAllow},
+		{Type: RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []Port{{Port: 53, Protocol: ProtocolUDP}}, Action: ActionAllow},
 	}, ActionDeny)
 	if err != nil {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
@@ -637,7 +637,7 @@ func TestEnsureInfraAllowed_SetsAutoAddedType(t *testing.T) {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
 	}
 
-	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{{Value: 80, Protocol: ProtocolTCP}})
+	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{{Port: 80, Protocol: ProtocolTCP}})
 
 	if len(cm.config.Rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(cm.config.Rules))
@@ -654,7 +654,7 @@ func TestEnsureHostnameAllowed_SetsAutoAddedType(t *testing.T) {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
 	}
 
-	cm.EnsureHostnameAllowed("github.com", []Port{{Value: 443, Protocol: ProtocolTCP}}, AutoAddedTypeGitHubService)
+	cm.EnsureHostnameAllowed("github.com", []Port{{Port: 443, Protocol: ProtocolTCP}}, AutoAddedTypeGitHubService)
 
 	if len(cm.config.Rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(cm.config.Rules))
@@ -662,7 +662,7 @@ func TestEnsureHostnameAllowed_SetsAutoAddedType(t *testing.T) {
 	if cm.config.Rules[0].AutoAddedType != AutoAddedTypeGitHubService {
 		t.Errorf("AutoAddedType = %q, want %q", cm.config.Rules[0].AutoAddedType, AutoAddedTypeGitHubService)
 	}
-	if !reflect.DeepEqual(cm.config.Rules[0].Ports, []Port{{Value: 443, Protocol: ProtocolTCP}}) {
+	if !reflect.DeepEqual(cm.config.Rules[0].Ports, []Port{{Port: 443, Protocol: ProtocolTCP}}) {
 		t.Errorf("Ports = %v, want [{443 tcp}]", cm.config.Rules[0].Ports)
 	}
 
@@ -673,7 +673,7 @@ func TestEnsureHostnameAllowed_SetsAutoAddedType(t *testing.T) {
 	if resolvedRules[0].AutoAddedType != AutoAddedTypeGitHubService {
 		t.Errorf("resolved AutoAddedType = %q, want %q", resolvedRules[0].AutoAddedType, AutoAddedTypeGitHubService)
 	}
-	if !reflect.DeepEqual(resolvedRules[0].Ports, []Port{{Value: 443, Protocol: ProtocolTCP}}) {
+	if !reflect.DeepEqual(resolvedRules[0].Ports, []Port{{Port: 443, Protocol: ProtocolTCP}}) {
 		t.Errorf("resolved Ports = %v, want [{443 tcp}]", resolvedRules[0].Ports)
 	}
 }
@@ -685,7 +685,7 @@ func TestEnsureHostnameAllowed_AzureInfrastructureType(t *testing.T) {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
 	}
 
-	cm.EnsureHostnameAllowed("blob.core.windows.net", []Port{{Value: 443, Protocol: ProtocolTCP}}, AutoAddedTypeAzureInfrastructure)
+	cm.EnsureHostnameAllowed("blob.core.windows.net", []Port{{Port: 443, Protocol: ProtocolTCP}}, AutoAddedTypeAzureInfrastructure)
 
 	if len(cm.config.Rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(cm.config.Rules))
@@ -702,8 +702,8 @@ func TestGetAutoAllowedTypeForHostname(t *testing.T) {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
 	}
 
-	cm.EnsureHostnameAllowed("github.com", []Port{{Value: 443, Protocol: ProtocolTCP}}, AutoAddedTypeGitHubService)
-	cm.EnsureHostnameAllowed("blob.core.windows.net", []Port{{Value: 443, Protocol: ProtocolTCP}}, AutoAddedTypeAzureInfrastructure)
+	cm.EnsureHostnameAllowed("github.com", []Port{{Port: 443, Protocol: ProtocolTCP}}, AutoAddedTypeGitHubService)
+	cm.EnsureHostnameAllowed("blob.core.windows.net", []Port{{Port: 443, Protocol: ProtocolTCP}}, AutoAddedTypeAzureInfrastructure)
 
 	// Exact match
 	if got := cm.GetAutoAllowedTypeForHostname("github.com"); got != AutoAddedTypeGitHubService {
@@ -734,8 +734,8 @@ func TestGetAutoAllowedType(t *testing.T) {
 
 	// Add auto-added rules
 	cm.EnsureDNSAllowed([]string{"8.8.8.8"})
-	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{{Value: 80, Protocol: ProtocolTCP}})
-	cm.EnsureHostnameAllowed("actions.githubusercontent.com", []Port{{Value: 443, Protocol: ProtocolTCP}}, AutoAddedTypeGitHubService)
+	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{{Port: 80, Protocol: ProtocolTCP}})
+	cm.EnsureHostnameAllowed("actions.githubusercontent.com", []Port{{Port: 443, Protocol: ProtocolTCP}}, AutoAddedTypeGitHubService)
 
 	// DNS rule should match on port 53
 	if got := cm.GetAutoAllowedType("8.8.8.8", 53, ""); got != AutoAddedTypeDNS {
@@ -781,7 +781,7 @@ func TestLoadConfigFromCargoWall_SudoLockdown(t *testing.T) {
 				Type:   datapb.CargoWallRuleType_CARGO_WALL_RULE_TYPE_HOSTNAME,
 				Value:  "github.com",
 				Action: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW,
-				Ports: []*cargowallv1pb.CargoWallPolicy_Port{
+				Ports: []*cargowallv1pb.CargoWallPolicy_PortRule{
 					{Port: 443, Protocol: datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_TCP},
 				},
 			},
@@ -811,7 +811,7 @@ func TestLoadConfigFromCargoWall_SudoLockdown(t *testing.T) {
 	if cm.resolvedRules[0].Value != "github.com" {
 		t.Errorf("rule Value = %q, want github.com", cm.resolvedRules[0].Value)
 	}
-	if !reflect.DeepEqual(cm.resolvedRules[0].Ports, []Port{{Value: 443, Protocol: ProtocolTCP}}) {
+	if !reflect.DeepEqual(cm.resolvedRules[0].Ports, []Port{{Port: 443, Protocol: ProtocolTCP}}) {
 		t.Errorf("rule Ports = %v, want [{443 tcp}]", cm.resolvedRules[0].Ports)
 	}
 }

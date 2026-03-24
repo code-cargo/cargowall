@@ -4,25 +4,25 @@
     {
       "type": "hostname",
       "value": "github.com",
-      "ports": [{"value": 443, "protocol": "tcp"}],
+      "ports": [{"port": 443, "protocol": "tcp"}],
       "action": "allow"
     },
     {
       "type": "hostname",
       "value": "registry.npmjs.org",
-      "ports": [{"value": 443, "protocol": "tcp"}],
+      "ports": [{"port": 443, "protocol": "tcp"}],
       "action": "allow"
     },
     {
       "type": "cidr",
       "value": "8.8.8.8/32",
-      "ports": [{"value": 53, "protocol": "udp"}],
+      "ports": [{"port": 53, "protocol": "udp"}],
       "action": "allow"
     },
     {
       "type": "cidr",
       "value": "8.8.4.4/32",
-      "ports": [{"value": 53, "protocol": "udp"}],
+      "ports": [{"port": 53, "protocol": "udp"}],
       "action": "allow"
     },
     {
@@ -33,7 +33,7 @@
     {
       "type": "hostname",
       "value": "api.example.com",
-      "ports": [{"value": 80, "protocol": "tcp"}, {"value": 443, "protocol": "tcp"}],
+      "ports": [{"port": 80, "protocol": "tcp"}, {"port": 443, "protocol": "tcp"}],
       "action": "allow"
     }
   ],

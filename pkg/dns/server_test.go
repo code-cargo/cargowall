@@ -203,7 +203,7 @@ func TestAddIPToBPFMaps(t *testing.T) {
 	}
 
 	ip := net.ParseIP("192.168.1.1")
-	ports := []config.Port{{Value: 80, Protocol: config.ProtocolAll}, {Value: 443, Protocol: config.ProtocolAll}}
+	ports := []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}
 
 	// Test successful addition
 	mockFw.On("AddIP", ip, config.ActionAllow, ports).Return(true, nil)
@@ -292,7 +292,7 @@ func TestDNSTrackingBeforeRules(t *testing.T) {
 		{
 			Type:   config.RuleTypeHostname,
 			Value:  "nats.nats.svc.cluster.local",
-			Ports:  []config.Port{{Value: 4222, Protocol: config.ProtocolAll}},
+			Ports:  []config.Port{{Port: 4222, Protocol: config.ProtocolAll}},
 			Action: config.ActionAllow,
 		},
 	}
@@ -303,7 +303,7 @@ func TestDNSTrackingBeforeRules(t *testing.T) {
 	mockFirewall.On("AddIP",
 		net.ParseIP("10.15.1.105"),
 		config.ActionAllow,
-		[]config.Port{{Value: 4222, Protocol: config.ProtocolAll}},
+		[]config.Port{{Port: 4222, Protocol: config.ProtocolAll}},
 	).Return(true, nil).Once()
 
 	// Call ApplyRulesToTrackedHostnames - this should add the tracked IP
@@ -319,7 +319,7 @@ func TestHostnameIPTracking(t *testing.T) {
 
 	// Setup config with a tracked hostname
 	err := cfg.LoadConfigFromRules([]config.Rule{
-		{Type: config.RuleTypeHostname, Value: "example.com", Action: config.ActionAllow, Ports: []config.Port{{Value: 443, Protocol: config.ProtocolAll}}},
+		{Type: config.RuleTypeHostname, Value: "example.com", Action: config.ActionAllow, Ports: []config.Port{{Port: 443, Protocol: config.ProtocolAll}}},
 	}, config.ActionDeny)
 	require.NoError(t, err)
 
@@ -348,8 +348,8 @@ func TestHostnameIPTracking(t *testing.T) {
 	server.dnsCache.Put(cacheKey, &dnsCacheEntry{msg: firstResp.Copy()}, 5*time.Minute)
 
 	// Expect AddIP for both IPs
-	mockFw.On("AddIP", net.ParseIP("192.168.1.1"), config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
-	mockFw.On("AddIP", net.ParseIP("192.168.1.2"), config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
+	mockFw.On("AddIP", net.ParseIP("192.168.1.1"), config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
+	mockFw.On("AddIP", net.ParseIP("192.168.1.2"), config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
 
 	query := new(dns.Msg)
 	query.SetQuestion("example.com.", dns.TypeA)
@@ -386,7 +386,7 @@ func TestHostnameIPTracking(t *testing.T) {
 	server.dnsCache.Put(cacheKey, &dnsCacheEntry{msg: newResp.Copy()}, 5*time.Minute)
 
 	// Expect AddIP for new IP only — no RemoveIP calls
-	mockFw.On("AddIP", net.ParseIP("192.168.1.3"), config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
+	mockFw.On("AddIP", net.ParseIP("192.168.1.3"), config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
 
 	query2 := new(dns.Msg)
 	query2.SetQuestion("example.com.", dns.TypeA)
@@ -480,13 +480,13 @@ func TestGetHostnamePorts(t *testing.T) {
 			Type:   config.RuleTypeHostname,
 			Value:  "api.example.com",
 			Action: config.ActionAllow,
-			Ports:  []config.Port{{Value: 443, Protocol: config.ProtocolAll}, {Value: 8443, Protocol: config.ProtocolAll}},
+			Ports:  []config.Port{{Port: 443, Protocol: config.ProtocolAll}, {Port: 8443, Protocol: config.ProtocolAll}},
 		},
 		{
 			Type:   config.RuleTypeHostname,
 			Value:  "example.com",
 			Action: config.ActionAllow,
-			Ports:  []config.Port{{Value: 80, Protocol: config.ProtocolAll}, {Value: 443, Protocol: config.ProtocolAll}},
+			Ports:  []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}},
 		},
 	}
 	err := cfg.LoadConfigFromRules(rules, config.ActionDeny)
@@ -496,9 +496,9 @@ func TestGetHostnamePorts(t *testing.T) {
 		hostname string
 		expected []config.Port
 	}{
-		{"api.example.com", []config.Port{{Value: 443, Protocol: config.ProtocolAll}, {Value: 8443, Protocol: config.ProtocolAll}}},
-		{"example.com", []config.Port{{Value: 80, Protocol: config.ProtocolAll}, {Value: 443, Protocol: config.ProtocolAll}}},
-		{"sub.example.com", []config.Port{{Value: 80, Protocol: config.ProtocolAll}, {Value: 443, Protocol: config.ProtocolAll}}}, // Should match parent domain
+		{"api.example.com", []config.Port{{Port: 443, Protocol: config.ProtocolAll}, {Port: 8443, Protocol: config.ProtocolAll}}},
+		{"example.com", []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}},
+		{"sub.example.com", []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}}, // Should match parent domain
 		{"other.com", nil},
 	}
 
@@ -604,7 +604,7 @@ func TestIPUpdateWithoutTTLRemoval(t *testing.T) {
 			Type:   config.RuleTypeHostname,
 			Value:  "persistent.example.com",
 			Action: config.ActionAllow,
-			Ports:  []config.Port{{Value: 443, Protocol: config.ProtocolAll}},
+			Ports:  []config.Port{{Port: 443, Protocol: config.ProtocolAll}},
 		},
 	}
 	err := cfg.LoadConfigFromRules(rules, config.ActionDeny)
@@ -612,9 +612,9 @@ func TestIPUpdateWithoutTTLRemoval(t *testing.T) {
 
 	// Add an IP for the hostname
 	ip := net.ParseIP("10.0.0.1")
-	mockFw.On("AddIP", ip, config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
+	mockFw.On("AddIP", ip, config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
 
-	err = server.addIPToBPFMaps(ip, "persistent.example.com", config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}}) // 30 second TTL
+	err = server.addIPToBPFMaps(ip, "persistent.example.com", config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}}) // 30 second TTL
 	assert.NoError(t, err)
 
 	// Track the IP
@@ -672,7 +672,7 @@ func TestApplyRulesToTrackedHostnames(t *testing.T) {
 		{
 			Type:   config.RuleTypeHostname,
 			Value:  "nats.nats.svc.cluster.local",
-			Ports:  []config.Port{{Value: 4222, Protocol: config.ProtocolAll}, {Value: 6222, Protocol: config.ProtocolAll}, {Value: 8222, Protocol: config.ProtocolAll}},
+			Ports:  []config.Port{{Port: 4222, Protocol: config.ProtocolAll}, {Port: 6222, Protocol: config.ProtocolAll}, {Port: 8222, Protocol: config.ProtocolAll}},
 			Action: config.ActionAllow,
 		},
 	}
@@ -683,7 +683,7 @@ func TestApplyRulesToTrackedHostnames(t *testing.T) {
 	mockFirewall.On("AddIP",
 		net.ParseIP("10.15.1.105"),
 		config.ActionAllow,
-		[]config.Port{{Value: 4222, Protocol: config.ProtocolAll}, {Value: 6222, Protocol: config.ProtocolAll}, {Value: 8222, Protocol: config.ProtocolAll}},
+		[]config.Port{{Port: 4222, Protocol: config.ProtocolAll}, {Port: 6222, Protocol: config.ProtocolAll}, {Port: 8222, Protocol: config.ProtocolAll}},
 	).Return(true, nil).Once()
 
 	// Call ApplyRulesToTrackedHostnames - this should apply rules to the tracked DNS mapping
@@ -972,7 +972,7 @@ func TestHandleDNSQuery_FilteringAllowedDomainPasses(t *testing.T) {
 func TestHandleDNSQuery_FirewallUpdateOnCacheHit(t *testing.T) {
 	cfg := config.NewConfigManager()
 	err := cfg.LoadConfigFromRules([]config.Rule{
-		{Type: config.RuleTypeHostname, Value: "tracked.example.com", Action: config.ActionAllow, Ports: []config.Port{{Value: 443, Protocol: config.ProtocolAll}}},
+		{Type: config.RuleTypeHostname, Value: "tracked.example.com", Action: config.ActionAllow, Ports: []config.Port{{Port: 443, Protocol: config.ProtocolAll}}},
 	}, config.ActionDeny)
 	require.NoError(t, err)
 
@@ -987,7 +987,7 @@ func TestHandleDNSQuery_FirewallUpdateOnCacheHit(t *testing.T) {
 	server.dnsCache.Put(cacheKey, &dnsCacheEntry{msg: cachedResp.Copy()}, 5*time.Minute)
 
 	// Expect AddIP for the tracked hostname
-	mockFw.On("AddIP", net.ParseIP("10.1.1.1"), config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
+	mockFw.On("AddIP", net.ParseIP("10.1.1.1"), config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
 
 	query := new(dns.Msg)
 	query.SetQuestion("tracked.example.com.", dns.TypeA)
@@ -1147,9 +1147,9 @@ func TestAddIPToBPFMaps_FirewallError(t *testing.T) {
 
 	ip := net.ParseIP("10.0.0.1")
 	expectedErr := errors.New("bpf map full")
-	mockFw.On("AddIP", ip, config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}}).Return(false, expectedErr)
+	mockFw.On("AddIP", ip, config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}}).Return(false, expectedErr)
 
-	err := server.addIPToBPFMaps(ip, "example.com", config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}})
+	err := server.addIPToBPFMaps(ip, "example.com", config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}})
 	assert.ErrorIs(t, err, expectedErr)
 }
 
@@ -1187,7 +1187,7 @@ func TestRemoveIPFromBPFMaps_FirewallError(t *testing.T) {
 func TestHandleDNSQuery_PreservesIPv6WhenAResponseArrives(t *testing.T) {
 	cfg := config.NewConfigManager()
 	err := cfg.LoadConfigFromRules([]config.Rule{
-		{Type: config.RuleTypeHostname, Value: "dual.example.com", Action: config.ActionAllow, Ports: []config.Port{{Value: 443, Protocol: config.ProtocolAll}}},
+		{Type: config.RuleTypeHostname, Value: "dual.example.com", Action: config.ActionAllow, Ports: []config.Port{{Port: 443, Protocol: config.ProtocolAll}}},
 	}, config.ActionDeny)
 	require.NoError(t, err)
 
@@ -1207,7 +1207,7 @@ func TestHandleDNSQuery_PreservesIPv6WhenAResponseArrives(t *testing.T) {
 	server.dnsCache.Put(cacheKey, &dnsCacheEntry{msg: cachedResp.Copy()}, 5*time.Minute)
 
 	// Expect AddIP for the new IPv4
-	mockFw.On("AddIP", net.ParseIP("10.2.3.4"), config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
+	mockFw.On("AddIP", net.ParseIP("10.2.3.4"), config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
 
 	query := new(dns.Msg)
 	query.SetQuestion("dual.example.com.", dns.TypeA)
@@ -1232,7 +1232,7 @@ func TestHandleDNSQuery_PreservesIPv6WhenAResponseArrives(t *testing.T) {
 func TestHandleDNSQuery_PreservesIPv4WhenAAAAResponseArrives(t *testing.T) {
 	cfg := config.NewConfigManager()
 	err := cfg.LoadConfigFromRules([]config.Rule{
-		{Type: config.RuleTypeHostname, Value: "dual6.example.com", Action: config.ActionAllow, Ports: []config.Port{{Value: 443, Protocol: config.ProtocolAll}}},
+		{Type: config.RuleTypeHostname, Value: "dual6.example.com", Action: config.ActionAllow, Ports: []config.Port{{Port: 443, Protocol: config.ProtocolAll}}},
 	}, config.ActionDeny)
 	require.NoError(t, err)
 
@@ -1263,7 +1263,7 @@ func TestHandleDNSQuery_PreservesIPv4WhenAAAAResponseArrives(t *testing.T) {
 	server.dnsCache.Put(cacheKey, &dnsCacheEntry{msg: aaaaResp.Copy()}, 5*time.Minute)
 
 	// Expect AddIP for the new IPv6
-	mockFw.On("AddIP", net.ParseIP("2001:db8::99"), config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
+	mockFw.On("AddIP", net.ParseIP("2001:db8::99"), config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
 
 	query := new(dns.Msg)
 	query.SetQuestion("dual6.example.com.", dns.TypeAAAA)
@@ -1292,7 +1292,7 @@ func TestHandleDNSQuery_PreservesIPv4WhenAAAAResponseArrives(t *testing.T) {
 func TestHandleDNSQuery_RoundRobinIPsAccumulate(t *testing.T) {
 	cfg := config.NewConfigManager()
 	err := cfg.LoadConfigFromRules([]config.Rule{
-		{Type: config.RuleTypeHostname, Value: "cdn.example.com", Action: config.ActionAllow, Ports: []config.Port{{Value: 443, Protocol: config.ProtocolAll}}},
+		{Type: config.RuleTypeHostname, Value: "cdn.example.com", Action: config.ActionAllow, Ports: []config.Port{{Port: 443, Protocol: config.ProtocolAll}}},
 	}, config.ActionDeny)
 	require.NoError(t, err)
 
@@ -1312,7 +1312,7 @@ func TestHandleDNSQuery_RoundRobinIPsAccumulate(t *testing.T) {
 		resp := makeCachedResponse("cdn.example.com.", ipStr)
 		server.dnsCache.Put(cacheKey, &dnsCacheEntry{msg: resp.Copy()}, 5*time.Minute)
 
-		mockFw.On("AddIP", net.ParseIP(ipStr), config.ActionAllow, []config.Port{{Value: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
+		mockFw.On("AddIP", net.ParseIP(ipStr), config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
 
 		query := new(dns.Msg)
 		query.SetQuestion("cdn.example.com.", dns.TypeA)

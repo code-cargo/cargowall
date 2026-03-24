@@ -68,10 +68,10 @@ const (
 
 // Common port definitions for infrastructure auto-allow rules.
 var (
-	PortHTTPS      = Port{Value: 443, Protocol: ProtocolTCP}
-	PortHTTP       = Port{Value: 80, Protocol: ProtocolTCP}
-	PortDNS        = Port{Value: 53, Protocol: ProtocolUDP}
-	PortWireServer = Port{Value: 32526, Protocol: ProtocolTCP}
+	PortHTTPS      = Port{Port: 443, Protocol: ProtocolTCP}
+	PortHTTP       = Port{Port: 80, Protocol: ProtocolTCP}
+	PortDNS        = Port{Port: 53, Protocol: ProtocolUDP}
+	PortWireServer = Port{Port: 32526, Protocol: ProtocolTCP}
 )
 
 // FirewallConfig represents the configuration for the L4 firewall
@@ -98,7 +98,7 @@ type Rule struct {
 
 // Port represents a firewall Port entry
 type Port struct {
-	Value    uint16       `json:"value"`
+	Port     uint16       `json:"port"`
 	Protocol ProtocolType `json:"protocol"`
 }
 
@@ -187,7 +187,7 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 				return fmt.Errorf("port %d: %w", pbPort.GetPort(), err)
 			}
 			rule.Ports = append(rule.Ports, Port{
-				Value:    uint16(pbPort.GetPort()),
+				Port:     uint16(pbPort.GetPort()),
 				Protocol: proto,
 			})
 		}
@@ -427,7 +427,7 @@ func parseHostWithPorts(entry string) (string, []Port) {
 			// Not a valid port — treat the whole entry as a host with no ports
 			return entry, nil
 		}
-		ports = append(ports, Port{Value: uint16(port), Protocol: ProtocolAll})
+		ports = append(ports, Port{Port: uint16(port), Protocol: ProtocolAll})
 	}
 
 	if len(ports) == 0 {
@@ -631,7 +631,7 @@ func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameActio
 			hasOverlap := false
 			for _, hp := range hostnamePorts {
 				for _, cp := range mostSpecificRule.Ports {
-					if hp.Value == cp.Value && protocolsOverlap(hp.Protocol, cp.Protocol) {
+					if hp.Port == cp.Port && protocolsOverlap(hp.Protocol, cp.Protocol) {
 						hasOverlap = true
 						break
 					}
@@ -856,7 +856,7 @@ func (cm *Manager) hasCIDRRule(ipStr string, port Port) bool {
 			return true
 		}
 		for _, p := range rule.Ports {
-			if p.Value == port.Value && protocolsOverlap(p.Protocol, port.Protocol) {
+			if p.Port == port.Port && protocolsOverlap(p.Protocol, port.Protocol) {
 				return true
 			}
 		}
@@ -952,7 +952,7 @@ func (cm *Manager) GetAutoAllowedType(ip string, port uint16, hostname string) A
 		if len(rule.Ports) > 0 {
 			portMatch := false
 			for _, p := range rule.Ports {
-				if p.Value == port {
+				if p.Port == port {
 					portMatch = true
 					break
 				}

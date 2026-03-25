@@ -1,8 +1,6 @@
 name: release
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -12,14 +10,12 @@ on:
         description: "Source ref to build from - commit SHA, branch, or tag (defaults to main)"
         required: false
         type: string
-
-permissions:
-  contents: write
-
 jobs:
   build:
     name: Build (${{ matrix.arch }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         arch: [amd64, arm64]
@@ -65,12 +61,22 @@ jobs:
     name: Upload Release Assets
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: artifacts/cargowall-linux-*
 
       - name: Create checksums
         working-directory: artifacts
@@ -96,7 +102,8 @@ jobs:
             --title "${{ steps.tag.outputs.tag }}" \
             --target "$TARGET" \
             --generate-notes \
-            --prerelease
+            --prerelease \
+            --draft
 
       - name: Upload release assets
         env:

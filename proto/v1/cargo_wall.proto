@@ -30,7 +30,7 @@ message CargoWallPolicy {
   }
 
   message SudoLockdown {
-    bool enable = 1;
+    bool enabled = 1;
     repeated string allow_commands = 2;
   }
 }

@@ -104,7 +104,7 @@ type Port struct {
 
 // SudoLockdownSettings holds policy-sourced sudo lockdown configuration.
 type SudoLockdownSettings struct {
-	Enable        bool     `json:"enable"`
+	Enabled       bool     `json:"enabled"`
 	AllowCommands []string `json:"allowCommands,omitempty"`
 }
 
@@ -201,7 +201,7 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 	var sudoLockdown *SudoLockdownSettings
 	if sl := cargoWall.GetSudoLockdown(); sl != nil {
 		sudoLockdown = &SudoLockdownSettings{
-			Enable:        sl.Enable,
+			Enabled:       sl.Enabled,
 			AllowCommands: sl.AllowCommands,
 		}
 	}

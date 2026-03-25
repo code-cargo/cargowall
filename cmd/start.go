@@ -383,7 +383,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 
 	// Apply policy-sourced sudo lockdown settings (overrides CLI flags)
 	if sl := configMgr.GetSudoLockdown(); sl != nil {
-		cmd.SudoLockdown = sl.Enable
+		cmd.SudoLockdown = sl.Enabled
 		cmd.SudoAllowCommands = strings.Join(sl.AllowCommands, ",")
 	}
 

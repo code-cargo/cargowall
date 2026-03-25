@@ -212,7 +212,7 @@ func (x *CargoWallPolicy_PortRule) GetPort() uint32 {
 
 type CargoWallPolicy_SudoLockdown struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Enable        bool                   `protobuf:"varint,1,opt,name=enable,proto3" json:"enable,omitempty"`
+	Enabled       bool                   `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
 	AllowCommands []string               `protobuf:"bytes,2,rep,name=allow_commands,json=allowCommands,proto3" json:"allow_commands,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -248,9 +248,9 @@ func (*CargoWallPolicy_SudoLockdown) Descriptor() ([]byte, []int) {
 	return file_cargo_wall_proto_rawDescGZIP(), []int{0, 2}
 }
 
-func (x *CargoWallPolicy_SudoLockdown) GetEnable() bool {
+func (x *CargoWallPolicy_SudoLockdown) GetEnabled() bool {
 	if x != nil {
-		return x.Enable
+		return x.Enabled
 	}
 	return false
 }
@@ -266,7 +266,7 @@ var File_cargo_wall_proto protoreflect.FileDescriptor
 
 const file_cargo_wall_proto_rawDesc = "" +
 	"\n" +
-	"\x10cargo_wall.proto\x12\x11grpc.cargowall.v1\x1a\x1fdata/cargo_wall_mode_enum.proto\x1a&data/cargo_wall_action_type_enum.proto\x1a$data/cargo_wall_rule_type_enum.proto\x1a#data/cargo_wall_protocol_enum.proto\"\xb8\x05\n" +
+	"\x10cargo_wall.proto\x12\x11grpc.cargowall.v1\x1a\x1fdata/cargo_wall_mode_enum.proto\x1a&data/cargo_wall_action_type_enum.proto\x1a$data/cargo_wall_rule_type_enum.proto\x1a#data/cargo_wall_protocol_enum.proto\"\xba\x05\n" +
 	"\x0fCargoWallPolicy\x124\n" +
 	"\x04mode\x18\x01 \x01(\x0e2 .grpc.cargowall.v1.CargoWallModeR\x04mode\x12M\n" +
 	"\x0edefault_action\x18\x02 \x01(\x0e2&.grpc.cargowall.v1.CargoWallActionTypeR\rdefaultAction\x12T\n" +
@@ -279,9 +279,9 @@ const file_cargo_wall_proto_rawDesc = "" +
 	"\x05ports\x18\x04 \x03(\v2+.grpc.cargowall.v1.CargoWallPolicy.PortRuleR\x05ports\x1a`\n" +
 	"\bPortRule\x12@\n" +
 	"\bprotocol\x18\x01 \x01(\x0e2$.grpc.cargowall.v1.CargoWallProtocolR\bprotocol\x12\x12\n" +
-	"\x04port\x18\x02 \x01(\rR\x04port\x1aM\n" +
-	"\fSudoLockdown\x12\x16\n" +
-	"\x06enable\x18\x01 \x01(\bR\x06enable\x12%\n" +
+	"\x04port\x18\x02 \x01(\rR\x04port\x1aO\n" +
+	"\fSudoLockdown\x12\x18\n" +
+	"\aenabled\x18\x01 \x01(\bR\aenabled\x12%\n" +
 	"\x0eallow_commands\x18\x02 \x03(\tR\rallowCommandsBYZ/github.com/code-cargo/cargowall/pb/cargowall/v1\xaa\x02%Controller.ApiService.Pb.CargoWall.V1b\x06proto3"
 
 var (

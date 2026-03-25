@@ -773,7 +773,7 @@ func TestLoadConfigFromCargoWall_SudoLockdown(t *testing.T) {
 	policy := &cargowallv1pb.CargoWallPolicy{
 		DefaultAction: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY,
 		SudoLockdown: &cargowallv1pb.CargoWallPolicy_SudoLockdown{
-			Enable:        true,
+			Enabled:       true,
 			AllowCommands: []string{"apt-get install", "systemctl restart"},
 		},
 		Rules: []*cargowallv1pb.CargoWallPolicy_Rule{
@@ -797,8 +797,8 @@ func TestLoadConfigFromCargoWall_SudoLockdown(t *testing.T) {
 	if sl == nil {
 		t.Fatal("expected SudoLockdown to be non-nil")
 	}
-	if !sl.Enable {
-		t.Error("expected SudoLockdown.Enable = true")
+	if !sl.Enabled {
+		t.Error("expected SudoLockdown.Enabled = true")
 	}
 	if !reflect.DeepEqual(sl.AllowCommands, []string{"apt-get install", "systemctl restart"}) {
 		t.Errorf("SudoLockdown.AllowCommands = %v, want [apt-get install, systemctl restart]", sl.AllowCommands)
@@ -854,7 +854,7 @@ func TestLoadConfig_SudoLockdown(t *testing.T) {
 		],
 		"defaultAction": "deny",
 		"sudoLockdown": {
-			"enable": true,
+			"enabled": true,
 			"allowCommands": ["apt-get update", "npm install"]
 		}
 	}`
@@ -876,8 +876,8 @@ func TestLoadConfig_SudoLockdown(t *testing.T) {
 	if sl == nil {
 		t.Fatal("expected SudoLockdown to be non-nil")
 	}
-	if !sl.Enable {
-		t.Error("expected SudoLockdown.Enable = true")
+	if !sl.Enabled {
+		t.Error("expected SudoLockdown.Enabled = true")
 	}
 	if !reflect.DeepEqual(sl.AllowCommands, []string{"apt-get update", "npm install"}) {
 		t.Errorf("SudoLockdown.AllowCommands = %v, want [apt-get update, npm install]", sl.AllowCommands)

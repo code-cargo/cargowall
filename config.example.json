@@ -38,7 +38,7 @@
     }
   ],
   "sudoLockdown": {
-    "enable": false,
+    "enabled": false,
     "allowCommands": ["/usr/bin/apt-get", "/usr/bin/docker"]
   }
 }

@@ -15,7 +15,7 @@ jobs:
     name: Build (${{ matrix.arch }})
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     strategy:
       matrix:
         arch: [amd64, arm64]
@@ -63,6 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
       id-token: write
       attestations: write
     steps:

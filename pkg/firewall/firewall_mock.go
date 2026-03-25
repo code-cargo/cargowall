@@ -23,7 +23,7 @@ func (_m *MockFirewall) EXPECT() *MockFirewall_Expecter {
 }
 
 // AddIP provides a mock function with given fields: ip, action, ports
-func (_m *MockFirewall) AddIP(ip net.IP, action config.Action, ports []uint16) (bool, error) {
+func (_m *MockFirewall) AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error) {
 	ret := _m.Called(ip, action, ports)
 
 	if len(ret) == 0 {
@@ -32,16 +32,16 @@ func (_m *MockFirewall) AddIP(ip net.IP, action config.Action, ports []uint16) (
 
 	var r0 bool
 	var r1 error
-	if rf, ok := ret.Get(0).(func(net.IP, config.Action, []uint16) (bool, error)); ok {
+	if rf, ok := ret.Get(0).(func(net.IP, config.Action, []config.Port) (bool, error)); ok {
 		return rf(ip, action, ports)
 	}
-	if rf, ok := ret.Get(0).(func(net.IP, config.Action, []uint16) bool); ok {
+	if rf, ok := ret.Get(0).(func(net.IP, config.Action, []config.Port) bool); ok {
 		r0 = rf(ip, action, ports)
 	} else {
 		r0 = ret.Get(0).(bool)
 	}
 
-	if rf, ok := ret.Get(1).(func(net.IP, config.Action, []uint16) error); ok {
+	if rf, ok := ret.Get(1).(func(net.IP, config.Action, []config.Port) error); ok {
 		r1 = rf(ip, action, ports)
 	} else {
 		r1 = ret.Error(1)
@@ -58,14 +58,14 @@ type MockFirewall_AddIP_Call struct {
 // AddIP is a helper method to define mock.On call
 //   - ip net.IP
 //   - action config.Action
-//   - ports []uint16
+//   - ports []config.Port
 func (_e *MockFirewall_Expecter) AddIP(ip interface{}, action interface{}, ports interface{}) *MockFirewall_AddIP_Call {
 	return &MockFirewall_AddIP_Call{Call: _e.mock.On("AddIP", ip, action, ports)}
 }
 
-func (_c *MockFirewall_AddIP_Call) Run(run func(ip net.IP, action config.Action, ports []uint16)) *MockFirewall_AddIP_Call {
+func (_c *MockFirewall_AddIP_Call) Run(run func(ip net.IP, action config.Action, ports []config.Port)) *MockFirewall_AddIP_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(net.IP), args[1].(config.Action), args[2].([]uint16))
+		run(args[0].(net.IP), args[1].(config.Action), args[2].([]config.Port))
 	})
 	return _c
 }
@@ -75,7 +75,7 @@ func (_c *MockFirewall_AddIP_Call) Return(_a0 bool, _a1 error) *MockFirewall_Add
 	return _c
 }
 
-func (_c *MockFirewall_AddIP_Call) RunAndReturn(run func(net.IP, config.Action, []uint16) (bool, error)) *MockFirewall_AddIP_Call {
+func (_c *MockFirewall_AddIP_Call) RunAndReturn(run func(net.IP, config.Action, []config.Port) (bool, error)) *MockFirewall_AddIP_Call {
 	_c.Call.Return(run)
 	return _c
 }

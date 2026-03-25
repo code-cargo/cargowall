@@ -3,6 +3,7 @@ syntax = "proto3";
 import "data/cargo_wall_mode_enum.proto";
 import "data/cargo_wall_action_type_enum.proto";
 import "data/cargo_wall_rule_type_enum.proto";
+import "data/cargo_wall_protocol_enum.proto";
 
 option csharp_namespace = "Controller.ApiService.Pb.CargoWall.V1";
 option go_package = "github.com/code-cargo/cargowall/pb/cargowall/v1";
@@ -12,12 +13,24 @@ package grpc.cargowall.v1;
 message CargoWallPolicy {
   CargoWallMode mode = 1;
   CargoWallActionType default_action = 2;
-  repeated Rule rules = 3;
+  SudoLockdown sudo_lockdown = 3;
+
+  repeated Rule rules = 100;
 
   message Rule {
     CargoWallRuleType type = 1;
     string value = 2;
     CargoWallActionType action = 3;
-    repeated uint32 ports = 4;
+    repeated PortRule ports = 4;
+  }
+
+  message PortRule {
+    CargoWallProtocol protocol = 1;
+    uint32 port = 2;
+  }
+
+  message SudoLockdown {
+    bool enabled = 1;
+    repeated string allow_commands = 2;
   }
 }

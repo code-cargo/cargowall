@@ -74,7 +74,8 @@ struct lpm_val {
 struct port_key {
     __u32 ip;
     __u16 port;
-    __u16 pad;
+    __u8 proto;           // IPPROTO_TCP (6) or IPPROTO_UDP (17)
+    __u8 pad;
 } __attribute__((packed));
 
 // Value for port rules - just allow/deny
@@ -95,7 +96,8 @@ struct lpm_key_v6 {
 struct port_key_v6 {
     __u8 ip[16];
     __u16 port;
-    __u16 pad;
+    __u8 proto;           // IPPROTO_TCP (6) or IPPROTO_UDP (17)
+    __u8 pad;
 } __attribute__((packed));
 
 // ---- Event struct with version discriminator ----
@@ -335,6 +337,7 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
             struct port_key pkey = {
                 .ip = dst_ip_nbo,
                 .port = dst_port,
+                .proto = ip_proto,
                 .pad = 0
             };
             struct port_val *pval = bpf_map_lookup_elem(&map_ports, &pkey);
@@ -361,6 +364,7 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
         struct port_key pkey = {
             .ip = 0,  // 0.0.0.0 wildcard
             .port = dst_port,
+            .proto = ip_proto,
             .pad = 0
         };
         struct port_val *pval = bpf_map_lookup_elem(&map_ports, &pkey);
@@ -519,6 +523,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
             __builtin_memset(&pkey, 0, sizeof(pkey));
             __builtin_memcpy(pkey.ip, dst_ip6, 16);
             pkey.port = dst_port;
+            pkey.proto = nexthdr;
 
             struct port_val *pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
             if (pval) {
@@ -543,6 +548,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
         struct port_key_v6 pkey;
         __builtin_memset(&pkey, 0, sizeof(pkey));
         pkey.port = dst_port;
+        pkey.proto = nexthdr;
 
         struct port_val *pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
         if (pval) {

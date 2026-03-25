@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+option csharp_namespace = "Controller.Data.Pb.CargoWall.V1";
+option go_package = "github.com/code-cargo/cargowall/pb/cargowall/v1/data";
+
+package grpc.cargowall.v1;
+
+// https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
+enum CargoWallProtocol {
+  CARGO_WALL_PROTOCOL_ALL = 0;
+  CARGO_WALL_PROTOCOL_TCP = 6;
+  CARGO_WALL_PROTOCOL_UDP = 17;
+}

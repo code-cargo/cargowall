@@ -43,7 +43,7 @@ type Firewall interface {
 
 	// AddIP adds a single IP to the BPF maps with the specified action and ports
 	// Returns (wasAdded bool, error) - wasAdded is true if the IP was newly added, false if it was a duplicate
-	AddIP(ip net.IP, action config.Action, ports []uint16) (bool, error)
+	AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error)
 
 	// RemoveIP removes a single IP from the BPF maps
 	RemoveIP(ip net.IP) error
@@ -68,8 +68,19 @@ type FirewallImpl struct {
 	mu               sync.RWMutex
 
 	// Track which ports are associated with each IP for proper cleanup
-	ipPorts map[string][]uint16 // IP string -> ports
+	ipPorts map[string][]portProto // IP string -> port+protocol pairs
 }
+
+// portProto carries a port number and its IANA protocol number for BPF map keys.
+type portProto struct {
+	Port  uint16
+	Proto uint8 // protoTCP=6, protoUDP=17
+}
+
+const (
+	protoTCP uint8 = 6
+	protoUDP uint8 = 17
+)
 
 // NewFirewall creates a new firewall instance that owns the eBPF maps
 func NewFirewall(cidrsMap, portsMap, cidrsV6Map, portsV6Map, defaultActionMap, auditModeMap *ebpf.Map, logger *slog.Logger) Firewall {
@@ -81,7 +92,7 @@ func NewFirewall(cidrsMap, portsMap, cidrsV6Map, portsV6Map, defaultActionMap, a
 		defaultActionMap: defaultActionMap,
 		auditModeMap:     auditModeMap,
 		logger:           logger,
-		ipPorts:          make(map[string][]uint16),
+		ipPorts:          make(map[string][]portProto),
 	}
 }
 
@@ -140,29 +151,33 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 
 			ones, _ := rule.IPNet.Mask.Size()
 
+			// Expand ports with protocol info for BPF maps
+			portValues := expandPorts(rule.Ports)
+
 			// Check if this is an IPv6 CIDR
 			if ip4 := rule.IPNet.IP.To4(); ip4 != nil {
 				// IPv4 CIDR
 
 				// Special handling for 0.0.0.0/0 with specific ports
 				// Don't add to LPM trie, only to port map
-				if rule.Value == "0.0.0.0/0" && len(rule.Ports) > 0 {
-					for _, port := range rule.Ports {
+				if rule.Value == "0.0.0.0/0" && len(portValues) > 0 {
+					for _, pp := range portValues {
 						portKey := bpf.TcBpfPortKey{
-							Ip:   0,
-							Port: port,
+							Ip:    0,
+							Port:  pp.Port,
+							Proto: pp.Proto,
 						}
 						portVal := bpf.TcBpfPortVal{
 							Action: actionVal,
 						}
 						if err := f.portsMap.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-							return fmt.Errorf("update port map for wildcard port %d: %w", port, err)
+							return fmt.Errorf("update port map for wildcard port %d proto %d: %w", pp.Port, pp.Proto, err)
 						}
 					}
 					continue
 				}
 
-				if err := f.addCIDRv4(ip4, uint32(ones), actionVal, rule.Ports, rule.Value); err != nil {
+				if err := f.addCIDRv4(ip4, uint32(ones), actionVal, portValues, rule.Value); err != nil {
 					return err
 				}
 			} else {
@@ -173,35 +188,37 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 				}
 
 				// Special handling for ::/0 with specific ports
-				if rule.Value == "::/0" && len(rule.Ports) > 0 {
-					for _, port := range rule.Ports {
+				if rule.Value == "::/0" && len(portValues) > 0 {
+					for _, pp := range portValues {
 						portKey := bpf.TcBpfPortKeyV6{
-							Port: port,
+							Port:  pp.Port,
+							Proto: pp.Proto,
 						}
 						portVal := bpf.TcBpfPortVal{
 							Action: actionVal,
 						}
 						if err := f.portsV6Map.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-							return fmt.Errorf("update v6 port map for wildcard port %d: %w", port, err)
+							return fmt.Errorf("update v6 port map for wildcard port %d proto %d: %w", pp.Port, pp.Proto, err)
 						}
 					}
 					continue
 				}
 
-				if err := f.addCIDRv6(ip6, uint32(ones), actionVal, rule.Ports, rule.Value); err != nil {
+				if err := f.addCIDRv6(ip6, uint32(ones), actionVal, portValues, rule.Value); err != nil {
 					return err
 				}
 			}
 
 		case config.RuleTypeHostname:
 			// Resolved hostnames are added as /32 or /128 entries
+			hostPortValues := expandPorts(rule.Ports)
 			for _, ip := range rule.IPs {
 				if ip4 := ip.To4(); ip4 != nil {
-					if err := f.addCIDRv4(ip4, 32, actionVal, rule.Ports, rule.Value); err != nil {
+					if err := f.addCIDRv4(ip4, 32, actionVal, hostPortValues, rule.Value); err != nil {
 						return err
 					}
 				} else if ip6 := ip.To16(); ip6 != nil {
-					if err := f.addCIDRv6(ip6, 128, actionVal, rule.Ports, rule.Value); err != nil {
+					if err := f.addCIDRv6(ip6, 128, actionVal, hostPortValues, rule.Value); err != nil {
 						return err
 					}
 				}
@@ -214,7 +231,7 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 
 // addCIDRv4 adds an IPv4 CIDR to the BPF LPM trie and optional port maps.
 // Must be called with f.mu held.
-func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, ports []uint16, label string) error {
+func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
 	// NativeEndian so the uint32 bytes in the map key are in network byte order,
 	// which is required for LPM trie prefix matching.
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
@@ -230,16 +247,17 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 
 	if len(ports) > 0 {
 		val.PortSpecific = 1
-		for _, port := range ports {
+		for _, pp := range ports {
 			portKey := bpf.TcBpfPortKey{
-				Ip:   ipUint32,
-				Port: port,
+				Ip:    ipUint32,
+				Port:  pp.Port,
+				Proto: pp.Proto,
 			}
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
 			}
 			if err := f.portsMap.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-				return fmt.Errorf("update port map for %s port %d: %w", label, port, err)
+				return fmt.Errorf("update port map for %s port %d proto %d: %w", label, pp.Port, pp.Proto, err)
 			}
 		}
 	}
@@ -252,7 +270,7 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 
 // addCIDRv6 adds an IPv6 CIDR to the BPF v6 LPM trie and optional port maps.
 // Must be called with f.mu held.
-func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, ports []uint16, label string) error {
+func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
 	var key bpf.TcBpfLpmKeyV6
 	key.Prefixlen = prefixLen
 	copy(key.Ip[:], ip6)
@@ -264,15 +282,16 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 
 	if len(ports) > 0 {
 		val.PortSpecific = 1
-		for _, port := range ports {
+		for _, pp := range ports {
 			var portKey bpf.TcBpfPortKeyV6
 			copy(portKey.Ip[:], ip6)
-			portKey.Port = port
+			portKey.Port = pp.Port
+			portKey.Proto = pp.Proto
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
 			}
 			if err := f.portsV6Map.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-				return fmt.Errorf("update v6 port map for %s port %d: %w", label, port, err)
+				return fmt.Errorf("update v6 port map for %s port %d proto %d: %w", label, pp.Port, pp.Proto, err)
 			}
 		}
 	}
@@ -283,19 +302,44 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 	return nil
 }
 
+// expandPorts converts config.Port entries into portProto values for BPF map keys.
+// ProtocolAll expands to both TCP and UDP entries so that the BPF lookup
+// (which always uses the packet's exact protocol) matches correctly.
+func expandPorts(ports []config.Port) []portProto {
+	if len(ports) == 0 {
+		return nil
+	}
+	result := make([]portProto, 0, len(ports)*2)
+	for _, p := range ports {
+		switch p.Protocol {
+		case config.ProtocolTCP:
+			result = append(result, portProto{Port: p.Port, Proto: protoTCP})
+		case config.ProtocolUDP:
+			result = append(result, portProto{Port: p.Port, Proto: protoUDP})
+		case config.ProtocolAll:
+			result = append(result, portProto{Port: p.Port, Proto: protoTCP})
+			result = append(result, portProto{Port: p.Port, Proto: protoUDP})
+		default:
+			slog.Warn("Unknown protocol in port rule, skipping", "port", p.Port, "protocol", p.Protocol)
+		}
+	}
+	return result
+}
+
 // AddIP adds a single IP to the BPF maps with the specified action and ports
 // Returns (wasAdded bool, error) - wasAdded is true if the IP was newly added, false if it was a duplicate
-func (f *FirewallImpl) AddIP(ip net.IP, action config.Action, ports []uint16) (bool, error) {
+func (f *FirewallImpl) AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error) {
+	pp := expandPorts(ports)
 	if ip4 := ip.To4(); ip4 != nil {
-		return f.addIPv4(ip4, ip, action, ports)
+		return f.addIPv4(ip4, ip, action, pp)
 	}
 	if ip6 := ip.To16(); ip6 != nil {
-		return f.addIPv6(ip6, ip, action, ports)
+		return f.addIPv6(ip6, ip, action, pp)
 	}
 	return false, fmt.Errorf("invalid IP: %s", ip.String())
 }
 
-func (f *FirewallImpl) addIPv4(ip4 net.IP, origIP net.IP, action config.Action, ports []uint16) (bool, error) {
+func (f *FirewallImpl) addIPv4(ip4 net.IP, origIP net.IP, action config.Action, ports []portProto) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -329,16 +373,17 @@ func (f *FirewallImpl) addIPv4(ip4 net.IP, origIP net.IP, action config.Action, 
 	}
 
 	if len(ports) > 0 {
-		for _, port := range ports {
+		for _, pp := range ports {
 			portKey := bpf.TcBpfPortKey{
-				Ip:   ipUint32,
-				Port: port,
+				Ip:    ipUint32,
+				Port:  pp.Port,
+				Proto: pp.Proto,
 			}
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
 			}
 			if err := f.portsMap.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-				return false, fmt.Errorf("failed to add port %d to map: %w", port, err)
+				return false, fmt.Errorf("failed to add port %d proto %d to map: %w", pp.Port, pp.Proto, err)
 			}
 		}
 	}
@@ -357,7 +402,7 @@ func (f *FirewallImpl) addIPv4(ip4 net.IP, origIP net.IP, action config.Action, 
 	return true, nil
 }
 
-func (f *FirewallImpl) addIPv6(ip6 net.IP, origIP net.IP, action config.Action, ports []uint16) (bool, error) {
+func (f *FirewallImpl) addIPv6(ip6 net.IP, origIP net.IP, action config.Action, ports []portProto) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -388,15 +433,16 @@ func (f *FirewallImpl) addIPv6(ip6 net.IP, origIP net.IP, action config.Action, 
 	}
 
 	if len(ports) > 0 {
-		for _, port := range ports {
+		for _, pp := range ports {
 			var portKey bpf.TcBpfPortKeyV6
 			copy(portKey.Ip[:], ip6)
-			portKey.Port = port
+			portKey.Port = pp.Port
+			portKey.Proto = pp.Proto
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
 			}
 			if err := f.portsV6Map.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-				return false, fmt.Errorf("failed to add v6 port %d to map: %w", port, err)
+				return false, fmt.Errorf("failed to add v6 port %d proto %d to map: %w", pp.Port, pp.Proto, err)
 			}
 		}
 	}
@@ -445,16 +491,18 @@ func (f *FirewallImpl) removeIPv4(ip4 net.IP, origIP net.IP) error {
 
 	ipStr := origIP.String()
 	if ports, exists := f.ipPorts[ipStr]; exists {
-		for _, port := range ports {
+		for _, pp := range ports {
 			portKey := bpf.TcBpfPortKey{
-				Ip:   ipUint32,
-				Port: port,
+				Ip:    ipUint32,
+				Port:  pp.Port,
+				Proto: pp.Proto,
 			}
 			if err := f.portsMap.Delete(&portKey); err != nil {
 				if !errors.Is(err, ebpf.ErrKeyNotExist) {
 					f.logger.Debug("Failed to remove port entry",
 						"ip", ipStr,
-						"port", port,
+						"port", pp.Port,
+						"proto", pp.Proto,
 						"error", err)
 				}
 			}
@@ -481,15 +529,17 @@ func (f *FirewallImpl) removeIPv6(ip6 net.IP, origIP net.IP) error {
 
 	ipStr := origIP.String()
 	if ports, exists := f.ipPorts[ipStr]; exists {
-		for _, port := range ports {
+		for _, pp := range ports {
 			var portKey bpf.TcBpfPortKeyV6
 			copy(portKey.Ip[:], ip6)
-			portKey.Port = port
+			portKey.Port = pp.Port
+			portKey.Proto = pp.Proto
 			if err := f.portsV6Map.Delete(&portKey); err != nil {
 				if !errors.Is(err, ebpf.ErrKeyNotExist) {
 					f.logger.Debug("Failed to remove v6 port entry",
 						"ip", ipStr,
-						"port", port,
+						"port", pp.Port,
+						"proto", pp.Proto,
 						"error", err)
 				}
 			}

@@ -6,6 +6,7 @@ option go_package = "github.com/code-cargo/cargowall/pb/cargowall/v1/data";
 package grpc.cargowall.v1;
 
 enum CargoWallRuleType {
-  CARGO_WALL_RULE_TYPE_CIDR = 0;
-  CARGO_WALL_RULE_TYPE_HOSTNAME = 1;
+  CARGO_WALL_RULE_TYPE_UNSPECIFIED = 0;
+  CARGO_WALL_RULE_TYPE_CIDR = 1;
+  CARGO_WALL_RULE_TYPE_HOSTNAME = 2;
 }

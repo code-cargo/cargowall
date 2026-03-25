@@ -24,19 +24,22 @@ const (
 type CargoWallRuleType int32
 
 const (
-	CargoWallRuleType_CARGO_WALL_RULE_TYPE_CIDR     CargoWallRuleType = 0
-	CargoWallRuleType_CARGO_WALL_RULE_TYPE_HOSTNAME CargoWallRuleType = 1
+	CargoWallRuleType_CARGO_WALL_RULE_TYPE_UNSPECIFIED CargoWallRuleType = 0
+	CargoWallRuleType_CARGO_WALL_RULE_TYPE_CIDR        CargoWallRuleType = 1
+	CargoWallRuleType_CARGO_WALL_RULE_TYPE_HOSTNAME    CargoWallRuleType = 2
 )
 
 // Enum value maps for CargoWallRuleType.
 var (
 	CargoWallRuleType_name = map[int32]string{
-		0: "CARGO_WALL_RULE_TYPE_CIDR",
-		1: "CARGO_WALL_RULE_TYPE_HOSTNAME",
+		0: "CARGO_WALL_RULE_TYPE_UNSPECIFIED",
+		1: "CARGO_WALL_RULE_TYPE_CIDR",
+		2: "CARGO_WALL_RULE_TYPE_HOSTNAME",
 	}
 	CargoWallRuleType_value = map[string]int32{
-		"CARGO_WALL_RULE_TYPE_CIDR":     0,
-		"CARGO_WALL_RULE_TYPE_HOSTNAME": 1,
+		"CARGO_WALL_RULE_TYPE_UNSPECIFIED": 0,
+		"CARGO_WALL_RULE_TYPE_CIDR":        1,
+		"CARGO_WALL_RULE_TYPE_HOSTNAME":    2,
 	}
 )
 
@@ -71,10 +74,11 @@ var File_data_cargo_wall_rule_type_enum_proto protoreflect.FileDescriptor
 
 const file_data_cargo_wall_rule_type_enum_proto_rawDesc = "" +
 	"\n" +
-	"$data/cargo_wall_rule_type_enum.proto\x12\x11grpc.cargowall.v1*U\n" +
-	"\x11CargoWallRuleType\x12\x1d\n" +
-	"\x19CARGO_WALL_RULE_TYPE_CIDR\x10\x00\x12!\n" +
-	"\x1dCARGO_WALL_RULE_TYPE_HOSTNAME\x10\x01BXZ4github.com/code-cargo/cargowall/pb/cargowall/v1/data\xaa\x02\x1fController.Data.Pb.CargoWall.V1b\x06proto3"
+	"$data/cargo_wall_rule_type_enum.proto\x12\x11grpc.cargowall.v1*{\n" +
+	"\x11CargoWallRuleType\x12$\n" +
+	" CARGO_WALL_RULE_TYPE_UNSPECIFIED\x10\x00\x12\x1d\n" +
+	"\x19CARGO_WALL_RULE_TYPE_CIDR\x10\x01\x12!\n" +
+	"\x1dCARGO_WALL_RULE_TYPE_HOSTNAME\x10\x02BXZ4github.com/code-cargo/cargowall/pb/cargowall/v1/data\xaa\x02\x1fController.Data.Pb.CargoWall.V1b\x06proto3"
 
 var (
 	file_data_cargo_wall_rule_type_enum_proto_rawDescOnce sync.Once

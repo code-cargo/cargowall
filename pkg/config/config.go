@@ -58,11 +58,28 @@ const (
 	RuleTypeCIDR     RuleType = "cidr"
 )
 
+type ProtocolType string
+
+const (
+	ProtocolAll ProtocolType = "all"
+	ProtocolTCP ProtocolType = "tcp"
+	ProtocolUDP ProtocolType = "udp"
+)
+
+// Common port definitions for infrastructure auto-allow rules.
+var (
+	PortHTTPS      = Port{Port: 443, Protocol: ProtocolTCP}
+	PortHTTP       = Port{Port: 80, Protocol: ProtocolTCP}
+	PortDNS        = Port{Port: 53, Protocol: ProtocolUDP}
+	PortWireServer = Port{Port: 32526, Protocol: ProtocolTCP}
+)
+
 // FirewallConfig represents the configuration for the L4 firewall
 type FirewallConfig struct {
 	Rules []Rule `json:"rules"`
 	// DefaultAction is the default action when no Rule matches (allow/deny)
-	DefaultAction Action `json:"defaultAction"`
+	DefaultAction Action                `json:"defaultAction"`
+	SudoLockdown  *SudoLockdownSettings `json:"sudoLockdown,omitempty"`
 }
 
 // Rule represents a firewall Rule
@@ -71,12 +88,24 @@ type Rule struct {
 	Type RuleType `json:"type"`
 	// Value is the hostname or CIDR block
 	Value string `json:"value"`
-	// Ports is optional list of ports (empty means all ports)
-	Ports []uint16 `json:"ports,omitempty"`
+	// Ports is optional list of Port (empty means all Ports on TCP and UDP)
+	Ports []Port `json:"ports,omitempty"`
 	// Action is "allow" or "deny"
 	Action Action `json:"action"`
 	// AutoAddedType indicates why this rule was auto-added (empty for user-configured rules)
 	AutoAddedType AutoAddedType `json:"autoAddedType,omitempty"`
+}
+
+// Port represents a firewall Port entry
+type Port struct {
+	Port     uint16       `json:"port"`
+	Protocol ProtocolType `json:"protocol"`
+}
+
+// SudoLockdownSettings holds policy-sourced sudo lockdown configuration.
+type SudoLockdownSettings struct {
+	Enabled       bool     `json:"enabled"`
+	AllowCommands []string `json:"allowCommands,omitempty"`
 }
 
 // ResolvedRule represents a Rule with resolved IP addresses or CIDR blocks
@@ -85,7 +114,7 @@ type ResolvedRule struct {
 	Value         string     // Original value (hostname or CIDR string)
 	IPs           []net.IP   // For hostnames: resolved IPs. For CIDR: empty
 	IPNet         *net.IPNet // For CIDR blocks only
-	Ports         []uint16
+	Ports         []Port
 	Action        Action
 	AutoAddedType AutoAddedType // Why this rule was auto-added (empty for user-configured rules)
 }
@@ -148,12 +177,19 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 			return fmt.Errorf("unknown rule type: %v", pbRule.Type)
 		}
 
-		// Convert ports (uint32 to uint16)
-		for _, port := range pbRule.Ports {
-			if port > 65535 {
-				return fmt.Errorf("invalid port number: %d", port)
+		// Convert ports
+		for _, pbPort := range pbRule.Ports {
+			if pbPort.GetPort() > 65535 {
+				return fmt.Errorf("invalid port number: %d", pbPort.GetPort())
 			}
-			rule.Ports = append(rule.Ports, uint16(port))
+			proto, err := convertProtocol(pbPort.GetProtocol())
+			if err != nil {
+				return fmt.Errorf("port %d: %w", pbPort.GetPort(), err)
+			}
+			rule.Ports = append(rule.Ports, Port{
+				Port:     uint16(pbPort.GetPort()),
+				Protocol: proto,
+			})
 		}
 
 		rules = append(rules, rule)
@@ -161,10 +197,20 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 
 	defaultAction := convertAction(cargoWall.DefaultAction)
 
+	// Extract sudo lockdown settings
+	var sudoLockdown *SudoLockdownSettings
+	if sl := cargoWall.GetSudoLockdown(); sl != nil {
+		sudoLockdown = &SudoLockdownSettings{
+			Enabled:       sl.Enabled,
+			AllowCommands: sl.AllowCommands,
+		}
+	}
+
 	cm.mu.Lock()
 	cm.config = &FirewallConfig{
 		Rules:         rules,
 		DefaultAction: defaultAction,
+		SudoLockdown:  sudoLockdown,
 	}
 	cm.mu.Unlock()
 
@@ -174,6 +220,26 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 
 	// Resolve all rules
 	return cm.resolveRules()
+}
+
+// convertProtocol converts protobuf Protocol enum to ProtocolType
+func convertProtocol(proto datapb.CargoWallProtocol) (ProtocolType, error) {
+	switch proto {
+	case datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_ALL:
+		return ProtocolAll, nil
+	case datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_TCP:
+		return ProtocolTCP, nil
+	case datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_UDP:
+		return ProtocolUDP, nil
+	default:
+		return "", fmt.Errorf("unknown protocol: %v", proto)
+	}
+}
+
+// protocolsOverlap returns true if two protocol types can match the same traffic.
+// ProtocolAll overlaps with everything; TCP and UDP only overlap with themselves.
+func protocolsOverlap(a, b ProtocolType) bool {
+	return a == ProtocolAll || b == ProtocolAll || a == b
 }
 
 // convertAction converts protobuf Action enum to Action
@@ -340,7 +406,7 @@ func splitAndTrim(s string) []string {
 //
 //	"10.0.0.0/8:443" -> ("10.0.0.0/8", [443])
 //	"github.com" -> ("github.com", nil)
-func parseHostWithPorts(entry string) (string, []uint16) {
+func parseHostWithPorts(entry string) (string, []Port) {
 	idx := strings.LastIndex(entry, ":")
 	if idx == -1 {
 		return entry, nil
@@ -350,7 +416,7 @@ func parseHostWithPorts(entry string) (string, []uint16) {
 	portsPart := entry[idx+1:]
 
 	// Parse each port separated by semicolons
-	var ports []uint16
+	var ports []Port
 	for _, p := range strings.Split(portsPart, ";") {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -361,7 +427,7 @@ func parseHostWithPorts(entry string) (string, []uint16) {
 			// Not a valid port — treat the whole entry as a host with no ports
 			return entry, nil
 		}
-		ports = append(ports, uint16(port))
+		ports = append(ports, Port{Port: uint16(port), Protocol: ProtocolAll})
 	}
 
 	if len(ports) == 0 {
@@ -517,7 +583,7 @@ func (cm *Manager) GetTrackedHostnameAction(hostname string) Action {
 
 // CheckIPRuleConflict checks if an IP has conflicting rules and returns the most restrictive action
 // Returns: (action Action, hasConflict bool, conflictingRule string)
-func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameAction Action, hostnamePorts []uint16) (Action, bool, string) {
+func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameAction Action, hostnamePorts []Port) (Action, bool, string) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
@@ -530,18 +596,18 @@ func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameActio
 	var mostSpecificBits int = -1
 
 	// Check all CIDR rules
-	for _, rule := range cm.config.Rules {
-		if rule.Type != RuleTypeCIDR {
+	for i := range cm.config.Rules {
+		if cm.config.Rules[i].Type != RuleTypeCIDR {
 			continue
 		}
 
 		// Parse CIDR
-		_, ipnet, err := net.ParseCIDR(rule.Value)
+		_, ipnet, err := net.ParseCIDR(cm.config.Rules[i].Value)
 		if err != nil {
 			// Try as single IP
-			if ruleIP := net.ParseIP(rule.Value); ruleIP != nil && ruleIP.Equal(ip) {
+			if ruleIP := net.ParseIP(cm.config.Rules[i].Value); ruleIP != nil && ruleIP.Equal(ip) {
 				// Exact match is most specific (32 bits)
-				mostSpecificRule = &rule
+				mostSpecificRule = &cm.config.Rules[i]
 				mostSpecificBits = 32
 			}
 			continue
@@ -551,7 +617,7 @@ func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameActio
 		if ipnet.Contains(ip) {
 			ones, _ := ipnet.Mask.Size()
 			if ones > mostSpecificBits {
-				mostSpecificRule = &rule
+				mostSpecificRule = &cm.config.Rules[i]
 				mostSpecificBits = ones
 			}
 		}
@@ -561,11 +627,11 @@ func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameActio
 	if mostSpecificRule != nil {
 		// If both rules have specific ports, only conflict if ports overlap
 		if len(mostSpecificRule.Ports) > 0 && len(hostnamePorts) > 0 {
-			// Check if any ports overlap
+			// Check if any ports overlap (same value + overlapping protocol)
 			hasOverlap := false
 			for _, hp := range hostnamePorts {
 				for _, cp := range mostSpecificRule.Ports {
-					if hp == cp {
+					if hp.Port == cp.Port && protocolsOverlap(hp.Protocol, cp.Protocol) {
 						hasOverlap = true
 						break
 					}
@@ -651,19 +717,19 @@ func (cm *Manager) ForwardMatchIP(ip string) string {
 // EnsureDNSAllowed adds CIDR allow rules on port 53 for the given IPs
 // so DNS infrastructure traffic is never blocked by the firewall.
 func (cm *Manager) EnsureDNSAllowed(ips []string) {
-	cm.ensureAllowed(ips, []uint16{53}, AutoAddedTypeDNS)
+	cm.ensureAllowed(ips, []Port{PortDNS}, AutoAddedTypeDNS)
 }
 
 // EnsureInfraAllowed adds CIDR allow rules for the given IPs on the specified
 // ports, so infrastructure traffic (e.g. Azure wireserver/IMDS) is allowed
 // only on the ports it actually needs.
-func (cm *Manager) EnsureInfraAllowed(ips []string, ports []uint16) {
+func (cm *Manager) EnsureInfraAllowed(ips []string, ports []Port) {
 	cm.ensureAllowed(ips, ports, AutoAddedTypeAzureInfrastructure)
 }
 
 // ensureAllowed adds CIDR allow rules for the given IPs with the specified ports.
 // If ports is nil, traffic on all ports is allowed.
-func (cm *Manager) ensureAllowed(ips []string, ports []uint16, autoAddedType AutoAddedType) {
+func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoAddedType) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -760,9 +826,9 @@ func (cm *Manager) hasCIDRRuleAllPorts(ipStr string) bool {
 	return false
 }
 
-// hasCIDRRule checks if an existing CIDR rule already covers the given IP and port.
+// hasCIDRRule checks if an existing CIDR rule already covers the given IP and port+protocol.
 // Must be called with cm.mu held.
-func (cm *Manager) hasCIDRRule(ipStr string, port uint16) bool {
+func (cm *Manager) hasCIDRRule(ipStr string, port Port) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
@@ -784,13 +850,13 @@ func (cm *Manager) hasCIDRRule(ipStr string, port uint16) bool {
 			continue
 		}
 
-		// IP matches — check if ports cover our target port
+		// IP matches — check if ports cover our target port+protocol
 		if len(rule.Ports) == 0 {
 			// No port restriction means all ports are covered
 			return true
 		}
 		for _, p := range rule.Ports {
-			if p == port {
+			if p.Port == port.Port && protocolsOverlap(p.Protocol, port.Protocol) {
 				return true
 			}
 		}
@@ -801,7 +867,7 @@ func (cm *Manager) hasCIDRRule(ipStr string, port uint16) bool {
 // EnsureHostnameAllowed adds an allow rule for a hostname so that it (and
 // its subdomains) are permitted through the firewall. This is used in
 // GitHub Actions mode to auto-allow infrastructure like the Actions service.
-func (cm *Manager) EnsureHostnameAllowed(hostname string, ports []uint16, autoAddedType AutoAddedType) {
+func (cm *Manager) EnsureHostnameAllowed(hostname string, ports []Port, autoAddedType AutoAddedType) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -886,7 +952,7 @@ func (cm *Manager) GetAutoAllowedType(ip string, port uint16, hostname string) A
 		if len(rule.Ports) > 0 {
 			portMatch := false
 			for _, p := range rule.Ports {
-				if p == port {
+				if p.Port == port {
 					portMatch = true
 					break
 				}
@@ -908,6 +974,18 @@ func (cm *Manager) GetAutoAllowedType(ip string, port uint16, hostname string) A
 		}
 	}
 	return AutoAddedTypeNone
+}
+
+// GetSudoLockdown returns the policy-sourced sudo lockdown settings, or nil
+// if no sudo lockdown configuration was provided.
+func (cm *Manager) GetSudoLockdown() *SudoLockdownSettings {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	if cm.config == nil {
+		return nil
+	}
+	return cm.config.SudoLockdown
 }
 
 // resolveRules resolves all hostname rules to IP addresses

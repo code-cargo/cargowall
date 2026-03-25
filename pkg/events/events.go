@@ -36,7 +36,7 @@ import (
 // FirewallUpdater allows the event processor to dynamically add IPs to the firewall
 // when lazy reverse DNS reveals a blocked IP belongs to an allowed hostname.
 type FirewallUpdater interface {
-	AddIP(ip net.IP, action config.Action, ports []uint16) (bool, error)
+	AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error)
 }
 
 // lookupProcessName reads the process name from /proc/<pid>/comm.

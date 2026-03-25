@@ -381,6 +381,12 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			"config_path", cmd.Config)
 	}
 
+	// Apply policy-sourced sudo lockdown settings (overrides CLI flags)
+	if sl := configMgr.GetSudoLockdown(); sl != nil {
+		cmd.SudoLockdown = sl.Enabled
+		cmd.SudoAllowCommands = strings.Join(sl.AllowCommands, ",")
+	}
+
 	// Enable sudo lockdown if requested (typically in GitHub Actions mode)
 	var sudoLockdownEnabled bool
 	var lockdownCfg *lockdown.SudoLockdownConfig
@@ -451,7 +457,7 @@ func loadGitHubActionsConfig(ctx context.Context, cmd *StartCmd, configMgr *conf
 		// allowed through DNS filtering for the policy fetch to succeed.
 		if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
 			configMgr.LoadConfigFromRules(nil, config.ActionDeny)
-			configMgr.EnsureHostnameAllowed(u.Hostname(), []uint16{443}, config.AutoAddedTypeCodeCargoService)
+			configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
 		}
 
 		logger.Info("Fetching policy from CodeCargo API", "api_url", cmd.ApiUrl, "job_key", cmd.JobKey)
@@ -534,7 +540,11 @@ func autoAllowInfraHosts(cmd *StartCmd, configMgr *config.Manager, fw firewall.F
 			// and 32526 (health) for every Azure VM / GitHub-hosted runner.
 			// The upstream IPs from systemd-resolved on Azure are
 			// typically 168.63.129.16.
-			configMgr.EnsureInfraAllowed(resolvedUpstreams, []uint16{53, 80, 32526})
+			configMgr.EnsureInfraAllowed(resolvedUpstreams, []config.Port{
+				config.PortDNS,
+				config.PortHTTP,
+				config.PortWireServer,
+			})
 
 			if err := fw.UpdateAllowlistTC(configMgr); err != nil {
 				logger.Warn("Failed to update allowlist with resolved upstreams", "error", err)
@@ -548,7 +558,7 @@ func autoAllowInfraHosts(cmd *StartCmd, configMgr *config.Manager, fw firewall.F
 	// Also pre-allow Azure IMDS metadata endpoint (169.254.169.254).
 	// This link-local IP serves instance metadata over HTTP on all
 	// Azure VMs and GitHub-hosted runners and must not be blocked.
-	configMgr.EnsureInfraAllowed([]string{"169.254.169.254"}, []uint16{80})
+	configMgr.EnsureInfraAllowed([]string{"169.254.169.254"}, []config.Port{config.PortHTTP})
 
 	// Auto-allow GitHub service hostnames on port 443.
 	// Defaults cover core GitHub domains; overridable via
@@ -561,7 +571,7 @@ func autoAllowInfraHosts(cmd *StartCmd, configMgr *config.Manager, fw firewall.F
 		githubHosts = splitAndTrimCSV(env)
 	}
 	for _, h := range githubHosts {
-		configMgr.EnsureHostnameAllowed(h, []uint16{443}, config.AutoAddedTypeGitHubService)
+		configMgr.EnsureHostnameAllowed(h, []config.Port{config.PortHTTPS}, config.AutoAddedTypeGitHubService)
 	}
 
 	// Auto-allow Azure infrastructure hostnames on port 443.
@@ -572,7 +582,7 @@ func autoAllowInfraHosts(cmd *StartCmd, configMgr *config.Manager, fw firewall.F
 		azureHosts = splitAndTrimCSV(env)
 	}
 	for _, h := range azureHosts {
-		configMgr.EnsureHostnameAllowed(h, []uint16{443}, config.AutoAddedTypeAzureInfrastructure)
+		configMgr.EnsureHostnameAllowed(h, []config.Port{config.PortHTTPS}, config.AutoAddedTypeAzureInfrastructure)
 	}
 
 	// Auto-discover hostnames from GitHub Actions runtime environment
@@ -589,7 +599,7 @@ func autoAllowInfraHosts(cmd *StartCmd, configMgr *config.Manager, fw firewall.F
 	} {
 		if val := os.Getenv(envVar); val != "" {
 			if u, err := url.Parse(val); err == nil && u.Hostname() != "" {
-				configMgr.EnsureHostnameAllowed(u.Hostname(), []uint16{443}, config.AutoAddedTypeGitHubService)
+				configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeGitHubService)
 				logger.Info("Auto-allowed Actions runtime hostname", "env", envVar, "hostname", u.Hostname())
 			}
 		}
@@ -599,7 +609,7 @@ func autoAllowInfraHosts(cmd *StartCmd, configMgr *config.Manager, fw firewall.F
 	// (which runs while the firewall is active) is not blocked.
 	if cmd.ApiUrl != "" {
 		if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
-			configMgr.EnsureHostnameAllowed(u.Hostname(), []uint16{443}, config.AutoAddedTypeCodeCargoService)
+			configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
 			logger.Info("Auto-allowed CodeCargo API hostname", "hostname", u.Hostname())
 		}
 	}

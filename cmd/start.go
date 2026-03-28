@@ -417,6 +417,16 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 
 	logger.Info("Shutting down TC firewall")
 
+	// Shut down logger while DNS proxy and network are still up.
+	if cmd.LoggerShutdown != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := cmd.LoggerShutdown(ctx); err != nil {
+			slog.Warn("logger shutdown failed", "error", err)
+		}
+		cancel()
+		logger = cmd.Logger
+	}
+
 	// Disable sudo lockdown if we enabled it
 	if sudoLockdownEnabled {
 		if err := lockdown.DisableSudoLockdown(lockdownCfg, logger); err != nil {

@@ -80,7 +80,7 @@ jobs:
         run: sudo chmod 644 test-results*.xml
 
       - name: Test Report
-        uses: dorny/test-reporter@v1
+        uses: dorny/test-reporter@v3
         if: always()
         with:
           name: Test Results

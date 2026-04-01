@@ -47,6 +47,7 @@ func (v VersionFlag) BeforeApply(app *kong.Kong, vars kong.Vars) error {
 }
 
 type StartHooks struct {
+	Ready      func() error
 	LoadPolicy func(ctx context.Context, cmd *StartCmd) (*cargowallv1pb.CargoWallPolicy, events.StateMachineClient, func(), error)
 	InitLogger func(ctx context.Context, version string, debug bool) (*slog.Logger, func(context.Context) error, error)
 }

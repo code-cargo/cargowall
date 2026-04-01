@@ -15,11 +15,14 @@ jobs:
     name: Build (${{ matrix.arch }})
     runs-on: ubuntu-latest
     permissions:
+      id-token: write
       contents: read
     strategy:
       matrix:
         arch: [amd64, arm64]
     steps:
+      - uses: code-cargo/cargowall-action@v1.0.1
+
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref || github.sha }}
@@ -67,6 +70,8 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: code-cargo/cargowall-action@v1.0.1
+
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:

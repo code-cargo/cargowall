@@ -11,16 +11,18 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-  actions: read
-  checks: write
 
 jobs:
   checks:
     name: Lint & Build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     steps:
+      - uses: code-cargo/cargowall-action@v1.0.1
+
       - uses: actions/checkout@v6
 
       - uses: actions/setup-go@v6
@@ -48,7 +50,14 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      checks: write
     steps:
+      - uses: code-cargo/cargowall-action@v1.0.1
+
       - uses: actions/checkout@v6
 
       - uses: actions/setup-go@v6
@@ -71,7 +80,7 @@ jobs:
         run: sudo chmod 644 test-results*.xml
 
       - name: Test Report
-        uses: dorny/test-reporter@v1
+        uses: dorny/test-reporter@v3
         if: always()
         with:
           name: Test Results
@@ -81,7 +90,13 @@ jobs:
   build-binary:
     name: Build Binary
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     steps:
+      - uses: code-cargo/cargowall-action@v1.0.1
+
       - uses: actions/checkout@v6
 
       - uses: actions/setup-go@v6
@@ -126,11 +141,13 @@ jobs:
         run: chmod +x bin/cargowall
 
       - name: Start CargoWall via Action
-        uses: code-cargo/cargowall-action@main
+        uses: code-cargo/cargowall-action@v1.0.1
         with:
           mode: enforce
-          default-action: deny
-          allowed-hosts: "api.github.com,github.com,actions.githubusercontent.com,githubusercontent.com,docker.io,docker.com"
+          offline: 'true'
+          allowed-hosts: | 
+             docker.io
+             docker.com
           binary-path: ./bin/cargowall
           debug: true
 
@@ -265,10 +282,10 @@ jobs:
         run: chmod +x bin/cargowall
 
       - name: Start CargoWall via Action
-        uses: code-cargo/cargowall-action@main
+        uses: code-cargo/cargowall-action@v1.0.1
         with:
           mode: audit
-          allowed-hosts: "api.github.com,github.com,actions.githubusercontent.com,githubusercontent.com"
+          offline: 'true'
           binary-path: ./bin/cargowall
           debug: true
 
@@ -300,4 +317,3 @@ jobs:
       - uses: code-cargo/cargowall-action@main
         with:
           binary-path: ./bin/cargowall
-          api-url: https://app.dev.codecargo.dev

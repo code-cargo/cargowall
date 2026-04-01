@@ -19,7 +19,6 @@ jobs:
     permissions:
       contents: read
       actions: read
-      checks: write
       id-token: write
     steps:
       - uses: code-cargo/cargowall-action@v1.0.1
@@ -55,6 +54,7 @@ jobs:
       contents: read
       actions: read
       id-token: write
+      checks: write
     steps:
       - uses: code-cargo/cargowall-action@v1.0.1
 

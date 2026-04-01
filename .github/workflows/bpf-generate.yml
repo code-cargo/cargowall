@@ -7,13 +7,15 @@ on:
       - "bpf/vmlinux.h"
       - ".github/workflows/bpf-generate.yml"
 
-permissions:
-  contents: read
+
 
 jobs:
   verify:
     name: Verify generated files
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: code-cargo/cargowall-action@v1.0.1
 

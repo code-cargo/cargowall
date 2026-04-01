@@ -361,15 +361,17 @@ func (x *CargoWallActionEvent) GetAutoAllowedType() data.CargoWallAutoAllowedTyp
 }
 
 type CreateCargoWallActionJobRequest struct {
-	state         protoimpl.MessageState       `protogen:"open.v1"`
-	JobName       string                       `protobuf:"bytes,1,opt,name=job_name,json=jobName,proto3" json:"job_name,omitempty"`
-	JobKey        string                       `protobuf:"bytes,2,opt,name=job_key,json=jobKey,proto3" json:"job_key,omitempty"`
-	Mode          data.CargoWallMode           `protobuf:"varint,3,opt,name=mode,proto3,enum=grpc.cargowall.v1.CargoWallMode" json:"mode,omitempty"`
-	DefaultAction data.CargoWallActionType     `protobuf:"varint,4,opt,name=default_action,json=defaultAction,proto3,enum=grpc.cargowall.v1.CargoWallActionType" json:"default_action,omitempty"`
-	Summary       *CargoWallActionJobSummary   `protobuf:"bytes,5,opt,name=summary,proto3" json:"summary,omitempty"`
-	StartedAt     *timestamppb.Timestamp       `protobuf:"bytes,6,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
-	CompletedAt   *timestamppb.Timestamp       `protobuf:"bytes,7,opt,name=completed_at,json=completedAt,proto3" json:"completed_at,omitempty"`
-	Status        data.CargoWallJobStatus      `protobuf:"varint,8,opt,name=status,proto3,enum=grpc.cargowall.v1.CargoWallJobStatus" json:"status,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// optional - will remove optional annotation in subsequent update
+	JobRunId      *uint64                      `protobuf:"varint,1,opt,name=job_run_id,json=jobRunId,proto3,oneof" json:"job_run_id,omitempty"`
+	JobName       string                       `protobuf:"bytes,2,opt,name=job_name,json=jobName,proto3" json:"job_name,omitempty"`
+	JobKey        string                       `protobuf:"bytes,3,opt,name=job_key,json=jobKey,proto3" json:"job_key,omitempty"`
+	Mode          data.CargoWallMode           `protobuf:"varint,4,opt,name=mode,proto3,enum=grpc.cargowall.v1.CargoWallMode" json:"mode,omitempty"`
+	DefaultAction data.CargoWallActionType     `protobuf:"varint,5,opt,name=default_action,json=defaultAction,proto3,enum=grpc.cargowall.v1.CargoWallActionType" json:"default_action,omitempty"`
+	Summary       *CargoWallActionJobSummary   `protobuf:"bytes,6,opt,name=summary,proto3" json:"summary,omitempty"`
+	StartedAt     *timestamppb.Timestamp       `protobuf:"bytes,7,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	CompletedAt   *timestamppb.Timestamp       `protobuf:"bytes,8,opt,name=completed_at,json=completedAt,proto3" json:"completed_at,omitempty"`
+	Status        data.CargoWallJobStatus      `protobuf:"varint,9,opt,name=status,proto3,enum=grpc.cargowall.v1.CargoWallJobStatus" json:"status,omitempty"`
 	Steps         []*CreateCargoWallActionStep `protobuf:"bytes,100,rep,name=steps,proto3" json:"steps,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -403,6 +405,13 @@ func (x *CreateCargoWallActionJobRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use CreateCargoWallActionJobRequest.ProtoReflect.Descriptor instead.
 func (*CreateCargoWallActionJobRequest) Descriptor() ([]byte, []int) {
 	return file_cargo_wall_action_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *CreateCargoWallActionJobRequest) GetJobRunId() uint64 {
+	if x != nil && x.JobRunId != nil {
+		return *x.JobRunId
+	}
+	return 0
 }
 
 func (x *CreateCargoWallActionJobRequest) GetJobName() string {
@@ -652,18 +661,21 @@ const file_cargo_wall_action_proto_rawDesc = "" +
 	"\r_matched_ruleB\n" +
 	"\n" +
 	"\b_processB\x14\n" +
-	"\x12_auto_allowed_type\"\x9f\x04\n" +
-	"\x1fCreateCargoWallActionJobRequest\x12\x19\n" +
-	"\bjob_name\x18\x01 \x01(\tR\ajobName\x12\x17\n" +
-	"\ajob_key\x18\x02 \x01(\tR\x06jobKey\x124\n" +
-	"\x04mode\x18\x03 \x01(\x0e2 .grpc.cargowall.v1.CargoWallModeR\x04mode\x12M\n" +
-	"\x0edefault_action\x18\x04 \x01(\x0e2&.grpc.cargowall.v1.CargoWallActionTypeR\rdefaultAction\x12F\n" +
-	"\asummary\x18\x05 \x01(\v2,.grpc.cargowall.v1.CargoWallActionJobSummaryR\asummary\x129\n" +
+	"\x12_auto_allowed_type\"\xd1\x04\n" +
+	"\x1fCreateCargoWallActionJobRequest\x12!\n" +
 	"\n" +
-	"started_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x12=\n" +
-	"\fcompleted_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAt\x12=\n" +
-	"\x06status\x18\b \x01(\x0e2%.grpc.cargowall.v1.CargoWallJobStatusR\x06status\x12B\n" +
-	"\x05steps\x18d \x03(\v2,.grpc.cargowall.v1.CreateCargoWallActionStepR\x05steps\"\xac\x02\n" +
+	"job_run_id\x18\x01 \x01(\x04H\x00R\bjobRunId\x88\x01\x01\x12\x19\n" +
+	"\bjob_name\x18\x02 \x01(\tR\ajobName\x12\x17\n" +
+	"\ajob_key\x18\x03 \x01(\tR\x06jobKey\x124\n" +
+	"\x04mode\x18\x04 \x01(\x0e2 .grpc.cargowall.v1.CargoWallModeR\x04mode\x12M\n" +
+	"\x0edefault_action\x18\x05 \x01(\x0e2&.grpc.cargowall.v1.CargoWallActionTypeR\rdefaultAction\x12F\n" +
+	"\asummary\x18\x06 \x01(\v2,.grpc.cargowall.v1.CargoWallActionJobSummaryR\asummary\x129\n" +
+	"\n" +
+	"started_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x12=\n" +
+	"\fcompleted_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAt\x12=\n" +
+	"\x06status\x18\t \x01(\x0e2%.grpc.cargowall.v1.CargoWallJobStatusR\x06status\x12B\n" +
+	"\x05steps\x18d \x03(\v2,.grpc.cargowall.v1.CreateCargoWallActionStepR\x05stepsB\r\n" +
+	"\v_job_run_id\"\xac\x02\n" +
 	"\x19CreateCargoWallActionStep\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06number\x18\x02 \x01(\x05R\x06number\x12>\n" +
@@ -749,6 +761,7 @@ func file_cargo_wall_action_proto_init() {
 	file_cargo_wall_action_proto_msgTypes[0].OneofWrappers = []any{}
 	file_cargo_wall_action_proto_msgTypes[2].OneofWrappers = []any{}
 	file_cargo_wall_action_proto_msgTypes[3].OneofWrappers = []any{}
+	file_cargo_wall_action_proto_msgTypes[4].OneofWrappers = []any{}
 	file_cargo_wall_action_proto_msgTypes[5].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

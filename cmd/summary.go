@@ -49,6 +49,7 @@ type SummaryCmd struct {
 	JobKey        string `help:"GitHub Actions job key (github.job)" name:"job-key"`
 	Mode          string `help:"CargoWall mode (enforce/audit)"`
 	DefaultAction string `help:"Default action type (allow/deny)" name:"default-action"`
+	JobRunId      uint64 `help:"GitHub Actions job run ID" name:"job-run-id"`
 	JobStatus     string `help:"GitHub Actions job status (success/failure/canceled/cancelled/timed_out)" name:"job-status"`
 
 	output io.Writer // overridable for testing; defaults to os.Stdout
@@ -567,6 +568,10 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 		Steps:         protoSteps,
 		Summary:       summary,
 		Status:        jobStatus,
+	}
+
+	if c.JobRunId != 0 {
+		req.JobRunId = &c.JobRunId
 	}
 
 	// Set timestamps from first/last events

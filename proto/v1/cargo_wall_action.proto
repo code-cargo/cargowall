@@ -69,14 +69,17 @@ message CargoWallActionEvent {
 }
 
 message CreateCargoWallActionJobRequest {
-  string job_name = 1;
-  string job_key = 2;
-  CargoWallMode mode = 3;
-  CargoWallActionType default_action = 4;
-  CargoWallActionJobSummary summary = 5;
-  google.protobuf.Timestamp started_at = 6;
-  google.protobuf.Timestamp completed_at = 7;
-  CargoWallJobStatus status = 8;
+  // optional - will remove optional annotation in subsequent update
+  optional uint64 job_run_id = 1;
+  string job_name = 2;
+  string job_key = 3;
+  CargoWallMode mode = 4;
+  CargoWallActionType default_action = 5;
+  CargoWallActionJobSummary summary = 6;
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp completed_at = 8;
+  CargoWallJobStatus status = 9;
+
 
   repeated CreateCargoWallActionStep steps = 100;
 }

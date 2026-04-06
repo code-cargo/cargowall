@@ -891,3 +891,129 @@ func TestLoadConfig_SudoLockdown(t *testing.T) {
 		t.Errorf("GetDefaultAction() = %v, want deny", cm.GetDefaultAction())
 	}
 }
+
+func TestHostnamePatternRules(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "github.com", Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "actions.githubusercontent.com.*.*.internal.cloudapp.net", Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "**.storage.azure.com", Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "evil.*.example.com", Action: ActionDeny},
+	}, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	// Plain hostname rules still work
+	if action := cm.GetTrackedHostnameAction("github.com"); action != ActionAllow {
+		t.Errorf("GetTrackedHostnameAction(github.com) = %q, want allow", action)
+	}
+	if action := cm.GetTrackedHostnameAction("api.github.com"); action != ActionAllow {
+		t.Errorf("GetTrackedHostnameAction(api.github.com) = %q, want allow", action)
+	}
+
+	// Pattern with two single wildcards in middle
+	if action := cm.GetTrackedHostnameAction("actions.githubusercontent.com.abc123.phxx.internal.cloudapp.net"); action != ActionAllow {
+		t.Errorf("two-star middle pattern should match, got %q", action)
+	}
+	if action := cm.GetTrackedHostnameAction("actions.githubusercontent.com.only1.internal.cloudapp.net"); action != "" {
+		t.Errorf("two-star middle pattern should not match with only 1 label, got %q", action)
+	}
+
+	// Double-star pattern
+	if action := cm.GetTrackedHostnameAction("westus2.storage.azure.com"); action != ActionAllow {
+		t.Errorf("doublestar pattern should match one label, got %q", action)
+	}
+	if action := cm.GetTrackedHostnameAction("account.westus2.storage.azure.com"); action != ActionAllow {
+		t.Errorf("doublestar pattern should match multiple labels, got %q", action)
+	}
+	if action := cm.GetTrackedHostnameAction("storage.azure.com"); action != "" {
+		t.Errorf("doublestar pattern should not match zero labels, got %q", action)
+	}
+
+	// Deny pattern
+	if action := cm.GetTrackedHostnameAction("evil.anything.example.com"); action != ActionDeny {
+		t.Errorf("deny pattern should match, got %q", action)
+	}
+
+	// No match
+	if action := cm.GetTrackedHostnameAction("unknown.com"); action != "" {
+		t.Errorf("unknown hostname should not match, got %q", action)
+	}
+}
+
+func TestFindTrackedHostnameWithPatterns(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "github.com", Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "*.*.internal.cloudapp.net", Action: ActionAllow},
+	}, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	// Plain hostname
+	if got := cm.FindTrackedHostname("api.github.com"); got != "github.com" {
+		t.Errorf("FindTrackedHostname(api.github.com) = %q, want github.com", got)
+	}
+
+	// Pattern match returns the raw pattern
+	if got := cm.FindTrackedHostname("abc.def.internal.cloudapp.net"); got != "*.*.internal.cloudapp.net" {
+		t.Errorf("FindTrackedHostname(abc.def.internal.cloudapp.net) = %q, want *.*.internal.cloudapp.net", got)
+	}
+
+	// No match
+	if got := cm.FindTrackedHostname("unknown.com"); got != "" {
+		t.Errorf("FindTrackedHostname(unknown.com) = %q, want empty", got)
+	}
+}
+
+func TestHostnamePatternNotInTrackedHostnames(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "github.com", Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "*.*.internal.cloudapp.net", Action: ActionAllow},
+	}, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	tracked := cm.GetTrackedHostnames()
+
+	// Pattern rules should NOT appear in the tracked hostnames map
+	if _, ok := tracked["*.*.internal.cloudapp.net"]; ok {
+		t.Error("pattern rule should not appear in trackedHostnames map")
+	}
+	// Plain hostname should be in the map
+	if _, ok := tracked["github.com"]; !ok {
+		t.Error("plain hostname should appear in trackedHostnames map")
+	}
+}
+
+func TestLeadingWildcardIsPattern(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "*.github.com", Action: ActionAllow},
+	}, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	// "*.github.com" should be treated as a glob pattern, not normalized
+	tracked := cm.GetTrackedHostnames()
+	if _, ok := tracked["github.com"]; ok {
+		t.Error("*.github.com should not be normalized to github.com")
+	}
+	if _, ok := tracked["*.github.com"]; ok {
+		t.Error("pattern should not appear in trackedHostnames map")
+	}
+
+	// * matches exactly one label
+	if action := cm.GetTrackedHostnameAction("api.github.com"); action != ActionAllow {
+		t.Errorf("api.github.com should match *.github.com, got %q", action)
+	}
+	// * does NOT match two labels
+	if action := cm.GetTrackedHostnameAction("a.b.github.com"); action != "" {
+		t.Errorf("a.b.github.com should NOT match *.github.com (single * = one label), got %q", action)
+	}
+}

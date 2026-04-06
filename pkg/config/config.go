@@ -110,13 +110,22 @@ type SudoLockdownSettings struct {
 
 // ResolvedRule represents a Rule with resolved IP addresses or CIDR blocks
 type ResolvedRule struct {
-	Type          RuleType   // "hostname" or "cidr"
-	Value         string     // Original value (hostname or CIDR string)
-	IPs           []net.IP   // For hostnames: resolved IPs. For CIDR: empty
-	IPNet         *net.IPNet // For CIDR blocks only
+	Type          RuleType         // "hostname" or "cidr"
+	Value         string           // Original value (hostname or CIDR string)
+	IPs           []net.IP         // For hostnames: resolved IPs. For CIDR: empty
+	IPNet         *net.IPNet       // For CIDR blocks only
+	Pattern       *HostnamePattern // Non-nil for hostname rules with glob wildcards
 	Ports         []Port
 	Action        Action
 	AutoAddedType AutoAddedType // Why this rule was auto-added (empty for user-configured rules)
+}
+
+// hostnamePatternEntry holds a compiled glob pattern with its associated rule metadata.
+type hostnamePatternEntry struct {
+	Pattern       HostnamePattern
+	Action        Action
+	Ports         []Port
+	AutoAddedType AutoAddedType
 }
 
 // Manager manages the firewall configuration and hostname resolution
@@ -128,7 +137,8 @@ type Manager struct {
 	ipToHostname     map[string]string    // Reverse lookup: IP -> hostname
 	ipLastSeen       map[string]time.Time // Track when each IP was last seen
 	trackedHostnames map[string]Action    // Track hostnames we have rules for (hostname -> action)
-	maxCacheSize     int                  // Maximum number of IPs to cache
+	hostnamePatterns []hostnamePatternEntry // Compiled glob patterns for hostname matching
+	maxCacheSize     int                    // Maximum number of IPs to cache
 	dnsCacheTTL      time.Duration        // How long to keep DNS entries
 }
 
@@ -315,7 +325,9 @@ func (cm *Manager) LoadFromEnv() error {
 		for _, entry := range splitAndTrim(allowedHosts) {
 			if entry != "" {
 				host, ports := parseHostWithPorts(entry)
-				host = normalizeHostname(host)
+				if !IsHostnamePattern(host) {
+					host = normalizeHostname(host)
+				}
 				rules = append(rules, Rule{
 					Type:   RuleTypeHostname,
 					Value:  host,
@@ -346,7 +358,9 @@ func (cm *Manager) LoadFromEnv() error {
 		for _, entry := range splitAndTrim(blockedHosts) {
 			if entry != "" {
 				host, ports := parseHostWithPorts(entry)
-				host = normalizeHostname(host)
+				if !IsHostnamePattern(host) {
+					host = normalizeHostname(host)
+				}
 				rules = append(rules, Rule{
 					Type:   RuleTypeHostname,
 					Value:  host,
@@ -577,6 +591,17 @@ func (cm *Manager) GetTrackedHostnameAction(hostname string) Action {
 		}
 	}
 
+	// Check hostname patterns (glob matching)
+	for _, entry := range cm.hostnamePatterns {
+		if entry.Pattern.Matches(hostname) {
+			slog.Debug("Found pattern match",
+				"hostname", hostname,
+				"pattern", entry.Pattern.Raw,
+				"action", entry.Action)
+			return entry.Action
+		}
+	}
+
 	slog.Debug("No tracked hostname found", "hostname", hostname)
 	return ""
 }
@@ -680,6 +705,13 @@ func (cm *Manager) FindTrackedHostname(name string) string {
 	for trackedHost := range cm.trackedHostnames {
 		if strings.HasSuffix(name, "."+trackedHost) {
 			return trackedHost
+		}
+	}
+
+	// Pattern match
+	for _, entry := range cm.hostnamePatterns {
+		if entry.Pattern.Matches(name) {
+			return entry.Pattern.Raw
 		}
 	}
 	return ""
@@ -913,7 +945,11 @@ func (cm *Manager) GetAutoAllowedTypeForHostname(hostname string) AutoAddedType 
 		if rule.Type != RuleTypeHostname || rule.AutoAddedType == AutoAddedTypeNone || rule.Action != ActionAllow {
 			continue
 		}
-		if hostname == rule.Value || strings.HasSuffix(hostname, "."+rule.Value) {
+		if rule.Pattern != nil {
+			if rule.Pattern.Matches(hostname) {
+				return rule.AutoAddedType
+			}
+		} else if hostname == rule.Value || strings.HasSuffix(hostname, "."+rule.Value) {
 			return rule.AutoAddedType
 		}
 	}
@@ -964,7 +1000,11 @@ func (cm *Manager) GetAutoAllowedType(ip string, port uint16, hostname string) A
 
 		switch rule.Type {
 		case RuleTypeHostname:
-			if hostname == rule.Value || strings.HasSuffix(hostname, "."+rule.Value) {
+			if rule.Pattern != nil {
+				if rule.Pattern.Matches(hostname) {
+					return rule.AutoAddedType
+				}
+			} else if hostname == rule.Value || strings.HasSuffix(hostname, "."+rule.Value) {
 				return rule.AutoAddedType
 			}
 		case RuleTypeCIDR:
@@ -1000,6 +1040,7 @@ func (cm *Manager) resolveRules() error {
 	}
 
 	cm.resolvedRules = nil
+	cm.hostnamePatterns = nil
 
 	for _, rule := range cm.config.Rules {
 		resolved := ResolvedRule{
@@ -1012,16 +1053,32 @@ func (cm *Manager) resolveRules() error {
 
 		switch rule.Type {
 		case RuleTypeHostname:
-			// Track ALL hostnames we have rules for - will resolve JIT when DNS queries arrive
-			cm.trackedHostnames[rule.Value] = rule.Action
-
-			// Check if we already have cached IPs for this hostname (from previous DNS intercepts)
-			if cachedIPs, ok := cm.hostnameCache[rule.Value]; ok {
-				resolved.IPs = cachedIPs
+			if IsHostnamePattern(rule.Value) {
+				// Compile glob pattern and store separately
+				pattern, err := CompileHostnamePattern(rule.Value)
+				if err != nil {
+					slog.Error("Invalid hostname pattern", "value", rule.Value, "error", err)
+					continue
+				}
+				resolved.Pattern = &pattern
+				cm.hostnamePatterns = append(cm.hostnamePatterns, hostnamePatternEntry{
+					Pattern:       pattern,
+					Action:        rule.Action,
+					Ports:         rule.Ports,
+					AutoAddedType: rule.AutoAddedType,
+				})
 			} else {
-				// Initialize the hostnameCache entry so UpdateDNSMapping can append IPs later
-				cm.hostnameCache[rule.Value] = []net.IP{}
-				resolved.IPs = []net.IP{}
+				// Track ALL hostnames we have rules for - will resolve JIT when DNS queries arrive
+				cm.trackedHostnames[rule.Value] = rule.Action
+
+				// Check if we already have cached IPs for this hostname (from previous DNS intercepts)
+				if cachedIPs, ok := cm.hostnameCache[rule.Value]; ok {
+					resolved.IPs = cachedIPs
+				} else {
+					// Initialize the hostnameCache entry so UpdateDNSMapping can append IPs later
+					cm.hostnameCache[rule.Value] = []net.IP{}
+					resolved.IPs = []net.IP{}
+				}
 			}
 
 		case RuleTypeCIDR:

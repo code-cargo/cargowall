@@ -145,9 +145,10 @@ jobs:
         with:
           mode: enforce
           offline: 'true'
-          allowed-hosts: | 
+          allowed-hosts: |
              docker.io
              docker.com
+             **.githubusercontent.com
           binary-path: ./bin/cargowall
           debug: true
 
@@ -155,6 +156,11 @@ jobs:
         run: |
           curl -sf --connect-timeout 10 --max-time 30 https://github.com > /dev/null
           echo "✅ github.com allowed"
+
+      - name: Test allowed connection via hostname pattern
+        run: |
+          curl -sf --connect-timeout 10 --max-time 30 https://raw.githubusercontent.com/github/gitignore/main/README.md > /dev/null
+          echo "✅ raw.githubusercontent.com allowed via **.githubusercontent.com pattern"
 
       - name: Test blocked connection
         run: |

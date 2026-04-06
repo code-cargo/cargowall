@@ -355,7 +355,6 @@ func TestParseHostWithPorts(t *testing.T) {
 	}
 }
 
-
 func TestLoadFromEnv_WithPorts(t *testing.T) {
 	// Save and restore env vars
 	envVars := []string{

@@ -937,9 +937,9 @@ func TestFindTrackedHostnameWithPatterns(t *testing.T) {
 		t.Errorf("FindTrackedHostname(api.github.com) = %q, want github.com", got)
 	}
 
-	// Pattern match returns the raw pattern
-	if got := cm.FindTrackedHostname("abc.def.internal.cloudapp.net"); got != "*.*.internal.cloudapp.net" {
-		t.Errorf("FindTrackedHostname(abc.def.internal.cloudapp.net) = %q, want *.*.internal.cloudapp.net", got)
+	// Pattern match returns the actual hostname (not the pattern string)
+	if got := cm.FindTrackedHostname("abc.def.internal.cloudapp.net"); got != "abc.def.internal.cloudapp.net" {
+		t.Errorf("FindTrackedHostname(abc.def.internal.cloudapp.net) = %q, want abc.def.internal.cloudapp.net", got)
 	}
 
 	// No match
@@ -995,5 +995,44 @@ func TestLeadingWildcardIsPattern(t *testing.T) {
 	// * does NOT match two labels
 	if action := cm.GetTrackedHostnameAction("a.b.github.com"); action != "" {
 		t.Errorf("a.b.github.com should NOT match *.github.com (single * = one label), got %q", action)
+	}
+}
+
+func TestDenyPatternOverridesParentAllow(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "example.com", Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "evil.*.example.com", Action: ActionDeny},
+	}, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	// Parent domain allow still works for normal subdomains
+	if action := cm.GetTrackedHostnameAction("api.example.com"); action != ActionAllow {
+		t.Errorf("api.example.com should be allowed via parent domain, got %q", action)
+	}
+
+	// Deny pattern overrides the parent-domain allow
+	if action := cm.GetTrackedHostnameAction("evil.foo.example.com"); action != ActionDeny {
+		t.Errorf("evil.foo.example.com should be denied by pattern even though example.com is allowed, got %q", action)
+	}
+}
+
+func TestConsecutiveDoubleStarRejected(t *testing.T) {
+	_, err := compileHostnamePattern("**.**.com")
+	if err == nil {
+		t.Error("expected error for consecutive ** segments, got nil")
+	}
+
+	_, err = compileHostnamePattern("foo.**.**.bar.com")
+	if err == nil {
+		t.Error("expected error for consecutive ** segments, got nil")
+	}
+
+	// Non-consecutive ** is fine
+	_, err = compileHostnamePattern("**.foo.**.com")
+	if err != nil {
+		t.Errorf("non-consecutive ** should be valid, got error: %v", err)
 	}
 }

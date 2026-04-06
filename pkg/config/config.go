@@ -566,27 +566,39 @@ func (cm *Manager) GetTrackedHostnameAction(hostname string) Action {
 		return action
 	}
 
-	// Check if it's a subdomain of a tracked hostname
-	// For example, if "google.com" is tracked, then "www.google.com" should inherit the same action
+	// Check if it's a subdomain of a tracked hostname.
+	// Don't return yet — a more specific deny pattern may override.
+	var parentAction Action
 	for trackedHost, action := range cm.trackedHostnames {
 		if strings.HasSuffix(hostname, "."+trackedHost) {
 			slog.Debug("Found parent domain match",
 				"hostname", hostname,
 				"parent", trackedHost,
 				"action", action)
-			return action
+			parentAction = action
+			break
 		}
 	}
 
-	// Check hostname patterns (glob matching)
+	// Check hostname patterns (glob matching).
+	// A deny pattern overrides a parent-domain allow (more specific wins).
 	for _, rule := range cm.resolvedRules {
 		if rule.Pattern != nil && rule.Pattern.Matches(hostname) {
 			slog.Debug("Found pattern match",
 				"hostname", hostname,
 				"pattern", rule.Pattern.Raw,
 				"action", rule.Action)
-			return rule.Action
+			if rule.Action == ActionDeny {
+				return ActionDeny
+			}
+			if parentAction == "" {
+				parentAction = rule.Action
+			}
 		}
+	}
+
+	if parentAction != "" {
+		return parentAction
 	}
 
 	slog.Debug("No tracked hostname found", "hostname", hostname)
@@ -695,10 +707,11 @@ func (cm *Manager) FindTrackedHostname(name string) string {
 		}
 	}
 
-	// Pattern match
+	// Pattern match — return the actual hostname (not the pattern string)
+	// so callers can safely pass it to UpdateDNSMapping / GetTrackedHostnameAction.
 	for _, rule := range cm.resolvedRules {
 		if rule.Pattern != nil && rule.Pattern.Matches(name) {
-			return rule.Pattern.Raw
+			return name
 		}
 	}
 	return ""

@@ -557,16 +557,16 @@ func (s *Server) getHostnamePorts(hostname string) []config.Port {
 		}
 	}
 
-	// Check parent domain
+	// Check patterns first — more specific than parent-domain match
 	for _, rule := range rules {
-		if rule.Type == config.RuleTypeHostname && rule.Pattern == nil && strings.HasSuffix(hostname, "."+rule.Value) {
+		if rule.Type == config.RuleTypeHostname && rule.Pattern != nil && rule.Pattern.Matches(hostname) {
 			return rule.Ports
 		}
 	}
 
-	// Check hostname patterns (glob matching)
+	// Fall back to parent domain
 	for _, rule := range rules {
-		if rule.Type == config.RuleTypeHostname && rule.Pattern != nil && rule.MatchesHostname(hostname) {
+		if rule.Type == config.RuleTypeHostname && rule.Pattern == nil && strings.HasSuffix(hostname, "."+rule.Value) {
 			return rule.Ports
 		}
 	}

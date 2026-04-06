@@ -30,6 +30,10 @@ func compileHostnamePattern(raw string) (hostnamePattern, error) {
 			return hostnamePattern{}, fmt.Errorf("empty segment at position %d in pattern %q", i, raw)
 		}
 		if seg == "*" || seg == "**" {
+			// Reject consecutive ** segments (e.g. "**.**.com") — ambiguous and degenerate
+			if seg == "**" && i > 0 && segments[i-1] == "**" {
+				return hostnamePattern{}, fmt.Errorf("consecutive ** segments at positions %d-%d in pattern %q", i-1, i, raw)
+			}
 			continue
 		}
 		// A segment with a mix of wildcards and literals (e.g. "foo*bar") is not supported
@@ -47,38 +51,43 @@ func (p *hostnamePattern) Matches(hostname string) bool {
 	return matchSegments(p.Segments, labels)
 }
 
-// matchSegments recursively matches pattern segments against hostname labels.
+// matchSegments matches pattern segments against hostname labels using dynamic
+// programming to avoid exponential backtracking with multiple "**" segments.
+// dp[si][li] reports whether segments[si:] matches labels[li:].
 func matchSegments(segments []string, labels []string) bool {
-	si, li := 0, 0
+	segCount := len(segments)
+	labelCount := len(labels)
 
-	for si < len(segments) {
+	dp := make([][]bool, segCount+1)
+	for si := range dp {
+		dp[si] = make([]bool, labelCount+1)
+	}
+
+	// Both fully consumed — match
+	dp[segCount][labelCount] = true
+
+	for si := segCount - 1; si >= 0; si-- {
 		seg := segments[si]
-
-		switch seg {
-		case "**":
-			remaining := segments[si+1:]
-			for take := 1; take <= len(labels)-li; take++ {
-				if matchSegments(remaining, labels[li+take:]) {
-					return true
+		for li := labelCount; li >= 0; li-- {
+			switch seg {
+			case "**":
+				// ** matches one or more labels
+				if li < labelCount && (dp[si][li+1] || dp[si+1][li+1]) {
+					dp[si][li] = true
+				}
+			case "*":
+				// * matches exactly one label
+				if li < labelCount && dp[si+1][li+1] {
+					dp[si][li] = true
+				}
+			default:
+				// Literal match
+				if li < labelCount && labels[li] == seg && dp[si+1][li+1] {
+					dp[si][li] = true
 				}
 			}
-			return false
-
-		case "*":
-			if li >= len(labels) {
-				return false
-			}
-			si++
-			li++
-
-		default:
-			if li >= len(labels) || labels[li] != seg {
-				return false
-			}
-			si++
-			li++
 		}
 	}
 
-	return si == len(segments) && li == len(labels)
+	return dp[0][0]
 }

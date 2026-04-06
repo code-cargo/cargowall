@@ -27,10 +27,13 @@ func TestCompileHostnamePattern(t *testing.T) {
 		{"double wildcard", "**.internal.cloudapp.net", false},
 		{"middle wildcards", "actions.githubusercontent.com.*.*.internal.cloudapp.net", false},
 		{"mixed", "foo.**.bar.*.baz.com", false},
+		{"non-consecutive doublestar", "**.foo.**.com", false},
 		{"empty pattern", "", true},
 		{"empty segment", "foo..bar.com", true},
 		{"partial wildcard", "foo*.bar.com", true},
 		{"partial wildcard mid", "foo.b*r.com", true},
+		{"consecutive doublestar", "**.**.com", true},
+		{"consecutive doublestar mid", "foo.**.**.bar.com", true},
 	}
 
 	for _, tt := range tests {

@@ -91,6 +91,18 @@ Add the [CargoWall GitHub Action](https://github.com/code-cargo/cargowall-action
       registry.npmjs.org
 ```
 
+Hostname rules support **glob patterns** for matching dynamic hostnames:
+
+- `*` matches exactly one DNS label
+- `**` matches one or more DNS labels
+
+```yaml
+allowed-hosts: |
+  github.com,
+  actions.githubusercontent.com.*.*.internal.cloudapp.net,
+  **.storage.azure.com
+```
+
 See the [cargowall-action README](https://github.com/code-cargo/cargowall-action) for full usage, inputs, outputs, and examples.
 
 ---

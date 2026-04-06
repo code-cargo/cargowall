@@ -443,7 +443,7 @@ func TestLoadFromEnv_WithPorts(t *testing.T) {
 	}
 }
 
-func TestLoadFromEnv_WildcardNormalization(t *testing.T) {
+func TestLoadFromEnv_WildcardPattern(t *testing.T) {
 	// Save and restore env vars
 	envVars := []string{
 		"CARGOWALL_DEFAULT_ACTION",
@@ -483,9 +483,9 @@ func TestLoadFromEnv_WildcardNormalization(t *testing.T) {
 		t.Fatalf("expected 2 rules, got %d", len(cm.config.Rules))
 	}
 
-	// *.github.com should be normalized to github.com
-	if cm.config.Rules[0].Value != "github.com" {
-		t.Errorf("rule[0].Value = %q, want %q (wildcard should be normalized)", cm.config.Rules[0].Value, "github.com")
+	// *.github.com is a glob pattern — should be preserved as-is (not normalized)
+	if cm.config.Rules[0].Value != "*.github.com" {
+		t.Errorf("rule[0].Value = %q, want %q (pattern should be preserved)", cm.config.Rules[0].Value, "*.github.com")
 	}
 	if !reflect.DeepEqual(cm.config.Rules[0].Ports, []Port{{Port: 443, Protocol: ProtocolAll}}) {
 		t.Errorf("rule[0].Ports = %v, want [{443 all}]", cm.config.Rules[0].Ports)

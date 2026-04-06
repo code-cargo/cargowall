@@ -134,12 +134,12 @@ type Manager struct {
 	config           *FirewallConfig
 	resolvedRules    []ResolvedRule
 	hostnameCache    map[string][]net.IP
-	ipToHostname     map[string]string    // Reverse lookup: IP -> hostname
-	ipLastSeen       map[string]time.Time // Track when each IP was last seen
-	trackedHostnames map[string]Action    // Track hostnames we have rules for (hostname -> action)
+	ipToHostname     map[string]string      // Reverse lookup: IP -> hostname
+	ipLastSeen       map[string]time.Time   // Track when each IP was last seen
+	trackedHostnames map[string]Action      // Track hostnames we have rules for (hostname -> action)
 	hostnamePatterns []hostnamePatternEntry // Compiled glob patterns for hostname matching
 	maxCacheSize     int                    // Maximum number of IPs to cache
-	dnsCacheTTL      time.Duration        // How long to keep DNS entries
+	dnsCacheTTL      time.Duration          // How long to keep DNS entries
 }
 
 // NewConfigManager creates a new configuration manager

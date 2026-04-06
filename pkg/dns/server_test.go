@@ -506,7 +506,7 @@ func TestGetHostnamePorts(t *testing.T) {
 		{"example.com", []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}},
 		{"sub.example.com", []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}}, // Should match parent domain
 		{"abc.def.internal.cloudapp.net", []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}},                             // Should match pattern
-		{"only1.internal.cloudapp.net", nil},                                                                                     // Pattern needs 2 labels
+		{"only1.internal.cloudapp.net", nil}, // Pattern needs 2 labels
 		{"other.com", nil},
 	}
 

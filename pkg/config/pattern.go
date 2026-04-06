@@ -56,8 +56,6 @@ func matchSegments(segments []string, labels []string) bool {
 
 		switch seg {
 		case "**":
-			// ** must match one or more labels
-			// Try consuming 1..N remaining labels, then match rest of pattern
 			remaining := segments[si+1:]
 			for take := 1; take <= len(labels)-li; take++ {
 				if matchSegments(remaining, labels[li+take:]) {
@@ -67,7 +65,6 @@ func matchSegments(segments []string, labels []string) bool {
 			return false
 
 		case "*":
-			// * matches exactly one label
 			if li >= len(labels) {
 				return false
 			}
@@ -75,7 +72,6 @@ func matchSegments(segments []string, labels []string) bool {
 			li++
 
 		default:
-			// Literal match
 			if li >= len(labels) || labels[li] != seg {
 				return false
 			}
@@ -84,6 +80,5 @@ func matchSegments(segments []string, labels []string) bool {
 		}
 	}
 
-	// Both must be fully consumed
 	return si == len(segments) && li == len(labels)
 }

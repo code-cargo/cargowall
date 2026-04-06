@@ -564,9 +564,9 @@ func (s *Server) getHostnamePorts(hostname string) []config.Port {
 		}
 	}
 
-	// Check hostname patterns
+	// Check hostname patterns (glob matching)
 	for _, rule := range rules {
-		if rule.Type == config.RuleTypeHostname && rule.Pattern != nil && rule.Pattern.Matches(hostname) {
+		if rule.Type == config.RuleTypeHostname && rule.Pattern != nil && rule.MatchesHostname(hostname) {
 			return rule.Ports
 		}
 	}

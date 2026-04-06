@@ -1,5 +1,6 @@
 .idea
 .claude
+.omc
 node_modules
 bin
 /cargowall

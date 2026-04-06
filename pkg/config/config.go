@@ -120,6 +120,15 @@ type ResolvedRule struct {
 	AutoAddedType AutoAddedType // Why this rule was auto-added (empty for user-configured rules)
 }
 
+// MatchesHostname returns true if the hostname matches this hostname rule
+// via glob pattern, exact match, or parent domain (subdomain) match.
+func (r *ResolvedRule) MatchesHostname(hostname string) bool {
+	if r.Pattern != nil {
+		return r.Pattern.Matches(hostname)
+	}
+	return hostname == r.Value || strings.HasSuffix(hostname, "."+r.Value)
+}
+
 // Manager manages the firewall configuration and hostname resolution
 type Manager struct {
 	mu               sync.RWMutex
@@ -923,11 +932,7 @@ func (cm *Manager) GetAutoAllowedTypeForHostname(hostname string) AutoAddedType 
 		if rule.Type != RuleTypeHostname || rule.AutoAddedType == AutoAddedTypeNone || rule.Action != ActionAllow {
 			continue
 		}
-		if rule.Pattern != nil {
-			if rule.Pattern.Matches(hostname) {
-				return rule.AutoAddedType
-			}
-		} else if hostname == rule.Value || strings.HasSuffix(hostname, "."+rule.Value) {
+		if rule.MatchesHostname(hostname) {
 			return rule.AutoAddedType
 		}
 	}
@@ -978,11 +983,7 @@ func (cm *Manager) GetAutoAllowedType(ip string, port uint16, hostname string) A
 
 		switch rule.Type {
 		case RuleTypeHostname:
-			if rule.Pattern != nil {
-				if rule.Pattern.Matches(hostname) {
-					return rule.AutoAddedType
-				}
-			} else if hostname == rule.Value || strings.HasSuffix(hostname, "."+rule.Value) {
+			if rule.MatchesHostname(hostname) {
 				return rule.AutoAddedType
 			}
 		case RuleTypeCIDR:

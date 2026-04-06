@@ -403,17 +403,17 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		}
 	}
 
-	logger.Info("CargoWall ready")
-
 	if hooks != nil && hooks.Ready != nil {
 		if err := hooks.Ready(); err != nil {
 			return fmt.Errorf("ready hook failed: %w", err)
 		}
 	} else {
 		if err := os.WriteFile("/tmp/cargowall-ready", nil, 0o660); err != nil {
-			return err
+			return fmt.Errorf("writing ready file: %w", err)
 		}
 	}
+
+	logger.Info("CargoWall ready")
 
 	// Handle signals for graceful shutdown
 	c := make(chan os.Signal, 1)

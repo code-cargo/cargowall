@@ -19,28 +19,66 @@ package cmd
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 )
 
 // swappableHandler is an slog.Handler that delegates to an atomically-swappable
 // inner handler. This allows LoggerShutdown to swap the handler without
 // invalidating *slog.Logger pointers held by long-lived goroutines.
+//
+// WithAttrs and WithGroup return a new swappableHandler sharing the same atomic
+// pointer, so derived loggers (logger.With(...)) are also affected by the swap.
+// Resolved handlers are cached lazily and only rebuilt when the inner swaps.
 type swappableHandler struct {
-	inner atomic.Pointer[slog.Handler]
+	inner *atomic.Pointer[slog.Handler]
+	apply func(slog.Handler) slog.Handler // nil for root handler
+	cache sync.Map                        // *slog.Handler → slog.Handler
+}
+
+func (h *swappableHandler) resolve() slog.Handler {
+	base := h.inner.Load()
+	if h.apply == nil {
+		return *base
+	}
+	if cached, ok := h.cache.Load(base); ok {
+		return cached.(slog.Handler)
+	}
+	resolved := h.apply(*base)
+	h.cache.Store(base, resolved)
+	return resolved
 }
 
 func (h *swappableHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return (*h.inner.Load()).Enabled(ctx, level)
+	return h.resolve().Enabled(ctx, level)
 }
 
 func (h *swappableHandler) Handle(ctx context.Context, r slog.Record) error {
-	return (*h.inner.Load()).Handle(ctx, r)
+	return h.resolve().Handle(ctx, r)
 }
 
 func (h *swappableHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return (*h.inner.Load()).WithAttrs(attrs)
+	parent := h.apply
+	return &swappableHandler{
+		inner: h.inner,
+		apply: func(base slog.Handler) slog.Handler {
+			if parent != nil {
+				base = parent(base)
+			}
+			return base.WithAttrs(attrs)
+		},
+	}
 }
 
 func (h *swappableHandler) WithGroup(name string) slog.Handler {
-	return (*h.inner.Load()).WithGroup(name)
+	parent := h.apply
+	return &swappableHandler{
+		inner: h.inner,
+		apply: func(base slog.Handler) slog.Handler {
+			if parent != nil {
+				base = parent(base)
+			}
+			return base.WithGroup(name)
+		},
+	}
 }

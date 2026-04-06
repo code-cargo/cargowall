@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -117,16 +118,23 @@ func (c *StartCmd) Run(globals *Globals) error {
 		handler, shutdown, err := c.Hooks.InitLogger(initCtx, c.Version, globals.Debug)
 		if err != nil {
 			slog.Warn("failed to initialize logger via hook", "error", err)
+		} else if handler == nil {
+			slog.Warn("InitLogger hook returned nil handler")
 		} else {
-			sh := &swappableHandler{}
-			sh.inner.Store(&handler)
+			inner := &atomic.Pointer[slog.Handler]{}
+			inner.Store(&handler)
+			sh := &swappableHandler{inner: inner}
 			c.Logger = slog.New(sh)
 			slog.SetDefault(c.Logger)
 			defaultHandler := defaultLog.Handler()
 			c.LoggerShutdown = func(ctx context.Context) error {
-				err := shutdown(ctx)
+				// Swap first so concurrent goroutines log safely
+				// while the old handler is being shutdown.
 				sh.inner.Store(&defaultHandler)
-				return err
+				if shutdown != nil {
+					return shutdown(ctx)
+				}
+				return nil
 			}
 		}
 	}

@@ -235,6 +235,46 @@ func TestStartCmd_LoggerShutdown_PropagatesError(t *testing.T) {
 	assert.True(t, isJSON, "inner handler should be restored even when shutdown returns an error")
 }
 
+func TestStartCmd_LoggerShutdown_NilShutdownFunc(t *testing.T) {
+	saveSlogDefault(t)
+	hooks := &StartHooks{
+		InitLogger: func(_ context.Context, _ string, _ bool) (slog.Handler, func(context.Context) error, error) {
+			return testTextHandler(), nil, nil
+		},
+	}
+	cmd := &StartCmd{Execute: noopExecute, Hooks: hooks}
+	require.NoError(t, cmd.Run(&Globals{}))
+	require.NotNil(t, cmd.LoggerShutdown)
+
+	// Should not panic
+	err := cmd.LoggerShutdown(context.Background())
+	require.NoError(t, err)
+
+	_, isJSON := innerHandler(t, cmd.Logger).(*slog.JSONHandler)
+	assert.True(t, isJSON, "handler should still be swapped to default")
+}
+
+func TestStartCmd_LoggerShutdown_SwapsBeforeCallingShutdown(t *testing.T) {
+	saveSlogDefault(t)
+	var handlerDuringShutdown slog.Handler
+	cmd := &StartCmd{Execute: noopExecute}
+	cmd.Hooks = &StartHooks{
+		InitLogger: func(_ context.Context, _ string, _ bool) (slog.Handler, func(context.Context) error, error) {
+			return testTextHandler(), func(_ context.Context) error {
+				// Capture what the handler resolves to during shutdown
+				handlerDuringShutdown = *cmd.Logger.Handler().(*swappableHandler).inner.Load()
+				return nil
+			}, nil
+		},
+	}
+	require.NoError(t, cmd.Run(&Globals{}))
+
+	require.NoError(t, cmd.LoggerShutdown(context.Background()))
+
+	_, isJSON := handlerDuringShutdown.(*slog.JSONHandler)
+	assert.True(t, isJSON, "handler should already be swapped to default when shutdown func runs")
+}
+
 // --- Edge cases ---
 
 func TestStartCmd_Run_NilHooks(t *testing.T) {
@@ -242,6 +282,21 @@ func TestStartCmd_Run_NilHooks(t *testing.T) {
 	cmd := &StartCmd{Execute: noopExecute, Hooks: nil}
 	err := cmd.Run(&Globals{})
 	require.NoError(t, err)
+	assert.Nil(t, cmd.LoggerShutdown)
+}
+
+func TestStartCmd_Run_InitLoggerHookNilHandler(t *testing.T) {
+	saveSlogDefault(t)
+	hooks := &StartHooks{
+		InitLogger: func(_ context.Context, _ string, _ bool) (slog.Handler, func(context.Context) error, error) {
+			return nil, func(context.Context) error { return nil }, nil
+		},
+	}
+	cmd := &StartCmd{Execute: noopExecute, Hooks: hooks}
+	err := cmd.Run(&Globals{})
+	require.NoError(t, err, "nil handler should be treated as a warning, not fatal")
+	_, ok := cmd.Logger.Handler().(*slog.JSONHandler)
+	assert.True(t, ok, "logger should remain the default JSON logger")
 	assert.Nil(t, cmd.LoggerShutdown)
 }
 

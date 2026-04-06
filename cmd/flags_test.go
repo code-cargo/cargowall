@@ -35,6 +35,18 @@ func saveSlogDefault(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 }
 
+// innerHandler extracts the inner handler from a swappableHandler-backed logger.
+func innerHandler(t *testing.T, logger *slog.Logger) slog.Handler {
+	t.Helper()
+	sh, ok := logger.Handler().(*swappableHandler)
+	require.True(t, ok, "expected *swappableHandler, got %T", logger.Handler())
+	return *sh.inner.Load()
+}
+
+func testTextHandler() slog.Handler {
+	return slog.NewTextHandler(io.Discard, nil)
+}
+
 // --- Run: default logger (no hooks) ---
 
 func TestStartCmd_Run_DefaultLogger(t *testing.T) {
@@ -70,23 +82,23 @@ func TestStartCmd_Run_GithubActionLogger(t *testing.T) {
 
 func TestStartCmd_Run_InitLoggerHookSetsLogger(t *testing.T) {
 	saveSlogDefault(t)
-	hookLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	hooks := &StartHooks{
-		InitLogger: func(_ context.Context, _ string, _ bool) (*slog.Logger, func(context.Context) error, error) {
-			return hookLogger, func(context.Context) error { return nil }, nil
+		InitLogger: func(_ context.Context, _ string, _ bool) (slog.Handler, func(context.Context) error, error) {
+			return testTextHandler(), func(context.Context) error { return nil }, nil
 		},
 	}
 	cmd := &StartCmd{Execute: noopExecute, Hooks: hooks}
 	err := cmd.Run(&Globals{})
 	require.NoError(t, err)
-	assert.Same(t, hookLogger, cmd.Logger)
+	_, ok := innerHandler(t, cmd.Logger).(*slog.TextHandler)
+	assert.True(t, ok, "expected inner *slog.TextHandler, got %T", innerHandler(t, cmd.Logger))
 	assert.NotNil(t, cmd.LoggerShutdown)
 }
 
 func TestStartCmd_Run_InitLoggerHookError(t *testing.T) {
 	saveSlogDefault(t)
 	hooks := &StartHooks{
-		InitLogger: func(_ context.Context, _ string, _ bool) (*slog.Logger, func(context.Context) error, error) {
+		InitLogger: func(_ context.Context, _ string, _ bool) (slog.Handler, func(context.Context) error, error) {
 			return nil, nil, fmt.Errorf("connection refused")
 		},
 	}
@@ -100,16 +112,16 @@ func TestStartCmd_Run_InitLoggerHookError(t *testing.T) {
 
 func TestStartCmd_Run_InitLoggerHookWithGithubAction(t *testing.T) {
 	saveSlogDefault(t)
-	hookLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	hooks := &StartHooks{
-		InitLogger: func(_ context.Context, _ string, _ bool) (*slog.Logger, func(context.Context) error, error) {
-			return hookLogger, func(context.Context) error { return nil }, nil
+		InitLogger: func(_ context.Context, _ string, _ bool) (slog.Handler, func(context.Context) error, error) {
+			return testTextHandler(), func(context.Context) error { return nil }, nil
 		},
 	}
 	cmd := &StartCmd{Execute: noopExecute, Hooks: hooks, GithubAction: true}
 	err := cmd.Run(&Globals{})
 	require.NoError(t, err)
-	assert.Same(t, hookLogger, cmd.Logger, "InitLogger hook should override GithubAction logger")
+	_, ok := innerHandler(t, cmd.Logger).(*slog.TextHandler)
+	assert.True(t, ok, "InitLogger hook should override GithubAction logger")
 	assert.NotNil(t, cmd.LoggerShutdown)
 }
 
@@ -150,8 +162,8 @@ func TestStartCmd_LoggerShutdown_CallsHookShutdown(t *testing.T) {
 	saveSlogDefault(t)
 	shutdownCalled := false
 	hooks := &StartHooks{
-		InitLogger: func(_ context.Context, _ string, _ bool) (*slog.Logger, func(context.Context) error, error) {
-			return slog.New(slog.NewTextHandler(io.Discard, nil)), func(context.Context) error {
+		InitLogger: func(_ context.Context, _ string, _ bool) (slog.Handler, func(context.Context) error, error) {
+			return testTextHandler(), func(context.Context) error {
 				shutdownCalled = true
 				return nil
 			}, nil
@@ -169,31 +181,29 @@ func TestStartCmd_LoggerShutdown_CallsHookShutdown(t *testing.T) {
 func TestStartCmd_LoggerShutdown_RestoresDefaultLogger(t *testing.T) {
 	saveSlogDefault(t)
 	hooks := &StartHooks{
-		InitLogger: func(_ context.Context, _ string, _ bool) (*slog.Logger, func(context.Context) error, error) {
-			return slog.New(slog.NewTextHandler(io.Discard, nil)), func(context.Context) error { return nil }, nil
+		InitLogger: func(_ context.Context, _ string, _ bool) (slog.Handler, func(context.Context) error, error) {
+			return testTextHandler(), func(context.Context) error { return nil }, nil
 		},
 	}
 	cmd := &StartCmd{Execute: noopExecute, Hooks: hooks}
 	require.NoError(t, cmd.Run(&Globals{}))
 
-	// Before shutdown: logger is the hook logger (TextHandler)
-	_, isText := cmd.Logger.Handler().(*slog.TextHandler)
+	// Before shutdown: inner handler is the hook's TextHandler
+	_, isText := innerHandler(t, cmd.Logger).(*slog.TextHandler)
 	require.True(t, isText)
 
 	require.NoError(t, cmd.LoggerShutdown(context.Background()))
 
-	// After shutdown: logger restored to default JSON handler
-	_, isJSON := cmd.Logger.Handler().(*slog.JSONHandler)
-	assert.True(t, isJSON, "expected *slog.JSONHandler after shutdown, got %T", cmd.Logger.Handler())
-	_, isDefaultJSON := slog.Default().Handler().(*slog.JSONHandler)
-	assert.True(t, isDefaultJSON, "slog.Default() should be restored to JSON handler")
+	// After shutdown: inner handler swapped to default JSONHandler
+	_, isJSON := innerHandler(t, cmd.Logger).(*slog.JSONHandler)
+	assert.True(t, isJSON, "expected inner *slog.JSONHandler after shutdown, got %T", innerHandler(t, cmd.Logger))
 }
 
 func TestStartCmd_LoggerShutdown_RestoresGithubActionLogger(t *testing.T) {
 	saveSlogDefault(t)
 	hooks := &StartHooks{
-		InitLogger: func(_ context.Context, _ string, _ bool) (*slog.Logger, func(context.Context) error, error) {
-			return slog.New(slog.NewTextHandler(io.Discard, nil)), func(context.Context) error { return nil }, nil
+		InitLogger: func(_ context.Context, _ string, _ bool) (slog.Handler, func(context.Context) error, error) {
+			return testTextHandler(), func(context.Context) error { return nil }, nil
 		},
 	}
 	cmd := &StartCmd{Execute: noopExecute, Hooks: hooks, GithubAction: true}
@@ -201,15 +211,15 @@ func TestStartCmd_LoggerShutdown_RestoresGithubActionLogger(t *testing.T) {
 
 	require.NoError(t, cmd.LoggerShutdown(context.Background()))
 
-	_, isGHA := cmd.Logger.Handler().(*GitHubActionsHandler)
-	assert.True(t, isGHA, "expected *GitHubActionsHandler after shutdown, got %T", cmd.Logger.Handler())
+	_, isGHA := innerHandler(t, cmd.Logger).(*GitHubActionsHandler)
+	assert.True(t, isGHA, "expected inner *GitHubActionsHandler after shutdown, got %T", innerHandler(t, cmd.Logger))
 }
 
 func TestStartCmd_LoggerShutdown_PropagatesError(t *testing.T) {
 	saveSlogDefault(t)
 	hooks := &StartHooks{
-		InitLogger: func(_ context.Context, _ string, _ bool) (*slog.Logger, func(context.Context) error, error) {
-			return slog.New(slog.NewTextHandler(io.Discard, nil)), func(context.Context) error {
+		InitLogger: func(_ context.Context, _ string, _ bool) (slog.Handler, func(context.Context) error, error) {
+			return testTextHandler(), func(context.Context) error {
 				return fmt.Errorf("flush failed")
 			}, nil
 		},
@@ -220,9 +230,9 @@ func TestStartCmd_LoggerShutdown_PropagatesError(t *testing.T) {
 	err := cmd.LoggerShutdown(context.Background())
 	assert.EqualError(t, err, "flush failed")
 
-	// Logger should still be restored despite the error
-	_, isJSON := cmd.Logger.Handler().(*slog.JSONHandler)
-	assert.True(t, isJSON, "logger should be restored even when shutdown returns an error")
+	// Inner handler should still be restored despite the error
+	_, isJSON := innerHandler(t, cmd.Logger).(*slog.JSONHandler)
+	assert.True(t, isJSON, "inner handler should be restored even when shutdown returns an error")
 }
 
 // --- Edge cases ---

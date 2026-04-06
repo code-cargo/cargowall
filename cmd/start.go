@@ -429,7 +429,6 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			slog.Warn("logger shutdown failed", "error", err)
 		}
 		cancel()
-		logger = cmd.Logger
 	}
 
 	// Disable sudo lockdown if we enabled it

@@ -49,7 +49,7 @@ func (v VersionFlag) BeforeApply(app *kong.Kong, vars kong.Vars) error {
 type StartHooks struct {
 	Ready      func() error
 	LoadPolicy func(ctx context.Context, cmd *StartCmd) (*cargowallv1pb.CargoWallPolicy, events.StateMachineClient, func(), error)
-	InitLogger func(ctx context.Context, version string, debug bool) (*slog.Logger, func(context.Context) error, error)
+	InitLogger func(ctx context.Context, version string, debug bool) (slog.Handler, func(context.Context) error, error)
 }
 
 type ExecuteFn func(cmd *StartCmd, hooks *StartHooks) error
@@ -57,8 +57,8 @@ type ExecuteFn func(cmd *StartCmd, hooks *StartHooks) error
 type StartCmd struct {
 	Execute        ExecuteFn                   `kong:"-"`
 	Logger         *slog.Logger                `kong:"-"`
-	LoggerShutdown func(context.Context) error `kong:"-"` // Set by Run(); called in StartCargoWall before teardown
-	Version        string                      `kong:"-"`
+	LoggerShutdown func(context.Context) error `kong:"-"`
+	Version        string                      `kong:"-"` // Version passed from main
 	Hooks          *StartHooks                 `kong:"-"`
 
 	// Configuration
@@ -110,19 +110,22 @@ func (c *StartCmd) Run(globals *Globals) error {
 
 	defaultLog := c.Logger
 	if c.Hooks != nil && c.Hooks.InitLogger != nil {
+		// Use a timeout context only for initialization to prevent hanging
 		initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer initCancel()
 
-		logger, shutdown, err := c.Hooks.InitLogger(initCtx, c.Version, globals.Debug)
+		handler, shutdown, err := c.Hooks.InitLogger(initCtx, c.Version, globals.Debug)
 		if err != nil {
 			slog.Warn("failed to initialize logger via hook", "error", err)
 		} else {
-			c.Logger = logger
-			slog.SetDefault(logger)
+			sh := &swappableHandler{}
+			sh.inner.Store(&handler)
+			c.Logger = slog.New(sh)
+			slog.SetDefault(c.Logger)
+			defaultHandler := defaultLog.Handler()
 			c.LoggerShutdown = func(ctx context.Context) error {
 				err := shutdown(ctx)
-				c.Logger = defaultLog
-				slog.SetDefault(defaultLog)
+				sh.inner.Store(&defaultHandler)
 				return err
 			}
 		}

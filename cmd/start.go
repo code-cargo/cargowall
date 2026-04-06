@@ -403,12 +403,17 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		}
 	}
 
-	logger.Info("CargoWall ready")
-
-	err = os.WriteFile("/tmp/cargowall-ready", nil, 0o660)
-	if err != nil {
-		return err
+	if hooks != nil && hooks.Ready != nil {
+		if err := hooks.Ready(); err != nil {
+			return fmt.Errorf("ready hook failed: %w", err)
+		}
+	} else {
+		if err := os.WriteFile("/tmp/cargowall-ready", nil, 0o660); err != nil {
+			return fmt.Errorf("writing ready file: %w", err)
+		}
 	}
+
+	logger.Info("CargoWall ready")
 
 	// Handle signals for graceful shutdown
 	c := make(chan os.Signal, 1)
@@ -416,6 +421,15 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	<-c
 
 	logger.Info("Shutting down TC firewall")
+
+	// Shut down logger while DNS proxy and network are still up.
+	if cmd.LoggerShutdown != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := cmd.LoggerShutdown(ctx); err != nil {
+			slog.Warn("logger shutdown failed", "error", err)
+		}
+		cancel()
+	}
 
 	// Disable sudo lockdown if we enabled it
 	if sudoLockdownEnabled {

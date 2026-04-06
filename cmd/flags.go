@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -47,17 +48,19 @@ func (v VersionFlag) BeforeApply(app *kong.Kong, vars kong.Vars) error {
 }
 
 type StartHooks struct {
+	Ready      func() error
 	LoadPolicy func(ctx context.Context, cmd *StartCmd) (*cargowallv1pb.CargoWallPolicy, events.StateMachineClient, func(), error)
-	InitLogger func(ctx context.Context, version string, debug bool) (*slog.Logger, func(context.Context) error, error)
+	InitLogger func(ctx context.Context, version string, debug bool) (slog.Handler, func(context.Context) error, error)
 }
 
 type ExecuteFn func(cmd *StartCmd, hooks *StartHooks) error
 
 type StartCmd struct {
-	Execute ExecuteFn    `kong:"-"`
-	Logger  *slog.Logger `kong:"-"`
-	Version string       `kong:"-"` // Version passed from main
-	Hooks   *StartHooks  `kong:"-"`
+	Execute        ExecuteFn                   `kong:"-"`
+	Logger         *slog.Logger                `kong:"-"`
+	LoggerShutdown func(context.Context) error `kong:"-"`
+	Version        string                      `kong:"-"` // Version passed from main
+	Hooks          *StartHooks                 `kong:"-"`
 
 	// Configuration
 	Config    string `help:"Path to configuration file" default:"/etc/cargowall/config.json" env:"CARGOWALL_CONFIG"`
@@ -90,60 +93,50 @@ func (c *StartCmd) AfterApply() error {
 	return nil
 }
 
-func (c *StartCmd) Run(globals *Globals) error {
-	ctx := context.Background()
-
-	// In GitHub Actions mode, use a simple logger with GH-compatible format
-	if c.GithubAction {
-		handler := NewGitHubActionsHandler(globals.Debug)
-		logger := slog.New(handler)
-		slog.SetDefault(logger)
-		c.Logger = logger
-		return c.Execute(c, c.Hooks)
+func defaultLogger(debug bool) *slog.Logger {
+	level := slog.LevelInfo
+	if debug {
+		level = slog.LevelDebug
 	}
+	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+}
 
-	// Initialize logger
+func (c *StartCmd) Run(globals *Globals) error {
+	if c.GithubAction {
+		c.Logger = slog.New(NewGitHubActionsHandler(globals.Debug))
+	} else {
+		c.Logger = defaultLogger(globals.Debug)
+	}
+	slog.SetDefault(c.Logger)
+
+	defaultLog := c.Logger
 	if c.Hooks != nil && c.Hooks.InitLogger != nil {
 		// Use a timeout context only for initialization to prevent hanging
-		initCtx, initCancel := context.WithTimeout(ctx, 5*time.Second)
+		initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer initCancel()
 
-		logger, shutdown, err := c.Hooks.InitLogger(initCtx, c.Version, globals.Debug)
+		handler, shutdown, err := c.Hooks.InitLogger(initCtx, c.Version, globals.Debug)
 		if err != nil {
 			slog.Warn("failed to initialize logger via hook", "error", err)
-			// Fall back to a simple JSON logger so c.Logger is never nil
-			level := slog.LevelInfo
-			if globals.Debug {
-				level = slog.LevelDebug
-			}
-			fallback := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-				Level: level,
-			}))
-			slog.SetDefault(fallback)
-			c.Logger = fallback
+		} else if handler == nil {
+			slog.Warn("InitLogger hook returned nil handler")
 		} else {
-			slog.SetDefault(logger)
-			c.Logger = logger
-			defer func() {
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if err := shutdown(shutdownCtx); err != nil {
-					slog.Warn("failed to shutdown logger", "error", err)
+			inner := &atomic.Pointer[slog.Handler]{}
+			inner.Store(&handler)
+			sh := &swappableHandler{inner: inner}
+			c.Logger = slog.New(sh)
+			slog.SetDefault(c.Logger)
+			defaultHandler := defaultLog.Handler()
+			c.LoggerShutdown = func(ctx context.Context) error {
+				// Swap first so concurrent goroutines log safely
+				// while the old handler is being shutdown.
+				sh.inner.Store(&defaultHandler)
+				if shutdown != nil {
+					return shutdown(ctx)
 				}
-			}()
+				return nil
+			}
 		}
-	} else {
-		// Fall back to a simple JSON logger
-		logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
-		}))
-		if globals.Debug {
-			logger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-				Level: slog.LevelDebug,
-			}))
-		}
-		slog.SetDefault(logger)
-		c.Logger = logger
 	}
 
 	return c.Execute(c, c.Hooks)

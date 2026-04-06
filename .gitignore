@@ -2,3 +2,5 @@
 .claude
 node_modules
 bin
+/cargowall
+

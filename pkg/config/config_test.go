@@ -355,25 +355,6 @@ func TestParseHostWithPorts(t *testing.T) {
 	}
 }
 
-func TestNormalizeHostname(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"*.github.com", "github.com"},
-		{"github.com", "github.com"},
-		{"*.*.example.com", "*.example.com"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := normalizeHostname(tt.input)
-			if got != tt.want {
-				t.Errorf("normalizeHostname(%q) = %q, want %q", tt.input, got, tt.want)
-			}
-		})
-	}
-}
 
 func TestLoadFromEnv_WithPorts(t *testing.T) {
 	// Save and restore env vars

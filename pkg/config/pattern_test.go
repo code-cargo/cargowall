@@ -8,13 +8,13 @@ import (
 )
 
 func TestIsHostnamePattern(t *testing.T) {
-	assert.True(t, IsHostnamePattern("*.github.com"))
-	assert.True(t, IsHostnamePattern("**.internal.cloudapp.net"))
-	assert.True(t, IsHostnamePattern("foo.*.*.bar.com"))
-	assert.True(t, IsHostnamePattern("*.*.internal.cloudapp.net"))
-	assert.True(t, IsHostnamePattern("**.github.com"))
-	assert.False(t, IsHostnamePattern("github.com"))
-	assert.False(t, IsHostnamePattern("api.github.com"))
+	assert.True(t, isHostnamePattern("*.github.com"))
+	assert.True(t, isHostnamePattern("**.internal.cloudapp.net"))
+	assert.True(t, isHostnamePattern("foo.*.*.bar.com"))
+	assert.True(t, isHostnamePattern("*.*.internal.cloudapp.net"))
+	assert.True(t, isHostnamePattern("**.github.com"))
+	assert.False(t, isHostnamePattern("github.com"))
+	assert.False(t, isHostnamePattern("api.github.com"))
 }
 
 func TestCompileHostnamePattern(t *testing.T) {
@@ -35,7 +35,7 @@ func TestCompileHostnamePattern(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := CompileHostnamePattern(tt.raw)
+			p, err := compileHostnamePattern(tt.raw)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -184,7 +184,7 @@ func TestHostnamePatternMatches(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := CompileHostnamePattern(tt.pattern)
+			p, err := compileHostnamePattern(tt.pattern)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, p.Matches(tt.hostname))
 		})

@@ -445,6 +445,6 @@ The DNS proxy handles Kubernetes service discovery by:
 ## GitHub Actions Integration
 
 - **DNS redirect:** iptables DNAT rules redirect all outbound DNS (port 53) to `127.0.0.1:53`, exempting the proxy's own upstream queries via `SO_MARK` (`0xCA12`)
-- **Sudo lockdown:** writes `/etc/sudoers.d/cargowall-lockdown` with a NOPASSWD allowlist; removes the runner user from the `docker` group
+- **Sudo lockdown:** writes `/etc/sudoers.d/zz-cargowall-lockdown` with a NOPASSWD allowlist; removes the runner user from sudo-granting groups (`sudo`, `admin`, `wheel`) and the `docker` group; disables competing sudoers.d files by renaming them to `*.cargowall-disabled`
 - **Auto-infrastructure:** `EnsureInfraAllowed()` and `EnsureHostnameAllowed()` add rules for platform services (Azure IMDS, GitHub API, etc.)
 - **Logging:** `slog.Handler` that formats messages as GitHub workflow commands (`::error::`, `::warning::`, `::debug::`)

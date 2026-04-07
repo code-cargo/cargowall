@@ -95,6 +95,7 @@ Hostname rules support **glob patterns** for matching dynamic hostnames:
 
 - `*` matches exactly one DNS label
 - `**` matches one or more DNS labels
+- Wildcards must be a full dot-separated segment — partial wildcards like `google.co*` are not supported
 
 ```yaml
 allowed-hosts: |

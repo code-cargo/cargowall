@@ -300,6 +300,373 @@ jobs:
           curl -sf --connect-timeout 10 --max-time 30 https://example.com > /dev/null
           echo "✅ example.com allowed in audit mode"
 
+  test-sudo-lockdown:
+    name: Integration Test (Sudo Lockdown)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
+
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
+
+      - name: Snapshot pre-lockdown sudo state
+        run: |
+          echo "--- Runner user info ---"
+          id runner
+          echo "--- Groups ---"
+          groups runner
+          echo "--- sudoers.d contents ---"
+          sudo ls -la /etc/sudoers.d/
+          echo "--- Verify runner has full sudo ---"
+          sudo whoami
+          echo "--- Save sudoers.d file list for later comparison ---"
+          sudo ls /etc/sudoers.d/ | sort > /tmp/sudoers-before.txt
+
+      - name: Start CargoWall with sudo lockdown
+        run: |
+          # Start cargowall inside a root wrapper that watches for a stop
+          # trigger. Once lockdown is active the runner user cannot sudo kill,
+          # so we need an already-root process that can send SIGTERM.
+          sudo bash -c '
+            ./bin/cargowall start \
+              --github-action \
+              --audit-mode \
+              --sudo-lockdown \
+              --sudo-allow-commands "/usr/sbin/iptables,/usr/sbin/ip6tables" \
+              --dns-upstream "8.8.8.8:53" &
+            CW_PID=$!
+            echo $CW_PID > /tmp/cargowall-pid
+            # Wait for stop trigger (created by a later step — no sudo needed)
+            while [ ! -f /tmp/cargowall-stop ]; do sleep 1; done
+            kill -TERM $CW_PID
+            wait $CW_PID 2>/dev/null
+          ' &
+
+          # Wait for cargowall to be ready
+          for i in $(seq 1 30); do
+            if [ -f /tmp/cargowall-ready ]; then
+              echo "CargoWall ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if [ ! -f /tmp/cargowall-ready ]; then
+            echo "CargoWall did not become ready"
+            exit 1
+          fi
+
+      - name: Test allowed sudo command works
+        run: |
+          if sudo /usr/sbin/iptables -L -n > /dev/null 2>&1; then
+            echo "✅ Allowed command (iptables) works via sudo"
+          else
+            echo "❌ Allowed command (iptables) failed via sudo"
+            exit 1
+          fi
+
+      - name: Test blocked sudo command is denied
+        run: |
+          OUTPUT=$(sudo -n /usr/bin/apt-get --version 2>&1) && {
+            echo "❌ apt-get should be blocked by sudo lockdown"
+            exit 1
+          }
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+            echo "✅ Blocked command (apt-get) denied by sudo"
+          else
+            echo "❌ apt-get failed but not due to sudoers denial: $OUTPUT"
+            exit 1
+          fi
+
+      - name: Test sudo bash is denied
+        run: |
+          OUTPUT=$(sudo -n /bin/bash -c "echo pwned" 2>&1) && {
+            echo "❌ sudo bash should be blocked"
+            exit 1
+          }
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+            echo "✅ sudo bash denied"
+          else
+            echo "❌ bash failed but not due to sudoers denial: $OUTPUT"
+            exit 1
+          fi
+
+      - name: Test sudo kill is denied
+        run: |
+          OUTPUT=$(sudo -n /usr/bin/kill -0 1 2>&1) && {
+            echo "❌ sudo kill should be blocked (not in allow list)"
+            exit 1
+          }
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+            echo "✅ sudo kill denied"
+          else
+            echo "❌ kill failed but not due to sudoers denial: $OUTPUT"
+            exit 1
+          fi
+
+      - name: Stop CargoWall and verify cleanup
+        run: |
+          CW_PID=$(cat /tmp/cargowall-pid)
+
+          # Signal the root wrapper to send SIGTERM — no sudo needed
+          touch /tmp/cargowall-stop
+
+          # Wait for cargowall to exit. Use /proc to check since kill -0
+          # requires permission on a root-owned process.
+          for i in $(seq 1 15); do
+            if [ ! -d "/proc/$CW_PID" ]; then
+              echo "CargoWall stopped after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if [ -d "/proc/$CW_PID" ]; then
+            echo "❌ CargoWall did not stop within 15s"
+            exit 1
+          fi
+
+      - name: Verify sudo access restored
+        run: |
+          echo "--- sudoers.d after cleanup ---"
+          sudo ls -la /etc/sudoers.d/
+
+          # Lockdown file should be removed
+          if sudo test -f /etc/sudoers.d/zz-cargowall-lockdown; then
+            echo "❌ Lockdown sudoers file still exists after cleanup"
+            exit 1
+          fi
+          echo "✅ Lockdown sudoers file removed"
+
+          # State file should be removed
+          if sudo test -f /etc/sudoers.d/.cargowall-lockdown-state; then
+            echo "❌ State file still exists after cleanup"
+            exit 1
+          fi
+          echo "✅ State file removed"
+
+          # Disabled files should be restored
+          STILL_DISABLED=$(sudo ls /etc/sudoers.d/ | grep -c '\.cargowall-disabled$' || true)
+          if [ "$STILL_DISABLED" -gt 0 ]; then
+            echo "❌ $STILL_DISABLED sudoers files still disabled after cleanup"
+            sudo ls -la /etc/sudoers.d/
+            exit 1
+          fi
+          echo "✅ All disabled sudoers files restored"
+
+          # sudoers.d should be back to original state
+          sudo ls /etc/sudoers.d/ | sort > /tmp/sudoers-after.txt
+          if ! diff /tmp/sudoers-before.txt /tmp/sudoers-after.txt; then
+            echo "❌ sudoers.d contents differ from pre-lockdown state"
+            exit 1
+          fi
+          echo "✅ sudoers.d contents match pre-lockdown state"
+
+      - name: Verify runner has full sudo again
+        run: |
+          if sudo whoami > /dev/null 2>&1; then
+            echo "✅ Full sudo access restored"
+          else
+            echo "❌ sudo access not restored after cleanup"
+            exit 1
+          fi
+
+          # Verify unrestricted commands work again
+          if sudo apt-get --version > /dev/null 2>&1; then
+            echo "✅ Previously blocked commands now work"
+          else
+            echo "❌ apt-get still blocked after cleanup"
+            exit 1
+          fi
+
+      - name: Emergency cleanup
+        if: always()
+        run: |
+          # Signal the root wrapper to stop cargowall gracefully
+          touch /tmp/cargowall-stop
+          sleep 5
+          # If we still have sudo, clean up any remnants
+          if sudo -n true 2>/dev/null; then
+            sudo rm -f /etc/sudoers.d/zz-cargowall-lockdown
+            sudo rm -f /etc/sudoers.d/.cargowall-lockdown-state
+            for f in /etc/sudoers.d/*.cargowall-disabled; do
+              [ -f "$f" ] || continue
+              sudo mv "$f" "${f%.cargowall-disabled}"
+            done
+            for group in sudo admin wheel; do
+              sudo gpasswd -a runner "$group" 2>/dev/null || true
+            done
+          fi
+          echo "Emergency cleanup complete"
+
+  test-sudo-lockdown-full-block:
+    name: Integration Test (Sudo Lockdown - Full Block)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
+
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
+
+      - name: Snapshot pre-lockdown sudo state
+        run: |
+          sudo ls /etc/sudoers.d/ | sort > /tmp/sudoers-before.txt
+
+      - name: Start CargoWall with sudo lockdown (no allowed commands)
+        run: |
+          sudo bash -c '
+            ./bin/cargowall start \
+              --github-action \
+              --audit-mode \
+              --sudo-lockdown \
+              --dns-upstream "8.8.8.8:53" &
+            CW_PID=$!
+            echo $CW_PID > /tmp/cargowall-pid
+            while [ ! -f /tmp/cargowall-stop ]; do sleep 1; done
+            kill -TERM $CW_PID
+            wait $CW_PID 2>/dev/null
+          ' &
+
+          for i in $(seq 1 30); do
+            if [ -f /tmp/cargowall-ready ]; then
+              echo "CargoWall ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if [ ! -f /tmp/cargowall-ready ]; then
+            echo "CargoWall did not become ready"
+            exit 1
+          fi
+
+      - name: Test iptables is denied (no commands allowed)
+        run: |
+          OUTPUT=$(sudo -n /usr/sbin/iptables -L -n 2>&1) && {
+            echo "❌ iptables should be blocked with no allowed commands"
+            exit 1
+          }
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+            echo "✅ iptables denied (full block mode)"
+          else
+            echo "❌ iptables failed but not due to sudoers denial: $OUTPUT"
+            exit 1
+          fi
+
+      - name: Test apt-get is denied
+        run: |
+          OUTPUT=$(sudo -n /usr/bin/apt-get --version 2>&1) && {
+            echo "❌ apt-get should be blocked"
+            exit 1
+          }
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+            echo "✅ apt-get denied (full block mode)"
+          else
+            echo "❌ apt-get failed but not due to sudoers denial: $OUTPUT"
+            exit 1
+          fi
+
+      - name: Test sudo bash is denied
+        run: |
+          OUTPUT=$(sudo -n /bin/bash -c "echo pwned" 2>&1) && {
+            echo "❌ sudo bash should be blocked"
+            exit 1
+          }
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+            echo "✅ sudo bash denied (full block mode)"
+          else
+            echo "❌ bash failed but not due to sudoers denial: $OUTPUT"
+            exit 1
+          fi
+
+      - name: Stop CargoWall and verify cleanup
+        run: |
+          CW_PID=$(cat /tmp/cargowall-pid)
+          touch /tmp/cargowall-stop
+          for i in $(seq 1 15); do
+            if [ ! -d "/proc/$CW_PID" ]; then
+              echo "CargoWall stopped after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if [ -d "/proc/$CW_PID" ]; then
+            echo "❌ CargoWall did not stop within 15s"
+            exit 1
+          fi
+
+      - name: Verify sudo access restored
+        run: |
+          if sudo test -f /etc/sudoers.d/zz-cargowall-lockdown; then
+            echo "❌ Lockdown sudoers file still exists after cleanup"
+            exit 1
+          fi
+          echo "✅ Lockdown sudoers file removed"
+
+          if sudo test -f /etc/sudoers.d/.cargowall-lockdown-state; then
+            echo "❌ State file still exists after cleanup"
+            exit 1
+          fi
+          echo "✅ State file removed"
+
+          STILL_DISABLED=$(sudo ls /etc/sudoers.d/ | grep -c '\.cargowall-disabled$' || true)
+          if [ "$STILL_DISABLED" -gt 0 ]; then
+            echo "❌ $STILL_DISABLED sudoers files still disabled after cleanup"
+            exit 1
+          fi
+          echo "✅ All disabled sudoers files restored"
+
+          sudo ls /etc/sudoers.d/ | sort > /tmp/sudoers-after.txt
+          if ! diff /tmp/sudoers-before.txt /tmp/sudoers-after.txt; then
+            echo "❌ sudoers.d contents differ from pre-lockdown state"
+            exit 1
+          fi
+          echo "✅ sudoers.d contents match pre-lockdown state"
+
+      - name: Verify runner has full sudo again
+        run: |
+          if sudo whoami > /dev/null 2>&1; then
+            echo "✅ Full sudo access restored"
+          else
+            echo "❌ sudo access not restored after cleanup"
+            exit 1
+          fi
+
+      - name: Emergency cleanup
+        if: always()
+        run: |
+          touch /tmp/cargowall-stop
+          sleep 5
+          if sudo -n true 2>/dev/null; then
+            sudo rm -f /etc/sudoers.d/zz-cargowall-lockdown
+            sudo rm -f /etc/sudoers.d/.cargowall-lockdown-state
+            for f in /etc/sudoers.d/*.cargowall-disabled; do
+              [ -f "$f" ] || continue
+              sudo mv "$f" "${f%.cargowall-disabled}"
+            done
+            for group in sudo admin wheel; do
+              sudo gpasswd -a runner "$group" 2>/dev/null || true
+            done
+          fi
+          echo "Emergency cleanup complete"
+
   test-cargowall-saas:
     name: Integration Test (SaaS)
     needs: build-binary

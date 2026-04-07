@@ -755,9 +755,21 @@ func enableSudoLockdown(cmd *StartCmd, logger *slog.Logger) (bool, *lockdown.Sud
 	if cmd.SudoAllowCommands != "" {
 		for _, c := range strings.Split(cmd.SudoAllowCommands, ",") {
 			c = strings.TrimSpace(c)
-			if c != "" {
-				allowCmds = append(allowCmds, c)
+			if c == "" {
+				continue
 			}
+			// Sudoers commands must be absolute paths with no arguments.
+			// Strip arguments (anything after the first space) and warn.
+			if idx := strings.IndexByte(c, ' '); idx >= 0 {
+				logger.Warn("Stripping arguments from sudo allow command (sudoers requires bare paths)",
+					"original", c, "path", c[:idx])
+				c = c[:idx]
+			}
+			if !strings.HasPrefix(c, "/") {
+				logger.Warn("Skipping non-absolute sudo allow command", "command", c)
+				continue
+			}
+			allowCmds = append(allowCmds, c)
 		}
 	}
 	cfg := &lockdown.SudoLockdownConfig{

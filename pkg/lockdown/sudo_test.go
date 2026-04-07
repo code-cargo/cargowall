@@ -344,6 +344,42 @@ runner ALL=(ALL) NOPASSWD:ALL
 			username: "runner",
 			want:     true, // nil GIDs = treat any %group as potential grant
 		},
+		{
+			name:     "ALL user specifier grants all users",
+			content:  "ALL ALL=(ALL) NOPASSWD: ALL\n",
+			username: "runner",
+			want:     true,
+		},
+		{
+			name:     "ALL user specifier with specific commands",
+			content:  "ALL ALL=(ALL) NOPASSWD: /usr/bin/apt\n",
+			username: "runner",
+			want:     true,
+		},
+		{
+			name:     "ALL user specifier with tab separator",
+			content:  "ALL\tALL=(ALL) ALL\n",
+			username: "runner",
+			want:     true,
+		},
+		{
+			name:     "ALL in comment line is ignored",
+			content:  "# ALL ALL=(ALL) ALL\n",
+			username: "runner",
+			want:     false,
+		},
+		{
+			name:     "hash-includes non-directive treated as comment",
+			content:  "#includes_discussion\nrunner ALL=(ALL) ALL\n",
+			username: "runner",
+			want:     true,
+		},
+		{
+			name:     "hash-includes non-directive alone is harmless",
+			content:  "#includes_discussion\n",
+			username: "runner",
+			want:     false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -702,6 +738,61 @@ func TestValidateSudoersInput_rejectsWildcards(t *testing.T) {
 		if err := validateSudoersInput("runner", []string{cmd}); err == nil {
 			t.Errorf("expected error for wildcard command %q, got nil", cmd)
 		}
+	}
+}
+
+func TestIsIncludeDirective(t *testing.T) {
+	tests := []struct {
+		line string
+		want bool
+	}{
+		{"#include /etc/sudoers.d/extra", true},
+		{"#includedir /etc/sudoers.d", true},
+		{"@include /etc/sudoers.d/extra", true},
+		{"@includedir /etc/sudoers.d", true},
+		{"#include", true},
+		{"#includedir", true},
+		{"@include", true},
+		{"@includedir", true},
+		{"#includes_discussion", false},
+		{"#including_notes", false},
+		{"@including_stuff", false},
+		{"@includedir_extra", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.line, func(t *testing.T) {
+			if got := isIncludeDirective(tt.line); got != tt.want {
+				t.Errorf("isIncludeDirective(%q) = %v, want %v", tt.line, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRecoverLockdownState_findsDisabledFiles(t *testing.T) {
+	dir := t.TempDir()
+	logger := discardLogger()
+
+	writeFile(t, filepath.Join(dir, "90-runner"+disabledSuffix), "runner ALL=(ALL) ALL\n")
+	writeFile(t, filepath.Join(dir, "50-extra"+disabledSuffix), "extra ALL=(ALL) ALL\n")
+	writeFile(t, filepath.Join(dir, "normal-file"), "something\n")
+
+	state := recoverLockdownState(dir, "runner", logger)
+	if len(state.DisabledFiles) != 2 {
+		t.Errorf("expected 2 disabled files, got %d: %v", len(state.DisabledFiles), state.DisabledFiles)
+	}
+	if state.Username != "runner" {
+		t.Errorf("expected username 'runner', got %q", state.Username)
+	}
+}
+
+func TestRecoverLockdownState_emptyDir(t *testing.T) {
+	dir := t.TempDir()
+	logger := discardLogger()
+
+	state := recoverLockdownState(dir, "runner", logger)
+	if len(state.DisabledFiles) != 0 {
+		t.Errorf("expected 0 disabled files, got %d", len(state.DisabledFiles))
 	}
 }
 

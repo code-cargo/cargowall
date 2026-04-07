@@ -750,30 +750,38 @@ func gateExistingConnections(existingIPs []string, configMgr *config.Manager, fw
 // enableSudoLockdown parses allowed commands from cmd.SudoAllowCommands,
 // builds a lockdown config, and enables sudo lockdown. Returns whether
 // lockdown was successfully enabled and the config (for cleanup).
-func enableSudoLockdown(cmd *StartCmd, logger *slog.Logger) (bool, *lockdown.SudoLockdownConfig) {
-	var allowCmds []string
-	if cmd.SudoAllowCommands != "" {
-		for _, c := range strings.Split(cmd.SudoAllowCommands, ",") {
-			c = strings.TrimSpace(c)
-			if c == "" {
-				continue
-			}
-			// Sudoers commands must be absolute paths with no arguments.
-			// Strip arguments (anything after the first space) and warn.
-			if idx := strings.IndexByte(c, ' '); idx >= 0 {
-				logger.Warn("Stripping arguments from sudo allow command (sudoers requires bare paths)",
-					"original", c, "path", c[:idx])
-				c = c[:idx]
-			}
-			if !strings.HasPrefix(c, "/") {
-				logger.Warn("Skipping non-absolute sudo allow command", "command", c)
-				continue
-			}
-			allowCmds = append(allowCmds, c)
-		}
+// parseSudoAllowCommands splits a comma-separated list of command paths,
+// stripping arguments (anything after the first whitespace) and skipping
+// non-absolute paths. Returns the cleaned list of command paths.
+func parseSudoAllowCommands(input string, logger *slog.Logger) []string {
+	if input == "" {
+		return nil
 	}
+	var cmds []string
+	for _, c := range strings.Split(input, ",") {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		// Sudoers commands must be absolute paths with no arguments.
+		// Strip arguments (anything after the first whitespace) and warn.
+		if fields := strings.Fields(c); len(fields) > 1 {
+			logger.Warn("Stripping arguments from sudo allow command (sudoers requires bare paths)",
+				"original", c, "path", fields[0])
+			c = fields[0]
+		}
+		if !strings.HasPrefix(c, "/") {
+			logger.Warn("Skipping non-absolute sudo allow command", "command", c)
+			continue
+		}
+		cmds = append(cmds, c)
+	}
+	return cmds
+}
+
+func enableSudoLockdown(cmd *StartCmd, logger *slog.Logger) (bool, *lockdown.SudoLockdownConfig) {
 	cfg := &lockdown.SudoLockdownConfig{
-		AllowCommands: allowCmds,
+		AllowCommands: parseSudoAllowCommands(cmd.SudoAllowCommands, logger),
 		Username:      "", // Auto-detect
 	}
 	if err := lockdown.EnableSudoLockdown(cfg, logger); err != nil {

@@ -310,7 +310,7 @@ func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, alia
 		}
 		// #include/#includedir and @include/@includedir are sudoers directives,
 		// NOT comments. Modern sudo (1.9.1+) uses the @ form.
-		if strings.HasPrefix(trimmed, "#include") || strings.HasPrefix(trimmed, "@include") {
+		if isIncludeDirective(trimmed) {
 			return false, fmt.Errorf("sudoers file %s contains include directive that cannot be inspected", path)
 		}
 		if strings.HasPrefix(trimmed, "#") {
@@ -322,6 +322,10 @@ func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, alia
 			return false, fmt.Errorf("sudoers file %s contains 'Defaults !authenticate' which bypasses password requirements", path)
 		}
 		if strings.HasPrefix(trimmed, directPrefix) || strings.HasPrefix(trimmed, directPrefixTab) {
+			return true, nil
+		}
+		// Detect ALL as user specifier — grants every user on the system.
+		if fields := strings.Fields(trimmed); len(fields) > 0 && fields[0] == "ALL" {
 			return true, nil
 		}
 		if strings.HasPrefix(trimmed, "User_Alias ") {
@@ -349,6 +353,22 @@ func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, alia
 		}
 	}
 	return false, nil
+}
+
+// isIncludeDirective returns true if the line is a sudoers #include,
+// #includedir, @include, or @includedir directive. Requires the keyword
+// to be followed by a space (and a path), or to be the entire line.
+func isIncludeDirective(line string) bool {
+	for _, prefix := range []string{"#include ", "#includedir ", "@include ", "@includedir "} {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	switch line {
+	case "#include", "#includedir", "@include", "@includedir":
+		return true
+	}
+	return false
 }
 
 // userAliasContains checks whether a User_Alias line includes the given
@@ -529,6 +549,55 @@ func removeLockdownState() {
 	os.Remove(stateFile)
 }
 
+// recoverLockdownState attempts to reconstruct a lockdownState by scanning
+// the filesystem for evidence of a previous lockdown run. Used as a fallback
+// when the state file exists but is corrupted.
+func recoverLockdownState(dir, username string, logger *slog.Logger) *lockdownState {
+	recovered := &lockdownState{Username: username}
+
+	// Recover disabled files by scanning for *.cargowall-disabled files.
+	recovered.DisabledFiles = findDisabledSudoersFiles(dir, logger)
+	if len(recovered.DisabledFiles) > 0 {
+		logger.Info("Recovered disabled sudoers files from filesystem scan",
+			"count", len(recovered.DisabledFiles), "files", recovered.DisabledFiles)
+	}
+
+	// Recover removed groups: any sudo-granting group the user is NOT
+	// currently a member of is assumed to have been removed by a previous
+	// lockdown. Over-restoring via gpasswd -a is idempotent and safe.
+	userGIDs, err := lookupUserGIDs(username)
+	if err != nil {
+		// Cannot determine membership — assume all were removed (fail-closed).
+		logger.Warn("Cannot look up user groups for state recovery, assuming all sudo groups removed",
+			"username", username, "error", err)
+		recovered.RemovedGroups = append(recovered.RemovedGroups, sudoGrantingGroups...)
+	} else {
+		for _, group := range sudoGrantingGroups {
+			grp, lookupErr := user.LookupGroup(group)
+			if lookupErr != nil {
+				continue // group does not exist on this system
+			}
+			if !userGIDs[grp.Gid] {
+				recovered.RemovedGroups = append(recovered.RemovedGroups, group)
+			}
+		}
+	}
+	if len(recovered.RemovedGroups) > 0 {
+		logger.Info("Inferred previously removed sudo groups",
+			"groups", recovered.RemovedGroups)
+	}
+
+	// Docker group: if user is not a member, assume we removed them.
+	if userGIDs != nil {
+		if grp, lookupErr := user.LookupGroup("docker"); lookupErr == nil && !userGIDs[grp.Gid] {
+			recovered.DockerRemoved = true
+			logger.Info("Inferred docker group was previously removed")
+		}
+	}
+
+	return recovered
+}
+
 // EnableSudoLockdown configures sudoers to restrict what commands can be run
 // with sudo, removes the target user from sudo-granting and docker groups,
 // and disables competing sudoers.d files.
@@ -544,10 +613,11 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	// Clean up stale state from a previous run that was not shut down cleanly
 	prev, prevErr := loadLockdownState()
 	if prevErr != nil {
-		logger.Warn("Failed to load stale lockdown state, proceeding with fresh lockdown",
+		logger.Warn("Lockdown state file is corrupted, attempting best-effort recovery",
 			"error", prevErr, "state_file", stateFile)
+		prev = recoverLockdownState(sudoersDir, username, logger)
 	}
-	if prevErr == nil && prev != nil {
+	if prev != nil {
 		logger.Warn("Found stale lockdown state from previous run, cleaning up first")
 		stale := &rollbackState{lockdownState: *prev, logger: logger}
 		stale.rollback()

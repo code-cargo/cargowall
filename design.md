@@ -7,6 +7,7 @@ Dual-stack (IPv4/IPv6) L4 firewall using TC eBPF egress filtering, cgroup socket
 - **Dual-Stack L4 Firewall**: Filters TCP and UDP traffic on both IPv4 and IPv6
 - **Protocol Handling**: Blocks non-TCP/UDP on IPv4; allows ICMPv6 and IPv6 multicast (`ff00::/8`); passes non-IP traffic (ARP)
 - **DNS Proxy with JIT Resolution**: Intercepts DNS queries and updates firewall rules in real-time
+- **Hostname Glob Patterns**: `*` (one label) and `**` (one or more labels) wildcards for matching dynamic hostnames
 - **DNS Query Filtering**: Blocks queries for non-allowed domains to prevent DNS tunneling
 - **Port-Specific Rules**: Granular port-based filtering including wildcard CIDRs (`0.0.0.0/0`, `::/0`)
 - **LPM Trie Optimization**: Separate IPv4 and IPv6 longest-prefix-match tries for efficient CIDR lookups
@@ -362,7 +363,7 @@ sequenceDiagram
   - Env vars: `CARGOWALL_DEFAULT_ACTION`, `CARGOWALL_ALLOWED_HOSTS`, `CARGOWALL_ALLOWED_CIDRS`, `CARGOWALL_BLOCKED_HOSTS`, `CARGOWALL_BLOCKED_CIDRS`
   - Port format in env: `host:port1;port2` (e.g., `github.com:443;80`)
 - Subdomain matching: `lb-140-82-113-22-iad.github.com` matches a `github.com` rule
-- Wildcard hostname normalization: `*.github.com` → `github.com` (parent domain matching handles subdomains)
+- Glob pattern matching for hostnames: `*` matches one DNS label, `**` matches one or more (e.g., `actions.githubusercontent.com.*.*.internal.cloudapp.net`, `**.storage.azure.com`)
 - IP-to-hostname reverse mapping via `UpdateDNSMapping()` with bounded cache (10,000 entries, 24h TTL)
 - Rule conflict detection: `CheckIPRuleConflict()` finds most specific CIDR by prefix length, checks port overlap, deny wins
 - `EnsureDNSAllowed(ips)` — adds /32 allow rules on port 53 for upstream DNS IPs

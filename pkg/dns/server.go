@@ -552,14 +552,21 @@ func (s *Server) getHostnamePorts(hostname string) []config.Port {
 
 	// First try exact match
 	for _, rule := range rules {
-		if rule.Type == config.RuleTypeHostname && rule.Value == hostname {
+		if rule.Type == config.RuleTypeHostname && rule.Pattern == nil && rule.Value == hostname {
 			return rule.Ports
 		}
 	}
 
-	// Check parent domain
+	// Check patterns first — more specific than parent-domain match
 	for _, rule := range rules {
-		if rule.Type == config.RuleTypeHostname && strings.HasSuffix(hostname, "."+rule.Value) {
+		if rule.Type == config.RuleTypeHostname && rule.Pattern != nil && rule.Pattern.Matches(hostname) {
+			return rule.Ports
+		}
+	}
+
+	// Fall back to parent domain
+	for _, rule := range rules {
+		if rule.Type == config.RuleTypeHostname && rule.Pattern == nil && strings.HasSuffix(hostname, "."+rule.Value) {
 			return rule.Ports
 		}
 	}

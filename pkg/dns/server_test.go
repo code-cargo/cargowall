@@ -488,6 +488,12 @@ func TestGetHostnamePorts(t *testing.T) {
 			Action: config.ActionAllow,
 			Ports:  []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}},
 		},
+		{
+			Type:   config.RuleTypeHostname,
+			Value:  "*.*.internal.cloudapp.net",
+			Action: config.ActionAllow,
+			Ports:  []config.Port{{Port: 443, Protocol: config.ProtocolTCP}},
+		},
 	}
 	err := cfg.LoadConfigFromRules(rules, config.ActionDeny)
 	require.NoError(t, err)
@@ -499,6 +505,8 @@ func TestGetHostnamePorts(t *testing.T) {
 		{"api.example.com", []config.Port{{Port: 443, Protocol: config.ProtocolAll}, {Port: 8443, Protocol: config.ProtocolAll}}},
 		{"example.com", []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}},
 		{"sub.example.com", []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}}, // Should match parent domain
+		{"abc.def.internal.cloudapp.net", []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}},                             // Should match pattern
+		{"only1.internal.cloudapp.net", nil}, // Pattern needs 2 labels
 		{"other.com", nil},
 	}
 
@@ -781,6 +789,36 @@ func TestIsQueryAllowed(t *testing.T) {
 			defaultAction: config.ActionDeny,
 			domain:        "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa",
 			expected:      true,
+		},
+		{
+			name:          "deny-by-default, hostname pattern allowed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "*.*.internal.cloudapp.net", Action: config.ActionAllow},
+			},
+			domain:   "abc.def.internal.cloudapp.net",
+			expected: true,
+		},
+		{
+			name:          "deny-by-default, hostname pattern not matched (too few labels)",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "*.*.internal.cloudapp.net", Action: config.ActionAllow},
+			},
+			domain:   "only1.internal.cloudapp.net",
+			expected: false,
+		},
+		{
+			name:          "allow-by-default, hostname pattern denied",
+			filterEnabled: true,
+			defaultAction: config.ActionAllow,
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "evil.*.example.com", Action: config.ActionDeny},
+			},
+			domain:   "evil.anything.example.com",
+			expected: false,
 		},
 	}
 

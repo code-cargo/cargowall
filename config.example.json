@@ -35,6 +35,12 @@
       "value": "api.example.com",
       "ports": [{"port": 80, "protocol": "tcp"}, {"port": 443, "protocol": "tcp"}],
       "action": "allow"
+    },
+    {
+      "type": "hostname",
+      "value": "actions.githubusercontent.com.*.*.internal.cloudapp.net",
+      "ports": [{"port": 443, "protocol": "tcp"}],
+      "action": "allow"
     }
   ],
   "sudoLockdown": {

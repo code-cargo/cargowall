@@ -160,6 +160,9 @@ func NewConfigManager() *Manager {
 
 // LoadConfigFromRules loads configuration from rules (for testing)
 func (cm *Manager) LoadConfigFromRules(rules []Rule, defaultAction Action) error {
+	if err := validateRules(rules); err != nil {
+		return err
+	}
 	cm.mu.Lock()
 	cm.config = &FirewallConfig{
 		Rules:         rules,
@@ -175,6 +178,23 @@ func (cm *Manager) LoadConfigFromRules(rules []Rule, defaultAction Action) error
 func isIPv6CIDR(value string) bool {
 	ip, _, err := net.ParseCIDR(value)
 	return err == nil && ip.To4() == nil
+}
+
+// validateRules enforces cross-field constraints on parsed rules. Each loader
+// entry point (LoadConfig, LoadConfigFromCargoWall, LoadConfigFromRules) calls
+// this so internal callers cannot bypass the checks.
+func validateRules(rules []Rule) error {
+	for _, rule := range rules {
+		for _, p := range rule.Ports {
+			if p.Protocol == ProtocolICMP && p.Port != 0 {
+				return fmt.Errorf("ICMP rules must have port=0, got %d", p.Port)
+			}
+			if p.Protocol == ProtocolICMP && rule.Type == RuleTypeCIDR && isIPv6CIDR(rule.Value) {
+				return fmt.Errorf("ICMP (proto 1) is IPv4-only; ICMPv6 is always allowed on IPv6 CIDR %q", rule.Value)
+			}
+		}
+	}
+	return nil
 }
 
 // LoadConfigFromCargoWall loads configuration from a protobuf CargoWall message
@@ -206,12 +226,6 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 			if err != nil {
 				return fmt.Errorf("port %d: %w", pbPort.GetPort(), err)
 			}
-			if proto == ProtocolICMP && pbPort.GetPort() != 0 {
-				return fmt.Errorf("ICMP rules must have port=0, got %d", pbPort.GetPort())
-			}
-			if proto == ProtocolICMP && rule.Type == RuleTypeCIDR && isIPv6CIDR(rule.Value) {
-				return fmt.Errorf("ICMP protocol not valid on IPv6 CIDR %q; ICMPv6 is always allowed", rule.Value)
-			}
 			rule.Ports = append(rule.Ports, Port{
 				Port:     uint16(pbPort.GetPort()),
 				Protocol: proto,
@@ -219,6 +233,10 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 		}
 
 		rules = append(rules, rule)
+	}
+
+	if err := validateRules(rules); err != nil {
+		return err
 	}
 
 	defaultAction := convertAction(cargoWall.DefaultAction)
@@ -296,15 +314,8 @@ func (cm *Manager) LoadConfig(path string) error {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
-	for _, rule := range config.Rules {
-		for _, p := range rule.Ports {
-			if p.Protocol == ProtocolICMP && p.Port != 0 {
-				return fmt.Errorf("ICMP rules must have port=0, got %d", p.Port)
-			}
-			if p.Protocol == ProtocolICMP && rule.Type == RuleTypeCIDR && isIPv6CIDR(rule.Value) {
-				return fmt.Errorf("ICMP protocol not valid on IPv6 CIDR %q; ICMPv6 is always allowed", rule.Value)
-			}
-		}
+	if err := validateRules(config.Rules); err != nil {
+		return err
 	}
 
 	slog.Info("Config loaded successfully",

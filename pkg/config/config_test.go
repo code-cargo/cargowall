@@ -728,8 +728,8 @@ func TestLoadConfigFromCargoWall_ICMPRejectsIPv6CIDR(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for ICMP rule on IPv6 CIDR, got nil")
 	}
-	if !strings.Contains(err.Error(), "ICMP protocol not valid on IPv6 CIDR") {
-		t.Errorf("error = %q, want it to contain 'ICMP protocol not valid on IPv6 CIDR'", err.Error())
+	if !strings.Contains(err.Error(), "IPv4-only") {
+		t.Errorf("error = %q, want it to contain 'IPv4-only'", err.Error())
 	}
 }
 
@@ -810,8 +810,8 @@ func TestLoadConfig_ICMPRejectsIPv6CIDR(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for ICMP rule on IPv6 CIDR, got nil")
 	}
-	if !strings.Contains(err.Error(), "ICMP protocol not valid on IPv6 CIDR") {
-		t.Errorf("error = %q, want it to contain 'ICMP protocol not valid on IPv6 CIDR'", err.Error())
+	if !strings.Contains(err.Error(), "IPv4-only") {
+		t.Errorf("error = %q, want it to contain 'IPv4-only'", err.Error())
 	}
 }
 

@@ -315,7 +315,7 @@ func expandPorts(ports []config.Port) []portProto {
 	if len(ports) == 0 {
 		return nil
 	}
-	result := make([]portProto, 0, len(ports)*2)
+	result := make([]portProto, 0, len(ports)*3)
 	for _, p := range ports {
 		switch p.Protocol {
 		case config.ProtocolTCP:
@@ -339,9 +339,9 @@ func expandPorts(ports []config.Port) []portProto {
 // maps. The v6 BPF data path (bpf/tcbpf.c, IPPROTO_ICMPV6 early-return)
 // unconditionally allows ICMPv6 before consulting the port map for NDP, so a
 // v6 port-map entry with proto=ICMP is dead and leaving PortSpecific=1 on the
-// LPM entry silently blackholes TCP/UDP. Filters in place (callers treat the
-// passed slice as consumed); returns the original slice unchanged in the
-// common case where no ICMP entries are present.
+// LPM entry silently blackholes TCP/UDP. Returns the input slice unchanged in
+// the common case where no ICMP entries are present; otherwise allocates a
+// new slice (rule-load is not a hot path).
 func stripICMPForV6(ports []portProto) ([]portProto, bool) {
 	hasICMP := false
 	for _, pp := range ports {
@@ -353,7 +353,7 @@ func stripICMPForV6(ports []portProto) ([]portProto, bool) {
 	if !hasICMP {
 		return ports, false
 	}
-	filtered := ports[:0]
+	filtered := make([]portProto, 0, len(ports)-1)
 	for _, pp := range ports {
 		if pp.Proto == protoICMP {
 			continue

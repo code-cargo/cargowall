@@ -171,6 +171,12 @@ func (cm *Manager) LoadConfigFromRules(rules []Rule, defaultAction Action) error
 	return cm.resolveRules()
 }
 
+// isIPv6CIDR reports whether value parses as an IPv6 CIDR.
+func isIPv6CIDR(value string) bool {
+	ip, _, err := net.ParseCIDR(value)
+	return err == nil && ip.To4() == nil
+}
+
 // LoadConfigFromCargoWall loads configuration from a protobuf CargoWall message
 func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPolicy) error {
 	// Convert protobuf CargoWall to internal config format
@@ -202,6 +208,9 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 			}
 			if proto == ProtocolICMP && pbPort.GetPort() != 0 {
 				return fmt.Errorf("ICMP rules must have port=0, got %d", pbPort.GetPort())
+			}
+			if proto == ProtocolICMP && rule.Type == RuleTypeCIDR && isIPv6CIDR(rule.Value) {
+				return fmt.Errorf("ICMP protocol not valid on IPv6 CIDR %q; ICMPv6 is always allowed", rule.Value)
 			}
 			rule.Ports = append(rule.Ports, Port{
 				Port:     uint16(pbPort.GetPort()),
@@ -291,6 +300,9 @@ func (cm *Manager) LoadConfig(path string) error {
 		for _, p := range rule.Ports {
 			if p.Protocol == ProtocolICMP && p.Port != 0 {
 				return fmt.Errorf("ICMP rules must have port=0, got %d", p.Port)
+			}
+			if p.Protocol == ProtocolICMP && rule.Type == RuleTypeCIDR && isIPv6CIDR(rule.Value) {
+				return fmt.Errorf("ICMP protocol not valid on IPv6 CIDR %q; ICMPv6 is always allowed", rule.Value)
 			}
 		}
 	}

@@ -272,6 +272,19 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 // addCIDRv6 adds an IPv6 CIDR to the BPF v6 LPM trie and optional port maps.
 // Must be called with f.mu held.
 func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
+	origPortCount := len(ports)
+	ports, dropped := stripICMPForV6(ports)
+	if dropped {
+		f.logger.Info("Dropping ICMP port(s) from v6 rule; ICMPv6 is always allowed", "label", label)
+	}
+	// ICMP-only rule on v6: skip writes entirely. ICMPv6 is already allowed
+	// unconditionally by BPF; writing PortSpecific=0 would silently broaden to
+	// allow-all TCP/UDP, and PortSpecific=1 with no port entries would blackhole
+	// TCP/UDP.
+	if origPortCount > 0 && len(ports) == 0 {
+		return nil
+	}
+
 	var key bpf.TcBpfLpmKeyV6
 	key.Prefixlen = prefixLen
 	copy(key.Ip[:], ip6)
@@ -328,6 +341,24 @@ func expandPorts(ports []config.Port) []portProto {
 		}
 	}
 	return result
+}
+
+// stripICMPForV6 removes ICMP entries from a port list destined for the v6 BPF
+// maps. The v6 BPF data path unconditionally allows ICMPv6 before consulting
+// the port map (required for NDP), so a v6 port-map entry with proto=ICMP is
+// dead, and leaving PortSpecific=1 on the LPM entry silently blackholes TCP/UDP.
+// Returns the filtered slice and whether any ICMP entries were dropped.
+func stripICMPForV6(ports []portProto) ([]portProto, bool) {
+	dropped := false
+	filtered := ports[:0:0]
+	for _, pp := range ports {
+		if pp.Proto == protoICMP {
+			dropped = true
+			continue
+		}
+		filtered = append(filtered, pp)
+	}
+	return filtered, dropped
 }
 
 // AddIP adds a single IP to the BPF maps with the specified action and ports
@@ -409,6 +440,19 @@ func (f *FirewallImpl) addIPv4(ip4 net.IP, origIP net.IP, action config.Action, 
 func (f *FirewallImpl) addIPv6(ip6 net.IP, origIP net.IP, action config.Action, ports []portProto) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	origPortCount := len(ports)
+	ports, dropped := stripICMPForV6(ports)
+	if dropped {
+		f.logger.Info("Dropping ICMP port(s) from v6 rule; ICMPv6 is always allowed", "ip", origIP.String())
+	}
+	// ICMP-only rule on v6: skip writes entirely. ICMPv6 is already allowed
+	// unconditionally by BPF; writing PortSpecific=0 would silently broaden to
+	// allow-all TCP/UDP, and PortSpecific=1 with no port entries would blackhole
+	// TCP/UDP.
+	if origPortCount > 0 && len(ports) == 0 {
+		return false, nil
+	}
 
 	var key bpf.TcBpfLpmKeyV6
 	key.Prefixlen = 128

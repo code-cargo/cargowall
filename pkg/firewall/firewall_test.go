@@ -350,3 +350,92 @@ func TestUpdateAllowlistTC_IPv4Wildcard_ICMPOnly(t *testing.T) {
 	assert.Equal(t, uint16(0), pKey.Port)
 	assert.Equal(t, protoICMP, pKey.Proto)
 }
+
+// --- IPv6 ICMP filtering (hostname → v6 blackhole guard) ---
+
+func TestAddIP_IPv6_ICMPOnly_SkipsWrites(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	added, err := fw.AddIP(net.ParseIP("2001:db8::1"), config.ActionAllow, []config.Port{config.PortICMP})
+	require.NoError(t, err)
+	assert.False(t, added, "ICMP-only v6 rule should not produce a BPF write")
+	assert.Empty(t, mocks["cidrsV6"].updates, "no v6 LPM entry for ICMP-only rule")
+	assert.Empty(t, mocks["portsV6"].updates, "no v6 port-map entry for ICMP-only rule")
+	_, tracked := fw.ipPorts["2001:db8::1"]
+	assert.False(t, tracked, "ipPorts must not track an IP with no BPF state")
+}
+
+func TestAddIP_IPv6_MixedICMPAndTCP_DropsICMP(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	added, err := fw.AddIP(net.ParseIP("2001:db8::1"), config.ActionAllow, []config.Port{
+		config.PortICMP,
+		{Port: 443, Protocol: config.ProtocolTCP},
+	})
+	require.NoError(t, err)
+	assert.True(t, added)
+
+	require.Len(t, mocks["cidrsV6"].updates, 1)
+	lpmVal := mocks["cidrsV6"].updates[0].value.(*bpf.TcBpfLpmVal)
+	assert.Equal(t, uint8(1), lpmVal.PortSpecific, "mixed rule stays port-specific after ICMP filter")
+
+	require.Len(t, mocks["portsV6"].updates, 1, "only the TCP entry should be written")
+	pKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfPortKeyV6)
+	assert.Equal(t, uint16(443), pKey.Port)
+	assert.Equal(t, protoTCP, pKey.Proto)
+}
+
+func TestUpdateAllowlistTC_HostnameResolvedToV6_ICMPOnly_NoV6Writes(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	rules := []config.Rule{
+		{Type: config.RuleTypeHostname, Value: "v6only.example", Ports: []config.Port{config.PortICMP}, Action: config.ActionAllow},
+	}
+
+	cm := config.NewConfigManager()
+	err := cm.LoadConfigFromRules(rules, config.ActionDeny)
+	require.NoError(t, err)
+
+	cm.UpdateDNSMapping("v6only.example", "2001:db8::1")
+
+	err = cm.LoadConfigFromRules(rules, config.ActionDeny)
+	require.NoError(t, err)
+
+	err = fw.UpdateAllowlistTC(cm)
+	require.NoError(t, err)
+
+	assert.Empty(t, mocks["cidrsV6"].updates, "ICMP-only hostname with v6 resolution must not write v6 LPM")
+	assert.Empty(t, mocks["portsV6"].updates, "ICMP-only hostname with v6 resolution must not write v6 port map")
+}
+
+func TestUpdateAllowlistTC_HostnameResolvedToV6_MixedPorts_FiltersICMP(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	rules := []config.Rule{
+		{Type: config.RuleTypeHostname, Value: "mixed.example", Ports: []config.Port{
+			config.PortICMP,
+			{Port: 443, Protocol: config.ProtocolTCP},
+		}, Action: config.ActionAllow},
+	}
+
+	cm := config.NewConfigManager()
+	err := cm.LoadConfigFromRules(rules, config.ActionDeny)
+	require.NoError(t, err)
+
+	cm.UpdateDNSMapping("mixed.example", "2001:db8::1")
+
+	err = cm.LoadConfigFromRules(rules, config.ActionDeny)
+	require.NoError(t, err)
+
+	err = fw.UpdateAllowlistTC(cm)
+	require.NoError(t, err)
+
+	require.Len(t, mocks["cidrsV6"].updates, 1)
+	lpmVal := mocks["cidrsV6"].updates[0].value.(*bpf.TcBpfLpmVal)
+	assert.Equal(t, uint8(1), lpmVal.PortSpecific)
+
+	require.Len(t, mocks["portsV6"].updates, 1, "only the TCP entry should be written for v6")
+	pKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfPortKeyV6)
+	assert.Equal(t, uint16(443), pKey.Port)
+	assert.Equal(t, protoTCP, pKey.Proto)
+}

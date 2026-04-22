@@ -707,6 +707,54 @@ func TestLoadConfigFromCargoWall_ICMPRejectsNonZeroPort(t *testing.T) {
 	}
 }
 
+func TestLoadConfigFromCargoWall_ICMPRejectsIPv6CIDR(t *testing.T) {
+	cm := NewConfigManager()
+
+	policy := &cargowallv1pb.CargoWallPolicy{
+		DefaultAction: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY,
+		Rules: []*cargowallv1pb.CargoWallPolicy_Rule{
+			{
+				Type:   datapb.CargoWallRuleType_CARGO_WALL_RULE_TYPE_CIDR,
+				Value:  "2001:db8::/64",
+				Action: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW,
+				Ports: []*cargowallv1pb.CargoWallPolicy_PortRule{
+					{Port: 0, Protocol: datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_ICMP},
+				},
+			},
+		},
+	}
+
+	err := cm.LoadConfigFromCargoWall(policy)
+	if err == nil {
+		t.Fatal("expected error for ICMP rule on IPv6 CIDR, got nil")
+	}
+	if !strings.Contains(err.Error(), "ICMP protocol not valid on IPv6 CIDR") {
+		t.Errorf("error = %q, want it to contain 'ICMP protocol not valid on IPv6 CIDR'", err.Error())
+	}
+}
+
+func TestLoadConfigFromCargoWall_ICMPAllowedOnHostname(t *testing.T) {
+	cm := NewConfigManager()
+
+	policy := &cargowallv1pb.CargoWallPolicy{
+		DefaultAction: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY,
+		Rules: []*cargowallv1pb.CargoWallPolicy_Rule{
+			{
+				Type:   datapb.CargoWallRuleType_CARGO_WALL_RULE_TYPE_HOSTNAME,
+				Value:  "example.com",
+				Action: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW,
+				Ports: []*cargowallv1pb.CargoWallPolicy_PortRule{
+					{Port: 0, Protocol: datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_ICMP},
+				},
+			},
+		},
+	}
+
+	if err := cm.LoadConfigFromCargoWall(policy); err != nil {
+		t.Fatalf("LoadConfigFromCargoWall() error = %v; hostname rules with ICMP should load", err)
+	}
+}
+
 func TestLoadConfig_ICMPRejectsNonZeroPort(t *testing.T) {
 	tmpfile, err := os.CreateTemp("", "cargowall-icmp-test-*.json")
 	if err != nil {
@@ -734,6 +782,36 @@ func TestLoadConfig_ICMPRejectsNonZeroPort(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "ICMP rules must have port=0") {
 		t.Errorf("error = %q, want it to contain 'ICMP rules must have port=0'", err.Error())
+	}
+}
+
+func TestLoadConfig_ICMPRejectsIPv6CIDR(t *testing.T) {
+	tmpfile, err := os.CreateTemp("", "cargowall-icmp-v6-test-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	configData := `{
+		"rules": [
+			{"type": "cidr", "value": "2001:db8::/64", "ports": [{"port": 0, "protocol": "icmp"}], "action": "allow"}
+		],
+		"defaultAction": "deny"
+	}`
+	if _, err := tmpfile.Write([]byte(configData)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := NewConfigManager()
+	err = cm.LoadConfig(tmpfile.Name())
+	if err == nil {
+		t.Fatal("expected error for ICMP rule on IPv6 CIDR, got nil")
+	}
+	if !strings.Contains(err.Error(), "ICMP protocol not valid on IPv6 CIDR") {
+		t.Errorf("error = %q, want it to contain 'ICMP protocol not valid on IPv6 CIDR'", err.Error())
 	}
 }
 

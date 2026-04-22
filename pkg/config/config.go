@@ -200,6 +200,9 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 			if err != nil {
 				return fmt.Errorf("port %d: %w", pbPort.GetPort(), err)
 			}
+			if proto == ProtocolICMP && pbPort.GetPort() != 0 {
+				return fmt.Errorf("ICMP rules must have port=0, got %d", pbPort.GetPort())
+			}
 			rule.Ports = append(rule.Ports, Port{
 				Port:     uint16(pbPort.GetPort()),
 				Protocol: proto,
@@ -282,6 +285,14 @@ func (cm *Manager) LoadConfig(path string) error {
 	var config FirewallConfig
 	if err := json.Unmarshal(data, &config); err != nil {
 		return fmt.Errorf("parse config: %w", err)
+	}
+
+	for _, rule := range config.Rules {
+		for _, p := range rule.Ports {
+			if p.Protocol == ProtocolICMP && p.Port != 0 {
+				return fmt.Errorf("ICMP rules must have port=0, got %d", p.Port)
+			}
+		}
 	}
 
 	slog.Info("Config loaded successfully",

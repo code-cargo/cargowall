@@ -304,7 +304,7 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 }
 
 // expandPorts converts config.Port entries into portProto values for BPF map keys.
-// ProtocolAll expands to both ICMP, TCP and UDP entries so that the BPF lookup
+// ProtocolAll expands to ICMP, TCP, and UDP entries so that the BPF lookup
 // (which always uses the packet's exact protocol) matches correctly.
 func expandPorts(ports []config.Port) []portProto {
 	if len(ports) == 0 {

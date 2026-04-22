@@ -298,12 +298,12 @@ func TestTcEgress(t *testing.T) {
 		},
 
 		{
-			name:    "IPv4 ICMP allowed via wildcard CIDR allow",
+			name:    "IPv4 ICMP allowed via CIDR allow rule",
 			packet:  craftIPv4ICMP(t, "140.82.114.3"),
 			wantRet: tcActOK,
 		},
 		{
-			name:    "IPv4 ICMP blocked to unknown host (default deny)",
+			name:    "IPv4 ICMP blocked outside allowed CIDR (default deny)",
 			packet:  craftIPv4ICMP(t, "93.184.216.34"),
 			wantRet: tcActShot,
 		},

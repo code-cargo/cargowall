@@ -20,6 +20,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
@@ -677,6 +678,62 @@ func TestLoadConfigFromCargoWall_ICMPRule(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cm.resolvedRules[0].Ports, []Port{{Port: 0, Protocol: ProtocolICMP}}) {
 		t.Errorf("rule Ports = %v, want [{0 icmp}]", cm.resolvedRules[0].Ports)
+	}
+}
+
+func TestLoadConfigFromCargoWall_ICMPRejectsNonZeroPort(t *testing.T) {
+	cm := NewConfigManager()
+
+	policy := &cargowallv1pb.CargoWallPolicy{
+		DefaultAction: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY,
+		Rules: []*cargowallv1pb.CargoWallPolicy_Rule{
+			{
+				Type:   datapb.CargoWallRuleType_CARGO_WALL_RULE_TYPE_CIDR,
+				Value:  "1.2.3.4/32",
+				Action: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW,
+				Ports: []*cargowallv1pb.CargoWallPolicy_PortRule{
+					{Port: 443, Protocol: datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_ICMP},
+				},
+			},
+		},
+	}
+
+	err := cm.LoadConfigFromCargoWall(policy)
+	if err == nil {
+		t.Fatal("expected error for ICMP rule with non-zero port, got nil")
+	}
+	if !strings.Contains(err.Error(), "ICMP rules must have port=0") {
+		t.Errorf("error = %q, want it to contain 'ICMP rules must have port=0'", err.Error())
+	}
+}
+
+func TestLoadConfig_ICMPRejectsNonZeroPort(t *testing.T) {
+	tmpfile, err := os.CreateTemp("", "cargowall-icmp-test-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	configData := `{
+		"rules": [
+			{"type": "cidr", "value": "1.2.3.4/32", "ports": [{"port": 443, "protocol": "icmp"}], "action": "allow"}
+		],
+		"defaultAction": "deny"
+	}`
+	if _, err := tmpfile.Write([]byte(configData)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := NewConfigManager()
+	err = cm.LoadConfig(tmpfile.Name())
+	if err == nil {
+		t.Fatal("expected error for ICMP rule with non-zero port, got nil")
+	}
+	if !strings.Contains(err.Error(), "ICMP rules must have port=0") {
+		t.Errorf("error = %q, want it to contain 'ICMP rules must have port=0'", err.Error())
 	}
 }
 

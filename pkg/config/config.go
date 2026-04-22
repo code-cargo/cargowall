@@ -61,17 +61,21 @@ const (
 type ProtocolType string
 
 const (
-	ProtocolAll ProtocolType = "all"
-	ProtocolTCP ProtocolType = "tcp"
-	ProtocolUDP ProtocolType = "udp"
+	ProtocolAll  ProtocolType = "all"
+	ProtocolTCP  ProtocolType = "tcp"
+	ProtocolUDP  ProtocolType = "udp"
+	ProtocolICMP ProtocolType = "icmp"
 )
 
 // Common port definitions for infrastructure auto-allow rules.
+// PortICMP carries Port=0 because ICMP has no port concept; the protocol
+// field alone drives the BPF lookup.
 var (
 	PortHTTPS      = Port{Port: 443, Protocol: ProtocolTCP}
 	PortHTTP       = Port{Port: 80, Protocol: ProtocolTCP}
 	PortDNS        = Port{Port: 53, Protocol: ProtocolUDP}
 	PortWireServer = Port{Port: 32526, Protocol: ProtocolTCP}
+	PortICMP       = Port{Port: 0, Protocol: ProtocolICMP}
 )
 
 // FirewallConfig represents the configuration for the L4 firewall
@@ -156,6 +160,9 @@ func NewConfigManager() *Manager {
 
 // LoadConfigFromRules loads configuration from rules (for testing)
 func (cm *Manager) LoadConfigFromRules(rules []Rule, defaultAction Action) error {
+	if err := validateRules(rules); err != nil {
+		return err
+	}
 	cm.mu.Lock()
 	cm.config = &FirewallConfig{
 		Rules:         rules,
@@ -165,6 +172,29 @@ func (cm *Manager) LoadConfigFromRules(rules []Rule, defaultAction Action) error
 
 	// Resolve all rules
 	return cm.resolveRules()
+}
+
+// isIPv6CIDR reports whether value parses as an IPv6 CIDR.
+func isIPv6CIDR(value string) bool {
+	ip, _, err := net.ParseCIDR(value)
+	return err == nil && ip.To4() == nil
+}
+
+// validateRules enforces cross-field constraints on parsed rules. Each loader
+// entry point (LoadConfig, LoadConfigFromCargoWall, LoadConfigFromRules) calls
+// this so internal callers cannot bypass the checks.
+func validateRules(rules []Rule) error {
+	for _, rule := range rules {
+		for _, p := range rule.Ports {
+			if p.Protocol == ProtocolICMP && p.Port != 0 {
+				return fmt.Errorf("ICMP rules must have port=0, got %d", p.Port)
+			}
+			if p.Protocol == ProtocolICMP && rule.Type == RuleTypeCIDR && isIPv6CIDR(rule.Value) {
+				return fmt.Errorf("ICMP (proto 1) is IPv4-only; ICMPv6 is always allowed on IPv6 CIDR %q", rule.Value)
+			}
+		}
+	}
+	return nil
 }
 
 // LoadConfigFromCargoWall loads configuration from a protobuf CargoWall message
@@ -205,6 +235,10 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 		rules = append(rules, rule)
 	}
 
+	if err := validateRules(rules); err != nil {
+		return err
+	}
+
 	defaultAction := convertAction(cargoWall.DefaultAction)
 
 	// Extract sudo lockdown settings
@@ -241,6 +275,8 @@ func convertProtocol(proto datapb.CargoWallProtocol) (ProtocolType, error) {
 		return ProtocolTCP, nil
 	case datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_UDP:
 		return ProtocolUDP, nil
+	case datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_ICMP:
+		return ProtocolICMP, nil
 	default:
 		return "", fmt.Errorf("unknown protocol: %v", proto)
 	}
@@ -276,6 +312,10 @@ func (cm *Manager) LoadConfig(path string) error {
 	var config FirewallConfig
 	if err := json.Unmarshal(data, &config); err != nil {
 		return fmt.Errorf("parse config: %w", err)
+	}
+
+	if err := validateRules(config.Rules); err != nil {
+		return err
 	}
 
 	slog.Info("Config loaded successfully",

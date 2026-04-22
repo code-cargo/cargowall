@@ -8,6 +8,7 @@ package grpc.cargowall.v1;
 // https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
 enum CargoWallProtocol {
   CARGO_WALL_PROTOCOL_ALL = 0;
+  CARGO_WALL_PROTOCOL_ICMP = 1;
   CARGO_WALL_PROTOCOL_TCP = 6;
   CARGO_WALL_PROTOCOL_UDP = 17;
 }

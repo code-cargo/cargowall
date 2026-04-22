@@ -208,7 +208,8 @@ func TestUpdateAllowlistTC_IPv4Wildcard_OnlyPortsMap(t *testing.T) {
 	err = fw.UpdateAllowlistTC(cm)
 	require.NoError(t, err)
 
-	assert.Len(t, mocks["ports"].updates, 4, "should update portsMap for each port+protocol combo")
+	// ProtocolAll expands to ICMP+TCP+UDP → 3 entries per port × 2 ports = 6.
+	assert.Len(t, mocks["ports"].updates, 6, "should update portsMap for each port+protocol combo")
 	assert.Empty(t, mocks["cidrs"].updates, "should NOT update cidrsMap for wildcard with ports")
 }
 
@@ -224,7 +225,8 @@ func TestUpdateAllowlistTC_IPv6Wildcard_OnlyPortsV6Map(t *testing.T) {
 	err = fw.UpdateAllowlistTC(cm)
 	require.NoError(t, err)
 
-	assert.Len(t, mocks["portsV6"].updates, 2, "should update portsV6Map for each port+protocol combo")
+	// ProtocolAll expands to ICMP+TCP+UDP → 3 entries for the single port.
+	assert.Len(t, mocks["portsV6"].updates, 3, "should update portsV6Map for each port+protocol combo")
 	assert.Empty(t, mocks["cidrsV6"].updates, "should NOT update cidrsV6Map for wildcard with ports")
 }
 
@@ -271,7 +273,181 @@ func TestUpdateAllowlistTC_Hostname_CreatesPerIPEntries(t *testing.T) {
 	err = fw.UpdateAllowlistTC(cm)
 	require.NoError(t, err)
 
-	// Each resolved IP gets a cidrsMap entry + a portsMap entry (one port per IP)
+	// Each resolved IP gets a cidrsMap entry + a portsMap entry per protocol
+	// (ProtocolAll expands to ICMP+TCP+UDP → 3 protocols × 1 port × 2 IPs = 6).
 	assert.Len(t, mocks["cidrs"].updates, 2, "should add /32 LPM entry per resolved IP")
-	assert.Len(t, mocks["ports"].updates, 4, "should add port+protocol entry per resolved IP (1 port × 2 protocols × 2 IPs)")
+	assert.Len(t, mocks["ports"].updates, 6, "should add port+protocol entry per resolved IP")
+}
+
+// --- expandPorts protocol translation ---
+
+func TestExpandPorts_ICMP(t *testing.T) {
+	got := expandPorts([]config.Port{{Port: 0, Protocol: config.ProtocolICMP}})
+	assert.Equal(t, []portProto{{Port: 0, Proto: protoICMP}}, got)
+}
+
+func TestExpandPorts_AllIncludesICMP(t *testing.T) {
+	got := expandPorts([]config.Port{{Port: 443, Protocol: config.ProtocolAll}})
+	assert.Equal(t, []portProto{
+		{Port: 0, Proto: protoICMP},
+		{Port: 443, Proto: protoTCP},
+		{Port: 443, Proto: protoUDP},
+	}, got)
+}
+
+func TestExpandPorts_MixedICMPAndTCP(t *testing.T) {
+	got := expandPorts([]config.Port{
+		{Port: 0, Protocol: config.ProtocolICMP},
+		{Port: 443, Protocol: config.ProtocolTCP},
+	})
+	assert.Equal(t, []portProto{
+		{Port: 0, Proto: protoICMP},
+		{Port: 443, Proto: protoTCP},
+	}, got)
+}
+
+func TestStripICMPForV6_NilInput(t *testing.T) {
+	filtered, dropped := stripICMPForV6(nil)
+	assert.Nil(t, filtered)
+	assert.False(t, dropped)
+}
+
+func TestStripICMPForV6_EmptyInput(t *testing.T) {
+	filtered, dropped := stripICMPForV6([]portProto{})
+	assert.Empty(t, filtered)
+	assert.False(t, dropped)
+}
+
+// --- UpdateAllowlistTC ICMP rules ---
+
+func TestUpdateAllowlistTC_ICMPRule_WritesICMPPortEntry(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	cm := config.NewConfigManager()
+	err := cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeCIDR, Value: "168.63.129.16/32", Ports: []config.Port{config.PortICMP}, Action: config.ActionAllow},
+	}, config.ActionDeny)
+	require.NoError(t, err)
+
+	err = fw.UpdateAllowlistTC(cm)
+	require.NoError(t, err)
+
+	require.Len(t, mocks["cidrs"].updates, 1, "LPM entry for the /32 CIDR")
+	lpmVal := mocks["cidrs"].updates[0].value.(*bpf.TcBpfLpmVal)
+	assert.Equal(t, uint8(1), lpmVal.Action)
+	assert.Equal(t, uint8(1), lpmVal.PortSpecific, "ICMP rule is port-specific (even though port=0)")
+
+	require.Len(t, mocks["ports"].updates, 1, "port map entry for ICMP")
+	pKey := mocks["ports"].updates[0].key.(*bpf.TcBpfPortKey)
+	assert.Equal(t, uint16(0), pKey.Port)
+	assert.Equal(t, protoICMP, pKey.Proto)
+}
+
+func TestUpdateAllowlistTC_IPv4Wildcard_ICMPOnly(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	cm := config.NewConfigManager()
+	err := cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []config.Port{config.PortICMP}, Action: config.ActionAllow},
+	}, config.ActionDeny)
+	require.NoError(t, err)
+
+	err = fw.UpdateAllowlistTC(cm)
+	require.NoError(t, err)
+
+	assert.Empty(t, mocks["cidrs"].updates, "wildcard CIDR skips LPM entry")
+	require.Len(t, mocks["ports"].updates, 1, "wildcard ICMP entry goes into port map with ip=0")
+	pKey := mocks["ports"].updates[0].key.(*bpf.TcBpfPortKey)
+	assert.Equal(t, uint32(0), pKey.Ip)
+	assert.Equal(t, uint16(0), pKey.Port)
+	assert.Equal(t, protoICMP, pKey.Proto)
+}
+
+// --- IPv6 ICMP filtering (hostname → v6 blackhole guard) ---
+
+func TestAddIP_IPv6_ICMPOnly_SkipsWrites(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	added, err := fw.AddIP(net.ParseIP("2001:db8::1"), config.ActionAllow, []config.Port{config.PortICMP})
+	require.NoError(t, err)
+	assert.False(t, added, "ICMP-only v6 rule should not produce a BPF write")
+	assert.Empty(t, mocks["cidrsV6"].updates, "no v6 LPM entry for ICMP-only rule")
+	assert.Empty(t, mocks["portsV6"].updates, "no v6 port-map entry for ICMP-only rule")
+	_, tracked := fw.ipPorts["2001:db8::1"]
+	assert.False(t, tracked, "ipPorts must not track an IP with no BPF state")
+}
+
+func TestAddIP_IPv6_MixedICMPAndTCP_DropsICMP(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	added, err := fw.AddIP(net.ParseIP("2001:db8::1"), config.ActionAllow, []config.Port{
+		config.PortICMP,
+		{Port: 443, Protocol: config.ProtocolTCP},
+	})
+	require.NoError(t, err)
+	assert.True(t, added)
+
+	require.Len(t, mocks["cidrsV6"].updates, 1)
+	lpmVal := mocks["cidrsV6"].updates[0].value.(*bpf.TcBpfLpmVal)
+	assert.Equal(t, uint8(1), lpmVal.PortSpecific, "mixed rule stays port-specific after ICMP filter")
+
+	require.Len(t, mocks["portsV6"].updates, 1, "only the TCP entry should be written")
+	pKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfPortKeyV6)
+	assert.Equal(t, uint16(443), pKey.Port)
+	assert.Equal(t, protoTCP, pKey.Proto)
+}
+
+func TestUpdateAllowlistTC_HostnameResolvedToV6_ICMPOnly_NoV6Writes(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	rules := []config.Rule{
+		{Type: config.RuleTypeHostname, Value: "v6only.example", Ports: []config.Port{config.PortICMP}, Action: config.ActionAllow},
+	}
+
+	cm := config.NewConfigManager()
+	err := cm.LoadConfigFromRules(rules, config.ActionDeny)
+	require.NoError(t, err)
+
+	cm.UpdateDNSMapping("v6only.example", "2001:db8::1")
+
+	err = cm.LoadConfigFromRules(rules, config.ActionDeny)
+	require.NoError(t, err)
+
+	err = fw.UpdateAllowlistTC(cm)
+	require.NoError(t, err)
+
+	assert.Empty(t, mocks["cidrsV6"].updates, "ICMP-only hostname with v6 resolution must not write v6 LPM")
+	assert.Empty(t, mocks["portsV6"].updates, "ICMP-only hostname with v6 resolution must not write v6 port map")
+}
+
+func TestUpdateAllowlistTC_HostnameResolvedToV6_MixedPorts_FiltersICMP(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	rules := []config.Rule{
+		{Type: config.RuleTypeHostname, Value: "mixed.example", Ports: []config.Port{
+			config.PortICMP,
+			{Port: 443, Protocol: config.ProtocolTCP},
+		}, Action: config.ActionAllow},
+	}
+
+	cm := config.NewConfigManager()
+	err := cm.LoadConfigFromRules(rules, config.ActionDeny)
+	require.NoError(t, err)
+
+	cm.UpdateDNSMapping("mixed.example", "2001:db8::1")
+
+	err = cm.LoadConfigFromRules(rules, config.ActionDeny)
+	require.NoError(t, err)
+
+	err = fw.UpdateAllowlistTC(cm)
+	require.NoError(t, err)
+
+	require.Len(t, mocks["cidrsV6"].updates, 1)
+	lpmVal := mocks["cidrsV6"].updates[0].value.(*bpf.TcBpfLpmVal)
+	assert.Equal(t, uint8(1), lpmVal.PortSpecific)
+
+	require.Len(t, mocks["portsV6"].updates, 1, "only the TCP entry should be written for v6")
+	pKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfPortKeyV6)
+	assert.Equal(t, uint16(443), pKey.Port)
+	assert.Equal(t, protoTCP, pKey.Proto)
 }

@@ -371,7 +371,7 @@ func stripICMPForV6(ports []portProto) ([]portProto, bool) {
 func (f *FirewallImpl) prepV6Ports(ports []portProto, labelKey, labelVal string) ([]portProto, bool) {
 	filtered, dropped := stripICMPForV6(ports)
 	if dropped {
-		f.logger.Info("Dropping ICMP port(s) from v6 rule; ICMPv6 is always allowed", labelKey, labelVal)
+		f.logger.Debug("Dropping ICMP port(s) from v6 rule; ICMPv6 is always allowed", labelKey, labelVal)
 	}
 	return filtered, dropped && len(filtered) == 0
 }

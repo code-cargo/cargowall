@@ -306,6 +306,18 @@ func TestExpandPorts_MixedICMPAndTCP(t *testing.T) {
 	}, got)
 }
 
+func TestStripICMPForV6_NilInput(t *testing.T) {
+	filtered, dropped := stripICMPForV6(nil)
+	assert.Nil(t, filtered)
+	assert.False(t, dropped)
+}
+
+func TestStripICMPForV6_EmptyInput(t *testing.T) {
+	filtered, dropped := stripICMPForV6([]portProto{})
+	assert.Empty(t, filtered)
+	assert.False(t, dropped)
+}
+
 // --- UpdateAllowlistTC ICMP rules ---
 
 func TestUpdateAllowlistTC_ICMPRule_WritesICMPPortEntry(t *testing.T) {

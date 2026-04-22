@@ -370,10 +370,19 @@ func stripICMPForV6(ports []portProto) ([]portProto, bool) {
 // PortSpecific=1 with no port entries would blackhole TCP/UDP).
 func (f *FirewallImpl) prepV6Ports(ports []portProto, labelKey, labelVal string) ([]portProto, bool) {
 	filtered, dropped := stripICMPForV6(ports)
-	if dropped {
+	skip := dropped && len(filtered) == 0
+	switch {
+	case skip:
+		// Whole rule is ICMP-only on v6: user's explicit intent is being satisfied
+		// only by the unconditional ICMPv6 allow in BPF. Worth surfacing so an
+		// operator debugging "why does v6 ICMP still work with cargowall?" or
+		// "why doesn't my ICMP rule restrict anything?" sees why.
+		f.logger.Warn("Skipping v6 rule: ICMP-only and ICMPv6 is unconditionally allowed", labelKey, labelVal)
+	case dropped:
+		// ICMP mixed with TCP/UDP — common under ProtocolAll expansion; noisy.
 		f.logger.Debug("Dropping ICMP port(s) from v6 rule; ICMPv6 is always allowed", labelKey, labelVal)
 	}
-	return filtered, dropped && len(filtered) == 0
+	return filtered, skip
 }
 
 // AddIP adds a single IP to the BPF maps with the specified action and ports

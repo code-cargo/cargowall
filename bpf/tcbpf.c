@@ -70,11 +70,12 @@ struct lpm_val {
     __u16 pad;
 } __attribute__((packed));
 
-// Key for port-specific rules
+// Key for port-specific rules. For ICMP (proto=1) the port field is always 0;
+// ICMP has no L4 port, so the protocol byte alone discriminates the rule.
 struct port_key {
     __u32 ip;
     __u16 port;
-    __u8 proto;           // IPPROTO_TCP (6) or IPPROTO_UDP (17)
+    __u8 proto;           // IPPROTO_TCP (6), IPPROTO_UDP (17), or IPPROTO_ICMP (1)
     __u8 pad;
 } __attribute__((packed));
 

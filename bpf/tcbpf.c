@@ -468,6 +468,8 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
     // router solicitation, etc.) which is the IPv6 equivalent of ARP.
     // Blocking it breaks basic IPv6 connectivity.
     // Check AFTER extension header walking to handle fragmented ICMPv6.
+    // NOTE: pkg/firewall/firewall.go:stripICMPForV6 relies on this invariant.
+    // If this early-return is removed, drop that Go-side filter too.
     if (nexthdr == IPPROTO_ICMPV6)
         return TC_ACT_OK;
 

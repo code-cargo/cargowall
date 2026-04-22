@@ -272,16 +272,8 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 // addCIDRv6 adds an IPv6 CIDR to the BPF v6 LPM trie and optional port maps.
 // Must be called with f.mu held.
 func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
-	origPortCount := len(ports)
-	ports, dropped := stripICMPForV6(ports)
-	if dropped {
-		f.logger.Info("Dropping ICMP port(s) from v6 rule; ICMPv6 is always allowed", "label", label)
-	}
-	// ICMP-only rule on v6: skip writes entirely. ICMPv6 is already allowed
-	// unconditionally by BPF; writing PortSpecific=0 would silently broaden to
-	// allow-all TCP/UDP, and PortSpecific=1 with no port entries would blackhole
-	// TCP/UDP.
-	if origPortCount > 0 && len(ports) == 0 {
+	ports, skip := f.prepV6Ports(ports, "label", label)
+	if skip {
 		return nil
 	}
 
@@ -344,21 +336,44 @@ func expandPorts(ports []config.Port) []portProto {
 }
 
 // stripICMPForV6 removes ICMP entries from a port list destined for the v6 BPF
-// maps. The v6 BPF data path unconditionally allows ICMPv6 before consulting
-// the port map (required for NDP), so a v6 port-map entry with proto=ICMP is
-// dead, and leaving PortSpecific=1 on the LPM entry silently blackholes TCP/UDP.
-// Returns the filtered slice and whether any ICMP entries were dropped.
+// maps. The v6 BPF data path (bpf/tcbpf.c, IPPROTO_ICMPV6 early-return)
+// unconditionally allows ICMPv6 before consulting the port map for NDP, so a
+// v6 port-map entry with proto=ICMP is dead and leaving PortSpecific=1 on the
+// LPM entry silently blackholes TCP/UDP. Filters in place (callers treat the
+// passed slice as consumed); returns the original slice unchanged in the
+// common case where no ICMP entries are present.
 func stripICMPForV6(ports []portProto) ([]portProto, bool) {
-	dropped := false
-	filtered := ports[:0:0]
+	hasICMP := false
 	for _, pp := range ports {
 		if pp.Proto == protoICMP {
-			dropped = true
+			hasICMP = true
+			break
+		}
+	}
+	if !hasICMP {
+		return ports, false
+	}
+	filtered := ports[:0]
+	for _, pp := range ports {
+		if pp.Proto == protoICMP {
 			continue
 		}
 		filtered = append(filtered, pp)
 	}
-	return filtered, dropped
+	return filtered, true
+}
+
+// prepV6Ports applies stripICMPForV6, logs when entries are dropped, and
+// reports whether the caller should skip the v6 write entirely (ICMP-only
+// rule — ICMPv6 is already unconditionally allowed by BPF, so writing a
+// PortSpecific=0 LPM entry would silently broaden to allow-all TCP/UDP and
+// PortSpecific=1 with no port entries would blackhole TCP/UDP).
+func (f *FirewallImpl) prepV6Ports(ports []portProto, labelKey, labelVal string) ([]portProto, bool) {
+	filtered, dropped := stripICMPForV6(ports)
+	if dropped {
+		f.logger.Info("Dropping ICMP port(s) from v6 rule; ICMPv6 is always allowed", labelKey, labelVal)
+	}
+	return filtered, dropped && len(filtered) == 0
 }
 
 // AddIP adds a single IP to the BPF maps with the specified action and ports
@@ -441,16 +456,8 @@ func (f *FirewallImpl) addIPv6(ip6 net.IP, origIP net.IP, action config.Action, 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	origPortCount := len(ports)
-	ports, dropped := stripICMPForV6(ports)
-	if dropped {
-		f.logger.Info("Dropping ICMP port(s) from v6 rule; ICMPv6 is always allowed", "ip", origIP.String())
-	}
-	// ICMP-only rule on v6: skip writes entirely. ICMPv6 is already allowed
-	// unconditionally by BPF; writing PortSpecific=0 would silently broaden to
-	// allow-all TCP/UDP, and PortSpecific=1 with no port entries would blackhole
-	// TCP/UDP.
-	if origPortCount > 0 && len(ports) == 0 {
+	ports, skip := f.prepV6Ports(ports, "ip", origIP.String())
+	if skip {
 		return false, nil
 	}
 

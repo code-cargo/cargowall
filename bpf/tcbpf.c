@@ -213,6 +213,12 @@ static __always_inline void submit_event_v4(struct __sk_buff *skb, __u32 src_ip,
     }
 }
 
+// Helper: emit an IPv4 protocol-block event. dst_port carries the protocol
+// number (userspace keys on src_port==0 && dst_port<256 to decode it).
+static __always_inline void submit_protocol_block_v4(struct __sk_buff *skb, __u32 src_ip, __u32 dst_ip, __u8 ip_proto) {
+    submit_event_v4(skb, src_ip, dst_ip, 0, ip_proto, 0);
+}
+
 // Helper: check if nexthdr is an IPv6 extension header
 static __always_inline int is_ipv6_ext_hdr(__u8 nexthdr) {
     return nexthdr == IPPROTO_HOPOPTS ||
@@ -256,10 +262,8 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
     __u32 dst_ip = bpf_ntohl(ip_hdr.daddr);
     __u8 ip_proto = ip_hdr.protocol;
 
-    // Only allow TCP and UDP protocols - block everything else
-    if (ip_proto != IPPROTO_TCP && ip_proto != IPPROTO_UDP) {
-        // Log blocked non-TCP/UDP protocol (store protocol number in dst_port)
-        submit_event_v4(skb, src_ip, dst_ip, 0, ip_proto, 0);
+    if (ip_proto != IPPROTO_TCP && ip_proto != IPPROTO_UDP && ip_proto != IPPROTO_ICMP) {
+        submit_protocol_block_v4(skb, src_ip, dst_ip, ip_proto);
         return check_audit_or_block();
     }
 
@@ -388,6 +392,8 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
     if (!allowed) {
         if (is_tcp_syn || ip_proto == IPPROTO_UDP) {
             submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, 0);
+        } else if (ip_proto == IPPROTO_ICMP) {
+            submit_protocol_block_v4(skb, src_ip, dst_ip, ip_proto);
         }
         return check_audit_or_block();
     }

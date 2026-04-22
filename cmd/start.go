@@ -574,6 +574,11 @@ func autoAllowInfraHosts(cmd *StartCmd, configMgr *config.Manager, fw firewall.F
 	// Azure VMs and GitHub-hosted runners and must not be blocked.
 	configMgr.EnsureInfraAllowed([]string{"169.254.169.254"}, []config.Port{config.PortHTTP})
 
+	// Pre-allow ICMP to the Azure wire server (168.63.129.16). GitHub-hosted
+	// runners periodically ping this IP, so without an allow rule each ping
+	// produces an EventProtocolBlocked log line — functional but noisy.
+	configMgr.EnsureInfraAllowed([]string{"168.63.129.16"}, []config.Port{config.PortICMP})
+
 	// Auto-allow GitHub service hostnames on port 443.
 	// Defaults cover core GitHub domains; overridable via
 	// CARGOWALL_GITHUB_SERVICE_HOSTS env var (comma-separated).

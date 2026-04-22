@@ -64,6 +64,7 @@ const (
 	ethP8021AD = 0x88A8
 
 	// IP protocols
+	ipprotoICMP     = 1
 	ipprotoTCP      = 6
 	ipprotoUDP      = 17
 	ipprotoICMPv6   = 58
@@ -296,10 +297,14 @@ func TestTcEgress(t *testing.T) {
 			wantRet: tcActShot,
 		},
 
-		// Blocked protocols (non-TCP/UDP)
 		{
-			name:    "IPv4 ICMP blocked",
+			name:    "IPv4 ICMP allowed via wildcard CIDR allow",
 			packet:  craftIPv4ICMP(t, "140.82.114.3"),
+			wantRet: tcActOK,
+		},
+		{
+			name:    "IPv4 ICMP blocked to unknown host (default deny)",
+			packet:  craftIPv4ICMP(t, "93.184.216.34"),
 			wantRet: tcActShot,
 		},
 		{
@@ -468,7 +473,7 @@ func TestTcEgressAuditMode(t *testing.T) {
 		},
 		{
 			name:    "Blocked ICMP passes in audit mode",
-			packet:  craftIPv4ICMP(t, "140.82.114.3"),
+			packet:  craftIPv4ICMP(t, "93.184.216.34"),
 			wantRet: tcActOK,
 		},
 	}
@@ -816,6 +821,11 @@ func TestTcEgressProtocolEnforcement(t *testing.T) {
 	err = objs.MapPorts.Update(&portKey2, &portVal, ebpf.UpdateAny)
 	require.NoError(t, err)
 
+	// Allow 10.0.0.2 ICMP ONLY (port=0, proto=1, no TCP/UDP entries)
+	portKeyICMP := TcBpfPortKey{Ip: ipToU32("10.0.0.2"), Port: 0, Proto: ipprotoICMP}
+	err = objs.MapPorts.Update(&portKeyICMP, &portVal, ebpf.UpdateAny)
+	require.NoError(t, err)
+
 	// Add IPv6 2001:db8:1::/48 with port_specific=1
 	key6 := TcBpfLpmKeyV6{Prefixlen: 48}
 	ip6 := net.ParseIP("2001:db8:1::")
@@ -841,6 +851,10 @@ func TestTcEgressProtocolEnforcement(t *testing.T) {
 		// IPv4 UDP-only port
 		{"IPv4 UDP to UDP-only port allowed", craftIPv4UDP(t, "10.0.0.1", 53), tcActOK},
 		{"IPv4 TCP to UDP-only port blocked", craftIPv4TCP(t, "10.0.0.1", 53), tcActShot},
+		// IPv4 ICMP only (proto field in port_key discriminates)
+		{"IPv4 ICMP to ICMP-allowed host allowed", craftIPv4ICMP(t, "10.0.0.2"), tcActOK},
+		{"IPv4 TCP to ICMP-only host blocked", craftIPv4TCP(t, "10.0.0.2", 443), tcActShot},
+		{"IPv4 ICMP to TCP-only host blocked", craftIPv4ICMP(t, "10.0.0.1"), tcActShot},
 		// IPv6 TCP-only port
 		{"IPv6 TCP to TCP-only port allowed", craftIPv6TCP(t, "2001:db8:1::1", 443), tcActOK},
 		{"IPv6 UDP to TCP-only port blocked", craftIPv6UDP(t, "2001:db8:1::1", 443), tcActShot},

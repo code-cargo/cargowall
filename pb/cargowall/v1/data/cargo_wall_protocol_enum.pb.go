@@ -25,22 +25,25 @@ const (
 type CargoWallProtocol int32
 
 const (
-	CargoWallProtocol_CARGO_WALL_PROTOCOL_ALL CargoWallProtocol = 0
-	CargoWallProtocol_CARGO_WALL_PROTOCOL_TCP CargoWallProtocol = 6
-	CargoWallProtocol_CARGO_WALL_PROTOCOL_UDP CargoWallProtocol = 17
+	CargoWallProtocol_CARGO_WALL_PROTOCOL_ALL  CargoWallProtocol = 0
+	CargoWallProtocol_CARGO_WALL_PROTOCOL_ICMP CargoWallProtocol = 1
+	CargoWallProtocol_CARGO_WALL_PROTOCOL_TCP  CargoWallProtocol = 6
+	CargoWallProtocol_CARGO_WALL_PROTOCOL_UDP  CargoWallProtocol = 17
 )
 
 // Enum value maps for CargoWallProtocol.
 var (
 	CargoWallProtocol_name = map[int32]string{
 		0:  "CARGO_WALL_PROTOCOL_ALL",
+		1:  "CARGO_WALL_PROTOCOL_ICMP",
 		6:  "CARGO_WALL_PROTOCOL_TCP",
 		17: "CARGO_WALL_PROTOCOL_UDP",
 	}
 	CargoWallProtocol_value = map[string]int32{
-		"CARGO_WALL_PROTOCOL_ALL": 0,
-		"CARGO_WALL_PROTOCOL_TCP": 6,
-		"CARGO_WALL_PROTOCOL_UDP": 17,
+		"CARGO_WALL_PROTOCOL_ALL":  0,
+		"CARGO_WALL_PROTOCOL_ICMP": 1,
+		"CARGO_WALL_PROTOCOL_TCP":  6,
+		"CARGO_WALL_PROTOCOL_UDP":  17,
 	}
 )
 
@@ -75,9 +78,10 @@ var File_data_cargo_wall_protocol_enum_proto protoreflect.FileDescriptor
 
 const file_data_cargo_wall_protocol_enum_proto_rawDesc = "" +
 	"\n" +
-	"#data/cargo_wall_protocol_enum.proto\x12\x11grpc.cargowall.v1*j\n" +
+	"#data/cargo_wall_protocol_enum.proto\x12\x11grpc.cargowall.v1*\x88\x01\n" +
 	"\x11CargoWallProtocol\x12\x1b\n" +
-	"\x17CARGO_WALL_PROTOCOL_ALL\x10\x00\x12\x1b\n" +
+	"\x17CARGO_WALL_PROTOCOL_ALL\x10\x00\x12\x1c\n" +
+	"\x18CARGO_WALL_PROTOCOL_ICMP\x10\x01\x12\x1b\n" +
 	"\x17CARGO_WALL_PROTOCOL_TCP\x10\x06\x12\x1b\n" +
 	"\x17CARGO_WALL_PROTOCOL_UDP\x10\x11BXZ4github.com/code-cargo/cargowall/pb/cargowall/v1/data\xaa\x02\x1fController.Data.Pb.CargoWall.V1b\x06proto3"
 

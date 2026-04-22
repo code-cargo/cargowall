@@ -627,6 +627,59 @@ func TestEnsureInfraAllowed_SetsAutoAddedType(t *testing.T) {
 	}
 }
 
+func TestEnsureInfraAllowed_ICMP(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules(nil, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	cm.EnsureInfraAllowed([]string{"168.63.129.16"}, []Port{PortICMP})
+
+	if len(cm.config.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(cm.config.Rules))
+	}
+	r := cm.config.Rules[0]
+	if r.Value != "168.63.129.16/32" {
+		t.Errorf("rule Value = %q, want 168.63.129.16/32", r.Value)
+	}
+	if !reflect.DeepEqual(r.Ports, []Port{{Port: 0, Protocol: ProtocolICMP}}) {
+		t.Errorf("Ports = %v, want [{0 icmp}]", r.Ports)
+	}
+	if r.AutoAddedType != AutoAddedTypeAzureInfrastructure {
+		t.Errorf("AutoAddedType = %q, want %q", r.AutoAddedType, AutoAddedTypeAzureInfrastructure)
+	}
+}
+
+func TestLoadConfigFromCargoWall_ICMPRule(t *testing.T) {
+	cm := NewConfigManager()
+
+	policy := &cargowallv1pb.CargoWallPolicy{
+		DefaultAction: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY,
+		Rules: []*cargowallv1pb.CargoWallPolicy_Rule{
+			{
+				Type:   datapb.CargoWallRuleType_CARGO_WALL_RULE_TYPE_CIDR,
+				Value:  "168.63.129.16/32",
+				Action: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW,
+				Ports: []*cargowallv1pb.CargoWallPolicy_PortRule{
+					{Port: 0, Protocol: datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_ICMP},
+				},
+			},
+		},
+	}
+
+	if err := cm.LoadConfigFromCargoWall(policy); err != nil {
+		t.Fatalf("LoadConfigFromCargoWall() error = %v", err)
+	}
+
+	if len(cm.resolvedRules) != 1 {
+		t.Fatalf("expected 1 resolved rule, got %d", len(cm.resolvedRules))
+	}
+	if !reflect.DeepEqual(cm.resolvedRules[0].Ports, []Port{{Port: 0, Protocol: ProtocolICMP}}) {
+		t.Errorf("rule Ports = %v, want [{0 icmp}]", cm.resolvedRules[0].Ports)
+	}
+}
+
 func TestEnsureHostnameAllowed_SetsAutoAddedType(t *testing.T) {
 	cm := NewConfigManager()
 	err := cm.LoadConfigFromRules(nil, ActionDeny)

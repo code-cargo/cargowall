@@ -61,17 +61,21 @@ const (
 type ProtocolType string
 
 const (
-	ProtocolAll ProtocolType = "all"
-	ProtocolTCP ProtocolType = "tcp"
-	ProtocolUDP ProtocolType = "udp"
+	ProtocolAll  ProtocolType = "all"
+	ProtocolTCP  ProtocolType = "tcp"
+	ProtocolUDP  ProtocolType = "udp"
+	ProtocolICMP ProtocolType = "icmp"
 )
 
 // Common port definitions for infrastructure auto-allow rules.
+// PortICMP carries Port=0 because ICMP has no port concept; the protocol
+// field alone drives the BPF lookup.
 var (
 	PortHTTPS      = Port{Port: 443, Protocol: ProtocolTCP}
 	PortHTTP       = Port{Port: 80, Protocol: ProtocolTCP}
 	PortDNS        = Port{Port: 53, Protocol: ProtocolUDP}
 	PortWireServer = Port{Port: 32526, Protocol: ProtocolTCP}
+	PortICMP       = Port{Port: 0, Protocol: ProtocolICMP}
 )
 
 // FirewallConfig represents the configuration for the L4 firewall
@@ -241,6 +245,8 @@ func convertProtocol(proto datapb.CargoWallProtocol) (ProtocolType, error) {
 		return ProtocolTCP, nil
 	case datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_UDP:
 		return ProtocolUDP, nil
+	case datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_ICMP:
+		return ProtocolICMP, nil
 	default:
 		return "", fmt.Errorf("unknown protocol: %v", proto)
 	}

@@ -208,7 +208,8 @@ func TestUpdateAllowlistTC_IPv4Wildcard_OnlyPortsMap(t *testing.T) {
 	err = fw.UpdateAllowlistTC(cm)
 	require.NoError(t, err)
 
-	assert.Len(t, mocks["ports"].updates, 4, "should update portsMap for each port+protocol combo")
+	// ProtocolAll expands to ICMP+TCP+UDP → 3 entries per port × 2 ports = 6.
+	assert.Len(t, mocks["ports"].updates, 6, "should update portsMap for each port+protocol combo")
 	assert.Empty(t, mocks["cidrs"].updates, "should NOT update cidrsMap for wildcard with ports")
 }
 
@@ -224,7 +225,8 @@ func TestUpdateAllowlistTC_IPv6Wildcard_OnlyPortsV6Map(t *testing.T) {
 	err = fw.UpdateAllowlistTC(cm)
 	require.NoError(t, err)
 
-	assert.Len(t, mocks["portsV6"].updates, 2, "should update portsV6Map for each port+protocol combo")
+	// ProtocolAll expands to ICMP+TCP+UDP → 3 entries for the single port.
+	assert.Len(t, mocks["portsV6"].updates, 3, "should update portsV6Map for each port+protocol combo")
 	assert.Empty(t, mocks["cidrsV6"].updates, "should NOT update cidrsV6Map for wildcard with ports")
 }
 
@@ -271,7 +273,80 @@ func TestUpdateAllowlistTC_Hostname_CreatesPerIPEntries(t *testing.T) {
 	err = fw.UpdateAllowlistTC(cm)
 	require.NoError(t, err)
 
-	// Each resolved IP gets a cidrsMap entry + a portsMap entry (one port per IP)
+	// Each resolved IP gets a cidrsMap entry + a portsMap entry per protocol
+	// (ProtocolAll expands to ICMP+TCP+UDP → 3 protocols × 1 port × 2 IPs = 6).
 	assert.Len(t, mocks["cidrs"].updates, 2, "should add /32 LPM entry per resolved IP")
-	assert.Len(t, mocks["ports"].updates, 4, "should add port+protocol entry per resolved IP (1 port × 2 protocols × 2 IPs)")
+	assert.Len(t, mocks["ports"].updates, 6, "should add port+protocol entry per resolved IP")
+}
+
+// --- expandPorts protocol translation ---
+
+func TestExpandPorts_ICMP(t *testing.T) {
+	got := expandPorts([]config.Port{{Port: 0, Protocol: config.ProtocolICMP}})
+	assert.Equal(t, []portProto{{Port: 0, Proto: protoICMP}}, got)
+}
+
+func TestExpandPorts_AllIncludesICMP(t *testing.T) {
+	got := expandPorts([]config.Port{{Port: 443, Protocol: config.ProtocolAll}})
+	assert.Equal(t, []portProto{
+		{Port: 0, Proto: protoICMP},
+		{Port: 443, Proto: protoTCP},
+		{Port: 443, Proto: protoUDP},
+	}, got)
+}
+
+func TestExpandPorts_MixedICMPAndTCP(t *testing.T) {
+	got := expandPorts([]config.Port{
+		{Port: 0, Protocol: config.ProtocolICMP},
+		{Port: 443, Protocol: config.ProtocolTCP},
+	})
+	assert.Equal(t, []portProto{
+		{Port: 0, Proto: protoICMP},
+		{Port: 443, Proto: protoTCP},
+	}, got)
+}
+
+// --- UpdateAllowlistTC ICMP rules ---
+
+func TestUpdateAllowlistTC_ICMPRule_WritesICMPPortEntry(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	cm := config.NewConfigManager()
+	err := cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeCIDR, Value: "168.63.129.16/32", Ports: []config.Port{config.PortICMP}, Action: config.ActionAllow},
+	}, config.ActionDeny)
+	require.NoError(t, err)
+
+	err = fw.UpdateAllowlistTC(cm)
+	require.NoError(t, err)
+
+	require.Len(t, mocks["cidrs"].updates, 1, "LPM entry for the /32 CIDR")
+	lpmVal := mocks["cidrs"].updates[0].value.(*bpf.TcBpfLpmVal)
+	assert.Equal(t, uint8(1), lpmVal.Action)
+	assert.Equal(t, uint8(1), lpmVal.PortSpecific, "ICMP rule is port-specific (even though port=0)")
+
+	require.Len(t, mocks["ports"].updates, 1, "port map entry for ICMP")
+	pKey := mocks["ports"].updates[0].key.(*bpf.TcBpfPortKey)
+	assert.Equal(t, uint16(0), pKey.Port)
+	assert.Equal(t, protoICMP, pKey.Proto)
+}
+
+func TestUpdateAllowlistTC_IPv4Wildcard_ICMPOnly(t *testing.T) {
+	fw, mocks := newTestFirewall()
+
+	cm := config.NewConfigManager()
+	err := cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []config.Port{config.PortICMP}, Action: config.ActionAllow},
+	}, config.ActionDeny)
+	require.NoError(t, err)
+
+	err = fw.UpdateAllowlistTC(cm)
+	require.NoError(t, err)
+
+	assert.Empty(t, mocks["cidrs"].updates, "wildcard CIDR skips LPM entry")
+	require.Len(t, mocks["ports"].updates, 1, "wildcard ICMP entry goes into port map with ip=0")
+	pKey := mocks["ports"].updates[0].key.(*bpf.TcBpfPortKey)
+	assert.Equal(t, uint32(0), pKey.Ip)
+	assert.Equal(t, uint16(0), pKey.Port)
+	assert.Equal(t, protoICMP, pKey.Proto)
 }

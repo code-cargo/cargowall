@@ -74,12 +74,13 @@ type FirewallImpl struct {
 // portProto carries a port number and its IANA protocol number for BPF map keys.
 type portProto struct {
 	Port  uint16
-	Proto uint8 // protoTCP=6, protoUDP=17
+	Proto uint8 // protoTCP=6, protoUDP=17, protoICMP=1
 }
 
 const (
-	protoTCP uint8 = 6
-	protoUDP uint8 = 17
+	protoICMP uint8 = 1
+	protoTCP  uint8 = 6
+	protoUDP  uint8 = 17
 )
 
 // NewFirewall creates a new firewall instance that owns the eBPF maps
@@ -303,7 +304,7 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 }
 
 // expandPorts converts config.Port entries into portProto values for BPF map keys.
-// ProtocolAll expands to both TCP and UDP entries so that the BPF lookup
+// ProtocolAll expands to both ICMP, TCP and UDP entries so that the BPF lookup
 // (which always uses the packet's exact protocol) matches correctly.
 func expandPorts(ports []config.Port) []portProto {
 	if len(ports) == 0 {
@@ -316,7 +317,10 @@ func expandPorts(ports []config.Port) []portProto {
 			result = append(result, portProto{Port: p.Port, Proto: protoTCP})
 		case config.ProtocolUDP:
 			result = append(result, portProto{Port: p.Port, Proto: protoUDP})
+		case config.ProtocolICMP:
+			result = append(result, portProto{Port: 0, Proto: protoICMP})
 		case config.ProtocolAll:
+			result = append(result, portProto{Port: 0, Proto: protoICMP})
 			result = append(result, portProto{Port: p.Port, Proto: protoTCP})
 			result = append(result, portProto{Port: p.Port, Proto: protoUDP})
 		default:

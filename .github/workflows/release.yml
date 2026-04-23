@@ -79,9 +79,13 @@ jobs:
           merge-multiple: true
 
       - name: Attest build provenance
-        uses: actions/attest@v4
+        id: attest
+        uses: actions/attest-build-provenance@v4.1.0
         with:
           subject-path: artifacts/cargowall-linux-*
+
+      - name: Stage bundle for release upload
+        run: cp "${{ steps.attest.outputs.bundle-path }}" artifacts/attestations.sigstore.json
 
       - name: Create checksums
         working-directory: artifacts

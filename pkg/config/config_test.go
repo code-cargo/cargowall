@@ -1073,39 +1073,39 @@ func TestHostnamePatternRules(t *testing.T) {
 	}
 
 	// Plain hostname rules still work
-	if action := cm.GetTrackedHostnameAction("github.com"); action != ActionAllow {
-		t.Errorf("GetTrackedHostnameAction(github.com) = %q, want allow", action)
+	if action, _, _ := cm.MatchHostnameRule("github.com"); action != ActionAllow {
+		t.Errorf("MatchHostnameRule(github.com) = %q, want allow", action)
 	}
-	if action := cm.GetTrackedHostnameAction("api.github.com"); action != ActionAllow {
-		t.Errorf("GetTrackedHostnameAction(api.github.com) = %q, want allow", action)
+	if action, _, _ := cm.MatchHostnameRule("api.github.com"); action != ActionAllow {
+		t.Errorf("MatchHostnameRule(api.github.com) = %q, want allow", action)
 	}
 
 	// Pattern with two single wildcards in middle
-	if action := cm.GetTrackedHostnameAction("actions.githubusercontent.com.abc123.phxx.internal.cloudapp.net"); action != ActionAllow {
+	if action, _, _ := cm.MatchHostnameRule("actions.githubusercontent.com.abc123.phxx.internal.cloudapp.net"); action != ActionAllow {
 		t.Errorf("two-star middle pattern should match, got %q", action)
 	}
-	if action := cm.GetTrackedHostnameAction("actions.githubusercontent.com.only1.internal.cloudapp.net"); action != "" {
+	if action, _, _ := cm.MatchHostnameRule("actions.githubusercontent.com.only1.internal.cloudapp.net"); action != "" {
 		t.Errorf("two-star middle pattern should not match with only 1 label, got %q", action)
 	}
 
 	// Double-star pattern
-	if action := cm.GetTrackedHostnameAction("westus2.storage.azure.com"); action != ActionAllow {
+	if action, _, _ := cm.MatchHostnameRule("westus2.storage.azure.com"); action != ActionAllow {
 		t.Errorf("doublestar pattern should match one label, got %q", action)
 	}
-	if action := cm.GetTrackedHostnameAction("account.westus2.storage.azure.com"); action != ActionAllow {
+	if action, _, _ := cm.MatchHostnameRule("account.westus2.storage.azure.com"); action != ActionAllow {
 		t.Errorf("doublestar pattern should match multiple labels, got %q", action)
 	}
-	if action := cm.GetTrackedHostnameAction("storage.azure.com"); action != "" {
+	if action, _, _ := cm.MatchHostnameRule("storage.azure.com"); action != "" {
 		t.Errorf("doublestar pattern should not match zero labels, got %q", action)
 	}
 
 	// Deny pattern
-	if action := cm.GetTrackedHostnameAction("evil.anything.example.com"); action != ActionDeny {
+	if action, _, _ := cm.MatchHostnameRule("evil.anything.example.com"); action != ActionDeny {
 		t.Errorf("deny pattern should match, got %q", action)
 	}
 
 	// No match
-	if action := cm.GetTrackedHostnameAction("unknown.com"); action != "" {
+	if action, _, _ := cm.MatchHostnameRule("unknown.com"); action != "" {
 		t.Errorf("unknown hostname should not match, got %q", action)
 	}
 }
@@ -1177,11 +1177,11 @@ func TestLeadingWildcardIsPattern(t *testing.T) {
 	}
 
 	// * matches exactly one label
-	if action := cm.GetTrackedHostnameAction("api.github.com"); action != ActionAllow {
+	if action, _, _ := cm.MatchHostnameRule("api.github.com"); action != ActionAllow {
 		t.Errorf("api.github.com should match *.github.com, got %q", action)
 	}
 	// * does NOT match two labels
-	if action := cm.GetTrackedHostnameAction("a.b.github.com"); action != "" {
+	if action, _, _ := cm.MatchHostnameRule("a.b.github.com"); action != "" {
 		t.Errorf("a.b.github.com should NOT match *.github.com (single * = one label), got %q", action)
 	}
 }
@@ -1197,13 +1197,156 @@ func TestDenyPatternOverridesParentAllow(t *testing.T) {
 	}
 
 	// Parent domain allow still works for normal subdomains
-	if action := cm.GetTrackedHostnameAction("api.example.com"); action != ActionAllow {
+	if action, _, _ := cm.MatchHostnameRule("api.example.com"); action != ActionAllow {
 		t.Errorf("api.example.com should be allowed via parent domain, got %q", action)
 	}
 
 	// Deny pattern overrides the parent-domain allow
-	if action := cm.GetTrackedHostnameAction("evil.foo.example.com"); action != ActionDeny {
+	if action, _, _ := cm.MatchHostnameRule("evil.foo.example.com"); action != ActionDeny {
 		t.Errorf("evil.foo.example.com should be denied by pattern even though example.com is allowed, got %q", action)
+	}
+}
+
+// Symmetric counterpart: parent-deny beats an allow-pattern. Documented
+// precedence is "parent-domain match wins over allow-pattern; deny-pattern
+// wins over parent-allow" — which collapses to "deny wins on ambiguity".
+// Pinning this so a future precedence rewrite doesn't silently invert it.
+func TestParentDenyOverridesAllowPattern(t *testing.T) {
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "blocked.com", Action: ActionDeny},
+		{Type: RuleTypeHostname, Value: "*.blocked.com", Action: ActionAllow},
+	}, ActionAllow)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	if action, _, _ := cm.MatchHostnameRule("evil.blocked.com"); action != ActionDeny {
+		t.Errorf("evil.blocked.com: parent-deny (blocked.com) must win over allow-pattern (*.blocked.com), got %q", action)
+	}
+}
+
+func TestMatchHostnameRule(t *testing.T) {
+	port443 := []Port{{Port: 443, Protocol: ProtocolTCP}}
+	port80 := []Port{{Port: 80, Protocol: ProtocolTCP}}
+	portSSH := []Port{{Port: 22, Protocol: ProtocolTCP}}
+
+	cm := NewConfigManager()
+	err := cm.LoadConfigFromRules([]Rule{
+		// Exact-match rule scoped to port 443.
+		{Type: RuleTypeHostname, Value: "api.example.com", Ports: port443, Action: ActionAllow},
+		// Parent-domain rule scoped to port 80.
+		{Type: RuleTypeHostname, Value: "example.com", Ports: port80, Action: ActionAllow},
+		// More specific parent-domain rule scoped to port 443. For descendants
+		// of foo.example.com this should win over the example.com rule.
+		{Type: RuleTypeHostname, Value: "foo.example.com", Ports: port443, Action: ActionAllow},
+		// Wildcard pattern rule scoped to port 22 (used by *.compute-1.amazonaws.com).
+		{Type: RuleTypeHostname, Value: "*.compute-1.amazonaws.com", Ports: portSSH, Action: ActionAllow},
+		// Deny pattern that overrides any parent allow.
+		{Type: RuleTypeHostname, Value: "evil.*.bad.com", Action: ActionDeny},
+		{Type: RuleTypeHostname, Value: "bad.com", Ports: port443, Action: ActionAllow},
+	}, ActionDeny)
+	if err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		hostname   string
+		wantAction Action
+		wantPorts  []Port
+	}{
+		{
+			name:       "exact match returns that rule's ports",
+			hostname:   "api.example.com",
+			wantAction: ActionAllow,
+			wantPorts:  port443,
+		},
+		{
+			name:       "parent-domain match inherits parent rule's ports",
+			hostname:   "static.example.com",
+			wantAction: ActionAllow,
+			wantPorts:  port80,
+		},
+		{
+			name:       "longest-suffix parent-domain wins",
+			hostname:   "bar.foo.example.com",
+			wantAction: ActionAllow,
+			wantPorts:  port443, // foo.example.com beats example.com
+		},
+		{
+			name:       "wildcard pattern returns that rule's ports (regression: nil-ports security bug)",
+			hostname:   "ec2-1-2-3-4.compute-1.amazonaws.com",
+			wantAction: ActionAllow,
+			wantPorts:  portSSH,
+		},
+		{
+			name:       "deny pattern overrides parent allow and returns deny pattern's ports",
+			hostname:   "evil.foo.bad.com",
+			wantAction: ActionDeny,
+			wantPorts:  nil,
+		},
+		{
+			name:       "no match returns empty action and nil ports",
+			hostname:   "unknown.com",
+			wantAction: "",
+			wantPorts:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotAction, gotPorts, _ := cm.MatchHostnameRule(tt.hostname)
+			if gotAction != tt.wantAction {
+				t.Errorf("action = %q, want %q", gotAction, tt.wantAction)
+			}
+			if !reflect.DeepEqual(gotPorts, tt.wantPorts) {
+				t.Errorf("ports = %v, want %v", gotPorts, tt.wantPorts)
+			}
+		})
+	}
+}
+
+// Longest-suffix parent-domain matching must not depend on rule iteration
+// order — load the same two parent rules in reversed order and assert the
+// more specific one still wins.
+func TestMatchHostnameRule_LongestParentWinsRegardlessOfOrder(t *testing.T) {
+	port443 := []Port{{Port: 443, Protocol: ProtocolTCP}}
+	port80 := []Port{{Port: 80, Protocol: ProtocolTCP}}
+
+	for _, tc := range []struct {
+		name  string
+		rules []Rule
+	}{
+		{
+			name: "specific rule defined first",
+			rules: []Rule{
+				{Type: RuleTypeHostname, Value: "foo.example.com", Ports: port443, Action: ActionAllow},
+				{Type: RuleTypeHostname, Value: "example.com", Ports: port80, Action: ActionAllow},
+			},
+		},
+		{
+			name: "specific rule defined second",
+			rules: []Rule{
+				{Type: RuleTypeHostname, Value: "example.com", Ports: port80, Action: ActionAllow},
+				{Type: RuleTypeHostname, Value: "foo.example.com", Ports: port443, Action: ActionAllow},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := NewConfigManager()
+			if err := cm.LoadConfigFromRules(tc.rules, ActionDeny); err != nil {
+				t.Fatalf("LoadConfigFromRules() error = %v", err)
+			}
+
+			gotAction, gotPorts, _ := cm.MatchHostnameRule("bar.foo.example.com")
+			if gotAction != ActionAllow {
+				t.Errorf("action = %q, want allow", gotAction)
+			}
+			if !reflect.DeepEqual(gotPorts, port443) {
+				t.Errorf("ports = %v, want %v (longest-suffix parent must win)", gotPorts, port443)
+			}
+		})
 	}
 }
 

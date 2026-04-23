@@ -260,6 +260,7 @@ type dedupKey struct {
 	process   string
 	dest      string
 	port      uint16
+	protocol  string
 	eventType events.AuditEventType
 }
 
@@ -272,7 +273,7 @@ func deduplicateStepEvents(stepEvents []StepEvents) {
 			if dest == "" {
 				dest = event.DstIP
 			}
-			key := dedupKey{process: event.Process, dest: dest, port: event.DstPort, eventType: event.EventType}
+			key := dedupKey{process: event.Process, dest: dest, port: event.DstPort, protocol: event.Protocol, eventType: event.EventType}
 			if _, exists := seen[key]; !exists {
 				seen[key] = struct{}{}
 				deduped = append(deduped, event)
@@ -290,7 +291,7 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 			switch event.EventType {
 			case events.EventConnectionBlocked:
 				totalBlocked++
-			case events.EventConnectionAllowed:
+			case events.EventConnectionAllowed, events.EventConnectionLateAllowed:
 				totalConnectionsAllowed++
 				if event.AutoAllowedType != "" {
 					totalAutoAllowed++
@@ -388,7 +389,7 @@ func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents
 				e := &summaryEntry{
 					dest:        dest,
 					typeLabel:   c.eventTypeLabel(event.EventType),
-					blocked:     event.EventType != events.EventConnectionAllowed,
+					blocked:     !event.EventType.IsConnectionAllowed(),
 					autoAllowed: event.AutoAllowedType != "",
 					process:     event.Process,
 				}
@@ -445,7 +446,7 @@ func computeSummary(allEvents []events.AuditEvent, mode data.CargoWallMode) *car
 	hostnames := make(map[string]struct{})
 	for _, e := range allEvents {
 		switch e.EventType {
-		case events.EventConnectionAllowed:
+		case events.EventConnectionAllowed, events.EventConnectionLateAllowed:
 			allowed++
 			if e.AutoAllowedType != "" {
 				autoAllowed++
@@ -630,7 +631,7 @@ func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {
 	switch e.EventType {
 	case events.EventDNSBlocked:
 		category = data.CargoWallEventCategory_CARGO_WALL_EVENT_CATEGORY_DNS
-	case events.EventConnectionBlocked, events.EventConnectionAllowed, events.EventExistingConnection:
+	case events.EventConnectionBlocked, events.EventConnectionAllowed, events.EventConnectionLateAllowed, events.EventExistingConnection:
 		category = data.CargoWallEventCategory_CARGO_WALL_EVENT_CATEGORY_CONNECTION
 	case events.EventProtocolBlocked:
 		category = data.CargoWallEventCategory_CARGO_WALL_EVENT_CATEGORY_PROTOCOL
@@ -704,9 +705,7 @@ func (c *SummaryCmd) eventDestination(event events.AuditEvent) string {
 
 func (c *SummaryCmd) eventTypeLabel(eventType events.AuditEventType) string {
 	switch eventType {
-	case events.EventConnectionBlocked:
-		return "Connection"
-	case events.EventConnectionAllowed:
+	case events.EventConnectionBlocked, events.EventConnectionAllowed, events.EventConnectionLateAllowed:
 		return "Connection"
 	case events.EventProtocolBlocked:
 		return "Protocol"

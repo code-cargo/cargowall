@@ -28,6 +28,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // bpfAvailable is set by TestMain to indicate whether BPF is available.
@@ -929,7 +930,8 @@ func TestMapSockPidReadWrite(t *testing.T) {
 type bpfBlockedEvent struct {
 	IpVersion uint8
 	Allowed   uint8
-	Pad1      [2]uint8
+	IpProto   uint8
+	Pad1      uint8
 	SrcIp     uint32
 	DstIp     uint32
 	SrcPort   uint16
@@ -966,6 +968,7 @@ func TestEventPidZeroWhenNoCookieMapping(t *testing.T) {
 
 	require.Equal(t, uint8(4), evt.IpVersion)
 	require.Equal(t, uint8(0), evt.Allowed)
+	require.Equal(t, uint8(unix.IPPROTO_TCP), evt.IpProto, "ip_proto must round-trip from BPF (catches stale .o or struct-offset drift)")
 	require.Equal(t, uint32(0), evt.Pid, "PID should be 0 when no cookie mapping exists")
 }
 
@@ -992,6 +995,7 @@ func TestEventPidZeroWhenNoCookieMappingIPv6(t *testing.T) {
 
 	require.Equal(t, uint8(6), evt.IpVersion, "should be IPv6 event")
 	require.Equal(t, uint8(0), evt.Allowed, "should be a blocked event")
+	require.Equal(t, uint8(unix.IPPROTO_TCP), evt.IpProto, "ip_proto must round-trip from BPF (catches stale .o or struct-offset drift)")
 	require.Equal(t, uint32(0), evt.Pid, "PID should be 0 when no cookie mapping exists")
 	require.Equal(t, uint16(80), evt.DstPort)
 }

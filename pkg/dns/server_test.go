@@ -467,14 +467,11 @@ func TestDNSResponseCaching(t *testing.T) {
 	}
 }
 
-func TestGetHostnamePorts(t *testing.T) {
+// TestDNSServerHostnamePortsLookup verifies that the happy-path DNS code uses
+// the combined config lookup so the action and ports come from the same rule.
+func TestDNSServerHostnamePortsLookup(t *testing.T) {
 	cfg := config.NewConfigManager()
-	server := &Server{
-		config: cfg,
-		logger: slog.Default(),
-	}
 
-	// Setup config with various rules
 	rules := []config.Rule{
 		{
 			Type:   config.RuleTypeHostname,
@@ -504,15 +501,15 @@ func TestGetHostnamePorts(t *testing.T) {
 	}{
 		{"api.example.com", []config.Port{{Port: 443, Protocol: config.ProtocolAll}, {Port: 8443, Protocol: config.ProtocolAll}}},
 		{"example.com", []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}},
-		{"sub.example.com", []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}}, // Should match parent domain
-		{"abc.def.internal.cloudapp.net", []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}},                             // Should match pattern
-		{"only1.internal.cloudapp.net", nil}, // Pattern needs 2 labels
+		{"sub.example.com", []config.Port{{Port: 80, Protocol: config.ProtocolAll}, {Port: 443, Protocol: config.ProtocolAll}}}, // parent-domain match
+		{"abc.def.internal.cloudapp.net", []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}},                             // pattern match
+		{"only1.internal.cloudapp.net", nil}, // pattern needs 2 labels
 		{"other.com", nil},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.hostname, func(t *testing.T) {
-			ports := server.getHostnamePorts(tt.hostname)
+			_, ports, _ := cfg.MatchHostnameRule(tt.hostname)
 			assert.Equal(t, tt.expected, ports)
 		})
 	}

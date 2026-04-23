@@ -730,7 +730,7 @@ func gateExistingConnections(existingIPs []string, configMgr *config.Manager, fw
 
 		hostname := configMgr.LookupHostnameByIP(ipStr)
 		trackedHost := configMgr.FindTrackedHostname(hostname)
-		action := configMgr.GetTrackedHostnameAction(hostname)
+		action, ports, _ := configMgr.MatchHostnameRule(hostname)
 
 		autoAllowedType := string(configMgr.GetAutoAllowedTypeForHostname(hostname))
 
@@ -741,11 +741,19 @@ func gateExistingConnections(existingIPs []string, configMgr *config.Manager, fw
 				auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, false, autoAllowedType)
 			}
 		} else {
-			// Either matches an allowed hostname, or unresolvable — allow it
-			if wasAdded, err := fw.AddIP(ip, config.ActionAllow, nil); err != nil {
+			// Matched allow rule → use its ports.
+			//
+			// Unresolvable (no hostname mapping at startup) → ports stays nil
+			// and the BPF entry becomes an all-ports allow. This is an
+			// intentional carveout: we'd rather keep a pre-existing socket
+			// alive than break in-flight work. Same shape as issue #45 in
+			// principle, but the attack window is narrow (only IPs already
+			// connected at startup that CargoWall can't identify) and we'd
+			// surface the connection in the audit log either way.
+			if wasAdded, err := fw.AddIP(ip, config.ActionAllow, ports); err != nil {
 				logger.Debug("Failed to allow existing connection IP", "ip", ipStr, "error", err)
 			} else if wasAdded {
-				logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname)
+				logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname, "ports", ports)
 				if auditLogger != nil {
 					auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, true, autoAllowedType)
 				}

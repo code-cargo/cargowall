@@ -106,7 +106,8 @@ struct port_key_v6 {
 struct blocked_event {
     __u8 ip_version;   // 4 or 6
     __u8 allowed;      // 0 = blocked, 1 = allowed
-    __u8 pad1[2];
+    __u8 ip_proto;     // L4 protocol (IPPROTO_TCP, IPPROTO_UDP, IPPROTO_ICMP, …)
+    __u8 pad1;
     __u32 src_ip;      // IPv4 (used when ip_version == 4)
     __u32 dst_ip;
     __u16 src_port;
@@ -196,12 +197,13 @@ static __always_inline int check_audit_or_block(void) {
 }
 
 // Helper: submit an event for IPv4
-static __always_inline void submit_event_v4(struct __sk_buff *skb, __u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 is_allowed) {
+static __always_inline void submit_event_v4(struct __sk_buff *skb, __u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 ip_proto, __u8 is_allowed) {
     struct blocked_event *evt = bpf_ringbuf_reserve(&map_events, sizeof(*evt), 0);
     if (evt) {
         __builtin_memset(evt, 0, sizeof(*evt));
         evt->ip_version = 4;
         evt->allowed = is_allowed;
+        evt->ip_proto = ip_proto;
         evt->src_ip = src_ip;
         evt->dst_ip = dst_ip;
         evt->src_port = src_port;
@@ -217,7 +219,7 @@ static __always_inline void submit_event_v4(struct __sk_buff *skb, __u32 src_ip,
 // Helper: emit an IPv4 protocol-block event. dst_port carries the protocol
 // number (userspace keys on src_port==0 && dst_port<256 to decode it).
 static __always_inline void submit_protocol_block_v4(struct __sk_buff *skb, __u32 src_ip, __u32 dst_ip, __u8 ip_proto) {
-    submit_event_v4(skb, src_ip, dst_ip, 0, ip_proto, 0);
+    submit_event_v4(skb, src_ip, dst_ip, 0, ip_proto, ip_proto, 0);
 }
 
 // Helper: check if nexthdr is an IPv6 extension header
@@ -230,12 +232,13 @@ static __always_inline int is_ipv6_ext_hdr(__u8 nexthdr) {
 }
 
 // Helper: submit an event for IPv6
-static __always_inline void submit_event_v6(struct __sk_buff *skb, __u8 src_ip6[16], __u8 dst_ip6[16], __u16 src_port, __u16 dst_port, __u8 is_allowed) {
+static __always_inline void submit_event_v6(struct __sk_buff *skb, __u8 src_ip6[16], __u8 dst_ip6[16], __u16 src_port, __u16 dst_port, __u8 ip_proto, __u8 is_allowed) {
     struct blocked_event *evt = bpf_ringbuf_reserve(&map_events, sizeof(*evt), 0);
     if (evt) {
         __builtin_memset(evt, 0, sizeof(*evt));
         evt->ip_version = 6;
         evt->allowed = is_allowed;
+        evt->ip_proto = ip_proto;
         evt->src_port = src_port;
         evt->dst_port = dst_port;
         __builtin_memcpy(evt->src_ip6, src_ip6, 16);
@@ -392,7 +395,7 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
 
     if (!allowed) {
         if (is_tcp_syn || ip_proto == IPPROTO_UDP) {
-            submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, 0);
+            submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0);
         } else if (ip_proto == IPPROTO_ICMP) {
             submit_protocol_block_v4(skb, src_ip, dst_ip, ip_proto);
         }
@@ -400,7 +403,7 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
     }
 
     if (is_tcp_syn) {
-        submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, 1);
+        submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 1);
     }
     return TC_ACT_OK;
 }
@@ -476,7 +479,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
 
     // Only allow TCP and UDP - block other protocols
     if (nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP) {
-        submit_event_v6(skb, src_ip6, dst_ip6, 0, nexthdr, 0);
+        submit_event_v6(skb, src_ip6, dst_ip6, 0, nexthdr, nexthdr, 0);
         return check_audit_or_block();
     }
 
@@ -579,13 +582,13 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
 
     if (!allowed) {
         if (is_tcp_syn || nexthdr == IPPROTO_UDP) {
-            submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, 0);
+            submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0);
         }
         return check_audit_or_block();
     }
 
     if (is_tcp_syn) {
-        submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, 1);
+        submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 1);
     }
     return TC_ACT_OK;
 }

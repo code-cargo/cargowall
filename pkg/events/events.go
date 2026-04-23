@@ -29,6 +29,7 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf/ringbuf"
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/config"
 )
@@ -114,7 +115,8 @@ func (n *NotificationTracker) SendNotification(hostname, ip string, port uint16)
 type BpfBlockedEvent struct {
 	IpVersion uint8
 	Allowed   uint8
-	Pad1      [2]uint8
+	IpProto   uint8 // L4 protocol (unix.IPPROTO_TCP, _UDP, _ICMP, …)
+	Pad1      uint8
 	SrcIp     uint32 // IPv4 (used when IpVersion == 4)
 	DstIp     uint32 // IPv4 (used when IpVersion == 4)
 	SrcPort   uint16
@@ -202,6 +204,44 @@ func reverseDNSAttempted(ip string) bool {
 // reverseDNSResolver uses the system default resolver for PTR lookups.
 var reverseDNSResolver = net.DefaultResolver
 
+// ipProtoToConfigProtocol maps the L4 protocol byte from a BpfBlockedEvent to
+// the corresponding config.ProtocolType. The bool reports whether the proto
+// is one we recognize; unknown protocols fail closed in dstPortAllowedByRule
+// rather than mapping to ProtocolAll, so a future guard-loosening upstream
+// can't silently widen the match.
+func ipProtoToConfigProtocol(proto uint8) (config.ProtocolType, bool) {
+	switch proto {
+	case unix.IPPROTO_TCP:
+		return config.ProtocolTCP, true
+	case unix.IPPROTO_UDP:
+		return config.ProtocolUDP, true
+	case unix.IPPROTO_ICMP:
+		return config.ProtocolICMP, true
+	default:
+		return "", false
+	}
+}
+
+// dstPortAllowedByRule reports whether a (dstPort, proto) tuple would be
+// permitted by an allow rule whose port restrictions are `ports`. An empty
+// `ports` means the rule allows all ports. An unknown L4 proto fails closed
+// (no overlap, even with ProtocolAll rules) — see ipProtoToConfigProtocol.
+func dstPortAllowedByRule(dstPort uint16, proto uint8, ports []config.Port) bool {
+	if len(ports) == 0 {
+		return true
+	}
+	eventProto, ok := ipProtoToConfigProtocol(proto)
+	if !ok {
+		return false
+	}
+	for _, p := range ports {
+		if p.Port == dstPort && config.ProtocolsOverlap(p.Protocol, eventProto) {
+			return true
+		}
+	}
+	return false
+}
+
 // processEvent handles a single blocked/allowed event from the ring buffer.
 func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *NotificationTracker,
 	auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger,
@@ -266,18 +306,55 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		}
 	}
 
-	// If we resolved a hostname and this was a BLOCKED event, check if the
-	// hostname is actually allowed. If so, add the IP to the firewall so
-	// subsequent connection retries succeed. This handles the case where a
-	// process resolved DNS outside CargoWall's proxy (cached/stale results).
-	if hostname != "" && event.Allowed == 0 && fw != nil {
-		action := configMgr.GetTrackedHostnameAction(hostname)
+	// Late-add: if a blocked event resolves to a hostname that's actually
+	// allowed (e.g. process bypassed our DNS proxy with a cached IP), open the
+	// firewall so future retries succeed. Only treat the triggering connection
+	// itself as late-allowed when its dst_port is in the rule's allow set —
+	// otherwise the retry will still be blocked and we'd misreport.
+	//
+	// Restricted to TCP/UDP because fw.AddIP exists to open BPF state for TCP
+	// SYN / UDP retries; non-TCP/UDP events can't benefit and we don't want to
+	// pollute the firewall or misreport as late-allowed.
+	var lateAllowed bool
+	var matchedRule string
+	if hostname != "" && event.Allowed == 0 && fw != nil &&
+		(event.IpProto == unix.IPPROTO_TCP || event.IpProto == unix.IPPROTO_UDP) {
+		action, ports, ruleValue := configMgr.MatchHostnameRule(hostname)
 		if action == config.ActionAllow {
+			matchedRule = ruleValue
 			ip := net.ParseIP(dstIP)
 			if ip != nil {
-				if added, err := fw.AddIP(ip, config.ActionAllow, nil); err == nil && added {
-					logger.Info("Late-resolved IP added to firewall",
-						"ip", dstIP, "hostname", hostname)
+				changed, err := fw.AddIP(ip, config.ActionAllow, ports)
+				if err != nil {
+					// Surface the failure for triage — the event will fall
+					// through to the blocked branch (lateAllowed stays false),
+					// so absence of this log + a "Connection blocked" entry
+					// means the firewall write is the proximate cause.
+					logger.Error("Late-resolved IP add failed",
+						"ip", dstIP, "hostname", hostname, "error", err)
+				} else {
+					if changed {
+						// `changed` covers both "IP was new" and "IP was
+						// present but new per-port entries were written"
+						// (shared-IP-different-ports case) — see
+						// Firewall.AddIP contract.
+						logger.Info("Late-resolved IP firewall state updated",
+							"ip", dstIP, "hostname", hostname, "ports", ports)
+					} else {
+						// IP already in the BPF map with matching state —
+						// useful when triaging "why didn't this connection
+						// succeed on retry?".
+						logger.Debug("Late-resolved IP already in firewall",
+							"ip", dstIP, "hostname", hostname, "ports", ports)
+					}
+					// Sound regardless of `changed`: FirewallImpl.addIPv4 /
+					// addIPv6 reconcile per-port entries before the LPM no-op
+					// check, so on err==nil the current rule's `ports` are
+					// guaranteed to be in map_ports — even when the IP was
+					// already in the LPM from a different rule with disjoint
+					// ports. Checking the inputs alone therefore answers
+					// "will the retry succeed?" correctly.
+					lateAllowed = dstPortAllowedByRule(event.DstPort, event.IpProto, ports)
 				}
 			}
 		}
@@ -306,7 +383,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			"pid", pid)
 
 		if auditLogger != nil {
-			if err := auditLogger.LogConnectionAllowed(srcIP, dstIP, hostname, event.DstPort, comm, pid, autoAllowedType); err != nil {
+			if err := auditLogger.LogConnectionAllowed(srcIP, dstIP, hostname, event.DstPort, comm, pid, autoAllowedType, getProtocolName(event.IpProto)); err != nil {
 				logger.Error("Failed to write audit log", "error", err)
 			}
 		}
@@ -334,6 +411,25 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		if notificationTracker != nil {
 			notificationTracker.SendNotification(hostname, dstIP, event.DstPort)
 		}
+	} else if lateAllowed {
+		// Policy outcome is allow (the retry will succeed), so log accordingly
+		// and skip the block notification. matchedRule is the rule's Value
+		// (pattern string for glob rules, configured hostname for plain rules) —
+		// distinct from displayHostname, which is what was actually resolved.
+		logger.Info("Connection late-allowed",
+			"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
+			"dst", displayHostname,
+			"dst_ip", dstIP,
+			"dst_port", event.DstPort,
+			"process", comm,
+			"pid", pid,
+			"matched_rule", matchedRule)
+
+		if auditLogger != nil {
+			if err := auditLogger.LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRule, event.DstPort, comm, pid, getProtocolName(event.IpProto)); err != nil {
+				logger.Error("Failed to write audit log", "error", err)
+			}
+		}
 	} else {
 		// Blocked TCP SYN or UDP connection
 		logger.Info("Connection blocked",
@@ -347,7 +443,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 
 		// Log to audit file if configured
 		if auditLogger != nil {
-			if err := auditLogger.LogConnectionBlocked(srcIP, dstIP, hostname, event.DstPort, comm, pid); err != nil {
+			if err := auditLogger.LogConnectionBlocked(srcIP, dstIP, hostname, event.DstPort, comm, pid, getProtocolName(event.IpProto)); err != nil {
 				logger.Error("Failed to write audit log", "error", err)
 			}
 		}

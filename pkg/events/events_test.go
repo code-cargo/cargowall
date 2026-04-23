@@ -435,7 +435,19 @@ func (m *mockFirewallUpdater) AddIP(ip net.IP, action config.Action, ports []con
 // pointer cast in processEvent, so the encoding stays in lockstep with the
 // struct layout — adding a field to BpfBlockedEvent here doesn't require
 // updating hand-written byte offsets.
+//
+// Caveat: binary.Write emits struct fields back-to-back with no implicit
+// alignment padding. That matches the in-memory layout only when the struct
+// has no implicit padding — currently guaranteed by the explicit Pad1/Pad2
+// fields sized to the next field's alignment. makeBpfEventCompileCheck below
+// asserts this invariant so a future field addition that introduces implicit
+// padding fails loudly instead of silently producing the wrong bytes.
 func makeBpfEvent(event BpfBlockedEvent) []byte {
+	if binary.Size(&event) != int(unsafe.Sizeof(event)) {
+		panic(fmt.Sprintf(
+			"makeBpfEvent: BpfBlockedEvent has implicit padding (binary.Size=%d, unsafe.Sizeof=%d) — add an explicit pad field or switch this helper to an unsafe memcpy",
+			binary.Size(&event), unsafe.Sizeof(event)))
+	}
 	buf := bytes.NewBuffer(make([]byte, 0, int(unsafe.Sizeof(event))))
 	if err := binary.Write(buf, binary.NativeEndian, &event); err != nil {
 		panic(fmt.Sprintf("makeBpfEvent: binary.Write failed: %v", err))

@@ -626,7 +626,7 @@ func (cm *Manager) cleanupOldEntries() {
 // The returned ports slice is a defensive copy — callers may freely retain or
 // mutate it without affecting the live ruleset. The cost (one small alloc per
 // call; rules typically carry a handful of ports) is negligible relative to
-// the two O(n) scans of resolvedRules this function already does.
+// the single O(n) scan of resolvedRules this function already does.
 func (cm *Manager) MatchHostnameRule(hostname string) (Action, []Port, string) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()

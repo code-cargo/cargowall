@@ -324,7 +324,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			matchedRule = ruleValue
 			ip := net.ParseIP(dstIP)
 			if ip != nil {
-				added, err := fw.AddIP(ip, config.ActionAllow, ports)
+				changed, err := fw.AddIP(ip, config.ActionAllow, ports)
 				if err != nil {
 					// Surface the failure for triage — the event will fall
 					// through to the blocked branch (lateAllowed stays false),
@@ -333,16 +333,21 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 					logger.Error("Late-resolved IP add failed",
 						"ip", dstIP, "hostname", hostname, "error", err)
 				} else {
-					if added {
-						logger.Info("Late-resolved IP added to firewall",
+					if changed {
+						// `changed` covers both "IP was new" and "IP was
+						// present but new per-port entries were written"
+						// (shared-IP-different-ports case) — see
+						// Firewall.AddIP contract.
+						logger.Info("Late-resolved IP firewall state updated",
 							"ip", dstIP, "hostname", hostname, "ports", ports)
 					} else {
-						// IP already in the BPF map — useful when triaging
-						// "why didn't this connection succeed on retry?".
+						// IP already in the BPF map with matching state —
+						// useful when triaging "why didn't this connection
+						// succeed on retry?".
 						logger.Debug("Late-resolved IP already in firewall",
 							"ip", dstIP, "hostname", hostname, "ports", ports)
 					}
-					// Sound regardless of `added`: FirewallImpl.addIPv4 /
+					// Sound regardless of `changed`: FirewallImpl.addIPv4 /
 					// addIPv6 reconcile per-port entries before the LPM no-op
 					// check, so on err==nil the current rule's `ports` are
 					// guaranteed to be in map_ports — even when the IP was

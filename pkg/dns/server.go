@@ -131,7 +131,7 @@ func (s *Server) isQueryAllowed(domain string) bool {
 	}
 
 	// Check if the domain matches any allowed hostname pattern
-	action := s.config.GetTrackedHostnameAction(domain)
+	action, _, _ := s.config.MatchHostnameRule(domain)
 	if action == config.ActionAllow {
 		return true
 	}
@@ -182,16 +182,12 @@ func (s *Server) ApplyRulesToTrackedHostnames() {
 
 	// Now re-process each tracked hostname with the newly loaded rules
 	for hostname, ipSet := range trackedHostnames {
-		// Check if this hostname now has rules
-		hostnameAction := s.config.GetTrackedHostnameAction(hostname)
+		hostnameAction, hostnamePorts, _ := s.config.MatchHostnameRule(hostname)
 		if hostnameAction != "" && len(ipSet) > 0 && s.firewall != nil {
 			s.logger.Info("Applying rules to tracked hostname",
 				"hostname", hostname,
 				"ip_count", len(ipSet),
 				"action", hostnameAction)
-
-			// Get ports for this hostname rule
-			hostnamePorts := s.getHostnamePorts(hostname)
 
 			// Add IPs to BPF maps
 			for ipStr := range ipSet {
@@ -435,17 +431,13 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 				s.hostnameIPs[hostname] = newIPSet
 				s.hostnameIPsMutex.Unlock()
 
-				// Check if we have rules for this hostname
-				hostnameAction := s.config.GetTrackedHostnameAction(hostname)
+				hostnameAction, hostnamePorts, _ := s.config.MatchHostnameRule(hostname)
 				if hostnameAction != "" && s.firewall != nil {
 					s.logger.Debug("Hostname tracked for BPF update",
 						"hostname", hostname,
 						"original", fullHostname,
 						"action", hostnameAction,
-						"ports", s.getHostnamePorts(hostname))
-
-					// Get ports for this hostname rule
-					hostnamePorts := s.getHostnamePorts(hostname)
+						"ports", hostnamePorts)
 
 					for _, ip := range ips {
 						ipStr := ip.String()
@@ -544,34 +536,6 @@ func (s *Server) addIPToBPFMaps(ip net.IP, hostname string, action config.Action
 // removeIPFromBPFMaps removes an IP from the BPF maps
 func (s *Server) removeIPFromBPFMaps(ip net.IP) error {
 	return s.firewall.RemoveIP(ip)
-}
-
-// getHostnamePorts retrieves port configuration for a hostname
-func (s *Server) getHostnamePorts(hostname string) []config.Port {
-	rules := s.config.GetResolvedRules()
-
-	// First try exact match
-	for _, rule := range rules {
-		if rule.Type == config.RuleTypeHostname && rule.Pattern == nil && rule.Value == hostname {
-			return rule.Ports
-		}
-	}
-
-	// Check patterns first — more specific than parent-domain match
-	for _, rule := range rules {
-		if rule.Type == config.RuleTypeHostname && rule.Pattern != nil && rule.Pattern.Matches(hostname) {
-			return rule.Ports
-		}
-	}
-
-	// Fall back to parent domain
-	for _, rule := range rules {
-		if rule.Type == config.RuleTypeHostname && rule.Pattern == nil && strings.HasSuffix(hostname, "."+rule.Value) {
-			return rule.Ports
-		}
-	}
-
-	return nil
 }
 
 // stripKubernetesSearchDomains removes common Kubernetes search domains

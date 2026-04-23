@@ -282,9 +282,14 @@ func convertProtocol(proto datapb.CargoWallProtocol) (ProtocolType, error) {
 	}
 }
 
-// protocolsOverlap returns true if two protocol types can match the same traffic.
-// ProtocolAll overlaps with everything; TCP and UDP only overlap with themselves.
-func protocolsOverlap(a, b ProtocolType) bool {
+// ProtocolsOverlap returns true if two protocol types can match the same
+// traffic. ProtocolAll overlaps with everything; TCP/UDP/ICMP only overlap
+// with themselves.
+//
+// Exported for cross-package use: pkg/events relies on this to decide whether
+// a BPF event's L4 protocol is in a configured rule's allow set. Treat as
+// part of the package's public contract.
+func ProtocolsOverlap(a, b ProtocolType) bool {
 	return a == ProtocolAll || b == ProtocolAll || a == b
 }
 
@@ -594,55 +599,111 @@ func (cm *Manager) cleanupOldEntries() {
 	}
 }
 
-// GetTrackedHostnameAction returns the action (allow/deny) for a tracked hostname.
-// Returns empty string if hostname is not tracked.
-func (cm *Manager) GetTrackedHostnameAction(hostname string) Action {
+// MatchHostnameRule returns the action, ports, and identifier of the most
+// specific configured hostname rule that matches `hostname`. All three come
+// from the same rule so callers can keep them coherent (the rule that allows
+// the hostname also dictates which ports are allowed) and so audit fields
+// can faithfully report which rule fired (e.g. `*.compute-1.amazonaws.com`,
+// not the resolved `ec2-…` subdomain).
+//
+// The third return is the rule's `Value` field — the hostname for non-pattern
+// rules, the original glob string for pattern rules.
+//
+// Match types considered: exact non-pattern hostnames, parent-domain rules
+// where `hostname` is a subdomain, and glob patterns.
+//
+// Precedence:
+//  1. Exact non-pattern hostname match wins outright.
+//  2. A deny pattern match wins over a parent-domain allow ("more specific wins").
+//  3. Otherwise: parent-domain match if any, else first allow-pattern match.
+//
+// Among parent-domain matches the longest suffix wins (e.g. `foo.example.com`
+// beats `example.com` for `bar.foo.example.com`). Among equal-length deny or
+// allow patterns the first in config order wins.
+//
+// Returns ("", nil, "") when no hostname rule matches.
+//
+// The returned ports slice is a defensive copy — callers may freely retain or
+// mutate it without affecting the live ruleset. The cost (one small alloc per
+// call; rules typically carry a handful of ports) is negligible relative to
+// the two O(n) scans of resolvedRules this function already does.
+func (cm *Manager) MatchHostnameRule(hostname string) (Action, []Port, string) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	// Check exact match
-	if action, ok := cm.trackedHostnames[hostname]; ok {
-		slog.Debug("Found exact match", "hostname", hostname, "action", action)
-		return action
-	}
+	// Single pass: classify each hostname rule into one of four candidates,
+	// then apply precedence at the end. Equivalent to the prior two-pass
+	// implementation but halves iterations of resolvedRules. Note we can't
+	// short-circuit on a deny-pattern match mid-iteration because an exact
+	// match later in the slice would supersede it (rule 1 in the precedence
+	// docstring); collecting all candidates first preserves correctness.
+	var exactRule, parentRule, denyPatternRule, allowPatternRule *ResolvedRule
 
-	// Check if it's a subdomain of a tracked hostname.
-	// Don't return yet — a more specific deny pattern may override.
-	var parentAction Action
-	for trackedHost, action := range cm.trackedHostnames {
-		if strings.HasSuffix(hostname, "."+trackedHost) {
-			slog.Debug("Found parent domain match",
-				"hostname", hostname,
-				"parent", trackedHost,
-				"action", action)
-			parentAction = action
-			break
+	for i := range cm.resolvedRules {
+		r := &cm.resolvedRules[i]
+		if r.Type != RuleTypeHostname {
+			continue
+		}
+		if r.Pattern == nil {
+			if r.Value == hostname {
+				exactRule = r
+			} else if strings.HasSuffix(hostname, "."+r.Value) &&
+				(parentRule == nil || len(r.Value) > len(parentRule.Value)) {
+				parentRule = r
+			}
+			continue
+		}
+		// Pattern rule.
+		if !r.Pattern.Matches(hostname) {
+			continue
+		}
+		if r.Action == ActionDeny {
+			if denyPatternRule == nil {
+				denyPatternRule = r
+			}
+		} else if allowPatternRule == nil {
+			allowPatternRule = r
 		}
 	}
 
-	// Check hostname patterns (glob matching).
-	// A deny pattern overrides a parent-domain allow (more specific wins).
-	for _, rule := range cm.resolvedRules {
-		if rule.Pattern != nil && rule.Pattern.Matches(hostname) {
-			slog.Debug("Found pattern match",
-				"hostname", hostname,
-				"pattern", rule.Pattern.Raw,
-				"action", rule.Action)
-			if rule.Action == ActionDeny {
-				return ActionDeny
-			}
-			if parentAction == "" {
-				parentAction = rule.Action
-			}
-		}
+	if exactRule != nil {
+		slog.Debug("Found exact match", "hostname", hostname, "action", exactRule.Action)
+		return exactRule.Action, copyPorts(exactRule.Ports), exactRule.Value
 	}
-
-	if parentAction != "" {
-		return parentAction
+	if denyPatternRule != nil {
+		slog.Debug("Found deny pattern match",
+			"hostname", hostname,
+			"pattern", denyPatternRule.Pattern.Raw)
+		return ActionDeny, copyPorts(denyPatternRule.Ports), denyPatternRule.Value
+	}
+	if parentRule != nil {
+		slog.Debug("Found parent domain match",
+			"hostname", hostname,
+			"parent", parentRule.Value,
+			"action", parentRule.Action)
+		return parentRule.Action, copyPorts(parentRule.Ports), parentRule.Value
+	}
+	if allowPatternRule != nil {
+		slog.Debug("Found allow pattern match",
+			"hostname", hostname,
+			"pattern", allowPatternRule.Pattern.Raw)
+		return allowPatternRule.Action, copyPorts(allowPatternRule.Ports), allowPatternRule.Value
 	}
 
 	slog.Debug("No tracked hostname found", "hostname", hostname)
-	return ""
+	return "", nil, ""
+}
+
+// copyPorts returns a defensive copy of `ports` so callers can't mutate the
+// Manager's live ruleset. Returns nil for an empty input to keep the
+// "no port restriction" sentinel cheap.
+func copyPorts(ports []Port) []Port {
+	if len(ports) == 0 {
+		return nil
+	}
+	out := make([]Port, len(ports))
+	copy(out, ports)
+	return out
 }
 
 // CheckIPRuleConflict checks if an IP has conflicting rules and returns the most restrictive action
@@ -695,7 +756,7 @@ func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameActio
 			hasOverlap := false
 			for _, hp := range hostnamePorts {
 				for _, cp := range mostSpecificRule.Ports {
-					if hp.Port == cp.Port && protocolsOverlap(hp.Protocol, cp.Protocol) {
+					if hp.Port == cp.Port && ProtocolsOverlap(hp.Protocol, cp.Protocol) {
 						hasOverlap = true
 						break
 					}
@@ -748,7 +809,7 @@ func (cm *Manager) FindTrackedHostname(name string) string {
 	}
 
 	// Pattern match — return the actual hostname (not the pattern string)
-	// so callers can safely pass it to UpdateDNSMapping / GetTrackedHostnameAction.
+	// so callers can safely pass it to UpdateDNSMapping / MatchHostnameRule.
 	for _, rule := range cm.resolvedRules {
 		if rule.Pattern != nil && rule.Pattern.Matches(name) {
 			return name
@@ -928,7 +989,7 @@ func (cm *Manager) hasCIDRRule(ipStr string, port Port) bool {
 			return true
 		}
 		for _, p := range rule.Ports {
-			if p.Port == port.Port && protocolsOverlap(p.Protocol, port.Protocol) {
+			if p.Port == port.Port && ProtocolsOverlap(p.Protocol, port.Protocol) {
 				return true
 			}
 		}

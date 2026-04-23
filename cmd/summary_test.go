@@ -131,6 +131,24 @@ func TestSummary_DeduplicateStepEvents_DifferentPortsKept(t *testing.T) {
 	assert.Len(t, stepEvents[0].Events, 2, "different ports should be separate entries")
 }
 
+// Same (process, dest, port) over different L4 protocols must survive
+// dedup so the UI doesn't collapse a TCP and a UDP observation into one row
+// (and silently pick whichever protocol won the map write).
+func TestSummary_DeduplicateStepEvents_DifferentProtocolsKept(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	stepEvents := []StepEvents{
+		{
+			Step: GitHubStep{Name: "build"},
+			Events: []events.AuditEvent{
+				{Timestamp: ts, EventType: events.EventConnectionBlocked, DstHostname: "a.com", DstIP: "1.1.1.1", DstPort: 53, Process: "dig", Protocol: "TCP"},
+				{Timestamp: ts, EventType: events.EventConnectionBlocked, DstHostname: "a.com", DstIP: "1.1.1.1", DstPort: 53, Process: "dig", Protocol: "UDP"},
+			},
+		},
+	}
+	deduplicateStepEvents(stepEvents)
+	assert.Len(t, stepEvents[0].Events, 2, "TCP and UDP observations on the same dest:port must remain separate")
+}
+
 // --- correlateEventsToSteps ---
 
 func TestSummary_CorrelateEventsToSteps_EventInStep(t *testing.T) {
@@ -459,6 +477,41 @@ func TestSummary_ComputeSummary_AutoAllowed(t *testing.T) {
 	assert.Equal(t, uint32(2), summary.AllowedConnections)
 	assert.Equal(t, uint32(1), summary.AutoAllowedConnections)
 	assert.Equal(t, uint32(1), summary.DeniedConnections)
+}
+
+// TestSummary_ComputeSummary_LateAllowedCountsAsAllowed verifies the audit-log
+// fidelity fix: a connection_late_allowed event represents an allow decision
+// (BPF dropped the SYN, but a late hostname resolution opened the firewall),
+// so it must be counted with allowed connections — not denied/would-deny.
+func TestSummary_ComputeSummary_LateAllowedCountsAsAllowed(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	evts := []events.AuditEvent{
+		makeEvent(t, events.EventConnectionAllowed, "a.com", "1.1.1.1", "curl", 443, ts),
+		makeEvent(t, events.EventConnectionLateAllowed, "b.com", "2.2.2.2", "curl", 443, ts),
+		makeEvent(t, events.EventConnectionBlocked, "c.com", "3.3.3.3", "curl", 443, ts),
+	}
+
+	summary := computeSummary(evts, data.CargoWallMode_CARGO_WALL_MODE_ENFORCE)
+
+	assert.Equal(t, uint32(3), summary.TotalConnections)
+	assert.Equal(t, uint32(2), summary.AllowedConnections, "late-allowed must count as allowed")
+	assert.Equal(t, uint32(1), summary.DeniedConnections, "late-allowed must NOT count as denied")
+	assert.Equal(t, uint32(0), summary.WouldDenyConnections, "late-allowed must NOT count as would-deny")
+}
+
+// TestSummary_AuditEventToProto_LateAllowed makes sure late-allowed events
+// land in the API proto with the right action (allow) and category (connection).
+func TestSummary_AuditEventToProto_LateAllowed(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	ev := makeEvent(t, events.EventConnectionLateAllowed, "example.com", "1.2.3.4", "curl", 443, ts)
+	ev.MatchedRule = "example.com"
+
+	proto := auditEventToProto(ev)
+
+	assert.Equal(t, data.CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW, proto.Action)
+	assert.Equal(t, data.CargoWallEventCategory_CARGO_WALL_EVENT_CATEGORY_CONNECTION, proto.Category)
+	require.NotNil(t, proto.MatchedRule)
+	assert.Equal(t, "example.com", *proto.MatchedRule)
 }
 
 func TestSummary_ComputeSummary_UnspecifiedModeFallsBackToEnforce(t *testing.T) {

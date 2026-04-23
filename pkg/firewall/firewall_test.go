@@ -121,6 +121,192 @@ func TestAddIP_ExactDuplicate(t *testing.T) {
 	assert.Empty(t, mocks["cidrs"].updates, "cidrsMap.Update should NOT be called for duplicate")
 }
 
+// Regression: when an IP is shared across hostname rules with disjoint port
+// sets (e.g. foo.example.com→:443 and bar.example.com→:8080 both resolving
+// to the same cloud IP), the second AddIP must still write the new (port,
+// proto) entries even though the LPM (Action, PortSpecific) check matches.
+// Pre-fix the per-port writes were skipped, leaving the second hostname's
+// connections silently blackholed and audit-mislabelled as late-allowed.
+//
+// The `changed` return is true here because the per-port entry was new to
+// map_ports — the caller's INFO log fires so operators can see that a new
+// port was opened on a previously-allowed IP.
+func TestAddIP_SharedIP_DifferentPorts_StillWritesPortEntries(t *testing.T) {
+	fw, mocks := newTestFirewall()
+	ip := net.ParseIP("10.0.0.1")
+	ip4 := ip.To4()
+	ipUint32 := binary.NativeEndian.Uint32(ip4)
+
+	// Existing LPM entry from a prior AddIP for the same IP with a different
+	// port set — Action and PortSpecific both match what we're about to write.
+	mocks["cidrs"].lookupFn = func(key, valueOut any) error {
+		k := key.(*bpf.TcBpfLpmKey)
+		if k.Ip == ipUint32 {
+			v := valueOut.(*bpf.TcBpfLpmVal)
+			v.Action = 1       // ActionAllow
+			v.PortSpecific = 1 // port-scoped (same as the call we're about to make)
+			return nil
+		}
+		return ebpf.ErrKeyNotExist
+	}
+	// Default ports lookupFn returns ErrKeyNotExist → the (8080, tcp) entry
+	// is "new" → portsChanged=true.
+
+	changed, err := fw.AddIP(ip, config.ActionAllow, []config.Port{{Port: 8080, Protocol: config.ProtocolTCP}})
+	require.NoError(t, err)
+	assert.True(t, changed, "per-port entry was newly written — caller can log it")
+
+	// The (8080, tcp) port entry MUST have been written to portsMap so the
+	// retry on the new port succeeds. Pre-fix this was skipped and the BPF
+	// blocked the connection silently.
+	require.Len(t, mocks["ports"].updates, 1, "per-port entry must be written even when LPM is a no-op")
+	portKey := mocks["ports"].updates[0].key.(*bpf.TcBpfPortKey)
+	assert.Equal(t, ipUint32, portKey.Ip)
+	assert.Equal(t, uint16(8080), portKey.Port)
+	assert.Equal(t, uint8(6), portKey.Proto, "TCP proto number")
+
+	// ipPorts must accumulate (set semantics) so RemoveIP later cleans up
+	// every (port, proto) ever written for this IP.
+	assert.Equal(t, []portProto{{Port: 8080, Proto: 6}}, fw.ipPorts[ip.String()])
+}
+
+// IPv6 sibling — same pattern, same bug, same fix.
+func TestAddIPv6_SharedIP_DifferentPorts_StillWritesPortEntries(t *testing.T) {
+	fw, mocks := newTestFirewall()
+	ip := net.ParseIP("2001:db8::1")
+
+	mocks["cidrsV6"].lookupFn = func(_, valueOut any) error {
+		v := valueOut.(*bpf.TcBpfLpmVal)
+		v.Action = 1
+		v.PortSpecific = 1
+		return nil
+	}
+
+	changed, err := fw.AddIP(ip, config.ActionAllow, []config.Port{{Port: 8080, Protocol: config.ProtocolTCP}})
+	require.NoError(t, err)
+	assert.True(t, changed, "per-port v6 entry was newly written")
+
+	require.Len(t, mocks["portsV6"].updates, 1, "per-port v6 entry must be written even when LPM is a no-op")
+	portKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfPortKeyV6)
+	assert.Equal(t, uint16(8080), portKey.Port)
+	assert.Equal(t, uint8(6), portKey.Proto)
+	assert.Equal(t, []portProto{{Port: 8080, Proto: 6}}, fw.ipPorts[ip.String()])
+}
+
+// True duplicate — same (action, ports), all per-port entries already match.
+// Both LPM no-op AND port lookups return existing matching values, so
+// `changed` must be false. Guards against accidentally collapsing the
+// "wrote port" detection back into "always returns true for non-empty ports".
+func TestAddIP_TrueDuplicateWithPorts_ReportsUnchanged(t *testing.T) {
+	fw, mocks := newTestFirewall()
+	ip := net.ParseIP("10.0.0.1")
+
+	mocks["cidrs"].lookupFn = func(_, valueOut any) error {
+		v := valueOut.(*bpf.TcBpfLpmVal)
+		v.Action = 1
+		v.PortSpecific = 1
+		return nil
+	}
+	mocks["ports"].lookupFn = func(_, valueOut any) error {
+		v := valueOut.(*bpf.TcBpfPortVal)
+		v.Action = 1 // already-present matching entry
+		return nil
+	}
+	// Pre-populate ipPorts so the merge is a no-op too.
+	fw.ipPorts[ip.String()] = []portProto{{Port: 443, Proto: 6}}
+
+	changed, err := fw.AddIP(ip, config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolTCP}})
+	require.NoError(t, err)
+	assert.False(t, changed, "true duplicate with matching state must report no change")
+	assert.Equal(t, []portProto{{Port: 443, Proto: 6}}, fw.ipPorts[ip.String()], "ipPorts unchanged")
+}
+
+// Two AddIP calls with disjoint port sets must accumulate both into ipPorts so
+// RemoveIP cleans up every (port, proto) we've ever written. Pre-fix the second
+// call overwrote ipPorts to its own ports only, leaving the first call's
+// entries orphaned in map_ports after RemoveIP.
+func TestAddIP_SharedIP_IpPortsAccumulatesAcrossCalls(t *testing.T) {
+	fw, mocks := newTestFirewall()
+	ip := net.ParseIP("10.0.0.1")
+
+	// First AddIP: new IP with [443].
+	changed, err := fw.AddIP(ip, config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolTCP}})
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, []portProto{{Port: 443, Proto: 6}}, fw.ipPorts[ip.String()])
+
+	// Second AddIP: same IP, different port [8080]. Configure cidrs lookup
+	// to return the LPM entry from the first call.
+	ipUint32 := binary.NativeEndian.Uint32(ip.To4())
+	mocks["cidrs"].lookupFn = func(key, valueOut any) error {
+		k := key.(*bpf.TcBpfLpmKey)
+		if k.Ip == ipUint32 {
+			v := valueOut.(*bpf.TcBpfLpmVal)
+			v.Action = 1
+			v.PortSpecific = 1
+			return nil
+		}
+		return ebpf.ErrKeyNotExist
+	}
+
+	changed, err = fw.AddIP(ip, config.ActionAllow, []config.Port{{Port: 8080, Protocol: config.ProtocolTCP}})
+	require.NoError(t, err)
+	assert.True(t, changed, "new port entry was written")
+
+	// BOTH ports tracked — RemoveIP will clean up both.
+	assert.ElementsMatch(t,
+		[]portProto{{Port: 443, Proto: 6}, {Port: 8080, Proto: 6}},
+		fw.ipPorts[ip.String()],
+		"ipPorts must accumulate disjoint port sets across calls")
+}
+
+// Transitioning an IP from PortSpecific=1 to PortSpecific=0 (i.e. AddIP with
+// nil ports after AddIP with some ports) must delete the previously-written
+// per-port entries from map_ports. Pre-fix they were silently orphaned: the
+// LPM's new PortSpecific=0 made them inert, but the entries themselves stayed
+// in the map and ipPorts was dropped — so RemoveIP could never find them.
+func TestAddIP_TransitionToAllPorts_DeletesStalePortEntries(t *testing.T) {
+	fw, mocks := newTestFirewall()
+	ip := net.ParseIP("10.0.0.1")
+	ipUint32 := binary.NativeEndian.Uint32(ip.To4())
+
+	// First call: add (ip, allow, [443, 8080]) with no existing LPM entry.
+	_, err := fw.AddIP(ip, config.ActionAllow, []config.Port{
+		{Port: 443, Protocol: config.ProtocolTCP},
+		{Port: 8080, Protocol: config.ProtocolTCP},
+	})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []portProto{{Port: 443, Proto: 6}, {Port: 8080, Proto: 6}}, fw.ipPorts[ip.String()])
+
+	// Second call: transition to all-ports. Configure the LPM lookup to return
+	// the previous (Action=allow, PortSpecific=1) entry.
+	mocks["cidrs"].lookupFn = func(_, valueOut any) error {
+		v := valueOut.(*bpf.TcBpfLpmVal)
+		v.Action = 1
+		v.PortSpecific = 1
+		return nil
+	}
+
+	changed, err := fw.AddIP(ip, config.ActionAllow, nil)
+	require.NoError(t, err)
+	assert.True(t, changed, "PortSpecific 1→0 LPM change must be reported")
+
+	// portsMap.Delete must have been called for each previously-tracked entry.
+	require.Len(t, mocks["ports"].deletes, 2, "stale per-port entries must be deleted from map_ports")
+	deletedKeys := make(map[uint16]uint8, 2)
+	for _, k := range mocks["ports"].deletes {
+		pk := k.(*bpf.TcBpfPortKey)
+		assert.Equal(t, ipUint32, pk.Ip)
+		deletedKeys[pk.Port] = pk.Proto
+	}
+	assert.Equal(t, uint8(6), deletedKeys[443])
+	assert.Equal(t, uint8(6), deletedKeys[8080])
+
+	// ipPorts dropped — the IP is now PortSpecific=0 and has no per-port state.
+	_, exists := fw.ipPorts[ip.String()]
+	assert.False(t, exists, "ipPorts entry must be removed after PortSpecific=0 transition")
+}
+
 func TestAddIP_SameIPDifferentAction(t *testing.T) {
 	fw, mocks := newTestFirewall()
 	ip := net.ParseIP("10.0.0.1")

@@ -17,6 +17,7 @@
 package events
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/config"
 )
@@ -123,11 +125,11 @@ func TestSubdomainHandling(t *testing.T) {
 				t.Fatalf("Failed to load config: %v", err)
 			}
 
-			// Test GetTrackedHostnameAction
-			action := cm.GetTrackedHostnameAction(tt.dnsHostname)
+			// Test MatchHostnameRule
+			action, _, _ := cm.MatchHostnameRule(tt.dnsHostname)
 
 			if tt.expectedAction != "" && action != tt.expectedAction {
-				t.Errorf("GetTrackedHostnameAction(%s) = %s, want %s",
+				t.Errorf("MatchHostnameRule(%s) = %s, want %s",
 					tt.dnsHostname, action, tt.expectedAction)
 			}
 
@@ -215,7 +217,7 @@ func TestConflictHandling(t *testing.T) {
 			}
 
 			// Test conflict detection
-			hostnameAction := cm.GetTrackedHostnameAction(tt.dnsHostname)
+			hostnameAction, _, _ := cm.MatchHostnameRule(tt.dnsHostname)
 			if hostnameAction == "" {
 				t.Fatalf("Hostname %s not tracked", tt.dnsHostname)
 			}
@@ -428,25 +430,17 @@ func (m *mockFirewallUpdater) AddIP(ip net.IP, action config.Action, ports []con
 	return true, nil
 }
 
-// makeBpfEvent serialises a BpfBlockedEvent into a byte slice suitable for processEvent.
+// makeBpfEvent serialises a BpfBlockedEvent into a byte slice suitable for
+// processEvent. Uses binary.Write with NativeEndian to mirror the unsafe-
+// pointer cast in processEvent, so the encoding stays in lockstep with the
+// struct layout — adding a field to BpfBlockedEvent here doesn't require
+// updating hand-written byte offsets.
 func makeBpfEvent(event BpfBlockedEvent) []byte {
-	size := int(unsafe.Sizeof(event))
-	buf := make([]byte, size)
-	// Write fields manually using native (little-endian on amd64) encoding,
-	// matching the unsafe.Pointer cast in processEvent.
-	buf[0] = event.IpVersion
-	buf[1] = event.Allowed
-	// Pad1 at offsets 2-3
-	binary.LittleEndian.PutUint32(buf[4:8], event.SrcIp)
-	binary.LittleEndian.PutUint32(buf[8:12], event.DstIp)
-	binary.LittleEndian.PutUint16(buf[12:14], event.SrcPort)
-	binary.LittleEndian.PutUint16(buf[14:16], event.DstPort)
-	copy(buf[16:32], event.SrcIp6[:])
-	copy(buf[32:48], event.DstIp6[:])
-	binary.LittleEndian.PutUint64(buf[48:56], event.Timestamp)
-	binary.LittleEndian.PutUint32(buf[56:60], event.Pid)
-	// Pad2 at offsets 60-63
-	return buf
+	buf := bytes.NewBuffer(make([]byte, 0, int(unsafe.Sizeof(event))))
+	if err := binary.Write(buf, binary.NativeEndian, &event); err != nil {
+		panic(fmt.Sprintf("makeBpfEvent: binary.Write failed: %v", err))
+	}
+	return buf.Bytes()
 }
 
 // ipv4ToUint32 converts an IPv4 string to the big-endian uint32 representation
@@ -474,6 +468,7 @@ func TestProcessEvent_IPv4BlockedTCP(t *testing.T) {
 	raw := makeBpfEvent(BpfBlockedEvent{
 		IpVersion: 4,
 		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
 		SrcIp:     ipv4ToUint32("10.0.0.1"),
 		DstIp:     ipv4ToUint32("93.184.216.34"),
 		SrcPort:   54321,
@@ -510,6 +505,7 @@ func TestProcessEvent_IPv4AllowedTCP(t *testing.T) {
 	raw := makeBpfEvent(BpfBlockedEvent{
 		IpVersion: 4,
 		Allowed:   1,
+		IpProto:   unix.IPPROTO_TCP,
 		SrcIp:     ipv4ToUint32("10.0.0.1"),
 		DstIp:     ipv4ToUint32("93.184.216.34"),
 		SrcPort:   54321,
@@ -542,6 +538,7 @@ func TestProcessEvent_ProtocolBlocked(t *testing.T) {
 	raw := makeBpfEvent(BpfBlockedEvent{
 		IpVersion: 4,
 		Allowed:   0,
+		IpProto:   unix.IPPROTO_ICMP,
 		SrcIp:     ipv4ToUint32("10.0.0.1"),
 		DstIp:     ipv4ToUint32("10.0.0.2"),
 		SrcPort:   0,
@@ -574,6 +571,7 @@ func TestProcessEvent_LateResolvedIPAddedToFirewall(t *testing.T) {
 	raw := makeBpfEvent(BpfBlockedEvent{
 		IpVersion: 4,
 		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
 		SrcIp:     ipv4ToUint32("10.0.0.1"),
 		DstIp:     ipv4ToUint32("93.184.216.34"),
 		SrcPort:   54321,
@@ -589,6 +587,419 @@ func TestProcessEvent_LateResolvedIPAddedToFirewall(t *testing.T) {
 	require.Len(t, fw.addedIPs, 1)
 	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
 	assert.Equal(t, "93.184.216.34", fw.addedIPs[0].ip.String())
+}
+
+// TestProcessEvent_LateResolvedIPInheritsRulePorts is the regression test for
+// the nil-ports security bug: when a port-scoped allow rule matches, the late-
+// add path must pass those ports to the firewall (not nil, which the BPF
+// program would interpret as allow-on-all-ports).
+func TestProcessEvent_LateResolvedIPInheritsRulePorts(t *testing.T) {
+	wantPorts := []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "*.compute-1.amazonaws.com", Ports: wantPorts, Action: config.ActionAllow},
+	}, config.ActionDeny))
+	cm.UpdateDNSMapping("ec2-1-2-3-4.compute-1.amazonaws.com", "1.2.3.4")
+
+	fw := &mockFirewallUpdater{}
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("1.2.3.4"),
+		SrcPort:   54321,
+		DstPort:   22, // attacker hits a non-allowed port; allow rule is for :443
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, nil, fw, newTestLogger())
+
+	require.Len(t, fw.addedIPs, 1)
+	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
+	assert.Equal(t, "1.2.3.4", fw.addedIPs[0].ip.String())
+	assert.Equal(t, wantPorts, fw.addedIPs[0].ports)
+}
+
+// IPv6 sibling of TestProcessEvent_LateResolvedIPInheritsRulePorts. The v6
+// AddIP path is mirrored from v4 but wasn't exercised end-to-end through
+// the late-add flow — this locks down the protocol matrix.
+func TestProcessEvent_LateResolvedIPv6InheritsRulePorts(t *testing.T) {
+	wantPorts := []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "*.example.com", Ports: wantPorts, Action: config.ActionAllow},
+	}, config.ActionDeny))
+	cm.UpdateDNSMapping("api.example.com", "2001:db8::1")
+
+	fw := &mockFirewallUpdater{}
+
+	dstIPv6 := net.ParseIP("2001:db8::1")
+	var dstIp6 [16]byte
+	copy(dstIp6[:], dstIPv6.To16())
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 6,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		DstIp6:    dstIp6,
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, nil, fw, newTestLogger())
+
+	require.Len(t, fw.addedIPs, 1)
+	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
+	assert.Equal(t, "2001:db8::1", fw.addedIPs[0].ip.String())
+	assert.Equal(t, wantPorts, fw.addedIPs[0].ports)
+}
+
+// TestProcessEvent_LateResolvedEmitsLateAllowedAudit verifies the audit-log
+// fidelity fix: when the late-add succeeds, the triggering connection is logged
+// as connection_late_allowed (with matched_rule), not connection_blocked, and
+// the user is not notified that something was blocked.
+func TestProcessEvent_LateResolvedEmitsLateAllowedAudit(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	smClient := &mockStateMachineClient{}
+	tracker := NewNotificationTracker(smClient, newTestLogger())
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+	cm.UpdateDNSMapping("example.com", "93.184.216.34")
+
+	fw := &mockFirewallUpdater{}
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionLateAllowed, events[0].EventType,
+		"late-resolved blocked event must be logged as late-allowed, not blocked")
+	// Exact-match rule case: MatchedRule and DstHostname coincide. The
+	// pattern-rule case where they diverge is covered by
+	// TestProcessEvent_LateResolvedMatchedRuleIsRulePatternNotHostname.
+	assert.Equal(t, "example.com", events[0].MatchedRule)
+	assert.Equal(t, "example.com", events[0].DstHostname)
+	assert.False(t, events[0].Blocked)
+	assert.False(t, events[0].WouldDeny)
+	assert.Equal(t, "93.184.216.34", events[0].DstIP)
+	assert.Equal(t, uint16(443), events[0].DstPort)
+
+	// User-facing notification must be suppressed — the connection will succeed
+	// on retry, so notifying the user that something was blocked would mislead.
+	assert.Empty(t, smClient.calls, "no block notification should fire when late-allowed")
+}
+
+// Pattern and parent-domain rules don't have an identifier identical to the
+// resolved destination. MatchedRule must report the rule that fired
+// (`*.compute-1.amazonaws.com`), not the resolved subdomain — otherwise the
+// audit log misrepresents which policy authorised the connection.
+func TestProcessEvent_LateResolvedMatchedRuleIsRulePatternNotHostname(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "*.compute-1.amazonaws.com",
+			Ports: []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}, Action: config.ActionAllow,
+		},
+	}, config.ActionDeny))
+	cm.UpdateDNSMapping("ec2-1-2-3-4.compute-1.amazonaws.com", "1.2.3.4")
+
+	fw := &mockFirewallUpdater{}
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("1.2.3.4"),
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionLateAllowed, events[0].EventType)
+	assert.Equal(t, "ec2-1-2-3-4.compute-1.amazonaws.com", events[0].DstHostname,
+		"DstHostname is the resolved destination")
+	assert.Equal(t, "*.compute-1.amazonaws.com", events[0].MatchedRule,
+		"MatchedRule must be the rule pattern, not the resolved subdomain")
+}
+
+// TestProcessEvent_BlockedNoMatchStillLogsBlocked makes sure the late-allowed
+// branch only fires when there's a matching allow rule. Without one, the
+// blocked event must continue to log connection_blocked and notify.
+func TestProcessEvent_BlockedNoMatchStillLogsBlocked(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	smClient := &mockStateMachineClient{}
+	tracker := NewNotificationTracker(smClient, newTestLogger())
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+	cm.UpdateDNSMapping("not-allowed.example.org", "93.184.216.34")
+
+	fw := &mockFirewallUpdater{}
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+
+	require.Empty(t, fw.addedIPs, "late-add must not fire when no allow rule matches")
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionBlocked, events[0].EventType)
+	assert.True(t, events[0].Blocked)
+	assert.Len(t, smClient.calls, 1, "notification must fire for genuine blocks")
+}
+
+// TestProcessEvent_LateResolvedDstPortNotInRulePortsStaysBlocked guards against
+// a subtle bug: when the IP's hostname matches an allow rule but the event's
+// dst_port is NOT in the rule's allow set, the retry will still be blocked,
+// so we must report the event as blocked (not late-allowed) and notify.
+//
+// Concretely: rule allows port 443/tcp; attacker hits port 22; the late-add
+// path opens nothing useful for port 22, so audit/notification must reflect
+// the genuine block.
+func TestProcessEvent_LateResolvedDstPortNotInRulePortsStaysBlocked(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	smClient := &mockStateMachineClient{}
+	tracker := NewNotificationTracker(smClient, newTestLogger())
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "*.compute-1.amazonaws.com",
+			Ports: []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}, Action: config.ActionAllow,
+		},
+	}, config.ActionDeny))
+	cm.UpdateDNSMapping("ec2-1-2-3-4.compute-1.amazonaws.com", "1.2.3.4")
+
+	fw := &mockFirewallUpdater{}
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("1.2.3.4"),
+		SrcPort:   54321,
+		DstPort:   22, // attacker hits non-allowed port
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+
+	// AddIP still fires (so future port-443 retries succeed), but this
+	// connection's audit/notification must reflect the genuine block.
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionBlocked, events[0].EventType,
+		"port not in rule ports must stay blocked, not late-allowed")
+	assert.True(t, events[0].Blocked)
+	assert.Len(t, smClient.calls, 1, "notification must fire for genuine blocks")
+}
+
+// A UDP event for the same port the rule allows over TCP must NOT be reported
+// as late-allowed — the BPF retry on UDP would still be blocked because the
+// port map is keyed by (ip, port, proto).
+func TestProcessEvent_LateResolvedUDPEventNotAllowedByTCPRule(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	smClient := &mockStateMachineClient{}
+	tracker := NewNotificationTracker(smClient, newTestLogger())
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "example.com",
+			Ports: []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}, Action: config.ActionAllow,
+		},
+	}, config.ActionDeny))
+	cm.UpdateDNSMapping("example.com", "93.184.216.34")
+
+	fw := &mockFirewallUpdater{}
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_UDP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionBlocked, events[0].EventType,
+		"UDP event must not be late-allowed against a TCP-only rule")
+	assert.True(t, events[0].Blocked)
+	assert.Len(t, smClient.calls, 1, "notification must fire when the protocol mismatch leaves the connection blocked")
+}
+
+// A TCP event for a port the rule allows over TCP must be reported as
+// late-allowed — symmetric counterpart to the UDP test above.
+func TestProcessEvent_LateResolvedTCPEventAllowedByTCPRule(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	smClient := &mockStateMachineClient{}
+	tracker := NewNotificationTracker(smClient, newTestLogger())
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "example.com",
+			Ports: []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}, Action: config.ActionAllow,
+		},
+	}, config.ActionDeny))
+	cm.UpdateDNSMapping("example.com", "93.184.216.34")
+
+	fw := &mockFirewallUpdater{}
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionLateAllowed, events[0].EventType,
+		"TCP event matching a TCP rule must be late-allowed")
+	assert.Empty(t, smClient.calls, "no block notification when late-allowed")
+}
+
+// ProtocolAll on a rule must overlap with any specific event protocol.
+func TestProcessEvent_LateResolvedTCPEventAllowedByProtocolAllRule(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	smClient := &mockStateMachineClient{}
+	tracker := NewNotificationTracker(smClient, newTestLogger())
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "example.com",
+			Ports: []config.Port{{Port: 443, Protocol: config.ProtocolAll}}, Action: config.ActionAllow,
+		},
+	}, config.ActionDeny))
+	cm.UpdateDNSMapping("example.com", "93.184.216.34")
+
+	fw := &mockFirewallUpdater{}
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionLateAllowed, events[0].EventType,
+		"ProtocolAll rule must overlap with TCP event")
+	assert.Empty(t, smClient.calls, "no block notification when late-allowed")
 }
 
 func TestProcessEvent_IPv6Event(t *testing.T) {
@@ -609,6 +1020,7 @@ func TestProcessEvent_IPv6Event(t *testing.T) {
 	raw := makeBpfEvent(BpfBlockedEvent{
 		IpVersion: 6,
 		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
 		SrcIp6:    srcIp6,
 		DstIp6:    dstIp6,
 		SrcPort:   54321,
@@ -649,6 +1061,7 @@ func TestProcessEvent_AutoAllowedType(t *testing.T) {
 	raw := makeBpfEvent(BpfBlockedEvent{
 		IpVersion: 4,
 		Allowed:   1,
+		IpProto:   unix.IPPROTO_UDP,
 		SrcIp:     ipv4ToUint32("10.0.0.1"),
 		DstIp:     ipv4ToUint32("8.8.8.8"),
 		SrcPort:   54321,
@@ -665,6 +1078,9 @@ func TestProcessEvent_AutoAllowedType(t *testing.T) {
 	require.Len(t, events, 1)
 	assert.Equal(t, EventConnectionAllowed, events[0].EventType)
 	assert.Equal(t, "dns", events[0].AutoAllowedType)
+	// Regression: an allowed UDP event must record Protocol="UDP" so the
+	// summary dedup key buckets it correctly. Pre-fix this read "TCP".
+	assert.Equal(t, "UDP", events[0].Protocol)
 }
 
 func TestProcessEvent_NoAutoAllowedTypeForUserRule(t *testing.T) {
@@ -681,6 +1097,7 @@ func TestProcessEvent_NoAutoAllowedTypeForUserRule(t *testing.T) {
 	raw := makeBpfEvent(BpfBlockedEvent{
 		IpVersion: 4,
 		Allowed:   1,
+		IpProto:   unix.IPPROTO_TCP,
 		SrcIp:     ipv4ToUint32("10.0.0.1"),
 		DstIp:     ipv4ToUint32("93.184.216.34"),
 		SrcPort:   54321,

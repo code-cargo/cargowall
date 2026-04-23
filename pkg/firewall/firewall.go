@@ -41,8 +41,14 @@ type Firewall interface {
 	// UpdateAllowlistTC updates the eBPF LPM trie and port maps for firewall rules
 	UpdateAllowlistTC(configMgr *config.Manager) error
 
-	// AddIP adds a single IP to the BPF maps with the specified action and ports
-	// Returns (wasAdded bool, error) - wasAdded is true if the IP was newly added, false if it was a duplicate
+	// AddIP adds a single IP to the BPF maps with the specified action and ports.
+	// Returns (changed bool, error). `changed` is true if this call made any
+	// observable change to BPF state — either a new/different LPM entry, or at
+	// least one new/different per-port entry. A duplicate call that re-writes
+	// identical state returns (false, nil). Per-port entries accumulate across
+	// calls (set semantics): the same IP added under two hostname rules with
+	// disjoint port sets ends up with both port sets in the map, and RemoveIP
+	// will clean up all of them.
 	AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error)
 
 	// RemoveIP removes a single IP from the BPF maps
@@ -403,6 +409,7 @@ func (f *FirewallImpl) addIPv4(ip4 net.IP, origIP net.IP, action config.Action, 
 	defer f.mu.Unlock()
 
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
+	ipStr := origIP.String()
 
 	key := bpf.TcBpfLpmKey{
 		Prefixlen: 32,
@@ -427,16 +434,27 @@ func (f *FirewallImpl) addIPv4(ip4 net.IP, origIP net.IP, action config.Action, 
 		val.PortSpecific = 1
 	}
 
-	if ipExists && existingVal.Action == val.Action && existingVal.PortSpecific == val.PortSpecific {
-		return false, nil
-	}
-
+	// Write per-port entries unconditionally (before the LPM no-op check). When
+	// an IP is shared across hostname rules with disjoint port sets — e.g.
+	// foo.example.com→:443 and bar.example.com→:8080 both resolving to the same
+	// cloud IP — the LPM (Action, PortSpecific) check would otherwise short-
+	// circuit the second call and silently leave the new (port, proto) entries
+	// missing from map_ports, blackholing the retry. Map writes are idempotent.
+	//
+	// portsChanged tracks whether any per-port entry was new or had a
+	// different value — feeds the `changed` return so callers' INFO logs
+	// fire on shared-IP-different-ports calls (LPM unchanged, ports new).
+	var portsChanged bool
 	if len(ports) > 0 {
 		for _, pp := range ports {
 			portKey := bpf.TcBpfPortKey{
 				Ip:    ipUint32,
 				Port:  pp.Port,
 				Proto: pp.Proto,
+			}
+			var existingPortVal bpf.TcBpfPortVal
+			if errLookup := f.portsMap.Lookup(&portKey, &existingPortVal); errLookup != nil || existingPortVal.Action != actionVal {
+				portsChanged = true
 			}
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
@@ -445,20 +463,70 @@ func (f *FirewallImpl) addIPv4(ip4 net.IP, origIP net.IP, action config.Action, 
 				return false, fmt.Errorf("failed to add port %d proto %d to map: %w", pp.Port, pp.Proto, err)
 			}
 		}
+		// Track every (port, proto) we've written for this IP across all
+		// AddIP calls (set semantics) so RemoveIP cleans up the full set.
+		// Without this, a second call with disjoint ports leaves the first
+		// call's entries orphaned in map_ports after RemoveIP.
+		f.ipPorts[ipStr] = mergePorts(f.ipPorts[ipStr], ports)
+	}
+
+	if ipExists && existingVal.Action == val.Action && existingVal.PortSpecific == val.PortSpecific {
+		return portsChanged, nil
 	}
 
 	if err := f.cidrsMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
 		return false, fmt.Errorf("failed to add IP to LPM trie: %w", err)
 	}
 
-	ipStr := origIP.String()
-	if len(ports) > 0 {
-		f.ipPorts[ipStr] = ports
-	} else {
+	// Transitioning to PortSpecific=0 (no port restrictions): the new LPM
+	// entry tells BPF to ignore map_ports for this IP, so any per-port entries
+	// we previously wrote are dead. Delete them now — once we drop ipPorts
+	// below, RemoveIP loses all knowledge of them and they'd leak forever.
+	if len(ports) == 0 {
+		for _, pp := range f.ipPorts[ipStr] {
+			portKey := bpf.TcBpfPortKey{
+				Ip:    ipUint32,
+				Port:  pp.Port,
+				Proto: pp.Proto,
+			}
+			if err := f.portsMap.Delete(&portKey); err != nil {
+				if !errors.Is(err, ebpf.ErrKeyNotExist) {
+					f.logger.Debug("Failed to remove stale port entry on PortSpecific=0 transition",
+						"ip", ipStr, "port", pp.Port, "proto", pp.Proto, "error", err)
+				}
+			}
+		}
 		delete(f.ipPorts, ipStr)
 	}
 
 	return true, nil
+}
+
+// mergePorts returns the union of two []portProto slices (set semantics),
+// preserving existing-first ordering and appending only entries not already
+// present. Used by addIPv4/addIPv6 to track the cumulative port set written
+// for an IP across multiple AddIP calls.
+//
+// Always returns a freshly-allocated slice — never aliases the inputs — so a
+// future caller that retains either input can't accidentally observe mutations
+// when the result grows.
+func mergePorts(existing, additions []portProto) []portProto {
+	out := make([]portProto, 0, len(existing)+len(additions))
+	out = append(out, existing...)
+	if len(existing) == 0 {
+		return append(out, additions...)
+	}
+	seen := make(map[portProto]bool, len(existing))
+	for _, pp := range existing {
+		seen[pp] = true
+	}
+	for _, pp := range additions {
+		if !seen[pp] {
+			out = append(out, pp)
+			seen[pp] = true
+		}
+	}
+	return out
 }
 
 func (f *FirewallImpl) addIPv6(ip6 net.IP, origIP net.IP, action config.Action, ports []portProto) (bool, error) {
@@ -469,6 +537,8 @@ func (f *FirewallImpl) addIPv6(ip6 net.IP, origIP net.IP, action config.Action, 
 	if skip {
 		return false, nil
 	}
+
+	ipStr := origIP.String()
 
 	var key bpf.TcBpfLpmKeyV6
 	key.Prefixlen = 128
@@ -492,16 +562,19 @@ func (f *FirewallImpl) addIPv6(ip6 net.IP, origIP net.IP, action config.Action, 
 		val.PortSpecific = 1
 	}
 
-	if ipExists && existingVal.Action == val.Action && existingVal.PortSpecific == val.PortSpecific {
-		return false, nil
-	}
-
+	// Per-port writes before the LPM no-op check; portsChanged tracks
+	// new/different per-port entries — see addIPv4 for the full rationale.
+	var portsChanged bool
 	if len(ports) > 0 {
 		for _, pp := range ports {
 			var portKey bpf.TcBpfPortKeyV6
 			copy(portKey.Ip[:], ip6)
 			portKey.Port = pp.Port
 			portKey.Proto = pp.Proto
+			var existingPortVal bpf.TcBpfPortVal
+			if errLookup := f.portsV6Map.Lookup(&portKey, &existingPortVal); errLookup != nil || existingPortVal.Action != actionVal {
+				portsChanged = true
+			}
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
 			}
@@ -509,16 +582,32 @@ func (f *FirewallImpl) addIPv6(ip6 net.IP, origIP net.IP, action config.Action, 
 				return false, fmt.Errorf("failed to add v6 port %d proto %d to map: %w", pp.Port, pp.Proto, err)
 			}
 		}
+		f.ipPorts[ipStr] = mergePorts(f.ipPorts[ipStr], ports)
+	}
+
+	if ipExists && existingVal.Action == val.Action && existingVal.PortSpecific == val.PortSpecific {
+		return portsChanged, nil
 	}
 
 	if err := f.cidrsV6Map.Update(&key, &val, ebpf.UpdateAny); err != nil {
 		return false, fmt.Errorf("failed to add IPv6 to LPM trie: %w", err)
 	}
 
-	ipStr := origIP.String()
-	if len(ports) > 0 {
-		f.ipPorts[ipStr] = ports
-	} else {
+	// Transitioning to PortSpecific=0 — delete tracked v6 port entries before
+	// dropping ipPorts. See addIPv4 for the full rationale.
+	if len(ports) == 0 {
+		for _, pp := range f.ipPorts[ipStr] {
+			var portKey bpf.TcBpfPortKeyV6
+			copy(portKey.Ip[:], ip6)
+			portKey.Port = pp.Port
+			portKey.Proto = pp.Proto
+			if err := f.portsV6Map.Delete(&portKey); err != nil {
+				if !errors.Is(err, ebpf.ErrKeyNotExist) {
+					f.logger.Debug("Failed to remove stale v6 port entry on PortSpecific=0 transition",
+						"ip", ipStr, "port", pp.Port, "proto", pp.Proto, "error", err)
+				}
+			}
+		}
 		delete(f.ipPorts, ipStr)
 	}
 

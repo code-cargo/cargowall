@@ -21,7 +21,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: code-cargo/cargowall-action@v1.1.0
+      - uses: code-cargo/cargowall-action@v1.1.1
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -56,7 +56,7 @@ jobs:
       id-token: write
       checks: write
     steps:
-      - uses: code-cargo/cargowall-action@v1.1.0
+      - uses: code-cargo/cargowall-action@v1.1.1
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -95,7 +95,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: code-cargo/cargowall-action@v1.1.0
+      - uses: code-cargo/cargowall-action@v1.1.1
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -141,7 +141,7 @@ jobs:
         run: chmod +x bin/cargowall
 
       - name: Start CargoWall via Action
-        uses: code-cargo/cargowall-action@v1.1.0
+        uses: code-cargo/cargowall-action@v1.1.1
         with:
           mode: enforce
           offline: 'true'
@@ -288,7 +288,7 @@ jobs:
         run: chmod +x bin/cargowall
 
       - name: Start CargoWall via Action
-        uses: code-cargo/cargowall-action@v1.1.0
+        uses: code-cargo/cargowall-action@v1.1.1
         with:
           mode: audit
           offline: 'true'

@@ -21,7 +21,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     steps:
-      - uses: code-cargo/cargowall-action@v1.1.1
+      - uses: code-cargo/cargowall-action@fc9644606d84536b4e59a30ad2802904f7b4ff22 # v1.2.0
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -70,7 +70,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: code-cargo/cargowall-action@v1.1.1
+      - uses: code-cargo/cargowall-action@fc9644606d84536b4e59a30ad2802904f7b4ff22 # v1.2.0
 
       - name: Download artifacts
         uses: actions/download-artifact@v8

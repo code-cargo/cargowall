@@ -1367,3 +1367,92 @@ func TestConsecutiveDoubleStarRejected(t *testing.T) {
 		t.Errorf("non-consecutive ** should be valid, got error: %v", err)
 	}
 }
+
+// Mirrors the GitHub Actions startup flow: the SaaS API hostname is added to
+// an empty bootstrap config so the policy fetch can resolve, then
+// LoadConfigFromCargoWall replaces the ruleset with the fetched policy (which
+// does not contain the API hostname), then autoAllowInfraHosts re-adds it.
+// Before the fix, the third step's EnsureHostnameAllowed call no-op'd on a
+// stale trackedHostnames entry, leaving the hostname unmatched at DNS-filter
+// time.
+func TestEnsureHostnameAllowed_ReAddedAfterCargoWallReload(t *testing.T) {
+	cm := NewConfigManager()
+
+	// Bootstrap with an empty deny-all config and add the API hostname.
+	if err := cm.LoadConfigFromRules(nil, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules(nil) error = %v", err)
+	}
+	cm.EnsureHostnameAllowed("app.codecargo.com", []Port{PortHTTPS}, AutoAddedTypeCodeCargoService)
+	if action, _, _ := cm.MatchHostnameRule("app.codecargo.com"); action != ActionAllow {
+		t.Fatalf("after bootstrap, MatchHostnameRule(app.codecargo.com) = %q, want allow", action)
+	}
+
+	// Simulate the API policy fetch landing a ruleset that does not include
+	// the API hostname.
+	policy := &cargowallv1pb.CargoWallPolicy{
+		DefaultAction: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY,
+		Rules: []*cargowallv1pb.CargoWallPolicy_Rule{
+			{
+				Type:   datapb.CargoWallRuleType_CARGO_WALL_RULE_TYPE_HOSTNAME,
+				Value:  "github.com",
+				Action: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW,
+				Ports: []*cargowallv1pb.CargoWallPolicy_PortRule{
+					{Port: 443, Protocol: datapb.CargoWallProtocol_CARGO_WALL_PROTOCOL_TCP},
+				},
+			},
+		},
+	}
+	if err := cm.LoadConfigFromCargoWall(policy); err != nil {
+		t.Fatalf("LoadConfigFromCargoWall() error = %v", err)
+	}
+
+	// After the reload, the API hostname is no longer in the ruleset.
+	if action, _, _ := cm.MatchHostnameRule("app.codecargo.com"); action != "" {
+		t.Fatalf("after reload, MatchHostnameRule(app.codecargo.com) = %q, want empty", action)
+	}
+
+	// autoAllowInfraHosts re-adds the API hostname. This must actually install
+	// a rule, not no-op on a stale trackedHostnames entry from the bootstrap.
+	cm.EnsureHostnameAllowed("app.codecargo.com", []Port{PortHTTPS}, AutoAddedTypeCodeCargoService)
+	action, ports, matched := cm.MatchHostnameRule("app.codecargo.com")
+	if action != ActionAllow {
+		t.Errorf("after re-add, MatchHostnameRule(app.codecargo.com) action = %q, want allow", action)
+	}
+	if matched != "app.codecargo.com" {
+		t.Errorf("after re-add, MatchHostnameRule(app.codecargo.com) matched = %q, want app.codecargo.com", matched)
+	}
+	if !reflect.DeepEqual(ports, []Port{PortHTTPS}) {
+		t.Errorf("after re-add, MatchHostnameRule(app.codecargo.com) ports = %v, want [{443 tcp}]", ports)
+	}
+}
+
+// resolveRules clears trackedHostnames so the map only reflects the current
+// ruleset. Without the clear, hostnames removed by a config reload would
+// linger as ghost entries — making FindTrackedHostname / GetTrackedHostnames
+// return matches that have no corresponding resolved rule.
+func TestResolveRules_TrackedHostnamesReflectCurrentRuleset(t *testing.T) {
+	cm := NewConfigManager()
+
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "old.example.com", Action: ActionAllow},
+	}, ActionDeny); err != nil {
+		t.Fatalf("first LoadConfigFromRules() error = %v", err)
+	}
+	if _, ok := cm.GetTrackedHostnames()["old.example.com"]; !ok {
+		t.Fatalf("expected old.example.com in trackedHostnames after first load")
+	}
+
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "new.example.com", Action: ActionAllow},
+	}, ActionDeny); err != nil {
+		t.Fatalf("second LoadConfigFromRules() error = %v", err)
+	}
+
+	tracked := cm.GetTrackedHostnames()
+	if _, ok := tracked["old.example.com"]; ok {
+		t.Errorf("old.example.com should be cleared after reload, still in trackedHostnames")
+	}
+	if _, ok := tracked["new.example.com"]; !ok {
+		t.Errorf("new.example.com should be in trackedHostnames after reload")
+	}
+}

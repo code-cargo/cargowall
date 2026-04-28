@@ -1133,6 +1133,12 @@ func (cm *Manager) resolveRules() error {
 	}
 
 	cm.resolvedRules = nil
+	// Repopulate trackedHostnames from the new ruleset. Otherwise stale
+	// entries from a prior config (e.g. the SaaS API hostname added by
+	// EnsureHostnameAllowed during the bootstrap before LoadConfigFromCargoWall
+	// replaces cm.config.Rules) cause EnsureHostnameAllowed to short-circuit
+	// when called again — leaving the hostname unmatched at DNS-filter time.
+	cm.trackedHostnames = make(map[string]Action)
 
 	for _, rule := range cm.config.Rules {
 		resolved := ResolvedRule{

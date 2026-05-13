@@ -198,7 +198,8 @@ func (s *Server) ApplyRulesToTrackedHostnames() {
 
 				// Check for conflicts
 				finalAction, hasConflict, conflictingRule := s.config.CheckIPRuleConflict(
-					ip, hostname, hostnameAction, hostnamePorts)
+					ip, hostname, hostnameAction, hostnamePorts,
+				)
 
 				if hasConflict {
 					s.logger.Warn("Rule conflict detected during reprocess",
@@ -447,7 +448,8 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 							ip,
 							hostname,
 							hostnameAction,
-							hostnamePorts)
+							hostnamePorts,
+						)
 
 						if hasConflict {
 							s.logger.Warn("Rule conflict detected",

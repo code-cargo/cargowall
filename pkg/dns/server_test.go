@@ -300,7 +300,8 @@ func TestDNSTrackingBeforeRules(t *testing.T) {
 	require.NoError(t, err)
 
 	// Expect AddIP to be called when we reprocess
-	mockFirewall.On("AddIP",
+	mockFirewall.On(
+		"AddIP",
 		net.ParseIP("10.15.1.105"),
 		config.ActionAllow,
 		[]config.Port{{Port: 4222, Protocol: config.ProtocolAll}},
@@ -685,7 +686,8 @@ func TestApplyRulesToTrackedHostnames(t *testing.T) {
 	require.NoError(t, err)
 
 	// Expect AddIP to be called for the cached NATS IP
-	mockFirewall.On("AddIP",
+	mockFirewall.On(
+		"AddIP",
 		net.ParseIP("10.15.1.105"),
 		config.ActionAllow,
 		[]config.Port{{Port: 4222, Protocol: config.ProtocolAll}, {Port: 6222, Protocol: config.ProtocolAll}, {Port: 8222, Protocol: config.ProtocolAll}},

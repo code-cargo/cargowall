@@ -146,6 +146,97 @@ All enforcement happens **inside the runner at the kernel level** — no iptable
 
 ---
 
+# Standalone Usage (Other Platforms)
+
+CargoWall's runtime is a self-contained Linux binary — the GitHub Actions integration is just one packaging of it. The same binary will run on any Linux host with a recent kernel, which makes it usable on **self-hosted runners for GitLab CI, Buildkite, Jenkins, CircleCI, or any non-CI Linux box** where you want eBPF-enforced egress control.
+
+> For GitHub Actions, use the [CargoWall GitHub Action](https://github.com/code-cargo/cargowall-action) — it handles install, policy wiring, sudo lockdown, Docker DNS interception, and audit summary correlation for you. This section is for everything else.
+
+## Requirements
+
+* Linux kernel **5.x or newer** (eBPF TC + cgroup hooks)
+* `CAP_BPF` and `CAP_NET_ADMIN` (typically run as root, or via capabilities/systemd)
+* An upstream DNS server CargoWall can forward queries to
+* Port `53/udp` available on `127.0.0.1` for the local DNS proxy
+
+## Build
+
+```bash
+make build       # produces bin/cargowall
+```
+
+## Configure
+
+Drop a policy file at `/etc/cargowall/config.json` (or any path — see `--config`). See [`config.example.json`](./config.example.json) for the full schema. Minimal example:
+
+```json
+{
+  "defaultAction": "deny",
+  "rules": [
+    {
+      "type": "hostname",
+      "value": "github.com",
+      "ports": [{"port": 443, "protocol": "tcp"}],
+      "action": "allow"
+    },
+    {
+      "type": "cidr",
+      "value": "8.8.8.8/32",
+      "ports": [{"port": 53, "protocol": "udp"}],
+      "action": "allow"
+    }
+  ]
+}
+```
+
+## Run
+
+```bash
+sudo cargowall start \
+  --config /etc/cargowall/config.json \
+  --dns-upstream 8.8.8.8:53
+```
+
+Useful flags (all available as env vars — see `cargowall start --help`):
+
+| Flag | Env | Purpose |
+|---|---|---|
+| `--config` | `CARGOWALL_CONFIG` | Path to the policy JSON file |
+| `--interface` | `CARGOWALL_INTERFACE` | Network interface to attach to (auto-detected if empty) |
+| `--dns-upstream` | `CARGOWALL_DNS_UPSTREAM` | Upstream DNS server (required) |
+| `--audit-mode` | `CARGOWALL_AUDIT_MODE` | Log only — don't block (recommended for rollout) |
+| `--audit-log` | `CARGOWALL_AUDIT_LOG` | NDJSON audit log path |
+| `--debug` | — | Verbose logging |
+
+When CargoWall is ready, it writes a `/tmp/cargowall-ready` sentinel — useful for CI scripts that want to gate the build step until the firewall is up.
+
+## Audit-then-enforce
+
+Start in audit mode, collect a few runs of NDJSON logs, then promote to enforce by removing `--audit-mode`:
+
+```bash
+sudo cargowall start \
+  --config /etc/cargowall/config.json \
+  --dns-upstream 8.8.8.8:53 \
+  --audit-mode \
+  --audit-log /var/log/cargowall.ndjson
+```
+
+## What's not in the standalone path
+
+The GitHub Action wraps the binary with a few extras you'd build yourself on other platforms:
+
+* Automatic Docker DNS interception (rewrites `/etc/docker/daemon.json`)
+* iptables DNS redirect for processes that bypass `/etc/resolv.conf`
+* Sudo lockdown to prevent firewall bypass mid-run
+* Auto-allow for Azure IMDS / GitHub service hosts
+* Post-run audit summary correlating events with workflow step timings
+* Optional CodeCargo SaaS policy fetch and result push
+
+If you want any of these on a different platform, the implementation lives in [`cmd/`](./cmd/) and most pieces are individually reusable.
+
+---
+
 # CodeCargo Platform
 
 Sign up for the [CodeCargo platform](https://www.codecargo.com) for enterprise features like:

@@ -446,7 +446,8 @@ func makeBpfEvent(event BpfBlockedEvent) []byte {
 	if binary.Size(&event) != int(unsafe.Sizeof(event)) {
 		panic(fmt.Sprintf(
 			"makeBpfEvent: BpfBlockedEvent has implicit padding (binary.Size=%d, unsafe.Sizeof=%d) — add an explicit pad field or switch this helper to an unsafe memcpy",
-			binary.Size(&event), unsafe.Sizeof(event)))
+			binary.Size(&event), unsafe.Sizeof(event),
+		))
 	}
 	buf := bytes.NewBuffer(make([]byte, 0, int(unsafe.Sizeof(event))))
 	if err := binary.Write(buf, binary.NativeEndian, &event); err != nil {

@@ -157,7 +157,7 @@ CargoWall's runtime is a self-contained Linux binary — the GitHub Actions inte
 * Linux kernel **5.x or newer** (eBPF TC + cgroup hooks)
 * `CAP_BPF` and `CAP_NET_ADMIN` (typically run as root, or via capabilities/systemd)
 * An upstream DNS server CargoWall can forward queries to
-* Port `53/udp` available on `127.0.0.1` for the local DNS proxy
+* Ports `53/udp` and `53/tcp` available on `127.0.0.1` for the local DNS proxy (the proxy starts listeners on both)
 
 ## Build
 
@@ -197,7 +197,13 @@ sudo cargowall start \
   --dns-upstream 8.8.8.8:53
 ```
 
-Useful flags (all available as env vars — see `cargowall start --help`):
+Standalone mode does **not** install the iptables DNS redirect or rewrite Docker's DNS config — that wiring is only applied in GitHub Actions mode. You need to route DNS traffic through the local proxy yourself, otherwise hostname rules will never populate (e.g. the `github.com` allow rule above will stay empty and traffic will be blocked under a deny-by-default policy). Common options:
+
+* Point `/etc/resolv.conf` at `nameserver 127.0.0.1` for host processes
+* Pass `--dns 127.0.0.1` to `docker run` (or set `"dns"` in `/etc/docker/daemon.json`) for containers
+* Add your own `iptables` NAT rule redirecting outbound `udp/tcp 53` to `127.0.0.1:53` for processes that bypass `/etc/resolv.conf` (Go's pure resolver, Node.js)
+
+Useful flags (most available as env vars — see `cargowall start --help`):
 
 | Flag | Env | Purpose |
 |---|---|---|

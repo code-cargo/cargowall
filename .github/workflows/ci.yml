@@ -667,6 +667,126 @@ jobs:
           fi
           echo "Emergency cleanup complete"
 
+  test-cargowall-gitlab-ci:
+    name: Integration Test (GitLab CI mode)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
+
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
+
+      - name: Write minimal policy
+        run: |
+          sudo mkdir -p /etc/cargowall
+          sudo tee /etc/cargowall/config.json > /dev/null <<'JSON'
+          {
+            "defaultAction": "deny",
+            "rules": [
+              {
+                "type": "hostname",
+                "value": "github.com",
+                "ports": [{"port": 443, "protocol": "tcp"}],
+                "action": "allow"
+              },
+              {
+                "type": "cidr",
+                "value": "8.8.8.8/32",
+                "ports": [{"port": 53, "protocol": "udp"}],
+                "action": "allow"
+              }
+            ]
+          }
+          JSON
+
+      - name: Start CargoWall with --gitlab-ci preset
+        run: |
+          # nohup + & + disown lets cargowall outlive this step's shell.
+          # The privileged-Docker stand-in for GitLab SaaS doesn't exist on
+          # GitHub Actions runners, so we exercise the same code path on the
+          # Azure-backed Linux runner — eBPF + sudo + iptables work the same.
+          sudo nohup ./bin/cargowall start \
+            --gitlab-ci \
+            --audit-mode \
+            --audit-log /tmp/cargowall-audit.json \
+            --pidfile /tmp/cargowall.pid \
+            --dns-upstream "8.8.8.8:53" \
+            --debug \
+            > /tmp/cargowall.log 2>&1 &
+          disown
+
+      - name: Wait for ready via wait-ready subcommand
+        run: ./bin/cargowall wait-ready --timeout 30s
+
+      - name: Show startup log (debug aid)
+        if: always()
+        run: sudo cat /tmp/cargowall.log || true
+
+      - name: Verify pidfile written
+        run: |
+          if ! sudo test -s /tmp/cargowall.pid; then
+            echo "❌ pidfile /tmp/cargowall.pid was not written"
+            exit 1
+          fi
+          echo "✅ pidfile present, pid=$(sudo cat /tmp/cargowall.pid)"
+
+      - name: Allowed call reaches github.com
+        run: |
+          curl -sf --connect-timeout 10 --max-time 30 https://github.com > /dev/null
+          echo "✅ github.com reachable"
+
+      - name: Disallowed call still goes through (audit mode logs only)
+        run: |
+          curl -sf --connect-timeout 5 --max-time 10 https://example.com > /dev/null || true
+          echo "✅ example.com fetch attempted (audit mode does not block)"
+
+      - name: Validate audit log contains would-deny events
+        run: |
+          AUDIT_LOG=/tmp/cargowall-audit.json
+          if ! sudo test -s "$AUDIT_LOG"; then
+            echo "❌ Audit log not written"
+            exit 1
+          fi
+          BLOCKED=$(sudo jq -s '[.[] | select(.event_type == "connection_blocked" or .event_type == "dns_blocked")] | length' "$AUDIT_LOG")
+          echo "would-deny events: $BLOCKED"
+          if [ "$BLOCKED" -eq 0 ]; then
+            echo "❌ Expected at least one would-deny event in audit log"
+            sudo head -5 "$AUDIT_LOG" | jq .
+            exit 1
+          fi
+          echo "✅ Audit log contains $BLOCKED would-deny events"
+
+      - name: Stop CargoWall via stop subcommand
+        run: |
+          sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid --timeout 15s
+          echo "✅ stop subcommand returned cleanly"
+
+      - name: Verify pidfile removed
+        run: |
+          if sudo test -f /tmp/cargowall.pid; then
+            echo "❌ pidfile still present after stop"
+            sudo ls -la /tmp/cargowall.pid
+            exit 1
+          fi
+          echo "✅ pidfile cleaned up"
+
+      - name: Emergency cleanup
+        if: always()
+        run: |
+          if sudo test -f /tmp/cargowall.pid; then
+            sudo kill -TERM $(sudo cat /tmp/cargowall.pid) 2>/dev/null || true
+          fi
+
   test-cargowall-saas:
     name: Integration Test (SaaS)
     needs: build-binary

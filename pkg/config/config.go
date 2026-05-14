@@ -46,7 +46,9 @@ const (
 	AutoAddedTypeNone                AutoAddedType = ""
 	AutoAddedTypeDNS                 AutoAddedType = "dns"
 	AutoAddedTypeAzureInfrastructure AutoAddedType = "azure_infrastructure"
+	AutoAddedTypeGCPInfrastructure   AutoAddedType = "gcp_infrastructure"
 	AutoAddedTypeGitHubService       AutoAddedType = "github_service"
+	AutoAddedTypeGitLabService       AutoAddedType = "gitlab_service"
 	AutoAddedTypeCodeCargoService    AutoAddedType = "codecargo_service"
 )
 
@@ -854,10 +856,10 @@ func (cm *Manager) EnsureDNSAllowed(ips []string) {
 }
 
 // EnsureInfraAllowed adds CIDR allow rules for the given IPs on the specified
-// ports, so infrastructure traffic (e.g. Azure wireserver/IMDS) is allowed
-// only on the ports it actually needs.
-func (cm *Manager) EnsureInfraAllowed(ips []string, ports []Port) {
-	cm.ensureAllowed(ips, ports, AutoAddedTypeAzureInfrastructure)
+// ports, tagged with the given AutoAddedType (e.g. AutoAddedTypeAzureInfrastructure
+// for Azure wireserver/IMDS, AutoAddedTypeGCPInfrastructure for GCP metadata).
+func (cm *Manager) EnsureInfraAllowed(ips []string, ports []Port, autoAddedType AutoAddedType) {
+	cm.ensureAllowed(ips, ports, autoAddedType)
 }
 
 // ensureAllowed adds CIDR allow rules for the given IPs with the specified ports.

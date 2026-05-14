@@ -68,16 +68,28 @@ type StartCmd struct {
 
 	Token  string `help:"codecargo token" env:"CODECARGO_AUTH_TOKEN"`
 	ApiUrl string `help:"CodeCargo API URL to fetch policy from" name:"api-url" env:"CARGOWALL_API_URL"`
-	JobKey string `help:"GitHub Actions job key for job-level policy resolution" name:"job-key" env:"CARGOWALL_JOB_KEY"`
+	JobKey string `help:"CI job key for job-level policy resolution" name:"job-key" env:"CARGOWALL_JOB_KEY"`
 
 	// Runtime options
 	DisableDNSTracking bool   `help:"Disable DNS tracking and hostname resolution" default:"false"`
 	DNSUpstream        string `help:"Upstream DNS server to forward queries to" required:"" env:"CARGOWALL_DNS_UPSTREAM"`
 
-	// GitHub Actions mode
-	GithubAction bool `help:"Run in GitHub Actions mode" default:"false" env:"CARGOWALL_GITHUB_ACTION"`
+	// CI presets — bundles the orthogonal flags below with sensible defaults
+	// for the named CI environment.
+	GithubAction bool `help:"Run in GitHub Actions mode (preset: enables DNS redirect, Docker DNS interception, query filtering, cache pre-population, cloud metadata auto-allow, GitHub hosts auto-allow)" default:"false" env:"CARGOWALL_GITHUB_ACTION"`
+	GitlabCI     bool `help:"Run in GitLab CI mode (preset: enables DNS redirect, Docker DNS interception, query filtering, cache pre-population, cloud metadata auto-allow, GitLab hosts auto-allow)" name:"gitlab-ci" default:"false" env:"CARGOWALL_GITLAB_CI"`
 
-	// Sudo lockdown (GitHub Actions security hardening)
+	// Orthogonal CI plumbing flags — usable on any CI system (or standalone).
+	// Each is also implied by a CI preset above.
+	DNSRedirectIptables    bool `help:"Install iptables OUTPUT NAT rules redirecting outbound DNS (UDP+TCP/53) to the local proxy at 127.0.0.1:53" default:"false" env:"CARGOWALL_DNS_REDIRECT_IPTABLES"`
+	DockerDNSInterception  bool `help:"Listen on the Docker bridge IP for DNS, rewrite /etc/docker/daemon.json so containers use the proxy, and restart the Docker daemon" default:"false" env:"CARGOWALL_DOCKER_DNS_INTERCEPTION"`
+	DNSQueryFiltering      bool `help:"Filter DNS queries against the firewall policy (blocks DNS tunneling)" default:"false" env:"CARGOWALL_DNS_QUERY_FILTERING"`
+	PrepopulateDNSCache    bool `help:"Pre-populate the BPF allowlist from the systemd-resolved cache and existing TCP connections at startup" default:"false" env:"CARGOWALL_PREPOPULATE_DNS_CACHE"`
+	AutoAllowCloudMetadata bool `help:"Auto-allow cloud metadata endpoints (Azure wireserver/IMDS or GCP metadata server, auto-detected via systemd-resolved upstreams)" default:"false" env:"CARGOWALL_AUTO_ALLOW_CLOUD_METADATA"`
+	AutoAllowGitHubHosts   bool `help:"Auto-allow GitHub service hostnames (github.com, *.githubusercontent.com, etc.) and discover ACTIONS_* runtime URLs" default:"false" env:"CARGOWALL_AUTO_ALLOW_GITHUB_HOSTS"`
+	AutoAllowGitlabHosts   bool `help:"Auto-allow GitLab service hostnames (gitlab.com, registry.gitlab.com, etc.) and discover CI_* runtime URLs" default:"false" env:"CARGOWALL_AUTO_ALLOW_GITLAB_HOSTS"`
+
+	// Sudo lockdown (CI security hardening)
 	SudoLockdown      bool   `help:"Enable sudo lockdown to prevent firewall bypass" default:"false" env:"CARGOWALL_SUDO_LOCKDOWN"`
 	SudoAllowCommands string `help:"Comma-separated list of command paths to allow via sudo when lockdown is enabled (e.g. /usr/bin/apt-get,/usr/bin/docker)" default:"" env:"CARGOWALL_SUDO_ALLOW_COMMANDS"`
 
@@ -87,10 +99,61 @@ type StartCmd struct {
 
 	// Pre-existing connection handling
 	AllowExistingConnections bool `help:"Allow pre-existing TCP connections at startup (loads /proc/net/tcp{,6} IPs into allow maps)" default:"false" env:"CARGOWALL_ALLOW_EXISTING_CONNECTIONS"`
+
+	// Pidfile pairs with the `cargowall stop` subcommand. Backgrounding is
+	// delegated to the shell (`cargowall start --pidfile X &`) — true Unix
+	// daemonization isn't worth the Go runtime complexity for CI use.
+	Pidfile string `help:"Write the cargowall process pid to this file (used with 'cargowall stop')" default:"" env:"CARGOWALL_PIDFILE"`
 }
 
+// CIMode is the active CI integration mode, derived from which preset flag
+// was passed. Drives log labels and which auto-allow defaults are applied.
+type CIMode string
+
+const (
+	CIModeNone         CIMode = ""
+	CIModeGithubAction CIMode = "github_action"
+	CIModeGitlabCI     CIMode = "gitlab_ci"
+)
+
+// CIMode returns the active CI integration mode for this start invocation.
+// GitHub Actions takes precedence if both presets are set (shouldn't happen).
+func (c *StartCmd) CIMode() CIMode {
+	if c.GithubAction {
+		return CIModeGithubAction
+	}
+	if c.GitlabCI {
+		return CIModeGitlabCI
+	}
+	return CIModeNone
+}
+
+// AfterApply expands CI presets into the orthogonal flags they imply.
+// `--github-action` and `--gitlab-ci` are conveniences that turn on the
+// underlying plumbing flags so users don't have to enumerate each one.
 func (c *StartCmd) AfterApply() error {
+	if c.GithubAction {
+		c.applyCIPreset(true /* github */)
+	}
+	if c.GitlabCI {
+		c.applyCIPreset(false /* gitlab */)
+	}
 	return nil
+}
+
+// applyCIPreset turns on the plumbing flags shared by both CI presets, then
+// sets the host auto-allow flag specific to the named CI.
+func (c *StartCmd) applyCIPreset(github bool) {
+	c.DNSRedirectIptables = true
+	c.DockerDNSInterception = true
+	c.DNSQueryFiltering = true
+	c.PrepopulateDNSCache = true
+	c.AutoAllowCloudMetadata = true
+	if github {
+		c.AutoAllowGitHubHosts = true
+	} else {
+		c.AutoAllowGitlabHosts = true
+	}
 }
 
 func defaultLogger(debug bool) *slog.Logger {
@@ -144,6 +207,8 @@ func (c *StartCmd) Run(globals *Globals) error {
 
 type CLI struct {
 	Globals
-	Start   StartCmd   `cmd:"" help:"Start the Cargowall eBPF firewall"`
-	Summary SummaryCmd `cmd:"" help:"Generate audit summary correlating events with GitHub Actions steps"`
+	Start     StartCmd     `cmd:"" help:"Start the Cargowall eBPF firewall"`
+	Summary   SummaryCmd   `cmd:"" help:"Generate audit summary correlating events with GitHub Actions steps"`
+	WaitReady WaitReadyCmd `cmd:"" name:"wait-ready" help:"Block until the cargowall ready sentinel appears"`
+	Stop      StopCmd      `cmd:"" help:"Send SIGTERM to a daemonized cargowall process"`
 }

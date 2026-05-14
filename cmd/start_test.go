@@ -79,3 +79,74 @@ func TestGateExistingConnections_DeniedHostnameNotAdded(t *testing.T) {
 
 	gateExistingConnections([]string{"10.20.30.40"}, cm, fw, nil, quietLogger())
 }
+
+// hostnameRulesFor returns the allow-rule hostname strings tagged with the
+// given AutoAddedType, in declaration order.
+func hostnameRulesFor(t *testing.T, cm *config.Manager, want config.AutoAddedType) []string {
+	t.Helper()
+	var out []string
+	for _, r := range cm.GetResolvedRules() {
+		if r.Type == config.RuleTypeHostname && r.AutoAddedType == want && r.Action == config.ActionAllow {
+			out = append(out, r.Value)
+		}
+	}
+	return out
+}
+
+func TestAutoAllowGitlabHosts_DefaultsAndEnvDiscovery(t *testing.T) {
+	t.Setenv("CI_SERVER_URL", "https://gitlab.example.com")
+	t.Setenv("CI_REGISTRY", "https://registry.example.com")
+	t.Setenv("CI_API_V4_URL", "https://gitlab.example.com/api/v4")
+	t.Setenv("CI_PAGES_URL", "")
+	t.Setenv("CI_REPOSITORY_URL", "")
+	t.Setenv("CI_DEPENDENCY_PROXY_SERVER", "")
+	t.Setenv("CI_PROJECT_URL", "")
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	autoAllowGitlabHosts(cm, quietLogger())
+
+	got := hostnameRulesFor(t, cm, config.AutoAddedTypeGitLabService)
+
+	// Defaults must be present.
+	require.Contains(t, got, "gitlab.com")
+	require.Contains(t, got, "registry.gitlab.com")
+	// Env-discovered hostnames must be present (deduplicated by EnsureHostnameAllowed).
+	require.Contains(t, got, "gitlab.example.com")
+	require.Contains(t, got, "registry.example.com")
+}
+
+func TestAutoAllowGitlabHosts_ServiceHostsEnvOverridesDefaults(t *testing.T) {
+	t.Setenv("CARGOWALL_GITLAB_SERVICE_HOSTS", "gitlab.internal,gitlab-runner.internal")
+	t.Setenv("CI_SERVER_URL", "")
+	t.Setenv("CI_REGISTRY", "")
+	t.Setenv("CI_API_V4_URL", "")
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	autoAllowGitlabHosts(cm, quietLogger())
+
+	got := hostnameRulesFor(t, cm, config.AutoAddedTypeGitLabService)
+	require.Contains(t, got, "gitlab.internal")
+	require.Contains(t, got, "gitlab-runner.internal")
+	require.NotContains(t, got, "gitlab.com", "default hosts should be replaced when env override is set")
+}
+
+func TestAutoAllowGitHubHosts_RuntimeURLDiscovery(t *testing.T) {
+	t.Setenv("ACTIONS_RUNTIME_URL", "https://pipelines.actions.githubusercontent.com/abc/")
+	t.Setenv("ACTIONS_RESULTS_URL", "https://results-receiver.actions.githubusercontent.com")
+	t.Setenv("ACTIONS_CACHE_URL", "")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	autoAllowGitHubHosts(cm, quietLogger())
+
+	got := hostnameRulesFor(t, cm, config.AutoAddedTypeGitHubService)
+	require.Contains(t, got, "github.com")
+	require.Contains(t, got, "pipelines.actions.githubusercontent.com")
+	require.Contains(t, got, "results-receiver.actions.githubusercontent.com")
+}

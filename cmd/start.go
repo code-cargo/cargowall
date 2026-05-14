@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -62,11 +63,15 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			"cap_bpf", caps.HasCAP_BPF,
 			"cap_net_admin", caps.HasCAP_NET_ADMIN)
 
-		if cmd.GithubAction {
-			// In GitHub Actions mode, provide actionable guidance
+		switch cmd.CIMode() {
+		case CIModeGithubAction:
 			logger.Error("eBPF is not supported on this runner. " +
 				"Self-hosted runners may need kernel 5.x+ and CAP_BPF/CAP_NET_ADMIN capabilities. " +
 				"GitHub-hosted runners require sudo privileges.")
+		case CIModeGitlabCI:
+			logger.Error("eBPF is not supported in this GitLab CI environment. " +
+				"GitLab SaaS runners run in privileged Docker containers but you may need a self-hosted runner with kernel 5.x+ " +
+				"and CAP_BPF/CAP_NET_ADMIN. Check your runner image's kernel version with `uname -r`.")
 		}
 
 		return cargowallEbpf.RequireCapabilities()
@@ -107,12 +112,12 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			logger,
 		)
 
-		// In GitHub Actions mode, also listen on Docker bridge for container DNS
-		if cmd.GithubAction {
-			// Enable DNS query filtering to prevent DNS tunneling
+		if cmd.DNSQueryFiltering {
 			dnsServer.EnableQueryFiltering(true)
 			logger.Info("DNS query filtering enabled (blocks DNS tunneling)")
+		}
 
+		if cmd.DockerDNSInterception {
 			var err error
 			dockerBridgeIP, err = network.GetDockerBridgeIP()
 			if err != nil {
@@ -151,7 +156,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		// Set up iptables DNAT to force all outbound DNS through the proxy.
 		// This catches processes that bypass /etc/resolv.conf and query
 		// upstream DNS directly (e.g., Go's pure resolver, Node.js).
-		if cmd.GithubAction {
+		if cmd.DNSRedirectIptables {
 			if err := network.SetupDNSRedirect(logger); err != nil {
 				logger.Warn("Failed to set up DNS redirect (iptables)", "error", err)
 			} else {
@@ -186,8 +191,8 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
 	var apiPolicyLoaded bool
-	if cmd.GithubAction {
-		apiPolicyLoaded = loadGitHubActionsConfig(ctx, cmd, configMgr, auditLogger, dockerBridgeIP, logger)
+	if cmd.CIMode() != CIModeNone {
+		apiPolicyLoaded = loadCIConfig(ctx, cmd, configMgr, auditLogger, dockerBridgeIP, logger)
 	} else if hooks != nil && hooks.LoadPolicy != nil {
 		// Extension hook: load policy from external source (e.g., NATS state machine)
 		policy, hookSmClient, cleanup, err := hooks.LoadPolicy(ctx, cmd)
@@ -325,14 +330,12 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		// IMPORTANT: Apply rules to any hostnames we tracked before config was loaded
 		// This is needed because we may have already resolved hostnames (like NATS)
 		// before we had the rules to track them
-		if (hooks != nil && hooks.LoadPolicy != nil) || cmd.GithubAction {
+		if (hooks != nil && hooks.LoadPolicy != nil) || cmd.PrepopulateDNSCache {
 			dnsServer.ApplyRulesToTrackedHostnames()
 			logger.Info("Applied firewall rules to tracked hostnames")
 		}
 
-		if cmd.GithubAction {
-			autoAllowInfraHosts(cmd, configMgr, fw, logger)
-		}
+		applyAutoAllowHelpers(cmd, configMgr, fw, logger)
 
 		// Shared resolver that uses the systemd-resolved stub listener for
 		// looking up cached DNS entries. Used for existing-connection reverse
@@ -345,11 +348,8 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		}
 
 		var existingIPs []string
-		if cmd.GithubAction {
+		if cmd.PrepopulateDNSCache {
 			existingIPs = reverseDNSExistingConnections(configMgr, cacheResolver, logger)
-		}
-
-		if cmd.GithubAction {
 			prePopulateDNSCache(configMgr, dnsServer, cacheResolver, logger)
 		}
 
@@ -359,22 +359,23 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	}
 
 	// Log appropriate config source
-	if apiPolicyLoaded {
+	switch {
+	case apiPolicyLoaded:
 		logger.Info("CargoWall TC firewall started",
 			"interface", ifname,
 			"config_source", "saas_api",
 			"api_url", cmd.ApiUrl,
 			"default_action", configMgr.GetDefaultAction())
-	} else if cmd.GithubAction {
+	case cmd.CIMode() != CIModeNone:
 		logger.Info("CargoWall TC firewall started",
 			"interface", ifname,
-			"config_source", "github_action",
+			"config_source", string(cmd.CIMode()),
 			"default_action", configMgr.GetDefaultAction())
-	} else if hooks != nil && hooks.LoadPolicy != nil {
+	case hooks != nil && hooks.LoadPolicy != nil:
 		logger.Info("CargoWall TC firewall started",
 			"interface", ifname,
 			"config_source", "hook")
-	} else {
+	default:
 		logger.Info("CargoWall TC firewall started",
 			"interface", ifname,
 			"config_source", "file",
@@ -397,7 +398,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	// Restart Docker daemon so containers pick up the DNS configuration
 	// written to daemon.json by ConfigureDockerDNS. Docker's SIGHUP handler
 	// does NOT reload DNS settings — a full restart is required.
-	if cmd.GithubAction && dockerBridgeIP != "" {
+	if cmd.DockerDNSInterception && dockerBridgeIP != "" {
 		if err := network.RestartDockerDaemon(logger); err != nil {
 			logger.Warn("Failed to restart Docker daemon for DNS config", "error", err)
 		}
@@ -411,6 +412,20 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		if err := os.WriteFile("/tmp/cargowall-ready", nil, 0o660); err != nil {
 			return fmt.Errorf("writing ready file: %w", err)
 		}
+	}
+
+	// Write pidfile so `cargowall stop --pidfile X` can target this process.
+	// Done after the ready sentinel so a wait-ready/stop pair sees a coherent state.
+	if cmd.Pidfile != "" {
+		pidStr := strconv.Itoa(os.Getpid())
+		if err := os.WriteFile(cmd.Pidfile, []byte(pidStr+"\n"), 0o644); err != nil {
+			logger.Warn("Failed to write pidfile", "path", cmd.Pidfile, "error", err)
+		}
+		defer func() {
+			if err := os.Remove(cmd.Pidfile); err != nil && !errors.Is(err, os.ErrNotExist) {
+				logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", err)
+			}
+		}()
 	}
 
 	logger.Info("CargoWall ready")
@@ -446,7 +461,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	}
 
 	// Restore Docker DNS configuration if we modified it
-	if cmd.GithubAction && dockerBridgeIP != "" {
+	if cmd.DockerDNSInterception && dockerBridgeIP != "" {
 		if err := network.RestoreDockerDNS(logger); err != nil {
 			logger.Warn("Failed to restore Docker DNS", "error", err)
 		}
@@ -455,12 +470,12 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	return nil
 }
 
-// loadGitHubActionsConfig handles GitHub Actions config priority:
+// loadCIConfig handles CI config priority:
 // (1) SaaS API fetch + bootstrap + mode override + state file,
 // (2) env vars, (3) config file. Calls EnsureDNSAllowed at end.
 // Returns true if SaaS API policy was loaded. Mutates cmd.AuditMode in place.
-func loadGitHubActionsConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, dockerBridgeIP string, logger *slog.Logger) bool {
-	logger.Info("Running in GitHub Actions mode")
+func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, dockerBridgeIP string, logger *slog.Logger) bool {
+	logger.Info("Running in CI mode", "mode", string(cmd.CIMode()))
 
 	var apiPolicyLoaded bool
 
@@ -539,62 +554,80 @@ func loadGitHubActionsConfig(ctx context.Context, cmd *StartCmd, configMgr *conf
 	return apiPolicyLoaded
 }
 
-// autoAllowInfraHosts detects and allows infrastructure hosts needed for
-// GitHub Actions: systemd-resolved upstreams, Azure wireserver, IMDS,
-// GitHub service hosts, Azure infra hosts, Actions runtime env vars,
-// and the CodeCargo API hostname.
-func autoAllowInfraHosts(cmd *StartCmd, configMgr *config.Manager, fw firewall.Firewall, logger *slog.Logger) {
-	// Ensure systemd-resolved upstream DNS servers are allowed through the
-	// firewall (needed for cache misses).
-	if resolvedUpstreams, err := detectSystemdResolvedUpstreams(); err == nil {
-		if len(resolvedUpstreams) > 0 {
-			configMgr.EnsureDNSAllowed(resolvedUpstreams)
-
-			// Auto-allow Azure wireserver on ports 53 (DNS), 80 (HTTP),
-			// and 32526 (health) for every Azure VM / GitHub-hosted runner.
-			// The upstream IPs from systemd-resolved on Azure are
-			// typically 168.63.129.16.
-			configMgr.EnsureInfraAllowed(resolvedUpstreams, []config.Port{
-				config.PortDNS,
-				config.PortHTTP,
-				config.PortWireServer,
-			})
-
-			if err := fw.UpdateAllowlistTC(configMgr); err != nil {
-				logger.Warn("Failed to update allowlist with resolved upstreams", "error", err)
-			}
-			logger.Info("Allowed systemd-resolved upstream DNS servers", "ips", resolvedUpstreams)
+// applyAutoAllowHelpers invokes each enabled auto-allow helper and updates
+// the BPF allowlist once at the end. The CodeCargo API allow runs whenever
+// --api-url is set (independent of CI mode) so the SaaS summary push works.
+func applyAutoAllowHelpers(cmd *StartCmd, configMgr *config.Manager, fw firewall.Firewall, logger *slog.Logger) {
+	ran := false
+	if cmd.AutoAllowCloudMetadata {
+		autoAllowCloudMetadata(configMgr, logger)
+		ran = true
+	}
+	if cmd.AutoAllowGitHubHosts {
+		autoAllowGitHubHosts(configMgr, logger)
+		ran = true
+	}
+	if cmd.AutoAllowGitlabHosts {
+		autoAllowGitlabHosts(configMgr, logger)
+		ran = true
+	}
+	if cmd.ApiUrl != "" {
+		autoAllowCodeCargoAPI(cmd.ApiUrl, configMgr, logger)
+		ran = true
+	}
+	if ran {
+		if err := fw.UpdateAllowlistTC(configMgr); err != nil {
+			logger.Warn("Failed to update allowlist with auto-allow rules", "error", err)
 		}
-	} else {
+	}
+}
+
+// autoAllowCloudMetadata allows the link-local cloud metadata endpoint
+// (169.254.169.254 on port 80, used by both Azure IMDS and GCP metadata)
+// plus systemd-resolved upstream DNS servers. If Azure-specific upstreams
+// are detected (168.63.129.16 wireserver) it also adds Azure wireserver
+// ports and Azure infrastructure hostnames.
+func autoAllowCloudMetadata(configMgr *config.Manager, logger *slog.Logger) {
+	resolvedUpstreams, err := detectSystemdResolvedUpstreams()
+	if err != nil {
 		logger.Debug("Could not detect systemd-resolved upstreams", "error", err)
+	} else if len(resolvedUpstreams) > 0 {
+		configMgr.EnsureDNSAllowed(resolvedUpstreams)
+		logger.Info("Allowed systemd-resolved upstream DNS servers", "ips", resolvedUpstreams)
 	}
 
-	// Also pre-allow Azure IMDS metadata endpoint (169.254.169.254).
-	// This link-local IP serves instance metadata over HTTP on all
-	// Azure VMs and GitHub-hosted runners and must not be blocked.
-	configMgr.EnsureInfraAllowed([]string{"169.254.169.254"}, []config.Port{config.PortHTTP})
+	// 169.254.169.254 is the link-local metadata IP on both Azure (IMDS) and
+	// GCP. Both serve metadata over HTTP/80 so a single allow covers either
+	// cloud. Tagged GCP because the Azure wireserver branch below adds the
+	// stronger Azure-specific allows when running on Azure.
+	configMgr.EnsureInfraAllowed([]string{"169.254.169.254"}, []config.Port{config.PortHTTP}, config.AutoAddedTypeGCPInfrastructure)
 
-	// Pre-allow ICMP to the Azure wire server (168.63.129.16). GitHub-hosted
-	// runners periodically ping this IP, so without an allow rule each ping
-	// produces an EventProtocolBlocked log line — functional but noisy.
-	// Kept as a separate rule from the TCP wire-server ports above: the port-map
-	// keys {ip, port, proto} are disjoint across TCP/UDP/ICMP so the two rules
-	// coexist without collision.
-	configMgr.EnsureInfraAllowed([]string{"168.63.129.16"}, []config.Port{config.PortICMP})
+	// Azure detection: the wireserver IP 168.63.129.16 is unique to Azure
+	// VMs (and to GitHub-hosted runners, which run on Azure).
+	azureDetected := false
+	for _, ip := range resolvedUpstreams {
+		if ip == "168.63.129.16" {
+			azureDetected = true
+			break
+		}
+	}
+	if !azureDetected {
+		return
+	}
 
-	// Auto-allow GitHub service hostnames on port 443.
-	// Defaults cover core GitHub domains; overridable via
-	// CARGOWALL_GITHUB_SERVICE_HOSTS env var (comma-separated).
-	githubHosts := []string{
-		"github.com", "api.github.com", "githubapp.com",
-		"actions.githubusercontent.com", "github.githubassets.com",
-	}
-	if env := os.Getenv("CARGOWALL_GITHUB_SERVICE_HOSTS"); env != "" {
-		githubHosts = splitAndTrimCSV(env)
-	}
-	for _, h := range githubHosts {
-		configMgr.EnsureHostnameAllowed(h, []config.Port{config.PortHTTPS}, config.AutoAddedTypeGitHubService)
-	}
+	// Auto-allow Azure wireserver on ports 53 (DNS), 80 (HTTP), and
+	// 32526 (health). The port-map keys {ip, port, proto} are disjoint
+	// across TCP/UDP/ICMP so the ICMP rule below coexists cleanly.
+	configMgr.EnsureInfraAllowed(resolvedUpstreams, []config.Port{
+		config.PortDNS,
+		config.PortHTTP,
+		config.PortWireServer,
+	}, config.AutoAddedTypeAzureInfrastructure)
+
+	// Pre-allow ICMP to the Azure wire server. GitHub-hosted runners
+	// periodically ping this IP — without an allow rule each ping produces
+	// an EventProtocolBlocked log line (functional but noisy).
+	configMgr.EnsureInfraAllowed([]string{"168.63.129.16"}, []config.Port{config.PortICMP}, config.AutoAddedTypeAzureInfrastructure)
 
 	// Auto-allow Azure infrastructure hostnames on port 443.
 	// Defaults cover blob storage and traffic manager; overridable
@@ -606,39 +639,89 @@ func autoAllowInfraHosts(cmd *StartCmd, configMgr *config.Manager, fw firewall.F
 	for _, h := range azureHosts {
 		configMgr.EnsureHostnameAllowed(h, []config.Port{config.PortHTTPS}, config.AutoAddedTypeAzureInfrastructure)
 	}
+}
 
-	// Auto-discover hostnames from GitHub Actions runtime environment
-	// variables. The runner communicates with specific subdomains like
-	// pipelines.actions.githubusercontent.com and results-receiver-service.
-	// actions.githubusercontent.com whose IPs differ from the parent
-	// domain's DNS resolution. Tracking them explicitly ensures Phase 1/2
-	// resolves their IPs into the BPF allowlist.
-	for _, envVar := range []string{
+// autoAllowGitHubHosts allows the default GitHub service hostnames plus any
+// hostnames discovered in the ACTIONS_* runtime environment variables.
+// Defaults are overridable via CARGOWALL_GITHUB_SERVICE_HOSTS.
+func autoAllowGitHubHosts(configMgr *config.Manager, logger *slog.Logger) {
+	githubHosts := []string{
+		"github.com", "api.github.com", "githubapp.com",
+		"actions.githubusercontent.com", "github.githubassets.com",
+	}
+	if env := os.Getenv("CARGOWALL_GITHUB_SERVICE_HOSTS"); env != "" {
+		githubHosts = splitAndTrimCSV(env)
+	}
+	for _, h := range githubHosts {
+		configMgr.EnsureHostnameAllowed(h, []config.Port{config.PortHTTPS}, config.AutoAddedTypeGitHubService)
+	}
+
+	// The runner communicates with specific subdomains like
+	// pipelines.actions.githubusercontent.com whose IPs differ from the
+	// parent domain's DNS resolution. Tracking them explicitly ensures
+	// Phase 1/2 resolves their IPs into the BPF allowlist.
+	autoAllowFromEnvURLs(configMgr, logger, config.AutoAddedTypeGitHubService, "Actions runtime", []string{
 		"ACTIONS_RUNTIME_URL",
 		"ACTIONS_RESULTS_URL",
 		"ACTIONS_CACHE_URL",
 		"ACTIONS_ID_TOKEN_REQUEST_URL",
-	} {
-		if val := os.Getenv(envVar); val != "" {
-			if u, err := url.Parse(val); err == nil && u.Hostname() != "" {
-				configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeGitHubService)
-				logger.Info("Auto-allowed Actions runtime hostname", "env", envVar, "hostname", u.Hostname())
-			}
-		}
+	})
+}
+
+// autoAllowGitlabHosts allows the default GitLab service hostnames plus any
+// hostnames discovered in the CI_* runtime environment variables that
+// GitLab Runner exports into the job environment. Defaults are overridable
+// via CARGOWALL_GITLAB_SERVICE_HOSTS.
+func autoAllowGitlabHosts(configMgr *config.Manager, logger *slog.Logger) {
+	gitlabHosts := []string{
+		"gitlab.com",
+		"registry.gitlab.com",
+	}
+	if env := os.Getenv("CARGOWALL_GITLAB_SERVICE_HOSTS"); env != "" {
+		gitlabHosts = splitAndTrimCSV(env)
+	}
+	for _, h := range gitlabHosts {
+		configMgr.EnsureHostnameAllowed(h, []config.Port{config.PortHTTPS}, config.AutoAddedTypeGitLabService)
 	}
 
-	// Auto-allow the CodeCargo API hostname so the summary push
-	// (which runs while the firewall is active) is not blocked.
-	if cmd.ApiUrl != "" {
-		if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
-			configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
-			logger.Info("Auto-allowed CodeCargo API hostname", "hostname", u.Hostname())
-		}
-	}
+	autoAllowFromEnvURLs(configMgr, logger, config.AutoAddedTypeGitLabService, "GitLab CI runtime", []string{
+		"CI_SERVER_URL",
+		"CI_API_V4_URL",
+		"CI_REGISTRY",
+		"CI_REPOSITORY_URL",
+		"CI_PAGES_URL",
+		"CI_DEPENDENCY_PROXY_SERVER",
+		"CI_PROJECT_URL",
+	})
+}
 
-	if err := fw.UpdateAllowlistTC(configMgr); err != nil {
-		logger.Warn("Failed to update allowlist with infra rules", "error", err)
+// autoAllowFromEnvURLs reads each env var as a URL and adds an HTTPS allow
+// rule for its hostname. Used by both the GitHub and GitLab auto-allow paths
+// to discover runtime endpoints injected by the CI runner.
+func autoAllowFromEnvURLs(configMgr *config.Manager, logger *slog.Logger, autoAddedType config.AutoAddedType, label string, envVars []string) {
+	for _, envVar := range envVars {
+		val := os.Getenv(envVar)
+		if val == "" {
+			continue
+		}
+		u, err := url.Parse(val)
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, autoAddedType)
+		logger.Info("Auto-allowed "+label+" hostname", "env", envVar, "hostname", u.Hostname())
 	}
+}
+
+// autoAllowCodeCargoAPI allows the CodeCargo API hostname on 443 so the
+// summary push (which runs while the firewall is active) isn't blocked.
+func autoAllowCodeCargoAPI(apiURL string, configMgr *config.Manager, logger *slog.Logger) {
+	u, err := url.Parse(apiURL)
+	if err != nil || u.Hostname() == "" {
+		return
+	}
+	configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
+	logger.Info("Auto-allowed CodeCargo API hostname", "hostname", u.Hostname())
 }
 
 // reverseDNSExistingConnections scans existing TCP connections from

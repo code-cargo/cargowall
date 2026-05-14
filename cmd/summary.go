@@ -669,6 +669,12 @@ func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {
 	return event
 }
 
+// mapAutoAllowedType converts an internal AutoAddedType string to the proto
+// enum used by the SaaS API push. Types not listed here (currently
+// "gcp_infrastructure" and "gitlab_service" — added in pkg/config without a
+// corresponding proto value) return ok=false, which causes the caller to
+// omit the AutoAllowedType field on the pushed event. A follow-up PR can
+// extend the proto and map them here.
 func mapAutoAllowedType(s string) (data.CargoWallAutoAllowedType, bool) {
 	switch s {
 	case "dns":

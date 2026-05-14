@@ -371,3 +371,15 @@ func TestStartCmd_CIMode_GithubBeatsGitlabWhenBothSet(t *testing.T) {
 	cmd := &StartCmd{GithubAction: true, GitlabCI: true}
 	assert.Equal(t, CIModeGithubAction, cmd.CIMode())
 }
+
+func TestStartCmd_AfterApply_BothPresetsSet_OnlyGithubHostsAllowed(t *testing.T) {
+	// Both presets set: AfterApply must follow CIMode() precedence and
+	// expand only the GitHub host-allow flag, not both. Otherwise the runtime
+	// auto-allows would silently widen beyond what the documented mode promises.
+	cmd := &StartCmd{GithubAction: true, GitlabCI: true}
+	require.NoError(t, cmd.AfterApply())
+
+	assert.True(t, cmd.AutoAllowGitHubHosts, "github-action wins, so GitHub hosts should be allowed")
+	assert.False(t, cmd.AutoAllowGitlabHosts, "GitLab hosts must NOT be allowed when GitHub preset wins")
+	assert.True(t, cmd.AutoAllowCloudMetadata, "shared plumbing should still be enabled")
+}

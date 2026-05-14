@@ -270,6 +270,8 @@ build:
 
 `--gitlab-ci` bundles the iptables DNS redirect, Docker DNS interception, query filtering, cache pre-population, cloud metadata auto-allow, and GitLab host auto-allow. To use just a subset, pass the orthogonal flags individually (see the flag table above).
 
+**Tip**: `CARGOWALL_PIDFILE` is read by both `start` and `stop`. Setting it once as a CI variable lets both invocations agree on the path without repeating `--pidfile` in every step.
+
 ## Audit-then-enforce
 
 Start in audit mode, collect a few runs of NDJSON logs, then promote to enforce by removing `--audit-mode`:

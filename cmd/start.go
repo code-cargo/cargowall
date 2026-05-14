@@ -404,6 +404,31 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		}
 	}
 
+	// Write pidfile BEFORE the ready sentinel so a `wait-ready` then `stop
+	// --pidfile X` sequence never races.
+	//
+	// O_NOFOLLOW: cargowall typically runs as root. If a previous job on a
+	// shared self-hosted runner planted a symlink at the pidfile path
+	// pointing at e.g. /etc/hostname, a vanilla os.WriteFile would clobber
+	// the target. O_NOFOLLOW makes open() fail with ELOOP instead.
+	if cmd.Pidfile != "" {
+		pidStr := strconv.Itoa(os.Getpid())
+		f, err := os.OpenFile(cmd.Pidfile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+		if err != nil {
+			logger.Warn("Failed to open pidfile", "path", cmd.Pidfile, "error", err)
+		} else {
+			if _, err := f.WriteString(pidStr + "\n"); err != nil {
+				logger.Warn("Failed to write pidfile", "path", cmd.Pidfile, "error", err)
+			}
+			_ = f.Close()
+			defer func() {
+				if err := os.Remove(cmd.Pidfile); err != nil && !errors.Is(err, os.ErrNotExist) {
+					logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", err)
+				}
+			}()
+		}
+	}
+
 	if hooks != nil && hooks.Ready != nil {
 		if err := hooks.Ready(); err != nil {
 			return fmt.Errorf("ready hook failed: %w", err)
@@ -412,20 +437,6 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		if err := os.WriteFile("/tmp/cargowall-ready", nil, 0o660); err != nil {
 			return fmt.Errorf("writing ready file: %w", err)
 		}
-	}
-
-	// Write pidfile so `cargowall stop --pidfile X` can target this process.
-	// Done after the ready sentinel so a wait-ready/stop pair sees a coherent state.
-	if cmd.Pidfile != "" {
-		pidStr := strconv.Itoa(os.Getpid())
-		if err := os.WriteFile(cmd.Pidfile, []byte(pidStr+"\n"), 0o644); err != nil {
-			logger.Warn("Failed to write pidfile", "path", cmd.Pidfile, "error", err)
-		}
-		defer func() {
-			if err := os.Remove(cmd.Pidfile); err != nil && !errors.Is(err, os.ErrNotExist) {
-				logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", err)
-			}
-		}()
 	}
 
 	logger.Info("CargoWall ready")
@@ -591,7 +602,17 @@ func autoAllowCloudMetadata(configMgr *config.Manager, logger *slog.Logger) {
 	resolvedUpstreams, err := detectSystemdResolvedUpstreams()
 	if err != nil {
 		logger.Debug("Could not detect systemd-resolved upstreams", "error", err)
-	} else if len(resolvedUpstreams) > 0 {
+	}
+	applyCloudMetadataAllows(configMgr, resolvedUpstreams, logger)
+}
+
+// applyCloudMetadataAllows is the testable inner logic of
+// autoAllowCloudMetadata: given a (possibly empty) set of systemd-resolved
+// upstreams, populate the cloud metadata + Azure-specific allows. Split out
+// so unit tests can drive Azure vs GCP behavior without touching
+// /run/systemd/resolve/resolv.conf.
+func applyCloudMetadataAllows(configMgr *config.Manager, resolvedUpstreams []string, logger *slog.Logger) {
+	if len(resolvedUpstreams) > 0 {
 		configMgr.EnsureDNSAllowed(resolvedUpstreams)
 		logger.Info("Allowed systemd-resolved upstream DNS servers", "ips", resolvedUpstreams)
 	}
@@ -600,6 +621,10 @@ func autoAllowCloudMetadata(configMgr *config.Manager, logger *slog.Logger) {
 	// GCP. Both serve metadata over HTTP/80 so a single allow covers either
 	// cloud. Tagged GCP because the Azure wireserver branch below adds the
 	// stronger Azure-specific allows when running on Azure.
+	//
+	// On bare-metal hosts with no metadata service the BPF entry is a
+	// harmless no-op (nothing listens, no traffic flows). The deliberate
+	// trade-off is one no-op map entry vs. an invasive cloud-detection probe.
 	configMgr.EnsureInfraAllowed([]string{"169.254.169.254"}, []config.Port{config.PortHTTP}, config.AutoAddedTypeGCPInfrastructure)
 
 	// Azure detection: the wireserver IP 168.63.129.16 is unique to Azure
@@ -670,8 +695,10 @@ func autoAllowGitHubHosts(configMgr *config.Manager, logger *slog.Logger) {
 
 // autoAllowGitlabHosts allows the default GitLab service hostnames plus any
 // hostnames discovered in the CI_* runtime environment variables that
-// GitLab Runner exports into the job environment. Defaults are overridable
-// via CARGOWALL_GITLAB_SERVICE_HOSTS.
+// GitLab Runner exports into the job environment. The defaults assume
+// gitlab.com SaaS — self-hosted GitLab users should override them via
+// CARGOWALL_GITLAB_SERVICE_HOSTS. CI_SERVER_URL discovery below covers the
+// self-hosted endpoint regardless.
 func autoAllowGitlabHosts(configMgr *config.Manager, logger *slog.Logger) {
 	gitlabHosts := []string{
 		"gitlab.com",
@@ -697,8 +724,10 @@ func autoAllowGitlabHosts(configMgr *config.Manager, logger *slog.Logger) {
 
 // autoAllowFromEnvURLs reads each env var as a URL and adds an HTTPS allow
 // rule for its hostname. Used by both the GitHub and GitLab auto-allow paths
-// to discover runtime endpoints injected by the CI runner.
-func autoAllowFromEnvURLs(configMgr *config.Manager, logger *slog.Logger, autoAddedType config.AutoAddedType, label string, envVars []string) {
+// to discover runtime endpoints injected by the CI runner. The kind label
+// (e.g. "Actions runtime", "GitLab CI runtime") is logged so operators can
+// trace which discovery path produced a given allow.
+func autoAllowFromEnvURLs(configMgr *config.Manager, logger *slog.Logger, autoAddedType config.AutoAddedType, kind string, envVars []string) {
 	for _, envVar := range envVars {
 		val := os.Getenv(envVar)
 		if val == "" {
@@ -709,7 +738,7 @@ func autoAllowFromEnvURLs(configMgr *config.Manager, logger *slog.Logger, autoAd
 			continue
 		}
 		configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, autoAddedType)
-		logger.Info("Auto-allowed "+label+" hostname", "env", envVar, "hostname", u.Hostname())
+		logger.Info("Auto-allowed CI runtime hostname", "kind", kind, "env", envVar, "hostname", u.Hostname())
 	}
 }
 

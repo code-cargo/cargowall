@@ -26,11 +26,11 @@ import (
 	"time"
 )
 
-// StopCmd reads a pidfile written by `cargowall start --detach`, sends
+// StopCmd reads a pidfile written by `cargowall start --pidfile X`, sends
 // SIGTERM to that process, and waits for it to exit (so subsequent CI
 // teardown steps can rely on iptables/Docker DNS having been restored).
 type StopCmd struct {
-	Pidfile string        `help:"Path to the pidfile written by 'cargowall start --detach'" default:"/run/cargowall.pid" env:"CARGOWALL_PIDFILE"`
+	Pidfile string        `help:"Path to the pidfile written by 'cargowall start --pidfile X'" required:"" env:"CARGOWALL_PIDFILE"`
 	Timeout time.Duration `help:"How long to wait for the process to exit after SIGTERM" default:"15s"`
 	Remove  bool          `help:"Remove the pidfile after a successful stop" default:"true"`
 }
@@ -66,12 +66,16 @@ func stopProcess(pid int, timeout time.Duration, pidfile string, remove bool) er
 		return fmt.Errorf("find process %d: %w", pid, err)
 	}
 
+	cleanup := func() {
+		if remove {
+			_ = os.Remove(pidfile)
+		}
+	}
+
 	if err := proc.Signal(syscall.SIGTERM); err != nil {
 		// ESRCH means the process is already gone — treat that as success.
 		if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
-			if remove {
-				_ = os.Remove(pidfile)
-			}
+			cleanup()
 			return nil
 		}
 		return fmt.Errorf("send SIGTERM to %d: %w", pid, err)
@@ -81,9 +85,7 @@ func stopProcess(pid int, timeout time.Duration, pidfile string, remove bool) er
 	for {
 		// Signal 0 probes whether the process exists without delivering anything.
 		if err := proc.Signal(syscall.Signal(0)); err != nil {
-			if remove {
-				_ = os.Remove(pidfile)
-			}
+			cleanup()
 			return nil
 		}
 		if time.Now().After(deadline) {

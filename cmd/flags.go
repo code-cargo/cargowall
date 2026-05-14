@@ -128,30 +128,33 @@ func (c *StartCmd) CIMode() CIMode {
 	return CIModeNone
 }
 
-// AfterApply expands CI presets into the orthogonal flags they imply.
-// `--github-action` and `--gitlab-ci` are conveniences that turn on the
-// underlying plumbing flags so users don't have to enumerate each one.
+// AfterApply expands the active CI preset into the orthogonal flags it
+// implies. `--github-action` and `--gitlab-ci` are conveniences that turn
+// on the underlying plumbing flags so users don't have to enumerate each
+// one. The presets are mutually exclusive — if both are set, CIMode()'s
+// precedence rule (GitHub wins) is the single source of truth.
 func (c *StartCmd) AfterApply() error {
-	if c.GithubAction {
-		c.applyCIPreset(true /* github */)
-	}
-	if c.GitlabCI {
-		c.applyCIPreset(false /* gitlab */)
+	switch c.CIMode() {
+	case CIModeGithubAction:
+		c.applyCIPreset(CIModeGithubAction)
+	case CIModeGitlabCI:
+		c.applyCIPreset(CIModeGitlabCI)
 	}
 	return nil
 }
 
 // applyCIPreset turns on the plumbing flags shared by both CI presets, then
 // sets the host auto-allow flag specific to the named CI.
-func (c *StartCmd) applyCIPreset(github bool) {
+func (c *StartCmd) applyCIPreset(mode CIMode) {
 	c.DNSRedirectIptables = true
 	c.DockerDNSInterception = true
 	c.DNSQueryFiltering = true
 	c.PrepopulateDNSCache = true
 	c.AutoAllowCloudMetadata = true
-	if github {
+	switch mode {
+	case CIModeGithubAction:
 		c.AutoAllowGitHubHosts = true
-	} else {
+	case CIModeGitlabCI:
 		c.AutoAllowGitlabHosts = true
 	}
 }
@@ -165,6 +168,10 @@ func defaultLogger(debug bool) *slog.Logger {
 }
 
 func (c *StartCmd) Run(globals *Globals) error {
+	// GithubAction-only by design: the handler emits GitHub-specific
+	// `::error::` / `::warning::` workflow commands. GitLab CI has no
+	// equivalent log-formatting protocol, so --gitlab-ci falls through to
+	// the default JSON logger.
 	if c.GithubAction {
 		c.Logger = slog.New(NewGitHubActionsHandler(globals.Debug))
 	} else {
@@ -210,5 +217,5 @@ type CLI struct {
 	Start     StartCmd     `cmd:"" help:"Start the Cargowall eBPF firewall"`
 	Summary   SummaryCmd   `cmd:"" help:"Generate audit summary correlating events with GitHub Actions steps"`
 	WaitReady WaitReadyCmd `cmd:"" name:"wait-ready" help:"Block until the cargowall ready sentinel appears"`
-	Stop      StopCmd      `cmd:"" help:"Send SIGTERM to a daemonized cargowall process"`
+	Stop      StopCmd      `cmd:"" help:"Send SIGTERM to a backgrounded cargowall process and wait for it to exit"`
 }

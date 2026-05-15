@@ -309,3 +309,77 @@ func TestStartCmd_Run_HooksWithNilInitLogger(t *testing.T) {
 	_, isJSON := cmd.Logger.Handler().(*slog.JSONHandler)
 	assert.True(t, isJSON)
 }
+
+// --- AfterApply: CI preset expansion ---
+
+func TestStartCmd_AfterApply_GithubActionExpandsOrthogonalFlags(t *testing.T) {
+	cmd := &StartCmd{GithubAction: true}
+	require.NoError(t, cmd.AfterApply())
+
+	assert.True(t, cmd.DNSRedirectIptables, "github-action should enable --dns-redirect-iptables")
+	assert.True(t, cmd.DockerDNSInterception, "github-action should enable --docker-dns-interception")
+	assert.True(t, cmd.DNSQueryFiltering, "github-action should enable --dns-query-filtering")
+	assert.True(t, cmd.PrepopulateDNSCache, "github-action should enable --prepopulate-dns-cache")
+	assert.True(t, cmd.AutoAllowCloudMetadata, "github-action should enable --auto-allow-cloud-metadata")
+	assert.True(t, cmd.AutoAllowGitHubHosts, "github-action should enable --auto-allow-github-hosts")
+	assert.False(t, cmd.AutoAllowGitlabHosts, "github-action must NOT enable --auto-allow-gitlab-hosts")
+	assert.Equal(t, CIModeGithubAction, cmd.CIMode())
+}
+
+func TestStartCmd_AfterApply_GitlabCIExpandsOrthogonalFlags(t *testing.T) {
+	cmd := &StartCmd{GitlabCI: true}
+	require.NoError(t, cmd.AfterApply())
+
+	assert.True(t, cmd.DNSRedirectIptables, "gitlab-ci should enable --dns-redirect-iptables")
+	assert.True(t, cmd.DockerDNSInterception, "gitlab-ci should enable --docker-dns-interception")
+	assert.True(t, cmd.DNSQueryFiltering, "gitlab-ci should enable --dns-query-filtering")
+	assert.True(t, cmd.PrepopulateDNSCache, "gitlab-ci should enable --prepopulate-dns-cache")
+	assert.True(t, cmd.AutoAllowCloudMetadata, "gitlab-ci should enable --auto-allow-cloud-metadata")
+	assert.True(t, cmd.AutoAllowGitlabHosts, "gitlab-ci should enable --auto-allow-gitlab-hosts")
+	assert.False(t, cmd.AutoAllowGitHubHosts, "gitlab-ci must NOT enable --auto-allow-github-hosts")
+	assert.Equal(t, CIModeGitlabCI, cmd.CIMode())
+}
+
+func TestStartCmd_AfterApply_NoPresetLeavesFlagsUnset(t *testing.T) {
+	cmd := &StartCmd{}
+	require.NoError(t, cmd.AfterApply())
+
+	assert.False(t, cmd.DNSRedirectIptables)
+	assert.False(t, cmd.DockerDNSInterception)
+	assert.False(t, cmd.DNSQueryFiltering)
+	assert.False(t, cmd.PrepopulateDNSCache)
+	assert.False(t, cmd.AutoAllowCloudMetadata)
+	assert.False(t, cmd.AutoAllowGitHubHosts)
+	assert.False(t, cmd.AutoAllowGitlabHosts)
+	assert.Equal(t, CIModeNone, cmd.CIMode())
+}
+
+func TestStartCmd_AfterApply_OrthogonalFlagsPreservedWhenSetExplicitly(t *testing.T) {
+	// User sets --dns-redirect-iptables alone (no preset). The flag should
+	// stay set after AfterApply runs.
+	cmd := &StartCmd{DNSRedirectIptables: true}
+	require.NoError(t, cmd.AfterApply())
+
+	assert.True(t, cmd.DNSRedirectIptables, "explicitly-set orthogonal flag should not be cleared")
+	assert.False(t, cmd.DockerDNSInterception, "other flags should remain false without a preset")
+	assert.Equal(t, CIModeNone, cmd.CIMode())
+}
+
+func TestStartCmd_CIMode_GithubBeatsGitlabWhenBothSet(t *testing.T) {
+	// Pathological config: both presets set. GitHub wins (arbitrary but
+	// stable). Documented so callers can rely on it.
+	cmd := &StartCmd{GithubAction: true, GitlabCI: true}
+	assert.Equal(t, CIModeGithubAction, cmd.CIMode())
+}
+
+func TestStartCmd_AfterApply_BothPresetsSet_OnlyGithubHostsAllowed(t *testing.T) {
+	// Both presets set: AfterApply must follow CIMode() precedence and
+	// expand only the GitHub host-allow flag, not both. Otherwise the runtime
+	// auto-allows would silently widen beyond what the documented mode promises.
+	cmd := &StartCmd{GithubAction: true, GitlabCI: true}
+	require.NoError(t, cmd.AfterApply())
+
+	assert.True(t, cmd.AutoAllowGitHubHosts, "github-action wins, so GitHub hosts should be allowed")
+	assert.False(t, cmd.AutoAllowGitlabHosts, "GitLab hosts must NOT be allowed when GitHub preset wins")
+	assert.True(t, cmd.AutoAllowCloudMetadata, "shared plumbing should still be enabled")
+}

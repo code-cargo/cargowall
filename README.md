@@ -197,11 +197,15 @@ sudo cargowall start \
   --dns-upstream 8.8.8.8:53
 ```
 
-Standalone mode does **not** install the iptables DNS redirect or rewrite Docker's DNS config — that wiring is only applied in GitHub Actions mode. You need to route DNS traffic through the local proxy yourself, otherwise hostname rules will never populate (e.g. the `github.com` allow rule above will stay empty and traffic will be blocked under a deny-by-default policy). Common options:
+By default, standalone mode does **not** install the iptables DNS redirect or rewrite Docker's DNS config. You need to route DNS traffic through the local proxy yourself, otherwise hostname rules will never populate (e.g. the `github.com` allow rule above will stay empty and traffic will be blocked under a deny-by-default policy). Three options:
 
-* Point `/etc/resolv.conf` at `nameserver 127.0.0.1` for host processes
-* Pass `--dns 127.0.0.1` to `docker run` (or set `"dns"` in `/etc/docker/daemon.json`) for containers
-* Add your own `iptables` NAT rule redirecting outbound `udp/tcp 53` to `127.0.0.1:53` for processes that bypass `/etc/resolv.conf` (Go's pure resolver, Node.js)
+1. **Pass the orthogonal flags** to let cargowall do the wiring (recommended on CI runners):
+   ```bash
+   sudo cargowall start --config /etc/cargowall/config.json --dns-upstream 8.8.8.8:53 \
+     --dns-redirect-iptables --docker-dns-interception --dns-query-filtering
+   ```
+2. **Use a CI preset** (`--github-action` or `--gitlab-ci`) — bundles all of the above plus cache pre-population and CI-specific host auto-allow.
+3. **Wire it manually**: point `/etc/resolv.conf` at `nameserver 127.0.0.1`, pass `--dns 127.0.0.1` to `docker run`, add your own `iptables -t nat -A OUTPUT -p udp --dport 53 ! -d 127.0.0.0/8 -j DNAT --to-destination 127.0.0.1:53`.
 
 Useful flags (most available as env vars — see `cargowall start --help`):
 
@@ -212,9 +216,61 @@ Useful flags (most available as env vars — see `cargowall start --help`):
 | `--dns-upstream` | `CARGOWALL_DNS_UPSTREAM` | Upstream DNS server (required) |
 | `--audit-mode` | `CARGOWALL_AUDIT_MODE` | Log only — don't block (recommended for rollout) |
 | `--audit-log` | `CARGOWALL_AUDIT_LOG` | NDJSON audit log path |
+| `--pidfile` | `CARGOWALL_PIDFILE` | Write the cargowall pid here so `cargowall stop` can target it |
 | `--debug` | — | Verbose logging |
+| `--github-action` | `CARGOWALL_GITHUB_ACTION` | GitHub Actions preset (expands the orthogonal flags below) |
+| `--gitlab-ci` | `CARGOWALL_GITLAB_CI` | GitLab CI preset (same plumbing, GitLab service host auto-allow instead) |
+| `--dns-redirect-iptables` | `CARGOWALL_DNS_REDIRECT_IPTABLES` | iptables DNAT outbound :53 → `127.0.0.1:53` |
+| `--docker-dns-interception` | `CARGOWALL_DOCKER_DNS_INTERCEPTION` | Listen on the Docker bridge IP and rewrite `/etc/docker/daemon.json` |
+| `--dns-query-filtering` | `CARGOWALL_DNS_QUERY_FILTERING` | Filter DNS queries against the policy (blocks DNS tunneling) |
+| `--prepopulate-dns-cache` | `CARGOWALL_PREPOPULATE_DNS_CACHE` | Seed the BPF allowlist from systemd-resolved + existing TCP connections |
+| `--auto-allow-cloud-metadata` | `CARGOWALL_AUTO_ALLOW_CLOUD_METADATA` | Allow Azure IMDS / GCP metadata at `169.254.169.254` (auto-detects Azure wireserver too) |
+| `--auto-allow-github-hosts` | `CARGOWALL_AUTO_ALLOW_GITHUB_HOSTS` | Allow GitHub service hosts + `ACTIONS_*` runtime URL discovery |
+| `--auto-allow-gitlab-hosts` | `CARGOWALL_AUTO_ALLOW_GITLAB_HOSTS` | Allow GitLab service hosts + `CI_*` runtime URL discovery |
 
-When CargoWall is ready, it writes a `/tmp/cargowall-ready` sentinel — useful for CI scripts that want to gate the build step until the firewall is up.
+When CargoWall is ready, it writes a `/tmp/cargowall-ready` sentinel. Use the `cargowall wait-ready` subcommand from your CI script to block until the firewall is up — it polls the sentinel and exits non-zero on timeout.
+
+## GitLab CI
+
+GitLab SaaS Linux runners give your job root inside a privileged Docker container, which is enough for eBPF — but you'll want to run a smoke job first to confirm `cargowall start --gitlab-ci` actually attaches in your project's runner image. Self-hosted runners with a recent kernel are the well-trodden path.
+
+```yaml
+variables:
+  CARGOWALL_VERSION: v1.2.0
+
+build:
+  tags: [self-hosted-linux]   # or remove for SaaS shared runners (see caveats above)
+  before_script:
+    - curl -fsSL -o /usr/local/bin/cargowall https://github.com/code-cargo/cargowall/releases/download/${CARGOWALL_VERSION}/cargowall-linux-amd64
+    - chmod +x /usr/local/bin/cargowall
+    - mkdir -p /etc/cargowall
+    - |
+      cat > /etc/cargowall/config.json <<'EOF'
+      {
+        "defaultAction": "deny",
+        "rules": [
+          {"type":"hostname","value":"gitlab.com","ports":[{"port":443,"protocol":"tcp"}],"action":"allow"},
+          {"type":"hostname","value":"registry.npmjs.org","ports":[{"port":443,"protocol":"tcp"}],"action":"allow"},
+          {"type":"cidr","value":"8.8.8.8/32","ports":[{"port":53,"protocol":"udp"}],"action":"allow"}
+        ]
+      }
+      EOF
+    - cargowall start --gitlab-ci --audit-mode --audit-log /tmp/cargowall.ndjson --pidfile /tmp/cargowall.pid --dns-upstream 8.8.8.8:53 &
+    - cargowall wait-ready --timeout 30s
+  script:
+    - npm ci
+    - npm run build
+  after_script:
+    - cargowall stop --pidfile /tmp/cargowall.pid
+  artifacts:
+    when: always
+    paths:
+      - /tmp/cargowall.ndjson
+```
+
+`--gitlab-ci` bundles the iptables DNS redirect, Docker DNS interception, query filtering, cache pre-population, cloud metadata auto-allow, and GitLab host auto-allow. To use just a subset, pass the orthogonal flags individually (see the flag table above).
+
+**Tip**: `CARGOWALL_PIDFILE` is read by both `start` and `stop`. Setting it once as a CI variable lets both invocations agree on the path without repeating `--pidfile` in every step.
 
 ## Audit-then-enforce
 
@@ -230,16 +286,11 @@ sudo cargowall start \
 
 ## What's not in the standalone path
 
-The GitHub Action wraps the binary with a few extras you'd build yourself on other platforms:
+The orthogonal flags above cover most of what the GitHub Action wraps the binary with. The remaining Action-only piece is:
 
-* Automatic Docker DNS interception (rewrites `/etc/docker/daemon.json`)
-* iptables DNS redirect for processes that bypass `/etc/resolv.conf`
-* Sudo lockdown to prevent firewall bypass mid-run
-* Auto-allow for Azure IMDS / GitHub service hosts
-* Post-run audit summary correlating events with workflow step timings
-* Optional CodeCargo SaaS policy fetch and result push
+* Post-run audit summary correlating events with workflow step timings (the `cargowall summary` subcommand can run standalone too, but the GitHub-step JSON it expects is GH-specific)
 
-If you want any of these on a different platform, the implementation lives in [`cmd/`](./cmd/) and most pieces are individually reusable.
+If you want a richer wrapper for another CI platform, the implementation lives in [`cmd/`](./cmd/) and most pieces are individually reusable.
 
 ---
 

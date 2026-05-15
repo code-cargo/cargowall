@@ -618,7 +618,7 @@ func TestEnsureInfraAllowed_SetsAutoAddedType(t *testing.T) {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
 	}
 
-	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{{Port: 80, Protocol: ProtocolTCP}})
+	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{{Port: 80, Protocol: ProtocolTCP}}, AutoAddedTypeAzureInfrastructure)
 
 	if len(cm.config.Rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(cm.config.Rules))
@@ -635,7 +635,7 @@ func TestEnsureInfraAllowed_ICMP(t *testing.T) {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
 	}
 
-	cm.EnsureInfraAllowed([]string{"168.63.129.16"}, []Port{PortICMP})
+	cm.EnsureInfraAllowed([]string{"168.63.129.16"}, []Port{PortICMP}, AutoAddedTypeAzureInfrastructure)
 
 	if len(cm.config.Rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(cm.config.Rules))
@@ -902,7 +902,7 @@ func TestGetAutoAllowedType(t *testing.T) {
 
 	// Add auto-added rules
 	cm.EnsureDNSAllowed([]string{"8.8.8.8"})
-	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{{Port: 80, Protocol: ProtocolTCP}})
+	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{{Port: 80, Protocol: ProtocolTCP}}, AutoAddedTypeAzureInfrastructure)
 	cm.EnsureHostnameAllowed("actions.githubusercontent.com", []Port{{Port: 443, Protocol: ProtocolTCP}}, AutoAddedTypeGitHubService)
 
 	// DNS rule should match on port 53

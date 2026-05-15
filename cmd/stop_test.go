@@ -21,9 +21,64 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestWritePidfile_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pid")
+
+	if err := writePidfile(path, 4242); err != nil {
+		t.Fatalf("writePidfile: %v", err)
+	}
+	got, err := readPidfile(path)
+	if err != nil {
+		t.Fatalf("readPidfile: %v", err)
+	}
+	if got != 4242 {
+		t.Fatalf("got pid %d, want 4242", got)
+	}
+}
+
+// O_NOFOLLOW is the *only* defense against the symlink-clobber attack
+// (a previous job on a shared self-hosted runner planting /tmp/cargowall.pid
+// as a symlink to /etc/hostname or similar). Pin the behavior so a future
+// refactor can't quietly drop the flag and leave the security gap open.
+func TestWritePidfile_RefusesToFollowSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "innocent-file")
+	pidfile := filepath.Join(dir, "pidfile")
+
+	original := []byte("important contents\n")
+	if err := os.WriteFile(target, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, pidfile); err != nil {
+		t.Fatal(err)
+	}
+
+	err := writePidfile(pidfile, 9999)
+	if err == nil {
+		t.Fatal("writePidfile should fail when the path is a symlink, got nil")
+	}
+	if !strings.Contains(err.Error(), "too many levels of symbolic links") &&
+		!strings.Contains(err.Error(), "ELOOP") {
+		// On Linux, O_NOFOLLOW on a symlink returns ELOOP. Accept either the
+		// raw constant name or the message text the kernel produces.
+		t.Logf("note: error was %v (still a refusal, just unexpected wording)", err)
+	}
+
+	// The critical property: the symlink target must be unmodified.
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read symlink target: %v", err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("symlink target was clobbered: got %q, want %q", string(got), string(original))
+	}
+}
 
 func TestReadPidfile_Valid(t *testing.T) {
 	dir := t.TempDir()

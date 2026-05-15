@@ -27,7 +27,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -407,26 +406,18 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	// Write pidfile BEFORE the ready sentinel so a `wait-ready` then `stop
 	// --pidfile X` sequence never races.
 	//
-	// O_NOFOLLOW: cargowall typically runs as root. If a previous job on a
-	// shared self-hosted runner planted a symlink at the pidfile path
-	// pointing at e.g. /etc/hostname, a vanilla os.WriteFile would clobber
-	// the target. O_NOFOLLOW makes open() fail with ELOOP instead.
+	// Failure to write is fatal — the user opted into --pidfile expecting
+	// `cargowall stop` to work later; silently best-effort would leave them
+	// with a useful-looking startup but a broken teardown.
 	if cmd.Pidfile != "" {
-		pidStr := strconv.Itoa(os.Getpid())
-		f, err := os.OpenFile(cmd.Pidfile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
-		if err != nil {
-			logger.Warn("Failed to open pidfile", "path", cmd.Pidfile, "error", err)
-		} else {
-			if _, err := f.WriteString(pidStr + "\n"); err != nil {
-				logger.Warn("Failed to write pidfile", "path", cmd.Pidfile, "error", err)
-			}
-			_ = f.Close()
-			defer func() {
-				if err := os.Remove(cmd.Pidfile); err != nil && !errors.Is(err, os.ErrNotExist) {
-					logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", err)
-				}
-			}()
+		if err := writePidfile(cmd.Pidfile, os.Getpid()); err != nil {
+			return fmt.Errorf("write pidfile %s: %w (cargowall stop --pidfile will not work)", cmd.Pidfile, err)
 		}
+		defer func() {
+			if err := os.Remove(cmd.Pidfile); err != nil && !errors.Is(err, os.ErrNotExist) {
+				logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", err)
+			}
+		}()
 	}
 
 	if hooks != nil && hooks.Ready != nil {
@@ -434,8 +425,8 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			return fmt.Errorf("ready hook failed: %w", err)
 		}
 	} else {
-		if err := os.WriteFile("/tmp/cargowall-ready", nil, 0o660); err != nil {
-			return fmt.Errorf("writing ready file: %w", err)
+		if err := os.WriteFile(cmd.ReadyFile, nil, 0o660); err != nil {
+			return fmt.Errorf("writing ready file %s: %w", cmd.ReadyFile, err)
 		}
 	}
 

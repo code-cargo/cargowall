@@ -104,6 +104,10 @@ type StartCmd struct {
 	// delegated to the shell (`cargowall start --pidfile X &`) — true Unix
 	// daemonization isn't worth the Go runtime complexity for CI use.
 	Pidfile string `help:"Write the cargowall process pid to this file (used with 'cargowall stop')" default:"" env:"CARGOWALL_PIDFILE"`
+
+	// ReadyFile path is shared with `cargowall wait-ready` via the same
+	// default and env var, so the two subcommands always agree.
+	ReadyFile string `help:"Path to write the readiness sentinel file" default:"/tmp/cargowall-ready" env:"CARGOWALL_READY_FILE"`
 }
 
 // CIMode is the active CI integration mode, derived from which preset flag

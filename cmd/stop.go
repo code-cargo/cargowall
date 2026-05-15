@@ -58,6 +58,23 @@ func readPidfile(path string) (int, error) {
 	return pid, nil
 }
 
+// writePidfile writes pid as a decimal string + newline to path.
+//
+// O_NOFOLLOW is the load-bearing detail: cargowall typically runs as root,
+// and a previous job on a shared self-hosted runner could plant a symlink
+// at the pidfile path pointing at e.g. /etc/hostname. Without O_NOFOLLOW,
+// open() would follow the link and we'd silently clobber the target.
+// With O_NOFOLLOW the call fails with ELOOP — see TestWritePidfile_RefusesToFollowSymlink.
+func writePidfile(path string, pid int) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(strconv.Itoa(pid) + "\n")
+	return err
+}
+
 // stopProcess sends SIGTERM and polls until the process exits or the
 // timeout fires. Removes the pidfile on success when remove is true.
 func stopProcess(pid int, timeout time.Duration, pidfile string, remove bool) error {

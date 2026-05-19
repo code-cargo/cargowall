@@ -558,12 +558,28 @@ func TestSummary_AuditEventToProto_AutoAllowedType(t *testing.T) {
 		assert.Equal(t, data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_GITHUB_SERVICE, *proto.AutoAllowedType)
 	})
 
+	t.Run("gitlab_service", func(t *testing.T) {
+		ev := makeEvent(t, events.EventConnectionAllowed, "gitlab.com", "1.1.1.1", "curl", 443, ts)
+		ev.AutoAllowedType = "gitlab_service"
+		proto := auditEventToProto(ev)
+		require.NotNil(t, proto.AutoAllowedType)
+		assert.Equal(t, data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_GITLAB_SERVICE, *proto.AutoAllowedType)
+	})
+
 	t.Run("codecargo_service", func(t *testing.T) {
 		ev := makeEvent(t, events.EventConnectionAllowed, "api.codecargo.io", "1.2.3.4", "curl", 443, ts)
 		ev.AutoAllowedType = "codecargo_service"
 		proto := auditEventToProto(ev)
 		require.NotNil(t, proto.AutoAllowedType)
 		assert.Equal(t, data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_CODECARGO_SERVICE, *proto.AutoAllowedType)
+	})
+
+	t.Run("cloud_metadata", func(t *testing.T) {
+		ev := makeEvent(t, events.EventConnectionAllowed, "", "169.254.169.254", "curl", 80, ts)
+		ev.AutoAllowedType = "cloud_metadata"
+		proto := auditEventToProto(ev)
+		require.NotNil(t, proto.AutoAllowedType)
+		assert.Equal(t, data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_CLOUD_METADATA, *proto.AutoAllowedType)
 	})
 
 	t.Run("empty_not_set", func(t *testing.T) {

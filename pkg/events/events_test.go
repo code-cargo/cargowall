@@ -36,6 +36,21 @@ import (
 	"github.com/code-cargo/cargowall/pkg/config"
 )
 
+// verdictPrimaryAction flattens a HostnameVerdict into a single Action for
+// tests that were written before mixed verdicts existed. Returns the deny
+// side if present (more restrictive wins for back-compat assertion shape),
+// else the allow side, else "" for no-match.
+func verdictPrimaryAction(v config.HostnameVerdict) config.Action {
+	switch {
+	case v.HasDeny():
+		return config.ActionDeny
+	case v.HasAllow():
+		return config.ActionAllow
+	default:
+		return ""
+	}
+}
+
 // TestSubdomainHandling exercises config.Manager subdomain matching logic
 // from the events package perspective. The core logic under test lives in pkg/config.
 func TestSubdomainHandling(t *testing.T) {
@@ -126,7 +141,8 @@ func TestSubdomainHandling(t *testing.T) {
 			}
 
 			// Test MatchHostnameRule
-			action, _, _ := cm.MatchHostnameRule(tt.dnsHostname)
+			v := cm.MatchHostnameRule(tt.dnsHostname)
+			action := verdictPrimaryAction(v)
 
 			if tt.expectedAction != "" && action != tt.expectedAction {
 				t.Errorf("MatchHostnameRule(%s) = %s, want %s",
@@ -134,7 +150,7 @@ func TestSubdomainHandling(t *testing.T) {
 			}
 
 			// Test if rule would be added to map
-			if action != "" {
+			if v.Matched() {
 				defaultAction := cm.GetDefaultAction()
 				shouldAdd := action != defaultAction
 
@@ -217,10 +233,11 @@ func TestConflictHandling(t *testing.T) {
 			}
 
 			// Test conflict detection
-			hostnameAction, _, _ := cm.MatchHostnameRule(tt.dnsHostname)
-			if hostnameAction == "" {
+			v := cm.MatchHostnameRule(tt.dnsHostname)
+			if !v.Matched() {
 				t.Fatalf("Hostname %s not tracked", tt.dnsHostname)
 			}
+			hostnameAction := verdictPrimaryAction(v)
 
 			// Get ports for hostname rule
 			var hostnamePorts []config.Port

@@ -14,6 +14,7 @@ message CargoWallPolicy {
   CargoWallMode mode = 1;
   CargoWallActionType default_action = 2;
   SudoLockdown sudo_lockdown = 3;
+  repeated string search_domains = 4;
 
   repeated Rule rules = 100;
 

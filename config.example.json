@@ -43,6 +43,10 @@
       "action": "allow"
     }
   ],
+  "searchDomains": [
+    ".compute.internal",
+    ".ec2.internal"
+  ],
   "sudoLockdown": {
     "enabled": false,
     "allowCommands": ["/usr/bin/apt-get", "/usr/bin/docker"]

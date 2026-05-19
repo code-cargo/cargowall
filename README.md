@@ -104,6 +104,25 @@ allowed-hosts: |
   **.storage.azure.com
 ```
 
+**Search domains** whitelist whole DNS suffixes for resolution without per-hostname tracking. Typical use case: you've allowed a VPC CIDR for internal traffic and want DNS resolution to work for any name under that VPC's internal suffix.
+
+```yaml
+search-domains: |
+  .compute.internal
+  .ec2.internal
+```
+
+The action input above (`search-domains`) corresponds to `searchDomains` in JSON config, `CARGOWALL_SEARCH_DOMAINS` in env, and `search_domains` in the protobuf policy.
+
+Each user-configured suffix has two effects:
+
+- **Stripping before rule matching** — a rule for `bastion` matches `bastion.compute.internal`.
+- **Bypass for unmatched DNS queries** — any name ending in the suffix passes the DNS proxy when no hostname rule matches it. An explicit `deny` rule (e.g. for `blocked.compute.internal`) still wins.
+
+Matching is case-insensitive; when configured suffixes overlap, the longest match wins. The Kubernetes suffixes (`.cluster.local`, `.svc.cluster.local`, `.default.svc.cluster.local`) are always active for stripping only — they don't grant the filter bypass, so K8s service names must still match a hostname rule after stripping.
+
+Suffixes must have at least two labels **and** must not themselves be public suffixes per [Mozilla's PSL](https://publicsuffix.org/); `.com`, `.co.uk`, `.com.au`, `.github.io`, and similar TLD-equivalents are rejected at config load.
+
 See the [cargowall-action README](https://github.com/code-cargo/cargowall-action) for full usage, inputs, outputs, and examples.
 
 ---
@@ -224,7 +243,7 @@ Useful flags (most available as env vars — see `cargowall start --help`):
 | `--docker-dns-interception` | `CARGOWALL_DOCKER_DNS_INTERCEPTION` | Listen on the Docker bridge IP and rewrite `/etc/docker/daemon.json` |
 | `--dns-query-filtering` | `CARGOWALL_DNS_QUERY_FILTERING` | Filter DNS queries against the policy (blocks DNS tunneling) |
 | `--prepopulate-dns-cache` | `CARGOWALL_PREPOPULATE_DNS_CACHE` | Seed the BPF allowlist from systemd-resolved + existing TCP connections |
-| `--auto-allow-cloud-metadata` | `CARGOWALL_AUTO_ALLOW_CLOUD_METADATA` | Allow Azure IMDS / GCP metadata at `169.254.169.254` (auto-detects Azure wireserver too) |
+| `--auto-allow-cloud-metadata` | `CARGOWALL_AUTO_ALLOW_CLOUD_METADATA` | Allow IMDS at `169.254.169.254`; detects AWS / Azure / GCP via DMI (override with `CARGOWALL_CLOUD_PROVIDER=aws\|azure\|gcp`, case-insensitive; unknown values are ignored and detection falls through to DMI / wireserver signals) and adds provider-specific allows: Azure wireserver + infra hostnames + `.internal.cloudapp.net`, AWS `.compute.internal` + `.ec2.internal`, GCP `.google.internal` |
 | `--auto-allow-github-hosts` | `CARGOWALL_AUTO_ALLOW_GITHUB_HOSTS` | Allow GitHub service hosts + `ACTIONS_*` runtime URL discovery |
 | `--auto-allow-gitlab-hosts` | `CARGOWALL_AUTO_ALLOW_GITLAB_HOSTS` | Allow GitLab service hosts + `CI_*` runtime URL discovery |
 

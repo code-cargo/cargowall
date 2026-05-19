@@ -124,6 +124,58 @@ func TestGenerateCacheKey(t *testing.T) {
 			expected: "example.com.|AAAA|IN",
 		},
 		{
+			name: "TXT record query",
+			msg: &dns.Msg{
+				Question: []dns.Question{
+					{
+						Name:   "example.com.",
+						Qtype:  dns.TypeTXT,
+						Qclass: dns.ClassINET,
+					},
+				},
+			},
+			expected: "example.com.|TXT|IN",
+		},
+		{
+			name: "MX record query",
+			msg: &dns.Msg{
+				Question: []dns.Question{
+					{
+						Name:   "example.com.",
+						Qtype:  dns.TypeMX,
+						Qclass: dns.ClassINET,
+					},
+				},
+			},
+			expected: "example.com.|MX|IN",
+		},
+		{
+			name: "SRV record query",
+			msg: &dns.Msg{
+				Question: []dns.Question{
+					{
+						Name:   "_xmpp._tcp.example.com.",
+						Qtype:  dns.TypeSRV,
+						Qclass: dns.ClassINET,
+					},
+				},
+			},
+			expected: "_xmpp._tcp.example.com.|SRV|IN",
+		},
+		{
+			name: "uppercase name is lowercased",
+			msg: &dns.Msg{
+				Question: []dns.Question{
+					{
+						Name:   "EXAMPLE.COM.",
+						Qtype:  dns.TypeA,
+						Qclass: dns.ClassINET,
+					},
+				},
+			},
+			expected: "example.com.|A|IN",
+		},
+		{
 			name:     "empty question",
 			msg:      &dns.Msg{},
 			expected: "",
@@ -138,23 +190,57 @@ func TestGenerateCacheKey(t *testing.T) {
 	}
 }
 
-func TestStripKubernetesSearchDomains(t *testing.T) {
-	server := &Server{}
-
+func TestStripSearchDomains(t *testing.T) {
 	tests := []struct {
-		hostname string
-		expected string
+		name          string
+		searchDomains []string
+		hostname      string
+		expected      string
 	}{
-		{"myservice.default.svc.cluster.local", "myservice"},
-		{"myservice.svc.cluster.local", "myservice"},
-		{"myservice.cluster.local", "myservice"},
-		{"myservice.example.com", "myservice.example.com"},
-		{"myservice", "myservice"},
+		// Kubernetes suffixes are always active (hardcoded defaults).
+		{"k8s default", nil, "myservice.default.svc.cluster.local", "myservice"},
+		{"k8s svc", nil, "myservice.svc.cluster.local", "myservice"},
+		{"k8s cluster", nil, "myservice.cluster.local", "myservice"},
+		{"no match", nil, "myservice.example.com", "myservice.example.com"},
+		{"no suffix", nil, "myservice", "myservice"},
+
+		// User-configured suffixes are stripped alongside the K8s defaults.
+		{"aws compute", []string{".compute.internal"}, "ip-10-0-0-5.us-west-2.compute.internal", "ip-10-0-0-5.us-west-2"},
+		{"aws ec2", []string{".ec2.internal"}, "bastion.ec2.internal", "bastion"},
+		{"azure", []string{".internal.cloudapp.net"}, "myvm.internal.cloudapp.net", "myvm"},
+
+		// Case-insensitive: DNS names are case-insensitive but configured
+		// suffixes are normalized to lowercase by normalizeSearchDomains.
+		{"case-insensitive aws", []string{".compute.internal"}, "Bastion.Compute.Internal", "Bastion"},
+		{"case-insensitive k8s", nil, "MyService.SVC.Cluster.Local", "MyService"},
+
+		// Longest matching suffix wins, regardless of slice order.
+		{
+			name:          "longest configured suffix wins (specific first)",
+			searchDomains: []string{".us-west-2.compute.internal", ".compute.internal"},
+			hostname:      "ip-10-0-0-5.us-west-2.compute.internal",
+			expected:      "ip-10-0-0-5",
+		},
+		{
+			name:          "longest configured suffix wins (general first)",
+			searchDomains: []string{".compute.internal", ".us-west-2.compute.internal"},
+			hostname:      "ip-10-0-0-5.us-west-2.compute.internal",
+			expected:      "ip-10-0-0-5",
+		},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.hostname, func(t *testing.T) {
-			result := server.stripKubernetesSearchDomains(tt.hostname)
+		t.Run(tt.name, func(t *testing.T) {
+			cm := config.NewConfigManager()
+			// LoadConfigFromRules initializes cm.config so AddSearchDomains
+			// can actually take effect (the helper no-ops on nil config, by
+			// design — matches other auto-allow helpers).
+			require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+			if tt.searchDomains != nil {
+				cm.AddSearchDomains(tt.searchDomains, slog.Default())
+			}
+			server := &Server{config: cm}
+			result := server.stripSearchDomains(tt.hostname)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -192,7 +278,7 @@ func TestExtractIPsFromResponse(t *testing.T) {
 	assert.Len(t, ips, 2)
 	assert.Contains(t, ips, net.ParseIP("192.168.1.1"))
 	assert.Contains(t, ips, net.ParseIP("192.168.1.2"))
-	assert.Equal(t, uint32(600), ttl) // Returns the last TTL seen
+	assert.Equal(t, uint32(300), ttl, "minimum TTL across answers")
 }
 
 func TestAddIPToBPFMaps(t *testing.T) {
@@ -510,8 +596,8 @@ func TestDNSServerHostnamePortsLookup(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.hostname, func(t *testing.T) {
-			_, ports, _ := cfg.MatchHostnameRule(tt.hostname)
-			assert.Equal(t, tt.expected, ports)
+			v := cfg.MatchHostnameRule(tt.hostname)
+			assert.Equal(t, tt.expected, v.AllowPorts)
 		})
 	}
 }
@@ -705,6 +791,125 @@ func TestApplyRulesToTrackedHostnames(t *testing.T) {
 	assert.NotNil(t, cached, "Cached entry should still exist")
 }
 
+// Regression: when a DNS lookup for a name like "bastion.compute.internal"
+// is tracked BEFORE the .compute.internal search domain is auto-added (the
+// DNS proxy starts before config-loading + auto-allow), a follow-up
+// ApplyRulesToTrackedHostnames after the suffix is configured must apply
+// the short-name rule via search-domain stripping. Without the post-auto-allow
+// reprocess call, the tracked IP stays out of BPF until a fresh DNS response.
+func TestApplyRulesToTrackedHostnames_PicksUpLateAddedSearchDomain(t *testing.T) {
+	configMgr := config.NewConfigManager()
+	mockFirewall := firewall.NewMockFirewall(t)
+	logger := slog.Default()
+
+	server := NewServer(configMgr, mockFirewall, "8.8.8.8:53", "127.0.0.1:53", logger)
+
+	// 1) Rule for the SHORT name exists from the start.
+	require.NoError(t, configMgr.LoadConfigFromRules([]config.Rule{
+		{
+			Type:   config.RuleTypeHostname,
+			Value:  "bastion",
+			Ports:  []config.Port{{Port: 22, Protocol: config.ProtocolTCP}},
+			Action: config.ActionAllow,
+		},
+	}, config.ActionDeny))
+
+	// 2) DNS lookup arrives BEFORE the search domain is configured. The
+	// full-form hostname doesn't match any rule yet (search-domain stripping
+	// isn't active for ".compute.internal" until step 3).
+	configMgr.UpdateDNSMapping("bastion.compute.internal", "10.0.0.5")
+
+	// A pre-auto-allow reprocess pass finds no match (no search domain →
+	// MatchHostnameRule("bastion.compute.internal") returns no action). No
+	// AddIP is recorded; firewall.NewMockFirewall(t) would fail on any
+	// unexpected call.
+	server.ApplyRulesToTrackedHostnames()
+
+	// 3) Auto-allow adds the search domain.
+	configMgr.AddSearchDomains([]string{".compute.internal"}, logger)
+
+	// 4) The post-auto-allow reprocess must now apply the short-name rule
+	// to the cached IP via stripping.
+	mockFirewall.On(
+		"AddIP",
+		net.ParseIP("10.0.0.5"),
+		config.ActionAllow,
+		[]config.Port{{Port: 22, Protocol: config.ProtocolTCP}},
+	).Return(true, nil).Once()
+
+	server.ApplyRulesToTrackedHostnames()
+
+	mockFirewall.AssertExpectations(t)
+}
+
+// Mixed-verdict cross-form: full hostname matches a deny pattern on one
+// port and the search-domain-stripped form matches an allow on a different
+// port. The reprocess pass writes the non-default side to BPF; the side
+// that matches the default action is skipped (BPF map size optimization —
+// unlisted ports fall through to the default-action map at packet time).
+//
+// For a mixed verdict the default is always one of {allow, deny}, so
+// exactly one side gets written. Pinning both directions catches the path
+// where the wrong side is selected (e.g. if the short-circuit ever fired
+// on the non-default side).
+func TestApplyRulesToTrackedHostnames_MixedVerdict(t *testing.T) {
+	rules := []config.Rule{
+		{
+			Type:   config.RuleTypeHostname,
+			Value:  "*.compute.internal",
+			Ports:  []config.Port{{Port: 80, Protocol: config.ProtocolTCP}},
+			Action: config.ActionDeny,
+		},
+		{
+			Type:   config.RuleTypeHostname,
+			Value:  "bastion",
+			Ports:  []config.Port{{Port: 22, Protocol: config.ProtocolTCP}},
+			Action: config.ActionAllow,
+		},
+	}
+	cases := []struct {
+		name          string
+		defaultAction config.Action
+		writeAction   config.Action
+		writePorts    []config.Port
+	}{
+		{
+			name:          "default_deny_writes_allow_side",
+			defaultAction: config.ActionDeny,
+			writeAction:   config.ActionAllow,
+			writePorts:    []config.Port{{Port: 22, Protocol: config.ProtocolTCP}},
+		},
+		{
+			name:          "default_allow_writes_deny_side",
+			defaultAction: config.ActionAllow,
+			writeAction:   config.ActionDeny,
+			writePorts:    []config.Port{{Port: 80, Protocol: config.ProtocolTCP}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			configMgr := config.NewConfigManager()
+			mockFirewall := firewall.NewMockFirewall(t)
+			logger := slog.Default()
+			server := NewServer(configMgr, mockFirewall, "8.8.8.8:53", "127.0.0.1:53", logger)
+
+			require.NoError(t, configMgr.LoadConfigFromRules(rules, tc.defaultAction))
+			configMgr.AddSearchDomains([]string{".compute.internal"}, logger)
+			configMgr.UpdateDNSMapping("bastion.compute.internal", "10.0.0.5")
+
+			mockFirewall.On(
+				"AddIP",
+				net.ParseIP("10.0.0.5"),
+				tc.writeAction,
+				tc.writePorts,
+			).Return(true, nil).Once()
+
+			server.ApplyRulesToTrackedHostnames()
+			mockFirewall.AssertExpectations(t)
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // isQueryAllowed unit tests
 // ---------------------------------------------------------------------------
@@ -716,6 +921,7 @@ func TestIsQueryAllowed(t *testing.T) {
 		defaultAction config.Action
 		rules         []config.Rule
 		domain        string
+		qtype         uint16 // zero defaults to dns.TypeA below
 		expected      bool
 	}{
 		{
@@ -776,18 +982,118 @@ func TestIsQueryAllowed(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:          "deny-by-default, IPv4 reverse DNS (in-addr.arpa) always allowed",
+			name:          "PTR query for IPv4 reverse DNS (in-addr.arpa) is allowed",
 			filterEnabled: true,
 			defaultAction: config.ActionDeny,
 			domain:        "16.129.63.168.in-addr.arpa",
+			qtype:         dns.TypePTR,
 			expected:      true,
 		},
 		{
-			name:          "deny-by-default, IPv6 reverse DNS (ip6.arpa) always allowed",
+			name:          "PTR query for IPv6 reverse DNS (ip6.arpa) is allowed",
 			filterEnabled: true,
 			defaultAction: config.ActionDeny,
 			domain:        "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa",
+			qtype:         dns.TypePTR,
 			expected:      true,
+		},
+		{
+			// Non-PTR query against a PTR-shaped name does NOT bypass —
+			// otherwise TXT/A/NS queries could carry tunneled data in
+			// numeric labels under .in-addr.arpa.
+			name:          "TXT query against canonical PTR name is NOT bypassed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			domain:        "16.129.63.168.in-addr.arpa",
+			qtype:         dns.TypeTXT,
+			expected:      false,
+		},
+		{
+			// Same Qtype gate for IPv6.
+			name:          "A query against canonical IPv6 PTR name is NOT bypassed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			domain:        "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa",
+			qtype:         dns.TypeA,
+			expected:      false,
+		},
+		{
+			// Reverse-DNS bypass requires the canonical PTR shape — a name
+			// that merely ends in .in-addr.arpa with non-numeric labels is
+			// rejected so the suffix can't be used to smuggle tunneled data.
+			name:          "malformed in-addr.arpa (non-numeric label) is not bypassed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			domain:        "exfil.payload.in-addr.arpa",
+			qtype:         dns.TypePTR,
+			expected:      false,
+		},
+		{
+			// Same shape check for IPv6.
+			name:          "malformed ip6.arpa (multi-char label) is not bypassed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			domain:        "exfil.ip6.arpa",
+			qtype:         dns.TypePTR,
+			expected:      false,
+		},
+		{
+			// IPv4 PTR with octet out of 0–255 range is rejected.
+			name:          "in-addr.arpa with octet > 255 is not bypassed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			domain:        "999.0.0.0.in-addr.arpa",
+			qtype:         dns.TypePTR,
+			expected:      false,
+		},
+		{
+			// strconv.Atoi accepts "+1" as 1 — but "+1" is not a valid
+			// decimal octet label, so the strict digit-only check must
+			// reject it before conversion.
+			name:          "in-addr.arpa with sign-prefixed octet is not bypassed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			domain:        "+1.2.3.4.in-addr.arpa",
+			qtype:         dns.TypePTR,
+			expected:      false,
+		},
+		{
+			name:          "in-addr.arpa with negative octet is not bypassed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			domain:        "-0.2.3.4.in-addr.arpa",
+			qtype:         dns.TypePTR,
+			expected:      false,
+		},
+		{
+			// Canonical PTR is exactly 4 octets — shortened names (e.g. for
+			// rDNS delegation discovery, which uses NS/SOA queries anyway)
+			// must NOT pass the PTR bypass.
+			name:          "shortened IPv4 PTR (1.in-addr.arpa) is not bypassed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			domain:        "1.in-addr.arpa",
+			qtype:         dns.TypePTR,
+			expected:      false,
+		},
+		{
+			// Same for IPv6 — exactly 32 nibbles required.
+			name:          "shortened IPv6 PTR is not bypassed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			domain:        "d.e.a.d.ip6.arpa",
+			qtype:         dns.TypePTR,
+			expected:      false,
+		},
+		{
+			// Canonical PTR uses unpadded octets; "001" is rejected even
+			// though strconv.Atoi would parse it as 1.
+			name:          "in-addr.arpa with zero-padded octet is not bypassed",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			domain:        "001.2.3.4.in-addr.arpa",
+			qtype:         dns.TypePTR,
+			expected:      false,
 		},
 		{
 			name:          "deny-by-default, hostname pattern allowed",
@@ -819,6 +1125,31 @@ func TestIsQueryAllowed(t *testing.T) {
 			domain:   "evil.anything.example.com",
 			expected: false,
 		},
+		{
+			// Rule values configured with uppercase characters must still
+			// match — DNS names are case-insensitive and resolveRules now
+			// normalizes Rule.Value to lowercase at load.
+			name:          "uppercase rule value matches lowercase query",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "Example.COM", Action: config.ActionAllow},
+			},
+			domain:   "example.com",
+			expected: true,
+		},
+		{
+			// Mixed-case glob patterns work the same way — the literal
+			// segments are lowercased at compile time.
+			name:          "uppercase glob pattern matches lowercase query",
+			filterEnabled: true,
+			defaultAction: config.ActionDeny,
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "*.GitHub.com", Action: config.ActionAllow},
+			},
+			domain:   "api.github.com",
+			expected: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -833,7 +1164,146 @@ func TestIsQueryAllowed(t *testing.T) {
 				logger:        slog.Default(),
 			}
 
-			got := server.isQueryAllowed(tt.domain)
+			qtype := tt.qtype
+			if qtype == 0 {
+				qtype = dns.TypeA
+			}
+			got := server.isQueryAllowed(tt.domain, qtype)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestIsQueryAllowed_SearchDomainBypass(t *testing.T) {
+	tests := []struct {
+		name          string
+		searchDomains []string
+		rules         []config.Rule
+		defaultAction config.Action
+		domain        string
+		expected      bool
+	}{
+		{
+			name:          "AWS suffix bypasses filter with no hostname rule",
+			searchDomains: []string{".compute.internal"},
+			defaultAction: config.ActionDeny,
+			domain:        "ip-10-0-0-5.us-west-2.compute.internal",
+			expected:      true,
+		},
+		{
+			name:          "multiple suffixes — match second",
+			searchDomains: []string{".compute.internal", ".ec2.internal"},
+			defaultAction: config.ActionDeny,
+			domain:        "bastion.ec2.internal",
+			expected:      true,
+		},
+		{
+			name:          "non-matching domain still blocked",
+			searchDomains: []string{".compute.internal"},
+			defaultAction: config.ActionDeny,
+			domain:        "evil.example.com",
+			expected:      false,
+		},
+		{
+			// The leading-dot guard in the suffix prevents matching when the
+			// "suffix" text appears in the middle or at the end of a different
+			// label boundary.
+			name:          "partial suffix match (missing leading-dot boundary) does not bypass",
+			searchDomains: []string{".compute.internal"},
+			defaultAction: config.ActionDeny,
+			domain:        "evilnotcompute.internal",
+			expected:      false,
+		},
+		{
+			// Case-insensitive bypass: DNS responses can arrive with any case.
+			name:          "case-insensitive bypass",
+			searchDomains: []string{".compute.internal"},
+			defaultAction: config.ActionDeny,
+			domain:        "Bastion.EC2.Compute.Internal",
+			expected:      true,
+		},
+		{
+			// Explicit deny rule under a search-domain suffix must win — the
+			// bypass is for unmatched names only, never a way around an
+			// explicit policy.
+			name:          "explicit deny rule under search-domain suffix wins over bypass",
+			searchDomains: []string{".compute.internal"},
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "blocked.compute.internal", Action: config.ActionDeny},
+			},
+			defaultAction: config.ActionDeny,
+			domain:        "blocked.compute.internal",
+			expected:      false,
+		},
+		{
+			// A deny rule on the SHORT name should also win once the suffix is
+			// stripped. Otherwise the bypass would silently swallow the deny —
+			// the second-order version of the precedence bug above.
+			name:          "deny rule on stripped form wins over suffix bypass",
+			searchDomains: []string{".compute.internal"},
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "blocked", Action: config.ActionDeny},
+			},
+			defaultAction: config.ActionDeny,
+			domain:        "blocked.compute.internal",
+			expected:      false,
+		},
+		{
+			// Conversely, an allow rule on the SHORT name should be honored
+			// when the suffixed form is queried — this is the K8s short-name
+			// pattern, generalized to any configured search domain. isQueryAllowed
+			// does the strip-and-retry internally now.
+			name:          "allow rule on stripped form (short-name pattern) is honored via isQueryAllowed",
+			searchDomains: []string{".compute.internal"},
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "bastion", Action: config.ActionAllow},
+			},
+			defaultAction: config.ActionDeny,
+			domain:        "bastion.compute.internal",
+			expected:      true,
+		},
+		{
+			// Same pattern through the always-active Kubernetes suffixes —
+			// no configured searchDomains needed.
+			name:          "K8s suffix strip + allow rule on short name",
+			searchDomains: nil,
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "myservice", Action: config.ActionAllow},
+			},
+			defaultAction: config.ActionDeny,
+			domain:        "myservice.svc.cluster.local",
+			expected:      true,
+		},
+		{
+			// Case-bypass exploit guard: a mixed-case query must not route
+			// around an explicit deny on the stripped form. Before the
+			// case-insensitivity fix in MatchHostnameRule, "Blocked" wouldn't
+			// match the rule for "blocked", so this domain would slip through
+			// the search-domain bypass.
+			name:          "mixed-case query does not bypass deny on stripped form",
+			searchDomains: []string{".compute.internal"},
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "blocked", Action: config.ActionDeny},
+			},
+			defaultAction: config.ActionDeny,
+			domain:        "Blocked.Compute.Internal",
+			expected:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.NewConfigManager()
+			require.NoError(t, cfg.LoadConfigFromRules(tt.rules, tt.defaultAction))
+			cfg.AddSearchDomains(tt.searchDomains, slog.Default())
+
+			server := &Server{
+				config:        cfg,
+				filterQueries: true,
+				logger:        slog.Default(),
+			}
+
+			got := server.isQueryAllowed(tt.domain, dns.TypeA)
 			assert.Equal(t, tt.expected, got)
 		})
 	}
@@ -1006,6 +1476,101 @@ func TestHandleDNSQuery_FilteringAllowedDomainPasses(t *testing.T) {
 	assert.Equal(t, dns.RcodeSuccess, w.msg.Rcode)
 }
 
+// Bypass-only resolutions (a name allowed only by the search-domain bypass,
+// with no matching hostname rule on either form) must not populate either
+// the per-server hostnameIPs map or the config manager's reverse-lookup map.
+// Otherwise ephemeral cloud-internal names (e.g. ip-X-X-X-X.compute.internal
+// per EC2 instance) would grow these maps without bound.
+func TestHandleDNSQuery_BypassOnlySkipsHostnameTracking(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules(nil, config.ActionDeny))
+	cfg.AddSearchDomains([]string{".compute.internal"}, slog.Default())
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const fullName = "ip-10-0-0-5.us-west-2.compute.internal."
+	cachedResp := makeCachedResponse(fullName, "10.0.0.5")
+	cacheKey := server.generateCacheKey(&dns.Msg{
+		Question: []dns.Question{{Name: fullName, Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+	})
+	server.dnsCache.Put(cacheKey, &dnsCacheEntry{msg: cachedResp.Copy()}, 5*time.Minute)
+
+	query := new(dns.Msg)
+	query.SetQuestion(fullName, dns.TypeA)
+	query.Id = 5555
+
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+
+	server.handleDNSQuery(w, query)
+
+	w.AssertExpectations(t)
+	require.NotNil(t, w.msg)
+	assert.Equal(t, dns.RcodeSuccess, w.msg.Rcode, "bypass-allowed query should succeed")
+
+	// The query was allowed by the search-domain bypass with no matching
+	// hostname rule, so neither per-host map should be populated.
+	server.hostnameIPsMutex.RLock()
+	assert.Empty(t, server.hostnameIPs,
+		"hostnameIPs must not record bypass-only resolutions")
+	server.hostnameIPsMutex.RUnlock()
+	assert.Empty(t, cfg.GetIPToHostnameMap(),
+		"config ipToHostname map must not record bypass-only resolutions")
+
+	// No firewall AddIP should have been called (no matching rule);
+	// firewall.NewMockFirewall(t) will fail the test if any unexpected call
+	// happened, so this is an implicit assertion.
+}
+
+// Counterpoint to the above: when a rule matches the stripped form (the K8s
+// or short-name pattern), per-host tracking SHOULD happen and the firewall
+// SHOULD be updated.
+func TestHandleDNSQuery_BypassWithMatchingShortRuleStillTracks(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "bastion", Action: config.ActionAllow,
+			Ports: []config.Port{{Port: 22, Protocol: config.ProtocolAll}},
+		},
+	}, config.ActionDeny))
+	cfg.AddSearchDomains([]string{".compute.internal"}, slog.Default())
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const fullName = "bastion.compute.internal."
+	cachedResp := makeCachedResponse(fullName, "10.0.0.10")
+	cacheKey := server.generateCacheKey(&dns.Msg{
+		Question: []dns.Question{{Name: fullName, Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+	})
+	server.dnsCache.Put(cacheKey, &dnsCacheEntry{msg: cachedResp.Copy()}, 5*time.Minute)
+
+	// The stripped form "bastion" matches the allow rule, so the BPF map
+	// should get updated.
+	mockFw.On("AddIP", net.ParseIP("10.0.0.10"), config.ActionAllow,
+		[]config.Port{{Port: 22, Protocol: config.ProtocolAll}}).Return(true, nil).Once()
+
+	query := new(dns.Msg)
+	query.SetQuestion(fullName, dns.TypeA)
+	query.Id = 6666
+
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+
+	server.handleDNSQuery(w, query)
+
+	w.AssertExpectations(t)
+	require.NotNil(t, w.msg)
+
+	// Reverse-mapping IS populated (used for audit attribution).
+	assert.Equal(t, "bastion.compute.internal",
+		cfg.GetIPToHostnameMap()["10.0.0.10"],
+		"reverse mapping should include the bypass-but-rule-matched IP")
+}
+
 func TestHandleDNSQuery_FirewallUpdateOnCacheHit(t *testing.T) {
 	cfg := config.NewConfigManager()
 	err := cfg.LoadConfigFromRules([]config.Rule{
@@ -1145,6 +1710,96 @@ func TestExtractIPsFromResponse_AdditionalCases(t *testing.T) {
 			},
 			expectedIPs: nil,
 			expectedTTL: 300,
+		},
+		{
+			// CNAME chain followed by the resolved A record. The CNAME RR
+			// must be ignored when extracting IPs; only the A is extracted.
+			// But the CNAME's TTL DOES count toward the response's min TTL
+			// (300 < 600), matching standard DNS cache semantics.
+			name: "CNAME chain followed by A — only A extracted, CNAME TTL counts",
+			answers: []dns.RR{
+				&dns.CNAME{
+					Hdr:    dns.RR_Header{Name: "www.example.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300},
+					Target: "example.com.",
+				},
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 600},
+					A:   net.ParseIP("192.0.2.5"),
+				},
+			},
+			expectedIPs: []string{"192.0.2.5"},
+			expectedTTL: 300, // min(CNAME 300, A 600)
+		},
+		{
+			// SRV and TXT are not address records — must be skipped silently.
+			name: "SRV and TXT records ignored",
+			answers: []dns.RR{
+				&dns.SRV{
+					Hdr:    dns.RR_Header{Name: "_xmpp._tcp.example.com.", Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: 100},
+					Target: "xmpp.example.com.",
+					Port:   5222,
+				},
+				&dns.TXT{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 100},
+					Txt: []string{"v=spf1 -all"},
+				},
+			},
+			expectedIPs: nil,
+			expectedTTL: 100,
+		},
+		{
+			// TTL=0 in the only answer. Pin current behavior: extracted TTL
+			// is 0, not the 86400 default (the default applies only when
+			// there are no answers at all).
+			name: "single answer with TTL=0",
+			answers: []dns.RR{
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "ephemeral.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0},
+					A:   net.ParseIP("192.0.2.99"),
+				},
+			},
+			expectedIPs: []string{"192.0.2.99"},
+			expectedTTL: 0,
+		},
+		{
+			// Multiple A records with mixed TTLs — returns the minimum,
+			// so a downstream cache respects the shortest-lived record.
+			name: "mixed TTLs across answers — min wins",
+			answers: []dns.RR{
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+					A:   net.ParseIP("192.0.2.1"),
+				},
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+					A:   net.ParseIP("192.0.2.2"),
+				},
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 900},
+					A:   net.ParseIP("192.0.2.3"),
+				},
+			},
+			expectedIPs: []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"},
+			expectedTTL: 60,
+		},
+		{
+			// Min-with-TTL-0: when any answer has TTL=0, the returned
+			// minimum is 0 (no special-casing in this function — see
+			// docstring; the cache Put path applies its own "treat 0 as
+			// default-floor" policy separately).
+			name: "TTL=0 among multiple answers propagates to returned min",
+			answers: []dns.RR{
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 600},
+					A:   net.ParseIP("192.0.2.4"),
+				},
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0},
+					A:   net.ParseIP("192.0.2.5"),
+				},
+			},
+			expectedIPs: []string{"192.0.2.4", "192.0.2.5"},
+			expectedTTL: 0,
 		},
 	}
 
@@ -1412,4 +2067,121 @@ func TestSetAuditLogger(t *testing.T) {
 
 	server.SetAuditLogger(auditLogger)
 	assert.Equal(t, auditLogger, server.auditLogger)
+}
+
+// =============================================================================
+// Direct unit table for isValidReverseDNS (H2)
+//
+// PTR validation is the security-relevant guard that prevents DNS-tunneling
+// data exfiltration via PTR-shaped queries. Tested transitively via the
+// TestIsQueryAllowed PTR rows, but a direct table is faster (no Server
+// fixture) and makes the rejection branches explicit.
+// =============================================================================
+
+func TestIsValidReverseDNS(t *testing.T) {
+	tests := []struct {
+		name   string
+		domain string
+		want   bool
+	}{
+		// IPv4 canonical PTR shape: exactly 4 unpadded decimal octets.
+		{"IPv4 canonical", "16.129.63.168.in-addr.arpa", true},
+		{"IPv4 all zeros (0.0.0.0)", "0.0.0.0.in-addr.arpa", true},
+		{"IPv4 boundary (255.255.255.255)", "255.255.255.255.in-addr.arpa", true},
+		{"IPv4 mixed magnitudes", "1.2.30.255.in-addr.arpa", true},
+
+		// IPv4 rejections.
+		{"IPv4 octet > 255", "999.0.0.0.in-addr.arpa", false},
+		{"IPv4 octet 256 (one past max)", "256.0.0.0.in-addr.arpa", false},
+		{"IPv4 zero-padded octet", "001.2.3.4.in-addr.arpa", false},
+		{"IPv4 sign-prefixed", "+1.2.3.4.in-addr.arpa", false},
+		{"IPv4 negative", "-0.2.3.4.in-addr.arpa", false},
+		{"IPv4 shortened (1 octet)", "1.in-addr.arpa", false},
+		{"IPv4 too many octets", "1.2.3.4.5.in-addr.arpa", false},
+		{"IPv4 non-numeric label", "exfil.payload.in-addr.arpa", false},
+		{"IPv4 empty leading label", ".2.3.4.in-addr.arpa", false},
+		{"IPv4 4-digit octet", "1234.0.0.0.in-addr.arpa", false},
+
+		// IPv6 canonical PTR shape: exactly 32 single-hex-nibble labels.
+		{
+			name:   "IPv6 canonical",
+			domain: "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa",
+			want:   true,
+		},
+		{
+			name:   "IPv6 mixed-case hex (canonical)",
+			domain: "F.E.D.C.B.A.9.8.7.6.5.4.3.2.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+			want:   true,
+		},
+
+		// IPv6 rejections.
+		{"IPv6 shortened (4 nibbles)", "d.e.a.d.ip6.arpa", false},
+		{"IPv6 too many nibbles", "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa", false},
+		{"IPv6 multi-char nibble", "ab.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa", false},
+		{"IPv6 invalid hex char (g)", "g.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa", false},
+
+		// Non-PTR suffixes.
+		{"not a reverse-DNS suffix", "github.com", false},
+		{"empty input", "", false},
+		{"only suffix (no octets)", ".in-addr.arpa", false},
+		{"only ip6 suffix", ".ip6.arpa", false},
+
+		// FQDN trailing dot — the handler always strips the trailing dot
+		// before calling isValidReverseDNS, but pin behavior for the bare
+		// function. Currently DOES NOT match (suffix is hardcoded without
+		// trailing dot).
+		{"FQDN trailing dot not accepted", "16.129.63.168.in-addr.arpa.", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isValidReverseDNS(tc.domain)
+			assert.Equal(t, tc.want, got, "isValidReverseDNS(%q)", tc.domain)
+		})
+	}
+}
+
+// =============================================================================
+// ApplyRulesToTrackedHostnames conflict path (M1)
+//
+// When a tracked hostname's resolved IP also falls inside a CIDR rule with a
+// conflicting action, CheckIPRuleConflict returns (deny, hasConflict=true,
+// cidr). ApplyRulesToTrackedHostnames must log the conflict AND apply the
+// most-restrictive action (deny) to BPF, not the hostname's allow.
+// =============================================================================
+
+func TestApplyRulesToTrackedHostnames_ConflictDenyWins(t *testing.T) {
+	configMgr := config.NewConfigManager()
+	mockFirewall := firewall.NewMockFirewall(t)
+	server := NewServer(configMgr, mockFirewall, "8.8.8.8:53", "127.0.0.1:53", slog.Default())
+
+	// Resolution arrives before rules are loaded.
+	configMgr.UpdateDNSMapping("example.com", "203.0.113.50")
+
+	// Hostname allow on example.com AND a CIDR deny that covers the resolved
+	// IP. The deny-wins precedence inside CheckIPRuleConflict must surface
+	// here as a Deny call to the firewall, not Allow.
+	err := configMgr.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "example.com", Action: config.ActionAllow,
+			Ports: []config.Port{{Port: 443, Protocol: config.ProtocolTCP}},
+		},
+		{
+			Type: config.RuleTypeCIDR, Value: "203.0.113.0/24", Action: config.ActionDeny,
+			Ports: []config.Port{{Port: 443, Protocol: config.ProtocolTCP}},
+		},
+	}, config.ActionAllow) // allow-by-default so the deny is meaningful
+	require.NoError(t, err)
+
+	// Expect AddIP with ActionDeny (the conflict-resolved final action),
+	// using the hostname rule's ports.
+	mockFirewall.On(
+		"AddIP",
+		net.ParseIP("203.0.113.50"),
+		config.ActionDeny,
+		[]config.Port{{Port: 443, Protocol: config.ProtocolTCP}},
+	).Return(true, nil).Once()
+
+	server.ApplyRulesToTrackedHostnames()
+	mockFirewall.AssertExpectations(t)
 }

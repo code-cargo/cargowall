@@ -27,6 +27,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -96,7 +98,6 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 
 	var dnsServer *dns.Server
 	var dockerBridgeIP string
-	var dnsRedirectEnabled bool
 	if !cmd.DisableDNSTracking {
 		// Get upstream DNS server (defaults to Kubernetes DNS)
 		upstream := cmd.DNSUpstream
@@ -126,10 +127,18 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 				dnsServer.AddListenAddr(dockerBridgeIP + ":53")
 				logger.Info("Docker DNS interception enabled", "docker_bridge", dockerBridgeIP)
 
-				// Configure Docker to use our DNS proxy
+				// Configure Docker to use our DNS proxy. Restore is deferred
+				// even on ConfigureDockerDNS failure — best-effort matches
+				// the previous shutdown semantic and guards against partial
+				// writes to daemon.json that the user expects rolled back.
 				if err := network.ConfigureDockerDNS(dockerBridgeIP, logger); err != nil {
 					logger.Warn("Failed to configure Docker DNS", "error", err)
 				}
+				defer func() {
+					if err := network.RestoreDockerDNS(logger); err != nil {
+						logger.Warn("Failed to restore Docker DNS", "error", err)
+					}
+				}()
 			}
 		}
 
@@ -155,11 +164,17 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		// Set up iptables DNAT to force all outbound DNS through the proxy.
 		// This catches processes that bypass /etc/resolv.conf and query
 		// upstream DNS directly (e.g., Go's pure resolver, Node.js).
+		// Teardown is deferred immediately so the rule never outlives the
+		// process — including across error-return paths below.
 		if cmd.DNSRedirectIptables {
 			if err := network.SetupDNSRedirect(logger); err != nil {
 				logger.Warn("Failed to set up DNS redirect (iptables)", "error", err)
 			} else {
-				dnsRedirectEnabled = true
+				defer func() {
+					if err := network.TeardownDNSRedirect(logger); err != nil {
+						logger.Warn("Failed to tear down DNS redirect", "error", err)
+					}
+				}()
 			}
 		}
 	}
@@ -167,7 +182,10 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	// Variable to hold the notification tracker
 	var notificationTracker *events.NotificationTracker
 
-	// Initialize audit logger if audit log path is specified
+	// Initialize audit logger if audit log path is specified. Defer the
+	// audit-mode log line until after config load — loadCIConfig may flip
+	// cmd.AuditMode from the API policy, and we want the log to reflect
+	// the final effective mode rather than the initial CLI flag.
 	var auditLogger *events.AuditLogger
 	if cmd.AuditLog != "" {
 		var err error
@@ -176,16 +194,6 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			return fmt.Errorf("failed to create audit logger: %w", err)
 		}
 		defer auditLogger.Close()
-
-		if cmd.AuditMode {
-			logger.Info("Running in AUDIT MODE - connections will be logged but NOT blocked",
-				"audit_log", cmd.AuditLog)
-		} else {
-			logger.Info("Audit logging enabled",
-				"audit_log", cmd.AuditLog)
-		}
-	} else if cmd.AuditMode {
-		logger.Warn("Audit mode enabled but no audit log path specified (--audit-log)")
 	}
 
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
@@ -218,6 +226,18 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			logger.Error("Failed to load config", "error", err, "path", cmd.Config)
 			// Continue with default deny-all policy
 		}
+	}
+
+	// Log the effective audit mode now that loadCIConfig has had a chance
+	// to override cmd.AuditMode from the API policy.
+	switch {
+	case cmd.AuditLog != "" && cmd.AuditMode:
+		logger.Info("Running in AUDIT MODE - connections will be logged but NOT blocked",
+			"audit_log", cmd.AuditLog)
+	case cmd.AuditLog != "":
+		logger.Info("Audit logging enabled", "audit_log", cmd.AuditLog)
+	case cmd.AuditMode:
+		logger.Warn("Audit mode enabled but no audit log path specified (--audit-log)")
 	}
 
 	// Find network interface
@@ -326,15 +346,22 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			logger.Debug("Updated DNS server with audit logger")
 		}
 
-		// IMPORTANT: Apply rules to any hostnames we tracked before config was loaded
-		// This is needed because we may have already resolved hostnames (like NATS)
-		// before we had the rules to track them
-		if (hooks != nil && hooks.LoadPolicy != nil) || cmd.PrepopulateDNSCache {
-			dnsServer.ApplyRulesToTrackedHostnames()
-			logger.Info("Applied firewall rules to tracked hostnames")
-		}
-
 		applyAutoAllowHelpers(cmd, configMgr, fw, logger)
+
+		// Apply firewall rules to any hostnames tracked before they were
+		// matchable. Two overlapping scenarios funnel here, both fixed by
+		// one pass after auto-allow finishes:
+		//
+		//  1. DNS proxy starts before config load (hooks / prepopulate
+		//     paths) — a hostname like NATS gets resolved while no rule
+		//     exists; the rule arrives later via LoadConfigFromCargoWall.
+		//  2. Auto-allow adds search domains (e.g. `.compute.internal`)
+		//     AFTER the proxy may have seen `bastion.compute.internal`
+		//     as an unmatched full name — stripping now makes the
+		//     short-name `bastion` rule fire.
+		//
+		// Cheap when no tracking has happened yet; idempotent in any case.
+		dnsServer.ApplyRulesToTrackedHostnames()
 
 		// Shared resolver that uses the systemd-resolved stub listener for
 		// looking up cached DNS entries. Used for existing-connection reverse
@@ -387,11 +414,17 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		cmd.SudoAllowCommands = strings.Join(sl.AllowCommands, ",")
 	}
 
-	// Enable sudo lockdown if requested (typically in GitHub Actions mode)
-	var sudoLockdownEnabled bool
-	var lockdownCfg *lockdown.SudoLockdownConfig
+	// Enable sudo lockdown if requested (typically in GitHub Actions mode).
+	// Disable is deferred immediately on success so /etc/sudoers gets
+	// restored on every return path, not just signal-driven shutdown.
 	if cmd.SudoLockdown {
-		sudoLockdownEnabled, lockdownCfg = enableSudoLockdown(cmd, logger)
+		if enabled, cfg := enableSudoLockdown(cmd, logger); enabled {
+			defer func() {
+				if err := lockdown.DisableSudoLockdown(cfg, logger); err != nil {
+					logger.Warn("Failed to disable sudo lockdown", "error", err)
+				}
+			}()
+		}
 	}
 
 	// Restart Docker daemon so containers pick up the DNS configuration
@@ -448,27 +481,9 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		cancel()
 	}
 
-	// Disable sudo lockdown if we enabled it
-	if sudoLockdownEnabled {
-		if err := lockdown.DisableSudoLockdown(lockdownCfg, logger); err != nil {
-			logger.Warn("Failed to disable sudo lockdown", "error", err)
-		}
-	}
-
-	// Remove iptables DNS redirect rules if we added them
-	if dnsRedirectEnabled {
-		if err := network.TeardownDNSRedirect(logger); err != nil {
-			logger.Warn("Failed to tear down DNS redirect", "error", err)
-		}
-	}
-
-	// Restore Docker DNS configuration if we modified it
-	if cmd.DockerDNSInterception && dockerBridgeIP != "" {
-		if err := network.RestoreDockerDNS(logger); err != nil {
-			logger.Warn("Failed to restore Docker DNS", "error", err)
-		}
-	}
-
+	// Sudo lockdown, iptables DNS redirect, and Docker DNS restore all run
+	// via defers registered at setup time — so they fire on every return
+	// path, not just signal-driven shutdown.
 	return nil
 }
 
@@ -584,70 +599,135 @@ func applyAutoAllowHelpers(cmd *StartCmd, configMgr *config.Manager, fw firewall
 	}
 }
 
-// autoAllowCloudMetadata allows the link-local cloud metadata endpoint
-// (169.254.169.254 on port 80, used by both Azure IMDS and GCP metadata)
-// plus systemd-resolved upstream DNS servers. If Azure-specific upstreams
-// are detected (168.63.129.16 wireserver) it also adds Azure wireserver
-// ports and Azure infrastructure hostnames.
+const (
+	defaultDMIPath        = "/sys/class/dmi/id"
+	linkLocalMetadataIP   = "169.254.169.254" // shared IMDS IP for AWS/Azure/GCP
+	azureWireserverIP     = "168.63.129.16"
+	envCargowallCloudProv = "CARGOWALL_CLOUD_PROVIDER"
+	// azureChassisAssetTag is Microsoft's well-known DMI marker for Azure VMs.
+	// It distinguishes real Azure VMs from generic Hyper-V guests, which also
+	// report "Microsoft Corporation" as sys_vendor.
+	azureChassisAssetTag = "7783-7084-3265-9085-8269-3286-77"
+)
+
+type cloudProvider string
+
+const (
+	cloudProviderUnknown cloudProvider = "unknown"
+	cloudProviderAWS     cloudProvider = "aws"
+	cloudProviderAzure   cloudProvider = "azure"
+	cloudProviderGCP     cloudProvider = "gcp"
+)
+
+// autoAllowCloudMetadata allows the shared link-local metadata endpoint and
+// systemd-resolved upstream DNS servers, then detects the cloud provider
+// (AWS / Azure / GCP) and applies provider-specific allows.
 func autoAllowCloudMetadata(configMgr *config.Manager, logger *slog.Logger) {
 	resolvedUpstreams, err := detectSystemdResolvedUpstreams()
 	if err != nil {
 		logger.Debug("Could not detect systemd-resolved upstreams", "error", err)
 	}
-	applyCloudMetadataAllows(configMgr, resolvedUpstreams, logger)
+	applyCloudMetadataAllows(configMgr, resolvedUpstreams, defaultDMIPath, logger)
 }
 
-// applyCloudMetadataAllows is the testable inner logic of
-// autoAllowCloudMetadata: given a (possibly empty) set of systemd-resolved
-// upstreams, populate the cloud metadata + Azure-specific allows. Split out
-// so unit tests can drive Azure vs GCP behavior without touching
-// /run/systemd/resolve/resolv.conf.
-func applyCloudMetadataAllows(configMgr *config.Manager, resolvedUpstreams []string, logger *slog.Logger) {
+// applyCloudMetadataAllows is the dmiPath-injected core of autoAllowCloudMetadata
+// so tests can drive each provider's behavior against a tempdir DMI path.
+func applyCloudMetadataAllows(configMgr *config.Manager, resolvedUpstreams []string, dmiPath string, logger *slog.Logger) {
 	if len(resolvedUpstreams) > 0 {
 		configMgr.EnsureDNSAllowed(resolvedUpstreams)
 		logger.Info("Allowed systemd-resolved upstream DNS servers", "ips", resolvedUpstreams)
 	}
 
-	// 169.254.169.254 is the link-local metadata IP on both Azure (IMDS) and
-	// GCP. Both serve metadata over HTTP/80 so a single allow covers either
-	// cloud. Tagged GCP because the Azure wireserver branch below adds the
-	// stronger Azure-specific allows when running on Azure.
-	//
-	// On bare-metal hosts with no metadata service the BPF entry is a
-	// harmless no-op (nothing listens, no traffic flows). The deliberate
-	// trade-off is one no-op map entry vs. an invasive cloud-detection probe.
-	configMgr.EnsureInfraAllowed([]string{"169.254.169.254"}, []config.Port{config.PortHTTP}, config.AutoAddedTypeGCPInfrastructure)
+	// On bare-metal hosts with no metadata service the BPF entry is a harmless
+	// no-op (nothing listens). Cheaper than an invasive cloud-detection probe.
+	configMgr.EnsureInfraAllowed([]string{linkLocalMetadataIP}, []config.Port{config.PortHTTP}, config.AutoAddedTypeCloudMetadata)
 
-	// Azure detection: the wireserver IP 168.63.129.16 is unique to Azure
-	// VMs (and to GitHub-hosted runners, which run on Azure).
-	azureDetected := false
-	for _, ip := range resolvedUpstreams {
-		if ip == "168.63.129.16" {
-			azureDetected = true
-			break
+	provider := detectCloudProvider(dmiPath, resolvedUpstreams)
+	logger.Info("Cloud provider detection", "provider", provider)
+	switch provider {
+	case cloudProviderAWS:
+		suffixes := []string{".compute.internal", ".ec2.internal"}
+		configMgr.AddSearchDomains(suffixes, logger)
+		logger.Info("Auto-allowed AWS internal DNS suffixes", "suffixes", suffixes)
+	case cloudProviderAzure:
+		autoAllowAzure(configMgr, logger)
+	case cloudProviderGCP:
+		// `.c.PROJECT_ID.internal` is intentionally omitted: the project ID
+		// requires a metadata-server query at startup. Users who need it can
+		// add it manually via the searchDomains config field.
+		suffixes := []string{".google.internal"}
+		configMgr.AddSearchDomains(suffixes, logger)
+		logger.Info("Auto-allowed GCP internal DNS suffixes", "suffixes", suffixes)
+	}
+}
+
+// detectCloudProvider returns the active cloud provider based on (in priority
+// order): the CARGOWALL_CLOUD_PROVIDER override, DMI signals (sys_vendor for
+// AWS/GCP, chassis_asset_tag for Azure), and the Azure wireserver IP
+// appearing among systemd-resolved upstreams. The wireserver fallback
+// covers containers where /sys/class/dmi/id is not readable.
+//
+// Azure detection uses chassis_asset_tag rather than sys_vendor because the
+// vendor string "Microsoft Corporation" also matches ordinary Hyper-V VMs;
+// the asset tag is Azure-specific.
+func detectCloudProvider(dmiPath string, resolvedUpstreams []string) cloudProvider {
+	switch cloudProvider(strings.ToLower(strings.TrimSpace(os.Getenv(envCargowallCloudProv)))) {
+	case cloudProviderAWS:
+		return cloudProviderAWS
+	case cloudProviderAzure:
+		return cloudProviderAzure
+	case cloudProviderGCP:
+		return cloudProviderGCP
+	}
+
+	// sys_vendor first: AWS / GCP identify themselves here unambiguously.
+	// Azure cannot, because "Microsoft Corporation" also matches plain
+	// Hyper-V VMs — that's why Azure detection lives in the chassis_asset_tag
+	// pass below.
+	if data, err := os.ReadFile(filepath.Join(dmiPath, "sys_vendor")); err == nil {
+		vendor := strings.TrimSpace(string(data))
+		switch {
+		case strings.Contains(vendor, "Amazon EC2"):
+			return cloudProviderAWS
+		case strings.Contains(vendor, "Google"):
+			return cloudProviderGCP
 		}
 	}
-	if !azureDetected {
-		return
+
+	// chassis_asset_tag distinguishes real Azure VMs from generic Hyper-V
+	// guests, which share sys_vendor="Microsoft Corporation" but never carry
+	// this Azure-specific asset tag.
+	if data, err := os.ReadFile(filepath.Join(dmiPath, "chassis_asset_tag")); err == nil {
+		if strings.TrimSpace(string(data)) == azureChassisAssetTag {
+			return cloudProviderAzure
+		}
 	}
 
-	// Auto-allow Azure wireserver on ports 53 (DNS), 80 (HTTP), and
-	// 32526 (health). The port-map keys {ip, port, proto} are disjoint
-	// across TCP/UDP/ICMP so the ICMP rule below coexists cleanly.
-	configMgr.EnsureInfraAllowed(resolvedUpstreams, []config.Port{
+	if slices.Contains(resolvedUpstreams, azureWireserverIP) {
+		return cloudProviderAzure
+	}
+	return cloudProviderUnknown
+}
+
+// autoAllowAzure allows the Azure wireserver, the default Azure VM internal
+// DNS suffix, and Azure infrastructure hostnames (overridable via
+// CARGOWALL_AZURE_INFRA_HOSTS).
+func autoAllowAzure(configMgr *config.Manager, logger *slog.Logger) {
+	wireserver := []string{azureWireserverIP}
+
+	configMgr.EnsureInfraAllowed(wireserver, []config.Port{
 		config.PortDNS,
 		config.PortHTTP,
 		config.PortWireServer,
 	}, config.AutoAddedTypeAzureInfrastructure)
 
-	// Pre-allow ICMP to the Azure wire server. GitHub-hosted runners
-	// periodically ping this IP — without an allow rule each ping produces
-	// an EventProtocolBlocked log line (functional but noisy).
-	configMgr.EnsureInfraAllowed([]string{"168.63.129.16"}, []config.Port{config.PortICMP}, config.AutoAddedTypeAzureInfrastructure)
+	// Pre-allow ICMP to the wireserver. GitHub-hosted runners periodically
+	// ping this IP — without an allow rule each ping produces an
+	// EventProtocolBlocked log line (functional but noisy).
+	configMgr.EnsureInfraAllowed(wireserver, []config.Port{config.PortICMP}, config.AutoAddedTypeAzureInfrastructure)
 
-	// Auto-allow Azure infrastructure hostnames on port 443.
-	// Defaults cover blob storage and traffic manager; overridable
-	// via CARGOWALL_AZURE_INFRA_HOSTS env var (comma-separated).
+	configMgr.AddSearchDomains([]string{".internal.cloudapp.net"}, logger)
+
 	azureHosts := []string{"trafficmanager.net", "blob.core.windows.net"}
 	if env := os.Getenv("CARGOWALL_AZURE_INFRA_HOSTS"); env != "" {
 		azureHosts = splitAndTrimCSV(env)
@@ -655,6 +735,7 @@ func applyCloudMetadataAllows(configMgr *config.Manager, resolvedUpstreams []str
 	for _, h := range azureHosts {
 		configMgr.EnsureHostnameAllowed(h, []config.Port{config.PortHTTPS}, config.AutoAddedTypeAzureInfrastructure)
 	}
+	logger.Info("Auto-allowed Azure infrastructure (wireserver, hostnames, search domain)")
 }
 
 // autoAllowGitHubHosts allows the default GitHub service hostnames plus any
@@ -833,42 +914,48 @@ func gateExistingConnections(existingIPs []string, configMgr *config.Manager, fw
 
 		hostname := configMgr.LookupHostnameByIP(ipStr)
 		trackedHost := configMgr.FindTrackedHostname(hostname)
-		action, ports, _ := configMgr.MatchHostnameRule(hostname)
+		verdict := configMgr.MatchHostnameRule(hostname)
 
 		autoAllowedType := string(configMgr.GetAutoAllowedTypeForHostname(hostname))
 
-		if trackedHost != "" && action == config.ActionDeny {
-			// Positively matches a denied hostname — do NOT allow
+		// Pure-deny on a positively tracked hostname → block. With a mixed
+		// verdict (deny on some ports, allow on others) we fall through to
+		// write both sides so BPF can resolve per-port at packet time.
+		if trackedHost != "" && verdict.HasDeny() && !verdict.HasAllow() {
 			logger.Info("Blocked pre-existing connection (denied hostname)", "ip", ipStr, "hostname", hostname, "trackedHost", trackedHost)
 			if auditLogger != nil {
 				auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, false, autoAllowedType)
 			}
-		} else {
-			// Matched allow rule → use its ports.
-			//
-			// Unresolvable (no hostname mapping at startup) → ports stays nil
-			// and the BPF entry becomes an all-ports allow. This is an
-			// intentional carveout: we'd rather keep a pre-existing socket
-			// alive than break in-flight work. Same shape as issue #45 in
-			// principle, but the attack window is narrow (only IPs already
-			// connected at startup that CargoWall can't identify) and we'd
-			// surface the connection in the audit log either way.
-			if wasAdded, err := fw.AddIP(ip, config.ActionAllow, ports); err != nil {
-				logger.Debug("Failed to allow existing connection IP", "ip", ipStr, "error", err)
-			} else if wasAdded {
-				logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname, "ports", ports)
-				if auditLogger != nil {
-					auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, true, autoAllowedType)
-				}
+			continue
+		}
+
+		// Write the verdict's deny side (if any) so per-port denies are
+		// preserved even when an allow rule also fires on the same name.
+		if verdict.HasDeny() {
+			if _, err := fw.AddIP(ip, config.ActionDeny, verdict.DenyPorts); err != nil {
+				logger.Debug("Failed to apply deny for existing connection IP", "ip", ipStr, "error", err)
+			}
+		}
+
+		// Write the allow side. When no rule matched (unresolvable IP or no
+		// hostname rule), verdict.AllowPorts is nil and AddIP becomes an
+		// all-ports allow — an intentional carveout for in-flight work,
+		// since we'd rather keep a pre-existing socket alive than break it.
+		// The attack window is narrow (only IPs already connected at
+		// startup that CargoWall can't identify) and the audit log
+		// surfaces them either way.
+		if wasAdded, err := fw.AddIP(ip, config.ActionAllow, verdict.AllowPorts); err != nil {
+			logger.Debug("Failed to allow existing connection IP", "ip", ipStr, "error", err)
+		} else if wasAdded {
+			logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname, "ports", verdict.AllowPorts)
+			if auditLogger != nil {
+				auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, true, autoAllowedType)
 			}
 		}
 	}
 	logger.Info("Processed pre-existing connections against allowlist", "count", len(existingIPs))
 }
 
-// enableSudoLockdown parses allowed commands from cmd.SudoAllowCommands,
-// builds a lockdown config, and enables sudo lockdown. Returns whether
-// lockdown was successfully enabled and the config (for cleanup).
 // parseSudoAllowCommands splits a comma-separated list of command paths,
 // stripping arguments (anything after the first whitespace) and skipping
 // non-absolute paths. Returns the cleaned list of command paths.
@@ -898,6 +985,9 @@ func parseSudoAllowCommands(input string, logger *slog.Logger) []string {
 	return cmds
 }
 
+// enableSudoLockdown parses allowed commands from cmd.SudoAllowCommands,
+// builds a lockdown config, and enables sudo lockdown. Returns whether
+// lockdown was successfully enabled and the config (for cleanup).
 func enableSudoLockdown(cmd *StartCmd, logger *slog.Logger) (bool, *lockdown.SudoLockdownConfig) {
 	cfg := &lockdown.SudoLockdownConfig{
 		AllowCommands: parseSudoAllowCommands(cmd.SudoAllowCommands, logger),

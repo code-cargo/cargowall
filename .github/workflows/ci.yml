@@ -705,7 +705,8 @@ jobs:
                 "ports": [{"port": 53, "protocol": "udp"}],
                 "action": "allow"
               }
-            ]
+            ],
+            "searchDomains": [".compute.internal"]
           }
           JSON
 
@@ -749,6 +750,73 @@ jobs:
         run: |
           curl -sf --connect-timeout 5 --max-time 10 https://example.com > /dev/null || true
           echo "✅ example.com fetch attempted (audit mode does not block)"
+
+      - name: DNS query under search-domain suffix is NOT logged as blocked
+        run: |
+          # `.compute.internal` is configured as a search domain (see policy
+          # above). A query for a name under that suffix with no matching
+          # hostname rule should pass cargowall's filter via the bypass.
+          # In audit mode this means: no dns_blocked event is logged for it.
+          # The upstream will return NXDOMAIN for an ephemeral name like
+          # this, which is fine — we only care about cargowall's verdict.
+          dig +time=5 +tries=1 @127.0.0.1 ip-10-0-0-5.us-west-2.compute.internal A > /tmp/bypass-query.log 2>&1 || true
+          cat /tmp/bypass-query.log
+          echo "✅ search-domain query issued"
+
+      - name: DNS query NOT covered by rule or search-domain IS logged
+        run: |
+          # No hostname rule, no search-domain match — cargowall should log
+          # this as dns_blocked-would (audit mode lets the query through
+          # but records the would-be-deny).
+          dig +time=5 +tries=1 @127.0.0.1 nonexistent.example.org A > /tmp/blocked-query.log 2>&1 || true
+          cat /tmp/blocked-query.log
+          echo "✅ control query issued"
+
+      - name: Verify search-domain bypass distinguished from would-deny
+        run: |
+          AUDIT_LOG=/tmp/cargowall-audit.json
+          if ! sudo test -s "$AUDIT_LOG"; then
+            echo "❌ Audit log not written"
+            exit 1
+          fi
+
+          # The bypassed query must NOT appear in dns_blocked events.
+          BYPASSED_LOGGED=$(sudo jq -s '[
+            .[] | select(.event_type == "dns_blocked")
+                | select((.dst_hostname // "") | contains("compute.internal"))
+          ] | length' "$AUDIT_LOG")
+          if [ "$BYPASSED_LOGGED" -ne 0 ]; then
+            echo "❌ search-domain query incorrectly logged as dns_blocked ($BYPASSED_LOGGED entries)"
+            sudo jq -s '.[] | select(.event_type == "dns_blocked")' "$AUDIT_LOG"
+            exit 1
+          fi
+          echo "✅ search-domain query not in dns_blocked log"
+
+          # The control query MUST appear in dns_blocked.
+          BLOCKED_LOGGED=$(sudo jq -s '[
+            .[] | select(.event_type == "dns_blocked")
+                | select((.dst_hostname // "") | contains("nonexistent.example.org"))
+          ] | length' "$AUDIT_LOG")
+          if [ "$BLOCKED_LOGGED" -eq 0 ]; then
+            echo "❌ control query missing from dns_blocked log"
+            sudo jq -s '.[] | select(.event_type == "dns_blocked")' "$AUDIT_LOG"
+            exit 1
+          fi
+          echo "✅ control query correctly in dns_blocked log"
+
+      - name: Verify cloud-provider detection ran
+        run: |
+          # --gitlab-ci enables --auto-allow-cloud-metadata, which triggers
+          # the new detectCloudProvider path. GitHub-hosted runners are on
+          # Azure VMs, so detection should resolve to "azure" via the
+          # chassis_asset_tag or wireserver-upstream fallback.
+          if ! sudo grep -q "Cloud provider detection" /tmp/cargowall.log; then
+            echo "❌ 'Cloud provider detection' log line missing"
+            sudo grep -i "cloud\|detect" /tmp/cargowall.log || true
+            exit 1
+          fi
+          DETECTED=$(sudo grep "Cloud provider detection" /tmp/cargowall.log | head -1)
+          echo "✅ Cloud provider detection ran: $DETECTED"
 
       - name: Validate audit log contains would-deny events
         run: |

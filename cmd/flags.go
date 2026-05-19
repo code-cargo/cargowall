@@ -85,7 +85,7 @@ type StartCmd struct {
 	DockerDNSInterception  bool `help:"Listen on the Docker bridge IP for DNS, rewrite /etc/docker/daemon.json so containers use the proxy, and restart the Docker daemon" default:"false" env:"CARGOWALL_DOCKER_DNS_INTERCEPTION"`
 	DNSQueryFiltering      bool `help:"Filter DNS queries against the firewall policy (blocks DNS tunneling)" default:"false" env:"CARGOWALL_DNS_QUERY_FILTERING"`
 	PrepopulateDNSCache    bool `help:"Pre-populate the BPF allowlist from the systemd-resolved cache and existing TCP connections at startup" default:"false" env:"CARGOWALL_PREPOPULATE_DNS_CACHE"`
-	AutoAllowCloudMetadata bool `help:"Auto-allow cloud metadata endpoints (Azure wireserver/IMDS or GCP metadata server, auto-detected via systemd-resolved upstreams)" default:"false" env:"CARGOWALL_AUTO_ALLOW_CLOUD_METADATA"`
+	AutoAllowCloudMetadata bool `help:"Auto-allow cloud metadata endpoints (AWS / Azure / GCP, auto-detected; override with CARGOWALL_CLOUD_PROVIDER=aws|azure|gcp)" default:"false" env:"CARGOWALL_AUTO_ALLOW_CLOUD_METADATA"`
 	AutoAllowGitHubHosts   bool `help:"Auto-allow GitHub service hostnames (github.com, *.githubusercontent.com, etc.) and discover ACTIONS_* runtime URLs" default:"false" env:"CARGOWALL_AUTO_ALLOW_GITHUB_HOSTS"`
 	AutoAllowGitlabHosts   bool `help:"Auto-allow GitLab service hostnames (gitlab.com, registry.gitlab.com, etc.) and discover CI_* runtime URLs" default:"false" env:"CARGOWALL_AUTO_ALLOW_GITLAB_HOSTS"`
 

@@ -27,6 +27,7 @@ type CargoWallPolicy struct {
 	Mode          data.CargoWallMode            `protobuf:"varint,1,opt,name=mode,proto3,enum=grpc.cargowall.v1.CargoWallMode" json:"mode,omitempty"`
 	DefaultAction data.CargoWallActionType      `protobuf:"varint,2,opt,name=default_action,json=defaultAction,proto3,enum=grpc.cargowall.v1.CargoWallActionType" json:"default_action,omitempty"`
 	SudoLockdown  *CargoWallPolicy_SudoLockdown `protobuf:"bytes,3,opt,name=sudo_lockdown,json=sudoLockdown,proto3" json:"sudo_lockdown,omitempty"`
+	SearchDomains []string                      `protobuf:"bytes,4,rep,name=search_domains,json=searchDomains,proto3" json:"search_domains,omitempty"`
 	Rules         []*CargoWallPolicy_Rule       `protobuf:"bytes,100,rep,name=rules,proto3" json:"rules,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -79,6 +80,13 @@ func (x *CargoWallPolicy) GetDefaultAction() data.CargoWallActionType {
 func (x *CargoWallPolicy) GetSudoLockdown() *CargoWallPolicy_SudoLockdown {
 	if x != nil {
 		return x.SudoLockdown
+	}
+	return nil
+}
+
+func (x *CargoWallPolicy) GetSearchDomains() []string {
+	if x != nil {
+		return x.SearchDomains
 	}
 	return nil
 }
@@ -266,11 +274,12 @@ var File_cargo_wall_proto protoreflect.FileDescriptor
 
 const file_cargo_wall_proto_rawDesc = "" +
 	"\n" +
-	"\x10cargo_wall.proto\x12\x11grpc.cargowall.v1\x1a\x1fdata/cargo_wall_mode_enum.proto\x1a&data/cargo_wall_action_type_enum.proto\x1a$data/cargo_wall_rule_type_enum.proto\x1a#data/cargo_wall_protocol_enum.proto\"\xba\x05\n" +
+	"\x10cargo_wall.proto\x12\x11grpc.cargowall.v1\x1a\x1fdata/cargo_wall_mode_enum.proto\x1a&data/cargo_wall_action_type_enum.proto\x1a$data/cargo_wall_rule_type_enum.proto\x1a#data/cargo_wall_protocol_enum.proto\"\xe1\x05\n" +
 	"\x0fCargoWallPolicy\x124\n" +
 	"\x04mode\x18\x01 \x01(\x0e2 .grpc.cargowall.v1.CargoWallModeR\x04mode\x12M\n" +
 	"\x0edefault_action\x18\x02 \x01(\x0e2&.grpc.cargowall.v1.CargoWallActionTypeR\rdefaultAction\x12T\n" +
-	"\rsudo_lockdown\x18\x03 \x01(\v2/.grpc.cargowall.v1.CargoWallPolicy.SudoLockdownR\fsudoLockdown\x12=\n" +
+	"\rsudo_lockdown\x18\x03 \x01(\v2/.grpc.cargowall.v1.CargoWallPolicy.SudoLockdownR\fsudoLockdown\x12%\n" +
+	"\x0esearch_domains\x18\x04 \x03(\tR\rsearchDomains\x12=\n" +
 	"\x05rules\x18d \x03(\v2'.grpc.cargowall.v1.CargoWallPolicy.RuleR\x05rules\x1a\xd9\x01\n" +
 	"\x04Rule\x128\n" +
 	"\x04type\x18\x01 \x01(\x0e2$.grpc.cargowall.v1.CargoWallRuleTypeR\x04type\x12\x14\n" +

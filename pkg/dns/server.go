@@ -20,6 +20,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -117,33 +118,52 @@ func (s *Server) EnableQueryFiltering(enable bool) {
 }
 
 // isQueryAllowed checks if a DNS query for the given domain should be forwarded.
-// Returns true if the domain matches an allowed hostname pattern or if filtering is disabled.
-func (s *Server) isQueryAllowed(domain string) bool {
+//
+// Precedence, in order:
+//  1. Filtering disabled → allow.
+//  2. Canonical PTR queries (Qtype=PTR and well-formed in-addr.arpa /
+//     ip6.arpa name) → allow. The double gate (Qtype + shape) is what
+//     prevents using PTR-shaped names as a tunneling channel via TXT/A/etc.
+//  3. Explicit hostname rule. MatchHostnameRule handles search-domain
+//     stripping internally and can return a mixed verdict (one form deny,
+//     other form allow). At the DNS gate we allow the query if ANY allow
+//     rule fires — the firewall layer enforces per-port deny separately.
+//     A pure deny verdict (no allow) blocks the query. A deny rule for
+//     "blocked" still blocks "blocked.compute.internal".
+//  4. Search-domain bypass: full form ends in a configured suffix → allow.
+//     This is the "let cloud-internal names resolve when no hostname rule
+//     covers them" path; traffic is still governed by hostname/CIDR rules.
+//  5. Default action.
+func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 	if !s.filterQueries {
-		return true // Filtering disabled, allow all
-	}
-
-	// Always allow reverse DNS lookups (PTR queries). The in-addr.arpa /
-	// ip6.arpa name format is constrained to IP octets and cannot be used
-	// for DNS tunneling data exfiltration.
-	if strings.HasSuffix(domain, ".in-addr.arpa") || strings.HasSuffix(domain, ".ip6.arpa") {
 		return true
 	}
 
-	// Check if the domain matches any allowed hostname pattern
-	action, _, _ := s.config.MatchHostnameRule(domain)
-	if action == config.ActionAllow {
+	// Allow reverse DNS lookups, but only true PTR queries with the
+	// canonical shape (exactly 4 numeric octets for IPv4, exactly 32 hex
+	// nibbles for IPv6). The Qtype gate stops TXT/A/NS queries against
+	// PTR-shaped names from slipping through this exception; the shape gate
+	// stops shortened/padded labels from carrying tunneled data.
+	if qtype == dns.TypePTR && isValidReverseDNS(domain) {
 		return true
 	}
 
-	// Also check if default action is "allow" (then we only block explicitly denied)
-	if s.config.GetDefaultAction() == config.ActionAllow {
-		// In allow-by-default mode, only block if explicitly denied
-		return action != config.ActionDeny
+	verdict := s.config.MatchHostnameRule(domain)
+	if verdict.HasAllow() {
+		return true
+	}
+	if verdict.HasDeny() {
+		return false
 	}
 
-	// In deny-by-default mode, domain must be explicitly allowed
-	return false
+	// No explicit rule — try the search-domain bypass. HasSearchDomainSuffix
+	// is the non-allocating predicate (case-insensitive, no per-query slice
+	// copy of the configured suffixes).
+	if s.config.HasSearchDomainSuffix(domain) {
+		return true
+	}
+
+	return s.config.GetDefaultAction() == config.ActionAllow
 }
 
 // ApplyRulesToTrackedHostnames applies newly loaded firewall rules to any hostnames we've already tracked
@@ -162,62 +182,41 @@ func (s *Server) ApplyRulesToTrackedHostnames() {
 	}
 	s.hostnameIPsMutex.Unlock()
 
-	// Also check for hostnames from DNS mappings that may use full names
+	// Track only the full hostname per IP. MatchHostnameRule (called per
+	// tracked hostname below) evaluates both the full and stripped forms
+	// internally with deny-anywhere precedence — adding the stripped form
+	// here as a separate key would double-iterate the same IP and let
+	// non-deterministic map-iteration order clobber the correct BPF action.
 	ipToHostname := s.config.GetIPToHostnameMap()
 	for ip, fullHostname := range ipToHostname {
-		// Check stripped versions too
-		stripped := s.stripKubernetesSearchDomains(fullHostname)
-		hostnamesToCheck := []string{fullHostname}
-		if stripped != fullHostname {
-			hostnamesToCheck = append(hostnamesToCheck, stripped)
+		if _, exists := trackedHostnames[fullHostname]; !exists {
+			trackedHostnames[fullHostname] = make(map[string]bool)
 		}
-
-		for _, hostname := range hostnamesToCheck {
-			if _, exists := trackedHostnames[hostname]; !exists {
-				trackedHostnames[hostname] = make(map[string]bool)
-			}
-			trackedHostnames[hostname][ip] = true
-		}
+		trackedHostnames[fullHostname][ip] = true
 	}
 
 	// Now re-process each tracked hostname with the newly loaded rules
 	for hostname, ipSet := range trackedHostnames {
-		hostnameAction, hostnamePorts, _ := s.config.MatchHostnameRule(hostname)
-		if hostnameAction != "" && len(ipSet) > 0 && s.firewall != nil {
-			s.logger.Info("Applying rules to tracked hostname",
-				"hostname", hostname,
-				"ip_count", len(ipSet),
-				"action", hostnameAction)
+		verdict := s.config.MatchHostnameRule(hostname)
+		if !verdict.Matched() || len(ipSet) == 0 || s.firewall == nil {
+			continue
+		}
+		s.logger.Info("Applying rules to tracked hostname",
+			"hostname", hostname,
+			"ip_count", len(ipSet),
+			"deny_rule", verdict.DenyRule,
+			"allow_rule", verdict.AllowRule)
 
-			// Add IPs to BPF maps
-			for ipStr := range ipSet {
-				ip := net.ParseIP(ipStr)
-				if ip == nil {
-					continue
-				}
-
-				// Check for conflicts
-				finalAction, hasConflict, conflictingRule := s.config.CheckIPRuleConflict(
-					ip, hostname, hostnameAction, hostnamePorts,
-				)
-
-				if hasConflict {
-					s.logger.Warn("Rule conflict detected during reprocess",
-						"hostname", hostname,
-						"ip", ipStr,
-						"conflicting_rule", conflictingRule,
-						"final_action", finalAction)
-				}
-
-				// Only add if different from default
-				if finalAction != s.config.GetDefaultAction() {
-					if err := s.addIPToBPFMaps(ip, hostname, finalAction, hostnamePorts); err != nil {
-						s.logger.Error("Failed to add IP to BPF maps during reprocess",
-							"hostname", hostname,
-							"ip", ipStr,
-							"error", err)
-					}
-				}
+		for ipStr := range ipSet {
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				continue
+			}
+			if verdict.HasDeny() {
+				s.applyVerdictSide(ip, hostname, config.ActionDeny, verdict.DenyPorts, true)
+			}
+			if verdict.HasAllow() {
+				s.applyVerdictSide(ip, hostname, config.ActionAllow, verdict.AllowPorts, true)
 			}
 		}
 	}
@@ -290,13 +289,12 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		"type", queryType,
 		"upstream", s.upstream)
 
-	// DNS Query Filtering: Block queries for non-allowed domains (prevents DNS tunneling)
+	// DNS Query Filtering: Block queries for non-allowed domains (prevents
+	// DNS tunneling). isQueryAllowed handles both the full and the
+	// search-domain-stripped form internally with the right precedence.
 	if s.filterQueries && len(r.Question) > 0 {
 		domain := strings.TrimSuffix(r.Question[0].Name, ".")
-		// Also check stripped version for Kubernetes compatibility
-		stripped := s.stripKubernetesSearchDomains(domain)
-
-		if !s.isQueryAllowed(domain) && !s.isQueryAllowed(stripped) {
+		if !s.isQueryAllowed(domain, r.Question[0].Qtype) {
 			// Check if we're in audit mode - log but don't block
 			isAuditMode := s.auditLogger != nil && s.auditLogger.IsAuditMode()
 
@@ -398,83 +396,73 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 				"ip_count", len(ips),
 				"ttl", ttl)
 
-			for _, ip := range ips {
-				s.config.UpdateDNSMapping(fullHostname, ip.String())
-			}
+			// Lowercase once for all canonical-form operations below; keep
+			// fullHostname for log attribution so wire-case is preserved
+			// in audit/debug output.
+			canonicalHostname := strings.ToLower(fullHostname)
 
-			// Check both full hostname and stripped version
-			// This allows rules to match either "myservice" or "myservice.default.svc.cluster.local"
-			hostnamesToCheck := []string{fullHostname}
-			stripped := s.stripKubernetesSearchDomains(fullHostname)
-			if stripped != fullHostname {
-				hostnamesToCheck = append(hostnamesToCheck, stripped)
-			}
+			// One MatchHostnameRule call per resolution — it internally
+			// evaluates both the full and search-domain-stripped forms and
+			// folds the result into a single HostnameVerdict. Calling it once
+			// per form here would be redundant and unsafe: the resulting BPF
+			// map updates could be applied in non-deterministic map-iteration
+			// order, letting the wrong form's action win the last-write race.
+			verdict := s.config.MatchHostnameRule(canonicalHostname)
+			// User-configured search-domain suffixes only — Kubernetes
+			// suffixes are strip-only, not bypass, and live separately in
+			// the config manager (see kubernetesSearchDomains).
+			bypassOnly := s.config.HasSearchDomainSuffix(canonicalHostname)
 
-			// Process firewall updates BEFORE returning DNS response
-			for _, hostname := range hostnamesToCheck {
-				// Always track the IPs we've seen for this hostname.
-				// Accumulate IPs across DNS responses to handle round-robin DNS
-				// correctly — old IPs remain valid even when new responses return
-				// different IPs for the same hostname.
-				s.hostnameIPsMutex.Lock()
-				newIPSet := make(map[string]bool)
-
-				// Preserve all existing IPs
-				for ipStr := range s.hostnameIPs[hostname] {
-					newIPSet[ipStr] = true
+			// bypassOnly && no rule match → skip ALL per-host tracking. The
+			// bypass is by design "no per-host bookkeeping"; tracking
+			// ephemeral cloud-internal names (e.g. ip-X-X-X-X.compute.internal
+			// per EC2 instance) would grow our per-host maps without bound.
+			if bypassOnly && !verdict.Matched() {
+				s.logger.Debug("Skipping per-host tracking for bypass-only hostname",
+					"hostname", fullHostname,
+					"ip_count", len(ips))
+			} else {
+				for _, ip := range ips {
+					s.config.UpdateDNSMapping(canonicalHostname, ip.String())
 				}
 
-				// Add new IPs from this response
+				// Track the IPs we've seen for this hostname. Accumulate
+				// across DNS responses to handle round-robin DNS — old IPs
+				// remain valid even when new responses return different IPs.
+				s.hostnameIPsMutex.Lock()
+				newIPSet := make(map[string]bool)
+				for ipStr := range s.hostnameIPs[canonicalHostname] {
+					newIPSet[ipStr] = true
+				}
 				for _, ip := range ips {
 					newIPSet[ip.String()] = true
 				}
-
-				s.hostnameIPs[hostname] = newIPSet
+				s.hostnameIPs[canonicalHostname] = newIPSet
 				s.hostnameIPsMutex.Unlock()
 
-				hostnameAction, hostnamePorts, _ := s.config.MatchHostnameRule(hostname)
-				if hostnameAction != "" && s.firewall != nil {
+				switch {
+				case verdict.Matched() && s.firewall != nil:
 					s.logger.Debug("Hostname tracked for BPF update",
-						"hostname", hostname,
-						"original", fullHostname,
-						"action", hostnameAction,
-						"ports", hostnamePorts)
+						"hostname", fullHostname,
+						"deny_rule", verdict.DenyRule,
+						"deny_ports", verdict.DenyPorts,
+						"allow_rule", verdict.AllowRule,
+						"allow_ports", verdict.AllowPorts)
 
 					for _, ip := range ips {
-						ipStr := ip.String()
-
-						// Check for conflicts
-						finalAction, hasConflict, conflictingRule := s.config.CheckIPRuleConflict(
-							ip,
-							hostname,
-							hostnameAction,
-							hostnamePorts,
-						)
-
-						if hasConflict {
-							s.logger.Warn("Rule conflict detected",
-								"hostname", hostname,
-								"ip", ipStr,
-								"conflicting_rule", conflictingRule,
-								"final_action", finalAction)
+						if verdict.HasDeny() {
+							s.applyVerdictSide(ip, fullHostname, config.ActionDeny, verdict.DenyPorts, false)
 						}
-
-						// Only add if different from default
-						if finalAction != s.config.GetDefaultAction() {
-							if err := s.addIPToBPFMaps(ip, hostname, finalAction, hostnamePorts); err != nil {
-								s.logger.Error("Failed to add IP to BPF maps",
-									"hostname", hostname,
-									"ip", ipStr,
-									"error", err)
-							}
+						if verdict.HasAllow() {
+							s.applyVerdictSide(ip, fullHostname, config.ActionAllow, verdict.AllowPorts, false)
 						}
 					}
-
-					break // Only process the first matching hostname
-				} else if hostnameAction == "" {
+				case !verdict.Matched():
 					// No rules yet, but track that we've seen this hostname
+					// so ApplyRulesToTrackedHostnames can backfill if a rule
+					// is added later.
 					s.logger.Debug("DNS resolution tracked (no rules yet)",
-						"hostname", hostname,
+						"hostname", fullHostname,
 						"ip_count", len(ips))
 				}
 			}
@@ -487,13 +475,27 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	}
 }
 
-// extractIPsFromResponse extracts IPv4 and IPv6 addresses and TTL from DNS response
+// extractIPsFromResponse extracts IPv4 and IPv6 addresses from msg.Answer
+// and returns the minimum TTL across all answers (or 86400 when there are
+// no answers). The minimum is the safe choice: a cache or downstream
+// consumer should respect the shortest-lived record in the response so
+// stale data isn't kept past any single record's expiry.
+//
+// TTL=0 in an answer is treated as a legitimate value here (returns 0).
+// The dnsCache Put path applies its own "treat 0 as a default-floor"
+// policy separately (see server.go around line 380); this function is
+// the literal-TTL view of the response.
 func (s *Server) extractIPsFromResponse(msg *dns.Msg) ([]net.IP, uint32) {
 	var ips []net.IP
-	var ttl uint32 = 86400 // Default to 24 hours
+	var minTTL uint32 = 86400 // Default to 24 hours when there are no answers.
+	seen := false
 
 	for _, answer := range msg.Answer {
-		ttl = answer.Header().Ttl
+		ttl := answer.Header().Ttl
+		if !seen || ttl < minTTL {
+			minTTL = ttl
+			seen = true
+		}
 
 		switch rr := answer.(type) {
 		case *dns.A:
@@ -505,7 +507,40 @@ func (s *Server) extractIPsFromResponse(msg *dns.Msg) ([]net.IP, uint32) {
 		}
 	}
 
-	return ips, ttl
+	return ips, minTTL
+}
+
+// applyVerdictSide writes one side (deny or allow) of a HostnameVerdict to
+// the BPF maps for a single IP. It runs the CIDR-rule conflict check, logs
+// any conflict, and short-circuits when the resulting action equals the
+// default. `isReprocess` annotates log wording so the rule-reprocess pass
+// is distinguishable from resolution-time writes in audit logs.
+func (s *Server) applyVerdictSide(ip net.IP, hostname string, action config.Action, ports []config.Port, isReprocess bool) {
+	ipStr := ip.String()
+	finalAction, hasConflict, conflictingRule := s.config.CheckIPRuleConflict(ip, hostname, action, ports)
+	if hasConflict {
+		s.logger.Warn(maybeReprocessMsg("Rule conflict detected", isReprocess),
+			"hostname", hostname,
+			"ip", ipStr,
+			"conflicting_rule", conflictingRule,
+			"final_action", finalAction)
+	}
+	if finalAction == s.config.GetDefaultAction() {
+		return
+	}
+	if err := s.addIPToBPFMaps(ip, hostname, finalAction, ports); err != nil {
+		s.logger.Error(maybeReprocessMsg("Failed to add IP to BPF maps", isReprocess),
+			"hostname", hostname,
+			"ip", ipStr,
+			"error", err)
+	}
+}
+
+func maybeReprocessMsg(base string, isReprocess bool) string {
+	if isReprocess {
+		return base + " during reprocess"
+	}
+	return base
 }
 
 // addIPToBPFMaps adds an IP to the BPF allow/deny maps
@@ -540,21 +575,66 @@ func (s *Server) removeIPFromBPFMaps(ip net.IP) error {
 	return s.firewall.RemoveIP(ip)
 }
 
-// stripKubernetesSearchDomains removes common Kubernetes search domains
-func (s *Server) stripKubernetesSearchDomains(hostname string) string {
-	searchDomains := []string{
-		".default.svc.cluster.local",
-		".svc.cluster.local",
-		".cluster.local",
-	}
-
-	for _, suffix := range searchDomains {
-		if strings.HasSuffix(hostname, suffix) {
-			return strings.TrimSuffix(hostname, suffix)
+// isValidReverseDNS reports whether domain is a well-formed canonical PTR
+// name — exactly 4 unpadded decimal-octet labels under ".in-addr.arpa" or
+// exactly 32 single-hex-nibble labels under ".ip6.arpa". Anything looser
+// (partial PTR for delegation lookups, zero-padded octets, etc.) is
+// rejected so this exception leaves no room for tunneled data in leading
+// labels. Case-insensitive (DNS names are).
+func isValidReverseDNS(domain string) bool {
+	lower := strings.ToLower(domain)
+	switch {
+	case strings.HasSuffix(lower, ".in-addr.arpa"):
+		labels := strings.Split(strings.TrimSuffix(lower, ".in-addr.arpa"), ".")
+		if len(labels) != 4 {
+			return false
 		}
+		for _, l := range labels {
+			// Each label is a decimal octet 0–255. Reject sign prefixes
+			// (strconv.Atoi would accept "+1" / "-0") and leading zeros
+			// (canonical PTR is unpadded; "001" would otherwise pass).
+			if len(l) < 1 || len(l) > 3 {
+				return false
+			}
+			if len(l) > 1 && l[0] == '0' {
+				return false
+			}
+			for i := 0; i < len(l); i++ {
+				if l[i] < '0' || l[i] > '9' {
+					return false
+				}
+			}
+			n, err := strconv.Atoi(l)
+			if err != nil || n > 255 {
+				return false
+			}
+		}
+		return true
+	case strings.HasSuffix(lower, ".ip6.arpa"):
+		labels := strings.Split(strings.TrimSuffix(lower, ".ip6.arpa"), ".")
+		if len(labels) != 32 {
+			return false
+		}
+		for _, l := range labels {
+			// Each label is exactly one hex nibble.
+			if len(l) != 1 {
+				return false
+			}
+			c := l[0]
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				return false
+			}
+		}
+		return true
 	}
+	return false
+}
 
-	return hostname
+// stripSearchDomains delegates to the config manager so all
+// search-domain-aware code paths (rule lookup, tracked-hostname lookup,
+// hostnameIPs tracking) consult the same canonical suffix list.
+func (s *Server) stripSearchDomains(hostname string) string {
+	return s.config.StripSearchDomains(hostname)
 }
 
 // generateCacheKey creates a unique key for caching DNS responses

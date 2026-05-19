@@ -319,12 +319,27 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	var matchedRule string
 	if hostname != "" && event.Allowed == 0 && fw != nil &&
 		(event.IpProto == unix.IPPROTO_TCP || event.IpProto == unix.IPPROTO_UDP) {
-		action, ports, ruleValue := configMgr.MatchHostnameRule(hostname)
-		if action == config.ActionAllow {
-			matchedRule = ruleValue
+		verdict := configMgr.MatchHostnameRule(hostname)
+		if verdict.HasAllow() {
+			matchedRule = verdict.AllowRule
 			ip := net.ParseIP(dstIP)
 			if ip != nil {
-				changed, err := fw.AddIP(ip, config.ActionAllow, ports)
+				// Write the deny side first (if any) so a mixed verdict —
+				// e.g. `*.compute.internal: deny 80` + `bastion: allow 22`
+				// — preserves the deny on its ports even though we're
+				// opening the firewall for the allow side. Order doesn't
+				// matter for correctness (per-port entries are
+				// independent), but writing deny first makes the resulting
+				// BPF state self-consistent if the allow write later
+				// fails.
+				if verdict.HasDeny() {
+					if _, denyErr := fw.AddIP(ip, config.ActionDeny, verdict.DenyPorts); denyErr != nil {
+						logger.Error("Late-resolved deny add failed",
+							"ip", dstIP, "hostname", hostname, "error", denyErr)
+					}
+				}
+
+				changed, err := fw.AddIP(ip, config.ActionAllow, verdict.AllowPorts)
 				if err != nil {
 					// Surface the failure for triage — the event will fall
 					// through to the blocked branch (lateAllowed stays false),
@@ -339,13 +354,13 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 						// (shared-IP-different-ports case) — see
 						// Firewall.AddIP contract.
 						logger.Info("Late-resolved IP firewall state updated",
-							"ip", dstIP, "hostname", hostname, "ports", ports)
+							"ip", dstIP, "hostname", hostname, "ports", verdict.AllowPorts)
 					} else {
 						// IP already in the BPF map with matching state —
 						// useful when triaging "why didn't this connection
 						// succeed on retry?".
 						logger.Debug("Late-resolved IP already in firewall",
-							"ip", dstIP, "hostname", hostname, "ports", ports)
+							"ip", dstIP, "hostname", hostname, "ports", verdict.AllowPorts)
 					}
 					// Sound regardless of `changed`: FirewallImpl.addIPv4 /
 					// addIPv6 reconcile per-port entries before the LPM no-op
@@ -354,7 +369,16 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 					// already in the LPM from a different rule with disjoint
 					// ports. Checking the inputs alone therefore answers
 					// "will the retry succeed?" correctly.
-					lateAllowed = dstPortAllowedByRule(event.DstPort, event.IpProto, ports)
+					//
+					// For a mixed verdict (e.g. `*.foo: deny 80` + `bar:
+					// allow all` on `bar.foo`), AllowPorts may be empty (all
+					// ports) while DenyPorts covers the event's port. The
+					// retry on that port will still be blocked by the deny
+					// side's per-port BPF entry, so it is NOT late-allowed.
+					allowMatches := dstPortAllowedByRule(event.DstPort, event.IpProto, verdict.AllowPorts)
+					denyMatches := verdict.HasDeny() &&
+						dstPortAllowedByRule(event.DstPort, event.IpProto, verdict.DenyPorts)
+					lateAllowed = allowMatches && !denyMatches
 				}
 			}
 		}
@@ -370,8 +394,17 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	comm := lookupProcessName(pid)
 
 	if event.Allowed == 1 {
-		// Check if this connection was allowed by an auto-added rule
-		autoAllowedType := string(configMgr.GetAutoAllowedType(dstIP, event.DstPort, hostname))
+		// Check if this connection was allowed by an auto-added rule.
+		// Pass the event's L4 protocol so the port match is protocol-aware
+		// (TCP/443 and UDP/443 rules don't conflate). Unknown protocols
+		// fall back to ProtocolAll so the attribution doesn't regress for
+		// non-TCP/UDP/ICMP traffic — the firewall already gated the
+		// connection by the time we get here, this is just audit tagging.
+		eventProto, ok := ipProtoToConfigProtocol(event.IpProto)
+		if !ok {
+			eventProto = config.ProtocolAll
+		}
+		autoAllowedType := string(configMgr.GetAutoAllowedType(dstIP, event.DstPort, eventProto, hostname))
 
 		// Allowed TCP SYN connection
 		logger.Info("Connection allowed",

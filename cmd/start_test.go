@@ -20,6 +20,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
@@ -184,31 +186,58 @@ func TestApplyAutoAllowHelpers_ApiUrlAloneTriggersUpdate(t *testing.T) {
 	require.Contains(t, got, "api.codecargo.com")
 }
 
-func TestApplyCloudMetadataAllows_NoUpstreamsGCPOnly(t *testing.T) {
-	t.Setenv("CARGOWALL_AZURE_INFRA_HOSTS", "")
-
-	cm := config.NewConfigManager()
-	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
-
-	applyCloudMetadataAllows(cm, nil, quietLogger())
-
-	// Link-local metadata IP allowed on 80 — covers Azure IMDS and GCP both.
-	require.Equal(t, config.AutoAddedTypeGCPInfrastructure,
-		cm.GetAutoAllowedType("169.254.169.254", 80, ""))
-
-	// No Azure-specific rules added when no Azure wireserver in upstreams.
-	require.Equal(t, config.AutoAddedTypeNone,
-		cm.GetAutoAllowedType("168.63.129.16", 80, ""))
-	require.Empty(t, hostnameRulesFor(t, cm, config.AutoAddedTypeAzureInfrastructure))
+// emptyDMI / dmiWithVendor / dmiWithChassisTag isolate cloud-detection tests
+// from the CI host's real DMI so the test suite is portable across runners.
+func emptyDMI(t *testing.T) string {
+	t.Helper()
+	t.Setenv("CARGOWALL_CLOUD_PROVIDER", "")
+	return t.TempDir()
 }
 
-func TestApplyCloudMetadataAllows_AzureDetectedAddsWireserver(t *testing.T) {
+func dmiWithVendor(t *testing.T, vendor string) string {
+	t.Helper()
+	t.Setenv("CARGOWALL_CLOUD_PROVIDER", "")
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sys_vendor"), []byte(vendor), 0o644))
+	return dir
+}
+
+func dmiWithChassisTag(t *testing.T, tag string) string {
+	t.Helper()
+	t.Setenv("CARGOWALL_CLOUD_PROVIDER", "")
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "chassis_asset_tag"), []byte(tag), 0o644))
+	return dir
+}
+
+func TestApplyCloudMetadataAllows_NoUpstreamsNoProviderDetected(t *testing.T) {
 	t.Setenv("CARGOWALL_AZURE_INFRA_HOSTS", "")
+	dmi := emptyDMI(t)
 
 	cm := config.NewConfigManager()
 	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
 
-	applyCloudMetadataAllows(cm, []string{"168.63.129.16"}, quietLogger())
+	applyCloudMetadataAllows(cm, nil, dmi, quietLogger())
+
+	// Shared link-local metadata IP allowed on 80 — the always-on baseline.
+	require.Equal(t, config.AutoAddedTypeCloudMetadata,
+		cm.GetAutoAllowedType("169.254.169.254", 80, config.ProtocolAll, ""))
+
+	// No provider-specific rules added.
+	require.Equal(t, config.AutoAddedTypeNone,
+		cm.GetAutoAllowedType("168.63.129.16", 80, config.ProtocolAll, ""))
+	require.Empty(t, hostnameRulesFor(t, cm, config.AutoAddedTypeAzureInfrastructure))
+	require.Empty(t, cm.GetSearchDomains())
+}
+
+func TestApplyCloudMetadataAllows_AzureDetectedViaWireserver(t *testing.T) {
+	t.Setenv("CARGOWALL_AZURE_INFRA_HOSTS", "")
+	dmi := emptyDMI(t)
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	applyCloudMetadataAllows(cm, []string{"168.63.129.16"}, dmi, quietLogger())
 
 	// Wireserver HTTP and health ports get the Azure tag. Port 53 is added
 	// by EnsureDNSAllowed first and tagged "dns"; GetAutoAllowedType is
@@ -216,11 +245,11 @@ func TestApplyCloudMetadataAllows_AzureDetectedAddsWireserver(t *testing.T) {
 	// for port 53 only. Asserting both pins down the actual semantics.
 	for _, port := range []uint16{80, 32526} {
 		require.Equal(t, config.AutoAddedTypeAzureInfrastructure,
-			cm.GetAutoAllowedType("168.63.129.16", port, ""),
+			cm.GetAutoAllowedType("168.63.129.16", port, config.ProtocolAll, ""),
 			"168.63.129.16:%d should be auto-allowed as Azure infra", port)
 	}
 	require.Equal(t, config.AutoAddedTypeDNS,
-		cm.GetAutoAllowedType("168.63.129.16", 53, ""),
+		cm.GetAutoAllowedType("168.63.129.16", 53, config.ProtocolAll, ""),
 		"168.63.129.16:53 is tagged DNS by EnsureDNSAllowed (first-match wins)")
 
 	// Azure infrastructure hostnames added.
@@ -228,18 +257,22 @@ func TestApplyCloudMetadataAllows_AzureDetectedAddsWireserver(t *testing.T) {
 	require.Contains(t, azureHosts, "trafficmanager.net")
 	require.Contains(t, azureHosts, "blob.core.windows.net")
 
-	// GCP-tagged metadata IP still allowed (the always-on baseline).
-	require.Equal(t, config.AutoAddedTypeGCPInfrastructure,
-		cm.GetAutoAllowedType("169.254.169.254", 80, ""))
+	// Shared metadata IP still allowed (the always-on baseline).
+	require.Equal(t, config.AutoAddedTypeCloudMetadata,
+		cm.GetAutoAllowedType("169.254.169.254", 80, config.ProtocolAll, ""))
+
+	// Azure VM default internal DNS suffix auto-added.
+	require.Contains(t, cm.GetSearchDomains(), ".internal.cloudapp.net")
 }
 
 func TestApplyCloudMetadataAllows_AzureHostsEnvOverride(t *testing.T) {
 	t.Setenv("CARGOWALL_AZURE_INFRA_HOSTS", "internal.example,corp.example")
+	dmi := emptyDMI(t)
 
 	cm := config.NewConfigManager()
 	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
 
-	applyCloudMetadataAllows(cm, []string{"168.63.129.16"}, quietLogger())
+	applyCloudMetadataAllows(cm, []string{"168.63.129.16"}, dmi, quietLogger())
 
 	azureHosts := hostnameRulesFor(t, cm, config.AutoAddedTypeAzureInfrastructure)
 	require.Contains(t, azureHosts, "internal.example")
@@ -282,4 +315,112 @@ func TestAutoAllowGitHubHosts_RuntimeURLDiscovery(t *testing.T) {
 	require.Contains(t, got, "github.com")
 	require.Contains(t, got, "pipelines.actions.githubusercontent.com")
 	require.Contains(t, got, "results-receiver.actions.githubusercontent.com")
+}
+
+func TestDetectCloudProvider(t *testing.T) {
+	tests := []struct {
+		name       string
+		envValue   string
+		vendor     string // "" means no sys_vendor file
+		chassisTag string // "" means no chassis_asset_tag file
+		upstreams  []string
+		want       cloudProvider
+	}{
+		{"env override aws", "aws", "", "", nil, cloudProviderAWS},
+		{"env override azure", "azure", "", "", nil, cloudProviderAzure},
+		{"env override gcp", "gcp", "", "", nil, cloudProviderGCP},
+		{"env override case-insensitive", "AWS", "", "", nil, cloudProviderAWS},
+		{"env override unknown value ignored", "linode", "Amazon EC2", "", nil, cloudProviderAWS},
+		{"dmi aws", "", "Amazon EC2", "", nil, cloudProviderAWS},
+		{"dmi azure via chassis tag", "", "Microsoft Corporation", azureChassisAssetTag, nil, cloudProviderAzure},
+		{"dmi azure chassis tag only (no vendor)", "", "", azureChassisAssetTag, nil, cloudProviderAzure},
+		{"plain Hyper-V VM is NOT Azure (vendor matches, chassis tag does not)", "", "Microsoft Corporation", "", nil, cloudProviderUnknown},
+		{"dmi gcp", "", "Google", "", nil, cloudProviderGCP},
+		{"dmi gcp with full name", "", "Google Compute Engine", "", nil, cloudProviderGCP},
+		{"dmi ignored when env set", "azure", "Amazon EC2", "", nil, cloudProviderAzure},
+		{"wireserver fallback when no DMI", "", "", "", []string{azureWireserverIP}, cloudProviderAzure},
+		{"wireserver fallback ignored when DMI says AWS", "", "Amazon EC2", "", []string{azureWireserverIP}, cloudProviderAWS},
+		{"plain Hyper-V VM with wireserver upstream IS Azure (via fallback)", "", "Microsoft Corporation", "", []string{azureWireserverIP}, cloudProviderAzure},
+		{"unknown vendor and no wireserver", "", "Bochs", "", []string{"8.8.8.8"}, cloudProviderUnknown},
+		{"no signals at all", "", "", "", nil, cloudProviderUnknown},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CARGOWALL_CLOUD_PROVIDER", tc.envValue)
+			dir := t.TempDir()
+			if tc.vendor != "" {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "sys_vendor"), []byte(tc.vendor), 0o644))
+			}
+			if tc.chassisTag != "" {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "chassis_asset_tag"), []byte(tc.chassisTag), 0o644))
+			}
+			got := detectCloudProvider(dir, tc.upstreams)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestApplyCloudMetadataAllows_AWSDetected(t *testing.T) {
+	t.Setenv("CARGOWALL_AZURE_INFRA_HOSTS", "")
+	dmi := dmiWithVendor(t, "Amazon EC2")
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	applyCloudMetadataAllows(cm, nil, dmi, quietLogger())
+
+	// Shared metadata IP still allowed (covers AWS IMDS at 169.254.169.254).
+	require.Equal(t, config.AutoAddedTypeCloudMetadata,
+		cm.GetAutoAllowedType("169.254.169.254", 80, config.ProtocolAll, ""))
+
+	// AWS internal DNS suffixes auto-added.
+	domains := cm.GetSearchDomains()
+	require.Contains(t, domains, ".compute.internal")
+	require.Contains(t, domains, ".ec2.internal")
+
+	// No Azure-specific allows.
+	require.Empty(t, hostnameRulesFor(t, cm, config.AutoAddedTypeAzureInfrastructure))
+}
+
+func TestApplyCloudMetadataAllows_AzureDetectedViaDMI(t *testing.T) {
+	t.Setenv("CARGOWALL_AZURE_INFRA_HOSTS", "")
+	// chassis_asset_tag is the Azure-specific signal — plain Hyper-V VMs
+	// share the "Microsoft Corporation" sys_vendor but not this tag.
+	dmi := dmiWithChassisTag(t, azureChassisAssetTag)
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	// Empty upstreams: DMI is the only signal. Confirms the DMI path is wired
+	// even when systemd-resolved isn't readable.
+	applyCloudMetadataAllows(cm, nil, dmi, quietLogger())
+
+	// Azure wireserver allowed on its specific ports.
+	require.Equal(t, config.AutoAddedTypeAzureInfrastructure,
+		cm.GetAutoAllowedType("168.63.129.16", 80, config.ProtocolAll, ""))
+
+	// Azure infrastructure hostnames added.
+	azureHosts := hostnameRulesFor(t, cm, config.AutoAddedTypeAzureInfrastructure)
+	require.Contains(t, azureHosts, "trafficmanager.net")
+
+	// Default Azure internal DNS suffix added.
+	require.Contains(t, cm.GetSearchDomains(), ".internal.cloudapp.net")
+}
+
+func TestApplyCloudMetadataAllows_GCPDetected(t *testing.T) {
+	dmi := dmiWithVendor(t, "Google Compute Engine")
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	applyCloudMetadataAllows(cm, nil, dmi, quietLogger())
+
+	require.Equal(t, config.AutoAddedTypeCloudMetadata,
+		cm.GetAutoAllowedType("169.254.169.254", 80, config.ProtocolAll, ""))
+
+	// GCP internal DNS suffix auto-added (covers metadata.google.internal).
+	require.Contains(t, cm.GetSearchDomains(), ".google.internal")
+
+	// No Azure-specific allows.
+	require.Empty(t, hostnameRulesFor(t, cm, config.AutoAddedTypeAzureInfrastructure))
 }

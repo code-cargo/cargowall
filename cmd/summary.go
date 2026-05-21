@@ -608,7 +608,9 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 	}
 
 	var result cargowallv1.CreateCargoWallActionJobResponse
-	if err := protojson.Unmarshal(body, &result); err != nil {
+	// DiscardUnknown so additive response fields from a newer controller don't
+	// make us silently drop the workflow URL.
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &result); err != nil {
 		slog.Info("Audit results pushed to API", "response", string(body))
 		return "", nil
 	}

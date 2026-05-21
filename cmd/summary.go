@@ -608,9 +608,11 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 	}
 
 	var result cargowallv1.CreateCargoWallActionJobResponse
-	if err := protojson.Unmarshal(body, &result); err != nil {
-		slog.Info("Audit results pushed to API", "response", string(body))
-		return "", nil
+	// DiscardUnknown so additive response fields from a newer controller are
+	// tolerated. A genuine parse failure is returned so the caller's best-effort
+	// warning fires (the push itself already succeeded; we just lack the link).
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("failed to parse API push response %q: %w", string(body), err)
 	}
 
 	slog.Info("Audit results pushed to API",

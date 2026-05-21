@@ -63,7 +63,9 @@ func fetchPolicyFromAPI(ctx context.Context, apiUrl, token, jobKey string) (*car
 	}
 
 	var policy cargowallv1pb.CargoWallPolicy
-	if err := protojson.Unmarshal(body, &policy); err != nil {
+	// DiscardUnknown so additive fields/enum values from a newer controller
+	// don't make us drop the entire policy and fall back to local config.
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &policy); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal policy response: %w", err)
 	}
 

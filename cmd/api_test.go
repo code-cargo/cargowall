@@ -40,7 +40,14 @@ func policyServer(t *testing.T, wantJobKey, body string) *httptest.Server {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)
 		assert.Equal(t, policyEndpoint, r.URL.Path)
-		assert.Equal(t, wantJobKey, r.URL.Query().Get("job_key"))
+		// Assert presence/absence explicitly: fetchPolicyFromAPI must omit the
+		// job_key param entirely when no job key is set, not send it empty.
+		gotJobKey, present := r.URL.Query()["job_key"]
+		if wantJobKey == "" {
+			assert.False(t, present, "job_key must be absent when no job key is set")
+		} else {
+			assert.Equal(t, []string{wantJobKey}, gotJobKey)
+		}
 		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(body))
@@ -51,7 +58,7 @@ func policyServer(t *testing.T, wantJobKey, body string) *httptest.Server {
 
 // TestFetchPolicyFromAPI_IgnoresUnknownField guards against the forward-compat
 // bug where a newer controller adding an additive field made the agent reject
-// (and silently drop) the entire policy.
+// the entire policy (loadCIConfig then warns and falls back to env/file config).
 func TestFetchPolicyFromAPI_IgnoresUnknownField(t *testing.T) {
 	body := `{
 		"mode": "CARGO_WALL_MODE_AUDIT",

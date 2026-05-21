@@ -19,6 +19,8 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -698,4 +700,27 @@ func TestSummary_GenerateSummary_CondensedAuditMode(t *testing.T) {
 	// Summary table and detailed sections skipped
 	assert.NotContains(t, out, "### Summary")
 	assert.NotContains(t, out, "### Recommended Allowlist Additions")
+}
+
+// TestPushToApi_IgnoresUnknownResponseField confirms an additive field in the
+// action-job response doesn't break workflow-URL extraction (the response-side
+// counterpart to the policy forward-compat tests).
+func TestPushToApi_IgnoresUnknownResponseField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/cargowall/v1/action/job", r.URL.Path)
+		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"job_id": "job-1",
+			"workflow_run_url": "https://app.codecargo.io/run/789",
+			"future_field": {"enabled": true}
+		}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &SummaryCmd{ApiUrl: srv.URL, Token: "test-token", JobName: "build"}
+	url, err := c.pushToApi(nil, nil)
+	require.NoError(t, err, "unknown response fields must not break URL extraction")
+	assert.Equal(t, "https://app.codecargo.io/run/789", url)
 }

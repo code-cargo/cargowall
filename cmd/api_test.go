@@ -28,11 +28,19 @@ import (
 	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 )
 
+// policyEndpoint is the path fetchPolicyFromAPI is expected to call.
+const policyEndpoint = "/api/cargowall/v1/action/policy"
+
 // policyServer returns an httptest server that serves the given JSON body for
-// the policy endpoint and asserts the bearer token was forwarded.
-func policyServer(t *testing.T, body string) *httptest.Server {
+// the policy endpoint. It asserts the request method, path, job_key query and
+// bearer token match what fetchPolicyFromAPI is expected to send, so the tests
+// also catch endpoint regressions.
+func policyServer(t *testing.T, wantJobKey, body string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, policyEndpoint, r.URL.Path)
+		assert.Equal(t, wantJobKey, r.URL.Query().Get("job_key"))
 		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(body))
@@ -51,9 +59,9 @@ func TestFetchPolicyFromAPI_IgnoresUnknownField(t *testing.T) {
 		"future_feature": {"enabled": true, "level": 3},
 		"another_unknown": "ignore me"
 	}`
-	srv := policyServer(t, body)
+	srv := policyServer(t, "job-123", body)
 
-	policy, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "")
+	policy, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "job-123")
 	require.NoError(t, err, "unknown fields must not cause the policy to be dropped")
 	require.NotNil(t, policy)
 	assert.Equal(t, datapb.CargoWallMode_CARGO_WALL_MODE_AUDIT, policy.Mode)
@@ -68,7 +76,7 @@ func TestFetchPolicyFromAPI_IgnoresUnknownEnumValue(t *testing.T) {
 		"mode": "CARGO_WALL_MODE_FUTURE_VALUE",
 		"default_action": "CARGO_WALL_ACTION_TYPE_ALLOW"
 	}`
-	srv := policyServer(t, body)
+	srv := policyServer(t, "", body)
 
 	policy, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "")
 	require.NoError(t, err, "unknown enum names must not cause the policy to be dropped")

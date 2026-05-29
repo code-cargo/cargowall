@@ -88,6 +88,9 @@ func TestEncodeEgressFilterAttrs(t *testing.T) {
 			kind = ad.String()
 		case unix.TCA_OPTIONS:
 			sawOptions = true
+			// Nested has no error return: it folds both fn's returned nad.Err()
+			// and any nested-decode failure into ad.err, which the ad.Err()
+			// check below surfaces — so a malformed nested attr still fails.
 			ad.Nested(func(nad *netlink.AttributeDecoder) error {
 				for nad.Next() {
 					switch nad.Type() {

@@ -198,7 +198,8 @@ type tcLegacyLink struct {
 func (t *tcLegacyLink) Close() error {
 	conn, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
 	if err != nil {
-		return fmt.Errorf("dial netlink: %w", err)
+		t.logger.Warn("Failed to dial netlink for legacy TC teardown", "ifindex", t.ifindex, "error", err)
+		return nil
 	}
 	defer conn.Close()
 

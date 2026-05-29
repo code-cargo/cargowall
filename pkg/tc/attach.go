@@ -52,8 +52,11 @@ func AttachEgress(ifname string, prog *ebpf.Program, logger *slog.Logger) (io.Cl
 		return l, nil
 	}
 	if !errors.Is(err, ebpf.ErrNotSupported) {
-		// A real failure (permissions, bad program, busy interface): surface it
-		// rather than silently falling back.
+		// AttachTCX runs cilium's haveTCX() feature probe on failure and returns
+		// ebpf.ErrNotSupported whenever TCX is absent (kernels <6.6). A raw
+		// EOPNOTSUPP/EINVAL reaching here therefore means TCX *is* supported but
+		// the attach genuinely failed (permissions, bad program, busy interface) —
+		// surface it rather than silently falling back to clsact.
 		return nil, fmt.Errorf("attach TCX egress: %w", err)
 	}
 

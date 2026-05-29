@@ -9,6 +9,7 @@ This file lists the dependencies used in this repository.
 | Go                                        | BSD-3-Clause | The Go Authors                              |
 | github.com/alecthomas/kong                | MIT          | Alec Thomas                                 |
 | github.com/cilium/ebpf                    | MIT          | Nathan Sweet, Cloudflare, Authors of Cilium |
+| github.com/mdlayher/netlink               | MIT          | Matt Layher                                 |
 | github.com/miekg/dns                      | BSD-3-Clause | The Go Authors, Miek Gieben                 |
 | github.com/stretchr/testify               | MIT          | Mat Ryer, Tyler Bunnell and contributors    |
 | golang.org/x/net                          | BSD-3-Clause | The Go Authors                              |
@@ -21,6 +22,9 @@ This file lists the dependencies used in this repository.
 | Dependency                    | License          | Copyright Owner               |
 |-------------------------------|------------------|-------------------------------|
 | github.com/davecgh/go-spew    | ISC              | Dave Collins                  |
+| github.com/google/go-cmp      | BSD-3-Clause     | The Go Authors                |
+| github.com/josharian/native   | MIT              | Josh Bleecher Snyder          |
+| github.com/mdlayher/socket    | MIT              | Matt Layher                   |
 | github.com/pmezard/go-difflib | BSD-3-Clause     | Patrick Mezard                |
 | github.com/stretchr/objx      | MIT              | Stretchr, Inc.                |
 | golang.org/x/mod              | BSD-3-Clause     | The Go Authors                |

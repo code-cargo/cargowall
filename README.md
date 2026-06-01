@@ -173,7 +173,7 @@ CargoWall's runtime is a self-contained Linux binary — the GitHub Actions inte
 
 ## Requirements
 
-* Linux kernel **5.x or newer** (eBPF TC + cgroup hooks)
+* Linux kernel **5.8 or newer** (eBPF TC + cgroup hooks). CargoWall attaches its egress filter via the modern TCX hook on kernel 6.6+ and automatically falls back to the legacy `clsact` qdisc on 5.8–6.5, so older LTS kernels are supported. (5.8 is the floor because the in-kernel event ring buffer requires it.)
 * `CAP_BPF` and `CAP_NET_ADMIN` (typically run as root, or via capabilities/systemd)
 * An upstream DNS server CargoWall can forward queries to
 * Ports `53/udp` and `53/tcp` available on `127.0.0.1` for the local DNS proxy (the proxy starts listeners on both)
@@ -251,14 +251,14 @@ When CargoWall is ready, it writes a `/tmp/cargowall-ready` sentinel. Use the `c
 
 ## GitLab CI
 
-GitLab SaaS Linux runners give your job root inside a privileged Docker container, which is enough for eBPF — but you'll want to run a smoke job first to confirm `cargowall start --gitlab-ci` actually attaches in your project's runner image. Self-hosted runners with a recent kernel are the well-trodden path.
+GitLab SaaS Linux runners give your job root inside a privileged Docker container, which is enough for eBPF. SaaS shared runners run a 5.15 kernel, which predates the TCX hook — CargoWall detects this and attaches its egress filter through the legacy `clsact` path automatically, so `cargowall start --gitlab-ci` works on SaaS runners as-is. Self-hosted runners on a 6.6+ kernel use the faster TCX attach.
 
 ```yaml
 variables:
-  CARGOWALL_VERSION: v1.2.0
+  CARGOWALL_VERSION: v1.3.0
 
 build:
-  tags: [self-hosted-linux]   # or remove for SaaS shared runners (see caveats above)
+  tags: [self-hosted-linux]   # or remove for SaaS shared runners (clsact fallback)
   before_script:
     - curl -fsSL -o /usr/local/bin/cargowall https://github.com/code-cargo/cargowall/releases/download/${CARGOWALL_VERSION}/cargowall-linux-amd64
     - chmod +x /usr/local/bin/cargowall

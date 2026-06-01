@@ -48,6 +48,7 @@ import (
 	"github.com/code-cargo/cargowall/pkg/firewall"
 	"github.com/code-cargo/cargowall/pkg/lockdown"
 	"github.com/code-cargo/cargowall/pkg/network"
+	"github.com/code-cargo/cargowall/pkg/tc"
 )
 
 func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
@@ -67,12 +68,13 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		switch cmd.CIMode() {
 		case CIModeGithubAction:
 			logger.Error("eBPF is not supported on this runner. " +
-				"Self-hosted runners may need kernel 5.x+ and CAP_BPF/CAP_NET_ADMIN capabilities. " +
+				"Self-hosted runners may need kernel 5.8+ and CAP_BPF/CAP_NET_ADMIN capabilities. " +
 				"GitHub-hosted runners require sudo privileges.")
 		case CIModeGitlabCI:
 			logger.Error("eBPF is not supported in this GitLab CI environment. " +
-				"GitLab SaaS runners run in privileged Docker containers but you may need a self-hosted runner with kernel 5.x+ " +
-				"and CAP_BPF/CAP_NET_ADMIN. Check your runner image's kernel version with `uname -r`.")
+				"GitLab SaaS runners run in privileged Docker containers and attach fine on the 5.15 SaaS kernel " +
+				"(cargowall falls back to legacy clsact below kernel 6.6), so this usually means a kernel older than 5.8 " +
+				"or missing CAP_BPF/CAP_NET_ADMIN. Check your runner image's kernel version with `uname -r`.")
 		}
 
 		return cargowallEbpf.RequireCapabilities()
@@ -311,7 +313,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, logger)
 
 	// Attach TC programs
-	egressLink, err := network.AttachTC(ifname, objs.TcEgress, ebpf.AttachTCXEgress, logger)
+	egressLink, err := tc.AttachEgress(ifname, objs.TcEgress, logger)
 	if err != nil {
 		return fmt.Errorf("failed to attach TC egress: %w", err)
 	}

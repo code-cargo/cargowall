@@ -76,7 +76,8 @@ func Detect() *Capabilities {
 	}
 	caps.KernelVersion = int8ArrayToString(uname.Release[:])
 
-	// Check kernel version (need 5.x+ for TCX, 4.15+ for basic TC)
+	// Check kernel version (need 5.8+ for the event ring buffer; the TC attach
+	// path itself falls back to clsact below 6.6)
 	caps.KernelSupported = isKernelSupported(caps.KernelVersion)
 
 	// Check capabilities
@@ -92,10 +93,12 @@ func Detect() *Capabilities {
 	return caps
 }
 
-// isKernelSupported checks if the kernel version supports eBPF TC programs.
-// TCX (the modern TC attachment method) requires kernel 6.6+
-// TC BPF (legacy) requires kernel 4.15+
-// We target 5.x+ as a reasonable minimum for GitHub Actions runners
+// isKernelSupported reports whether the running kernel meets cargowall's floor.
+//
+// The hard floor is 5.8: bpf/tcbpf.c declares map_events as BPF_MAP_TYPE_RINGBUF
+// and the ring buffer landed in 5.8. The TC attach mechanism is NOT the
+// constraint — TCX (6.6+) is preferred, but pkg/tc transparently falls back to
+// the legacy clsact qdisc (4.5+), so kernels 5.8–6.5 are fully supported.
 func isKernelSupported(version string) bool {
 	var major, minor int
 	_, err := fmt.Sscanf(version, "%d.%d", &major, &minor)
@@ -103,15 +106,13 @@ func isKernelSupported(version string) bool {
 		return false
 	}
 
-	// Require kernel 5.0 or newer for eBPF TC support
-	// GitHub Actions runners typically run Ubuntu 22.04 with kernel 6.x
-	if major >= 6 {
-		return true
+	if major > 5 {
+		return true // 6.x and newer
 	}
 	if major == 5 {
-		return true
+		return minor >= 8 // 5.8+ for ringbuf; 5.0–5.7 rejected
 	}
-	return false
+	return false // 4.x and older
 }
 
 // hasCapability checks if the current process has the specified capability
@@ -200,7 +201,7 @@ func RequireCapabilities() error {
 	var reasons []string
 
 	if !caps.KernelSupported {
-		reasons = append(reasons, fmt.Sprintf("kernel %s is not supported (need 5.x+)", caps.KernelVersion))
+		reasons = append(reasons, fmt.Sprintf("kernel %s is not supported (need 5.8+)", caps.KernelVersion))
 	}
 
 	if !caps.BPFSyscall {

@@ -59,6 +59,12 @@ type Server struct {
 	// DNS response cache (LRU with per-entry TTL)
 	dnsCache *lruCache[string, *dnsCacheEntry]
 
+	// CNAME targets learned from rule-allowed responses (LRU with per-entry
+	// TTL). Consulted only by the query filter: a separate query for a CNAME
+	// target of an allowed host is permitted instead of REFUSED. Does not
+	// affect IP enforcement, which already follows CNAME chains.
+	cnameAllowed *lruCache[string, bool]
+
 	// Audit logger for DNS events
 	auditLogger *events.AuditLogger
 }
@@ -88,8 +94,9 @@ func NewServer(cfg *config.Manager, fw firewall.Firewall, upstream, listenAddr s
 				},
 			},
 		},
-		hostnameIPs: make(map[string]map[string]bool),
-		dnsCache:    newLRUCache[string, *dnsCacheEntry](10000),
+		hostnameIPs:  make(map[string]map[string]bool),
+		dnsCache:     newLRUCache[string, *dnsCacheEntry](10000),
+		cnameAllowed: newLRUCache[string, bool](10000),
 	}
 }
 
@@ -130,10 +137,15 @@ func (s *Server) EnableQueryFiltering(enable bool) {
 //     rule fires — the firewall layer enforces per-port deny separately.
 //     A pure deny verdict (no allow) blocks the query. A deny rule for
 //     "blocked" still blocks "blocked.compute.internal".
-//  4. Search-domain bypass: full form ends in a configured suffix → allow.
+//  4. Derived CNAME-target allow: the name was learned as a CNAME target of
+//     a rule-allowed response → allow. This lets CNAME-chasing clients query
+//     the target directly (e.g. an Akamai edge name an allowed host CNAMEs
+//     to) instead of being REFUSED. Checked AFTER the deny rule above, so an
+//     explicit deny on the target still wins.
+//  5. Search-domain bypass: full form ends in a configured suffix → allow.
 //     This is the "let cloud-internal names resolve when no hostname rule
 //     covers them" path; traffic is still governed by hostname/CIDR rules.
-//  5. Default action.
+//  6. Default action.
 func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 	if !s.filterQueries {
 		return true
@@ -154,6 +166,16 @@ func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 	}
 	if verdict.HasDeny() {
 		return false
+	}
+
+	// Derived CNAME-target allow. Populated in handleDNSQuery when a
+	// rule-allowed response carries CNAME records (see s.cnameAllowed). The
+	// nil guard keeps Server literals constructed without NewServer (some
+	// tests) working. Checked after the deny rule above so a deny still wins.
+	if s.cnameAllowed != nil {
+		if _, ok := s.cnameAllowed.Get(strings.ToLower(domain)); ok {
+			return true
+		}
 	}
 
 	// No explicit rule — try the search-domain bypass. HasSearchDomainSuffix
@@ -390,24 +412,48 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		// Extract IPs and TTLs from response
 		ips, ttl := s.extractIPsFromResponse(resp)
 
+		// Lowercase once for all canonical-form operations below; keep
+		// fullHostname for log attribution so wire-case is preserved in
+		// audit/debug output.
+		canonicalHostname := strings.ToLower(fullHostname)
+
+		// One MatchHostnameRule call per resolution — it internally evaluates
+		// both the full and search-domain-stripped forms and folds the result
+		// into a single HostnameVerdict. Calling it once per form here would be
+		// redundant and unsafe: the resulting BPF map updates could be applied
+		// in non-deterministic map-iteration order, letting the wrong form's
+		// action win the last-write race.
+		verdict := s.config.MatchHostnameRule(canonicalHostname)
+
+		// Learn CNAME targets from rule-allowed responses so CNAME-chasing
+		// clients can query them directly under query filtering instead of
+		// being REFUSED (consulted by isQueryAllowed via s.cnameAllowed). Done
+		// outside the len(ips)>0 guard below so CNAME-only responses (no
+		// A/AAAA in the same message) still register their targets. Only
+		// rule-allowed responses qualify: a single forwarded response already
+		// carries every hop of the chain, so we never learn transitively from
+		// derived-allowed queries — that keeps the surface bounded. ttl is the
+		// response-wide min from extractIPsFromResponse, a conservative expiry
+		// that tracks the shortest-lived record. A target whose entry expires
+		// before its origin's dnsCache entry just gets re-REFUSED until the
+		// next origin query re-learns it — self-healing and TTL-bounded.
+		if s.filterQueries && verdict.HasAllow() {
+			for _, ans := range resp.Answer {
+				if cn, ok := ans.(*dns.CNAME); ok {
+					target := strings.ToLower(strings.TrimSuffix(cn.Target, "."))
+					if target != "" {
+						s.cnameAllowed.Put(target, true, time.Duration(ttl)*time.Second)
+					}
+				}
+			}
+		}
+
 		if len(ips) > 0 {
 			s.logger.Debug("DNS resolution intercepted",
 				"hostname", fullHostname,
 				"ip_count", len(ips),
 				"ttl", ttl)
 
-			// Lowercase once for all canonical-form operations below; keep
-			// fullHostname for log attribution so wire-case is preserved
-			// in audit/debug output.
-			canonicalHostname := strings.ToLower(fullHostname)
-
-			// One MatchHostnameRule call per resolution — it internally
-			// evaluates both the full and search-domain-stripped forms and
-			// folds the result into a single HostnameVerdict. Calling it once
-			// per form here would be redundant and unsafe: the resulting BPF
-			// map updates could be applied in non-deterministic map-iteration
-			// order, letting the wrong form's action win the last-write race.
-			verdict := s.config.MatchHostnameRule(canonicalHostname)
 			// User-configured search-domain suffixes only — Kubernetes
 			// suffixes are strip-only, not bypass, and live separately in
 			// the config manager (see kubernetesSearchDomains).

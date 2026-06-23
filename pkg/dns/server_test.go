@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -1309,6 +1310,80 @@ func TestIsQueryAllowed_SearchDomainBypass(t *testing.T) {
 	}
 }
 
+// TestIsQueryAllowed_CNAMEDerived covers the derived CNAME-target allow path:
+// a name learned as a CNAME target of a rule-allowed response is permitted
+// under query filtering, but an explicit deny still wins and unknown/expired
+// targets are refused.
+func TestIsQueryAllowed_CNAMEDerived(t *testing.T) {
+	tests := []struct {
+		name       string
+		rules      []config.Rule
+		derived    string        // target to pre-seed into cnameAllowed (lowercased on Put)
+		derivedTTL time.Duration // 0 → never expires
+		domain     string
+		expected   bool
+	}{
+		{
+			name:     "derived target is allowed under deny-by-default",
+			derived:  "a441.dscd.akamai.net",
+			domain:   "a441.dscd.akamai.net",
+			expected: true,
+		},
+		{
+			// An explicit deny rule on the target must beat the derived allow —
+			// the deny check in isQueryAllowed precedes the cnameAllowed lookup.
+			name: "explicit deny rule wins over derived allow",
+			rules: []config.Rule{
+				{Type: config.RuleTypeHostname, Value: "a441.dscd.akamai.net", Action: config.ActionDeny},
+			},
+			derived:  "a441.dscd.akamai.net",
+			domain:   "a441.dscd.akamai.net",
+			expected: false,
+		},
+		{
+			name:     "target never learned is refused",
+			derived:  "a441.dscd.akamai.net",
+			domain:   "other.akamai.net",
+			expected: false,
+		},
+		{
+			// DNS names are case-insensitive: Put lowercases, Get must too.
+			name:     "case-insensitive lookup",
+			derived:  "a441.dscd.akamai.net",
+			domain:   "A441.DSCD.Akamai.NET",
+			expected: true,
+		},
+		{
+			name:       "expired derived entry is refused",
+			derived:    "a441.dscd.akamai.net",
+			derivedTTL: time.Nanosecond,
+			domain:     "a441.dscd.akamai.net",
+			expected:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.NewConfigManager()
+			require.NoError(t, cfg.LoadConfigFromRules(tt.rules, config.ActionDeny))
+
+			server := &Server{
+				config:        cfg,
+				filterQueries: true,
+				logger:        slog.Default(),
+				cnameAllowed:  newLRUCache[string, bool](10000),
+			}
+			server.cnameAllowed.Put(strings.ToLower(tt.derived), true, tt.derivedTTL)
+			if tt.derivedTTL == time.Nanosecond {
+				time.Sleep(time.Millisecond) // let the entry lazily expire
+			}
+
+			got := server.isQueryAllowed(tt.domain, dns.TypeA)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // handleDNSQuery integration tests
 // ---------------------------------------------------------------------------
@@ -1317,13 +1392,14 @@ func TestIsQueryAllowed_SearchDomainBypass(t *testing.T) {
 func newTestServer(t *testing.T, cfg *config.Manager, fw firewall.Firewall) *Server {
 	t.Helper()
 	return &Server{
-		config:      cfg,
-		firewall:    fw,
-		logger:      slog.Default(),
-		upstream:    "8.8.8.8:53",
-		client:      &dns.Client{Timeout: 5 * time.Second},
-		hostnameIPs: make(map[string]map[string]bool),
-		dnsCache:    newLRUCache[string, *dnsCacheEntry](10000),
+		config:       cfg,
+		firewall:     fw,
+		logger:       slog.Default(),
+		upstream:     "8.8.8.8:53",
+		client:       &dns.Client{Timeout: 5 * time.Second},
+		hostnameIPs:  make(map[string]map[string]bool),
+		dnsCache:     newLRUCache[string, *dnsCacheEntry](10000),
+		cnameAllowed: newLRUCache[string, bool](10000),
 	}
 }
 
@@ -1522,6 +1598,220 @@ func TestHandleDNSQuery_BypassOnlySkipsHostnameTracking(t *testing.T) {
 	// No firewall AddIP should have been called (no matching rule);
 	// firewall.NewMockFirewall(t) will fail the test if any unexpected call
 	// happened, so this is an implicit assertion.
+}
+
+// makeCNAMEResponse builds a successful response for qname that CNAME-chains
+// through targets (in order) and, if finalIP is non-empty, ends in an A record
+// for finalIP attached to the last target. An empty finalIP yields a
+// CNAME-only response (no address record in the same message).
+func makeCNAMEResponse(qname string, targets []string, finalIP string) *dns.Msg {
+	msg := &dns.Msg{
+		MsgHdr:   dns.MsgHdr{Id: 9999, Response: true, Rcode: dns.RcodeSuccess},
+		Question: []dns.Question{{Name: qname, Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+	}
+	owner := qname
+	for _, target := range targets {
+		fqdn := dns.Fqdn(target)
+		msg.Answer = append(msg.Answer, &dns.CNAME{
+			Hdr:    dns.RR_Header{Name: owner, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300},
+			Target: fqdn,
+		})
+		owner = fqdn
+	}
+	if finalIP != "" {
+		msg.Answer = append(msg.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: owner, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   net.ParseIP(finalIP),
+		})
+	}
+	return msg
+}
+
+// seedCachedResponse stores resp in the DNS cache under qname/A so a
+// subsequent handleDNSQuery is served from cache (no upstream call).
+func seedCachedResponse(server *Server, qname string, resp *dns.Msg) {
+	cacheKey := server.generateCacheKey(&dns.Msg{
+		Question: []dns.Question{{Name: qname, Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+	})
+	server.dnsCache.Put(cacheKey, &dnsCacheEntry{msg: resp.Copy()}, 5*time.Minute)
+}
+
+// A rule-allowed response that CNAME-chains to other names makes those targets
+// directly queryable under query filtering, so CNAME-chasing clients aren't
+// REFUSED when they look up the target themselves.
+func TestHandleDNSQuery_CNAMELearnedFromAllowedResponse(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "builds.dotnet.microsoft.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const origin = "builds.dotnet.microsoft.com."
+	resp := makeCNAMEResponse(origin,
+		[]string{"dotnetcli.trafficmanager.net", "a441.dscd.akamai.net"},
+		"23.56.109.139")
+	seedCachedResponse(server, origin, resp)
+
+	// The final A record is allow-listed under the origin's rule (IP path).
+	mockFw.On("AddIP", net.ParseIP("23.56.109.139"), config.ActionAllow, []config.Port(nil)).Return(true, nil).Once()
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	query.Id = 6001
+
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	// Every CNAME target in the chain is now queryable directly, even though
+	// no rule names them.
+	for _, target := range []string{"dotnetcli.trafficmanager.net", "a441.dscd.akamai.net"} {
+		_, ok := server.cnameAllowed.Get(target)
+		assert.True(t, ok, "CNAME target %q should be learned", target)
+		assert.True(t, server.isQueryAllowed(target, dns.TypeA),
+			"direct query for CNAME target %q should be allowed", target)
+	}
+}
+
+// A CNAME-only response (no address record in the same message) must still
+// register its target — this is the case CNAME-chasing clients hit when a
+// server answers one hop at a time.
+func TestHandleDNSQuery_CNAMEOnlyResponseStillLearns(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const origin = "allowed.example.com."
+	resp := makeCNAMEResponse(origin, []string{"edge.cdn.example.net"}, "") // no A record
+	seedCachedResponse(server, origin, resp)
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	query.Id = 6002
+
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	// No A record means no firewall call, but the target must still be learned.
+	_, ok := server.cnameAllowed.Get("edge.cdn.example.net")
+	assert.True(t, ok, "CNAME-only response must still learn its target")
+}
+
+// A name allowed only by the search-domain bypass (no matching rule) must NOT
+// contribute its CNAME targets — learning is scoped to rule-allowed responses.
+func TestHandleDNSQuery_CNAMENotLearnedFromBypass(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules(nil, config.ActionDeny))
+	cfg.AddSearchDomains([]string{".compute.internal"}, slog.Default())
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const origin = "ip-10-0-0-5.us-west-2.compute.internal."
+	resp := makeCNAMEResponse(origin, []string{"edge.cdn.example.net"}, "10.0.0.5")
+	seedCachedResponse(server, origin, resp)
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	query.Id = 6003
+
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	_, ok := server.cnameAllowed.Get("edge.cdn.example.net")
+	assert.False(t, ok, "bypass-only resolution must not learn CNAME targets")
+}
+
+// The response block runs for cache hits too, so a derived target that expired
+// ahead of its origin's cache entry is re-learned on the next origin query.
+func TestHandleDNSQuery_CNAMERefreshedOnCacheHit(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "builds.dotnet.microsoft.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const origin = "builds.dotnet.microsoft.com."
+	resp := makeCNAMEResponse(origin, []string{"a441.dscd.akamai.net"}, "23.56.109.139")
+	seedCachedResponse(server, origin, resp)
+
+	// Deduped by the firewall after the first add; allow any number of calls.
+	mockFw.On("AddIP", net.ParseIP("23.56.109.139"), config.ActionAllow, []config.Port(nil)).Return(true, nil)
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	query.Id = 6004
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil)
+
+	server.handleDNSQuery(w, query)
+	_, ok := server.cnameAllowed.Get("a441.dscd.akamai.net")
+	require.True(t, ok)
+
+	// Simulate the derived entry expiring before the dnsCache entry.
+	server.cnameAllowed.Delete("a441.dscd.akamai.net")
+	_, ok = server.cnameAllowed.Get("a441.dscd.akamai.net")
+	require.False(t, ok)
+
+	// Second query is a cache hit, but the response block still re-learns.
+	server.handleDNSQuery(w, query)
+	_, ok = server.cnameAllowed.Get("a441.dscd.akamai.net")
+	assert.True(t, ok, "cache hit on origin should refresh the derived CNAME target")
+}
+
+// CNAME learning is independent of enforce/audit mode — it happens on the
+// response, not at the query gate.
+func TestHandleDNSQuery_CNAMELearnedInAuditMode(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "builds.dotnet.microsoft.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	tmpFile, err := os.CreateTemp(t.TempDir(), "audit-*.json")
+	require.NoError(t, err)
+	tmpFile.Close()
+	auditLogger, err := events.NewAuditLogger(tmpFile.Name(), true) // audit mode = true
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	server.auditLogger = auditLogger
+
+	const origin = "builds.dotnet.microsoft.com."
+	resp := makeCNAMEResponse(origin, []string{"a441.dscd.akamai.net"}, "23.56.109.139")
+	seedCachedResponse(server, origin, resp)
+
+	mockFw.On("AddIP", net.ParseIP("23.56.109.139"), config.ActionAllow, []config.Port(nil)).Return(true, nil).Once()
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	query.Id = 6005
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	_, ok := server.cnameAllowed.Get("a441.dscd.akamai.net")
+	assert.True(t, ok, "CNAME learning must work in audit mode too")
 }
 
 // Counterpoint to the above: when a rule matches the stripped form (the K8s

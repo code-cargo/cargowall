@@ -432,19 +432,21 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		// A/AAAA in the same message) still register their targets. Only
 		// rule-allowed responses qualify: a single forwarded response already
 		// carries every hop of the chain, so we never learn transitively from
-		// derived-allowed queries — that keeps the surface bounded. A target
-		// whose entry expires before its origin's dnsCache entry just gets
-		// re-REFUSED until the next origin query re-learns it — self-healing
-		// and TTL-bounded.
+		// derived-allowed queries — that keeps the surface bounded.
+		//
+		// cnameChainTargets follows the chain from the query name only, so
+		// unrelated CNAME records in the same response (a misbehaving or
+		// spoofed authoritative server for an allowed domain) are ignored
+		// instead of registering arbitrary names. Each target is learned for
+		// its own CNAME TTL (not the response-wide min, which would shorten it
+		// to the final address record's TTL), floored by derivedCNAMETTL. A
+		// target whose entry expires before its origin's dnsCache entry just
+		// gets re-REFUSED until the next origin query re-learns it —
+		// self-healing and TTL-bounded.
 		if s.filterQueries && verdict.HasAllow() && s.cnameAllowed != nil {
-			cnameTTL := time.Duration(derivedCNAMETTL(ttl)) * time.Second
-			for _, ans := range resp.Answer {
-				if cn, ok := ans.(*dns.CNAME); ok {
-					target := strings.ToLower(strings.TrimSuffix(cn.Target, "."))
-					if target != "" {
-						s.cnameAllowed.Put(target, true, cnameTTL)
-					}
-				}
+			for _, link := range cnameChainTargets(canonicalHostname, resp.Answer) {
+				ttl := time.Duration(derivedCNAMETTL(link.ttl)) * time.Second
+				s.cnameAllowed.Put(link.target, true, ttl)
 			}
 		}
 
@@ -521,12 +523,60 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	}
 }
 
-// derivedCNAMETTL floors a response TTL for the derived CNAME-allow cache.
-// extractIPsFromResponse returns the literal response-wide min, which can be 0
-// (some CDNs/load-balancers return TTL 0 to defeat caching). lruCache treats a
-// 0 duration as "never expires", so a literal 0 would pin the derived allow
-// indefinitely — the opposite of the TTL-bounded guarantee. Floor it to the
-// same default the dnsCache path uses (300s / 5 min).
+// cnameLink is one hop of a CNAME chain: the target name (lowercased, no
+// trailing dot) and the TTL of the CNAME record that points to it.
+type cnameLink struct {
+	target string
+	ttl    uint32
+}
+
+// cnameChainTargets walks the CNAME chain in answers starting from qname
+// (which must already be lowercased and trailing-dot-trimmed) and returns the
+// ordered targets actually reachable from qname. CNAME records whose owner is
+// not on the chain — unrelated or attacker-injected records in an otherwise
+// rule-allowed response — are ignored, so they can't register arbitrary names
+// as queryable. A visited set bounds malicious loops (A→B→A). Each target
+// carries its own CNAME record's TTL so the caller can expire it on the hop's
+// lifetime rather than the response-wide minimum.
+func cnameChainTargets(qname string, answers []dns.RR) []cnameLink {
+	// Index CNAMEs by lowercased owner; first record for an owner wins so a
+	// duplicate owner can't redirect the walk.
+	byOwner := make(map[string]*dns.CNAME, len(answers))
+	for _, ans := range answers {
+		cn, ok := ans.(*dns.CNAME)
+		if !ok {
+			continue
+		}
+		owner := strings.ToLower(strings.TrimSuffix(cn.Header().Name, "."))
+		if _, exists := byOwner[owner]; !exists {
+			byOwner[owner] = cn
+		}
+	}
+
+	var chain []cnameLink
+	visited := make(map[string]bool)
+	for cur := qname; ; {
+		cn, ok := byOwner[cur]
+		if !ok {
+			break
+		}
+		target := strings.ToLower(strings.TrimSuffix(cn.Target, "."))
+		if target == "" || visited[target] {
+			break
+		}
+		visited[target] = true
+		chain = append(chain, cnameLink{target: target, ttl: cn.Header().Ttl})
+		cur = target
+	}
+	return chain
+}
+
+// derivedCNAMETTL floors a CNAME record's TTL for the derived CNAME-allow
+// cache. A record's TTL can be 0 (some CDNs/load-balancers return TTL 0 to
+// defeat caching), and lruCache treats a 0 duration as "never expires", so a
+// literal 0 would pin the derived allow indefinitely — the opposite of the
+// TTL-bounded guarantee. Floor it to the same default the dnsCache path uses
+// (300s / 5 min).
 func derivedCNAMETTL(ttl uint32) uint32 {
 	if ttl == 0 {
 		return 300

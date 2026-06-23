@@ -1857,6 +1857,110 @@ func TestHandleDNSQuery_CNAMEZeroTTLStillLearns(t *testing.T) {
 	assert.True(t, ok, "TTL-0 response must still learn its CNAME target")
 }
 
+// cnameChainTargets must follow only the chain rooted at the query name, carry
+// each hop's own TTL, ignore unrelated/injected CNAME records, and terminate
+// on loops.
+func TestCnameChainTargets(t *testing.T) {
+	cname := func(owner, target string, ttl uint32) *dns.CNAME {
+		return &dns.CNAME{
+			Hdr:    dns.RR_Header{Name: dns.Fqdn(owner), Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: ttl},
+			Target: dns.Fqdn(target),
+		}
+	}
+
+	t.Run("follows chain from query name with per-hop TTLs", func(t *testing.T) {
+		answers := []dns.RR{
+			cname("builds.dotnet.microsoft.com", "dotnetcli.trafficmanager.net", 100),
+			cname("dotnetcli.trafficmanager.net", "a441.dscd.akamai.net", 50),
+			&dns.A{
+				Hdr: dns.RR_Header{Name: "a441.dscd.akamai.net.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 20},
+				A:   net.ParseIP("23.56.109.139"),
+			},
+		}
+		got := cnameChainTargets("builds.dotnet.microsoft.com", answers)
+		require.Len(t, got, 2)
+		// TTLs are the CNAMEs' own (100, 50), not the address record's 20.
+		assert.Equal(t, cnameLink{target: "dotnetcli.trafficmanager.net", ttl: 100}, got[0])
+		assert.Equal(t, cnameLink{target: "a441.dscd.akamai.net", ttl: 50}, got[1])
+	})
+
+	t.Run("ignores CNAME records not on the chain", func(t *testing.T) {
+		answers := []dns.RR{
+			cname("builds.dotnet.microsoft.com", "a441.dscd.akamai.net", 100),
+			cname("evil.example.com", "attacker.example.net", 100), // owner off-chain
+		}
+		got := cnameChainTargets("builds.dotnet.microsoft.com", answers)
+		require.Len(t, got, 1)
+		assert.Equal(t, "a441.dscd.akamai.net", got[0].target)
+	})
+
+	t.Run("case-insensitive owner matching", func(t *testing.T) {
+		answers := []dns.RR{cname("Builds.Dotnet.Microsoft.COM", "A441.DSCD.Akamai.NET", 30)}
+		got := cnameChainTargets("builds.dotnet.microsoft.com", answers)
+		require.Len(t, got, 1)
+		assert.Equal(t, cnameLink{target: "a441.dscd.akamai.net", ttl: 30}, got[0])
+	})
+
+	t.Run("terminates on a loop", func(t *testing.T) {
+		answers := []dns.RR{
+			cname("a.example.com", "b.example.com", 100),
+			cname("b.example.com", "a.example.com", 100), // loops back
+		}
+		got := cnameChainTargets("a.example.com", answers)
+		require.Len(t, got, 2) // a→b, b→a, then a revisited → stop
+		assert.Equal(t, "b.example.com", got[0].target)
+		assert.Equal(t, "a.example.com", got[1].target)
+	})
+
+	t.Run("no CNAME for query name returns nil", func(t *testing.T) {
+		answers := []dns.RR{
+			&dns.A{
+				Hdr: dns.RR_Header{Name: "builds.dotnet.microsoft.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 20},
+				A:   net.ParseIP("23.56.109.139"),
+			},
+		}
+		assert.Empty(t, cnameChainTargets("builds.dotnet.microsoft.com", answers))
+	})
+}
+
+// An unrelated CNAME record in an otherwise rule-allowed response (a spoofed or
+// misbehaving authoritative server) must NOT register its target — only names
+// on the chain rooted at the query name are learned.
+func TestHandleDNSQuery_CNAMEUnrelatedRecordNotLearned(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "builds.dotnet.microsoft.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const origin = "builds.dotnet.microsoft.com."
+	resp := makeCNAMEResponse(origin, []string{"a441.dscd.akamai.net"}, "23.56.109.139")
+	// Inject an off-chain CNAME, as a spoofed/misbehaving server might.
+	resp.Answer = append(resp.Answer, &dns.CNAME{
+		Hdr:    dns.RR_Header{Name: "evil.example.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300},
+		Target: "attacker.example.net.",
+	})
+	seedCachedResponse(server, origin, resp)
+
+	mockFw.On("AddIP", net.ParseIP("23.56.109.139"), config.ActionAllow, []config.Port(nil)).Return(true, nil).Once()
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	query.Id = 6007
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	_, ok := server.cnameAllowed.Get("a441.dscd.akamai.net")
+	assert.True(t, ok, "on-chain target should be learned")
+	_, ok = server.cnameAllowed.Get("attacker.example.net")
+	assert.False(t, ok, "unrelated CNAME target must not be learned")
+}
+
 // Counterpoint to the above: when a rule matches the stripped form (the K8s
 // or short-name pattern), per-host tracking SHOULD happen and the firewall
 // SHOULD be updated.

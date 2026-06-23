@@ -432,17 +432,17 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		// A/AAAA in the same message) still register their targets. Only
 		// rule-allowed responses qualify: a single forwarded response already
 		// carries every hop of the chain, so we never learn transitively from
-		// derived-allowed queries — that keeps the surface bounded. ttl is the
-		// response-wide min from extractIPsFromResponse, a conservative expiry
-		// that tracks the shortest-lived record. A target whose entry expires
-		// before its origin's dnsCache entry just gets re-REFUSED until the
-		// next origin query re-learns it — self-healing and TTL-bounded.
-		if s.filterQueries && verdict.HasAllow() {
+		// derived-allowed queries — that keeps the surface bounded. A target
+		// whose entry expires before its origin's dnsCache entry just gets
+		// re-REFUSED until the next origin query re-learns it — self-healing
+		// and TTL-bounded.
+		if s.filterQueries && verdict.HasAllow() && s.cnameAllowed != nil {
+			cnameTTL := time.Duration(derivedCNAMETTL(ttl)) * time.Second
 			for _, ans := range resp.Answer {
 				if cn, ok := ans.(*dns.CNAME); ok {
 					target := strings.ToLower(strings.TrimSuffix(cn.Target, "."))
 					if target != "" {
-						s.cnameAllowed.Put(target, true, time.Duration(ttl)*time.Second)
+						s.cnameAllowed.Put(target, true, cnameTTL)
 					}
 				}
 			}
@@ -519,6 +519,19 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	if err := w.WriteMsg(resp); err != nil {
 		s.logger.Error("Failed to write DNS response", "error", err)
 	}
+}
+
+// derivedCNAMETTL floors a response TTL for the derived CNAME-allow cache.
+// extractIPsFromResponse returns the literal response-wide min, which can be 0
+// (some CDNs/load-balancers return TTL 0 to defeat caching). lruCache treats a
+// 0 duration as "never expires", so a literal 0 would pin the derived allow
+// indefinitely — the opposite of the TTL-bounded guarantee. Floor it to the
+// same default the dnsCache path uses (300s / 5 min).
+func derivedCNAMETTL(ttl uint32) uint32 {
+	if ttl == 0 {
+		return 300
+	}
+	return ttl
 }
 
 // extractIPsFromResponse extracts IPv4 and IPv6 addresses from msg.Answer

@@ -1814,6 +1814,49 @@ func TestHandleDNSQuery_CNAMELearnedInAuditMode(t *testing.T) {
 	assert.True(t, ok, "CNAME learning must work in audit mode too")
 }
 
+// derivedCNAMETTL floors a 0 TTL so the derived allow can never be stored as
+// a never-expiring lruCache entry; non-zero TTLs pass through unchanged.
+func TestDerivedCNAMETTL(t *testing.T) {
+	assert.Equal(t, uint32(300), derivedCNAMETTL(0), "TTL 0 must be floored, not stored as never-expires")
+	assert.Equal(t, uint32(1), derivedCNAMETTL(1))
+	assert.Equal(t, uint32(20), derivedCNAMETTL(20))
+	assert.Equal(t, uint32(86400), derivedCNAMETTL(86400))
+}
+
+// End-to-end guard for the TTL-0 case (some CDNs return TTL 0 to defeat
+// caching): the target is still learned, and via derivedCNAMETTL it is stored
+// with a bounded expiry rather than a permanent entry.
+func TestHandleDNSQuery_CNAMEZeroTTLStillLearns(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "builds.dotnet.microsoft.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const origin = "builds.dotnet.microsoft.com."
+	resp := makeCNAMEResponse(origin, []string{"a441.dscd.akamai.net"}, "23.56.109.139")
+	for _, ans := range resp.Answer { // force every RR to TTL 0
+		ans.Header().Ttl = 0
+	}
+	seedCachedResponse(server, origin, resp)
+
+	mockFw.On("AddIP", net.ParseIP("23.56.109.139"), config.ActionAllow, []config.Port(nil)).Return(true, nil).Once()
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	query.Id = 6006
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	_, ok := server.cnameAllowed.Get("a441.dscd.akamai.net")
+	assert.True(t, ok, "TTL-0 response must still learn its CNAME target")
+}
+
 // Counterpoint to the above: when a rule matches the stripped form (the K8s
 // or short-name pattern), per-host tracking SHOULD happen and the firewall
 // SHOULD be updated.

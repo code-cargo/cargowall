@@ -1853,8 +1853,80 @@ func TestHandleDNSQuery_CNAMEZeroTTLStillLearns(t *testing.T) {
 	server.handleDNSQuery(w, query)
 	w.AssertExpectations(t)
 
-	_, ok := server.cnameAllowed.Get("a441.dscd.akamai.net")
-	assert.True(t, ok, "TTL-0 response must still learn its CNAME target")
+	// Assert the stored expiry, not just presence: a regression that Put the
+	// raw 0 TTL would store a never-expiring entry (zero expiry), which Get
+	// alone can't distinguish from a bounded one. derivedCNAMETTL floors 0 to
+	// 300s, so the entry must carry a non-zero expiry ~300s out.
+	exp, ok := server.cnameAllowed.peekExpiry("a441.dscd.akamai.net")
+	require.True(t, ok, "TTL-0 response must still learn its CNAME target")
+	require.False(t, exp.IsZero(), "TTL-0 must be floored, not stored as never-expires")
+	remaining := time.Until(exp)
+	assert.Greater(t, remaining, 290*time.Second, "expiry should be floored to ~300s")
+	assert.LessOrEqual(t, remaining, 300*time.Second)
+}
+
+// Each CNAME target must be learned for its OWN hop's TTL, not the response-wide
+// minimum (which would fold in the final address record's shorter TTL). This
+// asserts the end-to-end wiring: handleDNSQuery → cnameChainTargets per-hop ttl
+// → derivedCNAMETTL → cnameAllowed.Put.
+func TestHandleDNSQuery_CNAMEPerHopTTLApplied(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "builds.dotnet.microsoft.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const origin = "builds.dotnet.microsoft.com."
+	cn := func(owner, target string, ttl uint32) *dns.CNAME {
+		return &dns.CNAME{
+			Hdr:    dns.RR_Header{Name: dns.Fqdn(owner), Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: ttl},
+			Target: dns.Fqdn(target),
+		}
+	}
+	// origin --(120s)--> hop1 --(45s)--> a441, with a short-TTL A record (10s).
+	// If the learn path used the response-wide min, both targets would expire
+	// in ~10s; per-hop TTLs keep them at 120s and 45s.
+	resp := &dns.Msg{
+		MsgHdr:   dns.MsgHdr{Id: 7000, Response: true, Rcode: dns.RcodeSuccess},
+		Question: []dns.Question{{Name: origin, Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+		Answer: []dns.RR{
+			cn(origin, "hop1.example.net", 120),
+			cn("hop1.example.net", "a441.dscd.akamai.net", 45),
+			&dns.A{
+				Hdr: dns.RR_Header{Name: "a441.dscd.akamai.net.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10},
+				A:   net.ParseIP("23.56.109.139"),
+			},
+		},
+	}
+	seedCachedResponse(server, origin, resp)
+
+	mockFw.On("AddIP", net.ParseIP("23.56.109.139"), config.ActionAllow, []config.Port(nil)).Return(true, nil).Once()
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	query.Id = 7001
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	for _, tc := range []struct {
+		name   string
+		ttl    time.Duration
+		lowest time.Duration
+	}{
+		{"hop1.example.net", 120 * time.Second, 110 * time.Second},
+		{"a441.dscd.akamai.net", 45 * time.Second, 40 * time.Second},
+	} {
+		exp, ok := server.cnameAllowed.peekExpiry(tc.name)
+		require.True(t, ok, "%s should be learned", tc.name)
+		remaining := time.Until(exp)
+		assert.Greater(t, remaining, tc.lowest, "%s expiry should reflect its own CNAME TTL, not the response min", tc.name)
+		assert.LessOrEqual(t, remaining, tc.ttl, "%s expiry should not exceed its own CNAME TTL", tc.name)
+	}
 }
 
 // cnameChainTargets must follow only the chain rooted at the query name, carry

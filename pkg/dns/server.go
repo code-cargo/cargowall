@@ -540,14 +540,19 @@ type cnameLink struct {
 // lifetime rather than the response-wide minimum.
 func cnameChainTargets(qname string, answers []dns.RR) []cnameLink {
 	// Index CNAMEs by lowercased owner; first record for an owner wins so a
-	// duplicate owner can't redirect the walk.
-	byOwner := make(map[string]*dns.CNAME, len(answers))
+	// duplicate owner can't redirect the walk. Allocated lazily so the common
+	// CNAME-free response (e.g. a round-robin A answer) costs no map — a nil
+	// map read below is safe and simply ends the walk.
+	var byOwner map[string]*dns.CNAME
 	for _, ans := range answers {
 		cn, ok := ans.(*dns.CNAME)
 		if !ok {
 			continue
 		}
 		owner := strings.ToLower(strings.TrimSuffix(cn.Header().Name, "."))
+		if byOwner == nil {
+			byOwner = make(map[string]*dns.CNAME, len(answers))
+		}
 		if _, exists := byOwner[owner]; !exists {
 			byOwner[owner] = cn
 		}

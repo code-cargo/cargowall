@@ -2095,12 +2095,10 @@ func TestPickAllowForm(t *testing.T) {
 	}
 }
 
-// normalizeRules canonicalises hostname rule values at load time so
-// cm.config.Rules and cm.resolvedRules share the same byte sequence.
-// CIDR values are left untouched (case is meaningless for CIDRs and IPv6
-// "::1" would be mangled by ToLower of nothing, but defensiveness costs
-// nothing).
-func TestNormalizeRules_LowercasesHostnameOnly(t *testing.T) {
+// normalizeRules canonicalises rule values at load time so cm.config.Rules
+// and cm.resolvedRules share the same byte sequence: hostnames are
+// lower-cased and CIDRs are canonicalised (issue #64).
+func TestNormalizeRules_CanonicalisesHostnameAndCIDR(t *testing.T) {
 	rules := []Rule{
 		{Type: RuleTypeHostname, Value: "GitHub.COM", Action: ActionAllow},
 		{Type: RuleTypeHostname, Value: "*.Example.NET", Action: ActionAllow},
@@ -2114,7 +2112,73 @@ func TestNormalizeRules_LowercasesHostnameOnly(t *testing.T) {
 		t.Errorf("hostname[1] = %q, want %q", rules[1].Value, "*.example.net")
 	}
 	if rules[2].Value != "10.0.0.0/8" {
-		t.Errorf("CIDR rule should not be normalized: got %q", rules[2].Value)
+		t.Errorf("already-canonical CIDR changed: got %q", rules[2].Value)
+	}
+}
+
+// canonicalCIDR collapses textually-different-but-equivalent CIDR/IP forms to
+// one canonical string (issue #64), and leaves unparseable values untouched so
+// resolveRules can log them.
+func TestCanonicalCIDR(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"already-canonical IPv4 CIDR", "10.0.0.0/8", "10.0.0.0/8"},
+		{"bare IPv4 → /32", "8.8.8.8", "8.8.8.8/32"},
+		{"explicit /32 unchanged", "8.8.8.8/32", "8.8.8.8/32"},
+		{"IPv4 host bits masked", "10.0.0.5/8", "10.0.0.0/8"},
+		{"IPv6 case-folded", "2001:DB8::/32", "2001:db8::/32"},
+		{"IPv6 zero-compression canonicalised", "2001:db8:0:0::/64", "2001:db8::/64"},
+		{"bare IPv6 → /128", "2001:db8::1", "2001:db8::1/128"},
+		{"bare IPv6 case-folded → /128", "2001:DB8::1", "2001:db8::1/128"},
+		{"unparseable left untouched", "not-a-cidr", "not-a-cidr"},
+		{"empty left untouched", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := canonicalCIDR(tc.in); got != tc.want {
+				t.Errorf("canonicalCIDR(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// Equivalent-but-differently-spelled CIDR forms must collapse to one rule and
+// union their ports through the load-time merge (issue #64), the CIDR analogue
+// of TestMergeDuplicateRules_HostnameAllowUnion.
+func TestMergeDuplicateRules_EquivalentCIDRFormsUnion(t *testing.T) {
+	tcp443 := Port{Port: 443, Protocol: ProtocolTCP}
+	tcp80 := Port{Port: 80, Protocol: ProtocolTCP}
+
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules([]Rule{
+		// Same /128 host expressed as upper-case prefix, bare IP, and
+		// lower-case prefix — three spellings of one rule.
+		{Type: RuleTypeCIDR, Value: "2001:DB8::1/128", Ports: []Port{tcp443}, Action: ActionAllow},
+		{Type: RuleTypeCIDR, Value: "2001:db8::1", Ports: []Port{tcp80}, Action: ActionAllow},
+		{Type: RuleTypeCIDR, Value: "2001:db8:0:0::1/128", Action: ActionAllow},
+	}, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	cidrRules := make([]Rule, 0, len(cm.config.Rules))
+	for _, r := range cm.config.Rules {
+		if r.Type == RuleTypeCIDR {
+			cidrRules = append(cidrRules, r)
+		}
+	}
+	if len(cidrRules) != 1 {
+		t.Fatalf("got %d CIDR rules, want 1 (equivalent forms should merge): %+v", len(cidrRules), cidrRules)
+	}
+	if cidrRules[0].Value != "2001:db8::1/128" {
+		t.Errorf("merged CIDR value = %q, want %q", cidrRules[0].Value, "2001:db8::1/128")
+	}
+	// The third entry carries no ports — the all-ports sentinel absorbs the
+	// rest, so the union is all-ports (empty).
+	if len(cidrRules[0].Ports) != 0 {
+		t.Errorf("merged ports = %v, want all-ports (empty)", cidrRules[0].Ports)
 	}
 }
 
@@ -2220,7 +2284,9 @@ func TestCheckIPRuleConflict(t *testing.T) {
 			wantConflict:   false,
 		},
 		{
-			name: "single-IP rule treated as /32",
+			// A bare IP is canonicalised to an explicit /32 at load time
+			// (issue #64), so the reported conflicting rule is "10.0.0.5/32".
+			name: "single-IP rule canonicalised to /32",
 			rules: []Rule{
 				{Type: RuleTypeCIDR, Value: "10.0.0.5", Action: ActionDeny},
 			},
@@ -2228,7 +2294,7 @@ func TestCheckIPRuleConflict(t *testing.T) {
 			hostnameAction: ActionAllow,
 			wantAction:     ActionDeny,
 			wantConflict:   true,
-			wantRuleValue:  "10.0.0.5",
+			wantRuleValue:  "10.0.0.5/32",
 		},
 	}
 

@@ -370,7 +370,8 @@ func TestMergeDuplicateRules_CIDRUnionVisibleToConflictCheck(t *testing.T) {
 	// second duplicate; before the merge it was lost and this allow would
 	// have been reported as non-conflicting.
 	action, conflict, rule := cm.CheckIPRuleConflict(
-		net.ParseIP("1.2.3.4"), "host.example.com", ActionAllow, []Port{tcp443})
+		net.ParseIP("1.2.3.4"), "host.example.com", ActionAllow, []Port{tcp443},
+	)
 	if !conflict || action != ActionDeny {
 		t.Errorf("CheckIPRuleConflict = (%v, %v, %q), want (deny, true, 1.2.3.4/32)", action, conflict, rule)
 	}

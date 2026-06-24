@@ -219,6 +219,199 @@ func TestResolveRules_Mixed(t *testing.T) {
 	}
 }
 
+// portSetEqual compares two port lists as unordered sets (mergeDuplicateRules
+// preserves a deterministic order, but the union semantics are what matter).
+func portSetEqual(a, b []Port) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[Port]int, len(a))
+	for _, p := range a {
+		counts[p]++
+	}
+	for _, p := range b {
+		counts[p]--
+	}
+	for _, c := range counts {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// Issue #52: a policy that lists the same hostname/CIDR more than once must
+// allow the UNION of those entries' ports, not just one entry's. The merge
+// happens in applyLoadedConfig, so these tests drive it through
+// LoadConfigFromRules (the four loaders share that tail).
+
+func TestMergeDuplicateRules_HostnameAllowUnion(t *testing.T) {
+	tcp443 := Port{Port: 443, Protocol: ProtocolTCP}
+	tcp80 := Port{Port: 80, Protocol: ProtocolTCP}
+
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "github.com", Ports: []Port{tcp443}, Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "github.com", Ports: []Port{tcp80}, Action: ActionAllow},
+	}, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	// The two entries collapse into one rule across both views.
+	if len(cm.config.Rules) != 1 {
+		t.Fatalf("config.Rules: expected 1 merged rule, got %d", len(cm.config.Rules))
+	}
+	if len(cm.resolvedRules) != 1 {
+		t.Fatalf("resolvedRules: expected 1 merged rule, got %d", len(cm.resolvedRules))
+	}
+
+	verdict := cm.MatchHostnameRule("github.com")
+	if !verdict.HasAllow() {
+		t.Fatalf("expected an allow verdict, got %+v", verdict)
+	}
+	if want := []Port{tcp443, tcp80}; !portSetEqual(verdict.AllowPorts, want) {
+		t.Errorf("AllowPorts = %v, want union %v", verdict.AllowPorts, want)
+	}
+}
+
+func TestMergeDuplicateRules_AllPortsSentinelAbsorbs(t *testing.T) {
+	tcp443 := Port{Port: 443, Protocol: ProtocolTCP}
+
+	// An all-ports entry (empty Ports) on either side makes the whole group
+	// all-ports, regardless of order.
+	for _, tc := range []struct {
+		name  string
+		rules []Rule
+	}{
+		{"all-ports first", []Rule{
+			{Type: RuleTypeHostname, Value: "example.com", Action: ActionAllow},
+			{Type: RuleTypeHostname, Value: "example.com", Ports: []Port{tcp443}, Action: ActionAllow},
+		}},
+		{"all-ports second", []Rule{
+			{Type: RuleTypeHostname, Value: "example.com", Ports: []Port{tcp443}, Action: ActionAllow},
+			{Type: RuleTypeHostname, Value: "example.com", Action: ActionAllow},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := NewConfigManager()
+			if err := cm.LoadConfigFromRules(tc.rules, ActionDeny); err != nil {
+				t.Fatalf("LoadConfigFromRules() error = %v", err)
+			}
+			verdict := cm.MatchHostnameRule("example.com")
+			if !verdict.HasAllow() {
+				t.Fatalf("expected an allow verdict, got %+v", verdict)
+			}
+			if len(verdict.AllowPorts) != 0 {
+				t.Errorf("AllowPorts = %v, want empty (all ports)", verdict.AllowPorts)
+			}
+		})
+	}
+}
+
+func TestMergeDuplicateRules_PatternUnion(t *testing.T) {
+	tcp443 := Port{Port: 443, Protocol: ProtocolTCP}
+	tcp80 := Port{Port: 80, Protocol: ProtocolTCP}
+
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "*.github.com", Ports: []Port{tcp443}, Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "*.github.com", Ports: []Port{tcp80}, Action: ActionAllow},
+	}, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+	if len(cm.resolvedRules) != 1 {
+		t.Fatalf("resolvedRules: expected 1 merged pattern rule, got %d", len(cm.resolvedRules))
+	}
+	verdict := cm.MatchHostnameRule("api.github.com")
+	if want := []Port{tcp443, tcp80}; !portSetEqual(verdict.AllowPorts, want) {
+		t.Errorf("AllowPorts = %v, want union %v", verdict.AllowPorts, want)
+	}
+}
+
+func TestMergeDuplicateRules_DenyUnion(t *testing.T) {
+	tcp443 := Port{Port: 443, Protocol: ProtocolTCP}
+	tcp80 := Port{Port: 80, Protocol: ProtocolTCP}
+
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "blocked.example.com", Ports: []Port{tcp80}, Action: ActionDeny},
+		{Type: RuleTypeHostname, Value: "blocked.example.com", Ports: []Port{tcp443}, Action: ActionDeny},
+	}, ActionAllow); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+	verdict := cm.MatchHostnameRule("blocked.example.com")
+	if !verdict.HasDeny() {
+		t.Fatalf("expected a deny verdict, got %+v", verdict)
+	}
+	if want := []Port{tcp80, tcp443}; !portSetEqual(verdict.DenyPorts, want) {
+		t.Errorf("DenyPorts = %v, want union %v", verdict.DenyPorts, want)
+	}
+}
+
+func TestMergeDuplicateRules_CIDRUnionVisibleToConflictCheck(t *testing.T) {
+	tcp80 := Port{Port: 80, Protocol: ProtocolTCP}
+	tcp443 := Port{Port: 443, Protocol: ProtocolTCP}
+
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeCIDR, Value: "1.2.3.4/32", Ports: []Port{tcp80}, Action: ActionDeny},
+		{Type: RuleTypeCIDR, Value: "1.2.3.4/32", Ports: []Port{tcp443}, Action: ActionDeny},
+	}, ActionAllow); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+	if len(cm.config.Rules) != 1 {
+		t.Fatalf("config.Rules: expected 1 merged CIDR rule, got %d", len(cm.config.Rules))
+	}
+	if want := []Port{tcp80, tcp443}; !portSetEqual(cm.config.Rules[0].Ports, want) {
+		t.Errorf("merged CIDR ports = %v, want union %v", cm.config.Rules[0].Ports, want)
+	}
+
+	// CheckIPRuleConflict reads cm.config.Rules. Port 443 was only on the
+	// second duplicate; before the merge it was lost and this allow would
+	// have been reported as non-conflicting.
+	action, conflict, rule := cm.CheckIPRuleConflict(
+		net.ParseIP("1.2.3.4"), "host.example.com", ActionAllow, []Port{tcp443})
+	if !conflict || action != ActionDeny {
+		t.Errorf("CheckIPRuleConflict = (%v, %v, %q), want (deny, true, 1.2.3.4/32)", action, conflict, rule)
+	}
+}
+
+func TestMergeDuplicateRules_OppositeActionsNotMerged(t *testing.T) {
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "example.com", Ports: []Port{{Port: 443, Protocol: ProtocolTCP}}, Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "example.com", Ports: []Port{{Port: 80, Protocol: ProtocolTCP}}, Action: ActionDeny},
+	}, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+	// Opposite actions are a conflict, not a union: both rules survive and the
+	// existing matching-precedence logic decides the verdict (unchanged).
+	if len(cm.config.Rules) != 2 {
+		t.Fatalf("config.Rules: expected 2 rules (no merge across actions), got %d", len(cm.config.Rules))
+	}
+}
+
+func TestMergeDuplicateRules_NoDuplicatesUnchanged(t *testing.T) {
+	rules := []Rule{
+		{Type: RuleTypeHostname, Value: "github.com", Ports: []Port{{Port: 443, Protocol: ProtocolTCP}}, Action: ActionAllow},
+		{Type: RuleTypeCIDR, Value: "8.8.8.8/32", Ports: []Port{{Port: 53, Protocol: ProtocolUDP}}, Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "npmjs.org", Ports: []Port{{Port: 443, Protocol: ProtocolTCP}}, Action: ActionAllow},
+	}
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules(rules, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+	if len(cm.config.Rules) != len(rules) {
+		t.Fatalf("config.Rules: expected %d rules unchanged, got %d", len(rules), len(cm.config.Rules))
+	}
+	// First-occurrence order is preserved.
+	for i, want := range []string{"github.com", "8.8.8.8/32", "npmjs.org"} {
+		if cm.config.Rules[i].Value != want {
+			t.Errorf("config.Rules[%d].Value = %q, want %q", i, cm.config.Rules[i].Value, want)
+		}
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	// Create a temporary config file
 	tmpfile, err := os.CreateTemp("", "cargowall-test-*.json")
@@ -2251,9 +2444,9 @@ func TestUpdateDNSMapping(t *testing.T) {
 // Direct tests for unexported helpers (Phase 4)
 // =============================================================================
 
-// mergeDenyPorts: empty (all-ports) absorbs the other; otherwise dedup'd
+// unionPorts: empty (all-ports) absorbs the other; otherwise dedup'd
 // union. Port is a comparable struct, so {Port, Protocol} is the dedup key.
-func TestMergeDenyPorts(t *testing.T) {
+func TestUnionPorts(t *testing.T) {
 	tcp443 := Port{Port: 443, Protocol: ProtocolTCP}
 	tcp80 := Port{Port: 80, Protocol: ProtocolTCP}
 	udp443 := Port{Port: 443, Protocol: ProtocolUDP}
@@ -2273,9 +2466,9 @@ func TestMergeDenyPorts(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := mergeDenyPorts(tc.p1, tc.p2)
+			got := unionPorts(tc.p1, tc.p2)
 			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("mergeDenyPorts(%v, %v) = %v, want %v", tc.p1, tc.p2, got, tc.want)
+				t.Errorf("unionPorts(%v, %v) = %v, want %v", tc.p1, tc.p2, got, tc.want)
 			}
 		})
 	}

@@ -208,6 +208,7 @@ func (cm *Manager) applyLoadedConfig(cfg *FirewallConfig) error {
 	if err := validateRules(cfg.Rules); err != nil {
 		return err
 	}
+	cfg.Rules = mergeDuplicateRules(cfg.Rules)
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.config = cfg
@@ -246,6 +247,47 @@ func validateRules(rules []Rule) error {
 		}
 	}
 	return nil
+}
+
+// ruleKey identifies rules that should have their ports unioned: rules that
+// agree on type, value, AND action are the same rule expressed more than once,
+// so their ports are additive. Opposite-action rules on the same value are a
+// genuine allow/deny conflict (not a union) and are left intact for the
+// matching-precedence logic — hence Action is part of the key.
+type ruleKey struct {
+	Type   RuleType
+	Value  string
+	Action Action
+}
+
+// mergeDuplicateRules collapses rules sharing (Type, Value, Action) into one
+// rule whose Ports are the union of the duplicates' ports, so a policy that
+// lists the same hostname (or CIDR) twice allows the sum of their ports rather
+// than just the last/first entry's (issue #52). Rule values are already
+// canonical when this runs (hostnames lowercased by normalizeRules). Output
+// preserves first-occurrence order and keeps the first occurrence's
+// AutoAddedType. The "empty Ports = all ports" sentinel is honoured by
+// unionPorts: any all-ports duplicate makes the whole group all-ports.
+//
+// Running this once at load time means every downstream consumer — hostname
+// matching (cm.resolvedRules), CIDR conflict detection (cm.config.Rules), and
+// firewall BPF writes — observes the same unioned port set.
+func mergeDuplicateRules(rules []Rule) []Rule {
+	merged := make([]Rule, 0, len(rules))
+	idxByKey := make(map[ruleKey]int, len(rules))
+	for _, rule := range rules {
+		key := ruleKey{Type: rule.Type, Value: rule.Value, Action: rule.Action}
+		if i, ok := idxByKey[key]; ok {
+			merged[i].Ports = unionPorts(merged[i].Ports, rule.Ports)
+			continue
+		}
+		idxByKey[key] = len(merged)
+		// Copy Ports so a later union (which reassigns merged[i].Ports) can
+		// never alias or mutate the caller's backing array.
+		rule.Ports = copyPorts(rule.Ports)
+		merged = append(merged, rule)
+	}
+	return merged
 }
 
 // kubernetesSearchDomains are always-active suffixes that the DNS proxy
@@ -886,7 +928,7 @@ func (cm *Manager) cleanupOldEntries() {
 //
 // Two rules can fire on a single lookup: one against the full hostname and
 // one against its search-domain-stripped form. When the actions match,
-// the verdict carries one side (deny ports unioned via mergeDenyPorts,
+// the verdict carries one side (deny ports unioned via unionPorts,
 // allow form picked via narrower-exact-wins). When actions differ — e.g.
 // `*.compute.internal: deny 80` + `bastion: allow 22` querying
 // `bastion.compute.internal` — BOTH sides are recorded so the firewall
@@ -941,7 +983,7 @@ func (v HostnameVerdict) Matched() bool { return v.HasDeny() || v.HasAllow() }
 // form are each evaluated against the rule set independently, then folded
 // into one verdict:
 //
-//   - Both deny: union the port lists (mergeDenyPorts); attribute the
+//   - Both deny: union the port lists (unionPorts); attribute the
 //     deny rule via pickDenyForm (narrower-exact-wins, broader-port-wins).
 //   - Both allow: pick the allow rule via pickAllowForm (narrower-exact-wins).
 //   - Mixed (one deny, one allow): both sides are recorded on the verdict
@@ -970,7 +1012,7 @@ func (cm *Manager) MatchHostnameRule(hostname string) HostnameVerdict {
 
 	// Same-action: collapse into one side of the verdict.
 	if actionFull == ActionDeny && actionStripped == ActionDeny {
-		mergedPorts := mergeDenyPorts(portsFull, portsStripped)
+		mergedPorts := unionPorts(portsFull, portsStripped)
 		denyRule := valueFull
 		if pickDenyForm(valueFull, hostname, portsFull, valueStripped, stripped, portsStripped) {
 			denyRule = valueStripped
@@ -1039,7 +1081,7 @@ func matchedExactly(ruleValue, hostname string) bool {
 //     (all-ports — empty Ports — absorbs any port-scoped rule).
 //  3. Otherwise full form wins (stable default).
 //
-// Port UNION across both rules is the caller's job (see mergeDenyPorts);
+// Port UNION across both rules is the caller's job (see unionPorts);
 // this helper only decides which form's value/name supplies attribution.
 func pickDenyForm(
 	valueFull, name string, portsFull []Port,
@@ -1149,12 +1191,12 @@ func copyPorts(ports []Port) []Port {
 	return out
 }
 
-// mergeDenyPorts returns the union of two port lists from overlapping deny
-// rules. An empty input means "all ports" — the broader of the two absorbs
-// the other, so the merge is also empty. Otherwise the result is the
+// unionPorts returns the union of two port lists from overlapping rules of the
+// same action. An empty input means "all ports" — the broader of the two
+// absorbs the other, so the merge is also empty. Otherwise the result is the
 // deduplicated concatenation of p1 then p2 (Port is a comparable struct, so
 // map-based dedup is exact across both Port number AND Protocol).
-func mergeDenyPorts(p1, p2 []Port) []Port {
+func unionPorts(p1, p2 []Port) []Port {
 	if len(p1) == 0 || len(p2) == 0 {
 		return nil
 	}

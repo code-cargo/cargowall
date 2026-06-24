@@ -593,9 +593,11 @@ type cnameLink struct {
 // ordered targets actually reachable from qname. CNAME records whose owner is
 // not on the chain — unrelated or attacker-injected records in an otherwise
 // rule-allowed response — are ignored, so they can't register arbitrary names
-// as queryable. A visited set bounds malicious loops (A→B→A). Each target
-// carries its own CNAME record's TTL so the caller can expire it on the hop's
-// lifetime rather than the response-wide minimum.
+// as queryable. A visited set — seeded with qname — bounds malicious loops,
+// including ones that point back at the query name itself (N→X→N), so a crafted
+// response can't re-register qname and refresh its derived-allow TTL. Each
+// target carries its own CNAME record's TTL so the caller can expire it on the
+// hop's lifetime rather than the response-wide minimum.
 func cnameChainTargets(qname string, answers []dns.RR) []cnameLink {
 	// Index CNAMEs by lowercased owner; first record for an owner wins so a
 	// duplicate owner can't redirect the walk. Allocated lazily so the common
@@ -618,6 +620,12 @@ func cnameChainTargets(qname string, answers []dns.RR) []cnameLink {
 
 	var chain []cnameLink
 	visited := make(map[string]bool)
+	// Seed the query name so a chain that loops back to its own root
+	// (N→X→N) can't append N as its own target and refresh N's derived-allow
+	// TTL — a crafted/looped response would otherwise pin the entry past its
+	// intended lifetime. Off-root loops (X→Y→X) are already bounded by the
+	// per-target visited marks below.
+	visited[qname] = true
 	for cur := qname; ; {
 		cn, ok := byOwner[cur]
 		if !ok {

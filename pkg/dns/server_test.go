@@ -1973,15 +1973,29 @@ func TestCnameChainTargets(t *testing.T) {
 		assert.Equal(t, cnameLink{target: "a441.dscd.akamai.net", ttl: 30}, got[0])
 	})
 
-	t.Run("terminates on a loop", func(t *testing.T) {
+	t.Run("loop back to the query name does not re-register it", func(t *testing.T) {
 		answers := []dns.RR{
 			cname("a.example.com", "b.example.com", 100),
-			cname("b.example.com", "a.example.com", 100), // loops back
+			cname("b.example.com", "a.example.com", 100), // loops back to qname
 		}
+		// visited is seeded with qname, so a→b is learned but the b→a hop
+		// (back to the root) is dropped — otherwise a crafted N→X→N response
+		// would re-register qname and refresh its derived-allow TTL.
 		got := cnameChainTargets("a.example.com", answers)
-		require.Len(t, got, 2) // a→b, b→a, then a revisited → stop
+		require.Len(t, got, 1)
 		assert.Equal(t, "b.example.com", got[0].target)
-		assert.Equal(t, "a.example.com", got[1].target)
+	})
+
+	t.Run("terminates on an off-root loop", func(t *testing.T) {
+		answers := []dns.RR{
+			cname("q.example.com", "a.example.com", 100),
+			cname("a.example.com", "b.example.com", 100),
+			cname("b.example.com", "a.example.com", 100), // loops between a and b
+		}
+		got := cnameChainTargets("q.example.com", answers)
+		require.Len(t, got, 2) // q→a, a→b, then a revisited → stop
+		assert.Equal(t, "a.example.com", got[0].target)
+		assert.Equal(t, "b.example.com", got[1].target)
 	})
 
 	t.Run("no CNAME for query name returns nil", func(t *testing.T) {

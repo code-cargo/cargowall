@@ -1942,7 +1942,7 @@ func (cm *Manager) resolveRulesLocked() error {
 					slog.Error("Invalid CIDR/IP", "value", rule.Value, "error", err)
 					continue
 				}
-				// Convert single IP to /32 CIDR
+				// Convert single IP to a host route: /32 for IPv4, /128 for IPv6.
 				if ip4 := ip.To4(); ip4 != nil {
 					resolved.IPNet = &net.IPNet{
 						IP:   ip4,

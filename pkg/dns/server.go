@@ -434,11 +434,17 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		// learned as a CNAME target of an allowed host (see s.cnameAllowed).
 		// derivedPorts is the allow ports inherited from the origin rule
 		// (nil/empty = all ports). Used below to (a) enforce the target's
-		// resolved IPs and (b) inherit ports when extending the chain. Skipped
-		// when a rule already allows — the rule's verdict is authoritative.
+		// resolved IPs and (b) inherit ports when extending the chain.
+		//
+		// Gated on !verdict.Matched(), not !HasAllow(): an explicit deny (or a
+		// deny-only mixed side) must also suppress the derived allow AND stop
+		// chain extension, so a denied hostname can't propagate derived-allow
+		// learning to its CNAME targets when query filtering is off/audit mode
+		// (where the denied query is still forwarded and reaches this code).
+		// Any matching rule is authoritative.
 		var derivedPorts []config.Port
 		derived := false
-		if !verdict.HasAllow() && s.cnameAllowed != nil {
+		if !verdict.Matched() && s.cnameAllowed != nil {
 			if ports, ok := s.cnameAllowed.Get(canonicalHostname); ok {
 				derived, derivedPorts = true, ports
 			}

@@ -2230,6 +2230,43 @@ func TestHandleDNSQuery_DerivedTargetMergesPortsFromMultipleOrigins(t *testing.T
 	mockFw.AssertExpectations(t)
 }
 
+// An explicit deny on a name that also happens to be a learned CNAME target
+// must suppress the derived allow AND stop chain extension. With query
+// filtering off the denied query is still forwarded and reaches the learning
+// path, so this guards the !verdict.Matched() (not !HasAllow()) gate: a denied
+// hostname must not propagate derived-allow learning to its own CNAME targets.
+func TestHandleDNSQuery_DeniedTargetDoesNotDeriveOrLearn(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "denied.cdn.example.net", Action: config.ActionDeny},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = false // forwarded + processed despite the deny
+
+	const denied = "denied.cdn.example.net"
+	const onward = "onward.cdn.example.net"
+	// Pre-seed as if it had been learned as a CNAME target of an allowed host.
+	server.cnameAllowed.Put(denied, nil, 5*time.Minute)
+
+	// Its response chains onward and carries an A record. No AddIP is expected:
+	// the deny side equals the default action and short-circuits, and the
+	// derived allow must not fire (mockFw panics on any unexpected AddIP).
+	resp := makeCNAMEResponse(denied+".", []string{onward}, "203.0.113.99")
+	seedCachedResponse(server, denied+".", resp)
+
+	q := new(dns.Msg)
+	q.SetQuestion(denied+".", dns.TypeA)
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, q)
+
+	mockFw.AssertExpectations(t)
+	_, ok := server.cnameAllowed.Get(onward)
+	assert.False(t, ok, "a denied hostname must not extend the CNAME chain")
+}
+
 // Counterpoint to the above: when a rule matches the stripped form (the K8s
 // or short-name pattern), per-host tracking SHOULD happen and the firewall
 // SHOULD be updated.

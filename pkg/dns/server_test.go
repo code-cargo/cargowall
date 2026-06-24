@@ -18,6 +18,7 @@ package dns
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1474,6 +1475,67 @@ func TestHandleDNSQuery_FilteringEnforceBlocks(t *testing.T) {
 	w.AssertExpectations(t)
 	require.NotNil(t, w.msg)
 	assert.Equal(t, dns.RcodeRefused, w.msg.Rcode, "blocked domain should get REFUSED")
+}
+
+// #65: a DNS-path audit record must report the canonical lowercase hostname,
+// not the raw wire case, so it agrees with the connection-event path (which
+// logs the lowercase IP->hostname mapping). A mixed-case blocked query is the
+// observable surface for this on the query-filtering path.
+func TestHandleDNSQuery_BlockedQueryReportedLowercase(t *testing.T) {
+	cfg := config.NewConfigManager()
+	err := cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny)
+	require.NoError(t, err)
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	tmpFile, err := os.CreateTemp(t.TempDir(), "audit-*.json")
+	require.NoError(t, err)
+	tmpFile.Close()
+	auditLogger, err := events.NewAuditLogger(tmpFile.Name(), false) // enforce mode
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	server.auditLogger = auditLogger
+
+	// Mixed-case query for a domain with no allow rule -> blocked (REFUSED).
+	query := new(dns.Msg)
+	query.SetQuestion("Evil.Tunnel.Example.COM.", dns.TypeA)
+	query.Id = 5252
+
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+
+	server.handleDNSQuery(w, query)
+
+	w.AssertExpectations(t)
+	require.NotNil(t, w.msg)
+	assert.Equal(t, dns.RcodeRefused, w.msg.Rcode)
+
+	evs := readDNSAuditEvents(t, tmpFile.Name())
+	require.Len(t, evs, 1)
+	assert.Equal(t, events.EventDNSBlocked, evs[0].EventType)
+	assert.Equal(t, "evil.tunnel.example.com", evs[0].DstHostname,
+		"blocked query hostname must be reported lowercase (#65)")
+}
+
+// readDNSAuditEvents reads JSONL audit records written by events.AuditLogger.
+func readDNSAuditEvents(t *testing.T, path string) []events.AuditEvent {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var evs []events.AuditEvent
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var ev events.AuditEvent
+		require.NoError(t, json.Unmarshal([]byte(line), &ev))
+		evs = append(evs, ev)
+	}
+	return evs
 }
 
 func TestHandleDNSQuery_FilteringAuditModePassesThrough(t *testing.T) {

@@ -1279,15 +1279,14 @@ func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameActio
 			continue
 		}
 
-		// Parse CIDR
+		// Rule values are canonical explicit-prefix CIDRs — normalizeRules
+		// promotes bare IPs to /32 or /128 at load time — so ParseCIDR always
+		// succeeds. A parse failure means a malformed value that resolveRules
+		// already logged and skipped; skip it here too. A /32 or /128 host
+		// route matches only its exact IP via Contains, ranking most-specific
+		// at ones==32/128 (an IPv6 single IP correctly ranks as 128, not 32).
 		_, ipnet, err := net.ParseCIDR(cm.config.Rules[i].Value)
 		if err != nil {
-			// Try as single IP
-			if ruleIP := net.ParseIP(cm.config.Rules[i].Value); ruleIP != nil && ruleIP.Equal(ip) {
-				// Exact match is most specific (32 bits)
-				mostSpecificRule = &cm.config.Rules[i]
-				mostSpecificBits = 32
-			}
 			continue
 		}
 
@@ -1558,13 +1557,12 @@ func (cm *Manager) hasCIDRRuleAllPorts(ipStr string) bool {
 			continue
 		}
 
+		// Rule values are canonical explicit-prefix CIDRs (normalizeRules
+		// promotes bare IPs to /32 or /128 at load time), so ParseCIDR
+		// succeeds and host routes match via Contains; a parse failure is a
+		// malformed value resolveRules already skipped.
 		_, ipnet, err := net.ParseCIDR(rule.Value)
-		if err != nil {
-			ruleIP := net.ParseIP(rule.Value)
-			if ruleIP == nil || !ruleIP.Equal(ip) {
-				continue
-			}
-		} else if !ipnet.Contains(ip) {
+		if err != nil || !ipnet.Contains(ip) {
 			continue
 		}
 
@@ -1589,14 +1587,12 @@ func (cm *Manager) hasCIDRRule(ipStr string, port Port) bool {
 			continue
 		}
 
+		// Rule values are canonical explicit-prefix CIDRs (normalizeRules
+		// promotes bare IPs to /32 or /128 at load time), so ParseCIDR
+		// succeeds and host routes match via Contains; a parse failure is a
+		// malformed value resolveRules already skipped.
 		_, ipnet, err := net.ParseCIDR(rule.Value)
-		if err != nil {
-			// Try single IP
-			ruleIP := net.ParseIP(rule.Value)
-			if ruleIP == nil || !ruleIP.Equal(ip) {
-				continue
-			}
-		} else if !ipnet.Contains(ip) {
+		if err != nil || !ipnet.Contains(ip) {
 			continue
 		}
 
@@ -1935,7 +1931,12 @@ func (cm *Manager) resolveRulesLocked() error {
 		case RuleTypeCIDR:
 			_, ipnet, err := net.ParseCIDR(rule.Value)
 			if err != nil {
-				// Try parsing as single IP (treat as /32)
+				// Load-time normalizeRules canonicalises bare IPs to explicit
+				// /32 or /128 prefixes, so the ParseCIDR above succeeds for
+				// every config-sourced rule. This single-IP fallback only
+				// fires when resolveRules is driven directly with un-normalized
+				// rules (the public resolveRules() test wrapper) — production
+				// loaders always normalize first.
 				ip := net.ParseIP(rule.Value)
 				if ip == nil {
 					slog.Error("Invalid CIDR/IP", "value", rule.Value, "error", err)

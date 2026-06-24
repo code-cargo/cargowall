@@ -267,7 +267,7 @@ type ruleKey struct {
 // canonical when this runs (hostnames lowercased by normalizeRules). Output
 // preserves first-occurrence order and keeps the first occurrence's
 // AutoAddedType. The "empty Ports = all ports" sentinel is honoured by
-// unionPorts: any all-ports duplicate makes the whole group all-ports.
+// UnionPorts: any all-ports duplicate makes the whole group all-ports.
 //
 // Running this once at load time means every downstream consumer — hostname
 // matching (cm.resolvedRules), CIDR conflict detection (cm.config.Rules), and
@@ -278,7 +278,7 @@ func mergeDuplicateRules(rules []Rule) []Rule {
 	for _, rule := range rules {
 		key := ruleKey{Type: rule.Type, Value: rule.Value, Action: rule.Action}
 		if i, ok := idxByKey[key]; ok {
-			merged[i].Ports = unionPorts(merged[i].Ports, rule.Ports)
+			merged[i].Ports = UnionPorts(merged[i].Ports, rule.Ports)
 			continue
 		}
 		idxByKey[key] = len(merged)
@@ -928,7 +928,7 @@ func (cm *Manager) cleanupOldEntries() {
 //
 // Two rules can fire on a single lookup: one against the full hostname and
 // one against its search-domain-stripped form. When the actions match,
-// the verdict carries one side (deny ports unioned via unionPorts,
+// the verdict carries one side (deny ports unioned via UnionPorts,
 // allow form picked via narrower-exact-wins). When actions differ — e.g.
 // `*.compute.internal: deny 80` + `bastion: allow 22` querying
 // `bastion.compute.internal` — BOTH sides are recorded so the firewall
@@ -983,7 +983,7 @@ func (v HostnameVerdict) Matched() bool { return v.HasDeny() || v.HasAllow() }
 // form are each evaluated against the rule set independently, then folded
 // into one verdict:
 //
-//   - Both deny: union the port lists (unionPorts); attribute the
+//   - Both deny: union the port lists (UnionPorts); attribute the
 //     deny rule via pickDenyForm (narrower-exact-wins, broader-port-wins).
 //   - Both allow: pick the allow rule via pickAllowForm (narrower-exact-wins).
 //   - Mixed (one deny, one allow): both sides are recorded on the verdict
@@ -1012,7 +1012,7 @@ func (cm *Manager) MatchHostnameRule(hostname string) HostnameVerdict {
 
 	// Same-action: collapse into one side of the verdict.
 	if actionFull == ActionDeny && actionStripped == ActionDeny {
-		mergedPorts := unionPorts(portsFull, portsStripped)
+		mergedPorts := UnionPorts(portsFull, portsStripped)
 		denyRule := valueFull
 		if pickDenyForm(valueFull, hostname, portsFull, valueStripped, stripped, portsStripped) {
 			denyRule = valueStripped
@@ -1081,7 +1081,7 @@ func matchedExactly(ruleValue, hostname string) bool {
 //     (all-ports — empty Ports — absorbs any port-scoped rule).
 //  3. Otherwise full form wins (stable default).
 //
-// Port UNION across both rules is the caller's job (see unionPorts);
+// Port UNION across both rules is the caller's job (see UnionPorts);
 // this helper only decides which form's value/name supplies attribution.
 func pickDenyForm(
 	valueFull, name string, portsFull []Port,
@@ -1191,12 +1191,14 @@ func copyPorts(ports []Port) []Port {
 	return out
 }
 
-// unionPorts returns the union of two port lists from overlapping rules of the
+// UnionPorts returns the union of two port lists from overlapping rules of the
 // same action. An empty input means "all ports" — the broader of the two
 // absorbs the other, so the merge is also empty. Otherwise the result is the
 // deduplicated concatenation of p1 then p2 (Port is a comparable struct, so
-// map-based dedup is exact across both Port number AND Protocol).
-func unionPorts(p1, p2 []Port) []Port {
+// map-based dedup is exact across both Port number AND Protocol). Exported for
+// the DNS layer, which unions the allow ports a CNAME target inherits from
+// multiple allowed origins.
+func UnionPorts(p1, p2 []Port) []Port {
 	if len(p1) == 0 || len(p2) == 0 {
 		return nil
 	}

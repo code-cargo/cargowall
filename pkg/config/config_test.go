@@ -2442,10 +2442,10 @@ func TestUpdateDNSMapping(t *testing.T) {
 }
 
 // =============================================================================
-// Direct tests for unexported helpers (Phase 4)
+// Direct tests for internal helpers (Phase 4)
 // =============================================================================
 
-// unionPorts: empty (all-ports) absorbs the other; otherwise dedup'd
+// UnionPorts: empty (all-ports) absorbs the other; otherwise dedup'd
 // union. Port is a comparable struct, so {Port, Protocol} is the dedup key.
 func TestUnionPorts(t *testing.T) {
 	tcp443 := Port{Port: 443, Protocol: ProtocolTCP}
@@ -2467,9 +2467,9 @@ func TestUnionPorts(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := unionPorts(tc.p1, tc.p2)
+			got := UnionPorts(tc.p1, tc.p2)
 			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("unionPorts(%v, %v) = %v, want %v", tc.p1, tc.p2, got, tc.want)
+				t.Errorf("UnionPorts(%v, %v) = %v, want %v", tc.p1, tc.p2, got, tc.want)
 			}
 		})
 	}

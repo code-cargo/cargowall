@@ -1371,9 +1371,9 @@ func TestIsQueryAllowed_CNAMEDerived(t *testing.T) {
 				config:        cfg,
 				filterQueries: true,
 				logger:        slog.Default(),
-				cnameAllowed:  newLRUCache[string, bool](10000),
+				cnameAllowed:  newLRUCache[string, []config.Port](10000),
 			}
-			server.cnameAllowed.Put(strings.ToLower(tt.derived), true, tt.derivedTTL)
+			server.cnameAllowed.Put(strings.ToLower(tt.derived), nil, tt.derivedTTL)
 			if tt.derivedTTL == time.Nanosecond {
 				time.Sleep(time.Millisecond) // let the entry lazily expire
 			}
@@ -1399,7 +1399,7 @@ func newTestServer(t *testing.T, cfg *config.Manager, fw firewall.Firewall) *Ser
 		client:       &dns.Client{Timeout: 5 * time.Second},
 		hostnameIPs:  make(map[string]map[string]bool),
 		dnsCache:     newLRUCache[string, *dnsCacheEntry](10000),
-		cnameAllowed: newLRUCache[string, bool](10000),
+		cnameAllowed: newLRUCache[string, []config.Port](10000),
 	}
 }
 
@@ -1973,15 +1973,29 @@ func TestCnameChainTargets(t *testing.T) {
 		assert.Equal(t, cnameLink{target: "a441.dscd.akamai.net", ttl: 30}, got[0])
 	})
 
-	t.Run("terminates on a loop", func(t *testing.T) {
+	t.Run("loop back to the query name does not re-register it", func(t *testing.T) {
 		answers := []dns.RR{
 			cname("a.example.com", "b.example.com", 100),
-			cname("b.example.com", "a.example.com", 100), // loops back
+			cname("b.example.com", "a.example.com", 100), // loops back to qname
 		}
+		// visited is seeded with qname, so a→b is learned but the b→a hop
+		// (back to the root) is dropped — otherwise a crafted N→X→N response
+		// would re-register qname and refresh its derived-allow TTL.
 		got := cnameChainTargets("a.example.com", answers)
-		require.Len(t, got, 2) // a→b, b→a, then a revisited → stop
+		require.Len(t, got, 1)
 		assert.Equal(t, "b.example.com", got[0].target)
-		assert.Equal(t, "a.example.com", got[1].target)
+	})
+
+	t.Run("terminates on an off-root loop", func(t *testing.T) {
+		answers := []dns.RR{
+			cname("q.example.com", "a.example.com", 100),
+			cname("a.example.com", "b.example.com", 100),
+			cname("b.example.com", "a.example.com", 100), // loops between a and b
+		}
+		got := cnameChainTargets("q.example.com", answers)
+		require.Len(t, got, 2) // q→a, a→b, then a revisited → stop
+		assert.Equal(t, "a.example.com", got[0].target)
+		assert.Equal(t, "b.example.com", got[1].target)
 	})
 
 	t.Run("no CNAME for query name returns nil", func(t *testing.T) {
@@ -2031,6 +2045,240 @@ func TestHandleDNSQuery_CNAMEUnrelatedRecordNotLearned(t *testing.T) {
 	assert.True(t, ok, "on-chain target should be learned")
 	_, ok = server.cnameAllowed.Get("attacker.example.net")
 	assert.False(t, ok, "unrelated CNAME target must not be learned")
+}
+
+// A direct query for a CNAME target of an allowed host must ENFORCE that
+// target's resolved IPs (write them to the allow map), not merely un-REFUSE the
+// query. This is the gap that bit CDN-fronted PKI: the origin's in-band A
+// record is allowed, but a separate query for the target returned IPs that were
+// never enforced, so the connection was blocked. The target inherits the origin
+// rule's ports.
+func TestHandleDNSQuery_DerivedTargetIPsEnforced(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "www.microsoft.com", Action: config.ActionAllow,
+			Ports: []config.Port{config.PortHTTPS},
+		},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	// 1. Resolve the allowed origin. Its chain ends in 23.62.177.155 (allowed
+	//    under the origin rule) and learns the Akamai edge name as a CNAME
+	//    target carrying the origin's ports.
+	const origin = "www.microsoft.com."
+	const edge = "e13678.dscb.akamaiedge.net"
+	originResp := makeCNAMEResponse(origin,
+		[]string{"www.microsoft.com-c-3.edgekey.net", edge}, "23.62.177.155")
+	seedCachedResponse(server, origin, originResp)
+	mockFw.On("AddIP", net.ParseIP("23.62.177.155"), config.ActionAllow,
+		[]config.Port{config.PortHTTPS}).Return(true, nil).Once()
+
+	q1 := new(dns.Msg)
+	q1.SetQuestion(origin, dns.TypeA)
+	w1 := &MockResponseWriter{}
+	w1.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w1, q1)
+	require.True(t, server.isQueryAllowed(edge, dns.TypeA), "edge name should be queryable")
+
+	// 2. A separate direct query for the edge name returns a DIFFERENT IP (CDN
+	//    rotation). Pre-fix this IP was never enforced; now it must be allowed
+	//    on the inherited port.
+	edgeResp := makeCachedResponse(edge+".", "23.62.177.200")
+	seedCachedResponse(server, edge+".", edgeResp)
+	mockFw.On("AddIP", net.ParseIP("23.62.177.200"), config.ActionAllow,
+		[]config.Port{config.PortHTTPS}).Return(true, nil).Once()
+
+	q2 := new(dns.Msg)
+	q2.SetQuestion(edge+".", dns.TypeA)
+	w2 := &MockResponseWriter{}
+	w2.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w2, q2)
+
+	mockFw.AssertExpectations(t)
+	w1.AssertExpectations(t)
+	w2.AssertExpectations(t)
+}
+
+// A derived-allowed target whose own response CNAMEs onward must register the
+// next hop too (transitive learning) and enforce the terminal IP. This is the
+// multi-round-trip / CDN-variant case (e.g. DigiCert's Akamai↔Cloudflare split)
+// that the in-band "single response carries every hop" assumption missed.
+func TestHandleDNSQuery_DerivedResponseLearnsTransitively(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules(nil, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	// hop1 was already learned as a CNAME target of an allowed origin (all
+	// ports). A fresh query for it now returns the Cloudflare variant that
+	// chains onward to hop2 before its A record.
+	const hop1 = "mpki-ocsp.digicert.com"
+	const hop2 = "mpki-ocsp.digicert.com.cdn.cloudflare.net"
+	server.cnameAllowed.Put(hop1, nil, 5*time.Minute)
+
+	resp := makeCNAMEResponse(hop1+".", []string{hop2}, "104.18.38.233")
+	seedCachedResponse(server, hop1+".", resp)
+	mockFw.On("AddIP", net.ParseIP("104.18.38.233"), config.ActionAllow,
+		[]config.Port(nil)).Return(true, nil).Once()
+
+	q := new(dns.Msg)
+	q.SetQuestion(hop1+".", dns.TypeA)
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, q)
+
+	mockFw.AssertExpectations(t)
+	_, ok := server.cnameAllowed.Get(hop2)
+	assert.True(t, ok, "onward hop must be learned from a derived-allowed response")
+	assert.True(t, server.isQueryAllowed(hop2, dns.TypeA),
+		"transitively-learned hop should be directly queryable")
+}
+
+// The enforcement path is independent of query filtering. Even with filtering
+// off, an allowed origin's response learns its CNAME targets and a later direct
+// query for a target enforces its IPs — otherwise the gap persists whenever
+// filtering is disabled.
+func TestHandleDNSQuery_DerivedTargetEnforcedWithFilteringOff(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow,
+			Ports: []config.Port{config.PortHTTPS},
+		},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = false // filtering OFF
+
+	const origin = "allowed.example.com."
+	const target = "edge.cdn.example.net"
+	originResp := makeCNAMEResponse(origin, []string{target}, "203.0.113.10")
+	seedCachedResponse(server, origin, originResp)
+	mockFw.On("AddIP", net.ParseIP("203.0.113.10"), config.ActionAllow,
+		[]config.Port{config.PortHTTPS}).Return(true, nil).Once()
+	q1 := new(dns.Msg)
+	q1.SetQuestion(origin, dns.TypeA)
+	w1 := &MockResponseWriter{}
+	w1.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w1, q1)
+
+	_, ok := server.cnameAllowed.Get(target)
+	require.True(t, ok, "target must be learned even with filtering off")
+
+	targetResp := makeCachedResponse(target+".", "203.0.113.20")
+	seedCachedResponse(server, target+".", targetResp)
+	mockFw.On("AddIP", net.ParseIP("203.0.113.20"), config.ActionAllow,
+		[]config.Port{config.PortHTTPS}).Return(true, nil).Once()
+	q2 := new(dns.Msg)
+	q2.SetQuestion(target+".", dns.TypeA)
+	w2 := &MockResponseWriter{}
+	w2.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w2, q2)
+
+	mockFw.AssertExpectations(t)
+}
+
+// When a single CNAME target is reachable from two allowed origins with
+// different ports, the derived allow must carry the UNION of their ports — not
+// whichever origin resolved last. A direct query for the shared target then
+// enforces its IPs on both ports.
+func TestHandleDNSQuery_DerivedTargetMergesPortsFromMultipleOrigins(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "a.example.com", Action: config.ActionAllow,
+			Ports: []config.Port{config.PortHTTPS},
+		}, // 443
+		{
+			Type: config.RuleTypeHostname, Value: "b.example.com", Action: config.ActionAllow,
+			Ports: []config.Port{config.PortHTTP},
+		}, // 80
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const shared = "shared.cdn.example.net"
+
+	// Origin A (port 443) → shared. Learns shared=[443], enforces A's terminal IP.
+	respA := makeCNAMEResponse("a.example.com.", []string{shared}, "198.51.100.1")
+	seedCachedResponse(server, "a.example.com.", respA)
+	mockFw.On("AddIP", net.ParseIP("198.51.100.1"), config.ActionAllow,
+		[]config.Port{config.PortHTTPS}).Return(true, nil).Once()
+	wA := &MockResponseWriter{}
+	wA.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	qA := new(dns.Msg)
+	qA.SetQuestion("a.example.com.", dns.TypeA)
+	server.handleDNSQuery(wA, qA)
+
+	// Origin B (port 80) → shared. Unions shared into [443, 80].
+	respB := makeCNAMEResponse("b.example.com.", []string{shared}, "198.51.100.2")
+	seedCachedResponse(server, "b.example.com.", respB)
+	mockFw.On("AddIP", net.ParseIP("198.51.100.2"), config.ActionAllow,
+		[]config.Port{config.PortHTTP}).Return(true, nil).Once()
+	wB := &MockResponseWriter{}
+	wB.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	qB := new(dns.Msg)
+	qB.SetQuestion("b.example.com.", dns.TypeA)
+	server.handleDNSQuery(wB, qB)
+
+	// Direct query for the shared target enforces its IP on the UNION of ports.
+	respShared := makeCachedResponse(shared+".", "198.51.100.3")
+	seedCachedResponse(server, shared+".", respShared)
+	mockFw.On("AddIP", net.ParseIP("198.51.100.3"), config.ActionAllow,
+		[]config.Port{config.PortHTTPS, config.PortHTTP}).Return(true, nil).Once()
+	wS := &MockResponseWriter{}
+	wS.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	qS := new(dns.Msg)
+	qS.SetQuestion(shared+".", dns.TypeA)
+	server.handleDNSQuery(wS, qS)
+
+	mockFw.AssertExpectations(t)
+}
+
+// An explicit deny on a name that also happens to be a learned CNAME target
+// must suppress the derived allow AND stop chain extension. With query
+// filtering off the denied query is still forwarded and reaches the learning
+// path, so this guards the !verdict.Matched() (not !HasAllow()) gate: a denied
+// hostname must not propagate derived-allow learning to its own CNAME targets.
+func TestHandleDNSQuery_DeniedTargetDoesNotDeriveOrLearn(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "denied.cdn.example.net", Action: config.ActionDeny},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = false // forwarded + processed despite the deny
+
+	const denied = "denied.cdn.example.net"
+	const onward = "onward.cdn.example.net"
+	// Pre-seed as if it had been learned as a CNAME target of an allowed host.
+	server.cnameAllowed.Put(denied, nil, 5*time.Minute)
+
+	// Its response chains onward and carries an A record. No AddIP is expected:
+	// the deny side equals the default action and short-circuits, and the
+	// derived allow must not fire (mockFw panics on any unexpected AddIP).
+	resp := makeCNAMEResponse(denied+".", []string{onward}, "203.0.113.99")
+	seedCachedResponse(server, denied+".", resp)
+
+	q := new(dns.Msg)
+	q.SetQuestion(denied+".", dns.TypeA)
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, q)
+
+	mockFw.AssertExpectations(t)
+	_, ok := server.cnameAllowed.Get(onward)
+	assert.False(t, ok, "a denied hostname must not extend the CNAME chain")
 }
 
 // Counterpoint to the above: when a rule matches the stripped form (the K8s

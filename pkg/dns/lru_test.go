@@ -25,6 +25,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// peekExpiry returns the expiry recorded for key and whether the key is
+// present, without touching LRU order or applying lazy expiration. A zero
+// expiry means the entry never expires. Test-only introspection so tests can
+// assert the stored TTL (the public API only exposes presence via Get).
+func (c *lruCache[K, V]) peekExpiry(key K) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	elem, ok := c.items[key]
+	if !ok {
+		return time.Time{}, false
+	}
+	return elem.Value.(*lruEntry[K, V]).expiry, true
+}
+
 // Basic round-trip: Put → Get returns the stored value.
 func TestLRUCache_Basic(t *testing.T) {
 	c := newLRUCache[string, int](10)

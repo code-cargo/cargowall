@@ -351,7 +351,7 @@ sequenceDiagram
 - Primary listen address `127.0.0.1:53`, with additional addresses (e.g., Docker bridge IP) via `AddListenAddr()`
 - Configurable upstream DNS (e.g., `10.96.0.10:53` for Kubernetes)
 - LRU cache (10,000 entries) with per-entry TTL from DNS response minimum TTL
-- DNS query filtering (`EnableQueryFiltering`) — blocks queries for non-allowed domains; always allows reverse DNS (`in-addr.arpa`, `ip6.arpa`)
+- DNS query filtering (`EnableQueryFiltering`) — blocks queries for non-allowed domains; always allows reverse DNS (`in-addr.arpa`, `ip6.arpa`). CNAME targets seen in a rule-allowed response are learned (TTL-bounded, 10,000-entry LRU) and permitted for later direct queries, so CNAME-chasing clients resolving an allowed host's chain (e.g. an Akamai edge name) aren't refused; explicit deny rules still win. Learning is scoped to rule-allowed responses, so the only widening of the DNS-tunneling surface is which CNAME-target *names* may be queried — within the trust already extended to the allowed host's upstream chain (IP enforcement already follows that chain regardless)
 - `ApplyRulesToTrackedHostnames()` — re-evaluates all accumulated IPs against current config after rule changes
 - Rule conflict detection: checks CIDR vs hostname action conflicts via `CheckIPRuleConflict()`; deny wins
 - Kubernetes search domain stripping (`.default.svc.cluster.local`, `.svc.cluster.local`, `.cluster.local`)

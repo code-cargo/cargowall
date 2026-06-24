@@ -2442,7 +2442,7 @@ func TestUpdateDNSMapping(t *testing.T) {
 }
 
 // =============================================================================
-// Direct tests for unexported helpers (Phase 4)
+// Direct tests for internal helpers (Phase 4)
 // =============================================================================
 
 // UnionPorts: empty (all-ports) absorbs the other; otherwise dedup'd

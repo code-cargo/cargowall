@@ -1279,12 +1279,12 @@ func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameActio
 			continue
 		}
 
-		// Rule values are canonical explicit-prefix CIDRs — normalizeRules
-		// promotes bare IPs to /32 or /128 at load time — so ParseCIDR always
-		// succeeds. A parse failure means a malformed value that resolveRules
-		// already logged and skipped; skip it here too. A /32 or /128 host
-		// route matches only its exact IP via Contains, ranking most-specific
-		// at ones==32/128 (an IPv6 single IP correctly ranks as 128, not 32).
+		// normalizeRules promotes bare IPs to explicit /32 or /128 prefixes at
+		// load time, so every valid CIDR rule parses here; the only ParseCIDR
+		// failure left is a malformed value that resolveRules already logged
+		// and skipped, so skip it here too. A /32 or /128 host route matches
+		// only its exact IP via Contains, ranking most-specific at ones==32/128
+		// (an IPv6 single IP correctly ranks as 128, not 32).
 		_, ipnet, err := net.ParseCIDR(cm.config.Rules[i].Value)
 		if err != nil {
 			continue
@@ -1557,10 +1557,10 @@ func (cm *Manager) hasCIDRRuleAllPorts(ipStr string) bool {
 			continue
 		}
 
-		// Rule values are canonical explicit-prefix CIDRs (normalizeRules
-		// promotes bare IPs to /32 or /128 at load time), so ParseCIDR
-		// succeeds and host routes match via Contains; a parse failure is a
-		// malformed value resolveRules already skipped.
+		// normalizeRules promotes bare IPs to explicit /32 or /128 prefixes at
+		// load time, so every valid CIDR rule parses and host routes match via
+		// Contains; the only remaining ParseCIDR failure is a malformed value
+		// resolveRules already skipped, so skip it here too.
 		_, ipnet, err := net.ParseCIDR(rule.Value)
 		if err != nil || !ipnet.Contains(ip) {
 			continue
@@ -1587,10 +1587,10 @@ func (cm *Manager) hasCIDRRule(ipStr string, port Port) bool {
 			continue
 		}
 
-		// Rule values are canonical explicit-prefix CIDRs (normalizeRules
-		// promotes bare IPs to /32 or /128 at load time), so ParseCIDR
-		// succeeds and host routes match via Contains; a parse failure is a
-		// malformed value resolveRules already skipped.
+		// normalizeRules promotes bare IPs to explicit /32 or /128 prefixes at
+		// load time, so every valid CIDR rule parses and host routes match via
+		// Contains; the only remaining ParseCIDR failure is a malformed value
+		// resolveRules already skipped, so skip it here too.
 		_, ipnet, err := net.ParseCIDR(rule.Value)
 		if err != nil || !ipnet.Contains(ip) {
 			continue

@@ -59,11 +59,15 @@ type Server struct {
 	// DNS response cache (LRU with per-entry TTL)
 	dnsCache *lruCache[string, *dnsCacheEntry]
 
-	// CNAME targets learned from rule-allowed responses (LRU with per-entry
-	// TTL). Consulted only by the query filter: a separate query for a CNAME
-	// target of an allowed host is permitted instead of REFUSED. Does not
-	// affect IP enforcement, which already follows CNAME chains.
-	cnameAllowed *lruCache[string, bool]
+	// CNAME targets learned from allowed responses (LRU with per-entry TTL).
+	// Maps target -> allow ports inherited from the origin rule (nil/empty =
+	// all ports, matching rule semantics). Consulted by BOTH the query filter
+	// (un-REFUSE a direct query for a CNAME target of an allowed host) and IP
+	// enforcement (allow that target's resolved IPs on the inherited ports).
+	// The enforcement use closes the gap where a chain is split across multiple
+	// query round-trips — e.g. CDN-fronted PKI endpoints — so the in-band
+	// "single response carries every hop" assumption no longer holds.
+	cnameAllowed *lruCache[string, []config.Port]
 
 	// Audit logger for DNS events
 	auditLogger *events.AuditLogger
@@ -96,7 +100,7 @@ func NewServer(cfg *config.Manager, fw firewall.Firewall, upstream, listenAddr s
 		},
 		hostnameIPs:  make(map[string]map[string]bool),
 		dnsCache:     newLRUCache[string, *dnsCacheEntry](10000),
-		cnameAllowed: newLRUCache[string, bool](10000),
+		cnameAllowed: newLRUCache[string, []config.Port](10000),
 	}
 }
 
@@ -168,8 +172,9 @@ func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 		return false
 	}
 
-	// Derived CNAME-target allow. Populated in handleDNSQuery when a
-	// rule-allowed response carries CNAME records (see s.cnameAllowed). The
+	// Derived CNAME-target allow. Populated in handleDNSQuery when an allowed
+	// response carries CNAME records (see s.cnameAllowed); the stored value is
+	// the inherited allow ports, but the query gate only needs presence. The
 	// nil guard keeps Server literals constructed without NewServer (some
 	// tests) working. Checked after the deny rule above so a deny still wins.
 	if s.cnameAllowed != nil {
@@ -425,28 +430,59 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		// action win the last-write race.
 		verdict := s.config.MatchHostnameRule(canonicalHostname)
 
-		// Learn CNAME targets from rule-allowed responses so CNAME-chasing
-		// clients can query them directly under query filtering instead of
-		// being REFUSED (consulted by isQueryAllowed via s.cnameAllowed). Done
-		// outside the len(ips)>0 guard below so CNAME-only responses (no
-		// A/AAAA in the same message) still register their targets. Only
-		// rule-allowed responses qualify: a single forwarded response already
-		// carries every hop of the chain, so we never learn transitively from
-		// derived-allowed queries — that keeps the surface bounded.
+		// Derived CNAME-target allow: no rule matched, but this name was
+		// learned as a CNAME target of an allowed host (see s.cnameAllowed).
+		// derivedPorts is the allow ports inherited from the origin rule
+		// (nil/empty = all ports). Used below to (a) enforce the target's
+		// resolved IPs and (b) inherit ports when extending the chain. Skipped
+		// when a rule already allows — the rule's verdict is authoritative.
+		var derivedPorts []config.Port
+		derived := false
+		if !verdict.HasAllow() && s.cnameAllowed != nil {
+			if ports, ok := s.cnameAllowed.Get(canonicalHostname); ok {
+				derived, derivedPorts = true, ports
+			}
+		}
+
+		// Learn CNAME targets from allowed responses so a CNAME-chasing client
+		// can query them directly under query filtering instead of being
+		// REFUSED, and so enforcement can allow their resolved IPs (consulted
+		// by isQueryAllowed and the IP switch below via s.cnameAllowed). Done
+		// outside the len(ips)>0 guard so CNAME-only responses (no A/AAAA in the
+		// same message) still register their targets.
 		//
-		// cnameChainTargets follows the chain from the query name only, so
-		// unrelated CNAME records in the same response (a misbehaving or
-		// spoofed authoritative server for an allowed domain) are ignored
-		// instead of registering arbitrary names. Each target is learned for
-		// its own CNAME TTL (not the response-wide min, which would shorten it
-		// to the final address record's TTL), floored by derivedCNAMETTL. A
-		// target whose entry expires before its origin's dnsCache entry just
-		// gets re-REFUSED until the next origin query re-learns it —
-		// self-healing and TTL-bounded.
-		if s.filterQueries && verdict.HasAllow() && s.cnameAllowed != nil {
+		// Both rule-allowed (verdict.HasAllow) and derived-allowed responses
+		// qualify: the in-band "single response carries every hop" assumption
+		// breaks when a chain is split across query round-trips (e.g. CDN-
+		// fronted PKI that returns a different variant per query), so we extend
+		// the chain transitively. The widening is bounded — cnameChainTargets
+		// follows the chain from the query name only, so unrelated CNAME records
+		// (a misbehaving or spoofed authoritative server for an allowed domain)
+		// are ignored instead of registering arbitrary names; depth is bounded
+		// by the 10k LRU and per-hop TTL. Targets inherit the origin's allow
+		// ports. Each target is learned for its own CNAME TTL (not the response-
+		// wide min, which would shorten it to the final address record's TTL),
+		// floored by derivedCNAMETTL. A target whose entry expires before its
+		// origin's dnsCache entry just gets re-REFUSED until the next origin
+		// query re-learns it — self-healing and TTL-bounded.
+		//
+		// Not gated on s.filterQueries: the enforcement use applies even when
+		// query filtering is off; isQueryAllowed still only consults the cache
+		// when filtering is on.
+		//
+		// Ports are UNIONed across origins (config.UnionPorts), not last-write-
+		// wins: a target reachable from two allowed hosts on different ports
+		// (e.g. one allows 443, another 80) must end up allowed on both, and an
+		// all-ports origin must absorb a port-restricted one. Merge composes
+		// under the cache lock so concurrent resolutions can't drop a port.
+		if s.cnameAllowed != nil && (verdict.HasAllow() || derived) {
+			inheritPorts := derivedPorts
+			if verdict.HasAllow() {
+				inheritPorts = verdict.AllowPorts
+			}
 			for _, link := range cnameChainTargets(canonicalHostname, resp.Answer) {
 				ttl := time.Duration(derivedCNAMETTL(link.ttl)) * time.Second
-				s.cnameAllowed.Put(link.target, true, ttl)
+				s.cnameAllowed.Merge(link.target, inheritPorts, ttl, config.UnionPorts)
 			}
 		}
 
@@ -464,8 +500,10 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 			// bypassOnly && no rule match → skip ALL per-host tracking. The
 			// bypass is by design "no per-host bookkeeping"; tracking
 			// ephemeral cloud-internal names (e.g. ip-X-X-X-X.compute.internal
-			// per EC2 instance) would grow our per-host maps without bound.
-			if bypassOnly && !verdict.Matched() {
+			// per EC2 instance) would grow our per-host maps without bound. A
+			// derived-allowed name is exempt from the skip: it's a real CNAME
+			// target of an allowed host whose IPs must be enforced.
+			if bypassOnly && !verdict.Matched() && !derived {
 				s.logger.Debug("Skipping per-host tracking for bypass-only hostname",
 					"hostname", fullHostname,
 					"ip_count", len(ips))
@@ -504,6 +542,20 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 						if verdict.HasAllow() {
 							s.applyVerdictSide(ip, fullHostname, config.ActionAllow, verdict.AllowPorts, false)
 						}
+					}
+				case derived && s.firewall != nil:
+					// No rule matched, but this name is a CNAME target of an
+					// allowed host. Allow its resolved IPs on the inherited
+					// ports so a chain split across query round-trips (CDN-
+					// variant PKI, dynamic edge labels) is enforced, not just
+					// un-REFUSED. applyVerdictSide keeps the CIDR-conflict check
+					// and the default-action short-circuit.
+					s.logger.Debug("Hostname tracked for BPF update (derived CNAME allow)",
+						"hostname", fullHostname,
+						"allow_ports", derivedPorts)
+
+					for _, ip := range ips {
+						s.applyVerdictSide(ip, fullHostname, config.ActionAllow, derivedPorts, false)
 					}
 				case !verdict.Matched():
 					// No rules yet, but track that we've seen this hostname

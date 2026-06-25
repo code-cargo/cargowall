@@ -195,6 +195,34 @@ func isIPv6CIDR(value string) bool {
 	return err == nil && ip.To4() == nil
 }
 
+// canonicalCIDR returns the canonical string form of a CIDR or bare-IP rule
+// value, so textually-different-but-equivalent values collapse to one entry:
+//
+//   - "2001:DB8::/32"     → "2001:db8::/32"   (IPv6 case-folded)
+//   - "2001:db8:0:0::/64" → "2001:db8::/64"   (zero-compression canonicalised)
+//   - "8.8.8.8"           → "8.8.8.8/32"      (bare IPv4 → explicit /32)
+//   - "2001:db8::1"       → "2001:db8::1/128" (bare IPv6 → explicit /128)
+//   - "10.0.0.5/8"        → "10.0.0.0/8"      (host bits masked to network)
+//
+// net.ParseCIDR already lower-cases IPv6, collapses zero runs, and masks host
+// bits off the network address — exactly the canonical form ipnet.String()
+// re-emits. Bare IPs (no prefix) are promoted to a single-host /32 or /128 so
+// "8.8.8.8" and "8.8.8.8/32" dedup. Values that parse as neither are returned
+// unchanged; resolveRules logs them as invalid and skips them.
+func canonicalCIDR(value string) string {
+	if _, ipnet, err := net.ParseCIDR(value); err == nil {
+		return ipnet.String()
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return value
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return (&net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}).String()
+	}
+	return (&net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}).String()
+}
+
 // applyLoadedConfig is the shared tail of every Load* loader: normalize
 // and validate the rule set, then atomically swap cm.config under the
 // write lock and resolve rules. If normalization or validation fails the
@@ -216,18 +244,28 @@ func (cm *Manager) applyLoadedConfig(cfg *FirewallConfig) error {
 }
 
 // normalizeRules canonicalises rule values in place so cm.config.Rules and
-// cm.resolvedRules agree byte-for-byte. Today that's hostname-rule values:
-// DNS is case-insensitive but JSON / proto / env can carry mixed case
-// (e.g. "GitHub.com"), and MatchHostnameRule lowercases the lookup key —
-// so rule values must also be lowercased once at load time.
+// cm.resolvedRules agree byte-for-byte, and so equivalent-but-differently-
+// spelled values dedup in mergeDuplicateRules (which keys on the literal
+// Value string):
 //
-// All four loaders call this before resolveRules, so any code reading
-// cm.config.Rules directly (audit / introspection) sees the same canonical
-// form that MatchHostnameRule matches against.
+//   - Hostname rules are lower-cased. DNS is case-insensitive but JSON /
+//     proto / env can carry mixed case (e.g. "GitHub.com"), and
+//     MatchHostnameRule lowercases the lookup key.
+//   - CIDR rules are canonicalised via canonicalCIDR: IPv6 case-folded and
+//     zero-compressed, bare IPs promoted to /32 or /128, host bits masked.
+//     So "2001:DB8::/32" and "2001:db8::/32", or "8.8.8.8" and "8.8.8.8/32",
+//     become one entry rather than two (issue #64).
+//
+// All four loaders call this before validateRules / mergeDuplicateRules /
+// resolveRules, so any code reading cm.config.Rules directly (audit /
+// introspection) sees the same canonical form that matching runs against.
 func normalizeRules(rules []Rule) {
 	for i := range rules {
-		if rules[i].Type == RuleTypeHostname {
+		switch rules[i].Type {
+		case RuleTypeHostname:
 			rules[i].Value = strings.ToLower(rules[i].Value)
+		case RuleTypeCIDR:
+			rules[i].Value = canonicalCIDR(rules[i].Value)
 		}
 	}
 }
@@ -1241,15 +1279,14 @@ func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameActio
 			continue
 		}
 
-		// Parse CIDR
+		// normalizeRules promotes bare IPs to explicit /32 or /128 prefixes at
+		// load time, so every valid CIDR rule parses here; the only ParseCIDR
+		// failure left is a malformed value that resolveRules already logged
+		// and skipped, so skip it here too. A /32 or /128 host route matches
+		// only its exact IP via Contains, ranking most-specific at ones==32/128
+		// (an IPv6 single IP correctly ranks as 128, not 32).
 		_, ipnet, err := net.ParseCIDR(cm.config.Rules[i].Value)
 		if err != nil {
-			// Try as single IP
-			if ruleIP := net.ParseIP(cm.config.Rules[i].Value); ruleIP != nil && ruleIP.Equal(ip) {
-				// Exact match is most specific (32 bits)
-				mostSpecificRule = &cm.config.Rules[i]
-				mostSpecificBits = 32
-			}
 			continue
 		}
 
@@ -1520,13 +1557,12 @@ func (cm *Manager) hasCIDRRuleAllPorts(ipStr string) bool {
 			continue
 		}
 
+		// normalizeRules promotes bare IPs to explicit /32 or /128 prefixes at
+		// load time, so every valid CIDR rule parses and host routes match via
+		// Contains; the only remaining ParseCIDR failure is a malformed value
+		// resolveRules already skipped, so skip it here too.
 		_, ipnet, err := net.ParseCIDR(rule.Value)
-		if err != nil {
-			ruleIP := net.ParseIP(rule.Value)
-			if ruleIP == nil || !ruleIP.Equal(ip) {
-				continue
-			}
-		} else if !ipnet.Contains(ip) {
+		if err != nil || !ipnet.Contains(ip) {
 			continue
 		}
 
@@ -1551,14 +1587,12 @@ func (cm *Manager) hasCIDRRule(ipStr string, port Port) bool {
 			continue
 		}
 
+		// normalizeRules promotes bare IPs to explicit /32 or /128 prefixes at
+		// load time, so every valid CIDR rule parses and host routes match via
+		// Contains; the only remaining ParseCIDR failure is a malformed value
+		// resolveRules already skipped, so skip it here too.
 		_, ipnet, err := net.ParseCIDR(rule.Value)
-		if err != nil {
-			// Try single IP
-			ruleIP := net.ParseIP(rule.Value)
-			if ruleIP == nil || !ruleIP.Equal(ip) {
-				continue
-			}
-		} else if !ipnet.Contains(ip) {
+		if err != nil || !ipnet.Contains(ip) {
 			continue
 		}
 
@@ -1897,13 +1931,18 @@ func (cm *Manager) resolveRulesLocked() error {
 		case RuleTypeCIDR:
 			_, ipnet, err := net.ParseCIDR(rule.Value)
 			if err != nil {
-				// Try parsing as single IP (treat as /32)
+				// Load-time normalizeRules canonicalises bare IPs to explicit
+				// /32 or /128 prefixes, so the ParseCIDR above succeeds for
+				// every config-sourced rule. This single-IP fallback only
+				// fires when resolveRules is driven directly with un-normalized
+				// rules (the public resolveRules() test wrapper) — production
+				// loaders always normalize first.
 				ip := net.ParseIP(rule.Value)
 				if ip == nil {
 					slog.Error("Invalid CIDR/IP", "value", rule.Value, "error", err)
 					continue
 				}
-				// Convert single IP to /32 CIDR
+				// Convert single IP to a host route: /32 for IPv4, /128 for IPv6.
 				if ip4 := ip.To4(); ip4 != nil {
 					resolved.IPNet = &net.IPNet{
 						IP:   ip4,

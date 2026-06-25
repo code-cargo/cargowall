@@ -320,7 +320,10 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	// DNS tunneling). isQueryAllowed handles both the full and the
 	// search-domain-stripped form internally with the right precedence.
 	if s.filterQueries && len(r.Question) > 0 {
-		domain := strings.TrimSuffix(r.Question[0].Name, ".")
+		// Lowercased for reporting consistency (#65): isQueryAllowed and
+		// MatchHostnameRule fold case internally, so this only affects the
+		// case shown in the block logs and the LogDNSBlocked audit record.
+		domain := strings.ToLower(strings.TrimSuffix(r.Question[0].Name, "."))
 		if !s.isQueryAllowed(domain, r.Question[0].Qtype) {
 			// Check if we're in audit mode - log but don't block
 			isAuditMode := s.auditLogger != nil && s.auditLogger.IsAuditMode()
@@ -412,15 +415,15 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 
 	// Process response before returning replying
 	if len(r.Question) > 0 && resp.Rcode == dns.RcodeSuccess {
-		fullHostname := strings.TrimSuffix(r.Question[0].Name, ".")
+		// Lowercase the queried name once and use it for matching, per-host
+		// bookkeeping, AND log/audit attribution. Reporting the canonical
+		// lowercase form (rather than the raw wire case) keeps DNS-path output
+		// consistent with the connection-event path, which logs the lowercase
+		// hostname from the IP->hostname mapping (#65).
+		canonicalHostname := strings.ToLower(strings.TrimSuffix(r.Question[0].Name, "."))
 
 		// Extract IPs and TTLs from response
 		ips, ttl := s.extractIPsFromResponse(resp)
-
-		// Lowercase once for all canonical-form operations below; keep
-		// fullHostname for log attribution so wire-case is preserved in
-		// audit/debug output.
-		canonicalHostname := strings.ToLower(fullHostname)
 
 		// One MatchHostnameRule call per resolution — it internally evaluates
 		// both the full and search-domain-stripped forms and folds the result
@@ -494,7 +497,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 
 		if len(ips) > 0 {
 			s.logger.Debug("DNS resolution intercepted",
-				"hostname", fullHostname,
+				"hostname", canonicalHostname,
 				"ip_count", len(ips),
 				"ttl", ttl)
 
@@ -511,7 +514,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 			// target of an allowed host whose IPs must be enforced.
 			if bypassOnly && !verdict.Matched() && !derived {
 				s.logger.Debug("Skipping per-host tracking for bypass-only hostname",
-					"hostname", fullHostname,
+					"hostname", canonicalHostname,
 					"ip_count", len(ips))
 			} else {
 				for _, ip := range ips {
@@ -535,7 +538,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 				switch {
 				case verdict.Matched() && s.firewall != nil:
 					s.logger.Debug("Hostname tracked for BPF update",
-						"hostname", fullHostname,
+						"hostname", canonicalHostname,
 						"deny_rule", verdict.DenyRule,
 						"deny_ports", verdict.DenyPorts,
 						"allow_rule", verdict.AllowRule,
@@ -543,10 +546,10 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 
 					for _, ip := range ips {
 						if verdict.HasDeny() {
-							s.applyVerdictSide(ip, fullHostname, config.ActionDeny, verdict.DenyPorts, false)
+							s.applyVerdictSide(ip, canonicalHostname, config.ActionDeny, verdict.DenyPorts, false)
 						}
 						if verdict.HasAllow() {
-							s.applyVerdictSide(ip, fullHostname, config.ActionAllow, verdict.AllowPorts, false)
+							s.applyVerdictSide(ip, canonicalHostname, config.ActionAllow, verdict.AllowPorts, false)
 						}
 					}
 				case derived && s.firewall != nil:
@@ -557,18 +560,18 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 					// un-REFUSED. applyVerdictSide keeps the CIDR-conflict check
 					// and the default-action short-circuit.
 					s.logger.Debug("Hostname tracked for BPF update (derived CNAME allow)",
-						"hostname", fullHostname,
+						"hostname", canonicalHostname,
 						"allow_ports", derivedPorts)
 
 					for _, ip := range ips {
-						s.applyVerdictSide(ip, fullHostname, config.ActionAllow, derivedPorts, false)
+						s.applyVerdictSide(ip, canonicalHostname, config.ActionAllow, derivedPorts, false)
 					}
 				case !verdict.Matched():
 					// No rules yet, but track that we've seen this hostname
 					// so ApplyRulesToTrackedHostnames can backfill if a rule
 					// is added later.
 					s.logger.Debug("DNS resolution tracked (no rules yet)",
-						"hostname", fullHostname,
+						"hostname", canonicalHostname,
 						"ip_count", len(ips))
 				}
 			}

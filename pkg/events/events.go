@@ -284,7 +284,11 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			names, err := reverseDNSResolver.LookupAddr(ctx, dstIP)
 			cancel()
 			if err == nil && len(names) > 0 {
-				ptrName := strings.TrimSuffix(names[0], ".")
+				// Lowercased so an unmatched PTR name is reported in the same
+				// canonical case as forward mappings and tracked-rule matches,
+				// keeping connection-event output consistent (#65). PTR replies
+				// can carry mixed/0x20-randomized case off the wire.
+				ptrName := strings.ToLower(strings.TrimSuffix(names[0], "."))
 				// Try to match PTR result to a tracked hostname
 				if tracked := configMgr.FindTrackedHostname(ptrName); tracked != "" {
 					hostname = tracked

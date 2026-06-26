@@ -516,12 +516,12 @@ func cnameLogAttr(chain []string) []any {
 	if len(chain) == 0 {
 		return nil
 	}
-	return []any{"cname_target", strings.Join(chain, " → ")}
+	return []any{"cname_chain", strings.Join(chain, " → ")}
 }
 
 // logConnEvent emits a connection event at Info, appending the CNAME drill-down
 // attribute when present. Centralizes the append/cnameLogAttr wiring so every
-// event type surfaces cname_target consistently.
+// event type surfaces cname_chain consistently.
 func logConnEvent(logger *slog.Logger, msg string, cnameChain []string, attrs ...any) {
 	logger.Info(msg, append(attrs, cnameLogAttr(cnameChain)...)...)
 }

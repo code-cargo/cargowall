@@ -259,7 +259,7 @@ type CargoWallActionEvent struct {
 	// Full CNAME chain (origin..target) when the hostname was reached via a CNAME
 	// of an allowed host; empty otherwise. The first element is the origin the
 	// user allowed, the last is the edge/target actually connected to.
-	CnameTarget   []string `protobuf:"bytes,11,rep,name=cname_target,json=cnameTarget,proto3" json:"cname_target,omitempty"`
+	CnameChain    []string `protobuf:"bytes,11,rep,name=cname_chain,json=cnameChain,proto3" json:"cname_chain,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -364,9 +364,9 @@ func (x *CargoWallActionEvent) GetAutoAllowedType() data.CargoWallAutoAllowedTyp
 	return data.CargoWallAutoAllowedType(0)
 }
 
-func (x *CargoWallActionEvent) GetCnameTarget() []string {
+func (x *CargoWallActionEvent) GetCnameChain() []string {
 	if x != nil {
-		return x.CnameTarget
+		return x.CnameChain
 	}
 	return nil
 }
@@ -652,7 +652,7 @@ const file_cargo_wall_action_proto_rawDesc = "" +
 	"\fcompleted_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampH\x01R\vcompletedAt\x88\x01\x01\x12?\n" +
 	"\x06events\x18d \x03(\v2'.grpc.cargowall.v1.CargoWallActionEventR\x06eventsB\r\n" +
 	"\v_started_atB\x0f\n" +
-	"\r_completed_at\"\xec\x04\n" +
+	"\r_completed_at\"\xea\x04\n" +
 	"\x14CargoWallActionEvent\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12>\n" +
 	"\x06action\x18\x02 \x01(\x0e2&.grpc.cargowall.v1.CargoWallActionTypeR\x06action\x12\x1f\n" +
@@ -664,8 +664,9 @@ const file_cargo_wall_action_proto_rawDesc = "" +
 	"\aprocess\x18\b \x01(\tH\x05R\aprocess\x88\x01\x01\x12E\n" +
 	"\bcategory\x18\t \x01(\x0e2).grpc.cargowall.v1.CargoWallEventCategoryR\bcategory\x12\\\n" +
 	"\x11auto_allowed_type\x18\n" +
-	" \x01(\x0e2+.grpc.cargowall.v1.CargoWallAutoAllowedTypeH\x06R\x0fautoAllowedType\x88\x01\x01\x12!\n" +
-	"\fcname_target\x18\v \x03(\tR\vcnameTargetB\v\n" +
+	" \x01(\x0e2+.grpc.cargowall.v1.CargoWallAutoAllowedTypeH\x06R\x0fautoAllowedType\x88\x01\x01\x12\x1f\n" +
+	"\vcname_chain\x18\v \x03(\tR\n" +
+	"cnameChainB\v\n" +
 	"\t_hostnameB\x05\n" +
 	"\x03_ipB\a\n" +
 	"\x05_portB\v\n" +

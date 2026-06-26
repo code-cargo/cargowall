@@ -69,7 +69,7 @@ message CargoWallActionEvent {
   // Full CNAME chain (origin..target) when the hostname was reached via a CNAME
   // of an allowed host; empty otherwise. The first element is the origin the
   // user allowed, the last is the edge/target actually connected to.
-  repeated string cname_target = 11;
+  repeated string cname_chain = 11;
 }
 
 message CreateCargoWallActionJobRequest {

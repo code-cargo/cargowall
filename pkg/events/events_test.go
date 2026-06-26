@@ -845,7 +845,7 @@ func TestProcessEvent_BlockedNoMatchStillLogsBlocked(t *testing.T) {
 // TestProcessEvent_CNAMEDerivedAttributesToOrigin covers the reporting fix for
 // transparent CNAME support: a connection to a CNAME target's IP (the IP maps
 // to the opaque edge name) must be reported under the origin hostname the user
-// allowed, with the full chain surfaced as the cname_target drill-down field.
+// allowed, with the full chain surfaced as the cname_chain drill-down field.
 func TestProcessEvent_CNAMEDerivedAttributesToOrigin(t *testing.T) {
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
 	auditLogger, err := NewAuditLogger(auditPath, false)
@@ -885,7 +885,7 @@ func TestProcessEvent_CNAMEDerivedAttributesToOrigin(t *testing.T) {
 	assert.Equal(t, EventConnectionAllowed, events[0].EventType)
 	assert.Equal(t, "www.microsoft.com", events[0].DstHostname,
 		"event must be attributed to the origin the user allowed, not the CNAME edge")
-	assert.Equal(t, chain, events[0].CNAMETarget,
+	assert.Equal(t, chain, events[0].CNAMEChain,
 		"the full CNAME chain must be surfaced as the drill-down field")
 }
 
@@ -937,7 +937,7 @@ func TestProcessEvent_CNAMEDerivedBlockedAttributesToOrigin(t *testing.T) {
 	assert.Equal(t, EventConnectionBlocked, events[0].EventType,
 		":8080 is outside the origin rule's :443 allow set, so it stays blocked")
 	assert.Equal(t, "www.microsoft.com", events[0].DstHostname)
-	assert.Equal(t, chain, events[0].CNAMETarget)
+	assert.Equal(t, chain, events[0].CNAMEChain)
 }
 
 // TestProcessEvent_LateResolvedDstPortNotInRulePortsStaysBlocked guards against

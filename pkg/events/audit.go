@@ -56,9 +56,9 @@ type AuditEvent struct {
 	PID             uint32         `json:"pid,omitempty"`
 	MatchedRule     string         `json:"matched_rule,omitempty"`
 	AutoAllowedType string         `json:"auto_allowed_type,omitempty"`
-	CNAMETarget     []string       `json:"cname_target,omitempty"` // CNAME chain origin..target when DstHostname was reached via a CNAME of an allowed host
-	WouldDeny       bool           `json:"would_deny"`             // true in audit mode (would have been denied)
-	Blocked         bool           `json:"blocked"`                // true in enforce mode (actually blocked)
+	CNAMEChain      []string       `json:"cname_chain,omitempty"` // CNAME chain origin..target when DstHostname was reached via a CNAME of an allowed host
+	WouldDeny       bool           `json:"would_deny"`            // true in audit mode (would have been denied)
+	Blocked         bool           `json:"blocked"`               // true in enforce mode (actually blocked)
 }
 
 // AuditLogger writes audit events to a JSON file (one event per line)
@@ -133,7 +133,7 @@ func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPor
 		Protocol:    protocol,
 		Process:     process,
 		PID:         pid,
-		CNAMETarget: cnameChain,
+		CNAMEChain:  cnameChain,
 	})
 }
 
@@ -156,7 +156,7 @@ func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRu
 		Process:     process,
 		PID:         pid,
 		MatchedRule: matchedRule,
-		CNAMETarget: cnameChain,
+		CNAMEChain:  cnameChain,
 	})
 }
 
@@ -177,7 +177,7 @@ func (a *AuditLogger) LogConnectionAllowed(srcIP, dstIP, hostname string, dstPor
 		Process:         process,
 		PID:             pid,
 		AutoAllowedType: autoAllowedType,
-		CNAMETarget:     cnameChain,
+		CNAMEChain:      cnameChain,
 	})
 }
 
@@ -192,7 +192,7 @@ func (a *AuditLogger) LogProtocolBlocked(srcIP, dstIP, hostname, protocol, proce
 		Protocol:    protocol,
 		Process:     process,
 		PID:         pid,
-		CNAMETarget: cnameChain,
+		CNAMEChain:  cnameChain,
 	})
 }
 

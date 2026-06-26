@@ -314,13 +314,15 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	// host (derived-allow enforcement recorded the chain — see
 	// Manager.RecordCNAMEChain), report the connection under the origin hostname
 	// the user actually allowed (chain[0]) and surface the full chain as a
-	// drill-down field. Done before the late-allow block so a blocked derived
-	// connection on a non-inherited port also attributes to the origin and runs
-	// the late-allow check against the origin's rule. The recorded target equals
-	// the resolved `hostname`, so the chain[0] != hostname guard skips the
-	// no-op self case.
+	// drill-down field. For an edge IP shared by several allowed origins,
+	// LookupCNAMEChain returns the most recently-resolved one. Done before the
+	// late-allow block so a blocked derived connection on a non-inherited port
+	// also attributes to the origin and runs the late-allow check against the
+	// origin's rule. Setting hostname = chain[0] is a no-op when the resolved
+	// hostname already is the origin (e.g. the IP was later re-mapped in-band),
+	// but we still attach the chain so the drill-down isn't dropped.
 	var cnameChain []string
-	if chain := configMgr.LookupCNAMEChain(dstIP); len(chain) > 0 && chain[0] != "" && chain[0] != hostname {
+	if chain := configMgr.LookupCNAMEChain(dstIP); len(chain) > 0 && chain[0] != "" {
 		cnameChain = chain
 		hostname = chain[0]
 	}
@@ -510,13 +512,15 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 }
 
 // cnameLogAttr returns the slog key/value pair surfacing the CNAME drill-down
-// chain (origin → … → target) for a derived-allow connection, or nil when there
-// is no chain so normal connection events aren't annotated.
+// chain (origin..target) for a derived-allow connection, or nil when there is no
+// chain so normal connection events aren't annotated. The chain is passed as a
+// []string so the live log carries the same shape as the audit/proto field
+// rather than a pre-joined string.
 func cnameLogAttr(chain []string) []any {
 	if len(chain) == 0 {
 		return nil
 	}
-	return []any{"cname_chain", strings.Join(chain, " → ")}
+	return []any{"cname_chain", chain}
 }
 
 // logConnEvent emits a connection event at Info, appending the CNAME drill-down

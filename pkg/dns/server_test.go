@@ -2203,6 +2203,10 @@ func TestHandleDNSQuery_DerivedResponseLearnsTransitively(t *testing.T) {
 		"transitively-learned hop must extend the parent's chain so attribution stays rooted at the origin")
 	assert.True(t, server.isQueryAllowed(hop2, dns.TypeA),
 		"transitively-learned hop should be directly queryable")
+	// The A record belongs to hop2, so the per-IP attribution must reach the
+	// final target, not stop one hop short at the queried name (hop1).
+	assert.Equal(t, []string{origin, hop1, hop2}, cfg.LookupCNAMEChain("104.18.38.233"),
+		"recorded chain must reach the response's final CNAME target")
 }
 
 // The enforcement path is independent of query filtering. Even with filtering

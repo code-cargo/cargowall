@@ -597,20 +597,29 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 					// variant PKI, dynamic edge labels) is enforced, not just
 					// un-REFUSED. applyVerdictSide keeps the CIDR-conflict check
 					// and the default-action short-circuit.
+					// The A/AAAA records belong to the FINAL CNAME target, which
+					// may chain onward from the queried name within this same
+					// response; extend so the recorded drill-down reaches the
+					// actual edge instead of stopping at the queried name.
+					recordChain := append([]string{}, derivedChain...)
+					for _, link := range cnameChainTargets(canonicalHostname, resp.Answer) {
+						recordChain = append(recordChain, link.target)
+					}
+
 					s.logger.Debug("Hostname tracked for BPF update (derived CNAME allow)",
 						"hostname", canonicalHostname,
 						"allow_ports", derivedPorts,
-						"cname_chain", derivedChain)
+						"cname_chain", recordChain)
 
 					for _, ip := range ips {
 						s.applyVerdictSide(ip, canonicalHostname, config.ActionAllow, derivedPorts, false)
-						// Attribute this IP to the origin (derivedChain[0]) so the
+						// Attribute this IP to the origin (recordChain[0]) so the
 						// connection-event reporter can show the allowed hostname
 						// the user configured, with the CNAME chain as drill-down.
 						// Pass the response TTL so a later request that chased a
 						// different allowed origin to this shared edge wins the
 						// attribution once this one goes stale.
-						s.config.RecordCNAMEChain(ip.String(), derivedChain, time.Duration(ttl)*time.Second)
+						s.config.RecordCNAMEChain(ip.String(), recordChain, time.Duration(ttl)*time.Second)
 					}
 				case !verdict.Matched():
 					// No rules yet, but track that we've seen this hostname

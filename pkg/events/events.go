@@ -426,14 +426,13 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		autoAllowedType := string(configMgr.GetAutoAllowedType(dstIP, event.DstPort, eventProto, hostname))
 
 		// Allowed TCP SYN connection
-		logger.Info("Connection allowed", append([]any{
+		logConnEvent(logger, "Connection allowed", cnameChain,
 			"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
 			"dst", displayHostname,
 			"dst_ip", dstIP,
 			"dst_port", event.DstPort,
 			"process", comm,
-			"pid", pid,
-		}, cnameLogAttr(cnameChain)...)...)
+			"pid", pid)
 
 		if auditLogger != nil {
 			if err := auditLogger.LogConnectionAllowed(srcIP, dstIP, hostname, event.DstPort, comm, pid, autoAllowedType, getProtocolName(event.IpProto), cnameChain); err != nil {
@@ -443,7 +442,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	} else if event.SrcPort == 0 && event.DstPort < 256 {
 		// Non-TCP/UDP protocol block — dst_port contains the protocol number
 		protocolName := getProtocolName(uint8(event.DstPort))
-		logger.Info("Protocol blocked", append([]any{
+		logConnEvent(logger, "Protocol blocked", cnameChain,
 			"src", srcIP,
 			"dst", displayHostname,
 			"dst_ip", dstIP,
@@ -451,8 +450,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			"protocol_num", event.DstPort,
 			"process", comm,
 			"pid", pid,
-			"timestamp", time.Now().Format("2006-01-02 15:04:05"),
-		}, cnameLogAttr(cnameChain)...)...)
+			"timestamp", time.Now().Format("2006-01-02 15:04:05"))
 
 		// Log to audit file if configured
 		if auditLogger != nil {
@@ -469,16 +467,17 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		// Policy outcome is allow (the retry will succeed), so log accordingly
 		// and skip the block notification. matchedRule is the rule's Value
 		// (pattern string for glob rules, configured hostname for plain rules) —
-		// distinct from displayHostname, which is what was actually resolved.
-		logger.Info("Connection late-allowed", append([]any{
+		// distinct from displayHostname, which is the reported destination: the
+		// CNAME origin when this IP was reached via an allowed host's chain,
+		// otherwise the resolved hostname.
+		logConnEvent(logger, "Connection late-allowed", cnameChain,
 			"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
 			"dst", displayHostname,
 			"dst_ip", dstIP,
 			"dst_port", event.DstPort,
 			"process", comm,
 			"pid", pid,
-			"matched_rule", matchedRule,
-		}, cnameLogAttr(cnameChain)...)...)
+			"matched_rule", matchedRule)
 
 		if auditLogger != nil {
 			if err := auditLogger.LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRule, event.DstPort, comm, pid, getProtocolName(event.IpProto), cnameChain); err != nil {
@@ -487,15 +486,14 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		}
 	} else {
 		// Blocked TCP SYN or UDP connection
-		logger.Info("Connection blocked", append([]any{
+		logConnEvent(logger, "Connection blocked", cnameChain,
 			"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
 			"dst", displayHostname,
 			"dst_ip", dstIP,
 			"dst_port", event.DstPort,
 			"process", comm,
 			"pid", pid,
-			"timestamp", time.Now().Format("2006-01-02 15:04:05"),
-		}, cnameLogAttr(cnameChain)...)...)
+			"timestamp", time.Now().Format("2006-01-02 15:04:05"))
 
 		// Log to audit file if configured
 		if auditLogger != nil {
@@ -519,6 +517,13 @@ func cnameLogAttr(chain []string) []any {
 		return nil
 	}
 	return []any{"cname_target", strings.Join(chain, " → ")}
+}
+
+// logConnEvent emits a connection event at Info, appending the CNAME drill-down
+// attribute when present. Centralizes the append/cnameLogAttr wiring so every
+// event type surfaces cname_target consistently.
+func logConnEvent(logger *slog.Logger, msg string, cnameChain []string, attrs ...any) {
+	logger.Info(msg, append(attrs, cnameLogAttr(cnameChain)...)...)
 }
 
 // ProcessBlockedEvents processes blocked connection events

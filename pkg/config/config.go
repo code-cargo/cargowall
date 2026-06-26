@@ -1028,11 +1028,14 @@ func (cm *Manager) LookupCNAMEChain(ip string) []string {
 	now := time.Now()
 	best := -1       // most-recent non-expired
 	mostRecent := -1 // most-recent overall (fallback when all expired)
+	// Use !Before (>=) rather than After so equal timestamps resolve toward the
+	// later-scanned record. .After is false on a tie, which would otherwise keep
+	// the earliest (oldest-positioned) origin and contradict "most recent wins".
 	for i := range records {
-		if mostRecent == -1 || records[i].lastSeen.After(records[mostRecent].lastSeen) {
+		if mostRecent == -1 || !records[i].lastSeen.Before(records[mostRecent].lastSeen) {
 			mostRecent = i
 		}
-		if now.Before(records[i].expiry) && (best == -1 || records[i].lastSeen.After(records[best].lastSeen)) {
+		if now.Before(records[i].expiry) && (best == -1 || !records[i].lastSeen.Before(records[best].lastSeen)) {
 			best = i
 		}
 	}
@@ -1066,14 +1069,22 @@ func (cm *Manager) cleanupOldEntries() {
 
 	// Delete old entries
 	for _, ip := range toDelete {
-		delete(cm.ipToHostname, ip)
-		delete(cm.ipToCNAMEOrigins, ip)
-		delete(cm.ipLastSeen, ip)
+		cm.forgetIP(ip)
 	}
 
 	if len(toDelete) > 0 {
 		slog.Info("Cleaned up old DNS cache entries", "count", len(toDelete))
 	}
+}
+
+// forgetIP removes an IP from every per-IP map (the reverse-lookup tuple keyed
+// by IP: ipToHostname, ipToCNAMEOrigins, ipLastSeen). It is the single place
+// that knows the full set, so adding another per-IP map only requires one edit
+// here — callers can't leak an entry by forgetting one map. Must hold cm.mu.
+func (cm *Manager) forgetIP(ip string) {
+	delete(cm.ipToHostname, ip)
+	delete(cm.ipToCNAMEOrigins, ip)
+	delete(cm.ipLastSeen, ip)
 }
 
 // HostnameVerdict is the result of evaluating a hostname against the

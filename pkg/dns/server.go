@@ -494,7 +494,8 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		// rule-allowed response the origin is the queried name; for a derived
 		// response the chain extends the parent target's stored chain, so
 		// attribution survives a chain split across query round-trips.
-		// mergeDerivedAllow keeps the first chain (stable) while unioning ports.
+		// mergeDerivedAllow keeps the most recently-resolved chain (last-write-
+		// wins) while unioning ports; the per-IP record retains older origins.
 		if s.cnameAllowed != nil && (verdict.HasAllow() || derived) {
 			inheritPorts := derivedPorts
 			path := append([]string{}, derivedChain...)
@@ -512,23 +513,23 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 				ttl := time.Duration(derivedCNAMETTL(link.ttl)) * time.Second
 				path = append(path, link.target)
 				chain := append([]string{}, path...)
-				// Log at Info only the first time a target is learned (or re-
-				// learned after expiry); a refresh of an already-known target
-				// drops to Debug so steady-state resolutions stay quiet.
+				// Log a first-learn (or re-learn after expiry) at Info so a
+				// later-blocked edge IP is traceable to its origin; a refresh of
+				// an already-known target drops to Debug so steady-state
+				// resolutions stay quiet.
 				_, known := s.cnameAllowed.Get(link.target)
 				s.cnameAllowed.Merge(link.target, derivedAllow{ports: inheritPorts, chain: chain}, ttl, mergeDerivedAllow)
+				msg, level := "Learned CNAME target", slog.LevelInfo
 				if known {
-					s.logger.Debug("Refreshed CNAME target",
-						"target", link.target, "origin", chain[0], "source", source)
-				} else {
-					s.logger.Info("Learned CNAME target",
-						"target", link.target,
-						"origin", chain[0],
-						"chain", chain,
-						"inherited_ports", inheritPorts,
-						"source", source,
-						"ttl", ttl)
+					msg, level = "Refreshed CNAME target", slog.LevelDebug
 				}
+				s.logger.Log(context.Background(), level, msg,
+					"target", link.target,
+					"origin", chain[0],
+					"chain", chain,
+					"inherited_ports", inheritPorts,
+					"source", source,
+					"ttl", ttl)
 			}
 		}
 

@@ -516,11 +516,11 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 				// Log a first-learn (or re-learn after expiry) at Info so a
 				// later-blocked edge IP is traceable to its origin; a refresh of
 				// an already-known target drops to Debug so steady-state
-				// resolutions stay quiet.
-				_, known := s.cnameAllowed.Get(link.target)
-				s.cnameAllowed.Merge(link.target, derivedAllow{ports: inheritPorts, chain: chain}, ttl, mergeDerivedAllow)
+				// resolutions stay quiet. Merge reports liveness atomically, so
+				// no separate Get is needed.
+				existed := s.cnameAllowed.Merge(link.target, derivedAllow{ports: inheritPorts, chain: chain}, ttl, mergeDerivedAllow)
 				msg, level := "Learned CNAME target", slog.LevelInfo
-				if known {
+				if existed {
 					msg, level = "Refreshed CNAME target", slog.LevelDebug
 				}
 				s.logger.Log(context.Background(), level, msg,

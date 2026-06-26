@@ -366,19 +366,27 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 						logger.Debug("Late-resolved IP already in firewall",
 							"ip", dstIP, "hostname", hostname, "ports", verdict.AllowPorts)
 					}
-					// Sound regardless of `changed`: FirewallImpl.addIPv4 /
-					// addIPv6 reconcile per-port entries before the LPM no-op
-					// check, so on err==nil the current rule's `ports` are
-					// guaranteed to be in map_ports — even when the IP was
-					// already in the LPM from a different rule with disjoint
-					// ports. Checking the inputs alone therefore answers
-					// "will the retry succeed?" correctly.
+					// Best-effort prediction of "will the retry succeed?" from
+					// this rule's own ports: FirewallImpl reconciles per-port
+					// entries before the LPM no-op check, so on err==nil the
+					// current rule's `ports` are in map_ports even when the IP
+					// was already in the LPM from a different rule with disjoint
+					// ports.
 					//
 					// For a mixed verdict (e.g. `*.foo: deny 80` + `bar:
 					// allow all` on `bar.foo`), AllowPorts may be empty (all
 					// ports) while DenyPorts covers the event's port. The
 					// retry on that port will still be blocked by the deny
 					// side's per-port BPF entry, so it is NOT late-allowed.
+					//
+					// Caveat: this looks only at THIS hostname's verdict, not at
+					// other rules that resolved to the same shared IP. If that IP
+					// already carries a conflicting all-ports grant (e.g. a
+					// different all-ports-deny host shares it), the firewall's
+					// PortSpecific=0 stickiness makes this rule's per-port entry
+					// inert, so the audited late-allow/blocked label can diverge
+					// from the actual BPF verdict for that edge. Enforcement is
+					// unaffected — this only governs the audit/notification.
 					allowMatches := dstPortAllowedByRule(event.DstPort, event.IpProto, verdict.AllowPorts)
 					denyMatches := verdict.HasDeny() &&
 						dstPortAllowedByRule(event.DstPort, event.IpProto, verdict.DenyPorts)

@@ -60,14 +60,16 @@ type Server struct {
 	dnsCache *lruCache[string, *dnsCacheEntry]
 
 	// CNAME targets learned from allowed responses (LRU with per-entry TTL).
-	// Maps target -> allow ports inherited from the origin rule (nil/empty =
-	// all ports, matching rule semantics). Consulted by BOTH the query filter
-	// (un-REFUSE a direct query for a CNAME target of an allowed host) and IP
-	// enforcement (allow that target's resolved IPs on the inherited ports).
-	// The enforcement use closes the gap where a chain is split across multiple
-	// query round-trips — e.g. CDN-fronted PKI endpoints — so the in-band
-	// "single response carries every hop" assumption no longer holds.
-	cnameAllowed *lruCache[string, []config.Port]
+	// Maps target -> derivedAllow{ports, chain}: the allow ports inherited from
+	// the origin rule (nil/empty = all ports, matching rule semantics) and the
+	// full ordered CNAME chain from the origin down to this target. Consulted by
+	// BOTH the query filter (un-REFUSE a direct query for a CNAME target of an
+	// allowed host) and IP enforcement (allow that target's resolved IPs on the
+	// inherited ports, attributing them to the origin for reporting). The
+	// enforcement use closes the gap where a chain is split across multiple query
+	// round-trips — e.g. CDN-fronted PKI endpoints — so the in-band "single
+	// response carries every hop" assumption no longer holds.
+	cnameAllowed *lruCache[string, derivedAllow]
 
 	// Audit logger for DNS events
 	auditLogger *events.AuditLogger
@@ -100,7 +102,7 @@ func NewServer(cfg *config.Manager, fw firewall.Firewall, upstream, listenAddr s
 		},
 		hostnameIPs:  make(map[string]map[string]bool),
 		dnsCache:     newLRUCache[string, *dnsCacheEntry](10000),
-		cnameAllowed: newLRUCache[string, []config.Port](10000),
+		cnameAllowed: newLRUCache[string, derivedAllow](10000),
 	}
 }
 
@@ -446,10 +448,11 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		// (where the denied query is still forwarded and reaches this code).
 		// Any matching rule is authoritative.
 		var derivedPorts []config.Port
+		var derivedChain []string
 		derived := false
 		if !verdict.Matched() && s.cnameAllowed != nil {
-			if ports, ok := s.cnameAllowed.Get(canonicalHostname); ok {
-				derived, derivedPorts = true, ports
+			if entry, ok := s.cnameAllowed.Get(canonicalHostname); ok {
+				derived, derivedPorts, derivedChain = true, entry.ports, entry.chain
 			}
 		}
 
@@ -484,14 +487,48 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		// (e.g. one allows 443, another 80) must end up allowed on both, and an
 		// all-ports origin must absorb a port-restricted one. Merge composes
 		// under the cache lock so concurrent resolutions can't drop a port.
+		//
+		// Each target also stores the full ordered CNAME chain from the origin
+		// down to itself (path below), so a connection event for the target's
+		// resolved IPs can be reported under the origin the user allowed. For a
+		// rule-allowed response the origin is the queried name; for a derived
+		// response the chain extends the parent target's stored chain, so
+		// attribution survives a chain split across query round-trips.
+		// mergeDerivedAllow keeps the first chain (stable) while unioning ports.
 		if s.cnameAllowed != nil && (verdict.HasAllow() || derived) {
 			inheritPorts := derivedPorts
+			path := append([]string{}, derivedChain...)
+			// source records WHY the chain is being learned: which allow rule
+			// rooted it, or "derived" when extending a previously-learned chain.
+			// Logged on first-learn so a later-blocked edge IP is traceable back
+			// to the origin (or its absence shows it was never learned at all).
+			source := "derived"
 			if verdict.HasAllow() {
 				inheritPorts = verdict.AllowPorts
+				path = []string{canonicalHostname}
+				source = "rule:" + verdict.AllowRule
 			}
 			for _, link := range cnameChainTargets(canonicalHostname, resp.Answer) {
 				ttl := time.Duration(derivedCNAMETTL(link.ttl)) * time.Second
-				s.cnameAllowed.Merge(link.target, inheritPorts, ttl, config.UnionPorts)
+				path = append(path, link.target)
+				chain := append([]string{}, path...)
+				// Log at Info only the first time a target is learned (or re-
+				// learned after expiry); a refresh of an already-known target
+				// drops to Debug so steady-state resolutions stay quiet.
+				_, known := s.cnameAllowed.Get(link.target)
+				s.cnameAllowed.Merge(link.target, derivedAllow{ports: inheritPorts, chain: chain}, ttl, mergeDerivedAllow)
+				if known {
+					s.logger.Debug("Refreshed CNAME target",
+						"target", link.target, "origin", chain[0], "source", source)
+				} else {
+					s.logger.Info("Learned CNAME target",
+						"target", link.target,
+						"origin", chain[0],
+						"chain", chain,
+						"inherited_ports", inheritPorts,
+						"source", source,
+						"ttl", ttl)
+				}
 			}
 		}
 
@@ -561,10 +598,15 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 					// and the default-action short-circuit.
 					s.logger.Debug("Hostname tracked for BPF update (derived CNAME allow)",
 						"hostname", canonicalHostname,
-						"allow_ports", derivedPorts)
+						"allow_ports", derivedPorts,
+						"cname_chain", derivedChain)
 
 					for _, ip := range ips {
 						s.applyVerdictSide(ip, canonicalHostname, config.ActionAllow, derivedPorts, false)
+						// Attribute this IP to the origin (derivedChain[0]) so the
+						// connection-event reporter can show the allowed hostname
+						// the user configured, with the CNAME chain as drill-down.
+						s.config.RecordCNAMEChain(ip.String(), derivedChain)
 					}
 				case !verdict.Matched():
 					// No rules yet, but track that we've seen this hostname
@@ -589,6 +631,32 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 type cnameLink struct {
 	target string
 	ttl    uint32
+}
+
+// derivedAllow is the cached attribution for a CNAME target learned from an
+// allowed host: the allow ports inherited from the origin rule (nil/empty =
+// all ports) and the full ordered CNAME chain from the origin (chain[0]) down
+// to this target (chain[len-1]). The chain is what lets a connection event be
+// reported under the origin hostname the user actually allowed.
+type derivedAllow struct {
+	ports []config.Port
+	chain []string
+}
+
+// mergeDerivedAllow composes an existing cache entry with an incoming one for
+// the same target: allow ports are UNIONed across origins (config.UnionPorts —
+// a target reachable from two allowed hosts on different ports must end up
+// allowed on both), while the chain is kept first-write-wins so attribution is
+// stable. Ports stay authoritative for enforcement; the chain is for display.
+func mergeDerivedAllow(existing, incoming derivedAllow) derivedAllow {
+	chain := existing.chain
+	if len(chain) == 0 {
+		chain = incoming.chain
+	}
+	return derivedAllow{
+		ports: config.UnionPorts(existing.ports, incoming.ports),
+		chain: chain,
+	}
 }
 
 // cnameChainTargets walks the CNAME chain in answers starting from qname

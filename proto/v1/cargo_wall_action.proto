@@ -66,6 +66,10 @@ message CargoWallActionEvent {
   optional string process = 8;
   CargoWallEventCategory category = 9;
   optional CargoWallAutoAllowedType auto_allowed_type = 10;
+  // Full CNAME chain (origin..target) when the hostname was reached via a CNAME
+  // of an allowed host; empty otherwise. The first element is the origin the
+  // user allowed, the last is the edge/target actually connected to.
+  repeated string cname_target = 11;
 }
 
 message CreateCargoWallActionJobRequest {

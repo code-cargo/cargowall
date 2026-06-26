@@ -668,6 +668,9 @@ func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {
 			event.AutoAllowedType = &autoType
 		}
 	}
+	if len(e.CNAMETarget) > 0 {
+		event.CnameTarget = e.CNAMETarget
+	}
 	return event
 }
 

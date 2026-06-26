@@ -1372,9 +1372,9 @@ func TestIsQueryAllowed_CNAMEDerived(t *testing.T) {
 				config:        cfg,
 				filterQueries: true,
 				logger:        slog.Default(),
-				cnameAllowed:  newLRUCache[string, []config.Port](10000),
+				cnameAllowed:  newLRUCache[string, derivedAllow](10000),
 			}
-			server.cnameAllowed.Put(strings.ToLower(tt.derived), nil, tt.derivedTTL)
+			server.cnameAllowed.Put(strings.ToLower(tt.derived), derivedAllow{}, tt.derivedTTL)
 			if tt.derivedTTL == time.Nanosecond {
 				time.Sleep(time.Millisecond) // let the entry lazily expire
 			}
@@ -1400,7 +1400,7 @@ func newTestServer(t *testing.T, cfg *config.Manager, fw firewall.Firewall) *Ser
 		client:       &dns.Client{Timeout: 5 * time.Second},
 		hostnameIPs:  make(map[string]map[string]bool),
 		dnsCache:     newLRUCache[string, *dnsCacheEntry](10000),
-		cnameAllowed: newLRUCache[string, []config.Port](10000),
+		cnameAllowed: newLRUCache[string, derivedAllow](10000),
 	}
 }
 
@@ -2180,9 +2180,10 @@ func TestHandleDNSQuery_DerivedResponseLearnsTransitively(t *testing.T) {
 	// hop1 was already learned as a CNAME target of an allowed origin (all
 	// ports). A fresh query for it now returns the Cloudflare variant that
 	// chains onward to hop2 before its A record.
+	const origin = "ocsp.digicert.com"
 	const hop1 = "mpki-ocsp.digicert.com"
 	const hop2 = "mpki-ocsp.digicert.com.cdn.cloudflare.net"
-	server.cnameAllowed.Put(hop1, nil, 5*time.Minute)
+	server.cnameAllowed.Put(hop1, derivedAllow{chain: []string{origin, hop1}}, 5*time.Minute)
 
 	resp := makeCNAMEResponse(hop1+".", []string{hop2}, "104.18.38.233")
 	seedCachedResponse(server, hop1+".", resp)
@@ -2196,8 +2197,10 @@ func TestHandleDNSQuery_DerivedResponseLearnsTransitively(t *testing.T) {
 	server.handleDNSQuery(w, q)
 
 	mockFw.AssertExpectations(t)
-	_, ok := server.cnameAllowed.Get(hop2)
+	entry, ok := server.cnameAllowed.Get(hop2)
 	assert.True(t, ok, "onward hop must be learned from a derived-allowed response")
+	assert.Equal(t, []string{origin, hop1, hop2}, entry.chain,
+		"transitively-learned hop must extend the parent's chain so attribution stays rooted at the origin")
 	assert.True(t, server.isQueryAllowed(hop2, dns.TypeA),
 		"transitively-learned hop should be directly queryable")
 }
@@ -2324,7 +2327,7 @@ func TestHandleDNSQuery_DeniedTargetDoesNotDeriveOrLearn(t *testing.T) {
 	const denied = "denied.cdn.example.net"
 	const onward = "onward.cdn.example.net"
 	// Pre-seed as if it had been learned as a CNAME target of an allowed host.
-	server.cnameAllowed.Put(denied, nil, 5*time.Minute)
+	server.cnameAllowed.Put(denied, derivedAllow{}, 5*time.Minute)
 
 	// Its response chains onward and carries an A record. No AddIP is expected:
 	// the deny side equals the default action and short-circuits, and the

@@ -2507,6 +2507,48 @@ func TestUpdateDNSMapping(t *testing.T) {
 	}
 }
 
+// RecordCNAMEChain stores a lowercased copy of the chain keyed by IP and
+// LookupCNAMEChain returns an independent copy. Empty inputs are ignored, and
+// the entry shares the ipLastSeen-based cleanup lifecycle.
+func TestRecordAndLookupCNAMEChain(t *testing.T) {
+	cm := NewConfigManager()
+
+	// nil/empty inputs are no-ops.
+	cm.RecordCNAMEChain("", []string{"a", "b"})
+	cm.RecordCNAMEChain("1.2.3.4", nil)
+	if got := cm.LookupCNAMEChain("1.2.3.4"); got != nil {
+		t.Errorf("empty chain must not be recorded: got %v", got)
+	}
+
+	// Mixed-case chain is stored lowercase.
+	cm.RecordCNAMEChain("23.62.177.200", []string{"WWW.Microsoft.com", "E13678.dscb.AkamaiEdge.net"})
+	got := cm.LookupCNAMEChain("23.62.177.200")
+	want := []string{"www.microsoft.com", "e13678.dscb.akamaiedge.net"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("LookupCNAMEChain = %v, want %v", got, want)
+	}
+
+	// Returned slice is a copy — mutating it must not corrupt cache state.
+	got[0] = "tampered"
+	if again := cm.LookupCNAMEChain("23.62.177.200"); again[0] != "www.microsoft.com" {
+		t.Errorf("LookupCNAMEChain must return a copy; cache mutated to %v", again)
+	}
+
+	// Unknown IP → nil.
+	if got := cm.LookupCNAMEChain("9.9.9.9"); got != nil {
+		t.Errorf("unknown IP must return nil, got %v", got)
+	}
+
+	// ipLastSeen is touched so cleanupOldEntries can evict the chain.
+	cm.mu.Lock()
+	cm.ipLastSeen["23.62.177.200"] = time.Now().Add(-2 * dnsCacheTTL)
+	cm.cleanupOldEntries()
+	cm.mu.Unlock()
+	if got := cm.LookupCNAMEChain("23.62.177.200"); got != nil {
+		t.Errorf("stale CNAME chain must be evicted by cleanupOldEntries, got %v", got)
+	}
+}
+
 // =============================================================================
 // Direct tests for internal helpers (Phase 4)
 // =============================================================================

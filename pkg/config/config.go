@@ -165,6 +165,7 @@ type Manager struct {
 	resolvedRules    []ResolvedRule
 	hostnameCache    map[string][]net.IP
 	ipToHostname     map[string]string    // Reverse lookup: IP -> hostname
+	ipToCNAMEChain   map[string][]string  // Reverse lookup: IP -> CNAME chain (origin..target) for derived-allow attribution
 	ipLastSeen       map[string]time.Time // Track when each IP was last seen
 	trackedHostnames map[string]Action    // Track hostnames we have rules for (hostname -> action)
 	maxCacheSize     int                  // Maximum number of IPs to cache
@@ -175,6 +176,7 @@ func NewConfigManager() *Manager {
 	return &Manager{
 		hostnameCache:    make(map[string][]net.IP),
 		ipToHostname:     make(map[string]string),
+		ipToCNAMEChain:   make(map[string][]string),
 		ipLastSeen:       make(map[string]time.Time),
 		trackedHostnames: make(map[string]Action),
 		maxCacheSize:     10000, // Default max cache size
@@ -932,6 +934,44 @@ func (cm *Manager) UpdateDNSMapping(hostname string, ip string) {
 	}
 }
 
+// RecordCNAMEChain records the CNAME chain (origin..target, ordered) that a
+// derived-allow IP was reached through, so connection events for that IP can be
+// attributed to the origin hostname the user actually allowed rather than the
+// opaque CDN/edge target. Stored lowercase and bounded by the shared ipLastSeen
+// lifecycle (see cleanupOldEntries). A nil/empty chain is ignored.
+func (cm *Manager) RecordCNAMEChain(ip string, chain []string) {
+	if ip == "" || len(chain) == 0 {
+		return
+	}
+
+	stored := make([]string, len(chain))
+	for i, h := range chain {
+		stored[i] = strings.ToLower(h)
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	cm.ipToCNAMEChain[ip] = stored
+	cm.ipLastSeen[ip] = time.Now()
+}
+
+// LookupCNAMEChain returns the CNAME chain (origin..target) recorded for a
+// derived-allow IP, or nil if none. The returned slice is a copy so callers
+// can't mutate cache state.
+func (cm *Manager) LookupCNAMEChain(ip string) []string {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	chain, ok := cm.ipToCNAMEChain[ip]
+	if !ok {
+		return nil
+	}
+	out := make([]string, len(chain))
+	copy(out, chain)
+	return out
+}
+
 // dnsCacheTTL is how long a DNS reverse mapping is kept before
 // cleanupOldEntries can discard it. Set to a day so containers / long-lived
 // connections aren't reverse-resolved repeatedly. Inlined here because no
@@ -953,6 +993,7 @@ func (cm *Manager) cleanupOldEntries() {
 	// Delete old entries
 	for _, ip := range toDelete {
 		delete(cm.ipToHostname, ip)
+		delete(cm.ipToCNAMEChain, ip)
 		delete(cm.ipLastSeen, ip)
 	}
 

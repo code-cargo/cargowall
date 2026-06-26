@@ -606,7 +606,10 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 						// Attribute this IP to the origin (derivedChain[0]) so the
 						// connection-event reporter can show the allowed hostname
 						// the user configured, with the CNAME chain as drill-down.
-						s.config.RecordCNAMEChain(ip.String(), derivedChain)
+						// Pass the response TTL so a later request that chased a
+						// different allowed origin to this shared edge wins the
+						// attribution once this one goes stale.
+						s.config.RecordCNAMEChain(ip.String(), derivedChain, time.Duration(ttl)*time.Second)
 					}
 				case !verdict.Matched():
 					// No rules yet, but track that we've seen this hostname
@@ -646,12 +649,15 @@ type derivedAllow struct {
 // mergeDerivedAllow composes an existing cache entry with an incoming one for
 // the same target: allow ports are UNIONed across origins (config.UnionPorts —
 // a target reachable from two allowed hosts on different ports must end up
-// allowed on both), while the chain is kept first-write-wins so attribution is
-// stable. Ports stay authoritative for enforcement; the chain is for display.
+// allowed on both). The chain is kept last-write-wins: when an edge is shared
+// by several allowed origins, the most recently-resolved origin is the one a
+// chain-chasing client is currently following, so it's the best display
+// attribution and the one propagated to the per-IP record (which keeps its own
+// recency-ranked set across origins). Ports stay authoritative for enforcement.
 func mergeDerivedAllow(existing, incoming derivedAllow) derivedAllow {
-	chain := existing.chain
+	chain := incoming.chain
 	if len(chain) == 0 {
-		chain = incoming.chain
+		chain = existing.chain
 	}
 	return derivedAllow{
 		ports: config.UnionPorts(existing.ports, incoming.ports),

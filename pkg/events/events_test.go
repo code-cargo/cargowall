@@ -862,7 +862,7 @@ func TestProcessEvent_CNAMEDerivedAttributesToOrigin(t *testing.T) {
 	const edge = "e13678.dscb.akamaiedge.net"
 	chain := []string{"www.microsoft.com", edge}
 	cm.UpdateDNSMapping(edge, "23.62.177.200")
-	cm.RecordCNAMEChain("23.62.177.200", chain)
+	cm.RecordCNAMEChain("23.62.177.200", chain, time.Hour)
 
 	raw := makeBpfEvent(BpfBlockedEvent{
 		IpVersion: 4,
@@ -912,7 +912,7 @@ func TestProcessEvent_CNAMEDerivedBlockedAttributesToOrigin(t *testing.T) {
 	const edge = "e13678.dscb.akamaiedge.net"
 	chain := []string{"www.microsoft.com", edge}
 	cm.UpdateDNSMapping(edge, "23.62.177.200")
-	cm.RecordCNAMEChain("23.62.177.200", chain)
+	cm.RecordCNAMEChain("23.62.177.200", chain, time.Hour)
 
 	fw := &mockFirewallUpdater{}
 

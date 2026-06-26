@@ -164,10 +164,11 @@ type Manager struct {
 	config           *FirewallConfig
 	resolvedRules    []ResolvedRule
 	hostnameCache    map[string][]net.IP
-	ipToHostname     map[string]string    // Reverse lookup: IP -> hostname
-	ipLastSeen       map[string]time.Time // Track when each IP was last seen
-	trackedHostnames map[string]Action    // Track hostnames we have rules for (hostname -> action)
-	maxCacheSize     int                  // Maximum number of IPs to cache
+	ipToHostname     map[string]string              // Reverse lookup: IP -> hostname
+	ipToCNAMEOrigins map[string][]cnameOriginRecord // Reverse lookup: IP -> CNAME chains (one per origin) for derived-allow attribution
+	ipLastSeen       map[string]time.Time           // Track when each IP was last seen
+	trackedHostnames map[string]Action              // Track hostnames we have rules for (hostname -> action)
+	maxCacheSize     int                            // Maximum number of IPs to cache
 }
 
 // NewConfigManager creates a new configuration manager
@@ -175,6 +176,7 @@ func NewConfigManager() *Manager {
 	return &Manager{
 		hostnameCache:    make(map[string][]net.IP),
 		ipToHostname:     make(map[string]string),
+		ipToCNAMEOrigins: make(map[string][]cnameOriginRecord),
 		ipLastSeen:       make(map[string]time.Time),
 		trackedHostnames: make(map[string]Action),
 		maxCacheSize:     10000, // Default max cache size
@@ -932,6 +934,121 @@ func (cm *Manager) UpdateDNSMapping(hostname string, ip string) {
 	}
 }
 
+// cnameOriginRecord is one origin's CNAME chain to a derived-allow IP, kept with
+// freshness so the most recently-chased origin can be chosen at report time and
+// stale ones (no longer chaining here) dropped. A single CDN/edge IP can be
+// reached via the chains of several allowed origins; we retain a bounded,
+// recency-ranked set rather than collapsing to one.
+type cnameOriginRecord struct {
+	chain    []string  // origin..target, origin = chain[0]
+	lastSeen time.Time // when this origin last chained to the IP
+	expiry   time.Time // chain TTL; after this the origin no longer "currently chains here"
+}
+
+// maxCNAMEOriginsPerIP bounds the per-IP origin set. A CDN edge is fronted by
+// few of a user's allowed hostnames in practice, so a small cap is ample; the
+// oldest entry is evicted on overflow.
+const maxCNAMEOriginsPerIP = 8
+
+// cnameOriginFloorTTL is the minimum expiry applied when a response carries a
+// zero/absent TTL, so a TTL-0 CDN answer doesn't make an attribution expire
+// instantly (which would drop us back to the opaque edge name).
+const cnameOriginFloorTTL = 5 * time.Minute
+
+// RecordCNAMEChain records that a derived-allow IP was reached through `chain`
+// (origin..target, ordered), so connection events for that IP can be attributed
+// to the origin hostname the user actually allowed rather than the opaque
+// CDN/edge target. Multiple origins can reach the same IP; each is kept with its
+// recency and `ttl`-derived freshness so LookupCNAMEChain can pick the origin the
+// current request most likely chased. Stored lowercase and bounded by the shared
+// ipLastSeen lifecycle (see cleanupOldEntries). A nil/empty chain is ignored.
+func (cm *Manager) RecordCNAMEChain(ip string, chain []string, ttl time.Duration) {
+	if ip == "" || len(chain) == 0 {
+		return
+	}
+
+	stored := make([]string, len(chain))
+	for i, h := range chain {
+		stored[i] = strings.ToLower(h)
+	}
+
+	now := time.Now()
+	if ttl < cnameOriginFloorTTL {
+		ttl = cnameOriginFloorTTL
+	}
+	rec := cnameOriginRecord{chain: stored, lastSeen: now, expiry: now.Add(ttl)}
+	origin := stored[0]
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	records := cm.ipToCNAMEOrigins[ip]
+	// Upsert by origin: a repeat resolution of the same chain refreshes it in
+	// place rather than adding a duplicate.
+	replaced := false
+	for i := range records {
+		if len(records[i].chain) > 0 && records[i].chain[0] == origin {
+			records[i] = rec
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		records = append(records, rec)
+		// Evict the least-recently-seen entry if over the cap.
+		if len(records) > maxCNAMEOriginsPerIP {
+			oldest := 0
+			for i := 1; i < len(records); i++ {
+				if records[i].lastSeen.Before(records[oldest].lastSeen) {
+					oldest = i
+				}
+			}
+			records = append(records[:oldest], records[oldest+1:]...)
+		}
+	}
+	cm.ipToCNAMEOrigins[ip] = records
+	cm.ipLastSeen[ip] = now
+}
+
+// LookupCNAMEChain returns the CNAME chain (origin..target) for a derived-allow
+// IP that the current request most likely chased: the most recently-seen origin
+// whose chain has not yet expired ("still currently chains here"). If every
+// recorded origin has expired it falls back to the most recent one so a stale
+// IP still attributes to an allowed host rather than the opaque edge. Returns
+// nil if nothing was recorded. The returned slice is a copy.
+func (cm *Manager) LookupCNAMEChain(ip string) []string {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	records := cm.ipToCNAMEOrigins[ip]
+	if len(records) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	best := -1       // most-recent non-expired
+	mostRecent := -1 // most-recent overall (fallback when all expired)
+	// Use !Before (>=) rather than After so equal timestamps resolve toward the
+	// later-scanned record. .After is false on a tie, which would otherwise keep
+	// the earliest (oldest-positioned) origin and contradict "most recent wins".
+	for i := range records {
+		if mostRecent == -1 || !records[i].lastSeen.Before(records[mostRecent].lastSeen) {
+			mostRecent = i
+		}
+		if now.Before(records[i].expiry) && (best == -1 || !records[i].lastSeen.Before(records[best].lastSeen)) {
+			best = i
+		}
+	}
+	pick := best
+	if pick == -1 {
+		pick = mostRecent // all expired → fall back to last-known
+	}
+
+	out := make([]string, len(records[pick].chain))
+	copy(out, records[pick].chain)
+	return out
+}
+
 // dnsCacheTTL is how long a DNS reverse mapping is kept before
 // cleanupOldEntries can discard it. Set to a day so containers / long-lived
 // connections aren't reverse-resolved repeatedly. Inlined here because no
@@ -952,13 +1069,22 @@ func (cm *Manager) cleanupOldEntries() {
 
 	// Delete old entries
 	for _, ip := range toDelete {
-		delete(cm.ipToHostname, ip)
-		delete(cm.ipLastSeen, ip)
+		cm.forgetIP(ip)
 	}
 
 	if len(toDelete) > 0 {
 		slog.Info("Cleaned up old DNS cache entries", "count", len(toDelete))
 	}
+}
+
+// forgetIP removes an IP from every per-IP map (the reverse-lookup tuple keyed
+// by IP: ipToHostname, ipToCNAMEOrigins, ipLastSeen). It is the single place
+// that knows the full set, so adding another per-IP map only requires one edit
+// here — callers can't leak an entry by forgetting one map. Must hold cm.mu.
+func (cm *Manager) forgetIP(ip string) {
+	delete(cm.ipToHostname, ip)
+	delete(cm.ipToCNAMEOrigins, ip)
+	delete(cm.ipLastSeen, ip)
 }
 
 // HostnameVerdict is the result of evaluating a hostname against the

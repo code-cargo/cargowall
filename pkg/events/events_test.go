@@ -842,6 +842,104 @@ func TestProcessEvent_BlockedNoMatchStillLogsBlocked(t *testing.T) {
 	assert.Len(t, smClient.calls, 1, "notification must fire for genuine blocks")
 }
 
+// TestProcessEvent_CNAMEDerivedAttributesToOrigin covers the reporting fix for
+// transparent CNAME support: a connection to a CNAME target's IP (the IP maps
+// to the opaque edge name) must be reported under the origin hostname the user
+// allowed, with the full chain surfaced as the cname_chain drill-down field.
+func TestProcessEvent_CNAMEDerivedAttributesToOrigin(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "www.microsoft.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	// The derived edge IP maps to the CNAME target (what LookupHostnameByIP
+	// returns today), and the derived-allow enforcement recorded its chain.
+	const edge = "e13678.dscb.akamaiedge.net"
+	chain := []string{"www.microsoft.com", edge}
+	cm.UpdateDNSMapping(edge, "23.62.177.200")
+	cm.RecordCNAMEChain("23.62.177.200", chain, time.Hour)
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   1,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("23.62.177.200"),
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionAllowed, events[0].EventType)
+	assert.Equal(t, "www.microsoft.com", events[0].DstHostname,
+		"event must be attributed to the origin the user allowed, not the CNAME edge")
+	assert.Equal(t, chain, events[0].CNAMEChain,
+		"the full CNAME chain must be surfaced as the drill-down field")
+}
+
+// TestProcessEvent_CNAMEDerivedBlockedAttributesToOrigin checks the same
+// origin attribution + chain surfacing on the blocked path: a derived edge IP
+// hit on a port outside the origin rule's allow set (here the rule allows only
+// :443, the connection hits :8080) must stay blocked AND report under the
+// origin — the swap runs before the late-allow check so the origin's rule is
+// the one consulted.
+func TestProcessEvent_CNAMEDerivedBlockedAttributesToOrigin(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "www.microsoft.com",
+			Ports: []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}, Action: config.ActionAllow,
+		},
+	}, config.ActionDeny))
+
+	const edge = "e13678.dscb.akamaiedge.net"
+	chain := []string{"www.microsoft.com", edge}
+	cm.UpdateDNSMapping(edge, "23.62.177.200")
+	cm.RecordCNAMEChain("23.62.177.200", chain, time.Hour)
+
+	fw := &mockFirewallUpdater{}
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("23.62.177.200"),
+		SrcPort:   54321,
+		DstPort:   8080, // outside the origin rule's :443 allow set
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionBlocked, events[0].EventType,
+		":8080 is outside the origin rule's :443 allow set, so it stays blocked")
+	assert.Equal(t, "www.microsoft.com", events[0].DstHostname)
+	assert.Equal(t, chain, events[0].CNAMEChain)
+}
+
 // TestProcessEvent_LateResolvedDstPortNotInRulePortsStaysBlocked guards against
 // a subtle bug: when the IP's hostname matches an allow rule but the event's
 // dst_port is NOT in the rule's allow set, the retry will still be blocked,

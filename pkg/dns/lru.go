@@ -113,7 +113,12 @@ func (c *lruCache[K, V]) Put(key K, value V, ttl time.Duration) {
 // to the front. compose runs while the cache lock is held, so concurrent Merge
 // calls on the same key accumulate without the lost-update race a separate
 // Get-then-Put would have. If ttl is 0 the entry never expires.
-func (c *lruCache[K, V]) Merge(key K, value V, ttl time.Duration, compose func(existing, incoming V) V) {
+//
+// Returns whether a live existing entry was composed with (true) versus a fresh
+// insert — i.e. an absent key or one treated as absent because it had expired.
+// Lets callers distinguish "refresh" from "first-learn" atomically, without a
+// separate Get that would double-lock and race the Merge.
+func (c *lruCache[K, V]) Merge(key K, value V, ttl time.Duration, compose func(existing, incoming V) V) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -126,13 +131,14 @@ func (c *lruCache[K, V]) Merge(key K, value V, ttl time.Duration, compose func(e
 		e := elem.Value.(*lruEntry[K, V])
 		// Compose only with a live value; an expired entry is treated as
 		// absent so a stale set can't resurrect through the merge.
-		if e.expiry.IsZero() || time.Now().Before(e.expiry) {
+		live := e.expiry.IsZero() || time.Now().Before(e.expiry)
+		if live {
 			value = compose(e.value, value)
 		}
 		c.order.MoveToFront(elem)
 		e.value = value
 		e.expiry = expiry
-		return
+		return live
 	}
 
 	// Evict LRU tail if at capacity (mirrors Put).
@@ -149,6 +155,7 @@ func (c *lruCache[K, V]) Merge(key K, value V, ttl time.Duration, compose func(e
 		expiry: expiry,
 	})
 	c.items[key] = elem
+	return false
 }
 
 // Delete removes a key from the cache.

@@ -56,8 +56,9 @@ type AuditEvent struct {
 	PID             uint32         `json:"pid,omitempty"`
 	MatchedRule     string         `json:"matched_rule,omitempty"`
 	AutoAllowedType string         `json:"auto_allowed_type,omitempty"`
-	WouldDeny       bool           `json:"would_deny"` // true in audit mode (would have been denied)
-	Blocked         bool           `json:"blocked"`    // true in enforce mode (actually blocked)
+	CNAMEChain      []string       `json:"cname_chain,omitempty"` // CNAME chain origin..target when DstHostname was reached via a CNAME of an allowed host
+	WouldDeny       bool           `json:"would_deny"`            // true in audit mode (would have been denied)
+	Blocked         bool           `json:"blocked"`               // true in enforce mode (actually blocked)
 }
 
 // AuditLogger writes audit events to a JSON file (one event per line)
@@ -121,7 +122,7 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 // protocol of the dropped packet (typically "TCP" or "UDP" — see
 // getProtocolName); the field is shipped to the summary backend and rendered
 // in the UI's Baseline Entries table, so a real value beats a generic literal.
-func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, protocol string) error {
+func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
 	return a.LogEvent(AuditEvent{
 		Timestamp:   time.Now(),
 		EventType:   EventConnectionBlocked,
@@ -132,6 +133,7 @@ func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPor
 		Protocol:    protocol,
 		Process:     process,
 		PID:         pid,
+		CNAMEChain:  cnameChain,
 	})
 }
 
@@ -142,7 +144,7 @@ func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPor
 // `matchedRule` is the rule's Value (pattern string for glob rules, configured
 // hostname for plain rules), which can differ from the resolved DstHostname
 // (e.g. rule `*.compute-1.amazonaws.com` matching `ec2-1-2-3-4.compute-1...`).
-func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string) error {
+func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
 	return a.LogEvent(AuditEvent{
 		Timestamp:   time.Now(),
 		EventType:   EventConnectionLateAllowed,
@@ -154,6 +156,7 @@ func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRu
 		Process:     process,
 		PID:         pid,
 		MatchedRule: matchedRule,
+		CNAMEChain:  cnameChain,
 	})
 }
 
@@ -162,7 +165,7 @@ func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRu
 // getProtocolName); the field is shipped to the summary backend and feeds
 // the dedup key, so a real value beats a hardcoded literal (auto-allowed DNS
 // on :53 is the canonical UDP example).
-func (a *AuditLogger) LogConnectionAllowed(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, autoAllowedType, protocol string) error {
+func (a *AuditLogger) LogConnectionAllowed(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, autoAllowedType, protocol string, cnameChain []string) error {
 	return a.LogEvent(AuditEvent{
 		Timestamp:       time.Now(),
 		EventType:       EventConnectionAllowed,
@@ -174,11 +177,12 @@ func (a *AuditLogger) LogConnectionAllowed(srcIP, dstIP, hostname string, dstPor
 		Process:         process,
 		PID:             pid,
 		AutoAllowedType: autoAllowedType,
+		CNAMEChain:      cnameChain,
 	})
 }
 
 // LogProtocolBlocked logs a blocked protocol event
-func (a *AuditLogger) LogProtocolBlocked(srcIP, dstIP, hostname, protocol, process string, pid uint32) error {
+func (a *AuditLogger) LogProtocolBlocked(srcIP, dstIP, hostname, protocol, process string, pid uint32, cnameChain []string) error {
 	return a.LogEvent(AuditEvent{
 		Timestamp:   time.Now(),
 		EventType:   EventProtocolBlocked,
@@ -188,6 +192,7 @@ func (a *AuditLogger) LogProtocolBlocked(srcIP, dstIP, hostname, protocol, proce
 		Protocol:    protocol,
 		Process:     process,
 		PID:         pid,
+		CNAMEChain:  cnameChain,
 	})
 }
 

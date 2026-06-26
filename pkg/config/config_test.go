@@ -2507,6 +2507,132 @@ func TestUpdateDNSMapping(t *testing.T) {
 	}
 }
 
+// RecordCNAMEChain stores a lowercased copy of the chain keyed by IP and
+// LookupCNAMEChain returns an independent copy. Empty inputs are ignored, and
+// the entry shares the ipLastSeen-based cleanup lifecycle.
+func TestRecordAndLookupCNAMEChain(t *testing.T) {
+	cm := NewConfigManager()
+
+	// nil/empty inputs are no-ops.
+	cm.RecordCNAMEChain("", []string{"a", "b"}, time.Hour)
+	cm.RecordCNAMEChain("1.2.3.4", nil, time.Hour)
+	if got := cm.LookupCNAMEChain("1.2.3.4"); got != nil {
+		t.Errorf("empty chain must not be recorded: got %v", got)
+	}
+
+	// Mixed-case chain is stored lowercase.
+	cm.RecordCNAMEChain("23.62.177.200", []string{"WWW.Microsoft.com", "E13678.dscb.AkamaiEdge.net"}, time.Hour)
+	got := cm.LookupCNAMEChain("23.62.177.200")
+	want := []string{"www.microsoft.com", "e13678.dscb.akamaiedge.net"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("LookupCNAMEChain = %v, want %v", got, want)
+	}
+
+	// Returned slice is a copy — mutating it must not corrupt cache state.
+	got[0] = "tampered"
+	if again := cm.LookupCNAMEChain("23.62.177.200"); again[0] != "www.microsoft.com" {
+		t.Errorf("LookupCNAMEChain must return a copy; cache mutated to %v", again)
+	}
+
+	// Unknown IP → nil.
+	if got := cm.LookupCNAMEChain("9.9.9.9"); got != nil {
+		t.Errorf("unknown IP must return nil, got %v", got)
+	}
+
+	// ipLastSeen is touched so cleanupOldEntries can evict the chain.
+	cm.mu.Lock()
+	cm.ipLastSeen["23.62.177.200"] = time.Now().Add(-2 * dnsCacheTTL)
+	cm.cleanupOldEntries()
+	cm.mu.Unlock()
+	if got := cm.LookupCNAMEChain("23.62.177.200"); got != nil {
+		t.Errorf("stale CNAME chain must be evicted by cleanupOldEntries, got %v", got)
+	}
+}
+
+// When a CDN/edge IP is reachable from several allowed origins, LookupCNAMEChain
+// returns the most recently-seen origin whose chain is still live, falling back
+// to the most recent overall once everything has expired.
+func TestLookupCNAMEChain_MultiOriginRecencyAndExpiry(t *testing.T) {
+	cm := NewConfigManager()
+	const ip = "23.45.137.206"
+	const edge = "e13678.dscb.akamaiedge.net"
+	chainA := []string{"www.microsoft.com", edge}
+	chainB := []string{"login.microsoftonline.com", edge}
+
+	// A then B → B is more recent, so it wins.
+	cm.RecordCNAMEChain(ip, chainA, time.Hour)
+	cm.RecordCNAMEChain(ip, chainB, time.Hour)
+	if got := cm.LookupCNAMEChain(ip); !reflect.DeepEqual(got, chainB) {
+		t.Errorf("most-recent origin must win: got %v, want %v", got, chainB)
+	}
+
+	// Re-resolving A refreshes its recency (upsert in place, no duplicate).
+	cm.RecordCNAMEChain(ip, chainA, time.Hour)
+	if got := cm.LookupCNAMEChain(ip); !reflect.DeepEqual(got, chainA) {
+		t.Errorf("re-resolved origin must win: got %v, want %v", got, chainA)
+	}
+	cm.mu.RLock()
+	n := len(cm.ipToCNAMEOrigins[ip])
+	cm.mu.RUnlock()
+	if n != 2 {
+		t.Errorf("repeat origin must upsert in place: got %d records, want 2", n)
+	}
+
+	// Expire the most-recent origin (A); the still-live B must be chosen even
+	// though it's older. (RecordCNAMEChain floors TTLs, so set expiry directly.)
+	cm.mu.Lock()
+	for i := range cm.ipToCNAMEOrigins[ip] {
+		if cm.ipToCNAMEOrigins[ip][i].chain[0] == "www.microsoft.com" {
+			cm.ipToCNAMEOrigins[ip][i].expiry = time.Now().Add(-time.Minute)
+		}
+	}
+	cm.mu.Unlock()
+	if got := cm.LookupCNAMEChain(ip); !reflect.DeepEqual(got, chainB) {
+		t.Errorf("expired most-recent origin must be skipped: got %v, want %v", got, chainB)
+	}
+
+	// All expired → fall back to the most recent overall (A).
+	cm.mu.Lock()
+	for i := range cm.ipToCNAMEOrigins[ip] {
+		cm.ipToCNAMEOrigins[ip][i].expiry = time.Now().Add(-time.Minute)
+	}
+	cm.mu.Unlock()
+	if got := cm.LookupCNAMEChain(ip); !reflect.DeepEqual(got, chainA) {
+		t.Errorf("all-expired fallback must be the most recent origin: got %v, want %v", got, chainA)
+	}
+}
+
+// The per-IP origin set is bounded; the oldest origin is evicted on overflow
+// while the freshest survives.
+func TestRecordCNAMEChain_CapsOriginsPerIP(t *testing.T) {
+	cm := NewConfigManager()
+	const ip = "203.0.113.7"
+
+	// Distinct origin names a.example.com, b.example.com, … recorded oldest-first.
+	origin := func(i int) string { return string(rune('a'+i)) + ".example.com" }
+	for i := 0; i < maxCNAMEOriginsPerIP+3; i++ {
+		cm.RecordCNAMEChain(ip, []string{origin(i), "edge.cdn.example.net"}, time.Hour)
+	}
+
+	cm.mu.RLock()
+	present := make(map[string]bool, len(cm.ipToCNAMEOrigins[ip]))
+	for _, r := range cm.ipToCNAMEOrigins[ip] {
+		present[r.chain[0]] = true
+	}
+	n := len(cm.ipToCNAMEOrigins[ip])
+	cm.mu.RUnlock()
+
+	if n != maxCNAMEOriginsPerIP {
+		t.Errorf("per-IP origin set must be capped at %d, got %d", maxCNAMEOriginsPerIP, n)
+	}
+	if !present[origin(maxCNAMEOriginsPerIP+2)] {
+		t.Errorf("most-recent origin must survive eviction")
+	}
+	if present[origin(0)] {
+		t.Errorf("oldest origin must be evicted on overflow")
+	}
+}
+
 // =============================================================================
 // Direct tests for internal helpers (Phase 4)
 // =============================================================================

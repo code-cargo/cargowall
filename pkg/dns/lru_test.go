@@ -189,6 +189,32 @@ func TestLRUCache_LenIncludesNotYetEvictedExpired(t *testing.T) {
 	assert.Equal(t, 1, c.Len(), "lazy eviction on Get removes expired entry")
 }
 
+// Merge reports whether it composed with a LIVE existing entry: false on a
+// fresh insert or an expired (treated-as-absent) key, true on a live refresh.
+// The compose fn runs only in the live case.
+func TestLRUCache_MergeReportsLiveness(t *testing.T) {
+	c := newLRUCache[string, int](10)
+	sum := func(existing, incoming int) int { return existing + incoming }
+
+	// Absent key → fresh insert, no compose, reports not-existed.
+	assert.False(t, c.Merge("k", 1, time.Minute, sum), "first Merge of absent key must report not-existed")
+	got, _ := c.Get("k")
+	assert.Equal(t, 1, got, "fresh Merge stores the incoming value")
+
+	// Live key → compose, reports existed.
+	assert.True(t, c.Merge("k", 2, time.Minute, sum), "Merge of a live key must report existed")
+	got, _ = c.Get("k")
+	assert.Equal(t, 3, got, "live Merge composes (1+2)")
+
+	// Expired key is treated as absent: no compose, reports not-existed, value
+	// replaced rather than summed.
+	c.Merge("e", 5, 10*time.Millisecond, sum)
+	time.Sleep(20 * time.Millisecond)
+	assert.False(t, c.Merge("e", 7, time.Minute, sum), "Merge of an expired key must report not-existed")
+	got, _ = c.Get("e")
+	assert.Equal(t, 7, got, "expired Merge replaces (not composes) → 7")
+}
+
 // Concurrent Get/Put must not race. Run under `go test -race` to catch any
 // missed locking.
 func TestLRUCache_ConcurrentAccess(t *testing.T) {

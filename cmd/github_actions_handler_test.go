@@ -31,20 +31,33 @@ import (
 
 // captureStderr redirects os.Stderr around fn and returns what was written. The
 // GitHubActionsHandler writes to os.Stderr directly, so the test swaps the global
-// for the duration of the call.
+// for the duration of the call. A goroutine drains the read end concurrently, so
+// a write larger than the OS pipe buffer can't deadlock and the read end is
+// always consumed and closed; os.Stderr is restored and the write end closed even
+// if fn panics.
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	old := os.Stderr
 	r, w, err := os.Pipe()
 	require.NoError(t, err)
 	os.Stderr = w
-	defer func() { os.Stderr = old }()
 
-	fn()
-	require.NoError(t, w.Close())
-	data, err := io.ReadAll(r)
-	require.NoError(t, err)
-	return string(data)
+	done := make(chan string, 1)
+	go func() {
+		data, _ := io.ReadAll(r)
+		_ = r.Close()
+		done <- string(data)
+	}()
+
+	func() {
+		defer func() {
+			os.Stderr = old
+			_ = w.Close()
+		}()
+		fn()
+	}()
+
+	return <-done
 }
 
 // TestGitHubActionsHandler_TimestampPrefix verifies every emitted line carries a

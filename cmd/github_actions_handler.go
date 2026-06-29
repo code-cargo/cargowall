@@ -83,23 +83,27 @@ func (h *GitHubActionsHandler) Handle(_ context.Context, r slog.Record) error {
 	// startup race this surfaces is sub-second.
 	ts := r.Time.UTC().Format("2006-01-02 15:04:05.000")
 
+	var out strings.Builder
 	if prefix == "" {
 		// Plain log line. Timestamp every physical line so a multi-line attribute
 		// value (e.g. a wrapped, multi-line error) stays timestamped instead of
 		// only its first line.
 		for line := range strings.SplitSeq(body, "\n") {
-			fmt.Fprintf(os.Stderr, "%s %s\n", ts, line)
+			fmt.Fprintf(&out, "%s %s\n", ts, line)
 		}
-		return nil
+	} else {
+		// Workflow command (::error::/::warning::/::debug::). Emit a single command
+		// and do NOT inject the timestamp: a unique value per line would defeat
+		// GitHub's de-duplication of identical annotations and inflate the per-run
+		// annotation count. GitHub already timestamps the raw log line. Escape so an
+		// embedded newline stays one annotation rather than leaking un-prefixed
+		// continuation lines.
+		fmt.Fprintf(&out, "%s%s\n", prefix, escapeWorkflowMessage(body))
 	}
 
-	// Workflow command (::error::/::warning::/::debug::). Emit a single command and
-	// do NOT inject the timestamp: a unique value per line would defeat GitHub's
-	// de-duplication of identical annotations and inflate the per-run annotation
-	// count. GitHub already timestamps the raw log line. Escape so an embedded
-	// newline stays one annotation rather than leaking un-prefixed continuation
-	// lines.
-	fmt.Fprintf(os.Stderr, "%s%s\n", prefix, escapeWorkflowMessage(body))
+	// Write the whole record in one call so a concurrent log from another
+	// goroutine can't interleave between a multi-line record's lines.
+	_, _ = os.Stderr.WriteString(out.String())
 	return nil
 }
 

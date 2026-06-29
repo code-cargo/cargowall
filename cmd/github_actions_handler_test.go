@@ -132,3 +132,20 @@ func TestGitHubActionsHandler_MultiLine(t *testing.T) {
 	// The workflow command stays one line with newlines escaped as %0A.
 	assert.Equal(t, "::error::boom detail=a%0Ab", lines[2])
 }
+
+// TestGitHubActionsHandler_TrailingNewline verifies a plain record whose body
+// ends in a newline does not emit a stray timestamp-only line.
+func TestGitHubActionsHandler_TrailingNewline(t *testing.T) {
+	h := NewGitHubActionsHandler(false)
+	ts := time.Date(2026, 6, 29, 15, 24, 8, 456_000_000, time.UTC)
+
+	out := captureStderr(t, func() {
+		rec := slog.NewRecord(ts, slog.LevelInfo, "ran", 0)
+		rec.AddAttrs(slog.String("output", "done\n"))
+		require.NoError(t, h.Handle(context.Background(), rec))
+	})
+
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	require.Len(t, lines, 1)
+	assert.Equal(t, "2026-06-29 15:24:08.456 ran output=done", lines[0])
+}

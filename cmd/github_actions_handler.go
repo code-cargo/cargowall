@@ -87,8 +87,9 @@ func (h *GitHubActionsHandler) Handle(_ context.Context, r slog.Record) error {
 	if prefix == "" {
 		// Plain log line. Timestamp every physical line so a multi-line attribute
 		// value (e.g. a wrapped, multi-line error) stays timestamped instead of
-		// only its first line.
-		for line := range strings.SplitSeq(body, "\n") {
+		// only its first line. Trim a single trailing newline first so a value
+		// ending in "\n" doesn't produce a stray timestamp-only line.
+		for line := range strings.SplitSeq(strings.TrimSuffix(body, "\n"), "\n") {
 			fmt.Fprintf(&out, "%s %s\n", ts, line)
 		}
 	} else {

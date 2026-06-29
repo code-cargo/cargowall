@@ -77,7 +77,10 @@ func (h *GitHubActionsHandler) Handle(_ context.Context, r slog.Record) error {
 		return true
 	})
 
-	fmt.Fprintf(os.Stderr, "%s%s\n", prefix, sb.String())
+	// Leading timestamp on every line. Placed after the prefix so GitHub still
+	// parses the ::error::/::warning:: workflow command at column 0. Millisecond
+	// precision because the startup race this surfaces is sub-second.
+	fmt.Fprintf(os.Stderr, "%s%s %s\n", prefix, r.Time.Format("2006-01-02 15:04:05.000"), sb.String())
 	return nil
 }
 

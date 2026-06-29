@@ -510,7 +510,7 @@ func TestProcessEvent_IPv4BlockedTCP(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, nil, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -546,7 +546,7 @@ func TestProcessEvent_IPv4AllowedTCP(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -579,12 +579,261 @@ func TestProcessEvent_ProtocolBlocked(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, nil, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
 	assert.Equal(t, EventProtocolBlocked, events[0].EventType)
 	assert.Equal(t, "ICMP", events[0].Protocol)
+}
+
+// --- Readiness gate: pre-ready startup-race drops (issue: suppress) ---
+
+// blockTestDeps bundles the fixtures the readiness-gate tests share: a
+// temp-file audit logger, a state-machine mock + tracker, and a default-deny
+// config manager.
+type blockTestDeps struct {
+	auditLogger *AuditLogger
+	smClient    *mockStateMachineClient
+	tracker     *NotificationTracker
+	cm          *config.Manager
+	auditPath   string
+}
+
+func newBlockTestDeps(t *testing.T) blockTestDeps {
+	t.Helper()
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { auditLogger.Close() })
+
+	smClient := &mockStateMachineClient{}
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	return blockTestDeps{
+		auditLogger: auditLogger,
+		smClient:    smClient,
+		tracker:     NewNotificationTracker(smClient, newTestLogger()),
+		cm:          cm,
+		auditPath:   auditPath,
+	}
+}
+
+// markReverseDNSAttempted resets the reverse-DNS cache (avoiding cross-test
+// pollution) and pre-seeds the given IPs as already-attempted, so processEvent
+// skips the real PTR lookup — keeping these tests hermetic and fast.
+func markReverseDNSAttempted(ips ...string) {
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	for _, ip := range ips {
+		reverseDNSCache[ip] = time.Now()
+	}
+	reverseDNSMu.Unlock()
+}
+
+// makeBlockedTCPv4Event builds a blocked IPv4 TCP SYN to 93.184.216.34:443 with
+// the given BPF (CLOCK_MONOTONIC) timestamp.
+func makeBlockedTCPv4Event(ts uint64) []byte {
+	return makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+		Timestamp: ts,
+	})
+}
+
+func TestProcessEvent_PreReadyBlockedTCPSuppressed(t *testing.T) {
+	d := newBlockTestDeps(t)
+	r := NewReadiness()
+	r.readyMono.Store(1_000_000) // 1ms boundary
+
+	markReverseDNSAttempted("93.184.216.34")
+	processEvent(makeBlockedTCPv4Event(500_000), d.cm, d.tracker, d.auditLogger, nil, r, newTestLogger())
+
+	assert.Empty(t, readAuditEvents(t, d.auditPath), "pre-ready block must not be written to the audit log")
+	assert.Empty(t, d.smClient.calls, "pre-ready block must not notify")
+}
+
+func TestProcessEvent_PostReadyBlockedTCPReported(t *testing.T) {
+	d := newBlockTestDeps(t)
+	r := NewReadiness()
+	r.readyMono.Store(1_000_000)
+
+	markReverseDNSAttempted("93.184.216.34")
+	processEvent(makeBlockedTCPv4Event(2_000_000), d.cm, d.tracker, d.auditLogger, nil, r, newTestLogger())
+
+	events := readAuditEvents(t, d.auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionBlocked, events[0].EventType)
+	assert.Len(t, d.smClient.calls, 1, "post-ready block must notify")
+}
+
+func TestProcessEvent_NotYetReadyBlockedSuppressed(t *testing.T) {
+	d := newBlockTestDeps(t)
+	r := NewReadiness() // readyMono == 0: not ready yet
+
+	markReverseDNSAttempted("93.184.216.34")
+	processEvent(makeBlockedTCPv4Event(2_000_000), d.cm, d.tracker, d.auditLogger, nil, r, newTestLogger())
+
+	assert.Empty(t, readAuditEvents(t, d.auditPath), "blocks before MarkReady must be suppressed")
+	assert.Empty(t, d.smClient.calls)
+}
+
+func TestProcessEvent_ZeroEventTimestampNotSuppressed(t *testing.T) {
+	d := newBlockTestDeps(t)
+	r := NewReadiness()
+	r.readyMono.Store(1_000_000)
+
+	markReverseDNSAttempted("93.184.216.34")
+	// Defensive: a zero/garbage BPF stamp must never mask a real block.
+	processEvent(makeBlockedTCPv4Event(0), d.cm, d.tracker, d.auditLogger, nil, r, newTestLogger())
+
+	events := readAuditEvents(t, d.auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionBlocked, events[0].EventType)
+}
+
+func TestProcessEvent_NilReadinessNeverSuppresses(t *testing.T) {
+	d := newBlockTestDeps(t)
+
+	markReverseDNSAttempted("93.184.216.34")
+	processEvent(makeBlockedTCPv4Event(500_000), d.cm, d.tracker, d.auditLogger, nil, nil, newTestLogger())
+
+	events := readAuditEvents(t, d.auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionBlocked, events[0].EventType)
+	assert.Len(t, d.smClient.calls, 1)
+}
+
+func makeBlockedICMPv4Event(ts uint64) []byte {
+	return makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_ICMP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("10.0.0.2"),
+		SrcPort:   0,
+		DstPort:   1, // ICMP
+		Timestamp: ts,
+	})
+}
+
+func TestProcessEvent_PreReadyProtocolBlockedSuppressed(t *testing.T) {
+	d := newBlockTestDeps(t)
+	r := NewReadiness()
+	r.readyMono.Store(1_000_000)
+
+	markReverseDNSAttempted("10.0.0.2")
+	processEvent(makeBlockedICMPv4Event(500_000), d.cm, d.tracker, d.auditLogger, nil, r, newTestLogger())
+
+	assert.Empty(t, readAuditEvents(t, d.auditPath), "pre-ready protocol block must not be written to the audit log")
+	assert.Empty(t, d.smClient.calls)
+}
+
+func TestProcessEvent_PostReadyProtocolBlockedReported(t *testing.T) {
+	d := newBlockTestDeps(t)
+	r := NewReadiness()
+	r.readyMono.Store(1_000_000)
+
+	markReverseDNSAttempted("10.0.0.2")
+	processEvent(makeBlockedICMPv4Event(2_000_000), d.cm, d.tracker, d.auditLogger, nil, r, newTestLogger())
+
+	events := readAuditEvents(t, d.auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventProtocolBlocked, events[0].EventType)
+}
+
+func TestProcessEvent_PreReadyDoesNotSuppressAllowed(t *testing.T) {
+	d := newBlockTestDeps(t)
+	r := NewReadiness()
+	r.readyMono.Store(1_000_000) // boundary above the event's timestamp
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   1, // allow outcome — must never be gated
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+		Timestamp: 500_000,
+	})
+
+	markReverseDNSAttempted("93.184.216.34")
+	processEvent(raw, d.cm, d.tracker, d.auditLogger, nil, r, newTestLogger())
+
+	events := readAuditEvents(t, d.auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionAllowed, events[0].EventType, "the readiness gate must only apply to blocked branches")
+}
+
+func TestProcessEvent_PreReadyBlockedIPv6Suppressed(t *testing.T) {
+	d := newBlockTestDeps(t)
+	r := NewReadiness()
+	r.readyMono.Store(1_000_000)
+
+	var dstIp6 [16]byte
+	copy(dstIp6[:], net.ParseIP("2001:db8::dead").To16())
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 6,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		DstIp6:    dstIp6,
+		SrcPort:   54321,
+		DstPort:   443,
+		Timestamp: 500_000,
+	})
+
+	markReverseDNSAttempted("2001:db8::dead")
+	processEvent(raw, d.cm, d.tracker, d.auditLogger, nil, r, newTestLogger())
+
+	assert.Empty(t, readAuditEvents(t, d.auditPath), "pre-ready IPv6 block must be suppressed (v6 parity)")
+	assert.Empty(t, d.smClient.calls)
+}
+
+func TestReadiness_isPreReady(t *testing.T) {
+	tests := []struct {
+		name      string
+		readyMono uint64
+		eventMono uint64
+		want      bool
+	}{
+		{"not ready yet suppresses everything", 0, 123, true},
+		{"event before boundary", 100, 50, true},
+		{"event at boundary is reported (exclusive)", 100, 100, false},
+		{"event after boundary", 100, 150, false},
+		{"zero event timestamp never suppresses", 100, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewReadiness()
+			r.readyMono.Store(tt.readyMono)
+			assert.Equal(t, tt.want, r.isPreReady(tt.eventMono))
+		})
+	}
+
+	t.Run("nil receiver never suppresses", func(t *testing.T) {
+		var r *Readiness
+		assert.False(t, r.isPreReady(50))
+	})
+}
+
+func TestReadiness_MarkReadySetsMonotonic(t *testing.T) {
+	r := NewReadiness()
+	require.Equal(t, uint64(0), r.readyMono.Load())
+
+	r.MarkReady()
+	stored := r.readyMono.Load()
+	assert.NotZero(t, stored, "MarkReady must record a non-zero boundary")
+
+	var ts unix.Timespec
+	require.NoError(t, unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts))
+	assert.GreaterOrEqual(t, uint64(ts.Nano()), stored, "a later monotonic read must be >= the boundary")
 }
 
 func TestProcessEvent_LateResolvedIPAddedToFirewall(t *testing.T) {
@@ -612,7 +861,7 @@ func TestProcessEvent_LateResolvedIPAddedToFirewall(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, nil, fw, newTestLogger())
+	processEvent(raw, cm, nil, nil, fw, nil, newTestLogger())
 
 	require.Len(t, fw.addedIPs, 1)
 	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
@@ -648,7 +897,7 @@ func TestProcessEvent_LateResolvedIPInheritsRulePorts(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, nil, fw, newTestLogger())
+	processEvent(raw, cm, nil, nil, fw, nil, newTestLogger())
 
 	require.Len(t, fw.addedIPs, 1)
 	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
@@ -687,7 +936,7 @@ func TestProcessEvent_LateResolvedIPv6InheritsRulePorts(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, nil, fw, newTestLogger())
+	processEvent(raw, cm, nil, nil, fw, nil, newTestLogger())
 
 	require.Len(t, fw.addedIPs, 1)
 	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
@@ -730,7 +979,7 @@ func TestProcessEvent_LateResolvedEmitsLateAllowedAudit(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -786,7 +1035,7 @@ func TestProcessEvent_LateResolvedMatchedRuleIsRulePatternNotHostname(t *testing
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, fw, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -831,7 +1080,7 @@ func TestProcessEvent_BlockedNoMatchStillLogsBlocked(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger())
 
 	require.Empty(t, fw.addedIPs, "late-add must not fire when no allow rule matches")
 
@@ -878,7 +1127,7 @@ func TestProcessEvent_CNAMEDerivedAttributesToOrigin(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -930,7 +1179,7 @@ func TestProcessEvent_CNAMEDerivedBlockedAttributesToOrigin(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, fw, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -982,7 +1231,7 @@ func TestProcessEvent_LateResolvedDstPortNotInRulePortsStaysBlocked(t *testing.T
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger())
 
 	// AddIP still fires (so future port-443 retries succeed), but this
 	// connection's audit/notification must reflect the genuine block.
@@ -1031,7 +1280,7 @@ func TestProcessEvent_LateResolvedUDPEventNotAllowedByTCPRule(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1077,7 +1326,7 @@ func TestProcessEvent_LateResolvedTCPEventAllowedByTCPRule(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1121,7 +1370,7 @@ func TestProcessEvent_LateResolvedTCPEventAllowedByProtocolAllRule(t *testing.T)
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1159,7 +1408,7 @@ func TestProcessEvent_IPv6Event(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1172,7 +1421,7 @@ func TestProcessEvent_TooShortBuffer(t *testing.T) {
 	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
 
 	// Should not panic — processEvent should return early for short buffers
-	processEvent([]byte{0x04}, cm, nil, nil, nil, newTestLogger())
+	processEvent([]byte{0x04}, cm, nil, nil, nil, nil, newTestLogger())
 }
 
 func TestProcessEvent_AutoAllowedType(t *testing.T) {
@@ -1200,7 +1449,7 @@ func TestProcessEvent_AutoAllowedType(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1236,7 +1485,7 @@ func TestProcessEvent_NoAutoAllowedTypeForUserRule(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger())
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)

@@ -309,8 +309,14 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	}
 	defer rd.Close()
 
+	// Readiness boundary for startup-race suppression: blocked events stamped
+	// (CLOCK_MONOTONIC) before MarkReady are drops from the attach-before-program
+	// window and are excluded from the audit log / SaaS / summary / notifications.
+	// MarkReady runs once, just before the ready signal is published.
+	readiness := events.NewReadiness()
+
 	// Start processors before attaching programs
-	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, logger)
+	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, readiness, logger)
 
 	// Attach TC programs
 	egressLink, err := tc.AttachEgress(ifname, objs.TcEgress, logger)
@@ -454,6 +460,12 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			}
 		}()
 	}
+
+	// Record the readiness boundary BEFORE publishing the ready signal, so the
+	// happens-before is: boundary recorded → sentinel/hook fires → CI proceeds →
+	// user traffic. A user-triggered block is therefore stamped after the
+	// boundary and correctly reported; it can never be misclassified as pre-ready.
+	readiness.MarkReady()
 
 	if hooks != nil && hooks.Ready != nil {
 		if err := hooks.Ready(); err != nil {

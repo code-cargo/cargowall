@@ -73,9 +73,16 @@ func (r *Readiness) MarkReady() {
 }
 
 // isPreReady reports whether a blocked event with the given CLOCK_MONOTONIC BPF
-// timestamp occurred before the readiness boundary. It is nil-safe, and a zero
-// event timestamp never suppresses, so a missing/garbage field can't mask a real
-// block.
+// timestamp occurred before the readiness boundary (and so should be excluded
+// from reporting). Precedence:
+//   - a nil Readiness never suppresses (reporting is unaffected when the gate
+//     isn't wired up);
+//   - before MarkReady (readyMono == 0) the firewall is still being programmed,
+//     so the whole window is pre-ready and every event is suppressed — including
+//     one with a zero/garbage stamp;
+//   - after MarkReady, a zero event timestamp never suppresses, so a
+//     missing/garbage field can't mask a real (post-ready) block; otherwise the
+//     event is pre-ready iff its stamp precedes the boundary.
 func (r *Readiness) isPreReady(eventMono uint64) bool {
 	if r == nil {
 		return false

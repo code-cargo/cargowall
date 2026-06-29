@@ -804,6 +804,7 @@ func TestReadiness_isPreReady(t *testing.T) {
 		want      bool
 	}{
 		{"not ready yet suppresses everything", 0, 123, true},
+		{"not ready yet suppresses even a zero stamp", 0, 0, true},
 		{"event before boundary", 100, 50, true},
 		{"event at boundary is reported (exclusive)", 100, 100, false},
 		{"event after boundary", 100, 150, false},

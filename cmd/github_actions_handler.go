@@ -76,9 +76,46 @@ func (h *GitHubActionsHandler) Handle(_ context.Context, r slog.Record) error {
 		sb.WriteString(fmt.Sprintf(" %s=%v", a.Key, a.Value))
 		return true
 	})
+	body := sb.String()
 
-	fmt.Fprintf(os.Stderr, "%s%s\n", prefix, sb.String())
+	// UTC so the timestamp aligns with GitHub's own per-line log timestamps and
+	// is unambiguous across runner timezones. Millisecond precision because the
+	// startup race this surfaces is sub-second.
+	ts := r.Time.UTC().Format("2006-01-02 15:04:05.000")
+
+	var out strings.Builder
+	if prefix == "" {
+		// Plain log line. Timestamp every physical line so a multi-line attribute
+		// value (e.g. a wrapped, multi-line error) stays timestamped instead of
+		// only its first line. Trim a single trailing newline first so a value
+		// ending in "\n" doesn't produce a stray timestamp-only line.
+		for line := range strings.SplitSeq(strings.TrimSuffix(body, "\n"), "\n") {
+			fmt.Fprintf(&out, "%s %s\n", ts, line)
+		}
+	} else {
+		// Workflow command (::error::/::warning::/::debug::). Emit a single command
+		// and do NOT inject the timestamp: a unique value per line would defeat
+		// GitHub's de-duplication of identical annotations and inflate the per-run
+		// annotation count. GitHub already timestamps the raw log line. Escape so an
+		// embedded newline stays one annotation rather than leaking un-prefixed
+		// continuation lines.
+		fmt.Fprintf(&out, "%s%s\n", prefix, escapeWorkflowMessage(body))
+	}
+
+	// Write the whole record in one call so a concurrent log from another
+	// goroutine can't interleave between a multi-line record's lines.
+	_, _ = os.Stderr.WriteString(out.String())
 	return nil
+}
+
+// escapeWorkflowMessage encodes a string for use as the message of a GitHub
+// Actions workflow command, per GitHub's data-escaping rules (% first, then CR
+// and LF), so multi-line or percent-bearing messages parse as a single command.
+func escapeWorkflowMessage(s string) string {
+	s = strings.ReplaceAll(s, "%", "%25")
+	s = strings.ReplaceAll(s, "\r", "%0D")
+	s = strings.ReplaceAll(s, "\n", "%0A")
+	return s
 }
 
 func (h *GitHubActionsHandler) WithAttrs(attrs []slog.Attr) slog.Handler {

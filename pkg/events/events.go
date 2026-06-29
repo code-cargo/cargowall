@@ -459,8 +459,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			"protocol", protocolName,
 			"protocol_num", event.DstPort,
 			"process", comm,
-			"pid", pid,
-			"timestamp", time.Now().Format("2006-01-02 15:04:05"))
+			"pid", pid)
 
 		// Log to audit file if configured
 		if auditLogger != nil {
@@ -502,8 +501,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			"dst_ip", dstIP,
 			"dst_port", event.DstPort,
 			"process", comm,
-			"pid", pid,
-			"timestamp", time.Now().Format("2006-01-02 15:04:05"))
+			"pid", pid)
 
 		// Log to audit file if configured
 		if auditLogger != nil {

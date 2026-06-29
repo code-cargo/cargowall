@@ -309,21 +309,8 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	}
 	defer rd.Close()
 
-	// Readiness boundary for startup-race suppression: blocked events stamped
-	// (CLOCK_MONOTONIC) before MarkReady are drops from the attach-before-program
-	// window and are excluded from the audit log / SaaS / summary / notifications.
-	// MarkReady runs once, just before the ready signal is published.
-	readiness := events.NewReadiness()
-
-	// Start processors before attaching programs
-	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, readiness, logger)
-
-	// Attach TC programs
-	egressLink, err := tc.AttachEgress(ifname, objs.TcEgress, logger)
-	if err != nil {
-		return fmt.Errorf("failed to attach TC egress: %w", err)
-	}
-	defer egressLink.Close()
+	// Start the event reader before the firewall is enforcing so no events are missed.
+	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, logger)
 
 	// Set default action through firewall
 	defaultAction := configMgr.GetDefaultAction()
@@ -391,6 +378,20 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			gateExistingConnections(existingIPs, configMgr, fw, auditLogger, logger)
 		}
 	}
+
+	// Attach the TC egress program only AFTER the maps are fully programmed
+	// (default action + static allowlist + auto-allow infra + tracked hostnames +
+	// existing connections). The BPF maps exist independently of the link, so
+	// attaching earlier would run the program live in default-deny with an empty
+	// allowlist, dropping legitimate startup traffic until the rules land (the
+	// attach-before-program race). Programming first makes the firewall correct
+	// from its first enforced packet; dynamic DNS-resolved hosts are still handled
+	// in-band by the late-add path in processEvent.
+	egressLink, err := tc.AttachEgress(ifname, objs.TcEgress, logger)
+	if err != nil {
+		return fmt.Errorf("failed to attach TC egress: %w", err)
+	}
+	defer egressLink.Close()
 
 	// Log appropriate config source
 	switch {
@@ -460,12 +461,6 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			}
 		}()
 	}
-
-	// Record the readiness boundary BEFORE publishing the ready signal, so the
-	// happens-before is: boundary recorded → sentinel/hook fires → CI proceeds →
-	// user traffic. A user-triggered block is therefore stamped after the
-	// boundary and correctly reported; it can never be misclassified as pre-ready.
-	readiness.MarkReady()
 
 	if hooks != nil && hooks.Ready != nil {
 		if err := hooks.Ready(); err != nil {

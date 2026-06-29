@@ -25,7 +25,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -39,62 +38,6 @@ import (
 // when lazy reverse DNS reveals a blocked IP belongs to an allowed hostname.
 type FirewallUpdater interface {
 	AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error)
-}
-
-// Readiness records the CLOCK_MONOTONIC instant at which CargoWall finished
-// programming its allow rules and published the ready signal. Blocked events
-// whose BPF timestamp (bpf_ktime_get_ns, also CLOCK_MONOTONIC) predates that
-// instant are startup-race drops — the TC program attaches default-deny before
-// the auto-allow infra rules land, so a connection in that window is dropped
-// once and self-heals on TCP retransmit. They are not policy decisions, so they
-// are excluded from the audit log (hence the SaaS push + summary) and from block
-// notifications. The zero value is "not ready yet": every event before MarkReady
-// is treated as pre-ready.
-type Readiness struct {
-	readyMono atomic.Uint64 // CLOCK_MONOTONIC ns at ready; 0 = not yet ready
-}
-
-// NewReadiness returns a Readiness in the not-yet-ready state.
-func NewReadiness() *Readiness { return &Readiness{} }
-
-// MarkReady records the current CLOCK_MONOTONIC instant as the readiness
-// boundary. Call exactly once, immediately before publishing the ready signal,
-// so it happens-before any externally triggered (e.g. user) traffic.
-func (r *Readiness) MarkReady() {
-	var ts unix.Timespec
-	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
-		// Fail open for reporting: never leave readyMono at 0 (which would
-		// suppress every block forever). A 1ns boundary suppresses nothing
-		// real — every genuine bpf_ktime_get_ns stamp is far larger.
-		r.readyMono.Store(1)
-		return
-	}
-	r.readyMono.Store(uint64(ts.Nano()))
-}
-
-// isPreReady reports whether a blocked event with the given CLOCK_MONOTONIC BPF
-// timestamp occurred before the readiness boundary (and so should be excluded
-// from reporting). Precedence:
-//   - a nil Readiness never suppresses (reporting is unaffected when the gate
-//     isn't wired up);
-//   - before MarkReady (readyMono == 0) the firewall is still being programmed,
-//     so the whole window is pre-ready and every event is suppressed — including
-//     one with a zero/garbage stamp;
-//   - after MarkReady, a zero event timestamp never suppresses, so a
-//     missing/garbage field can't mask a real (post-ready) block; otherwise the
-//     event is pre-ready iff its stamp precedes the boundary.
-func (r *Readiness) isPreReady(eventMono uint64) bool {
-	if r == nil {
-		return false
-	}
-	readyMono := r.readyMono.Load()
-	if readyMono == 0 { // MarkReady not run yet → everything so far is pre-ready
-		return true
-	}
-	if eventMono == 0 { // defensive: never suppress on a zero/garbage stamp
-		return false
-	}
-	return eventMono < readyMono
 }
 
 // lookupProcessName reads the process name from /proc/<pid>/comm.
@@ -301,7 +244,7 @@ func dstPortAllowedByRule(dstPort uint16, proto uint8, ports []config.Port) bool
 
 // processEvent handles a single blocked/allowed event from the ring buffer.
 func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *NotificationTracker,
-	auditLogger *AuditLogger, fw FirewallUpdater, readiness *Readiness, logger *slog.Logger,
+	auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger,
 ) {
 	if len(raw) < int(unsafe.Sizeof(BpfBlockedEvent{})) {
 		return
@@ -509,24 +452,6 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	} else if event.SrcPort == 0 && event.DstPort < 256 {
 		// Non-TCP/UDP protocol block — dst_port contains the protocol number
 		protocolName := getProtocolName(uint8(event.DstPort))
-
-		if readiness.isPreReady(event.Timestamp) {
-			// Startup-race drop (see Readiness): keep it in the process log for
-			// forensics, but exclude it from the audit log (→ SaaS push +
-			// summary) and the notification — it is not a policy decision.
-			logConnEvent(logger, "Protocol blocked", cnameChain,
-				"src", srcIP,
-				"dst", displayHostname,
-				"dst_ip", dstIP,
-				"protocol", protocolName,
-				"protocol_num", event.DstPort,
-				"process", comm,
-				"pid", pid,
-				"pre_ready", true,
-				"reported", false)
-			return
-		}
-
 		logConnEvent(logger, "Protocol blocked", cnameChain,
 			"src", srcIP,
 			"dst", displayHostname,
@@ -570,25 +495,6 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		}
 	} else {
 		// Blocked TCP SYN or UDP connection
-		if readiness.isPreReady(event.Timestamp) {
-			// Startup-race drop (see Readiness): the TC program attached
-			// default-deny before the auto-allow infra rules were programmed, so
-			// this was dropped once and self-heals on retransmit. Keep it in the
-			// process log for forensics, but exclude it from the audit log (→
-			// SaaS push + summary) and the notification — it is not a policy
-			// decision.
-			logConnEvent(logger, "Connection blocked", cnameChain,
-				"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
-				"dst", displayHostname,
-				"dst_ip", dstIP,
-				"dst_port", event.DstPort,
-				"process", comm,
-				"pid", pid,
-				"pre_ready", true,
-				"reported", false)
-			return
-		}
-
 		logConnEvent(logger, "Connection blocked", cnameChain,
 			"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
 			"dst", displayHostname,
@@ -631,7 +537,7 @@ func logConnEvent(logger *slog.Logger, msg string, cnameChain []string, attrs ..
 }
 
 // ProcessBlockedEvents processes blocked connection events
-func ProcessBlockedEvents(rd *ringbuf.Reader, configMgr *config.Manager, notificationTracker *NotificationTracker, auditLogger *AuditLogger, fw FirewallUpdater, readiness *Readiness, logger *slog.Logger) {
+func ProcessBlockedEvents(rd *ringbuf.Reader, configMgr *config.Manager, notificationTracker *NotificationTracker, auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger) {
 	for {
 		record, err := rd.Read()
 		if err != nil {
@@ -642,6 +548,6 @@ func ProcessBlockedEvents(rd *ringbuf.Reader, configMgr *config.Manager, notific
 			continue
 		}
 
-		processEvent(record.RawSample, configMgr, notificationTracker, auditLogger, fw, readiness, logger)
+		processEvent(record.RawSample, configMgr, notificationTracker, auditLogger, fw, logger)
 	}
 }

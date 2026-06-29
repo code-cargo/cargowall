@@ -56,7 +56,7 @@ func TestGitHubActionsHandler_TimestampPrefix(t *testing.T) {
 
 	out := captureStderr(t, func() {
 		info := slog.NewRecord(ts, slog.LevelInfo, "Connection blocked", 0)
-		info.AddAttrs(slog.Bool("pre_ready", true))
+		info.AddAttrs(slog.Int("dst_port", 443))
 		require.NoError(t, h.Handle(context.Background(), info))
 
 		errRec := slog.NewRecord(ts, slog.LevelError, "boom", 0)
@@ -68,7 +68,7 @@ func TestGitHubActionsHandler_TimestampPrefix(t *testing.T) {
 
 	// Info line: "<timestamp> <message> <attrs>", no prefix.
 	assert.Regexp(t, `^2026-06-29 15:24:08\.456 Connection blocked\b`, lines[0])
-	assert.Contains(t, lines[0], "pre_ready=true")
+	assert.Contains(t, lines[0], "dst_port=443")
 
 	// Error line: prefix stays at column 0, timestamp follows it.
 	assert.Regexp(t, `^::error::2026-06-29 15:24:08\.456 boom\b`, lines[1])

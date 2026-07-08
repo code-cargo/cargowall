@@ -264,31 +264,34 @@ type dedupKey struct {
 	eventType events.AuditEventType
 }
 
+// backfillDistinguishingFields keeps one row per destination while preserving
+// distinguishing fields carried only by a later duplicate (e.g. a CNAME chain
+// or auto-allowed type — see issue #77). Only empty fields on the retained
+// representative are filled; a value already present is authoritative.
+// MatchedRule needs no backfill: only connection_late_allowed events carry it,
+// and they always do, so with eventType in the dedup key a same-key group is
+// uniformly populated or uniformly empty.
+func backfillDistinguishingFields(rep, dup *events.AuditEvent) {
+	if len(rep.CNAMEChain) == 0 && len(dup.CNAMEChain) > 0 {
+		rep.CNAMEChain = dup.CNAMEChain
+	}
+	if rep.AutoAllowedType == "" && dup.AutoAllowedType != "" {
+		rep.AutoAllowedType = dup.AutoAllowedType
+	}
+}
+
 func deduplicateStepEvents(stepEvents []StepEvents) {
-	for i, se := range stepEvents {
+	for i := range stepEvents {
 		seen := make(map[dedupKey]int) // key -> index into deduped
 		var deduped []events.AuditEvent
-		for _, event := range se.Events {
+		for _, event := range stepEvents[i].Events {
 			dest := event.DstHostname
 			if dest == "" {
 				dest = event.DstIP
 			}
 			key := dedupKey{process: event.Process, dest: dest, port: event.DstPort, protocol: event.Protocol, eventType: event.EventType}
 			if idx, exists := seen[key]; exists {
-				// Keep one row per destination, but backfill distinguishing
-				// fields the retained representative is missing (e.g. a CNAME
-				// chain or auto-allowed type carried only by a later duplicate
-				// — see issue #77). Only fill empty fields; a value already on
-				// the representative is authoritative. MatchedRule needs no
-				// backfill: only connection_late_allowed events carry it, and
-				// they always do, so with eventType in the key a same-key group
-				// is uniformly populated or uniformly empty.
-				if len(deduped[idx].CNAMEChain) == 0 && len(event.CNAMEChain) > 0 {
-					deduped[idx].CNAMEChain = event.CNAMEChain
-				}
-				if deduped[idx].AutoAllowedType == "" && event.AutoAllowedType != "" {
-					deduped[idx].AutoAllowedType = event.AutoAllowedType
-				}
+				backfillDistinguishingFields(&deduped[idx], &event)
 				continue
 			}
 			seen[key] = len(deduped)

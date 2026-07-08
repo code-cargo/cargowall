@@ -175,6 +175,27 @@ func TestSummary_DeduplicateStepEvents_ChainBackfilledFromLaterDuplicate(t *test
 	assert.Equal(t, ts, stepEvents[0].Events[0].Timestamp, "representative is still the first-seen event")
 }
 
+// The backfill is unconditional on EventType — the Log*Blocked paths also
+// emit chains (e.g. a derived connection blocked on a non-inherited port is
+// attributed to the origin with its chain), so a chain carried by a later
+// blocked duplicate must be preserved too.
+func TestSummary_DeduplicateStepEvents_ChainBackfilledOnBlockedEvent(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	chain := []string{"auth.docker.io", "auth.docker.io.cdn.cloudflare.net"}
+	stepEvents := []StepEvents{
+		{
+			Step: GitHubStep{Name: "build"},
+			Events: []events.AuditEvent{
+				{Timestamp: ts, EventType: events.EventConnectionBlocked, DstHostname: "auth.docker.io", DstIP: "1.1.1.1", DstPort: 25, Protocol: "TCP", Process: "curl"},
+				{Timestamp: ts.Add(time.Second), EventType: events.EventConnectionBlocked, DstHostname: "auth.docker.io", DstIP: "2.2.2.2", DstPort: 25, Protocol: "TCP", Process: "curl", CNAMEChain: chain},
+			},
+		},
+	}
+	deduplicateStepEvents(stepEvents)
+	require.Len(t, stepEvents[0].Events, 1)
+	assert.Equal(t, chain, stepEvents[0].Events[0].CNAMEChain, "chain backfilled onto a blocked representative")
+}
+
 // If the representative already carries a chain, a later chainless duplicate
 // must not clobber it.
 func TestSummary_DeduplicateStepEvents_ChainNotOverwritten(t *testing.T) {

@@ -264,20 +264,38 @@ type dedupKey struct {
 	eventType events.AuditEventType
 }
 
+// backfillDistinguishingFields keeps one row per destination while preserving
+// distinguishing fields carried only by a later duplicate (e.g. a CNAME chain
+// or auto-allowed type — see issue #77). Only empty fields on the retained
+// representative are filled; a value already present is authoritative.
+// MatchedRule needs no backfill: only connection_late_allowed events carry it,
+// and they always do, so with eventType in the dedup key a same-key group is
+// uniformly populated or uniformly empty.
+func backfillDistinguishingFields(rep, dup *events.AuditEvent) {
+	if len(rep.CNAMEChain) == 0 && len(dup.CNAMEChain) > 0 {
+		rep.CNAMEChain = dup.CNAMEChain
+	}
+	if rep.AutoAllowedType == "" && dup.AutoAllowedType != "" {
+		rep.AutoAllowedType = dup.AutoAllowedType
+	}
+}
+
 func deduplicateStepEvents(stepEvents []StepEvents) {
-	for i, se := range stepEvents {
-		seen := make(map[dedupKey]struct{})
+	for i := range stepEvents {
+		seen := make(map[dedupKey]int) // key -> index into deduped
 		var deduped []events.AuditEvent
-		for _, event := range se.Events {
+		for _, event := range stepEvents[i].Events {
 			dest := event.DstHostname
 			if dest == "" {
 				dest = event.DstIP
 			}
 			key := dedupKey{process: event.Process, dest: dest, port: event.DstPort, protocol: event.Protocol, eventType: event.EventType}
-			if _, exists := seen[key]; !exists {
-				seen[key] = struct{}{}
-				deduped = append(deduped, event)
+			if idx, exists := seen[key]; exists {
+				backfillDistinguishingFields(&deduped[idx], &event)
+				continue
 			}
+			seen[key] = len(deduped)
+			deduped = append(deduped, event)
 		}
 		stepEvents[i].Events = deduped
 	}

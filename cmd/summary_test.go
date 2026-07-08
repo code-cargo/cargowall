@@ -151,6 +151,95 @@ func TestSummary_DeduplicateStepEvents_DifferentProtocolsKept(t *testing.T) {
 	assert.Len(t, stepEvents[0].Events, 2, "TCP and UDP observations on the same dest:port must remain separate")
 }
 
+// A CNAME-derived connection is attributed to its origin hostname (chain[0]),
+// so a chain-bearing event and a plain direct connection to the same origin
+// share a dedup key. First-seen wins, so when the chainless direct hit sorts
+// first the chain must be backfilled onto it rather than dropped (issue #77).
+func TestSummary_DeduplicateStepEvents_ChainBackfilledFromLaterDuplicate(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	chain := []string{"auth.docker.io", "auth.docker.io.cdn.cloudflare.net"}
+	stepEvents := []StepEvents{
+		{
+			Step: GitHubStep{Name: "build"},
+			Events: []events.AuditEvent{
+				// First-seen: plain direct connection, no chain.
+				{Timestamp: ts, EventType: events.EventConnectionAllowed, DstHostname: "auth.docker.io", DstIP: "1.1.1.1", DstPort: 443, Protocol: "TCP", Process: "curl"},
+				// Later duplicate (same key): CNAME-derived, carries the chain.
+				{Timestamp: ts.Add(time.Second), EventType: events.EventConnectionAllowed, DstHostname: "auth.docker.io", DstIP: "2.2.2.2", DstPort: 443, Protocol: "TCP", Process: "curl", CNAMEChain: chain},
+			},
+		},
+	}
+	deduplicateStepEvents(stepEvents)
+	require.Len(t, stepEvents[0].Events, 1, "same origin collapses to one row")
+	assert.Equal(t, chain, stepEvents[0].Events[0].CNAMEChain, "chain backfilled from the later duplicate")
+	assert.Equal(t, ts, stepEvents[0].Events[0].Timestamp, "representative is still the first-seen event")
+}
+
+// The backfill is unconditional on EventType — the Log*Blocked paths also
+// emit chains (e.g. a derived connection blocked on a non-inherited port is
+// attributed to the origin with its chain), so a chain carried by a later
+// blocked duplicate must be preserved too.
+func TestSummary_DeduplicateStepEvents_ChainBackfilledOnBlockedEvent(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	chain := []string{"auth.docker.io", "auth.docker.io.cdn.cloudflare.net"}
+	stepEvents := []StepEvents{
+		{
+			Step: GitHubStep{Name: "build"},
+			Events: []events.AuditEvent{
+				{Timestamp: ts, EventType: events.EventConnectionBlocked, DstHostname: "auth.docker.io", DstIP: "1.1.1.1", DstPort: 25, Protocol: "TCP", Process: "curl"},
+				{Timestamp: ts.Add(time.Second), EventType: events.EventConnectionBlocked, DstHostname: "auth.docker.io", DstIP: "2.2.2.2", DstPort: 25, Protocol: "TCP", Process: "curl", CNAMEChain: chain},
+			},
+		},
+	}
+	deduplicateStepEvents(stepEvents)
+	require.Len(t, stepEvents[0].Events, 1)
+	assert.Equal(t, chain, stepEvents[0].Events[0].CNAMEChain, "chain backfilled onto a blocked representative")
+}
+
+// If the representative already carries a chain, a later chainless duplicate
+// must not clobber it.
+func TestSummary_DeduplicateStepEvents_ChainNotOverwritten(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	chain := []string{"auth.docker.io", "auth.docker.io.cdn.cloudflare.net"}
+	stepEvents := []StepEvents{
+		{
+			Step: GitHubStep{Name: "build"},
+			Events: []events.AuditEvent{
+				{Timestamp: ts, EventType: events.EventConnectionAllowed, DstHostname: "auth.docker.io", DstIP: "2.2.2.2", DstPort: 443, Protocol: "TCP", Process: "curl", CNAMEChain: chain},
+				{Timestamp: ts.Add(time.Second), EventType: events.EventConnectionAllowed, DstHostname: "auth.docker.io", DstIP: "1.1.1.1", DstPort: 443, Protocol: "TCP", Process: "curl"},
+			},
+		},
+	}
+	deduplicateStepEvents(stepEvents)
+	require.Len(t, stepEvents[0].Events, 1)
+	assert.Equal(t, chain, stepEvents[0].Events[0].CNAMEChain, "retained chain must be preserved")
+}
+
+// auto_allowed_type is per-IP (CIDR pass of GetAutoAllowedType) while the
+// dedup key ignores DstIP when a hostname is set, so round-robin DNS can
+// produce same-key duplicates where only a later one carries the type — it
+// must be backfilled when the representative lacks it, but never overwritten.
+func TestSummary_DeduplicateStepEvents_AutoAllowedTypeBackfilled(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	stepEvents := []StepEvents{
+		{
+			Step: GitHubStep{Name: "build"},
+			Events: []events.AuditEvent{
+				// First-seen: resolved IP outside any auto-allowed range.
+				{Timestamp: ts, EventType: events.EventConnectionAllowed, DstHostname: "a.com", DstIP: "1.1.1.1", DstPort: 443, Protocol: "TCP", Process: "curl"},
+				// Later duplicate: resolved IP inside an auto-allowed range.
+				{Timestamp: ts.Add(time.Second), EventType: events.EventConnectionAllowed, DstHostname: "a.com", DstIP: "2.2.2.2", DstPort: 443, Protocol: "TCP", Process: "curl", AutoAllowedType: "dns"},
+				// Third duplicate: a different type must not overwrite.
+				{Timestamp: ts.Add(2 * time.Second), EventType: events.EventConnectionAllowed, DstHostname: "a.com", DstIP: "3.3.3.3", DstPort: 443, Protocol: "TCP", Process: "curl", AutoAllowedType: "github_service"},
+			},
+		},
+	}
+	deduplicateStepEvents(stepEvents)
+	require.Len(t, stepEvents[0].Events, 1)
+	assert.Equal(t, "dns", stepEvents[0].Events[0].AutoAllowedType, "missing auto_allowed_type backfilled from the first duplicate that carries one, later values don't overwrite")
+	assert.Equal(t, ts, stepEvents[0].Events[0].Timestamp, "representative is still the first-seen event")
+}
+
 // --- correlateEventsToSteps ---
 
 func TestSummary_CorrelateEventsToSteps_EventInStep(t *testing.T) {

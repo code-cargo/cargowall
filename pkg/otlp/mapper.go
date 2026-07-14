@@ -144,10 +144,8 @@ func logRecordFromEvent(ev events.AuditEvent) *logspb.LogRecord {
 func eventBody(ev events.AuditEvent) string {
 	action := strings.ReplaceAll(strings.TrimPrefix(string(ev.EventType), "connection_"), "_", " ")
 	if ev.EventType == events.EventExistingConnection {
-		action = "existing connection " + verdict(ev)
-		if action == "existing connection would_deny" {
-			action = "existing connection blocked"
-		}
+		// Keep the body consistent with the cargowall.verdict attribute.
+		action = "existing connection " + strings.ReplaceAll(verdict(ev), "_", " ")
 	}
 	target := ev.DstHostname
 	if target == "" {

@@ -176,6 +176,17 @@ func TestLogRecordFromEvent_ExistingConnection(t *testing.T) {
 	})
 	assert.Equal(t, logspb.SeverityNumber_SEVERITY_NUMBER_WARN, blocked.SeverityNumber)
 	assert.Equal(t, "existing connection deny 93.184.216.34", blocked.Body.GetStringValue())
+
+	// Body must agree with the cargowall.verdict attribute for a
+	// hypothetical would-deny-only event too (no rewrite to "blocked").
+	wouldDeny := logRecordFromEvent(events.AuditEvent{
+		Timestamp: time.Now(),
+		EventType: events.EventExistingConnection,
+		DstIP:     "93.184.216.34",
+		WouldDeny: true,
+	})
+	assert.Equal(t, "would_deny", attrMap(t, wouldDeny.Attributes)["cargowall.verdict"].GetStringValue())
+	assert.Equal(t, "existing connection would deny 93.184.216.34", wouldDeny.Body.GetStringValue())
 }
 
 func TestBuildResource(t *testing.T) {

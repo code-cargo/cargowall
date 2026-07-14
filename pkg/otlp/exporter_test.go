@@ -57,6 +57,7 @@ func newCollector(t *testing.T) *collector {
 			require.NoError(t, err)
 			body, err = io.ReadAll(gz)
 			require.NoError(t, err)
+			require.NoError(t, gz.Close())
 		}
 		var req collogspb.ExportLogsServiceRequest
 		require.NoError(t, proto.Unmarshal(body, &req))

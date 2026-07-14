@@ -12,8 +12,6 @@
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 
-//go:build linux
-
 package events
 
 import (
@@ -230,4 +228,60 @@ func TestAuditLogger_IsAuditMode(t *testing.T) {
 func TestAuditLogger_InvalidPath(t *testing.T) {
 	_, err := NewAuditLogger("/nonexistent/dir/audit.jsonl", false)
 	assert.Error(t, err)
+}
+
+// fakeSink records every event it receives.
+type fakeSink struct {
+	events []AuditEvent
+}
+
+func (s *fakeSink) Consume(event AuditEvent) {
+	s.events = append(s.events, event)
+}
+
+func TestAuditLogger_SinkReceivesNormalizedEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := NewAuditLogger(path, true)
+	require.NoError(t, err)
+	defer logger.Close()
+
+	sink := &fakeSink{}
+	logger.AddSink(sink)
+
+	require.NoError(t, logger.LogConnectionBlocked("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1234, "TCP", nil))
+	require.NoError(t, logger.LogConnectionAllowed("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1234, "", "TCP", nil))
+
+	require.Len(t, sink.events, 2)
+	// Sink must see the event after audit-mode normalization, matching the file.
+	assert.Equal(t, EventConnectionBlocked, sink.events[0].EventType)
+	assert.True(t, sink.events[0].WouldDeny)
+	assert.False(t, sink.events[0].Blocked)
+	assert.Equal(t, EventConnectionAllowed, sink.events[1].EventType)
+	assert.False(t, sink.events[1].WouldDeny)
+
+	fileEvents := readAuditEvents(t, path)
+	require.Len(t, fileEvents, 2)
+	for i := range fileEvents {
+		// Timestamps survive the JSON round-trip but lose location identity.
+		assert.True(t, fileEvents[i].Timestamp.Equal(sink.events[i].Timestamp))
+		fileEvents[i].Timestamp = sink.events[i].Timestamp
+	}
+	assert.Equal(t, fileEvents, sink.events)
+}
+
+func TestAuditLogger_FileLess(t *testing.T) {
+	logger, err := NewAuditLogger("", false)
+	require.NoError(t, err)
+
+	sink := &fakeSink{}
+	logger.AddSink(sink)
+
+	require.NoError(t, logger.LogDNSBlocked("blocked.example.com"))
+	require.Len(t, sink.events, 1)
+	assert.Equal(t, EventDNSBlocked, sink.events[0].EventType)
+	assert.True(t, sink.events[0].Blocked)
+
+	assert.False(t, logger.IsAuditMode())
+	require.NoError(t, logger.Close())
+	require.NoError(t, logger.Close())
 }

@@ -17,6 +17,12 @@ This file lists the dependencies used in this repository.
 | google.golang.org/genproto/googleapis/api | Apache-2.0   | Google                                      |
 | google.golang.org/protobuf                | BSD-3-Clause | The Go Authors                              |
 
+## Generated code
+
+| Source                                                     | License    | Copyright Owner               |
+|------------------------------------------------------------|------------|-------------------------------|
+| opentelemetry-proto (`pb/otlp`, generated via buf from `buf.build/opentelemetry/opentelemetry`) | Apache-2.0 | The OpenTelemetry Authors |
+
 ## Indirect
 
 | Dependency                    | License          | Copyright Owner               |

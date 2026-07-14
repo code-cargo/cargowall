@@ -57,7 +57,7 @@ generate:
 
 generate-proto:
 	@printf "${GREEN}Running buf generate in proto/...${RESET}\n"
-	cd proto && npx buf generate
+	cd proto && npx buf generate --clean && npx buf generate --clean --template buf.gen.otlp.yaml
 
 test:
 	@printf "${GREEN}Running tests...${RESET}\n"

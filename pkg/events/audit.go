@@ -12,8 +12,6 @@
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 
-//go:build linux
-
 package events
 
 import (
@@ -61,27 +59,46 @@ type AuditEvent struct {
 	Blocked         bool           `json:"blocked"`               // true in enforce mode (actually blocked)
 }
 
-// AuditLogger writes audit events to a JSON file (one event per line)
+// EventSink receives every audit event after the audit/enforce mode flags
+// have been normalized. Consume is called under the audit logger's mutex on
+// the ring-buffer reader and DNS handler goroutines, so it must not block.
+type EventSink interface {
+	Consume(event AuditEvent)
+}
+
+// AuditLogger writes audit events to a JSON file (one event per line) and
+// fans them out to any registered sinks. With an empty path it acts as a
+// file-less event hub (sinks only).
 type AuditLogger struct {
 	file      *os.File
 	encoder   *json.Encoder
 	mu        sync.Mutex
 	auditMode bool      // true = audit mode (log only), false = enforce mode (actually blocking)
 	lastSync  time.Time // last time file.Sync() was called
+	sinks     []EventSink
 }
 
-// NewAuditLogger creates a new audit logger that writes to the specified file
+// NewAuditLogger creates a new audit logger that writes to the specified
+// file. An empty path skips file output entirely — events still flow to
+// sinks registered via AddSink.
 func NewAuditLogger(path string, auditMode bool) (*AuditLogger, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open audit log file: %w", err)
+	a := &AuditLogger{auditMode: auditMode}
+	if path != "" {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open audit log file: %w", err)
+		}
+		a.file = file
+		a.encoder = json.NewEncoder(file)
 	}
+	return a, nil
+}
 
-	return &AuditLogger{
-		file:      file,
-		encoder:   json.NewEncoder(file),
-		auditMode: auditMode,
-	}, nil
+// AddSink registers a sink that will receive every subsequent audit event.
+func (a *AuditLogger) AddSink(s EventSink) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sinks = append(a.sinks, s)
 }
 
 // LogEvent writes an audit event to the log file
@@ -103,6 +120,14 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 			event.WouldDeny = false
 			event.Blocked = true
 		}
+	}
+
+	for _, s := range a.sinks {
+		s.Consume(event)
+	}
+
+	if a.encoder == nil {
+		return nil
 	}
 
 	if err := a.encoder.Encode(event); err != nil {

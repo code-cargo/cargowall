@@ -5,7 +5,7 @@
     "@bufbuild/protobuf": "^2.10.2"
   },
   "scripts": {
-    "generate": "buf generate --clean",
+    "generate": "buf generate --clean && buf generate --clean --template buf.gen.otlp.yaml",
     "dep-update": "buf dep update"
   }
 }

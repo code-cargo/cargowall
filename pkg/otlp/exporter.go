@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -55,7 +56,8 @@ type Exporter struct {
 	resource *resourcepb.Resource
 	scope    *commonpb.InstrumentationScope
 	done     chan struct{}
-	closed   atomic.Bool
+	mu       sync.Mutex // guards closed and closing e.queue vs. sends in Consume
+	closed   bool
 	dropped  atomic.Uint64
 	logger   *slog.Logger
 }
@@ -96,24 +98,35 @@ func (e *Exporter) Endpoint() string {
 
 // Consume implements events.EventSink. It never blocks: when the queue is
 // full or the exporter has been shut down, the event is counted as dropped.
+// The mutex makes the closed check and the send atomic with respect to
+// Shutdown closing the queue (a bare closed-flag check would race and panic
+// on send-to-closed-channel); it is only ever held for a non-blocking send.
 func (e *Exporter) Consume(ev events.AuditEvent) {
-	if e.closed.Load() {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
 		e.dropped.Add(1)
 		return
 	}
 	select {
 	case e.queue <- ev:
+		e.mu.Unlock()
 	default:
+		e.mu.Unlock()
 		e.dropped.Add(1)
 	}
 }
 
 // Shutdown stops the worker and flushes any queued events, bounded by ctx.
 func (e *Exporter) Shutdown(ctx context.Context) error {
-	if e.closed.Swap(true) {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
 		return nil
 	}
+	e.closed = true
 	close(e.queue)
+	e.mu.Unlock()
 	select {
 	case <-e.done:
 		return nil
@@ -138,11 +151,18 @@ func (e *Exporter) run() {
 		batch = batch[:0]
 	}
 
+	logDropped := func() {
+		if n := e.dropped.Swap(0); n > 0 {
+			e.logger.Warn("OTLP exporter dropped events (queue full)", "count", n)
+		}
+	}
+
 	for {
 		select {
 		case ev, ok := <-e.queue:
 			if !ok {
 				flush()
+				logDropped()
 				return
 			}
 			batch = append(batch, logRecordFromEvent(ev))
@@ -151,9 +171,7 @@ func (e *Exporter) run() {
 			}
 		case <-ticker.C:
 			flush()
-			if n := e.dropped.Swap(0); n > 0 {
-				e.logger.Warn("OTLP exporter dropped events (queue full)", "count", n)
-			}
+			logDropped()
 		}
 	}
 }

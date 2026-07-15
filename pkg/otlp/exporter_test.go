@@ -251,6 +251,35 @@ func TestExporter_ConsumeAfterShutdownDrops(t *testing.T) {
 	require.NoError(t, e.Shutdown(context.Background()))
 }
 
+// Regression test for a send-on-closed-channel panic: Consume's closed
+// check and its queue send must be atomic with Shutdown closing the queue.
+func TestExporter_ConcurrentConsumeShutdown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	for range 2000 {
+		e := New(testConfig(server.URL), "test", discardLogger())
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for range 50 {
+					e.Consume(testEvent())
+				}
+			}()
+		}
+		close(start)
+		_ = e.Shutdown(context.Background())
+		wg.Wait()
+	}
+}
+
 func TestExporter_ShutdownRespectsContext(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(2 * time.Second)

@@ -80,7 +80,7 @@ jobs:
             -p 4318:4318 \
             -v /tmp/otelcol/config.yaml:/etc/otelcol/config.yaml:ro \
             -v /tmp/otelcol/out:/out \
-            otel/opentelemetry-collector:0.116.1 \
+            otel/opentelemetry-collector:0.156.0 \
             --config /etc/otelcol/config.yaml
           # Wait until the OTLP receiver accepts connections
           for i in $(seq 1 30); do
@@ -125,6 +125,11 @@ jobs:
 
       - name: Generate allowed and denied traffic
         run: |
+          # First connection to a fresh IP is typically relabeled
+          # connection_late_allowed (SYN races the DNS-driven map add); the
+          # second lands as a plain connection_allowed.
+          curl -sS -o /dev/null https://github.com
+          sleep 1
           curl -sS -o /dev/null https://github.com
           # example.com is not in policy: DNS filtering flags it (dns_blocked)
           # and the connection is recorded would_deny; audit mode lets it pass.
@@ -147,12 +152,15 @@ jobs:
 
           jqdef='def attr($k): [.attributes[]? | select(.key==$k) | .value.stringValue] | first;'
 
-          # 1. github.com connection exported with verdict allow.
-          jq -e "$jqdef"'[ .[] | select(.eventName=="cargowall.connection_allowed"
+          # 1. github.com connections exported with verdict allow — the first
+          # is legitimately connection_late_allowed (SYN vs map-add race),
+          # so accept both allow-outcome event names.
+          jq -e "$jqdef"'[ .[] | select(
+              (.eventName=="cargowall.connection_allowed" or .eventName=="cargowall.connection_late_allowed")
               and attr("server.address")=="github.com"
               and attr("cargowall.verdict")=="allow") ] | length > 0' \
             /tmp/records-flat.json > /dev/null \
-            || { echo "::error::no connection_allowed record for github.com"; exit 1; }
+            || { echo "::error::no allow-verdict record for github.com"; exit 1; }
 
           # 2. example.com DNS block exported with verdict would_deny (audit mode).
           jq -e "$jqdef"'[ .[] | select(.eventName=="cargowall.dns_blocked"

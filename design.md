@@ -377,6 +377,14 @@ sequenceDiagram
 - Late-resolved IP addition: if a blocked event resolves to an allowed hostname, adds the IP to the firewall on the fly
 - Audit logging via `AuditLogger` — NDJSON with `would_deny`/`blocked` flags based on audit mode
 - Notification deduplication: one notification per unique destination (`hostname:port` or `ip:port`) via `NotificationTracker`
+- Event fan-out: `AuditLogger` also tees every event (after mode-flag normalization) to registered `EventSink`s; sinks must not block. With an empty path it acts as a file-less event hub, so sinks work without `--audit-log`
+
+### OTLP Exporter (`pkg/otlp`)
+- Streams every audit event to an OTLP/HTTP logs endpoint as one log record per event, enabled iff the standard `OTEL_EXPORTER_OTLP[_LOGS]_ENDPOINT` env var is set
+- Hand-rolled exporter — no OpenTelemetry SDK dependency; OTLP protos are generated from `buf.build/opentelemetry/opentelemetry` (see `proto/buf.gen.otlp.yaml`) and marshaled with the existing `google.golang.org/protobuf` dep, so `go.mod` gains nothing
+- `http/protobuf` transport only; misconfiguration (e.g. `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`) logs a warning and disables export without affecting the firewall
+- Delivery is best-effort by design: bounded queue (2048) with non-blocking enqueue so the ring-buffer reader and DNS handler never stall; batches of 512 records or 5s; jittered exponential backoff on 429/5xx honoring `Retry-After`; drops (counted and logged) rather than backpressure
+- Shutdown flushes queued events with a 5s-bounded context before the audit logger closes
 
 ## eBPF Programs
 

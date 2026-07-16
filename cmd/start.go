@@ -48,6 +48,7 @@ import (
 	"github.com/code-cargo/cargowall/pkg/firewall"
 	"github.com/code-cargo/cargowall/pkg/lockdown"
 	"github.com/code-cargo/cargowall/pkg/network"
+	"github.com/code-cargo/cargowall/pkg/otlp"
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
 
@@ -198,6 +199,35 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		defer auditLogger.Close()
 	}
 
+	// OpenTelemetry export: enabled iff the standard OTLP env vars are set.
+	// The exporter subscribes to the audit event stream, so without
+	// --audit-log a file-less audit logger acts as the event hub.
+	otelExporter, err := otlp.NewFromEnv(cmd.Version, logger)
+	if err != nil {
+		logger.Warn("OpenTelemetry export disabled (invalid OTLP configuration)", "error", err)
+	}
+	if otelExporter != nil {
+		if auditLogger == nil {
+			var err error
+			auditLogger, err = events.NewAuditLogger("", cmd.AuditMode)
+			if err != nil {
+				return fmt.Errorf("failed to create audit event hub: %w", err)
+			}
+			defer auditLogger.Close()
+		}
+		auditLogger.AddSink(otelExporter)
+		// Flush before the audit logger closes (defer LIFO), bounded like
+		// the LoggerShutdown teardown below.
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := otelExporter.Shutdown(shutdownCtx); err != nil {
+				logger.Warn("OTLP exporter shutdown incomplete", "error", err)
+			}
+		}()
+		logger.Info("OpenTelemetry log export enabled", "endpoint", otelExporter.Endpoint())
+	}
+
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
 	var apiPolicyLoaded bool
 	if cmd.CIMode() != CIModeNone {
@@ -238,6 +268,8 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			"audit_log", cmd.AuditLog)
 	case cmd.AuditLog != "":
 		logger.Info("Audit logging enabled", "audit_log", cmd.AuditLog)
+	case cmd.AuditMode && otelExporter != nil:
+		logger.Info("Running in AUDIT MODE - connections will be exported via OTLP but NOT blocked")
 	case cmd.AuditMode:
 		logger.Warn("Audit mode enabled but no audit log path specified (--audit-log)")
 	}

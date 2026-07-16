@@ -249,6 +249,20 @@ Useful flags (most available as env vars — see `cargowall start --help`):
 
 When CargoWall is ready, it writes a `/tmp/cargowall-ready` sentinel. Use the `cargowall wait-ready` subcommand from your CI script to block until the firewall is up — it polls the sentinel and exits non-zero on timeout.
 
+## OpenTelemetry export
+
+If an OTLP endpoint is configured via the standard OpenTelemetry environment variables, `cargowall start` streams every network event (connections allowed/blocked/late-allowed, protocols blocked, DNS blocked, existing connections) to it as OTLP log records — one record per event, with OTel semantic-convention attributes (`destination.address`, `server.address`, `network.transport`, `process.pid`, …) plus `cargowall.*` attributes for the verdict, matched rule, and CNAME chain. No flags needed; export is on iff the endpoint variable is set, and works with or without `--audit-log`:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20<token>"
+sudo -E cargowall start --config /etc/cargowall/config.json --dns-upstream 8.8.8.8:53
+```
+
+Supported variables (per the [OTLP exporter spec](https://opentelemetry.io/docs/specs/otel/protocol/exporter/)): `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_COMPRESSION` (`gzip`), `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, and their `_LOGS_`-specific variants. Only the `http/protobuf` transport is supported — `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` disables export with a warning (the firewall itself is unaffected).
+
+**Note**: under a deny-by-default policy, the collector endpoint itself must be allowed in your rules, or the exporter's own traffic will be blocked. Delivery is best-effort — events are batched, retried on transient errors, and dropped (with a logged count) rather than ever blocking packet processing.
+
 ## GitLab CI
 
 GitLab SaaS Linux runners give your job root inside a privileged Docker container, which is enough for eBPF. SaaS shared runners run a 5.15 kernel, which predates the TCX hook — CargoWall detects this and attaches its egress filter through the legacy `clsact` path automatically, so `cargowall start --gitlab-ci` works on SaaS runners as-is. Self-hosted runners on a 6.6+ kernel use the faster TCX attach.

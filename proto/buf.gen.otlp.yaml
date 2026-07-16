@@ -1,0 +1,18 @@
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/code-cargo/cargowall/pb/otlp
+inputs:
+  - module: buf.build/opentelemetry/opentelemetry:5f2c7d4f740541589805e0816dad4bb0
+    paths:
+      - opentelemetry/proto/common/v1/common.proto
+      - opentelemetry/proto/resource/v1/resource.proto
+      - opentelemetry/proto/logs/v1/logs.proto
+      - opentelemetry/proto/collector/logs/v1/logs_service.proto
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.36.11
+    out: ../pb/otlp
+    opt:
+      - paths=source_relative

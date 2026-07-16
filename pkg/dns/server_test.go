@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -3010,4 +3011,186 @@ func TestApplyRulesToTrackedHostnames_ConflictDenyWins(t *testing.T) {
 
 	server.ApplyRulesToTrackedHostnames()
 	mockFirewall.AssertExpectations(t)
+}
+
+// readAuditEvents parses the JSONL audit file into events.
+func readAuditEvents(t *testing.T, path string) []events.AuditEvent {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var out []events.AuditEvent
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var e events.AuditEvent
+		require.NoError(t, json.Unmarshal([]byte(line), &e))
+		out = append(out, e)
+	}
+	return out
+}
+
+// A connection blocked before its destination could be attributed to an
+// allowed hostname must be re-reported as late-allowed once the address
+// records flow through the proxy and the firewall opens for the IP (#83).
+func TestHandleDNSQuery_ReconcilesRecentBlocks(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "productionresultssa5.blob.core.windows.net", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+
+	auditPath := filepath.Join(t.TempDir(), "audit.json")
+	auditLogger, err := events.NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	server.SetAuditLogger(auditLogger)
+
+	// The client dialed the IP before the proxy ever saw an A record for it
+	// (resolution served from a warm local cache), so the block was audited
+	// with no hostname attribution.
+	blockedAt := time.Now().Add(-5 * time.Second)
+	recentBlocks := events.NewRecentBlocks(0)
+	recentBlocks.Consume(events.AuditEvent{
+		Timestamp: blockedAt,
+		EventType: events.EventConnectionBlocked,
+		SrcIP:     "10.1.0.215",
+		DstIP:     "20.209.112.225",
+		DstPort:   443,
+		Protocol:  "TCP",
+		Process:   "MainThread",
+		PID:       2411,
+	})
+	server.SetRecentBlocks(recentBlocks)
+
+	const qname = "productionresultssa5.blob.core.windows.net."
+	seedCachedResponse(server, qname, makeCachedResponse(qname, "20.209.112.225"))
+	mockFw.On("AddIP", net.ParseIP("20.209.112.225"), config.ActionAllow, []config.Port(nil)).Return(true, nil).Once()
+
+	query := new(dns.Msg)
+	query.SetQuestion(qname, dns.TypeA)
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	audited := readAuditEvents(t, auditPath)
+	require.Len(t, audited, 1)
+	e := audited[0]
+	assert.Equal(t, events.EventConnectionLateAllowed, e.EventType)
+	assert.Equal(t, "20.209.112.225", e.DstIP)
+	assert.Equal(t, "productionresultssa5.blob.core.windows.net", e.DstHostname)
+	assert.Equal(t, "productionresultssa5.blob.core.windows.net", e.MatchedRule)
+	assert.Equal(t, uint16(443), e.DstPort)
+	assert.Equal(t, "MainThread", e.Process)
+	assert.Equal(t, uint32(2411), e.PID)
+	assert.True(t, e.Timestamp.Equal(blockedAt), "reconciled event must be dated at the blocked attempt")
+
+	// The entry is consumed — a second resolution must not re-emit it.
+	assert.Empty(t, recentBlocks.TakeMatching("20.209.112.225", nil, nil, false))
+}
+
+// An allowed CNAME-only response (the incident shape in #83: the AAAA answer
+// carries the chain, the A answer never traverses the proxy) must trigger
+// pre-resolution of the terminal target so the firewall opens immediately —
+// and reconcile any blocks that raced the resolution, attributed to the
+// origin hostname the user allowed.
+func TestHandleDNSQuery_PreResolvesCNAMEOnlyResponse(t *testing.T) {
+	// Local upstream that answers A for the terminal target.
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	upstream := &dns.Server{
+		PacketConn: pc,
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+			m := new(dns.Msg)
+			m.SetReply(r)
+			if r.Question[0].Name == "edge.cdn.example.net." && r.Question[0].Qtype == dns.TypeA {
+				m.Answer = append(m.Answer, &dns.A{
+					Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+					A:   net.ParseIP("192.0.2.10"),
+				})
+			}
+			_ = w.WriteMsg(m)
+		}),
+	}
+	go func() { _ = upstream.ActivateAndServe() }()
+	defer func() { _ = upstream.Shutdown() }()
+
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.upstream = pc.LocalAddr().String()
+	server.preResolved = newLRUCache[string, struct{}](100)
+
+	auditPath := filepath.Join(t.TempDir(), "audit.json")
+	auditLogger, err := events.NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	server.SetAuditLogger(auditLogger)
+
+	// A block that raced the resolution: the client already held 192.0.2.10.
+	recentBlocks := events.NewRecentBlocks(0)
+	recentBlocks.Consume(events.AuditEvent{
+		Timestamp: time.Now().Add(-2 * time.Second),
+		EventType: events.EventConnectionBlocked,
+		SrcIP:     "10.1.0.215",
+		DstIP:     "192.0.2.10",
+		DstPort:   443,
+		Protocol:  "TCP",
+		Process:   "MainThread",
+		PID:       2411,
+	})
+	server.SetRecentBlocks(recentBlocks)
+
+	added := make(chan struct{}, 1)
+	// MatchedBy because the wire-parsed A record is a 4-byte net.IP while
+	// net.ParseIP returns the 16-byte form — Equal, not DeepEqual, semantics.
+	mockFw.On("AddIP",
+		mock.MatchedBy(func(ip net.IP) bool { return ip.Equal(net.ParseIP("192.0.2.10")) }),
+		config.ActionAllow, []config.Port(nil)).
+		Run(func(mock.Arguments) { added <- struct{}{} }).
+		Return(true, nil).Once()
+
+	const origin = "allowed.example.com."
+	seedCachedResponse(server, origin, makeCNAMEResponse(origin, []string{"edge.cdn.example.net"}, ""))
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	select {
+	case <-added:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pre-resolve did not add the terminal target's IP to the firewall")
+	}
+
+	// The dedup TTL suppresses a second pre-resolve for the same target — a
+	// repeat CNAME-only response must not exchange (and AddIP, mocked Once)
+	// again.
+	w2 := &MockResponseWriter{}
+	w2.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	query2 := new(dns.Msg)
+	query2.SetQuestion(origin, dns.TypeA)
+	server.handleDNSQuery(w2, query2)
+	time.Sleep(200 * time.Millisecond)
+
+	// The raced block is reconciled, attributed to the allowed origin with
+	// the chain as drill-down.
+	audited := readAuditEvents(t, auditPath)
+	require.Len(t, audited, 1)
+	e := audited[0]
+	assert.Equal(t, events.EventConnectionLateAllowed, e.EventType)
+	assert.Equal(t, "192.0.2.10", e.DstIP)
+	assert.Equal(t, "allowed.example.com", e.DstHostname)
+	assert.Equal(t, "allowed.example.com", e.MatchedRule)
+	assert.Equal(t, []string{"allowed.example.com", "edge.cdn.example.net"}, e.CNAMEChain)
 }

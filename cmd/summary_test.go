@@ -813,3 +813,65 @@ func TestPushToApi_IgnoresUnknownResponseField(t *testing.T) {
 	require.NoError(t, err, "unknown response fields must not break URL extraction")
 	assert.Equal(t, "https://app.codecargo.io/run/789", url)
 }
+
+// Blocked events superseded by a later connection_late_allowed for the same
+// (dst_ip, dst_port, protocol) must be dropped so they aren't pushed to the
+// SaaS as denies (#83): the daemon emits the late-allowed record when the
+// firewall opens for an IP after its connections were already blocked.
+func TestReconcileLateAllowedBlocks(t *testing.T) {
+	base := time.Date(2026, 7, 16, 3, 57, 0, 0, time.UTC)
+	conn := func(eventType events.AuditEventType, ip string, port uint16, protocol string, ts time.Time) events.AuditEvent {
+		return events.AuditEvent{
+			Timestamp: ts,
+			EventType: eventType,
+			DstIP:     ip,
+			DstPort:   port,
+			Protocol:  protocol,
+			Process:   "MainThread",
+		}
+	}
+
+	input := []events.AuditEvent{
+		// Retries blocked before the firewall caught up — all superseded by
+		// the late-allowed record dated at the last retry.
+		conn(events.EventConnectionBlocked, "20.209.113.193", 443, "TCP", base),
+		conn(events.EventConnectionBlocked, "20.209.113.193", 443, "TCP", base.Add(5*time.Second)),
+		conn(events.EventConnectionBlocked, "20.209.113.193", 443, "TCP", base.Add(17*time.Second)),
+		conn(events.EventConnectionLateAllowed, "20.209.113.193", 443, "TCP", base.Add(17*time.Second)),
+		// Same IP, different port: no late-allow for this tuple — kept.
+		conn(events.EventConnectionBlocked, "20.209.113.193", 80, "TCP", base.Add(2*time.Second)),
+		// Same tuple but blocked AFTER the late-allow: blocked again — kept.
+		conn(events.EventConnectionBlocked, "20.209.113.193", 443, "TCP", base.Add(30*time.Second)),
+		// Unrelated destination with no late-allow — kept.
+		conn(events.EventConnectionBlocked, "203.0.113.9", 443, "TCP", base),
+		// Non-blocked events always pass through.
+		conn(events.EventConnectionAllowed, "20.209.178.193", 443, "TCP", base.Add(35*time.Second)),
+	}
+
+	got := reconcileLateAllowedBlocks(input)
+
+	var blockedIPs []string
+	lateAllowed := 0
+	for _, e := range got {
+		switch e.EventType {
+		case events.EventConnectionBlocked:
+			blockedIPs = append(blockedIPs, e.DstIP)
+		case events.EventConnectionLateAllowed:
+			lateAllowed++
+		}
+	}
+	assert.Equal(t, 1, lateAllowed, "the late-allowed record itself is kept")
+	assert.Len(t, got, 5)
+	require.Len(t, blockedIPs, 3)
+	assert.ElementsMatch(t, []string{"20.209.113.193", "20.209.113.193", "203.0.113.9"}, blockedIPs)
+}
+
+// With no late-allowed events the audit stream passes through untouched.
+func TestReconcileLateAllowedBlocks_NoLateAllows(t *testing.T) {
+	input := []events.AuditEvent{
+		makeEvent(t, events.EventConnectionBlocked, "", "203.0.113.9", "curl", 443, time.Now()),
+		makeEvent(t, events.EventConnectionAllowed, "github.com", "140.82.116.3", "git", 443, time.Now()),
+	}
+	got := reconcileLateAllowedBlocks(input)
+	assert.Equal(t, input, got)
+}

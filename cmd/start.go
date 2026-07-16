@@ -228,6 +228,17 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		logger.Info("OpenTelemetry log export enabled", "endpoint", otelExporter.Endpoint())
 	}
 
+	// Late-allow reconciliation (#83): buffer recently blocked connections so
+	// the DNS enforcement path can re-report them as late-allowed once it
+	// opens the firewall for their destination IP. Registered as an audit
+	// sink here — before ProcessBlockedEvents starts — so no blocked event is
+	// missed.
+	if dnsServer != nil && auditLogger != nil {
+		recentBlocks := events.NewRecentBlocks(0)
+		auditLogger.AddSink(recentBlocks)
+		dnsServer.SetRecentBlocks(recentBlocks)
+	}
+
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
 	var apiPolicyLoaded bool
 	if cmd.CIMode() != CIModeNone {

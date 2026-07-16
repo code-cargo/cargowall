@@ -170,8 +170,17 @@ func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPor
 // hostname for plain rules), which can differ from the resolved DstHostname
 // (e.g. rule `*.compute-1.amazonaws.com` matching `ec2-1-2-3-4.compute-1...`).
 func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
+	return a.LogConnectionLateAllowedAt(time.Now(), srcIP, dstIP, hostname, matchedRule, dstPort, process, pid, protocol, cnameChain)
+}
+
+// LogConnectionLateAllowedAt is LogConnectionLateAllowed with an explicit
+// event timestamp. Late-allow reconciliation (#83) dates the event at the
+// original blocked attempt rather than the reconcile time, so step
+// correlation in the summary reflects when the connection actually happened
+// and so the event supersedes every blocked record at or before it.
+func (a *AuditLogger) LogConnectionLateAllowedAt(ts time.Time, srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
 	return a.LogEvent(AuditEvent{
-		Timestamp:   time.Now(),
+		Timestamp:   ts,
 		EventType:   EventConnectionLateAllowed,
 		SrcIP:       srcIP,
 		DstIP:       dstIP,

@@ -104,8 +104,7 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 	defer rb.mu.Unlock()
 
 	key := recentBlockKey{port: event.DstPort, protocol: event.Protocol}
-	byKey := rb.byIP[event.DstIP]
-	if _, exists := byKey[key]; !exists {
+	if _, exists := rb.byIP[event.DstIP][key]; !exists {
 		if rb.size >= maxRecentBlocks {
 			rb.pruneExpiredLocked(time.Now())
 			if rb.size >= maxRecentBlocks {
@@ -114,6 +113,11 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 		}
 		rb.size++
 	}
+	// Resolve the destination's map only after the prune above: pruning an
+	// all-expired destination deletes its map from byIP, so a reference taken
+	// beforehand would be orphaned — the write would land in a map nothing
+	// points at, losing the block while rb.size still counts it.
+	byKey := rb.byIP[event.DstIP]
 	if byKey == nil {
 		byKey = make(map[recentBlockKey]RecentBlock)
 		rb.byIP[event.DstIP] = byKey
@@ -155,12 +159,12 @@ func (rb *RecentBlocks) TakeMatching(dstIP string, allowPorts, denyPorts []confi
 			continue
 		}
 		proto, _ := protocolTypeForAuditName(b.Protocol) // recorded entries always map
-		if !auditPortCovered(allowPorts, b.DstPort, proto) {
+		if !rulePortCovered(allowPorts, b.DstPort, proto) {
 			continue
 		}
 		delete(byKey, key)
 		rb.size--
-		if hasDeny && auditPortCovered(denyPorts, b.DstPort, proto) {
+		if hasDeny && rulePortCovered(denyPorts, b.DstPort, proto) {
 			continue
 		}
 		taken = append(taken, b)
@@ -189,20 +193,6 @@ func (rb *RecentBlocks) pruneExpiredLocked(now time.Time) {
 			delete(rb.byIP, ip)
 		}
 	}
-}
-
-// auditPortCovered reports whether a rule-side port list covers (port, proto).
-// Empty means the side applies to all ports, matching rule semantics.
-func auditPortCovered(ports []config.Port, port uint16, proto config.ProtocolType) bool {
-	if len(ports) == 0 {
-		return true
-	}
-	for _, p := range ports {
-		if p.Port == port && config.ProtocolsOverlap(p.Protocol, proto) {
-			return true
-		}
-	}
-	return false
 }
 
 // protocolTypeForAuditName maps an audit-log protocol name (getProtocolName)

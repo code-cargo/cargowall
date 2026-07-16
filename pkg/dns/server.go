@@ -858,6 +858,17 @@ func (s *Server) extractIPsFromResponse(msg *dns.Msg) ([]net.IP, uint32) {
 // callers know a late-allow reconciliation of earlier blocks is sound. A
 // deny side, a conflict resolving to deny, and a failed BPF write all
 // return false.
+//
+// The answer reflects THIS hostname's verdict, not the IP's full BPF state:
+// CheckIPRuleConflict only consults CIDR rules, so a deny another hostname
+// wrote for a shared IP is invisible here — the same caveat the in-band
+// late-allow path documents (see dstPortAllowedByRule's caller in
+// pkg/events). Under the default-deny configuration this is inert: an allow
+// takes the addIPToBPFMaps path and a deny returns false. It bites only with
+// defaultAction=allow, where an allow side short-circuits without writing and
+// reports true while a shared-IP deny entry survives — reconciliation would
+// then label a still-blocked attempt late-allowed. Enforcement is unaffected;
+// this governs audit reporting only.
 func (s *Server) applyVerdictSide(ip net.IP, hostname string, action config.Action, ports []config.Port, isReprocess bool) bool {
 	ipStr := ip.String()
 	finalAction, hasConflict, conflictingRule := s.config.CheckIPRuleConflict(ip, hostname, action, ports)
@@ -910,9 +921,10 @@ func (s *Server) reconcileRecentBlocks(ip net.IP, hostname, matchedRule string, 
 }
 
 // maxPreResolveDepth bounds recursive pre-resolution when a pre-resolved
-// response is itself CNAME-only: one extra level covers a chain split across
-// query round-trips without letting a malicious server chain pre-resolves
-// indefinitely.
+// response is itself CNAME-only, so a server that keeps answering with yet
+// another CNAME can't chain pre-resolves indefinitely. The client's own
+// response resolves at depth 0, so this permits two further upstream levels —
+// enough for a chain split across query round-trips, with a hop to spare.
 const maxPreResolveDepth = 2
 
 // preResolveDedupTTL rate-limits pre-resolution per target so a client

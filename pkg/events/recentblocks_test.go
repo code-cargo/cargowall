@@ -17,6 +17,7 @@
 package events
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -122,6 +123,74 @@ func TestRecentBlocks_TTLExpiry(t *testing.T) {
 	rb.Consume(blockedAuditEvent("20.0.0.1", 443, "TCP", time.Now()))
 	time.Sleep(80 * time.Millisecond)
 	assert.Empty(t, rb.TakeMatching("20.0.0.1", nil, nil, false))
+}
+
+// reachableEntries counts entries actually reachable from byIP, so a test can
+// assert rb.size against reality rather than against itself.
+func (rb *RecentBlocks) reachableEntries() int {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	n := 0
+	for _, byKey := range rb.byIP {
+		n += len(byKey)
+	}
+	return n
+}
+
+// fillRecentBlocks adds n fresh blocks on distinct destination IPs.
+func fillRecentBlocks(rb *RecentBlocks, n int, at time.Time) {
+	for i := range n {
+		rb.Consume(blockedAuditEvent(fmt.Sprintf("10.%d.%d.%d", i/65536, (i/256)%256, i%256), 443, "TCP", at))
+	}
+}
+
+// A block arriving while the buffer is full, for a destination whose existing
+// entries are all expired, must survive the overflow prune. The prune deletes
+// that destination's emptied map from byIP, so Consume has to resolve the map
+// AFTER pruning — reading it beforehand orphaned the write (the block was lost
+// and unreconcilable) and leaked rb.size, which never recovers and eventually
+// wedges the buffer at capacity, silently disabling reconciliation for the
+// rest of the run.
+func TestRecentBlocks_ConsumeAtCapacityAfterPruningDestination(t *testing.T) {
+	rb := NewRecentBlocks(5 * time.Minute)
+	fresh := time.Now()
+
+	// The victim's only entry is already past the TTL.
+	rb.Consume(blockedAuditEvent("20.209.113.193", 443, "TCP", fresh.Add(-10*time.Minute)))
+	fillRecentBlocks(rb, maxRecentBlocks-1, fresh)
+	require.Equal(t, maxRecentBlocks, rb.size, "precondition: buffer at capacity")
+
+	// New port on the victim IP: not an existing key, so this prunes.
+	rb.Consume(blockedAuditEvent("20.209.113.193", 8443, "TCP", fresh))
+
+	taken := rb.TakeMatching("20.209.113.193", nil, nil, false)
+	require.Len(t, taken, 1, "block must be reconcilable, not written to an orphaned map")
+	assert.Equal(t, uint16(8443), taken[0].DstPort)
+	assert.Equal(t, rb.reachableEntries(), rb.size, "size must track reachable entries, not leak")
+}
+
+// Once the buffer is genuinely full of live entries, new destinations are
+// dropped rather than evicting — reconciliation is best-effort reporting, and
+// enforcement is unaffected. The size counter must stay exact across the drop.
+func TestRecentBlocks_ConsumeAtCapacityDropsNewDestinations(t *testing.T) {
+	rb := NewRecentBlocks(5 * time.Minute)
+	fresh := time.Now()
+
+	fillRecentBlocks(rb, maxRecentBlocks, fresh)
+	require.Equal(t, maxRecentBlocks, rb.size)
+
+	rb.Consume(blockedAuditEvent("20.209.113.193", 443, "TCP", fresh))
+	assert.Empty(t, rb.TakeMatching("20.209.113.193", nil, nil, false), "overflow drops rather than evicting")
+	assert.Equal(t, rb.reachableEntries(), rb.size)
+
+	// A repeat block on an already-buffered tuple still refreshes in place:
+	// it needs no new slot, so capacity must not turn it away.
+	last := fresh.Add(time.Second)
+	rb.Consume(blockedAuditEvent("10.0.0.0", 443, "TCP", last))
+	taken := rb.TakeMatching("10.0.0.0", nil, nil, false)
+	require.Len(t, taken, 1)
+	assert.True(t, taken[0].At.Equal(last), "latest attempt must win even at capacity")
+	assert.Equal(t, rb.reachableEntries(), rb.size)
 }
 
 // The buffer plugs into the audit stream as an EventSink; verify events

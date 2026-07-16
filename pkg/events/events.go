@@ -226,6 +226,11 @@ func ipProtoToConfigProtocol(proto uint8) (config.ProtocolType, bool) {
 // permitted by an allow rule whose port restrictions are `ports`. An empty
 // `ports` means the rule allows all ports. An unknown L4 proto fails closed
 // (no overlap, even with ProtocolAll rules) — see ipProtoToConfigProtocol.
+//
+// Shares rulePortCovered with the late-allow reconciliation path, which
+// reaches the same question from an audit-log protocol name rather than an L4
+// byte: both decide "does this rule side cover the connection?", and the
+// reconciler's mixed-verdict handling is only correct if it matches this one.
 func dstPortAllowedByRule(dstPort uint16, proto uint8, ports []config.Port) bool {
 	if len(ports) == 0 {
 		return true
@@ -234,8 +239,17 @@ func dstPortAllowedByRule(dstPort uint16, proto uint8, ports []config.Port) bool
 	if !ok {
 		return false
 	}
+	return rulePortCovered(ports, dstPort, eventProto)
+}
+
+// rulePortCovered reports whether a rule-side port list covers (port, proto).
+// An empty list means the side applies to all ports, matching rule semantics.
+func rulePortCovered(ports []config.Port, port uint16, proto config.ProtocolType) bool {
+	if len(ports) == 0 {
+		return true
+	}
 	for _, p := range ports {
-		if p.Port == dstPort && config.ProtocolsOverlap(p.Protocol, eventProto) {
+		if p.Port == port && config.ProtocolsOverlap(p.Protocol, proto) {
 			return true
 		}
 	}

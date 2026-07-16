@@ -98,7 +98,7 @@ type StartCmd struct {
 	AuditLog  string `help:"Path to write JSON audit log for step correlation" env:"CARGOWALL_AUDIT_LOG"`
 
 	// Pre-existing connection handling
-	AllowExistingConnections bool `help:"Allow pre-existing TCP/UDP connections at startup (scans /proc/net/{tcp,udp}{,6}, re-scans just before enforcement; remote IPs are loaded into allow maps)" default:"false" env:"CARGOWALL_ALLOW_EXISTING_CONNECTIONS"`
+	AllowExistingConnections bool `help:"Allow pre-existing TCP/UDP connections at startup (scans /proc/net/{tcp,udp}{,6}, re-scans just before enforcement; rule-matched peers use rule ports, unidentified peers are allowed only on their observed ports)" default:"false" env:"CARGOWALL_ALLOW_EXISTING_CONNECTIONS"`
 
 	// Pidfile pairs with the `cargowall stop` subcommand. Backgrounding is
 	// delegated to the shell (`cargowall start --pidfile X &`) — true Unix

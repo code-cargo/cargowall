@@ -17,11 +17,13 @@
 package cmd
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
@@ -50,23 +52,24 @@ func TestGateExistingConnections_InheritsRulePorts(t *testing.T) {
 	fw := firewall.NewMockFirewall(t)
 	fw.EXPECT().AddIP(net.ParseIP("1.2.3.4"), config.ActionAllow, wantPorts).Return(true, nil).Once()
 
-	gateExistingConnections([]string{"1.2.3.4"}, cm, fw, nil, quietLogger())
+	gateExistingConnections(existingConns{"1.2.3.4": {{Port: 443, Protocol: config.ProtocolTCP}}}, cm, fw, nil, quietLogger())
 }
 
-// Pre-existing connections to IPs we can't identify keep the all-ports allow
-// policy so we don't break running processes at startup.
-func TestGateExistingConnections_UnresolvableStillAllAllowed(t *testing.T) {
+// Pre-existing connections to IPs we can't identify are kept alive, but only
+// on their observed remote ports — an unidentifiable peer must not be opened
+// on every port.
+func TestGateExistingConnections_UnresolvableAllowsObservedPortsOnly(t *testing.T) {
 	cm := config.NewConfigManager()
 	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
 
+	observed := []config.Port{
+		{Port: 8443, Protocol: config.ProtocolTCP},
+		{Port: 4433, Protocol: config.ProtocolUDP},
+	}
 	fw := firewall.NewMockFirewall(t)
-	// The matcher needs the typed nil ([]config.Port(nil)) — testify's mock
-	// uses ObjectsAreEqual, which treats untyped nil and a typed nil slice
-	// as different. The production code passes the result of MatchHostnameRule,
-	// whose third return is a typed nil for the unresolvable case.
-	fw.EXPECT().AddIP(net.ParseIP("203.0.113.5"), config.ActionAllow, []config.Port(nil)).Return(true, nil).Once()
+	fw.EXPECT().AddIP(net.ParseIP("203.0.113.5"), config.ActionAllow, observed).Return(true, nil).Once()
 
-	gateExistingConnections([]string{"203.0.113.5"}, cm, fw, nil, quietLogger())
+	gateExistingConnections(existingConns{"203.0.113.5": observed}, cm, fw, nil, quietLogger())
 }
 
 // Denied pre-existing connections must not be added to the allowlist —
@@ -80,7 +83,7 @@ func TestGateExistingConnections_DeniedHostnameNotAdded(t *testing.T) {
 
 	fw := firewall.NewMockFirewall(t)
 
-	gateExistingConnections([]string{"10.20.30.40"}, cm, fw, nil, quietLogger())
+	gateExistingConnections(existingConns{"10.20.30.40": {{Port: 443, Protocol: config.ProtocolTCP}}}, cm, fw, nil, quietLogger())
 }
 
 // hostnameRulesFor returns the allow-rule hostname strings tagged with the
@@ -441,23 +444,30 @@ func writeProcNetFixture(t *testing.T, name string, lines []string) string {
 
 func TestScanProcNet(t *testing.T) {
 	// Remote addresses are hex little-endian per 4-byte group:
-	// "22D8B85D" = 93.184.216.34, "0100007F" = 127.0.0.1.
+	// "22D8B85D" = 93.184.216.34, "0100007F" = 127.0.0.1. Ports are
+	// big-endian hex: 01BB = 443, 0050 = 80, 0035 = 53.
 	tests := []struct {
 		name       string
 		lines      []string
 		isIPv6     bool
 		wantStates map[string]bool
-		want       []string
+		proto      config.ProtocolType
+		want       map[string][]config.Port
 	}{
 		{
-			name: "tcp keeps established and in-flight handshakes",
+			name: "tcp keeps established and in-flight handshakes with observed ports",
 			lines: []string{
 				"   0: 0100000A:D431 22D8B85D:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 1", // ESTABLISHED
 				"   1: 0100000A:D432 0101A8C0:0050 02 00000000:00000000 00:00000000 00000000  1000        0 2", // SYN_SENT
 				"   2: 0100000A:D433 0201A8C0:0050 03 00000000:00000000 00:00000000 00000000  1000        0 3", // SYN_RECV
 			},
 			wantStates: tcpScanStates,
-			want:       []string{"93.184.216.34", "192.168.1.1", "192.168.1.2"},
+			proto:      config.ProtocolTCP,
+			want: map[string][]config.Port{
+				"93.184.216.34": {{Port: 443, Protocol: config.ProtocolTCP}},
+				"192.168.1.1":   {{Port: 80, Protocol: config.ProtocolTCP}},
+				"192.168.1.2":   {{Port: 80, Protocol: config.ProtocolTCP}},
+			},
 		},
 		{
 			name: "tcp skips closing and listening states",
@@ -466,7 +476,8 @@ func TestScanProcNet(t *testing.T) {
 				"   1: 0100000A:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 2", // LISTEN
 			},
 			wantStates: tcpScanStates,
-			want:       nil,
+			proto:      config.ProtocolTCP,
+			want:       map[string][]config.Port{},
 		},
 		{
 			name: "skips loopback and zero remotes even in wanted states",
@@ -475,7 +486,8 @@ func TestScanProcNet(t *testing.T) {
 				"   1: 0100000A:D432 00000000:0000 01 00000000:00000000 00:00000000 00000000  1000        0 2", // unspecified
 			},
 			wantStates: tcpScanStates,
-			want:       nil,
+			proto:      config.ProtocolTCP,
+			want:       map[string][]config.Port{},
 		},
 		{
 			name: "udp keeps connected sockets only",
@@ -484,7 +496,10 @@ func TestScanProcNet(t *testing.T) {
 				"   1: 0100000A:8236 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 2", // unconnected
 			},
 			wantStates: udpScanStates,
-			want:       []string{"93.184.216.34"},
+			proto:      config.ProtocolUDP,
+			want: map[string][]config.Port{
+				"93.184.216.34": {{Port: 53, Protocol: config.ProtocolUDP}},
+			},
 		},
 		{
 			name: "malformed lines are skipped",
@@ -492,10 +507,14 @@ func TestScanProcNet(t *testing.T) {
 				"garbage",
 				"   0: 0100000A:D431",
 				"   1: 0100000A:D431 ZZZZZZZZ:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 1",
-				"   2: 0100000A:D431 22D8B85D:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 2",
+				"   2: 0100000A:D431 22D8B85D:ZZZZ 01 00000000:00000000 00:00000000 00000000  1000        0 2",
+				"   3: 0100000A:D431 22D8B85D:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 3",
 			},
 			wantStates: tcpScanStates,
-			want:       []string{"93.184.216.34"},
+			proto:      config.ProtocolTCP,
+			want: map[string][]config.Port{
+				"93.184.216.34": {{Port: 443, Protocol: config.ProtocolTCP}},
+			},
 		},
 		{
 			name: "ipv6 decodes groups and skips link-local",
@@ -506,39 +525,174 @@ func TestScanProcNet(t *testing.T) {
 			},
 			isIPv6:     true,
 			wantStates: tcpScanStates,
-			want:       []string{"2001:db8::123:4567:89ab:cdef"},
+			proto:      config.ProtocolTCP,
+			want: map[string][]config.Port{
+				"2001:db8::123:4567:89ab:cdef": {{Port: 443, Protocol: config.ProtocolTCP}},
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := writeProcNetFixture(t, "procnet", tt.lines)
-			seen := make(map[string]bool)
-			require.NoError(t, scanProcNet(path, tt.isIPv6, tt.wantStates, seen))
+			seen := make(map[string]map[config.Port]bool)
+			require.NoError(t, scanProcNet(path, tt.isIPv6, tt.wantStates, tt.proto, seen))
 
-			got := make([]string, 0, len(seen))
-			for ip := range seen {
-				got = append(got, ip)
+			got := make(map[string][]config.Port, len(seen))
+			for ip, ports := range seen {
+				for p := range ports {
+					got[ip] = append(got[ip], p)
+				}
 			}
-			require.ElementsMatch(t, tt.want, got)
+			require.Len(t, got, len(tt.want))
+			for ip, wantPorts := range tt.want {
+				require.ElementsMatch(t, wantPorts, got[ip], "ports for %s", ip)
+			}
 		})
 	}
 }
 
-// The exclude set lets the pre-attach re-scan return only connections that
-// appeared after the initial scan. Excluded IPs must never reappear.
+// hexIPv4LE encodes an IPv4 address in the little-endian hex format used by
+// /proc/net/tcp remote-address columns.
+func hexIPv4LE(t *testing.T, ip string) string {
+	t.Helper()
+	b := net.ParseIP(ip).To4()
+	require.NotNil(t, b, "not an IPv4 address: %s", ip)
+	return fmt.Sprintf("%02X%02X%02X%02X", b[3], b[2], b[1], b[0])
+}
+
+// tcpTuple is shorthand for an observed TCP remote port in tests.
+func tcpTuple(port uint16) config.Port {
+	return config.Port{Port: port, Protocol: config.ProtocolTCP}
+}
+
+// withProcNetFixture points procNetSources at a single fixture file listing
+// the given remote "ip:port" TCP tuples as ESTABLISHED connections,
+// restoring the real /proc sources when the test ends.
+func withProcNetFixture(t *testing.T, tuples ...string) {
+	t.Helper()
+	lines := make([]string, 0, len(tuples))
+	for i, tuple := range tuples {
+		host, portStr, err := net.SplitHostPort(tuple)
+		require.NoError(t, err, "fixture tuple must be ip:port: %s", tuple)
+		port, err := strconv.ParseUint(portStr, 10, 16)
+		require.NoError(t, err)
+		lines = append(lines, fmt.Sprintf("   %d: 0100000A:D431 %s:%04X 01 00000000:00000000 00:00000000 00000000  1000        0 1", i, hexIPv4LE(t, host), port))
+	}
+	path := writeProcNetFixture(t, "tcp", lines)
+	saved := procNetSources
+	procNetSources = []procNetSource{{path: path, states: tcpScanStates, proto: config.ProtocolTCP}}
+	t.Cleanup(func() { procNetSources = saved })
+}
+
+// The exclude set lets the pre-attach re-scan return only tuples that
+// appeared after the initial scan — including a new port on an already-seen
+// peer.
 func TestScanExistingConnections_Exclude(t *testing.T) {
-	first, err := scanExistingConnections(nil)
-	require.NoError(t, err)
+	withProcNetFixture(t, "198.51.100.7:443", "198.51.100.7:8443", "203.0.113.9:443")
 
-	exclude := make(map[string]bool, len(first))
-	for _, ip := range first {
-		exclude[ip] = true
-	}
-
-	delta, err := scanExistingConnections(exclude)
+	all, err := scanExistingConnections(nil)
 	require.NoError(t, err)
-	for _, ip := range delta {
-		require.False(t, exclude[ip], "excluded IP %s reappeared in the delta scan", ip)
+	require.Equal(t, existingConns{
+		"198.51.100.7": {tcpTuple(443), tcpTuple(8443)},
+		"203.0.113.9":  {tcpTuple(443)},
+	}, all)
+
+	delta, err := scanExistingConnections(map[string]bool{
+		tupleKey("198.51.100.7", tcpTuple(443)): true,
+		tupleKey("203.0.113.9", tcpTuple(443)):  true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, existingConns{
+		"198.51.100.7": {tcpTuple(8443)},
+	}, delta, "a new port on an already-gated peer must still surface in the delta")
+}
+
+// A missing optional source (e.g. IPv6 disabled) must not fail the scan; a
+// missing required source must.
+func TestScanExistingConnections_OptionalSourceMayBeAbsent(t *testing.T) {
+	path := writeProcNetFixture(t, "tcp", []string{
+		"   0: 0100000A:D431 " + hexIPv4LE(t, "198.51.100.7") + ":01BB 01 00000000:00000000 00:00000000 00000000  1000        0 1",
+	})
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+
+	saved := procNetSources
+	t.Cleanup(func() { procNetSources = saved })
+
+	procNetSources = []procNetSource{
+		{path: path, states: tcpScanStates, proto: config.ProtocolTCP},
+		{path: missing, states: udpScanStates, proto: config.ProtocolUDP, optional: true},
 	}
+	conns, err := scanExistingConnections(nil)
+	require.NoError(t, err)
+	require.Equal(t, existingConns{"198.51.100.7": {tcpTuple(443)}}, conns)
+
+	procNetSources = []procNetSource{{path: missing, states: tcpScanStates, proto: config.ProtocolTCP}}
+	_, err = scanExistingConnections(nil)
+	require.Error(t, err)
+}
+
+// Regression: --allow-existing-connections used to be a silent no-op unless
+// --prepopulate-dns-cache was also set (the scan only ran inside the
+// prepopulate block, so the gate never received IPs). The scan must run for
+// either flag alone, and not at all when both are off.
+func TestScanExistingForStartup_EitherFlagScans(t *testing.T) {
+	withProcNetFixture(t, "198.51.100.7:443")
+	want := existingConns{"198.51.100.7": {tcpTuple(443)}}
+
+	allowOnly := &StartCmd{AllowExistingConnections: true}
+	require.Equal(t, want, scanExistingForStartup(allowOnly, quietLogger()))
+
+	prepopOnly := &StartCmd{PrepopulateDNSCache: true}
+	require.Equal(t, want, scanExistingForStartup(prepopOnly, quietLogger()))
+
+	require.Nil(t, scanExistingForStartup(&StartCmd{}, quietLogger()))
+}
+
+func TestGateExistingStartupConnections_GatesAndRecords(t *testing.T) {
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	// Unmatched IP: the allow must be scoped to the observed tuple.
+	fw := firewall.NewMockFirewall(t)
+	fw.EXPECT().AddIP(net.ParseIP("198.51.100.7"), config.ActionAllow, []config.Port{tcpTuple(443)}).Return(true, nil).Once()
+
+	cmd := &StartCmd{AllowExistingConnections: true}
+	gated := gateExistingStartupConnections(cmd, existingConns{"198.51.100.7": {tcpTuple(443)}}, cm, fw, nil, quietLogger())
+	require.True(t, gated[tupleKey("198.51.100.7", tcpTuple(443))],
+		"gated tuples must be recorded for the delta re-scan")
+}
+
+// With the flag off nothing is gated — NewMockFirewall(t) fails the test on
+// any unexpected AddIP call.
+func TestGateExistingStartupConnections_FlagOffDoesNotGate(t *testing.T) {
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	fw := firewall.NewMockFirewall(t)
+	require.Nil(t, gateExistingStartupConnections(&StartCmd{}, existingConns{"198.51.100.7": {tcpTuple(443)}}, cm, fw, nil, quietLogger()))
+}
+
+// The pre-attach re-scan must gate only tuples that appeared after the
+// initial scan — already-gated tuples must not be re-processed, but a new
+// port on an already-gated peer must be.
+func TestRescanAndGateDelta_GatesOnlyNewConnections(t *testing.T) {
+	withProcNetFixture(t, "198.51.100.7:443", "198.51.100.7:8443", "203.0.113.9:443")
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	fw := firewall.NewMockFirewall(t)
+	fw.EXPECT().AddIP(net.ParseIP("198.51.100.7"), config.ActionAllow, []config.Port{tcpTuple(8443)}).Return(true, nil).Once()
+	fw.EXPECT().AddIP(net.ParseIP("203.0.113.9"), config.ActionAllow, []config.Port{tcpTuple(443)}).Return(true, nil).Once()
+
+	cmd := &StartCmd{AllowExistingConnections: true}
+	rescanAndGateDelta(cmd, map[string]bool{tupleKey("198.51.100.7", tcpTuple(443)): true}, cm, fw, nil, quietLogger())
+}
+
+func TestRescanAndGateDelta_FlagOffDoesNotScan(t *testing.T) {
+	withProcNetFixture(t, "198.51.100.7:443")
+
+	fw := firewall.NewMockFirewall(t)
+	rescanAndGateDelta(&StartCmd{}, nil, config.NewConfigManager(), fw, nil, quietLogger())
 }

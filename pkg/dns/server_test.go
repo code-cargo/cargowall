@@ -3194,3 +3194,116 @@ func TestHandleDNSQuery_PreResolvesCNAMEOnlyResponse(t *testing.T) {
 	assert.Equal(t, "allowed.example.com", e.MatchedRule)
 	assert.Equal(t, []string{"allowed.example.com", "edge.cdn.example.net"}, e.CNAMEChain)
 }
+
+// Under defaultAction=allow an allow verdict that matches the default writes
+// nothing to BPF — so it must NOT claim an open for reconciliation. Any block
+// buffered for the IP under default-allow necessarily came from a deny entry
+// (possibly written for a shared IP by another hostname) that this resolution
+// did not remove; labeling it late-allowed would be wrong.
+func TestHandleDNSQuery_DefaultAllowDoesNotReconcile(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow},
+	}, config.ActionAllow))
+
+	// NewMockFirewall(t) fails the test on any unexpected AddIP: the
+	// default-action short-circuit must not write either.
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+
+	auditPath := filepath.Join(t.TempDir(), "audit.json")
+	auditLogger, err := events.NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	server.SetAuditLogger(auditLogger)
+
+	recentBlocks := events.NewRecentBlocks(0)
+	recentBlocks.Consume(events.AuditEvent{
+		Timestamp: time.Now().Add(-5 * time.Second),
+		EventType: events.EventConnectionBlocked,
+		SrcIP:     "10.1.0.215",
+		DstIP:     "192.0.2.20",
+		DstPort:   443,
+		Protocol:  "TCP",
+	})
+	server.SetRecentBlocks(recentBlocks)
+
+	const qname = "allowed.example.com."
+	seedCachedResponse(server, qname, makeCachedResponse(qname, "192.0.2.20"))
+
+	query := new(dns.Msg)
+	query.SetQuestion(qname, dns.TypeA)
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	assert.Empty(t, readAuditEvents(t, auditPath), "no late-allowed event may be emitted")
+	assert.Len(t, recentBlocks.TakeMatching("192.0.2.20", nil, nil, false), 1,
+		"the block must stay buffered — nothing was opened")
+}
+
+// A derived CNAME allow must respect the origin's mixed verdict during
+// reconciliation: blocks on origin-denied ports stay blocked (and are removed
+// from the buffer), only allow-covered blocks are re-reported late-allowed —
+// the same allowMatches && !denyMatches rule the in-band path applies.
+func TestHandleDNSQuery_DerivedReconcileRespectsOriginDenyPorts(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow},
+		{
+			Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionDeny,
+			Ports: []config.Port{{Port: 80, Protocol: config.ProtocolTCP}},
+		},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+
+	auditPath := filepath.Join(t.TempDir(), "audit.json")
+	auditLogger, err := events.NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	server.SetAuditLogger(auditLogger)
+
+	// The edge was learned as a CNAME target of the mixed-verdict origin.
+	const origin = "allowed.example.com"
+	const edge = "edge.cdn.example.net"
+	server.cnameAllowed.Put(edge, derivedAllow{chain: []string{origin, edge}}, 5*time.Minute)
+
+	// Two raced blocks on the edge IP: one on an origin-denied port, one on
+	// an allow-covered port.
+	recentBlocks := events.NewRecentBlocks(0)
+	for _, port := range []uint16{80, 443} {
+		recentBlocks.Consume(events.AuditEvent{
+			Timestamp: time.Now().Add(-2 * time.Second),
+			EventType: events.EventConnectionBlocked,
+			SrcIP:     "10.1.0.215",
+			DstIP:     "192.0.2.30",
+			DstPort:   port,
+			Protocol:  "TCP",
+		})
+	}
+	server.SetRecentBlocks(recentBlocks)
+
+	seedCachedResponse(server, edge+".", makeCachedResponse(edge+".", "192.0.2.30"))
+	mockFw.On("AddIP", net.ParseIP("192.0.2.30"), config.ActionAllow, []config.Port(nil)).Return(true, nil).Once()
+
+	query := new(dns.Msg)
+	query.SetQuestion(edge+".", dns.TypeA)
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+	mockFw.AssertExpectations(t)
+
+	audited := readAuditEvents(t, auditPath)
+	require.Len(t, audited, 1, "only the allow-covered block may be late-allowed")
+	assert.Equal(t, events.EventConnectionLateAllowed, audited[0].EventType)
+	assert.Equal(t, uint16(443), audited[0].DstPort)
+	assert.Equal(t, origin, audited[0].DstHostname)
+
+	// The denied-port block was removed without being re-reported, so a later
+	// pass can't mislabel it either.
+	assert.Empty(t, recentBlocks.TakeMatching("192.0.2.30", nil, nil, false))
+}

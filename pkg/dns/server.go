@@ -661,13 +661,19 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 				// Reconciliation attribution: the origin hostname the user
 				// actually allowed (recordChain[0]) and the rule that
 				// admitted it — re-matched here because the derived cache
-				// stores only the chain, not the rule.
+				// stores only the chain, not the rule. The origin's deny
+				// side must flow into reconciliation too: with a mixed
+				// verdict (deny on some ports, allow on others), blocks on
+				// origin-denied ports would otherwise be mislabeled
+				// late-allowed — the in-band path judges with the full
+				// verdict, and the reconciler is only correct if it matches.
 				origin := canonicalHostname
 				if len(recordChain) > 0 && recordChain[0] != "" {
 					origin = recordChain[0]
 				}
+				ov := s.config.MatchHostnameRule(origin)
 				originRule := ""
-				if ov := s.config.MatchHostnameRule(origin); ov.HasAllow() {
+				if ov.HasAllow() {
 					originRule = ov.AllowRule
 				}
 
@@ -681,7 +687,7 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 					// attribution once this one goes stale.
 					s.config.RecordCNAMEChain(ip.String(), recordChain, time.Duration(ttl)*time.Second)
 					if allowed {
-						s.reconcileRecentBlocks(ip, origin, originRule, derivedPorts, nil, false, recordChain)
+						s.reconcileRecentBlocks(ip, origin, originRule, derivedPorts, ov.DenyPorts, ov.HasDeny(), recordChain)
 					}
 				}
 			case !verdict.Matched():
@@ -853,22 +859,19 @@ func (s *Server) extractIPsFromResponse(msg *dns.Msg) ([]net.IP, uint32) {
 // default. `isReprocess` annotates log wording so the rule-reprocess pass
 // is distinguishable from resolution-time writes in audit logs.
 //
-// Returns whether the IP's traffic on this side's ports is now allowed —
-// the allow entry was written (or the default already allows it) — so
-// callers know a late-allow reconciliation of earlier blocks is sound. A
-// deny side, a conflict resolving to deny, and a failed BPF write all
-// return false.
+// Returns whether this call OPENED the firewall for the IP on this side's
+// ports — an allow entry was actually written — so callers know a late-allow
+// reconciliation of earlier blocks is sound. A deny side, a conflict
+// resolving to deny, a failed BPF write, and the default-action short-circuit
+// all return false.
 //
-// The answer reflects THIS hostname's verdict, not the IP's full BPF state:
-// CheckIPRuleConflict only consults CIDR rules, so a deny another hostname
-// wrote for a shared IP is invisible here — the same caveat the in-band
-// late-allow path documents (see dstPortAllowedByRule's caller in
-// pkg/events). Under the default-deny configuration this is inert: an allow
-// takes the addIPToBPFMaps path and a deny returns false. It bites only with
-// defaultAction=allow, where an allow side short-circuits without writing and
-// reports true while a shared-IP deny entry survives — reconciliation would
-// then label a still-blocked attempt late-allowed. Enforcement is unaffected;
-// this governs audit reporting only.
+// The short-circuit returns false even when the default is allow: no BPF
+// write happened, so nothing changed for the IP now. CheckIPRuleConflict only
+// consults CIDR rules, so a deny another hostname wrote for a shared IP is
+// invisible here — claiming an open would let reconciliation label a
+// still-blocked attempt late-allowed. Under default-allow any buffered block
+// for the IP necessarily came from such a deny entry, which this call did
+// not remove.
 func (s *Server) applyVerdictSide(ip net.IP, hostname string, action config.Action, ports []config.Port, isReprocess bool) bool {
 	ipStr := ip.String()
 	finalAction, hasConflict, conflictingRule := s.config.CheckIPRuleConflict(ip, hostname, action, ports)
@@ -880,7 +883,7 @@ func (s *Server) applyVerdictSide(ip net.IP, hostname string, action config.Acti
 			"final_action", finalAction)
 	}
 	if finalAction == s.config.GetDefaultAction() {
-		return finalAction == config.ActionAllow
+		return false
 	}
 	if err := s.addIPToBPFMaps(ip, hostname, finalAction, ports); err != nil {
 		s.logger.Error(maybeReprocessMsg("Failed to add IP to BPF maps", isReprocess),

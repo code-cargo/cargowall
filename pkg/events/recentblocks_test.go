@@ -211,3 +211,20 @@ func TestRecentBlocks_AsAuditSink(t *testing.T) {
 	assert.Equal(t, uint32(2411), taken[0].PID)
 	assert.False(t, taken[0].At.IsZero())
 }
+
+// Mid-stream drops (established connections killed at attach) log as
+// connection_blocked with the MidStream marker; the reconciler must recover
+// them like any other block.
+func TestRecentBlocks_MidStreamBlockIsReconcilable(t *testing.T) {
+	rb := NewRecentBlocks(0)
+	al, err := NewAuditLogger("", false)
+	require.NoError(t, err)
+	defer al.Close()
+	al.AddSink(rb)
+
+	require.NoError(t, al.LogConnectionBlockedMidStream("10.0.0.1", "20.209.112.225", "", 443, "curl", 42, "TCP", nil))
+
+	taken := rb.TakeMatching("20.209.112.225", nil, nil, false)
+	require.Len(t, taken, 1)
+	assert.Equal(t, uint16(443), taken[0].DstPort)
+}

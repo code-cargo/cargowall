@@ -103,11 +103,14 @@ struct port_key_v6 {
 
 // ---- Event struct with version discriminator ----
 
+// Event flags (blocked_event.flags bit field)
+#define EVENT_FLAG_MIDSTREAM 0x1  // non-SYN TCP drop: established connection killed mid-stream
+
 struct blocked_event {
     __u8 ip_version;   // 4 or 6
     __u8 allowed;      // 0 = blocked, 1 = allowed
     __u8 ip_proto;     // L4 protocol (IPPROTO_TCP, IPPROTO_UDP, IPPROTO_ICMP, …)
-    __u8 pad1;
+    __u8 flags;        // EVENT_FLAG_* bits (was padding; wire layout unchanged)
     __u32 src_ip;      // IPv4 (used when ip_version == 4)
     __u32 dst_ip;
     __u16 src_port;
@@ -185,6 +188,30 @@ struct {
     __uint(max_entries, 65536);
 } map_sock_pid SEC(".maps");
 
+// Rate-limit maps for mid-stream drop events: a killed TCP connection
+// retransmits for minutes (and in audit mode non-SYN data segments flow
+// continuously), so emit at most one event per (dst_ip, dst_port, proto)
+// per interval. 10s caps a tuple at 6 events/min while refreshing well
+// inside the 5-minute RecentBlocks TTL, so the late-allow reconciler always
+// has a live entry. 4096 entries matches the rule maps — one per distinct
+// blocked destination tuple, ~110KB worst case. LRU eviction under pressure
+// costs an occasional duplicate event, never a lost verdict.
+#define MIDSTREAM_EMIT_INTERVAL_NS (10ULL * 1000000000ULL)
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, struct port_key);
+    __type(value, __u64);   // last emit, bpf_ktime_get_ns()
+    __uint(max_entries, 4096);
+} map_midstream_seen SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, struct port_key_v6);
+    __type(value, __u64);   // last emit, bpf_ktime_get_ns()
+    __uint(max_entries, 4096);
+} map_midstream_seen_v6 SEC(".maps");
+
 
 // Helper: check audit mode and return appropriate action
 static __always_inline int check_audit_or_block(void) {
@@ -196,14 +223,48 @@ static __always_inline int check_audit_or_block(void) {
     return TC_ACT_SHOT;  // Enforce mode: block
 }
 
+// Helper: rate-limit mid-stream drop events per IPv4 destination tuple.
+// A concurrent lookup/update race across CPUs costs at most one duplicate
+// event — not worth an atomic.
+static __always_inline int midstream_should_emit(__u32 dst_ip_nbo, __u16 dst_port, __u8 proto) {
+    struct port_key key = {
+        .ip = dst_ip_nbo,
+        .port = dst_port,
+        .proto = proto,
+        .pad = 0
+    };
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *last = bpf_map_lookup_elem(&map_midstream_seen, &key);
+    if (last && now - *last < MIDSTREAM_EMIT_INTERVAL_NS)
+        return 0;
+    bpf_map_update_elem(&map_midstream_seen, &key, &now, BPF_ANY);
+    return 1;
+}
+
+// Helper: rate-limit mid-stream drop events per IPv6 destination tuple.
+static __always_inline int midstream_should_emit_v6(const __u8 dst_ip6[16], __u16 dst_port, __u8 proto) {
+    struct port_key_v6 key;
+    __builtin_memset(&key, 0, sizeof(key));
+    __builtin_memcpy(key.ip, dst_ip6, 16);
+    key.port = dst_port;
+    key.proto = proto;
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *last = bpf_map_lookup_elem(&map_midstream_seen_v6, &key);
+    if (last && now - *last < MIDSTREAM_EMIT_INTERVAL_NS)
+        return 0;
+    bpf_map_update_elem(&map_midstream_seen_v6, &key, &now, BPF_ANY);
+    return 1;
+}
+
 // Helper: submit an event for IPv4
-static __always_inline void submit_event_v4(struct __sk_buff *skb, __u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 ip_proto, __u8 is_allowed) {
+static __always_inline void submit_event_v4(struct __sk_buff *skb, __u32 src_ip, __u32 dst_ip, __u16 src_port, __u16 dst_port, __u8 ip_proto, __u8 is_allowed, __u8 flags) {
     struct blocked_event *evt = bpf_ringbuf_reserve(&map_events, sizeof(*evt), 0);
     if (evt) {
         __builtin_memset(evt, 0, sizeof(*evt));
         evt->ip_version = 4;
         evt->allowed = is_allowed;
         evt->ip_proto = ip_proto;
+        evt->flags = flags;
         evt->src_ip = src_ip;
         evt->dst_ip = dst_ip;
         evt->src_port = src_port;
@@ -219,7 +280,7 @@ static __always_inline void submit_event_v4(struct __sk_buff *skb, __u32 src_ip,
 // Helper: emit an IPv4 protocol-block event. dst_port carries the protocol
 // number (userspace keys on src_port==0 && dst_port<256 to decode it).
 static __always_inline void submit_protocol_block_v4(struct __sk_buff *skb, __u32 src_ip, __u32 dst_ip, __u8 ip_proto) {
-    submit_event_v4(skb, src_ip, dst_ip, 0, ip_proto, ip_proto, 0);
+    submit_event_v4(skb, src_ip, dst_ip, 0, ip_proto, ip_proto, 0, 0);
 }
 
 // Helper: check if nexthdr is an IPv6 extension header
@@ -232,13 +293,14 @@ static __always_inline int is_ipv6_ext_hdr(__u8 nexthdr) {
 }
 
 // Helper: submit an event for IPv6
-static __always_inline void submit_event_v6(struct __sk_buff *skb, __u8 src_ip6[16], __u8 dst_ip6[16], __u16 src_port, __u16 dst_port, __u8 ip_proto, __u8 is_allowed) {
+static __always_inline void submit_event_v6(struct __sk_buff *skb, __u8 src_ip6[16], __u8 dst_ip6[16], __u16 src_port, __u16 dst_port, __u8 ip_proto, __u8 is_allowed, __u8 flags) {
     struct blocked_event *evt = bpf_ringbuf_reserve(&map_events, sizeof(*evt), 0);
     if (evt) {
         __builtin_memset(evt, 0, sizeof(*evt));
         evt->ip_version = 6;
         evt->allowed = is_allowed;
         evt->ip_proto = ip_proto;
+        evt->flags = flags;
         evt->src_port = src_port;
         evt->dst_port = dst_port;
         __builtin_memcpy(evt->src_ip6, src_ip6, 16);
@@ -395,15 +457,24 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
 
     if (!allowed) {
         if (is_tcp_syn || ip_proto == IPPROTO_UDP) {
-            submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0);
+            submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0, 0);
         } else if (ip_proto == IPPROTO_ICMP) {
             submit_protocol_block_v4(skb, src_ip, dst_ip, ip_proto);
+        } else if (ip_proto == IPPROTO_TCP && !is_non_first_fragment) {
+            // Mid-stream TCP drop: an established connection killed because
+            // its destination isn't allowed. Previously silent — invisible
+            // to audit and the late-allow reconciler. Rate-limited per dst
+            // tuple; non-first fragments carry no L4 header (port 0), so
+            // they stay silent as before.
+            if (midstream_should_emit(dst_ip_nbo, dst_port, ip_proto)) {
+                submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0, EVENT_FLAG_MIDSTREAM);
+            }
         }
         return check_audit_or_block();
     }
 
     if (is_tcp_syn) {
-        submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 1);
+        submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 1, 0);
     }
     return TC_ACT_OK;
 }
@@ -479,7 +550,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
 
     // Only allow TCP and UDP - block other protocols
     if (nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP) {
-        submit_event_v6(skb, src_ip6, dst_ip6, 0, nexthdr, nexthdr, 0);
+        submit_event_v6(skb, src_ip6, dst_ip6, 0, nexthdr, nexthdr, 0, 0);
         return check_audit_or_block();
     }
 
@@ -582,13 +653,18 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
 
     if (!allowed) {
         if (is_tcp_syn || nexthdr == IPPROTO_UDP) {
-            submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0);
+            submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0, 0);
+        } else if (nexthdr == IPPROTO_TCP && !is_non_first_fragment) {
+            // Mid-stream TCP drop — see the IPv4 branch for rationale.
+            if (midstream_should_emit_v6(dst_ip6, dst_port, nexthdr)) {
+                submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0, EVENT_FLAG_MIDSTREAM);
+            }
         }
         return check_audit_or_block();
     }
 
     if (is_tcp_syn) {
-        submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 1);
+        submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 1, 0);
     }
     return TC_ACT_OK;
 }

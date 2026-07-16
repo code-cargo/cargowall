@@ -108,14 +108,16 @@ type TcBpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TcBpfMapSpecs struct {
-	MapAuditMode     *ebpf.MapSpec `ebpf:"map_audit_mode"`
-	MapCidrs         *ebpf.MapSpec `ebpf:"map_cidrs"`
-	MapCidrsV6       *ebpf.MapSpec `ebpf:"map_cidrs_v6"`
-	MapDefaultAction *ebpf.MapSpec `ebpf:"map_default_action"`
-	MapEvents        *ebpf.MapSpec `ebpf:"map_events"`
-	MapPorts         *ebpf.MapSpec `ebpf:"map_ports"`
-	MapPortsV6       *ebpf.MapSpec `ebpf:"map_ports_v6"`
-	MapSockPid       *ebpf.MapSpec `ebpf:"map_sock_pid"`
+	MapAuditMode       *ebpf.MapSpec `ebpf:"map_audit_mode"`
+	MapCidrs           *ebpf.MapSpec `ebpf:"map_cidrs"`
+	MapCidrsV6         *ebpf.MapSpec `ebpf:"map_cidrs_v6"`
+	MapDefaultAction   *ebpf.MapSpec `ebpf:"map_default_action"`
+	MapEvents          *ebpf.MapSpec `ebpf:"map_events"`
+	MapMidstreamSeen   *ebpf.MapSpec `ebpf:"map_midstream_seen"`
+	MapMidstreamSeenV6 *ebpf.MapSpec `ebpf:"map_midstream_seen_v6"`
+	MapPorts           *ebpf.MapSpec `ebpf:"map_ports"`
+	MapPortsV6         *ebpf.MapSpec `ebpf:"map_ports_v6"`
+	MapSockPid         *ebpf.MapSpec `ebpf:"map_sock_pid"`
 }
 
 // TcBpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -144,14 +146,16 @@ func (o *TcBpfObjects) Close() error {
 //
 // It can be passed to LoadTcBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TcBpfMaps struct {
-	MapAuditMode     *ebpf.Map `ebpf:"map_audit_mode"`
-	MapCidrs         *ebpf.Map `ebpf:"map_cidrs"`
-	MapCidrsV6       *ebpf.Map `ebpf:"map_cidrs_v6"`
-	MapDefaultAction *ebpf.Map `ebpf:"map_default_action"`
-	MapEvents        *ebpf.Map `ebpf:"map_events"`
-	MapPorts         *ebpf.Map `ebpf:"map_ports"`
-	MapPortsV6       *ebpf.Map `ebpf:"map_ports_v6"`
-	MapSockPid       *ebpf.Map `ebpf:"map_sock_pid"`
+	MapAuditMode       *ebpf.Map `ebpf:"map_audit_mode"`
+	MapCidrs           *ebpf.Map `ebpf:"map_cidrs"`
+	MapCidrsV6         *ebpf.Map `ebpf:"map_cidrs_v6"`
+	MapDefaultAction   *ebpf.Map `ebpf:"map_default_action"`
+	MapEvents          *ebpf.Map `ebpf:"map_events"`
+	MapMidstreamSeen   *ebpf.Map `ebpf:"map_midstream_seen"`
+	MapMidstreamSeenV6 *ebpf.Map `ebpf:"map_midstream_seen_v6"`
+	MapPorts           *ebpf.Map `ebpf:"map_ports"`
+	MapPortsV6         *ebpf.Map `ebpf:"map_ports_v6"`
+	MapSockPid         *ebpf.Map `ebpf:"map_sock_pid"`
 }
 
 func (m *TcBpfMaps) Close() error {
@@ -161,6 +165,8 @@ func (m *TcBpfMaps) Close() error {
 		m.MapCidrsV6,
 		m.MapDefaultAction,
 		m.MapEvents,
+		m.MapMidstreamSeen,
+		m.MapMidstreamSeenV6,
 		m.MapPorts,
 		m.MapPortsV6,
 		m.MapSockPid,

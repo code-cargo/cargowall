@@ -424,3 +424,121 @@ func TestApplyCloudMetadataAllows_GCPDetected(t *testing.T) {
 	// No Azure-specific allows.
 	require.Empty(t, hostnameRulesFor(t, cm, config.AutoAddedTypeAzureInfrastructure))
 }
+
+// writeProcNetFixture writes a /proc/net/{tcp,udp}{,6}-format file. Lines
+// share the sl/local_address/rem_address/st column layout; trailing columns
+// are irrelevant to the parser.
+func writeProcNetFixture(t *testing.T, name string, lines []string) string {
+	t.Helper()
+	content := "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+	for _, l := range lines {
+		content += l + "\n"
+	}
+	path := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	return path
+}
+
+func TestScanProcNet(t *testing.T) {
+	// Remote addresses are hex little-endian per 4-byte group:
+	// "22D8B85D" = 93.184.216.34, "0100007F" = 127.0.0.1.
+	tests := []struct {
+		name       string
+		lines      []string
+		isIPv6     bool
+		wantStates map[string]bool
+		want       []string
+	}{
+		{
+			name: "tcp keeps established and in-flight handshakes",
+			lines: []string{
+				"   0: 0100000A:D431 22D8B85D:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 1", // ESTABLISHED
+				"   1: 0100000A:D432 0101A8C0:0050 02 00000000:00000000 00:00000000 00000000  1000        0 2", // SYN_SENT
+				"   2: 0100000A:D433 0201A8C0:0050 03 00000000:00000000 00:00000000 00000000  1000        0 3", // SYN_RECV
+			},
+			wantStates: tcpScanStates,
+			want:       []string{"93.184.216.34", "192.168.1.1", "192.168.1.2"},
+		},
+		{
+			name: "tcp skips closing and listening states",
+			lines: []string{
+				"   0: 0100000A:D431 22D8B85D:01BB 06 00000000:00000000 00:00000000 00000000  1000        0 1", // TIME_WAIT
+				"   1: 0100000A:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 2", // LISTEN
+			},
+			wantStates: tcpScanStates,
+			want:       nil,
+		},
+		{
+			name: "skips loopback and zero remotes even in wanted states",
+			lines: []string{
+				"   0: 0100000A:D431 0100007F:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 1", // loopback
+				"   1: 0100000A:D432 00000000:0000 01 00000000:00000000 00:00000000 00000000  1000        0 2", // unspecified
+			},
+			wantStates: tcpScanStates,
+			want:       nil,
+		},
+		{
+			name: "udp keeps connected sockets only",
+			lines: []string{
+				"   0: 0100000A:8235 22D8B85D:0035 01 00000000:00000000 00:00000000 00000000  1000        0 1", // connected
+				"   1: 0100000A:8236 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 2", // unconnected
+			},
+			wantStates: udpScanStates,
+			want:       []string{"93.184.216.34"},
+		},
+		{
+			name: "malformed lines are skipped",
+			lines: []string{
+				"garbage",
+				"   0: 0100000A:D431",
+				"   1: 0100000A:D431 ZZZZZZZZ:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 1",
+				"   2: 0100000A:D431 22D8B85D:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 2",
+			},
+			wantStates: tcpScanStates,
+			want:       []string{"93.184.216.34"},
+		},
+		{
+			name: "ipv6 decodes groups and skips link-local",
+			lines: []string{
+				"   0: 00000000000000000000000001000000:D431 B80D01200000000067452301EFCDAB89:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 1",
+				"   1: 00000000000000000000000001000000:D432 000080FE000000000000000001000000:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 2", // fe80::1 link-local
+				"   2: 00000000000000000000000001000000:D433 00000000000000000000000000000000:0000 01 00000000:00000000 00:00000000 00000000  1000        0 3", // unspecified
+			},
+			isIPv6:     true,
+			wantStates: tcpScanStates,
+			want:       []string{"2001:db8::123:4567:89ab:cdef"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeProcNetFixture(t, "procnet", tt.lines)
+			seen := make(map[string]bool)
+			require.NoError(t, scanProcNet(path, tt.isIPv6, tt.wantStates, seen))
+
+			got := make([]string, 0, len(seen))
+			for ip := range seen {
+				got = append(got, ip)
+			}
+			require.ElementsMatch(t, tt.want, got)
+		})
+	}
+}
+
+// The exclude set lets the pre-attach re-scan return only connections that
+// appeared after the initial scan. Excluded IPs must never reappear.
+func TestScanExistingConnections_Exclude(t *testing.T) {
+	first, err := scanExistingConnections(nil)
+	require.NoError(t, err)
+
+	exclude := make(map[string]bool, len(first))
+	for _, ip := range first {
+		exclude[ip] = true
+	}
+
+	delta, err := scanExistingConnections(exclude)
+	require.NoError(t, err)
+	for _, ip := range delta {
+		require.False(t, exclude[ip], "excluded IP %s reappeared in the delta scan", ip)
+	}
+}

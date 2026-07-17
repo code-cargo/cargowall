@@ -1115,6 +1115,25 @@ func TestMidStreamDropEmitsEventIPv6(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActShot), ret)
 	requireNoEvent(t, rd, "repeat drop on the same dst tuple must be rate-limited")
+
+	// Kernel replies to inbound traffic must NOT be reported — the IPv6
+	// twin of the IPv4 exclusion cases. Fresh dst ports so the rate-limit
+	// map can't be the reason for silence.
+	for _, tc := range []struct {
+		name  string
+		flags uint8
+		port  uint16
+	}{
+		{"RST", 0x04, 9001},
+		{"RST-ACK", 0x14, 9002},
+		{"SYN-ACK", 0x12, 9003},
+	} {
+		pkt := craftIPv6TCPWithFlags(t, "2001:db8::1", tc.port, tc.flags)
+		ret, _, err = objs.TcEgress.Test(pkt)
+		require.NoError(t, err)
+		require.Equal(t, uint32(tcActShot), ret, "%s still dropped", tc.name)
+		requireNoEvent(t, rd, tc.name+" must not emit a mid-stream event (inbound-scan reply, not a killed connection)")
+	}
 }
 
 // In audit mode the packet passes but the mid-stream event still emits

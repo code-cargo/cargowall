@@ -1061,6 +1061,26 @@ func TestMidStreamDropEmitsEvent(t *testing.T) {
 	require.NotZero(t, evt.Flags&0x1)
 	require.Equal(t, uint16(8080), evt.DstPort)
 
+	// Kernel replies to inbound traffic must NOT be reported as killed
+	// connections: RST / RST-ACK (closed-port replies to a port scan) and
+	// SYN-ACK (handshake reply to an inbound SYN). Fresh dst ports so the
+	// rate-limit map can't be the reason for silence.
+	for _, tc := range []struct {
+		name  string
+		flags uint8
+		port  uint16
+	}{
+		{"RST", 0x04, 9001},
+		{"RST-ACK", 0x14, 9002},
+		{"SYN-ACK", 0x12, 9003},
+	} {
+		pkt := craftIPv4TCPWithFlags(t, "93.184.216.34", tc.port, tc.flags)
+		ret, _, err = objs.TcEgress.Test(pkt)
+		require.NoError(t, err)
+		require.Equal(t, uint32(tcActShot), ret, "%s still dropped", tc.name)
+		requireNoEvent(t, rd, tc.name+" must not emit a mid-stream event (inbound-scan reply, not a killed connection)")
+	}
+
 	// SYN blocks are unflagged (regression guard for the flags byte).
 	synPkt := craftIPv4TCP(t, "93.184.216.34", 443)
 	ret, _, err = objs.TcEgress.Test(synPkt)

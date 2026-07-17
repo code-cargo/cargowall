@@ -353,6 +353,7 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
     __u16 src_port = 0;
     __u16 dst_port = 0;
     __u8 is_tcp_syn = 0;
+    __u8 is_tcp_midstream = 0;
 
     // Only parse L4 headers for non-fragmented packets or first fragments.
     // Non-first fragments don't contain L4 headers, so we skip parsing and
@@ -374,6 +375,13 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
                 return check_audit_or_block();
             if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
                 is_tcp_syn = 1;
+            } else if ((tcp_flags & TCP_FLAG_ACK) && !(tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_RST))) {
+                // Segment of an established flow: ACK set, no SYN/RST.
+                // Deliberately excludes kernel RST replies to inbound port
+                // scans and SYN-ACK replies to inbound handshakes — on a
+                // public CI runner those arrive constantly and would be
+                // misreported as killed egress connections.
+                is_tcp_midstream = 1;
             }
         } else if (ip_proto == IPPROTO_UDP) {
             struct udphdr udp_hdr;
@@ -460,12 +468,12 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
             submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0, 0);
         } else if (ip_proto == IPPROTO_ICMP) {
             submit_protocol_block_v4(skb, src_ip, dst_ip, ip_proto);
-        } else if (ip_proto == IPPROTO_TCP && !is_non_first_fragment) {
+        } else if (is_tcp_midstream) {
             // Mid-stream TCP drop: an established connection killed because
             // its destination isn't allowed. Previously silent — invisible
             // to audit and the late-allow reconciler. Rate-limited per dst
-            // tuple; non-first fragments carry no L4 header (port 0), so
-            // they stay silent as before.
+            // tuple; non-first fragments carry no L4 header, so they stay
+            // silent as before (is_tcp_midstream is never set for them).
             if (midstream_should_emit(dst_ip_nbo, dst_port, ip_proto)) {
                 submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0, EVENT_FLAG_MIDSTREAM);
             }
@@ -557,6 +565,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
     __u16 src_port = 0;
     __u16 dst_port = 0;
     __u8 is_tcp_syn = 0;
+    __u8 is_tcp_midstream = 0;
 
     // Only parse L4 headers for non-fragmented packets or first fragments.
     // Non-first fragments don't contain L4 headers at this offset.
@@ -574,6 +583,10 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
                 return check_audit_or_block();
             if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
                 is_tcp_syn = 1;
+            } else if ((tcp_flags & TCP_FLAG_ACK) && !(tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_RST))) {
+                // Established-flow segment — see the IPv4 branch for why
+                // RST and SYN-ACK replies are excluded.
+                is_tcp_midstream = 1;
             }
         } else if (nexthdr == IPPROTO_UDP) {
             struct udphdr udp_hdr;
@@ -654,7 +667,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
     if (!allowed) {
         if (is_tcp_syn || nexthdr == IPPROTO_UDP) {
             submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0, 0);
-        } else if (nexthdr == IPPROTO_TCP && !is_non_first_fragment) {
+        } else if (is_tcp_midstream) {
             // Mid-stream TCP drop — see the IPv4 branch for rationale.
             if (midstream_should_emit_v6(dst_ip6, dst_port, nexthdr)) {
                 submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0, EVENT_FLAG_MIDSTREAM);

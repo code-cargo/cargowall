@@ -953,6 +953,18 @@ func (s *Server) preResolveCNAMETarget(target string, depth int) {
 		"target", target,
 		"depth", depth)
 	go func() {
+		// A panic here would take down the daemon — and with it the TC
+		// program, failing the firewall open. Pre-resolution is best-effort
+		// reporting/enforcement warm-up, never worth that; log and drop.
+		// The goroutine's lifetime is bounded by the client's Timeout per
+		// Exchange, so no shutdown plumbing is needed.
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("Panic in CNAME target pre-resolve",
+					"target", target,
+					"panic", r)
+			}
+		}()
 		for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
 			m := new(dns.Msg)
 			m.SetQuestion(dns.Fqdn(target), qtype)

@@ -111,12 +111,17 @@ func (n *NotificationTracker) SendNotification(hostname, ip string, port uint16)
 	}
 }
 
+// BpfEventFlagMidstream marks a non-SYN TCP drop: an established connection
+// killed mid-stream because its destination isn't allowed. Mirrors
+// EVENT_FLAG_MIDSTREAM in tcbpf.c.
+const BpfEventFlagMidstream = 0x1
+
 // BpfBlockedEvent matches the struct in tcbpf.c
 type BpfBlockedEvent struct {
 	IpVersion uint8
 	Allowed   uint8
-	IpProto   uint8 // L4 protocol (unix.IPPROTO_TCP, _UDP, _ICMP, …)
-	Pad1      uint8
+	IpProto   uint8  // L4 protocol (unix.IPPROTO_TCP, _UDP, _ICMP, …)
+	Flags     uint8  // BpfEventFlag* bits
 	SrcIp     uint32 // IPv4 (used when IpVersion == 4)
 	DstIp     uint32 // IPv4 (used when IpVersion == 4)
 	SrcPort   uint16
@@ -226,6 +231,11 @@ func ipProtoToConfigProtocol(proto uint8) (config.ProtocolType, bool) {
 // permitted by an allow rule whose port restrictions are `ports`. An empty
 // `ports` means the rule allows all ports. An unknown L4 proto fails closed
 // (no overlap, even with ProtocolAll rules) — see ipProtoToConfigProtocol.
+//
+// Shares rulePortCovered with the late-allow reconciliation path, which
+// reaches the same question from an audit-log protocol name rather than an L4
+// byte: both decide "does this rule side cover the connection?", and the
+// reconciler's mixed-verdict handling is only correct if it matches this one.
 func dstPortAllowedByRule(dstPort uint16, proto uint8, ports []config.Port) bool {
 	if len(ports) == 0 {
 		return true
@@ -234,8 +244,17 @@ func dstPortAllowedByRule(dstPort uint16, proto uint8, ports []config.Port) bool
 	if !ok {
 		return false
 	}
+	return rulePortCovered(ports, dstPort, eventProto)
+}
+
+// rulePortCovered reports whether a rule-side port list covers (port, proto).
+// An empty list means the side applies to all ports, matching rule semantics.
+func rulePortCovered(ports []config.Port, port uint16, proto config.ProtocolType) bool {
+	if len(ports) == 0 {
+		return true
+	}
 	for _, p := range ports {
-		if p.Port == dstPort && config.ProtocolsOverlap(p.Protocol, eventProto) {
+		if p.Port == port && config.ProtocolsOverlap(p.Protocol, proto) {
 			return true
 		}
 	}
@@ -494,8 +513,17 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			}
 		}
 	} else {
-		// Blocked TCP SYN or UDP connection
-		logConnEvent(logger, "Connection blocked", cnameChain,
+		// Blocked TCP SYN, UDP, or mid-stream TCP connection. Mid-stream
+		// means an established connection was killed because its destination
+		// isn't allowed (e.g. a pre-existing socket whose IP was never
+		// seeded) — surfaced distinctly so operators can tell a killed
+		// connection from a refused new one.
+		midStream := event.Flags&BpfEventFlagMidstream != 0
+		msg := "Connection blocked"
+		if midStream {
+			msg = "Connection blocked (mid-stream)"
+		}
+		logConnEvent(logger, msg, cnameChain,
 			"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
 			"dst", displayHostname,
 			"dst_ip", dstIP,
@@ -505,7 +533,13 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 
 		// Log to audit file if configured
 		if auditLogger != nil {
-			if err := auditLogger.LogConnectionBlocked(srcIP, dstIP, hostname, event.DstPort, comm, pid, getProtocolName(event.IpProto), cnameChain); err != nil {
+			var err error
+			if midStream {
+				err = auditLogger.LogConnectionBlockedMidStream(srcIP, dstIP, hostname, event.DstPort, comm, pid, getProtocolName(event.IpProto), cnameChain)
+			} else {
+				err = auditLogger.LogConnectionBlocked(srcIP, dstIP, hostname, event.DstPort, comm, pid, getProtocolName(event.IpProto), cnameChain)
+			}
+			if err != nil {
 				logger.Error("Failed to write audit log", "error", err)
 			}
 		}

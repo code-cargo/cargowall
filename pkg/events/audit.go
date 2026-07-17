@@ -55,6 +55,7 @@ type AuditEvent struct {
 	MatchedRule     string         `json:"matched_rule,omitempty"`
 	AutoAllowedType string         `json:"auto_allowed_type,omitempty"`
 	CNAMEChain      []string       `json:"cname_chain,omitempty"` // CNAME chain origin..target when DstHostname was reached via a CNAME of an allowed host
+	MidStream       bool           `json:"mid_stream,omitempty"`  // set on connection_blocked when the drop was a non-SYN TCP segment (established connection killed mid-stream, e.g. a pre-existing socket whose dst was never seeded)
 	WouldDeny       bool           `json:"would_deny"`            // true in audit mode (would have been denied)
 	Blocked         bool           `json:"blocked"`               // true in enforce mode (actually blocked)
 }
@@ -162,6 +163,26 @@ func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPor
 	})
 }
 
+// LogConnectionBlockedMidStream logs a blocked non-SYN TCP segment — an
+// established connection killed mid-stream. Kept as EventConnectionBlocked
+// (with MidStream set) so the RecentBlocks reconciler, summary pipeline, and
+// OTLP mapping treat it like any other block.
+func (a *AuditLogger) LogConnectionBlockedMidStream(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
+	return a.LogEvent(AuditEvent{
+		Timestamp:   time.Now(),
+		EventType:   EventConnectionBlocked,
+		SrcIP:       srcIP,
+		DstIP:       dstIP,
+		DstHostname: hostname,
+		DstPort:     dstPort,
+		Protocol:    protocol,
+		Process:     process,
+		PID:         pid,
+		CNAMEChain:  cnameChain,
+		MidStream:   true,
+	})
+}
+
 // LogConnectionLateAllowed logs a connection that BPF initially dropped but
 // that we then opened the firewall for after late hostname resolution matched
 // an allow rule. The original SYN was lost, but the next retry will succeed.
@@ -170,8 +191,17 @@ func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPor
 // hostname for plain rules), which can differ from the resolved DstHostname
 // (e.g. rule `*.compute-1.amazonaws.com` matching `ec2-1-2-3-4.compute-1...`).
 func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
+	return a.LogConnectionLateAllowedAt(time.Now(), srcIP, dstIP, hostname, matchedRule, dstPort, process, pid, protocol, cnameChain)
+}
+
+// LogConnectionLateAllowedAt is LogConnectionLateAllowed with an explicit
+// event timestamp. Late-allow reconciliation (#83) dates the event at the
+// original blocked attempt rather than the reconcile time, so step
+// correlation in the summary reflects when the connection actually happened
+// and so the event supersedes every blocked record at or before it.
+func (a *AuditLogger) LogConnectionLateAllowedAt(ts time.Time, srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
 	return a.LogEvent(AuditEvent{
-		Timestamp:   time.Now(),
+		Timestamp:   ts,
 		EventType:   EventConnectionLateAllowed,
 		SrcIP:       srcIP,
 		DstIP:       dstIP,

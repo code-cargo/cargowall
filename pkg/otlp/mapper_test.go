@@ -97,10 +97,30 @@ func TestLogRecordFromEvent_AllowedOmitsEmptyFields(t *testing.T) {
 	for _, absent := range []string{
 		"source.address", "server.address", "process.executable.name",
 		"process.pid", "cargowall.matched_rule", "cargowall.auto_allowed_type",
-		"cargowall.cname_chain",
+		"cargowall.cname_chain", "cargowall.mid_stream",
 	} {
 		assert.NotContains(t, attrs, absent)
 	}
+}
+
+// Mid-stream blocks (established connections killed by attach) carry the
+// cargowall.mid_stream attribute so backends can distinguish a killed
+// connection from a refused new one.
+func TestLogRecordFromEvent_MidStreamBlocked(t *testing.T) {
+	rec := logRecordFromEvent(events.AuditEvent{
+		Timestamp: time.Now(),
+		EventType: events.EventConnectionBlocked,
+		DstIP:     "93.184.216.34",
+		DstPort:   443,
+		Protocol:  "TCP",
+		MidStream: true,
+		Blocked:   true,
+	})
+
+	attrs := attrMap(t, rec.Attributes)
+	assert.True(t, attrs["cargowall.mid_stream"].GetBoolValue())
+	assert.Equal(t, "deny", attrs["cargowall.verdict"].GetStringValue())
+	assert.Equal(t, "cargowall.connection_blocked", rec.EventName)
 }
 
 func TestLogRecordFromEvent_WouldDeny(t *testing.T) {

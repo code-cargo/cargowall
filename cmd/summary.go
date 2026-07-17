@@ -86,6 +86,10 @@ func (c *SummaryCmd) Run() error {
 		return fmt.Errorf("failed to read audit log: %w", err)
 	}
 
+	// Drop blocked events that a later late-allow superseded so they aren't
+	// counted or pushed as denies (#83).
+	auditEvents = reconcileLateAllowedBlocks(auditEvents)
+
 	if len(auditEvents) == 0 {
 		// Best-effort API push — log warning on failure but don't fail the summary
 		var workflowRunLink string
@@ -171,6 +175,50 @@ func (c *SummaryCmd) readAuditLog() ([]events.AuditEvent, error) {
 	}
 
 	return allEvents, scanner.Err()
+}
+
+// reconcileLateAllowedBlocks drops connection_blocked events superseded by a
+// connection_late_allowed event for the same (dst_ip, dst_port, protocol) at
+// the same time or later. The daemon emits such events when the firewall
+// opens for an IP after it was blocked — either in-band (the blocked event's
+// hostname matched an allow rule) or via late-allow reconciliation when the
+// address records finally traverse the DNS proxy (#83). The policy outcome
+// for those attempts is allow, so shipping the block rows to the SaaS as
+// denies would fail the check on connections that actually succeeded on
+// retry. Blocked events AFTER the latest late-allow for a tuple are kept:
+// they represent the destination being blocked again (e.g. a conflicting
+// per-port grant), not a superseded retry.
+func reconcileLateAllowedBlocks(auditEvents []events.AuditEvent) []events.AuditEvent {
+	type connKey struct {
+		ip       string
+		port     uint16
+		protocol string
+	}
+	latestLateAllow := make(map[connKey]time.Time)
+	for _, e := range auditEvents {
+		if e.EventType != events.EventConnectionLateAllowed || e.DstIP == "" {
+			continue
+		}
+		k := connKey{ip: e.DstIP, port: e.DstPort, protocol: e.Protocol}
+		if e.Timestamp.After(latestLateAllow[k]) {
+			latestLateAllow[k] = e.Timestamp
+		}
+	}
+	if len(latestLateAllow) == 0 {
+		return auditEvents
+	}
+
+	kept := make([]events.AuditEvent, 0, len(auditEvents))
+	for _, e := range auditEvents {
+		if e.EventType == events.EventConnectionBlocked {
+			ts, ok := latestLateAllow[connKey{ip: e.DstIP, port: e.DstPort, protocol: e.Protocol}]
+			if ok && !e.Timestamp.After(ts) {
+				continue
+			}
+		}
+		kept = append(kept, e)
+	}
+	return kept
 }
 
 func (c *SummaryCmd) correlateEventsToSteps(auditEvents []events.AuditEvent, steps []GitHubStep) []StepEvents {

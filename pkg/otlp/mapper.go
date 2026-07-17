@@ -130,6 +130,9 @@ func logRecordFromEvent(ev events.AuditEvent) *logspb.LogRecord {
 	if len(ev.CNAMEChain) > 0 {
 		attrs = append(attrs, stringArrayAttr("cargowall.cname_chain", ev.CNAMEChain))
 	}
+	if ev.MidStream {
+		attrs = append(attrs, boolAttr("cargowall.mid_stream", true))
+	}
 	attrs = append(
 		attrs,
 		boolAttr("cargowall.would_deny", ev.WouldDeny),

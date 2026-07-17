@@ -84,7 +84,7 @@ type StartCmd struct {
 	DNSRedirectIptables    bool `help:"Install iptables OUTPUT NAT rules redirecting outbound DNS (UDP+TCP/53) to the local proxy at 127.0.0.1:53" default:"false" env:"CARGOWALL_DNS_REDIRECT_IPTABLES"`
 	DockerDNSInterception  bool `help:"Listen on the Docker bridge IP for DNS, rewrite /etc/docker/daemon.json so containers use the proxy, and restart the Docker daemon" default:"false" env:"CARGOWALL_DOCKER_DNS_INTERCEPTION"`
 	DNSQueryFiltering      bool `help:"Filter DNS queries against the firewall policy (blocks DNS tunneling)" default:"false" env:"CARGOWALL_DNS_QUERY_FILTERING"`
-	PrepopulateDNSCache    bool `help:"Pre-populate the BPF allowlist from the systemd-resolved cache and existing TCP connections at startup" default:"false" env:"CARGOWALL_PREPOPULATE_DNS_CACHE"`
+	PrepopulateDNSCache    bool `help:"Pre-populate the BPF allowlist from the systemd-resolved cache and reverse-DNS existing connections at startup" default:"false" env:"CARGOWALL_PREPOPULATE_DNS_CACHE"`
 	AutoAllowCloudMetadata bool `help:"Auto-allow cloud metadata endpoints (AWS / Azure / GCP, auto-detected; override with CARGOWALL_CLOUD_PROVIDER=aws|azure|gcp)" default:"false" env:"CARGOWALL_AUTO_ALLOW_CLOUD_METADATA"`
 	AutoAllowGitHubHosts   bool `help:"Auto-allow GitHub service hostnames (github.com, *.githubusercontent.com, etc.) and discover ACTIONS_* runtime URLs" default:"false" env:"CARGOWALL_AUTO_ALLOW_GITHUB_HOSTS"`
 	AutoAllowGitlabHosts   bool `help:"Auto-allow GitLab service hostnames (gitlab.com, registry.gitlab.com, etc.) and discover CI_* runtime URLs" default:"false" env:"CARGOWALL_AUTO_ALLOW_GITLAB_HOSTS"`
@@ -98,7 +98,7 @@ type StartCmd struct {
 	AuditLog  string `help:"Path to write JSON audit log for step correlation" env:"CARGOWALL_AUDIT_LOG"`
 
 	// Pre-existing connection handling
-	AllowExistingConnections bool `help:"Allow pre-existing TCP connections at startup (loads /proc/net/tcp{,6} IPs into allow maps)" default:"false" env:"CARGOWALL_ALLOW_EXISTING_CONNECTIONS"`
+	AllowExistingConnections bool `help:"Allow pre-existing TCP/UDP connections at startup (scans /proc/net/{tcp,udp}{,6}, re-scans just before enforcement; rule-matched peers use rule ports, unidentified peers are allowed only on their observed ports)" default:"false" env:"CARGOWALL_ALLOW_EXISTING_CONNECTIONS"`
 
 	// Pidfile pairs with the `cargowall stop` subcommand. Backgrounding is
 	// delegated to the shell (`cargowall start --pidfile X &`) — true Unix

@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
@@ -407,7 +408,8 @@ func TestTcEgress(t *testing.T) {
 			wantRet: tcActShot,
 		},
 
-		// Non-SYN TCP to blocked host (blocked without event submission)
+		// Non-SYN TCP to blocked host (blocked; emits a rate-limited
+		// mid-stream event — see TestMidStreamDropEmitsEvent)
 		{
 			name:    "IPv4 TCP ACK to blocked host",
 			packet:  craftIPv4TCPWithFlags(t, "93.184.216.34", 80, 0x10),
@@ -931,7 +933,7 @@ type bpfBlockedEvent struct {
 	IpVersion uint8
 	Allowed   uint8
 	IpProto   uint8
-	Pad1      uint8
+	Flags     uint8 // EVENT_FLAG_* bits
 	SrcIp     uint32
 	DstIp     uint32
 	SrcPort   uint16
@@ -998,6 +1000,130 @@ func TestEventPidZeroWhenNoCookieMappingIPv6(t *testing.T) {
 	require.Equal(t, uint8(unix.IPPROTO_TCP), evt.IpProto, "ip_proto must round-trip from BPF (catches stale .o or struct-offset drift)")
 	require.Equal(t, uint32(0), evt.Pid, "PID should be 0 when no cookie mapping exists")
 	require.Equal(t, uint16(80), evt.DstPort)
+}
+
+// readOneEvent reads a single ring buffer record and decodes it, failing the
+// test on timeout.
+func readOneEvent(t *testing.T, rd *ringbuf.Reader) bpfBlockedEvent {
+	t.Helper()
+	rd.SetDeadline(time.Now().Add(2 * time.Second))
+	record, err := rd.Read()
+	require.NoError(t, err)
+	var evt bpfBlockedEvent
+	require.NoError(t, binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &evt))
+	return evt
+}
+
+// requireNoEvent asserts the ring buffer stays empty for a short window.
+func requireNoEvent(t *testing.T, rd *ringbuf.Reader, msg string) {
+	t.Helper()
+	rd.SetDeadline(time.Now().Add(200 * time.Millisecond))
+	_, err := rd.Read()
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded, msg)
+}
+
+// A non-SYN TCP drop (established connection killed mid-stream) must emit a
+// flagged event — previously these drops were silent — and repeats within
+// MIDSTREAM_EMIT_INTERVAL_NS on the same dst tuple must be rate-limited.
+func TestMidStreamDropEmitsEvent(t *testing.T) {
+	objs := loadBPFObjects(t)
+	setupTestRules(t, objs)
+
+	rd, err := ringbuf.NewReader(objs.MapEvents)
+	require.NoError(t, err)
+	defer rd.Close()
+
+	// ACK segment (0x10) to a blocked host: dropped and flagged mid-stream.
+	pkt := craftIPv4TCPWithFlags(t, "93.184.216.34", 80, 0x10)
+	ret, _, err := objs.TcEgress.Test(pkt)
+	require.NoError(t, err)
+	require.Equal(t, uint32(tcActShot), ret)
+
+	evt := readOneEvent(t, rd)
+	require.Equal(t, uint8(4), evt.IpVersion)
+	require.Equal(t, uint8(0), evt.Allowed)
+	require.Equal(t, uint8(unix.IPPROTO_TCP), evt.IpProto)
+	require.NotZero(t, evt.Flags&0x1, "mid-stream drop must carry EVENT_FLAG_MIDSTREAM")
+	require.Equal(t, uint16(80), evt.DstPort)
+
+	// Same tuple again: rate-limited, no second event.
+	ret, _, err = objs.TcEgress.Test(pkt)
+	require.NoError(t, err)
+	require.Equal(t, uint32(tcActShot), ret)
+	requireNoEvent(t, rd, "repeat drop on the same dst tuple must be rate-limited")
+
+	// Different dst port = different tuple: emits.
+	pkt2 := craftIPv4TCPWithFlags(t, "93.184.216.34", 8080, 0x10)
+	ret, _, err = objs.TcEgress.Test(pkt2)
+	require.NoError(t, err)
+	require.Equal(t, uint32(tcActShot), ret)
+	evt = readOneEvent(t, rd)
+	require.NotZero(t, evt.Flags&0x1)
+	require.Equal(t, uint16(8080), evt.DstPort)
+
+	// SYN blocks are unflagged (regression guard for the flags byte).
+	synPkt := craftIPv4TCP(t, "93.184.216.34", 443)
+	ret, _, err = objs.TcEgress.Test(synPkt)
+	require.NoError(t, err)
+	require.Equal(t, uint32(tcActShot), ret)
+	evt = readOneEvent(t, rd)
+	require.Zero(t, evt.Flags, "SYN block must not carry the mid-stream flag")
+}
+
+// IPv6 sibling of TestMidStreamDropEmitsEvent.
+func TestMidStreamDropEmitsEventIPv6(t *testing.T) {
+	objs := loadBPFObjects(t)
+	setupTestRules(t, objs)
+
+	rd, err := ringbuf.NewReader(objs.MapEvents)
+	require.NoError(t, err)
+	defer rd.Close()
+
+	pkt := craftIPv6TCPWithFlags(t, "2001:db8::1", 80, 0x10)
+	ret, _, err := objs.TcEgress.Test(pkt)
+	require.NoError(t, err)
+	require.Equal(t, uint32(tcActShot), ret)
+
+	evt := readOneEvent(t, rd)
+	require.Equal(t, uint8(6), evt.IpVersion)
+	require.Equal(t, uint8(0), evt.Allowed)
+	require.Equal(t, uint8(unix.IPPROTO_TCP), evt.IpProto)
+	require.NotZero(t, evt.Flags&0x1, "mid-stream drop must carry EVENT_FLAG_MIDSTREAM")
+	require.Equal(t, uint16(80), evt.DstPort)
+
+	ret, _, err = objs.TcEgress.Test(pkt)
+	require.NoError(t, err)
+	require.Equal(t, uint32(tcActShot), ret)
+	requireNoEvent(t, rd, "repeat drop on the same dst tuple must be rate-limited")
+}
+
+// In audit mode the packet passes but the mid-stream event still emits
+// (rate-limited), so killed-connection visibility works during dry runs.
+func TestMidStreamDropAuditMode(t *testing.T) {
+	objs := loadBPFObjects(t)
+	setupTestRules(t, objs)
+
+	var auditKey uint32 = 0
+	var auditVal uint8 = 1
+	require.NoError(t, objs.MapAuditMode.Update(&auditKey, &auditVal, ebpf.UpdateAny))
+
+	rd, err := ringbuf.NewReader(objs.MapEvents)
+	require.NoError(t, err)
+	defer rd.Close()
+
+	pkt := craftIPv4TCPWithFlags(t, "93.184.216.34", 80, 0x10)
+	ret, _, err := objs.TcEgress.Test(pkt)
+	require.NoError(t, err)
+	require.Equal(t, uint32(tcActOK), ret, "audit mode must pass the packet")
+
+	evt := readOneEvent(t, rd)
+	require.NotZero(t, evt.Flags&0x1, "audit mode still emits the flagged event")
+
+	// Continuous data segments must not flood the ring buffer.
+	ret, _, err = objs.TcEgress.Test(pkt)
+	require.NoError(t, err)
+	require.Equal(t, uint32(tcActOK), ret)
+	requireNoEvent(t, rd, "audit-mode repeats must be rate-limited too")
 }
 
 // setupTestRules configures the BPF maps with test rules.

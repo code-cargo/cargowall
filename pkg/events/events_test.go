@@ -1243,3 +1243,84 @@ func TestProcessEvent_NoAutoAllowedTypeForUserRule(t *testing.T) {
 	assert.Equal(t, EventConnectionAllowed, events[0].EventType)
 	assert.Empty(t, events[0].AutoAllowedType, "user-configured rules should not have auto_allowed_type")
 }
+
+// A mid-stream drop (non-SYN TCP segment of an established connection killed
+// by attach) must surface as a normal connection_blocked audit event with the
+// MidStream marker, so it is visible to operators and flows into RecentBlocks.
+func TestProcessEvent_MidStreamBlocked(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		Flags:     BpfEventFlagMidstream,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionBlocked, events[0].EventType)
+	assert.True(t, events[0].MidStream)
+	assert.Equal(t, "93.184.216.34", events[0].DstIP)
+	assert.Equal(t, uint16(443), events[0].DstPort)
+	assert.True(t, events[0].Blocked)
+}
+
+// The in-band late-allow path must also fire for mid-stream drops: when the
+// killed connection's IP maps to an allowed hostname, the firewall re-opens
+// and retransmits survive.
+func TestProcessEvent_MidStreamLateAllowFires(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+	cm.UpdateDNSMapping("example.com", "93.184.216.34")
+
+	fw := &mockFirewallUpdater{}
+
+	raw := makeBpfEvent(BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		Flags:     BpfEventFlagMidstream,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+	})
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger())
+
+	require.Len(t, fw.addedIPs, 1)
+	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
+	assert.Equal(t, "93.184.216.34", fw.addedIPs[0].ip.String())
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionLateAllowed, events[0].EventType)
+}

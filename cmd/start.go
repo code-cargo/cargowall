@@ -29,6 +29,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -228,6 +229,17 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		logger.Info("OpenTelemetry log export enabled", "endpoint", otelExporter.Endpoint())
 	}
 
+	// Late-allow reconciliation (#83): buffer recently blocked connections so
+	// the DNS enforcement path can re-report them as late-allowed once it
+	// opens the firewall for their destination IP. Registered as an audit
+	// sink here — before ProcessBlockedEvents starts — so no blocked event is
+	// missed.
+	if dnsServer != nil && auditLogger != nil {
+		recentBlocks := events.NewRecentBlocks(0)
+		auditLogger.AddSink(recentBlocks)
+		dnsServer.SetRecentBlocks(recentBlocks)
+	}
+
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
 	var apiPolicyLoaded bool
 	if cmd.CIMode() != CIModeNone {
@@ -362,6 +374,10 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		return fmt.Errorf("failed to update CIDR rules: %w", err)
 	}
 
+	// IPs already processed by gateExistingConnections, so the pre-attach
+	// re-scan below gates only the delta.
+	var gatedExisting map[string]bool
+
 	// Update DNS server with firewall now that it's created
 	if dnsServer != nil {
 		dnsServer.SetFirewall(fw)
@@ -400,16 +416,20 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			},
 		}
 
-		var existingIPs []string
+		existing := scanExistingForStartup(cmd, logger)
+
 		if cmd.PrepopulateDNSCache {
-			existingIPs = reverseDNSExistingConnections(configMgr, cacheResolver, logger)
+			reverseDNSExistingConnections(existing, configMgr, cacheResolver, logger)
 			prePopulateDNSCache(configMgr, dnsServer, cacheResolver, logger)
 		}
 
-		if cmd.AllowExistingConnections && fw != nil && len(existingIPs) > 0 {
-			gateExistingConnections(existingIPs, configMgr, fw, auditLogger, logger)
-		}
+		// Gate AFTER pre-population so reverse-DNS attribution is available.
+		gatedExisting = gateExistingStartupConnections(cmd, existing, configMgr, fw, auditLogger, logger)
 	}
+
+	// Re-scan just before attach so connections established during the DNS
+	// pre-population window survive.
+	rescanAndGateDelta(cmd, gatedExisting, configMgr, fw, auditLogger, logger)
 
 	// Attach the TC egress program only AFTER the maps are fully programmed
 	// (default action + static allowlist + auto-allow infra + tracked hostnames +
@@ -866,22 +886,16 @@ func autoAllowCodeCargoAPI(apiURL string, configMgr *config.Manager, logger *slo
 	logger.Info("Auto-allowed CodeCargo API hostname", "hostname", u.Hostname())
 }
 
-// reverseDNSExistingConnections scans existing TCP connections from
-// /proc/net/tcp{,6} and performs reverse DNS lookups for each IP via the
-// cache resolver, updating the config manager's DNS mappings.
-// Returns the list of scanned IPs.
-func reverseDNSExistingConnections(configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) []string {
-	scannedIPs, err := scanExistingConnections()
-	if err != nil {
-		logger.Debug("Could not scan existing connections", "error", err)
-		return nil
-	}
-	if len(scannedIPs) == 0 {
-		return nil
+// reverseDNSExistingConnections performs reverse DNS lookups for each
+// scanned existing-connection IP via the cache resolver, updating the config
+// manager's DNS mappings.
+func reverseDNSExistingConnections(conns existingConns, configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) {
+	if len(conns) == 0 {
+		return
 	}
 
 	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	for _, ip := range scannedIPs {
+	for ip := range conns {
 		rCtx, rCancel := context.WithTimeout(lookupCtx, 1*time.Second)
 		if names, err := cacheResolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
 			hostname := strings.TrimSuffix(names[0], ".")
@@ -891,9 +905,7 @@ func reverseDNSExistingConnections(configMgr *config.Manager, cacheResolver *net
 		rCancel()
 	}
 	lookupCancel()
-	logger.Info("Populated reverse DNS cache from existing connections", "ips", len(scannedIPs))
-
-	return scannedIPs
+	logger.Info("Populated reverse DNS cache from existing connections", "ips", len(conns))
 }
 
 // prePopulateDNSCache pre-populates the BPF allowlist and reverse lookup cache
@@ -943,11 +955,12 @@ func prePopulateDNSCache(configMgr *config.Manager, dnsServer *dns.Server, cache
 	logger.Info("Pre-resolved tracked hostnames via DNS proxy")
 }
 
-// gateExistingConnections iterates pre-existing IPs, blocks those that resolve
-// to a denied tracked hostname, and allows everything else (allowed hostnames
-// and unresolvable IPs).
-func gateExistingConnections(existingIPs []string, configMgr *config.Manager, fw firewall.Firewall, auditLogger *events.AuditLogger, logger *slog.Logger) {
-	for _, ipStr := range existingIPs {
+// gateExistingConnections iterates pre-existing connections, blocks those
+// that resolve to a denied tracked hostname, and allows everything else —
+// allowed hostnames on their rule's ports, unresolvable/unmatched IPs on the
+// observed remote ports only.
+func gateExistingConnections(conns existingConns, configMgr *config.Manager, fw firewall.Firewall, auditLogger *events.AuditLogger, logger *slog.Logger) {
+	for ipStr, observedPorts := range conns {
 		ip := net.ParseIP(ipStr)
 		if ip == nil {
 			continue
@@ -978,23 +991,27 @@ func gateExistingConnections(existingIPs []string, configMgr *config.Manager, fw
 			}
 		}
 
-		// Write the allow side. When no rule matched (unresolvable IP or no
-		// hostname rule), verdict.AllowPorts is nil and AddIP becomes an
-		// all-ports allow — an intentional carveout for in-flight work,
-		// since we'd rather keep a pre-existing socket alive than break it.
-		// The attack window is narrow (only IPs already connected at
-		// startup that CargoWall can't identify) and the audit log
-		// surfaces them either way.
-		if wasAdded, err := fw.AddIP(ip, config.ActionAllow, verdict.AllowPorts); err != nil {
+		// Write the allow side. With a matched allow rule the rule's ports
+		// govern (nil = the rule allows all ports). When no allow rule
+		// matched (unresolvable IP or no hostname rule), allow only the
+		// observed remote ports — a carveout for in-flight work, since
+		// we'd rather keep a pre-existing socket alive than break it, but
+		// scoped so an unidentifiable peer isn't opened on every port. The
+		// audit log surfaces these either way.
+		allowPorts := verdict.AllowPorts
+		if !verdict.HasAllow() {
+			allowPorts = observedPorts
+		}
+		if wasAdded, err := fw.AddIP(ip, config.ActionAllow, allowPorts); err != nil {
 			logger.Debug("Failed to allow existing connection IP", "ip", ipStr, "error", err)
 		} else if wasAdded {
-			logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname, "ports", verdict.AllowPorts)
+			logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname, "ports", allowPorts)
 			if auditLogger != nil {
 				auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, true, autoAllowedType)
 			}
 		}
 	}
-	logger.Info("Processed pre-existing connections against allowlist", "count", len(existingIPs))
+	logger.Info("Processed pre-existing connections against allowlist", "count", len(conns))
 }
 
 // parseSudoAllowCommands splits a comma-separated list of command paths,
@@ -1065,33 +1082,141 @@ func detectSystemdResolvedUpstreams() ([]string, error) {
 	return upstreams, nil
 }
 
-// scanExistingConnections reads /proc/net/tcp and /proc/net/tcp6 to find all
-// unique remote IPs from established TCP connections. This is used in GitHub
-// Actions mode to discover connections that were set up before cargowall
-// started, so we can reverse-lookup their hostnames and populate the DNS cache.
-func scanExistingConnections() ([]string, error) {
-	seen := make(map[string]bool)
+// procNetSource is one /proc/net file scanned for pre-existing connections.
+// Optional sources may be absent (e.g. IPv6 disabled) without failing the
+// scan.
+type procNetSource struct {
+	path     string
+	isIPv6   bool
+	states   map[string]bool
+	proto    config.ProtocolType
+	optional bool
+}
 
-	// Scan IPv4 connections
-	if err := scanProcTCP("/proc/net/tcp", false, seen); err != nil {
-		return nil, err
+// procNetSources lists the files scanned by scanExistingConnections. A var
+// so tests can point the scan at fixture files.
+var procNetSources = []procNetSource{
+	{path: "/proc/net/tcp", states: tcpScanStates, proto: config.ProtocolTCP},
+	{path: "/proc/net/tcp6", isIPv6: true, states: tcpScanStates, proto: config.ProtocolTCP, optional: true},
+	{path: "/proc/net/udp", states: udpScanStates, proto: config.ProtocolUDP, optional: true},
+	{path: "/proc/net/udp6", isIPv6: true, states: udpScanStates, proto: config.ProtocolUDP, optional: true},
+}
+
+// existingConns maps a remote IP to the distinct (port, protocol) tuples of
+// pre-existing connections observed to it.
+type existingConns map[string][]config.Port
+
+// tupleKey identifies one observed connection tuple, used to exclude
+// already-gated tuples from the pre-attach delta re-scan.
+func tupleKey(ip string, p config.Port) string {
+	return fmt.Sprintf("%s|%d|%s", ip, p.Port, p.Protocol)
+}
+
+// scanExistingConnections reads /proc/net/{tcp,udp}{,6} to find the remote
+// (ip, port, protocol) tuples of connections that were set up before
+// cargowall started, so they can be gated against the allowlist (and, with
+// cache pre-population, reverse-looked-up to populate the DNS cache). Tuples
+// whose tupleKey is present in exclude are omitted, letting a pre-attach
+// re-scan return only the delta.
+func scanExistingConnections(exclude map[string]bool) (existingConns, error) {
+	seen := make(map[string]map[config.Port]bool)
+
+	for _, src := range procNetSources {
+		if err := scanProcNet(src.path, src.isIPv6, src.states, src.proto, seen); err != nil {
+			if src.optional && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
 	}
 
-	// Scan IPv6 connections (best-effort — file may not exist)
-	if err := scanProcTCP("/proc/net/tcp6", true, seen); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-
-	result := make([]string, 0, len(seen))
-	for ip := range seen {
-		result = append(result, ip)
+	result := make(existingConns, len(seen))
+	for ip, ports := range seen {
+		kept := make([]config.Port, 0, len(ports))
+		for p := range ports {
+			if exclude[tupleKey(ip, p)] {
+				continue
+			}
+			kept = append(kept, p)
+		}
+		if len(kept) == 0 {
+			continue
+		}
+		// Deterministic order for logs and tests (map iteration is random).
+		slices.SortFunc(kept, func(a, b config.Port) int {
+			if a.Port != b.Port {
+				return int(a.Port) - int(b.Port)
+			}
+			return strings.Compare(string(a.Protocol), string(b.Protocol))
+		})
+		result[ip] = kept
 	}
 	return result, nil
 }
 
-// scanProcTCP reads a /proc/net/tcp or /proc/net/tcp6 file and adds unique
-// remote IPs from ESTABLISHED connections to the seen map.
-func scanProcTCP(path string, isIPv6 bool, seen map[string]bool) error {
+// scanExistingForStartup runs the initial pre-existing-connection scan when
+// either consumer needs it: gating (--allow-existing-connections) or
+// reverse-DNS cache pre-population (--prepopulate-dns-cache). The scan needs
+// no DNS — gating must never depend on the prepopulate flag (regression
+// guard: --allow-existing-connections used to be a silent no-op without it).
+func scanExistingForStartup(cmd *StartCmd, logger *slog.Logger) existingConns {
+	if !cmd.AllowExistingConnections && !cmd.PrepopulateDNSCache {
+		return nil
+	}
+	conns, err := scanExistingConnections(nil)
+	if err != nil {
+		logger.Debug("Could not scan existing connections", "error", err)
+	}
+	return conns
+}
+
+// gateExistingStartupConnections gates the initial scan results when
+// --allow-existing-connections is set, returning the set of gated tuple keys
+// so the pre-attach re-scan gates only the delta (including a new port on an
+// already-seen peer).
+func gateExistingStartupConnections(cmd *StartCmd, conns existingConns, configMgr *config.Manager, fw firewall.Firewall, auditLogger *events.AuditLogger, logger *slog.Logger) map[string]bool {
+	if !cmd.AllowExistingConnections || fw == nil || len(conns) == 0 {
+		return nil
+	}
+	gateExistingConnections(conns, configMgr, fw, auditLogger, logger)
+	gated := make(map[string]bool, len(conns))
+	for ip, ports := range conns {
+		for _, p := range ports {
+			gated[tupleKey(ip, p)] = true
+		}
+	}
+	return gated
+}
+
+// rescanAndGateDelta re-scans /proc just before the TC program attaches and
+// gates only connections that appeared after the initial scan. The DNS
+// pre-population between the initial scan and attach can take tens of
+// seconds of sequential lookups, and connections established in that window
+// would otherwise be killed mid-stream the moment the program attaches.
+func rescanAndGateDelta(cmd *StartCmd, gated map[string]bool, configMgr *config.Manager, fw firewall.Firewall, auditLogger *events.AuditLogger, logger *slog.Logger) {
+	if !cmd.AllowExistingConnections || fw == nil {
+		return
+	}
+	if delta, err := scanExistingConnections(gated); err != nil {
+		logger.Debug("Pre-attach connection re-scan failed", "error", err)
+	} else if len(delta) > 0 {
+		gateExistingConnections(delta, configMgr, fw, auditLogger, logger)
+	}
+}
+
+// TCP states to keep when scanning /proc/net/tcp{,6}: ESTABLISHED ("01")
+// plus in-flight handshakes — SYN_SENT ("02") / SYN_RECV ("03") destinations
+// must also survive attach or a connection mid-handshake at startup dies.
+var tcpScanStates = map[string]bool{"01": true, "02": true, "03": true}
+
+// Connected UDP sockets report TCP_ESTABLISHED ("01") in /proc/net/udp{,6};
+// unconnected ones sit in TCP_CLOSE ("07") with a zero rem_address.
+var udpScanStates = map[string]bool{"01": true}
+
+// scanProcNet reads a /proc/net/{tcp,udp}{,6} file (they share the
+// sl/local_address/rem_address/st column layout) and adds the remote
+// (ip, port) tuples of connections in the wanted states to the seen map.
+func scanProcNet(path string, isIPv6 bool, wantStates map[string]bool, proto config.ProtocolType, seen map[string]map[config.Port]bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -1110,8 +1235,7 @@ func scanProcTCP(path string, isIPv6 bool, seen map[string]bool) error {
 		}
 
 		// Column 3 (0-indexed field 3) is the connection state.
-		// "01" = ESTABLISHED.
-		if fields[3] != "01" {
+		if !wantStates[fields[3]] {
 			continue
 		}
 
@@ -1131,12 +1255,22 @@ func scanProcTCP(path string, isIPv6 bool, seen map[string]bool) error {
 			continue
 		}
 
-		// Skip loopback and link-local addresses
-		if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		port, err := strconv.ParseUint(parts[1], 16, 16)
+		if err != nil {
 			continue
 		}
 
-		seen[ip.String()] = true
+		// Skip zero remotes (unconnected sockets), loopback, and link-local
+		// addresses.
+		if ip.IsUnspecified() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+
+		ipStr := ip.String()
+		if seen[ipStr] == nil {
+			seen[ipStr] = make(map[config.Port]bool)
+		}
+		seen[ipStr][config.Port{Port: uint16(port), Protocol: proto}] = true
 	}
 
 	return scanner.Err()

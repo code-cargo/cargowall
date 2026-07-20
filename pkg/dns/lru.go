@@ -49,13 +49,20 @@ func newLRUCache[K comparable, V any](capacity int) *lruCache[K, V] {
 // Get returns the value for key and moves it to the front of the LRU list.
 // Returns false if the key is missing or expired.
 func (c *lruCache[K, V]) Get(key K) (V, bool) {
+	v, _, ok := c.GetWithExpiry(key)
+	return v, ok
+}
+
+// GetWithExpiry is Get plus the entry's expiry time (zero = never expires),
+// for callers that need the remaining lifetime as well as the value.
+func (c *lruCache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	elem, ok := c.items[key]
 	if !ok {
 		var zero V
-		return zero, false
+		return zero, time.Time{}, false
 	}
 
 	e := elem.Value.(*lruEntry[K, V])
@@ -65,11 +72,11 @@ func (c *lruCache[K, V]) Get(key K) (V, bool) {
 		c.order.Remove(elem)
 		delete(c.items, key)
 		var zero V
-		return zero, false
+		return zero, time.Time{}, false
 	}
 
 	c.order.MoveToFront(elem)
-	return e.value, true
+	return e.value, e.expiry, true
 }
 
 // Put adds or updates a key-value pair. If ttl is 0, the entry never expires.
@@ -109,10 +116,15 @@ func (c *lruCache[K, V]) Put(key K, value V, ttl time.Duration) {
 }
 
 // Merge stores compose(existing, value) under key — or value alone when the
-// key is absent or already expired — refreshing the TTL and moving the entry
-// to the front. compose runs while the cache lock is held, so concurrent Merge
-// calls on the same key accumulate without the lost-update race a separate
-// Get-then-Put would have. If ttl is 0 the entry never expires.
+// key is absent or already expired — and moves the entry to the front.
+// compose runs while the cache lock is held, so concurrent Merge calls on the
+// same key accumulate without the lost-update race a separate Get-then-Put
+// would have. If ttl is 0 the entry never expires.
+//
+// Expiry is extend-only for a live entry: the later of the existing and
+// incoming expiry wins (never-expires wins over any finite expiry), so a
+// re-merge with a shorter TTL refreshes the value but cannot truncate a
+// longer lifetime an earlier merge established.
 //
 // Returns whether a live existing entry was composed with (true) versus a fresh
 // insert — i.e. an absent key or one treated as absent because it had expired.
@@ -134,6 +146,13 @@ func (c *lruCache[K, V]) Merge(key K, value V, ttl time.Duration, compose func(e
 		live := e.expiry.IsZero() || time.Now().Before(e.expiry)
 		if live {
 			value = compose(e.value, value)
+			// Extend-only expiry (see doc comment): keep the later of
+			// existing and incoming; zero (never expires) wins either way.
+			if expiry.IsZero() || e.expiry.IsZero() {
+				expiry = time.Time{}
+			} else if e.expiry.After(expiry) {
+				expiry = e.expiry
+			}
 		}
 		c.order.MoveToFront(elem)
 		e.value = value

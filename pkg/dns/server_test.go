@@ -1937,8 +1937,8 @@ func TestHandleDNSQuery_CNAMEZeroTTLStillLearns(t *testing.T) {
 // in the final address record's shorter TTL), and not the hop's own TTL alone
 // (a short-TTL tail under a long-TTL ancestor would expire into REFUSED while
 // resolver caches still point clients at it). This asserts the end-to-end
-// wiring: handleDNSQuery → cnameChainTargets per-hop ttl → running max →
-// derivedCNAMETTL → cnameAllowed.Merge.
+// wiring: handleDNSQuery → cnameChainTargets per-hop ttl → derivedCNAMETTL →
+// running max → cnameAllowed.Merge.
 func TestHandleDNSQuery_CNAMEChainTTLRunningMax(t *testing.T) {
 	const origin = "builds.dotnet.microsoft.com."
 	cn := func(owner, target string, ttl uint32) *dns.CNAME {
@@ -1948,15 +1948,13 @@ func TestHandleDNSQuery_CNAMEChainTTLRunningMax(t *testing.T) {
 		}
 	}
 	type expiry struct {
-		name   string
-		ttl    time.Duration
-		lowest time.Duration
+		name string
+		ttl  time.Duration
 	}
 	for _, tt := range []struct {
-		name    string
-		queryID uint16
-		hops    []dns.RR
-		want    []expiry
+		name string
+		hops []dns.RR
+		want []expiry
 	}{
 		{
 			// The #87 shape: a short-TTL tail under a long-TTL ancestor. The
@@ -1964,30 +1962,44 @@ func TestHandleDNSQuery_CNAMEChainTTLRunningMax(t *testing.T) {
 			// expire while a resolver still holds the 120s upper record and
 			// keeps sending clients straight to the tail. The 10s A record
 			// must not drag either down (response-wide-min regression).
-			name:    "descending TTLs: tail inherits ancestor max",
-			queryID: 7001,
+			name: "descending TTLs: tail inherits ancestor max",
 			hops: []dns.RR{
 				cn(origin, "hop1.example.net", 120),
 				cn("hop1.example.net", "a441.dscd.akamai.net", 45),
 			},
 			want: []expiry{
-				{"hop1.example.net", 120 * time.Second, 110 * time.Second},
-				{"a441.dscd.akamai.net", 120 * time.Second, 110 * time.Second},
+				{"hop1.example.net", 120 * time.Second},
+				{"a441.dscd.akamai.net", 120 * time.Second},
 			},
 		},
 		{
 			// Ascending TTLs: the max only ever widens, so a hop whose own
 			// TTL exceeds every ancestor's keeps it, and the earlier hop is
 			// unaffected by the later, longer one.
-			name:    "ascending TTLs: own TTL wins when larger",
-			queryID: 7003,
+			name: "ascending TTLs: own TTL wins when larger",
 			hops: []dns.RR{
 				cn(origin, "hop1.example.net", 45),
 				cn("hop1.example.net", "a441.dscd.akamai.net", 120),
 			},
 			want: []expiry{
-				{"hop1.example.net", 45 * time.Second, 40 * time.Second},
-				{"a441.dscd.akamai.net", 120 * time.Second, 110 * time.Second},
+				{"hop1.example.net", 45 * time.Second},
+				{"a441.dscd.akamai.net", 120 * time.Second},
+			},
+		},
+		{
+			// The max runs over EFFECTIVE (floored) TTLs: a sub-30s hop is
+			// raised to minDerivedCNAMETTL and a TTL-0 hop to defaultDNSTTL,
+			// and both floors reach descendants — a TTL-0 hop under a
+			// nonzero ancestor must keep the 300s defeat-caching window, not
+			// shrink to the ancestor's TTL.
+			name: "zero and sub-floor TTLs floored per hop before the max",
+			hops: []dns.RR{
+				cn(origin, "hop1.example.net", 5),
+				cn("hop1.example.net", "a441.dscd.akamai.net", 0),
+			},
+			want: []expiry{
+				{"hop1.example.net", 30 * time.Second},
+				{"a441.dscd.akamai.net", 300 * time.Second},
 			},
 		},
 	} {
@@ -2002,7 +2014,7 @@ func TestHandleDNSQuery_CNAMEChainTTLRunningMax(t *testing.T) {
 			server.filterQueries = true
 
 			resp := &dns.Msg{
-				MsgHdr:   dns.MsgHdr{Id: tt.queryID - 1, Response: true, Rcode: dns.RcodeSuccess},
+				MsgHdr:   dns.MsgHdr{Id: 7000, Response: true, Rcode: dns.RcodeSuccess},
 				Question: []dns.Question{{Name: origin, Qtype: dns.TypeA, Qclass: dns.ClassINET}},
 				Answer: append(append([]dns.RR{}, tt.hops...), &dns.A{
 					Hdr: dns.RR_Header{Name: "a441.dscd.akamai.net.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10},
@@ -2015,7 +2027,7 @@ func TestHandleDNSQuery_CNAMEChainTTLRunningMax(t *testing.T) {
 
 			query := new(dns.Msg)
 			query.SetQuestion(origin, dns.TypeA)
-			query.Id = tt.queryID
+			query.Id = 7001
 			w := &MockResponseWriter{}
 			w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
 			server.handleDNSQuery(w, query)
@@ -2025,11 +2037,66 @@ func TestHandleDNSQuery_CNAMEChainTTLRunningMax(t *testing.T) {
 				exp, ok := server.cnameAllowed.peekExpiry(tc.name)
 				require.True(t, ok, "%s should be learned", tc.name)
 				remaining := time.Until(exp)
-				assert.Greater(t, remaining, tc.lowest, "%s expiry should reflect the chain's running-max TTL", tc.name)
+				assert.Greater(t, remaining, tc.ttl-10*time.Second, "%s expiry should reflect the chain's running-max TTL", tc.name)
 				assert.LessOrEqual(t, remaining, tc.ttl, "%s expiry should not exceed the chain's running-max TTL", tc.name)
 			}
 		})
 	}
+}
+
+// A chain split across query round-trips must keep the ancestor guarantee:
+// hops learned via the derived path seed the running max with the parent
+// entry's remaining life (derivedReach), so a short-TTL tail learned from a
+// later response outlives its own record for as long as the already-learned
+// ancestor's records can still point clients at it.
+func TestHandleDNSQuery_CNAMEDerivedSeedsAncestorReach(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	// The parent hop was learned from an earlier response and still has ~10
+	// minutes of life (e.g. a long ancestor CNAME TTL).
+	server.cnameAllowed.Put("hop1.example.net",
+		derivedAllow{chain: []string{"allowed.example.com", "hop1.example.net"}}, 600*time.Second)
+
+	// The client now queries the hop directly; the split chain's next
+	// response carries only the short-TTL tail.
+	const qname = "hop1.example.net."
+	resp := &dns.Msg{
+		MsgHdr:   dns.MsgHdr{Id: 7100, Response: true, Rcode: dns.RcodeSuccess},
+		Question: []dns.Question{{Name: qname, Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+		Answer: []dns.RR{&dns.CNAME{
+			Hdr:    dns.RR_Header{Name: qname, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 9},
+			Target: "tail.example.net.",
+		}},
+	}
+	seedCachedResponse(server, qname, resp)
+
+	query := new(dns.Msg)
+	query.SetQuestion(qname, dns.TypeA)
+	query.Id = 7101
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	// The tail must inherit the parent's remaining ~600s, not its own
+	// 9s→30s floored TTL.
+	exp, ok := server.cnameAllowed.peekExpiry("tail.example.net")
+	require.True(t, ok, "derived response must learn the tail")
+	remaining := time.Until(exp)
+	assert.Greater(t, remaining, 550*time.Second, "tail must seed from the parent entry's remaining life")
+	assert.LessOrEqual(t, remaining, 600*time.Second, "tail must not outlive the parent's remaining life")
+
+	// Attribution still extends the parent's chain down to the tail.
+	entry, ok := server.cnameAllowed.Get("tail.example.net")
+	require.True(t, ok)
+	assert.Equal(t, []string{"allowed.example.com", "hop1.example.net", "tail.example.net"}, entry.chain)
 }
 
 // cnameChainTargets must follow only the chain rooted at the query name, carry

@@ -215,6 +215,38 @@ func TestLRUCache_MergeReportsLiveness(t *testing.T) {
 	assert.Equal(t, 7, got, "expired Merge replaces (not composes) → 7")
 }
 
+// Merge's expiry is extend-only for a live entry: a re-merge with a shorter
+// TTL still composes the value but keeps the later expiry, a longer TTL
+// extends it, and never-expires (ttl 0) wins over any finite expiry. Guards
+// the #87 running-max fix: a partial-chain re-learn with a smaller max must
+// not truncate a lifetime an earlier response established.
+func TestLRUCache_MergeExpiryExtendOnly(t *testing.T) {
+	c := newLRUCache[string, int](10)
+	sum := func(existing, incoming int) int { return existing + incoming }
+
+	c.Merge("k", 1, 100*time.Second, sum)
+	assert.True(t, c.Merge("k", 2, 10*time.Second, sum), "shorter re-merge still composes with the live entry")
+	exp, ok := c.peekExpiry("k")
+	require.True(t, ok)
+	assert.Greater(t, time.Until(exp), 90*time.Second, "shorter re-merge must not truncate the existing expiry")
+	got, _ := c.Get("k")
+	assert.Equal(t, 3, got, "value still composes on a shorter re-merge")
+
+	c.Merge("k", 4, 200*time.Second, sum)
+	exp, ok = c.peekExpiry("k")
+	require.True(t, ok)
+	assert.Greater(t, time.Until(exp), 190*time.Second, "longer re-merge extends the expiry")
+
+	c.Merge("k", 8, 0, sum)
+	exp, ok = c.peekExpiry("k")
+	require.True(t, ok)
+	assert.True(t, exp.IsZero(), "never-expires re-merge wins over a finite expiry")
+	assert.True(t, c.Merge("k", 16, time.Minute, sum), "finite re-merge of a never-expiring entry composes")
+	exp, ok = c.peekExpiry("k")
+	require.True(t, ok)
+	assert.True(t, exp.IsZero(), "existing never-expires wins over an incoming finite expiry")
+}
+
 // Concurrent Get/Put must not race. Run under `go test -race` to catch any
 // missed locking.
 func TestLRUCache_ConcurrentAccess(t *testing.T) {

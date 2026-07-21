@@ -56,6 +56,32 @@ func SetupDNSRedirect(logger *slog.Logger) error {
 	return nil
 }
 
+// FlushResolvedCache clears systemd-resolved's DNS cache via
+// `resolvectl flush-caches`. Once the DNS redirect is installed, flushing
+// forces every subsequent lookup — including from processes that warmed the
+// 127.0.0.53 stub cache before cargowall attached — to miss the stub and go
+// upstream, where the redirect routes it through the proxy. That is where
+// suffix/wildcard rules match, resolved IPs get firewall-allowed, and
+// hostname attribution is retained; a warm stub cache hit never travels
+// upstream, so the proxy never sees the name and the connection lands as an
+// unattributed bare IP (deny-by-default).
+//
+// Best-effort: on hosts without systemd-resolved there is no stub cache to
+// flush and the redirect alone suffices, so a missing resolvectl is not an
+// error. A genuine flush failure is returned for the caller to log.
+func FlushResolvedCache(logger *slog.Logger) error {
+	path, err := exec.LookPath("resolvectl")
+	if err != nil {
+		logger.Debug("resolvectl not found; skipping systemd-resolved cache flush")
+		return nil
+	}
+	if out, err := exec.Command(path, "flush-caches").CombinedOutput(); err != nil {
+		return fmt.Errorf("resolvectl flush-caches failed: %w (output: %s)", err, out)
+	}
+	logger.Info("Flushed systemd-resolved DNS cache")
+	return nil
+}
+
 // TeardownDNSRedirect removes the iptables DNAT rules added by SetupDNSRedirect.
 func TeardownDNSRedirect(logger *slog.Logger) error {
 	var lastErr error

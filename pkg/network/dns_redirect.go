@@ -99,16 +99,32 @@ func FlushResolvedCache(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	// resolvectl can be installed on hosts that don't actually run
-	// systemd-resolved (a different resolver is in use). Flushing there only
-	// errors, so skip quietly rather than warn on every startup.
+	// systemd-resolved (a different resolver is in use); its runtime dir is
+	// absent there, so skip quietly rather than warn on every startup. Only a
+	// genuine "not there" is benign — a stat failure such as EACCES/EIO is real
+	// and surfaced, mirroring the LookPath classification above (otherwise a
+	// host where resolved *is* running would be misreported as a correct skip).
 	if _, err := os.Stat(resolvedRuntimeDir); err != nil {
-		logger.Debug("systemd-resolved not running; skipping cache flush", "probe", resolvedRuntimeDir)
-		return nil
+		if errors.Is(err, os.ErrNotExist) {
+			logger.Debug("systemd-resolved not running; skipping cache flush", "probe", resolvedRuntimeDir)
+			return nil
+		}
+		return fmt.Errorf("probing %s failed: %w", resolvedRuntimeDir, err)
 	}
 
 	flushCtx, cancel := context.WithTimeout(ctx, flushResolvedTimeout)
 	defer cancel()
-	if out, err := exec.CommandContext(flushCtx, path, "flush-caches").CombinedOutput(); err != nil {
+	flush := exec.CommandContext(flushCtx, path, "flush-caches")
+	// WaitDelay bounds CombinedOutput's Wait after the deadline kills the
+	// process: without it, Wait blocks until every inheritor of the stdout/
+	// stderr pipes exits, so the timeout would rest on resolvectl never leaving
+	// a lingering child holding them.
+	flush.WaitDelay = time.Second
+	if out, err := flush.CombinedOutput(); err != nil {
+		// Name the deadline rather than surfacing a bare "signal: killed".
+		if ctxErr := flushCtx.Err(); ctxErr != nil {
+			return fmt.Errorf("resolvectl flush-caches timed out after %s: %w", flushResolvedTimeout, ctxErr)
+		}
 		return fmt.Errorf("resolvectl flush-caches failed: %w (output: %s)", err, out)
 	}
 	logger.Info("Flushed systemd-resolved DNS cache")

@@ -168,20 +168,24 @@ jobs:
           binary-path: ./bin/cargowall
           debug: true
 
+      - name: Test allowed connection via hostname pattern
+        run: |
+          # Runs FIRST among the connection tests: it doubles as the #89
+          # regression check for raw.githubusercontent.com, which was warmed
+          # into the systemd-resolved stub cache before attach (step above).
+          # Keeping it first minimizes the warm→request window so a short record
+          # TTL can't expire the entry and silently degrade this to the ordinary
+          # cold-cache path. If the attach-time cache flush regresses, this
+          # getaddrinfo is served invisibly from the warm stub, the proxy never
+          # sees the name, and the connection is blocked as a bare IP — failing
+          # here.
+          curl -sf --connect-timeout 10 --max-time 30 https://raw.githubusercontent.com/github/gitignore/main/README.md > /dev/null
+          echo "✅ raw.githubusercontent.com allowed via **.githubusercontent.com pattern (warm-cache re-resolved through proxy)"
+
       - name: Test allowed connection
         run: |
           curl -sf --connect-timeout 10 --max-time 30 https://github.com > /dev/null
           echo "✅ github.com allowed"
-
-      - name: Test allowed connection via hostname pattern
-        run: |
-          # Doubles as the #89 regression check: raw.githubusercontent.com was
-          # warmed into the systemd-resolved stub cache before attach (step
-          # above). If the attach-time cache flush regresses, this getaddrinfo
-          # is served invisibly from the warm stub, the proxy never sees the
-          # name, and the connection is blocked as a bare IP — failing here.
-          curl -sf --connect-timeout 10 --max-time 30 https://raw.githubusercontent.com/github/gitignore/main/README.md > /dev/null
-          echo "✅ raw.githubusercontent.com allowed via **.githubusercontent.com pattern (warm-cache re-resolved through proxy)"
 
       - name: Test blocked connection
         run: |

@@ -18,6 +18,7 @@ package network
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -26,16 +27,17 @@ import (
 	"time"
 )
 
-// writeFakeResolvectl drops an executable `resolvectl` into a fresh temp dir
-// whose body is the given /bin/sh script, and returns the dir so the caller can
-// make it the sole PATH entry.
-func writeFakeResolvectl(t *testing.T, script string) string {
+// installFakeResolvectl drops an executable `resolvectl` running the given
+// /bin/sh script into a fresh temp dir and makes it the FIRST entry on PATH.
+// The existing PATH is preserved after it so LookPath resolves the fake yet the
+// script can still invoke real utilities (e.g. `sleep`).
+func installFakeResolvectl(t *testing.T, script string) {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "resolvectl"), []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
 		t.Fatalf("write fake resolvectl: %v", err)
 	}
-	return dir
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func discardLogger() *slog.Logger {
@@ -62,7 +64,7 @@ func TestFlushResolvedCache_NotInstalled(t *testing.T) {
 // TestFlushResolvedCache_ResolvedNotRunning: resolvectl present but the runtime
 // dir is absent → quiet skip, and the fake (which would exit 1) must not run.
 func TestFlushResolvedCache_ResolvedNotRunning(t *testing.T) {
-	t.Setenv("PATH", writeFakeResolvectl(t, "exit 1"))
+	installFakeResolvectl(t, "exit 1")
 	prev := resolvedRuntimeDir
 	resolvedRuntimeDir = filepath.Join(t.TempDir(), "absent")
 	t.Cleanup(func() { resolvedRuntimeDir = prev })
@@ -74,7 +76,7 @@ func TestFlushResolvedCache_ResolvedNotRunning(t *testing.T) {
 
 // TestFlushResolvedCache_FlushFails: resolved running + non-zero exit → error.
 func TestFlushResolvedCache_FlushFails(t *testing.T) {
-	t.Setenv("PATH", writeFakeResolvectl(t, "echo boom >&2; exit 1"))
+	installFakeResolvectl(t, "echo boom >&2; exit 1")
 	withResolvedRunning(t)
 
 	if err := FlushResolvedCache(context.Background(), discardLogger()); err == nil {
@@ -84,7 +86,7 @@ func TestFlushResolvedCache_FlushFails(t *testing.T) {
 
 // TestFlushResolvedCache_Success: resolved running + zero exit → nil.
 func TestFlushResolvedCache_Success(t *testing.T) {
-	t.Setenv("PATH", writeFakeResolvectl(t, "exit 0"))
+	installFakeResolvectl(t, "exit 0")
 	withResolvedRunning(t)
 
 	if err := FlushResolvedCache(context.Background(), discardLogger()); err != nil {
@@ -95,7 +97,7 @@ func TestFlushResolvedCache_Success(t *testing.T) {
 // TestFlushResolvedCache_Timeout: a wedged resolvectl is killed at the deadline
 // and surfaced as an error rather than hanging startup.
 func TestFlushResolvedCache_Timeout(t *testing.T) {
-	t.Setenv("PATH", writeFakeResolvectl(t, "sleep 5"))
+	installFakeResolvectl(t, "sleep 5")
 	withResolvedRunning(t)
 	prev := flushResolvedTimeout
 	flushResolvedTimeout = 50 * time.Millisecond
@@ -107,6 +109,9 @@ func TestFlushResolvedCache_Timeout(t *testing.T) {
 	case err := <-done:
 		if err == nil {
 			t.Fatal("expected timeout error, got nil")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected a deadline-exceeded error naming the timeout, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("FlushResolvedCache did not honor its timeout")

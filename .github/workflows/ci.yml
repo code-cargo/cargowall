@@ -140,6 +140,22 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
+      - name: Warm systemd-resolved cache before attach (reproduce #89)
+        run: |
+          # GitHub's Azure runners resolve via systemd-resolved (127.0.0.53).
+          # Populate its stub cache with a wildcard-matched name BEFORE cargowall
+          # attaches. The concrete name can't be pre-tracked, so only the
+          # attach-time cache flush makes the later getaddrinfo miss the stub and
+          # re-resolve through the proxy — where **.githubusercontent.com matches
+          # and the IP is allowed with attribution. Without the flush the warm
+          # entry is served invisibly and the "hostname pattern" curl below is
+          # blocked as a bare IP. Best-effort so runners without systemd-resolved
+          # simply fall back to the cold-cache path.
+          resolvectl query raw.githubusercontent.com 2>/dev/null \
+            || getent ahosts raw.githubusercontent.com \
+            || true
+          echo "Warmed resolver cache for raw.githubusercontent.com"
+
       - name: Start CargoWall via Action
         uses: code-cargo/cargowall-action@aa88f652e49b36a660add09311d077383dbc2ae7 # v1.3.3
         with:
@@ -159,8 +175,13 @@ jobs:
 
       - name: Test allowed connection via hostname pattern
         run: |
+          # Doubles as the #89 regression check: raw.githubusercontent.com was
+          # warmed into the systemd-resolved stub cache before attach (step
+          # above). If the attach-time cache flush regresses, this getaddrinfo
+          # is served invisibly from the warm stub, the proxy never sees the
+          # name, and the connection is blocked as a bare IP — failing here.
           curl -sf --connect-timeout 10 --max-time 30 https://raw.githubusercontent.com/github/gitignore/main/README.md > /dev/null
-          echo "✅ raw.githubusercontent.com allowed via **.githubusercontent.com pattern"
+          echo "✅ raw.githubusercontent.com allowed via **.githubusercontent.com pattern (warm-cache re-resolved through proxy)"
 
       - name: Test blocked connection
         run: |
@@ -732,6 +753,24 @@ jobs:
       - name: Show startup log (debug aid)
         if: always()
         run: sudo cat /tmp/cargowall.log || true
+
+      - name: Verify systemd-resolved cache flush ran at attach (#89)
+        run: |
+          # On the Azure runner the client resolver is systemd-resolved, whose
+          # warm stub cache used to serve pre-attach answers invisibly (#89).
+          # With the DNS redirect active (--gitlab-ci preset), cargowall flushes
+          # that cache at attach so future lookups traverse the proxy. Assert the
+          # FlushResolvedCache path executed — the flush itself on a resolved
+          # host, or the documented best-effort skip elsewhere.
+          if sudo grep -q "Flushed systemd-resolved DNS cache" /tmp/cargowall.log; then
+            echo "✅ resolved cache flushed at attach"
+          elif sudo grep -qE "systemd-resolved not running|resolvectl not found" /tmp/cargowall.log; then
+            echo "ℹ️ systemd-resolved not in use on this runner; flush correctly skipped"
+          else
+            echo "❌ neither flush nor skip logged — FlushResolvedCache path not reached"
+            sudo grep -iE "resolv|flush|dns redirect" /tmp/cargowall.log || true
+            exit 1
+          fi
 
       - name: Verify pidfile written
         run: |

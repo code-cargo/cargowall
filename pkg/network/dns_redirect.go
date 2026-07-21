@@ -17,9 +17,13 @@
 package network
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"time"
 )
 
 // DNSProxyFWMark is the firewall mark applied to the DNS proxy's own upstream
@@ -56,6 +60,17 @@ func SetupDNSRedirect(logger *slog.Logger) error {
 	return nil
 }
 
+// resolvedRuntimeDir exists only while systemd-resolved is running. Its
+// presence is the signal that tells "resolved not in use" (a quiet skip) apart
+// from "resolved running but the flush genuinely failed" (surfaced to the
+// caller). A var so tests can point it at a controllable path.
+var resolvedRuntimeDir = "/run/systemd/resolve"
+
+// flushResolvedTimeout bounds the resolvectl call so a wedged systemd-resolved
+// (or its D-Bus endpoint) cannot stall startup before the eBPF program
+// attaches and the firewall begins enforcing. A var so tests can shorten it.
+var flushResolvedTimeout = 5 * time.Second
+
 // FlushResolvedCache clears systemd-resolved's DNS cache via
 // `resolvectl flush-caches`. Once the DNS redirect is installed, flushing
 // forces every subsequent lookup — including from processes that warmed the
@@ -66,16 +81,34 @@ func SetupDNSRedirect(logger *slog.Logger) error {
 // upstream, so the proxy never sees the name and the connection lands as an
 // unattributed bare IP (deny-by-default).
 //
-// Best-effort: on hosts without systemd-resolved there is no stub cache to
-// flush and the redirect alone suffices, so a missing resolvectl is not an
-// error. A genuine flush failure is returned for the caller to log.
-func FlushResolvedCache(logger *slog.Logger) error {
+// Best-effort with two quiet skips (return nil, log at Debug): resolvectl not
+// installed, or systemd-resolved not running — in both cases there is no stub
+// cache to flush and the redirect alone suffices. Everything else is surfaced
+// to the caller: a non-not-found lookup error (e.g. a non-executable resolvectl
+// on PATH), a non-zero flush exit, or the bounded call timing out.
+func FlushResolvedCache(ctx context.Context, logger *slog.Logger) error {
 	path, err := exec.LookPath("resolvectl")
 	if err != nil {
-		logger.Debug("resolvectl not found; skipping systemd-resolved cache flush")
+		// Only genuine not-installed is benign; a permission or other PATH
+		// resolution failure is real and must not silently skip the flush.
+		if errors.Is(err, exec.ErrNotFound) {
+			logger.Debug("resolvectl not found; skipping systemd-resolved cache flush")
+			return nil
+		}
+		return fmt.Errorf("locating resolvectl failed: %w", err)
+	}
+
+	// resolvectl can be installed on hosts that don't actually run
+	// systemd-resolved (a different resolver is in use). Flushing there only
+	// errors, so skip quietly rather than warn on every startup.
+	if _, err := os.Stat(resolvedRuntimeDir); err != nil {
+		logger.Debug("systemd-resolved not running; skipping cache flush", "probe", resolvedRuntimeDir)
 		return nil
 	}
-	if out, err := exec.Command(path, "flush-caches").CombinedOutput(); err != nil {
+
+	flushCtx, cancel := context.WithTimeout(ctx, flushResolvedTimeout)
+	defer cancel()
+	if out, err := exec.CommandContext(flushCtx, path, "flush-caches").CombinedOutput(); err != nil {
 		return fmt.Errorf("resolvectl flush-caches failed: %w (output: %s)", err, out)
 	}
 	logger.Info("Flushed systemd-resolved DNS cache")

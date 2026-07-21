@@ -441,7 +441,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		// path, flushing would only churn the cache for no benefit.
 		// Non-fatal — hosts without systemd-resolved work via the redirect.
 		if dnsRedirectActive {
-			if err := network.FlushResolvedCache(logger); err != nil {
+			if err := network.FlushResolvedCache(ctx, logger); err != nil {
 				logger.Warn("Failed to flush systemd-resolved cache (non-fatal)", "error", err)
 			}
 		}

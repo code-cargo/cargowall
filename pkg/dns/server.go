@@ -420,7 +420,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		// Cache successful responses
 		if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
 			// Find minimum TTL from answers
-			minTTL := uint32(300) // Default 5 minutes
+			minTTL := uint32(defaultDNSTTL)
 			for _, answer := range resp.Answer {
 				if answer.Header().Ttl > 0 && answer.Header().Ttl < minTTL {
 					minTTL = answer.Header().Ttl
@@ -488,10 +488,21 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 	// Any matching rule is authoritative.
 	var derivedPorts []config.Port
 	var derivedChain []string
+	// derivedReach seeds the chain's running-max TTL (see the learning loop
+	// below) with the parent entry's remaining life, so a chain split across
+	// query round-trips keeps the ancestor guarantee: a short-TTL tail
+	// learned from this response must outlive its own record for as long as
+	// the already-learned ancestor's records can still point clients at it.
+	var derivedReach uint32
 	derived := false
 	if !verdict.Matched() && s.cnameAllowed != nil {
-		if entry, ok := s.cnameAllowed.Get(canonicalHostname); ok {
+		if entry, exp, ok := s.cnameAllowed.GetWithExpiry(canonicalHostname); ok {
 			derived, derivedPorts, derivedChain = true, entry.ports, entry.chain
+			if rem := time.Until(exp); exp.IsZero() || rem > maxDerivedCNAMETTL*time.Second {
+				derivedReach = maxDerivedCNAMETTL
+			} else if rem > 0 {
+				derivedReach = uint32(rem / time.Second)
+			}
 		}
 	}
 
@@ -515,12 +526,26 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 	// follows the chain from the query name only, so unrelated CNAME records
 	// (a misbehaving or spoofed authoritative server for an allowed domain)
 	// are ignored instead of registering arbitrary names; depth is bounded
-	// by the 10k LRU and per-hop TTL. Targets inherit the origin's allow
-	// ports. Each target is learned for its own CNAME TTL (not the response-
-	// wide min, which would shorten it to the final address record's TTL),
-	// floored by derivedCNAMETTL. A target whose entry expires before its
-	// origin's dnsCache entry just gets re-REFUSED until the next origin
-	// query re-learns it — self-healing and TTL-bounded.
+	// by the 10k LRU and the capped chain TTL below. Targets inherit the
+	// origin's allow ports. Each target is learned for the running max of
+	// the effective (derivedCNAMETTL-floored) CNAME TTLs from the origin
+	// down to it (not the response-wide min, which would shorten it to the
+	// final address record's TTL, and not the hop's own TTL alone): a
+	// client reaches a hop by following its ancestors' cached records, so
+	// it can keep querying that hop directly for as long as the longest-
+	// lived record above it survives — a short-TTL tail under a long-TTL
+	// ancestor (the common CDN shape, #87) would otherwise expire into
+	// REFUSED while cache still points clients at it, with no origin
+	// re-query to re-learn it. The max runs over effective TTLs so the
+	// TTL-0→defaultDNSTTL accommodation reaches descendants too, is seeded
+	// with the parent entry's remaining life when a chain splits across
+	// query round-trips (derivedReach above), and is capped at
+	// maxDerivedCNAMETTL so one huge ancestor TTL can't pin a whole chain
+	// near-indefinitely. Merge's expiry is extend-only, so a later partial-
+	// chain re-learn with a smaller max can't truncate a longer lifetime an
+	// earlier response established. A target whose entry still expires
+	// before the client's interest in it just gets re-REFUSED until the
+	// next origin query re-learns it — self-healing and TTL-bounded.
 	//
 	// Not gated on s.filterQueries: the enforcement use applies even when
 	// query filtering is off; isQueryAllowed still only consults the cache
@@ -553,8 +578,13 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 			path = []string{canonicalHostname}
 			source = "rule:" + verdict.AllowRule
 		}
+		// reach is the running max of effective TTLs from the chain root
+		// down to the current hop — how long a chain-chasing client can
+		// still be pointed at it (see the comment above).
+		reach := derivedReach
 		for _, link := range links {
-			ttl := time.Duration(derivedCNAMETTL(link.ttl)) * time.Second
+			reach = min(max(reach, derivedCNAMETTL(link.ttl)), maxDerivedCNAMETTL)
+			ttl := time.Duration(reach) * time.Second
 			path = append(path, link.target)
 			chain := append([]string{}, path...)
 			// Log a first-learn (or re-learn after expiry) at Info so a
@@ -759,8 +789,8 @@ func mergeDerivedAllow(existing, incoming derivedAllow) derivedAllow {
 // as queryable. A visited set — seeded with qname — bounds malicious loops,
 // including ones that point back at the query name itself (N→X→N), so a crafted
 // response can't re-register qname and refresh its derived-allow TTL. Each
-// target carries its own CNAME record's TTL so the caller can expire it on the
-// hop's lifetime rather than the response-wide minimum.
+// target carries its own CNAME record's TTL; the caller folds these into the
+// chain's running-max expiry rather than using the response-wide minimum.
 func cnameChainTargets(qname string, answers []dns.RR) []cnameLink {
 	// Index CNAMEs by lowercased owner; first record for an owner wins so a
 	// duplicate owner can't redirect the walk. Allocated lazily so the common
@@ -805,17 +835,35 @@ func cnameChainTargets(qname string, answers []dns.RR) []cnameLink {
 	return chain
 }
 
-// derivedCNAMETTL floors a CNAME record's TTL for the derived CNAME-allow
-// cache. A record's TTL can be 0 (some CDNs/load-balancers return TTL 0 to
-// defeat caching), and lruCache treats a 0 duration as "never expires", so a
-// literal 0 would pin the derived allow indefinitely — the opposite of the
-// TTL-bounded guarantee. Floor it to the same default the dnsCache path uses
-// (300s / 5 min).
+const (
+	// defaultDNSTTL (seconds) is the shared fallback TTL: the dnsCache
+	// response path uses it when no answer carries a usable TTL, and
+	// derivedCNAMETTL maps TTL-0 records to it — some CDNs/load-balancers
+	// return TTL 0 to defeat caching, and lruCache treats a 0 duration as
+	// "never expires", so a literal 0 would pin a derived allow
+	// indefinitely, the opposite of the TTL-bounded guarantee.
+	defaultDNSTTL = 300
+	// minDerivedCNAMETTL (seconds) floors small nonzero CNAME TTLs (#87):
+	// a TTL-1 record would otherwise yield a 1-second allow window —
+	// strictly worse than the TTL-0 case above — and REFUSE the client's
+	// very next direct query for the target.
+	minDerivedCNAMETTL = 30
+	// maxDerivedCNAMETTL (seconds) caps the chain running-max TTL so one
+	// huge (or crafted) ancestor TTL can't pin every downstream hop's
+	// derived allow near-indefinitely; matches the dnsCache no-answer
+	// default (see extractIPsFromResponse).
+	maxDerivedCNAMETTL = 86400
+)
+
+// derivedCNAMETTL returns the effective TTL (seconds) of one CNAME hop for
+// the derived CNAME-allow cache: TTL 0 maps to defaultDNSTTL and small TTLs
+// are floored to minDerivedCNAMETTL. Applied per hop BEFORE the running max
+// in the learning loop, so both floors propagate to descendant hops.
 func derivedCNAMETTL(ttl uint32) uint32 {
 	if ttl == 0 {
-		return 300
+		return defaultDNSTTL
 	}
-	return ttl
+	return max(ttl, minDerivedCNAMETTL)
 }
 
 // extractIPsFromResponse extracts IPv4 and IPv6 addresses from msg.Answer

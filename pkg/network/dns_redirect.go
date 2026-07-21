@@ -17,9 +17,13 @@
 package network
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"time"
 )
 
 // DNSProxyFWMark is the firewall mark applied to the DNS proxy's own upstream
@@ -53,6 +57,77 @@ func SetupDNSRedirect(logger *slog.Logger) error {
 		}
 	}
 	logger.Info("DNS redirect iptables rules installed")
+	return nil
+}
+
+// resolvedRuntimeDir exists only while systemd-resolved is running. Its
+// presence is the signal that tells "resolved not in use" (a quiet skip) apart
+// from "resolved running but the flush genuinely failed" (surfaced to the
+// caller). A var so tests can point it at a controllable path.
+var resolvedRuntimeDir = "/run/systemd/resolve"
+
+// flushResolvedTimeout bounds the resolvectl call so a wedged systemd-resolved
+// (or its D-Bus endpoint) cannot stall startup before the eBPF program
+// attaches and the firewall begins enforcing. A var so tests can shorten it.
+var flushResolvedTimeout = 5 * time.Second
+
+// FlushResolvedCache clears systemd-resolved's DNS cache via
+// `resolvectl flush-caches`. Once the DNS redirect is installed, flushing
+// forces every subsequent lookup — including from processes that warmed the
+// 127.0.0.53 stub cache before cargowall attached — to miss the stub and go
+// upstream, where the redirect routes it through the proxy. That is where
+// suffix/wildcard rules match, resolved IPs get firewall-allowed, and
+// hostname attribution is retained; a warm stub cache hit never travels
+// upstream, so the proxy never sees the name and the connection lands as an
+// unattributed bare IP (deny-by-default).
+//
+// Best-effort with two quiet skips (return nil, log at Debug): resolvectl not
+// installed, or systemd-resolved not running — in both cases there is no stub
+// cache to flush and the redirect alone suffices. Everything else is surfaced
+// to the caller: a non-not-found lookup error (e.g. a non-executable resolvectl
+// on PATH), a non-zero flush exit, or the bounded call timing out.
+func FlushResolvedCache(ctx context.Context, logger *slog.Logger) error {
+	path, err := exec.LookPath("resolvectl")
+	if err != nil {
+		// Only genuine not-installed is benign; a permission or other PATH
+		// resolution failure is real and must not silently skip the flush.
+		if errors.Is(err, exec.ErrNotFound) {
+			logger.Debug("resolvectl not found; skipping systemd-resolved cache flush")
+			return nil
+		}
+		return fmt.Errorf("locating resolvectl failed: %w", err)
+	}
+
+	// resolvectl can be installed on hosts that don't actually run
+	// systemd-resolved (a different resolver is in use); its runtime dir is
+	// absent there, so skip quietly rather than warn on every startup. Only a
+	// genuine "not there" is benign — a stat failure such as EACCES/EIO is real
+	// and surfaced, mirroring the LookPath classification above (otherwise a
+	// host where resolved *is* running would be misreported as a correct skip).
+	if _, err := os.Stat(resolvedRuntimeDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			logger.Debug("systemd-resolved not running; skipping cache flush", "probe", resolvedRuntimeDir)
+			return nil
+		}
+		return fmt.Errorf("probing %s failed: %w", resolvedRuntimeDir, err)
+	}
+
+	flushCtx, cancel := context.WithTimeout(ctx, flushResolvedTimeout)
+	defer cancel()
+	flush := exec.CommandContext(flushCtx, path, "flush-caches")
+	// WaitDelay bounds CombinedOutput's Wait after the deadline kills the
+	// process: without it, Wait blocks until every inheritor of the stdout/
+	// stderr pipes exits, so the timeout would rest on resolvectl never leaving
+	// a lingering child holding them.
+	flush.WaitDelay = time.Second
+	if out, err := flush.CombinedOutput(); err != nil {
+		// Name the deadline rather than surfacing a bare "signal: killed".
+		if ctxErr := flushCtx.Err(); ctxErr != nil {
+			return fmt.Errorf("resolvectl flush-caches timed out after %s: %w", flushResolvedTimeout, ctxErr)
+		}
+		return fmt.Errorf("resolvectl flush-caches failed: %w (output: %s)", err, out)
+	}
+	logger.Info("Flushed systemd-resolved DNS cache")
 	return nil
 }
 

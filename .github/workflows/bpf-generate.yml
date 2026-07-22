@@ -17,7 +17,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: code-cargo/cargowall-action@aa88f652e49b36a660add09311d077383dbc2ae7 # v1.3.3
+      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 

@@ -32,28 +32,36 @@ import (
 const policyEndpoint = "/api/cargowall/v1/action/policy"
 
 // policyServer returns an httptest server that serves the given JSON body for
-// the policy endpoint. It asserts the request method, path, job_key query and
-// bearer token match what fetchPolicyFromAPI is expected to send, so the tests
-// also catch endpoint regressions.
-func policyServer(t *testing.T, wantJobKey, body string) *httptest.Server {
+// the policy endpoint. It asserts the request method, path, job_key/version
+// query and bearer token match what fetchPolicyFromAPI is expected to send, so
+// the tests also catch endpoint regressions.
+func policyServer(t *testing.T, wantJobKey, wantVersion, body string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)
 		assert.Equal(t, policyEndpoint, r.URL.Path)
-		// Assert presence/absence explicitly: fetchPolicyFromAPI must omit the
-		// job_key param entirely when no job key is set, not send it empty.
-		gotJobKey, present := r.URL.Query()["job_key"]
-		if wantJobKey == "" {
-			assert.False(t, present, "job_key must be absent when no job key is set")
-		} else {
-			assert.Equal(t, []string{wantJobKey}, gotJobKey)
-		}
+		// Assert presence/absence explicitly: fetchPolicyFromAPI must omit an
+		// unset param entirely, not send it empty.
+		assertQueryParam(t, r, "job_key", wantJobKey)
+		assertQueryParam(t, r, "version", wantVersion)
 		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// assertQueryParam asserts that name is absent when want is empty, and carries
+// exactly want otherwise.
+func assertQueryParam(t *testing.T, r *http.Request, name, want string) {
+	t.Helper()
+	got, present := r.URL.Query()[name]
+	if want == "" {
+		assert.False(t, present, "%s must be absent when unset", name)
+		return
+	}
+	assert.Equal(t, []string{want}, got)
 }
 
 // TestFetchPolicyFromAPI_IgnoresUnknownField guards against the forward-compat
@@ -66,9 +74,9 @@ func TestFetchPolicyFromAPI_IgnoresUnknownField(t *testing.T) {
 		"future_feature": {"enabled": true, "level": 3},
 		"another_unknown": "ignore me"
 	}`
-	srv := policyServer(t, "job-123", body)
+	srv := policyServer(t, "job-123", "v1.2.3", body)
 
-	policy, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "job-123")
+	policy, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "job-123", "v1.2.3")
 	require.NoError(t, err, "unknown fields must not cause the policy to be dropped")
 	require.NotNil(t, policy)
 	assert.Equal(t, datapb.CargoWallMode_CARGO_WALL_MODE_AUDIT, policy.Mode)
@@ -83,11 +91,23 @@ func TestFetchPolicyFromAPI_IgnoresUnknownEnumValue(t *testing.T) {
 		"mode": "CARGO_WALL_MODE_FUTURE_VALUE",
 		"default_action": "CARGO_WALL_ACTION_TYPE_ALLOW"
 	}`
-	srv := policyServer(t, "", body)
+	srv := policyServer(t, "", "", body)
 
-	policy, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "")
+	policy, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
 	require.NoError(t, err, "unknown enum names must not cause the policy to be dropped")
 	require.NotNil(t, policy)
 	assert.Equal(t, datapb.CargoWallMode_CARGO_WALL_MODE_UNSPECIFIED, policy.Mode)
 	assert.Equal(t, datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW, policy.DefaultAction)
+}
+
+// TestFetchPolicyFromAPI_ReportsVersionWithoutJobKey covers the mixed case: the
+// agent reports its version (#92) on a run with no job key, so version must
+// still be sent and job_key must stay absent.
+func TestFetchPolicyFromAPI_ReportsVersionWithoutJobKey(t *testing.T) {
+	srv := policyServer(t, "", "v1.2.3", `{"mode": "CARGO_WALL_MODE_AUDIT"}`)
+
+	policy, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "v1.2.3")
+	require.NoError(t, err)
+	require.NotNil(t, policy)
+	assert.Equal(t, datapb.CargoWallMode_CARGO_WALL_MODE_AUDIT, policy.Mode)
 }

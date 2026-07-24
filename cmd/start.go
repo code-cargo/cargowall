@@ -590,8 +590,8 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 			configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
 		}
 
-		logger.Info("Fetching policy from CodeCargo API", "api_url", cmd.ApiUrl, "job_key", cmd.JobKey)
-		policy, err := fetchPolicyFromAPI(ctx, cmd.ApiUrl, cmd.Token, cmd.JobKey)
+		logger.Info("Fetching policy from CodeCargo API", "api_url", cmd.ApiUrl, "job_key", cmd.JobKey, "version", cmd.Version)
+		policy, err := fetchPolicyFromAPI(ctx, cmd.ApiUrl, cmd.Token, cmd.JobKey, cmd.Version)
 		if err != nil {
 			logger.Warn("API policy fetch failed, falling back to env/file config", "error", err)
 		} else {

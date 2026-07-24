@@ -814,6 +814,44 @@ func TestPushToApi_IgnoresUnknownResponseField(t *testing.T) {
 	assert.Equal(t, "https://app.codecargo.io/run/789", url)
 }
 
+// TestPushToApi_ReportsVersion confirms the agent version (#92) rides along on
+// the job push as a top-level field, and is omitted entirely when unset rather
+// than sent empty.
+func TestPushToApi_ReportsVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+	}{
+		{name: "set", version: "v1.2.3"},
+		{name: "unset", version: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"job_id": "job-1"}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			c := &SummaryCmd{ApiUrl: srv.URL, Token: "test-token", JobName: "build", Version: tc.version}
+			_, err := c.pushToApi(nil, nil)
+			require.NoError(t, err)
+
+			if tc.version == "" {
+				assert.NotContains(t, got, "version", "version must be omitted when unset")
+				return
+			}
+			assert.Equal(t, tc.version, got["version"])
+			// Version belongs on the request, not nested in the stats summary.
+			if summary, ok := got["summary"].(map[string]any); ok {
+				assert.NotContains(t, summary, "version")
+			}
+		})
+	}
+}
+
 // Blocked events superseded by a later connection_late_allowed for the same
 // (dst_ip, dst_port, protocol) must be dropped so they aren't pushed to the
 // SaaS as denies (#83): the daemon emits the late-allowed record when the

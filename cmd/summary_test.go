@@ -829,6 +829,9 @@ func TestPushToApi_ReportsVersion(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var got map[string]any
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodPost, r.Method)
+				assert.Equal(t, "/api/cargowall/v1/action/job", r.URL.Path)
+				assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
 				require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"job_id": "job-1"}`))

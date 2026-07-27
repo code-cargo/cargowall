@@ -34,10 +34,19 @@ import (
 // SaaS API. The endpoint returns the merged policy (org defaults + repo
 // overrides + job-level overrides) as a CargoWallPolicy protobuf message
 // serialised as JSON.
-func fetchPolicyFromAPI(ctx context.Context, apiUrl, token, jobKey string) (*cargowallv1pb.CargoWallPolicy, error) {
+func fetchPolicyFromAPI(ctx context.Context, apiUrl, token, jobKey, version string) (*cargowallv1pb.CargoWallPolicy, error) {
 	endpoint := strings.TrimRight(apiUrl, "/") + "/api/cargowall/v1/action/policy"
+	// Empty params are omitted entirely rather than sent blank, so the server
+	// can distinguish "not reported" from "reported as empty".
+	q := url.Values{}
 	if jobKey != "" {
-		endpoint += "?job_key=" + url.QueryEscape(jobKey)
+		q.Set("job_key", jobKey)
+	}
+	if version != "" {
+		q.Set("version", version)
+	}
+	if len(q) > 0 {
+		endpoint += "?" + q.Encode()
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)

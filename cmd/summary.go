@@ -39,6 +39,8 @@ import (
 
 // SummaryCmd generates a markdown summary correlating audit events with GitHub Actions steps
 type SummaryCmd struct {
+	Version string `kong:"-"` // Version passed from main
+
 	AuditLog string `help:"Path to audit log JSON file" required:""`
 	Steps    string `help:"JSON array of step timing from GitHub API" required:""`
 
@@ -639,6 +641,10 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 
 	if c.JobRunId != 0 {
 		req.JobRunId = &c.JobRunId
+	}
+
+	if c.Version != "" {
+		req.Version = &c.Version
 	}
 
 	// Set timestamps from first/last events

@@ -44,6 +44,7 @@ func main() {
 		return cmd.StartCargoWall(c, hooks)
 	}
 	cli.Start.Version = version
+	cli.Summary.Version = version
 
 	err := ctx.Run(&cli.Globals)
 	ctx.FatalIfErrorf(err)

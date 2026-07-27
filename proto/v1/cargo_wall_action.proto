@@ -33,6 +33,10 @@ service CargoWallActionJobService {
 
 message GetCargoWallActionJobRunPolicyRequest {
   optional string job_key = 1;
+  // Version of the cargowall agent requesting the policy (e.g. "v1.2.3", or
+  // "develop"/"dev" for unreleased builds). Absent when reported by an agent
+  // predating version reporting.
+  optional string version = 2;
 }
 
 message CargoWallActionJobSummary {
@@ -83,6 +87,10 @@ message CreateCargoWallActionJobRequest {
   google.protobuf.Timestamp started_at = 7;
   google.protobuf.Timestamp completed_at = 8;
   CargoWallJobStatus status = 9;
+  // Version of the cargowall agent that produced this job (e.g. "v1.2.3", or
+  // "develop"/"dev" for unreleased builds). Absent when reported by an agent
+  // predating version reporting.
+  optional string version = 10;
 
 
   repeated CreateCargoWallActionStep steps = 100;

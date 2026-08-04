@@ -397,10 +397,15 @@ type CreateCargoWallActionJobRequest struct {
 	// Version of the cargowall agent that produced this job (e.g. "v1.2.3", or
 	// "develop"/"dev" for unreleased builds). Absent when reported by an agent
 	// predating version reporting.
-	Version       *string                      `protobuf:"bytes,10,opt,name=version,proto3,oneof" json:"version,omitempty"`
-	Steps         []*CreateCargoWallActionStep `protobuf:"bytes,100,rep,name=steps,proto3" json:"steps,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Version *string `protobuf:"bytes,10,opt,name=version,proto3,oneof" json:"version,omitempty"`
+	// Human-readable reason the run's effective mode was downgraded from the
+	// requested posture (e.g. to audit under --api-failure-mode=audit because
+	// the policy could not be retrieved). Absent when the run executed at its
+	// requested posture.
+	DowngradeReason *string                      `protobuf:"bytes,11,opt,name=downgrade_reason,json=downgradeReason,proto3,oneof" json:"downgrade_reason,omitempty"`
+	Steps           []*CreateCargoWallActionStep `protobuf:"bytes,100,rep,name=steps,proto3" json:"steps,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *CreateCargoWallActionJobRequest) Reset() {
@@ -499,6 +504,13 @@ func (x *CreateCargoWallActionJobRequest) GetStatus() data.CargoWallJobStatus {
 func (x *CreateCargoWallActionJobRequest) GetVersion() string {
 	if x != nil && x.Version != nil {
 		return *x.Version
+	}
+	return ""
+}
+
+func (x *CreateCargoWallActionJobRequest) GetDowngradeReason() string {
+	if x != nil && x.DowngradeReason != nil {
+		return *x.DowngradeReason
 	}
 	return ""
 }
@@ -699,7 +711,7 @@ const file_cargo_wall_action_proto_rawDesc = "" +
 	"\r_matched_ruleB\n" +
 	"\n" +
 	"\b_processB\x14\n" +
-	"\x12_auto_allowed_type\"\xfc\x04\n" +
+	"\x12_auto_allowed_type\"\xc1\x05\n" +
 	"\x1fCreateCargoWallActionJobRequest\x12!\n" +
 	"\n" +
 	"job_run_id\x18\x01 \x01(\x04H\x00R\bjobRunId\x88\x01\x01\x12\x19\n" +
@@ -713,11 +725,13 @@ const file_cargo_wall_action_proto_rawDesc = "" +
 	"\fcompleted_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAt\x12=\n" +
 	"\x06status\x18\t \x01(\x0e2%.grpc.cargowall.v1.CargoWallJobStatusR\x06status\x12\x1d\n" +
 	"\aversion\x18\n" +
-	" \x01(\tH\x01R\aversion\x88\x01\x01\x12B\n" +
+	" \x01(\tH\x01R\aversion\x88\x01\x01\x12.\n" +
+	"\x10downgrade_reason\x18\v \x01(\tH\x02R\x0fdowngradeReason\x88\x01\x01\x12B\n" +
 	"\x05steps\x18d \x03(\v2,.grpc.cargowall.v1.CreateCargoWallActionStepR\x05stepsB\r\n" +
 	"\v_job_run_idB\n" +
 	"\n" +
-	"\b_version\"\xac\x02\n" +
+	"\b_versionB\x13\n" +
+	"\x11_downgrade_reason\"\xac\x02\n" +
 	"\x19CreateCargoWallActionStep\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06number\x18\x02 \x01(\x05R\x06number\x12>\n" +

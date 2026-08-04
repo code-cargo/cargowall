@@ -647,6 +647,13 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 		req.Version = &c.Version
 	}
 
+	// Carry the downgrade reason left by `cargowall start` (a separate
+	// process invocation) so the dashboard can show why a job ran degraded
+	// (e.g. "downgraded to audit mode: policy could not be retrieved").
+	if reason := readDowngradeReason(); reason != "" {
+		req.DowngradeReason = &reason
+	}
+
 	// Set timestamps from first/last events
 	if len(allEvents) > 0 {
 		req.StartedAt = timestamppb.New(allEvents[0].Timestamp)
@@ -692,6 +699,17 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 		"workflow_run_id", result.WorkflowRunId,
 		"workflow_run_link", result.WorkflowRunUrl)
 	return result.WorkflowRunUrl, nil
+}
+
+// readDowngradeReason returns the downgrade reason recorded by `cargowall
+// start`, or "" when the run executed at its requested posture (file absent
+// or unreadable — best-effort by design).
+func readDowngradeReason() string {
+	data, err := os.ReadFile(downgradeReasonFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {

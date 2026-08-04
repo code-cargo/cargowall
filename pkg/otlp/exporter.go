@@ -265,14 +265,16 @@ func (e *Exporter) send(body []byte) (retryable bool, retryAfter time.Duration, 
 		resp.StatusCode == http.StatusBadGateway,
 		resp.StatusCode == http.StatusServiceUnavailable,
 		resp.StatusCode == http.StatusGatewayTimeout:
-		return true, parseRetryAfter(resp.Header.Get("Retry-After")), fmt.Errorf("OTLP endpoint returned status %d", resp.StatusCode)
+		return true, ParseRetryAfter(resp.Header.Get("Retry-After")), fmt.Errorf("OTLP endpoint returned status %d", resp.StatusCode)
 	default:
 		return false, 0, fmt.Errorf("OTLP endpoint returned status %d", resp.StatusCode)
 	}
 }
 
-// parseRetryAfter handles both delta-seconds and HTTP-date forms.
-func parseRetryAfter(v string) time.Duration {
+// ParseRetryAfter handles both delta-seconds and HTTP-date forms. Exported
+// for reuse by the policy-fetch retry loop in cmd, which faces the same
+// header from the same SaaS.
+func ParseRetryAfter(v string) time.Duration {
 	if v == "" {
 		return 0
 	}

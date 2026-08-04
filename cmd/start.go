@@ -56,6 +56,15 @@ import (
 func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	logger := cmd.Logger
 
+	// Clear stale state files from a previous run FIRST, before any fallible
+	// startup work. These files are how the action observes this process:
+	// a stale ready sentinel would make an --api-failure-mode=fail abort
+	// fail-open (the wait loop sees the old file and unblocks the build with
+	// no firewall attached), a stale failure sentinel would abort a healthy
+	// run, and a stale mode file would feed the summary step the previous
+	// job's posture.
+	removeStaleStateFiles(cmd, logger)
+
 	// Check eBPF capabilities early to provide clear error messages
 	caps := cargowallEbpf.Detect()
 	if !caps.IsSupported() {
@@ -234,17 +243,6 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		logger.Info("OpenTelemetry log export enabled", "endpoint", otelExporter.Endpoint())
 	}
 
-	// Late-allow reconciliation (#83): buffer recently blocked connections so
-	// the DNS enforcement path can re-report them as late-allowed once it
-	// opens the firewall for their destination IP. Registered as an audit
-	// sink here — before ProcessBlockedEvents starts — so no blocked event is
-	// missed.
-	if dnsServer != nil && auditLogger != nil {
-		recentBlocks := events.NewRecentBlocks(0)
-		auditLogger.AddSink(recentBlocks)
-		dnsServer.SetRecentBlocks(recentBlocks)
-	}
-
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
 	var apiPolicyLoaded bool
 	if cmd.CIMode() != CIModeNone {
@@ -275,6 +273,32 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			logger.Error("Failed to load config", "error", err, "path", cmd.Config)
 			// Continue with default deny-all policy
 		}
+	}
+
+	// The DNS proxy honours audit mode only through the audit logger (it
+	// consults auditLogger.IsAuditMode at query time), so a run whose mode
+	// was flipped to audit by the API policy or --api-failure-mode=audit
+	// without --audit-log/OTLP still needs a file-less event hub — otherwise
+	// the eBPF layer goes permissive while DNS query filtering keeps
+	// refusing blocked hostnames.
+	if cmd.AuditMode && auditLogger == nil {
+		var err error
+		auditLogger, err = events.NewAuditLogger("", true)
+		if err != nil {
+			return fmt.Errorf("failed to create audit event hub: %w", err)
+		}
+		defer auditLogger.Close()
+	}
+
+	// Late-allow reconciliation (#83): buffer recently blocked connections so
+	// the DNS enforcement path can re-report them as late-allowed once it
+	// opens the firewall for their destination IP. Registered as an audit
+	// sink here — after the audit hub's final identity is known and before
+	// ProcessBlockedEvents starts — so no blocked event is missed.
+	if dnsServer != nil && auditLogger != nil {
+		recentBlocks := events.NewRecentBlocks(0)
+		auditLogger.AddSink(recentBlocks)
+		dnsServer.SetRecentBlocks(recentBlocks)
 	}
 
 	// Log the effective audit mode now that loadCIConfig has had a chance
@@ -537,17 +561,27 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		}()
 	}
 
-	if hooks != nil && hooks.Ready != nil {
+	switch {
+	case cmd.policyLockdown:
+		// Deliberately no ready sentinel: "ready" means the requested policy
+		// is enforced, and it is not. The failure sentinel written at config
+		// load tells the action why. The process stays alive on purpose —
+		// the runner remains deny-all locked down (fail-closed) until the
+		// job tears it down, and shutdown runs the full teardown path
+		// (signal handler below is armed) instead of an abrupt exit.
+		logger.Error("CargoWall running in POLICY LOCKDOWN (default-deny) — ready sentinel withheld, see failure sentinel",
+			"failure_file", cmd.FailureFile)
+	case hooks != nil && hooks.Ready != nil:
 		if err := hooks.Ready(); err != nil {
 			return fmt.Errorf("ready hook failed: %w", err)
 		}
-	} else {
+		logger.Info("CargoWall ready")
+	default:
 		if err := os.WriteFile(cmd.ReadyFile, nil, 0o660); err != nil {
 			return fmt.Errorf("writing ready file %s: %w", cmd.ReadyFile, err)
 		}
+		logger.Info("CargoWall ready")
 	}
-
-	logger.Info("CargoWall ready")
 
 	// Handle signals for graceful shutdown
 	c := make(chan os.Signal, 1)
@@ -571,10 +605,67 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	return nil
 }
 
+// modeFile is where the effective enforcement mode ("enforce"/"audit") is
+// recorded for the action's summary step, which reads it to report the mode
+// in the workflow summary and push it to the SaaS. The path is hardcoded in
+// the cargowall-action repo too — keep them in sync. A var so tests can
+// redirect it.
+var modeFile = "/tmp/cargowall-mode"
+
+// downgradeReasonFile carries the human-readable reason for an
+// --api-failure-mode=audit downgrade from `cargowall start` to `cargowall
+// summary` (separate process invocations), which pushes it to the SaaS so
+// the dashboard can show why a job ran degraded. A var so tests can
+// redirect it; shared by the writer in handlePolicyFetchFailure and the
+// reader in pushToApi.
+var downgradeReasonFile = "/tmp/cargowall-downgrade-reason"
+
+// removeStaleStateFiles clears the state files a previous run may have left
+// behind, warning (not failing) on anything but absence.
+func removeStaleStateFiles(cmd *StartCmd, logger *slog.Logger) {
+	for _, path := range []string{cmd.ReadyFile, cmd.FailureFile, modeFile, downgradeReasonFile} {
+		if path == "" {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("Failed to remove stale state file", "path", path, "error", err)
+		}
+	}
+}
+
+// writeSentinel creates a state file with O_EXCL so a path pre-planted in
+// world-writable /tmp (plain file or symlink) makes the write fail instead
+// of following it — these files are written as root. Callers remove stale
+// files at startup, so exclusive creation is the expected case.
+func writeSentinel(path string, content []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(content); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// writeModeFile records the effective enforcement mode for the action's
+// summary step. Written on both the API-success and fallback paths — a job
+// downgraded to audit by --api-failure-mode=audit must not keep reporting
+// "enforce" in the workflow summary and dashboard.
+func writeModeFile(auditMode bool) {
+	mode := "enforce"
+	if auditMode {
+		mode = "audit"
+	}
+	_ = writeSentinel(modeFile, []byte(mode))
+}
+
 // loadCIConfig handles CI config priority:
 // (1) SaaS API fetch + bootstrap + mode override + state file,
 // (2) env vars, (3) config file. Calls EnsureDNSAllowed at end.
-// Returns true if SaaS API policy was loaded. Mutates cmd.AuditMode in place.
+// Returns true if SaaS API policy was loaded. Mutates cmd.AuditMode (and,
+// under --api-failure-mode=fail, cmd.policyLockdown) in place.
 func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, dockerBridgeIP string, logger *slog.Logger) bool {
 	logger.Info("Running in CI mode", "mode", string(cmd.CIMode()))
 
@@ -592,14 +683,15 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 
 		logger.Info("Fetching policy from CodeCargo API", "api_url", cmd.ApiUrl, "job_key", cmd.JobKey, "version", cmd.Version)
 		policy, err := fetchPolicyFromAPI(ctx, cmd.ApiUrl, cmd.Token, cmd.JobKey, cmd.Version)
-		if err != nil {
-			logger.Warn("API policy fetch failed, falling back to env/file config", "error", err)
-		} else {
+		if err == nil {
 			if policyJSON, jsonErr := protojson.Marshal(policy); jsonErr == nil {
 				logger.Info("Raw policy from API", "policy", string(policyJSON))
 			}
-			if err := configMgr.LoadConfigFromCargoWall(policy); err != nil {
-				logger.Warn("Failed to load API policy into config, falling back to env/file config", "error", err)
+			if loadErr := configMgr.LoadConfigFromCargoWall(policy); loadErr != nil {
+				// A policy we can't load is as good as one we couldn't
+				// retrieve — classify it malformed so the failure-mode
+				// handling below treats both identically.
+				err = &PolicyFetchError{Class: PolicyFetchMalformed, err: loadErr}
 			} else {
 				// Override audit mode from the API response's mode field
 				switch policy.Mode {
@@ -613,13 +705,9 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 				if auditLogger != nil {
 					auditLogger.SetAuditMode(cmd.AuditMode)
 				}
-				// Write effective mode to a state file so the summary
-				// step picks up the SaaS-overridden value.
-				modeStr := "enforce"
-				if cmd.AuditMode {
-					modeStr = "audit"
-				}
-				_ = os.WriteFile("/tmp/cargowall-mode", []byte(modeStr), 0o644)
+				// Record the effective mode so the summary step picks up
+				// the SaaS-overridden value.
+				writeModeFile(cmd.AuditMode)
 
 				apiPolicyLoaded = true
 				logger.Info("Policy loaded from CodeCargo API",
@@ -628,10 +716,15 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 					"rules", len(policy.Rules))
 			}
 		}
+		if err != nil {
+			handlePolicyFetchFailure(cmd, auditLogger, err, logger)
+		}
 	}
 
-	// Priority 2: env vars, Priority 3: config file
-	if !apiPolicyLoaded {
+	// Priority 2: env vars, Priority 3: config file. Skipped in policy
+	// lockdown: --api-failure-mode=fail means "do not trust local config",
+	// so the deny-all bootstrap loaded before the fetch stays in force.
+	if !apiPolicyLoaded && !cmd.policyLockdown {
 		if err := configMgr.LoadFromEnv(); err != nil {
 			logger.Debug("No environment config found, trying file", "error", err)
 			if err := configMgr.LoadConfig(cmd.Config); err != nil {
@@ -653,6 +746,77 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 	configMgr.EnsureDNSAllowed(dnsIPs)
 
 	return apiPolicyLoaded
+}
+
+// handlePolicyFetchFailure applies the --api-failure-mode posture to a failed
+// policy fetch. Only genuine retrieval failures (transport/server/malformed)
+// may change posture; an authoritative "not onboarded" 404, a rejected token,
+// or an inactive repository always keeps today's env/file fallback regardless
+// of the flag — the default api-url is attempted on every run, and a naive
+// "any error → audit" would silently disable enforcement for every user
+// without a CodeCargo account. Under "fail" the process deliberately keeps
+// running: it enters policy lockdown (deny-all, ready sentinel withheld,
+// failure sentinel written) instead of aborting, so the worst case is an
+// over-blocked build rather than an unprotected one.
+func handlePolicyFetchFailure(cmd *StartCmd, auditLogger *events.AuditLogger, fetchErr error, logger *slog.Logger) {
+	var fe *PolicyFetchError
+	if !errors.As(fetchErr, &fe) || !fe.Class.IsRetrievalFailure() {
+		attrs := []any{"error", fetchErr}
+		if fe != nil {
+			attrs = append(attrs, "class", fe.Class, "status", fe.StatusCode)
+		}
+		if fe != nil && fe.Class == PolicyFetchUnauthorized {
+			// Louder than the generic fallback: a rejected token is a
+			// configuration error the user needs to fix, not an outage.
+			logger.Error("CodeCargo API rejected the token — check CODECARGO_AUTH_TOKEN; using env/file config", attrs...)
+		} else {
+			logger.Warn("No API policy for this run, using env/file config", attrs...)
+		}
+		// No mode file here: absence has always meant "no SaaS policy in
+		// play" to the summary step, and the everyday not-onboarded case
+		// must keep that contract.
+		return
+	}
+
+	attrs := []any{"class", fe.Class, "status", fe.StatusCode, "error", fetchErr}
+	switch cmd.ApiFailureMode {
+	case "fail":
+		cmd.policyLockdown = true
+		cmd.AuditMode = false
+		logger.Error("API policy fetch failed — entering policy lockdown (--api-failure-mode=fail): default-deny, local config ignored, ready sentinel withheld", attrs...)
+		reason := fmt.Sprintf("cargowall entered policy lockdown (default-deny): policy fetch from %s failed (%s) and --api-failure-mode=fail: %v", cmd.ApiUrl, fe.Class, fetchErr)
+		if cmd.FailureFile != "" {
+			if werr := writeSentinel(cmd.FailureFile, []byte(reason+"\n")); werr != nil {
+				logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
+			}
+		}
+		// Also recorded as the downgrade reason: if the action lets the job
+		// proceed (or the post step runs before teardown), the summary push
+		// tells the dashboard the run was locked down and why.
+		if werr := writeSentinel(downgradeReasonFile, []byte(reason)); werr != nil {
+			logger.Warn("Failed to write downgrade reason file", "path", downgradeReasonFile, "error", werr)
+		}
+		// No mode file: lockdown is not a SaaS-resolved posture, and the
+		// failure sentinel already carries the state the action needs.
+		return
+	case "audit":
+		cmd.AuditMode = true
+		// Re-sync the audit logger, which was constructed from the initial
+		// flag before config load (the API-success path does the same).
+		if auditLogger != nil {
+			auditLogger.SetAuditMode(true)
+		}
+		// Record why the run degraded so the summary push can carry it to
+		// the SaaS dashboard.
+		reason := fmt.Sprintf("downgraded to audit mode: policy could not be retrieved from %s (%s): %v", cmd.ApiUrl, fe.Class, fetchErr)
+		if werr := writeSentinel(downgradeReasonFile, []byte(reason)); werr != nil {
+			logger.Warn("Failed to write downgrade reason file", "path", downgradeReasonFile, "error", werr)
+		}
+		logger.Warn("API policy fetch failed — downgrading to audit mode (--api-failure-mode=audit)", attrs...)
+	default: // "local"
+		logger.Warn("API policy fetch failed, falling back to env/file config", attrs...)
+	}
+	writeModeFile(cmd.AuditMode)
 }
 
 // applyAutoAllowHelpers invokes each enabled auto-allow helper and updates

@@ -17,15 +17,19 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
@@ -35,6 +39,168 @@ import (
 
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// redirectStateFiles points the effective-mode and downgrade-reason state
+// files at tempdir paths for the duration of the test, restoring the real
+// paths on cleanup.
+func redirectStateFiles(t *testing.T) (modePath, reasonPath string) {
+	t.Helper()
+	oldMode, oldReason := modeFile, downgradeReasonFile
+	dir := t.TempDir()
+	modeFile = filepath.Join(dir, "cargowall-mode")
+	downgradeReasonFile = filepath.Join(dir, "cargowall-downgrade-reason")
+	t.Cleanup(func() { modeFile, downgradeReasonFile = oldMode, oldReason })
+	return modeFile, downgradeReasonFile
+}
+
+// TestLoadCIConfig_ApiFailureModes is the (error class × --api-failure-mode)
+// posture table: only genuine retrieval failures (transport / server /
+// malformed) may downgrade to audit or abort. Authoritative answers — 404
+// not-onboarded (the everyday case for users without a CodeCargo account,
+// since api-url defaults to the SaaS), 401/403 bad token, 400 inactive repo —
+// must keep today's env/file fallback no matter what the flag says.
+func TestLoadCIConfig_ApiFailureModes(t *testing.T) {
+	setFastPolicyRetries(t)
+
+	const (
+		respTransport  = -1 // server closed before the request: no HTTP response
+		respUnloadable = -2 // 200 whose policy LoadConfigFromCargoWall rejects
+		respOK         = 200
+	)
+
+	tests := []struct {
+		name          string
+		resp          int
+		failureMode   string
+		wantLoaded    bool
+		wantAuditMode bool
+		wantLockdown  bool
+		wantSentinel  bool
+		wantModeFile  string // "" = file must not exist
+		wantReason    string // required downgrade-reason substring; "" = file must not exist
+	}{
+		{"server error, local keeps enforce", 500, "local", false, false, false, false, "enforce", ""},
+		{"server error, empty mode defaults to local", 500, "", false, false, false, false, "enforce", ""},
+		{"server error, audit downgrades", 500, "audit", false, true, false, false, "audit", "downgraded to audit mode"},
+		{"server error, fail locks down", 500, "fail", false, false, true, true, "", "policy lockdown"},
+		{"transport error, audit downgrades", respTransport, "audit", false, true, false, false, "audit", "downgraded to audit mode"},
+		{"transport error, fail locks down", respTransport, "fail", false, false, true, true, "", "policy lockdown"},
+		{"unloadable policy, audit downgrades", respUnloadable, "audit", false, true, false, false, "audit", "downgraded to audit mode"},
+		{"404 not onboarded, audit must not downgrade", 404, "audit", false, false, false, false, "", ""},
+		{"404 not onboarded, fail must not lock down", 404, "fail", false, false, false, false, "", ""},
+		{"401 unauthorized, fail must not lock down", 401, "fail", false, false, false, false, "", ""},
+		{"400 precondition, audit must not downgrade", 400, "audit", false, false, false, false, "", ""},
+		{"success ignores failure mode", respOK, "fail", true, true, false, false, "audit", ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			modePath, reasonPath := redirectStateFiles(t)
+			failurePath := filepath.Join(t.TempDir(), "cargowall-failed")
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch tc.resp {
+				case respUnloadable:
+					// Rule type left unspecified → LoadConfigFromCargoWall
+					// rejects the policy after a successful fetch.
+					_, _ = w.Write([]byte(`{"mode": "CARGO_WALL_MODE_ENFORCE", "rules": [{"value": "1.2.3.4/32"}]}`))
+				case respOK:
+					_, _ = w.Write([]byte(`{"mode": "CARGO_WALL_MODE_AUDIT", "default_action": "CARGO_WALL_ACTION_TYPE_DENY"}`))
+				default:
+					w.WriteHeader(tc.resp)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			apiURL := srv.URL
+			if tc.resp == respTransport {
+				srv.Close()
+			}
+
+			cmd := &StartCmd{
+				GithubAction:   true,
+				ApiUrl:         apiURL,
+				Token:          "test-token",
+				ApiFailureMode: tc.failureMode,
+				FailureFile:    failurePath,
+				Config:         filepath.Join(t.TempDir(), "no-config.json"),
+			}
+
+			loaded := loadCIConfig(context.Background(), cmd, config.NewConfigManager(), nil, "", quietLogger())
+
+			assert.Equal(t, tc.wantLoaded, loaded)
+			assert.Equal(t, tc.wantAuditMode, cmd.AuditMode)
+			assert.Equal(t, tc.wantLockdown, cmd.policyLockdown)
+
+			if tc.wantSentinel {
+				data, rerr := os.ReadFile(failurePath)
+				require.NoError(t, rerr, "fail mode must write the failure sentinel")
+				assert.Contains(t, string(data), "policy fetch")
+			} else {
+				_, serr := os.Stat(failurePath)
+				assert.True(t, os.IsNotExist(serr), "failure sentinel must not be written")
+			}
+
+			if tc.wantModeFile == "" {
+				// Absent in lockdown AND on non-retrieval fallbacks: file
+				// absence has always meant "no SaaS policy in play" to the
+				// summary step, and the everyday not-onboarded case must
+				// keep that contract.
+				_, serr := os.Stat(modePath)
+				assert.True(t, os.IsNotExist(serr), "mode file must not be written")
+			} else {
+				data, rerr := os.ReadFile(modePath)
+				require.NoError(t, rerr, "mode file must be written")
+				assert.Equal(t, tc.wantModeFile, string(data))
+			}
+
+			if tc.wantReason != "" {
+				data, rerr := os.ReadFile(reasonPath)
+				require.NoError(t, rerr, "posture change must record its reason for the summary push")
+				assert.Contains(t, string(data), tc.wantReason)
+			} else {
+				_, serr := os.Stat(reasonPath)
+				assert.True(t, os.IsNotExist(serr), "downgrade reason must only be written on a posture change")
+			}
+		})
+	}
+}
+
+// TestLoadCIConfig_LockdownSkipsLocalConfig: --api-failure-mode=fail means
+// "do not trust local config" — in lockdown the env/file fallback must be
+// skipped so the deny-all bootstrap stays in force, while "local" mode picks
+// the same env config up.
+func TestLoadCIConfig_LockdownSkipsLocalConfig(t *testing.T) {
+	setFastPolicyRetries(t)
+	t.Setenv("CARGOWALL_DEFAULT_ACTION", "allow")
+
+	for _, tc := range []struct {
+		failureMode string
+		wantAction  config.Action
+	}{
+		{"fail", config.ActionDeny},
+		{"local", config.ActionAllow},
+	} {
+		t.Run(tc.failureMode, func(t *testing.T) {
+			redirectStateFiles(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			t.Cleanup(srv.Close)
+
+			cmd := &StartCmd{
+				GithubAction:   true,
+				ApiUrl:         srv.URL,
+				Token:          "test-token",
+				ApiFailureMode: tc.failureMode,
+				FailureFile:    filepath.Join(t.TempDir(), "cargowall-failed"),
+			}
+			cm := config.NewConfigManager()
+			loadCIConfig(context.Background(), cmd, cm, nil, "", quietLogger())
+
+			assert.Equal(t, tc.wantAction, cm.GetDefaultAction())
+		})
+	}
 }
 
 // Regression test for the nil-ports security bug: when an existing IP's

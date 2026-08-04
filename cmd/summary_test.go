@@ -855,6 +855,46 @@ func TestPushToApi_ReportsVersion(t *testing.T) {
 	}
 }
 
+// TestPushToApi_ReportsDowngradeReason confirms the downgrade reason recorded
+// by `cargowall start` under --api-failure-mode=audit rides along on the job
+// push, and is omitted entirely when the run executed at its requested
+// posture (no state file).
+func TestPushToApi_ReportsDowngradeReason(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+	}{
+		{name: "downgraded", reason: "downgraded to audit mode: policy could not be retrieved from https://app.codecargo.com (transport): dial tcp: timeout"},
+		{name: "not downgraded", reason: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, reasonPath := redirectStateFiles(t)
+			if tc.reason != "" {
+				require.NoError(t, os.WriteFile(reasonPath, []byte(tc.reason+"\n"), 0o644))
+			}
+
+			var got map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"job_id": "job-1"}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			c := &SummaryCmd{ApiUrl: srv.URL, Token: "test-token", JobName: "build", Mode: "audit"}
+			_, err := c.pushToApi(nil, nil)
+			require.NoError(t, err)
+
+			if tc.reason == "" {
+				assert.NotContains(t, got, "downgrade_reason", "downgrade_reason must be omitted when the run was not downgraded")
+				return
+			}
+			assert.Equal(t, tc.reason, got["downgrade_reason"], "reason must be pushed trimmed of the trailing newline")
+		})
+	}
+}
+
 // Blocked events superseded by a later connection_late_allowed for the same
 // (dst_ip, dst_port, protocol) must be dropped so they aren't pushed to the
 // SaaS as denies (#83): the daemon emits the late-allowed record when the

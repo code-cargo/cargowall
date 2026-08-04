@@ -19,6 +19,7 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -30,7 +31,7 @@ func TestWaitForReady_AlreadyExists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := waitForReady(path, 100*time.Millisecond, 10*time.Millisecond); err != nil {
+	if err := waitForReady(path, "", 100*time.Millisecond, 10*time.Millisecond); err != nil {
 		t.Fatalf("expected nil error when sentinel already exists, got %v", err)
 	}
 }
@@ -44,7 +45,7 @@ func TestWaitForReady_AppearsBeforeTimeout(t *testing.T) {
 		_ = os.WriteFile(path, nil, 0o644)
 	}()
 
-	if err := waitForReady(path, 500*time.Millisecond, 10*time.Millisecond); err != nil {
+	if err := waitForReady(path, "", 500*time.Millisecond, 10*time.Millisecond); err != nil {
 		t.Fatalf("expected sentinel to appear before timeout, got %v", err)
 	}
 }
@@ -53,8 +54,46 @@ func TestWaitForReady_TimesOut(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "never-appears")
 
-	err := waitForReady(path, 50*time.Millisecond, 10*time.Millisecond)
+	err := waitForReady(path, "", 50*time.Millisecond, 10*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
+	}
+}
+
+func TestWaitForReady_FailureSentinelFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "never-appears")
+	failurePath := filepath.Join(dir, "failed")
+	if err := os.WriteFile(failurePath, []byte("policy fetch from https://api failed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	err := waitForReady(readyPath, failurePath, 5*time.Second, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected failure-sentinel error, got nil")
+	}
+	if !strings.Contains(err.Error(), "policy fetch from https://api failed") {
+		t.Fatalf("error must carry the sentinel's reason, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected fail-fast, waited %v", elapsed)
+	}
+}
+
+// The ready sentinel wins when both exist — a completed startup must not be
+// reported as failed because a concurrent watcher raced the state files.
+func TestWaitForReady_ReadyWinsOverFailure(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+	failurePath := filepath.Join(dir, "failed")
+	for _, p := range []string{readyPath, failurePath} {
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := waitForReady(readyPath, failurePath, 100*time.Millisecond, 10*time.Millisecond); err != nil {
+		t.Fatalf("expected ready sentinel to win, got %v", err)
 	}
 }

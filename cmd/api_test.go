@@ -20,12 +20,16 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
+	"github.com/code-cargo/cargowall/pkg/otlp"
 )
 
 // policyEndpoint is the path fetchPolicyFromAPI is expected to call.
@@ -110,4 +114,132 @@ func TestFetchPolicyFromAPI_ReportsVersionWithoutJobKey(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, policy)
 	assert.Equal(t, datapb.CargoWallMode_CARGO_WALL_MODE_AUDIT, policy.Mode)
+}
+
+// setFastPolicyRetries shrinks the retry schedule so retry-path tests run in
+// milliseconds, restoring the production values on cleanup.
+func setFastPolicyRetries(t *testing.T) {
+	t.Helper()
+	oldTimeout, oldBase, oldBudget := policyFetchAttemptTimeout, policyFetchBaseBackoff, policyFetchTotalBudget
+	policyFetchAttemptTimeout = 2 * time.Second
+	policyFetchBaseBackoff = time.Millisecond
+	policyFetchTotalBudget = 5 * time.Second
+	t.Cleanup(func() {
+		policyFetchAttemptTimeout, policyFetchBaseBackoff, policyFetchTotalBudget = oldTimeout, oldBase, oldBudget
+	})
+}
+
+// countingServer returns a server driven by handler and an attempt counter,
+// so tests can assert which classes are retried and which are terminal.
+func countingServer(t *testing.T, handler func(w http.ResponseWriter, attempt int32)) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler(w, attempts.Add(1))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &attempts
+}
+
+// TestFetchPolicyFromAPI_ClassifiesStatuses drives every status class the
+// SaaS can answer with and asserts the classification, whether it counts as
+// a retrieval failure (the only kind --api-failure-mode may act on), and the
+// retry behavior: outages (429/5xx) are retried, authoritative answers
+// (400/401/403/404) are terminal on the first attempt.
+func TestFetchPolicyFromAPI_ClassifiesStatuses(t *testing.T) {
+	setFastPolicyRetries(t)
+
+	tests := []struct {
+		status        int
+		wantClass     PolicyFetchClass
+		wantRetrieval bool
+		wantAttempts  int32
+	}{
+		{http.StatusBadRequest, PolicyFetchPrecondition, false, 1},
+		{http.StatusUnauthorized, PolicyFetchUnauthorized, false, 1},
+		{http.StatusForbidden, PolicyFetchUnauthorized, false, 1},
+		{http.StatusNotFound, PolicyFetchNotOnboarded, false, 1},
+		{http.StatusTooManyRequests, PolicyFetchServer, true, 3},
+		{http.StatusInternalServerError, PolicyFetchServer, true, 3},
+		{http.StatusServiceUnavailable, PolicyFetchServer, true, 3},
+	}
+	for _, tc := range tests {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			srv, attempts := countingServer(t, func(w http.ResponseWriter, _ int32) {
+				w.WriteHeader(tc.status)
+			})
+
+			_, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
+			var fe *PolicyFetchError
+			require.ErrorAs(t, err, &fe)
+			assert.Equal(t, tc.wantClass, fe.Class)
+			assert.Equal(t, tc.status, fe.StatusCode)
+			assert.Equal(t, tc.wantRetrieval, fe.Class.IsRetrievalFailure())
+			assert.Equal(t, tc.wantAttempts, attempts.Load())
+		})
+	}
+}
+
+// TestFetchPolicyFromAPI_TransportErrorClassified: a connection failure (no
+// HTTP response at all) is a transport-class retrieval failure with no
+// status code.
+func TestFetchPolicyFromAPI_TransportErrorClassified(t *testing.T) {
+	setFastPolicyRetries(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	endpoint := srv.URL
+	srv.Close()
+
+	_, err := fetchPolicyFromAPI(context.Background(), endpoint, "test-token", "", "")
+	var fe *PolicyFetchError
+	require.ErrorAs(t, err, &fe)
+	assert.Equal(t, PolicyFetchTransport, fe.Class)
+	assert.Zero(t, fe.StatusCode)
+	assert.True(t, fe.Class.IsRetrievalFailure())
+}
+
+// TestFetchPolicyFromAPI_MalformedBodyNotRetried: an unparsable 200 body is a
+// retrieval failure (the policy exists but can't be used) yet retrying is
+// pointless — the server answered consistently.
+func TestFetchPolicyFromAPI_MalformedBodyNotRetried(t *testing.T) {
+	setFastPolicyRetries(t)
+	srv, attempts := countingServer(t, func(w http.ResponseWriter, _ int32) {
+		_, _ = w.Write([]byte("<html>not a policy</html>"))
+	})
+
+	_, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
+	var fe *PolicyFetchError
+	require.ErrorAs(t, err, &fe)
+	assert.Equal(t, PolicyFetchMalformed, fe.Class)
+	assert.True(t, fe.Class.IsRetrievalFailure())
+	assert.Equal(t, int32(1), attempts.Load())
+}
+
+// TestFetchPolicyFromAPI_RetriesServerErrorThenSucceeds: a transient outage
+// that recovers within the retry budget must yield the policy, not a fallback.
+func TestFetchPolicyFromAPI_RetriesServerErrorThenSucceeds(t *testing.T) {
+	setFastPolicyRetries(t)
+	srv, attempts := countingServer(t, func(w http.ResponseWriter, attempt int32) {
+		if attempt <= 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(`{"mode": "CARGO_WALL_MODE_ENFORCE"}`))
+	})
+
+	policy, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
+	require.NoError(t, err)
+	require.NotNil(t, policy)
+	assert.Equal(t, datapb.CargoWallMode_CARGO_WALL_MODE_ENFORCE, policy.Mode)
+	assert.Equal(t, int32(3), attempts.Load())
+}
+
+// TestParseRetryAfter covers the shared parser the fetch retry loop relies
+// on: delta-seconds and future HTTP-date forms are honoured, past dates and
+// garbage defer to the computed backoff.
+func TestParseRetryAfter(t *testing.T) {
+	assert.Equal(t, 2*time.Second, otlp.ParseRetryAfter("2"))
+	assert.Equal(t, time.Duration(0), otlp.ParseRetryAfter(""))
+	assert.Equal(t, time.Duration(0), otlp.ParseRetryAfter("Wed, 21 Oct 2020 07:28:00 GMT"))
+	assert.Equal(t, time.Duration(0), otlp.ParseRetryAfter("-5"))
+	assert.Greater(t, otlp.ParseRetryAfter(time.Now().Add(time.Hour).UTC().Format(http.TimeFormat)), 55*time.Minute)
 }

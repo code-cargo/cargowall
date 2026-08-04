@@ -92,6 +92,11 @@ message CreateCargoWallActionJobRequest {
   // predating version reporting.
   optional string version = 10;
 
+  // Human-readable reason the run's effective mode was downgraded from the
+  // requested posture (e.g. to audit under --api-failure-mode=audit because
+  // the policy could not be retrieved). Absent when the run executed at its
+  // requested posture.
+  optional string downgrade_reason = 11;
 
   repeated CreateCargoWallActionStep steps = 100;
 }

@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,12 +29,120 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
+	"github.com/code-cargo/cargowall/pkg/otlp"
+)
+
+// PolicyFetchClass classifies why a policy fetch failed. The distinction is
+// load-bearing for --api-failure-mode: --api-url defaults to the SaaS and is
+// attempted on every run, so a 404 from an org/repo that isn't onboarded to
+// CodeCargo must stay distinguishable from a real outage — otherwise "any
+// error → audit/fail" would change posture for every user without a
+// CodeCargo account.
+type PolicyFetchClass int
+
+const (
+	PolicyFetchTransport    PolicyFetchClass = iota // client.Do, deadline, body read
+	PolicyFetchServer                               // 5xx, 429
+	PolicyFetchMalformed                            // protojson unmarshal, LoadConfigFromCargoWall
+	PolicyFetchNotOnboarded                         // 404: org/repo not in CodeCargo
+	PolicyFetchUnauthorized                         // 401, 403: token misconfiguration
+	PolicyFetchPrecondition                         // 400: e.g. inactive repository
+)
+
+func (c PolicyFetchClass) String() string {
+	switch c {
+	case PolicyFetchTransport:
+		return "transport"
+	case PolicyFetchServer:
+		return "server"
+	case PolicyFetchMalformed:
+		return "malformed"
+	case PolicyFetchNotOnboarded:
+		return "not_onboarded"
+	case PolicyFetchUnauthorized:
+		return "unauthorized"
+	case PolicyFetchPrecondition:
+		return "precondition"
+	}
+	return fmt.Sprintf("unknown(%d)", int(c))
+}
+
+// IsRetrievalFailure reports whether the class represents a genuine failure
+// to retrieve an existing policy (outage or malformed response) — the only
+// classes --api-failure-mode may act on. The API answering authoritatively
+// that there is nothing to retrieve (not onboarded) or that the client is
+// misconfigured (unauthorized, precondition) is not a retrieval failure. An
+// onboarded org with no policy assigned returns 200 with a resolved deny-all
+// policy, so "onboarded" and "reachable" are cleanly separable on the wire.
+func (c PolicyFetchClass) IsRetrievalFailure() bool {
+	switch c {
+	case PolicyFetchTransport, PolicyFetchServer, PolicyFetchMalformed:
+		return true
+	}
+	return false
+}
+
+// retryable reports whether another fetch attempt could plausibly succeed.
+// Malformed is a retrieval failure but not retryable: the server answered
+// consistently, it just sent something we can't parse.
+func (c PolicyFetchClass) retryable() bool {
+	return c.IsRetrievalFailure() && c != PolicyFetchMalformed
+}
+
+// PolicyFetchError is the classified error returned by fetchPolicyFromAPI.
+type PolicyFetchError struct {
+	Class      PolicyFetchClass
+	StatusCode int // 0 when no HTTP response was received
+	err        error
+
+	// retryAfter carries a parsed Retry-After header from a 429 response so
+	// the retry loop can honour it over its computed backoff.
+	retryAfter time.Duration
+}
+
+func (e *PolicyFetchError) Error() string {
+	if e.StatusCode != 0 {
+		return fmt.Sprintf("policy fetch failed (class=%s, status=%d): %v", e.Class, e.StatusCode, e.err)
+	}
+	return fmt.Sprintf("policy fetch failed (class=%s): %v", e.Class, e.err)
+}
+
+func (e *PolicyFetchError) Unwrap() error { return e.err }
+
+// classifyStatus maps a non-200 status to a fetch class. The API contract
+// only returns 400/401/403/404 intentionally; anything else unexpected (odd
+// proxies, load balancers) is treated as a server-side failure like 429/5xx.
+func classifyStatus(code int) PolicyFetchClass {
+	switch code {
+	case http.StatusBadRequest:
+		return PolicyFetchPrecondition
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return PolicyFetchUnauthorized
+	case http.StatusNotFound:
+		return PolicyFetchNotOnboarded
+	default:
+		return PolicyFetchServer
+	}
+}
+
+// Retry schedule for fetchPolicyFromAPI. The action's readiness wait is 30s,
+// so the whole fetch (attempts + backoff) must finish comfortably inside it —
+// with the old single 30s attempt, a hung fetch timed the action out and the
+// fallback posture was unreachable in exactly the case it exists for. Vars so
+// tests can shrink the delays.
+var (
+	policyFetchAttempts       = 3
+	policyFetchAttemptTimeout = 5 * time.Second
+	policyFetchBaseBackoff    = 500 * time.Millisecond
+	policyFetchTotalBudget    = 10 * time.Second
 )
 
 // fetchPolicyFromAPI fetches the resolved CargoWall policy from the CodeCargo
 // SaaS API. The endpoint returns the merged policy (org defaults + repo
 // overrides + job-level overrides) as a CargoWallPolicy protobuf message
-// serialised as JSON.
+// serialised as JSON. Transient failures (transport errors, 429, 5xx) are
+// retried with exponential backoff; all other failures are terminal. On
+// failure the returned error is always a *PolicyFetchError.
 func fetchPolicyFromAPI(ctx context.Context, apiUrl, token, jobKey, version string) (*cargowallv1pb.CargoWallPolicy, error) {
 	endpoint := strings.TrimRight(apiUrl, "/") + "/api/cargowall/v1/action/policy"
 	// Empty params are omitted entirely rather than sent blank, so the server
@@ -49,34 +158,111 @@ func fetchPolicyFromAPI(ctx context.Context, apiUrl, token, jobKey, version stri
 		endpoint += "?" + q.Encode()
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, policyFetchTotalBudget)
+	defer cancel()
+
+	client := &http.Client{}
+	var lastErr *PolicyFetchError
+	for attempt := range policyFetchAttempts {
+		if attempt > 0 {
+			if err := sleepBackoff(ctx, attempt, lastErr.retryAfter); err != nil {
+				return nil, lastErr
+			}
+		}
+		policy, ferr := fetchPolicyOnce(ctx, client, endpoint, token)
+		if ferr == nil {
+			return policy, nil
+		}
+		lastErr = ferr
+		if !ferr.Class.retryable() {
+			return nil, ferr
+		}
+	}
+	return nil, lastErr
+}
+
+// fetchPolicyOnce performs a single policy fetch attempt with a per-attempt
+// timeout, classifying any failure.
+func fetchPolicyOnce(ctx context.Context, client *http.Client, endpoint, token string) (*cargowallv1pb.CargoWallPolicy, *PolicyFetchError) {
+	ctx, cancel := context.WithTimeout(ctx, policyFetchAttemptTimeout)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+		return nil, &PolicyFetchError{Class: PolicyFetchTransport, err: fmt.Errorf("failed to create HTTP request: %w", err)}
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch policy from API: %w", err)
+		return nil, &PolicyFetchError{Class: PolicyFetchTransport, err: fmt.Errorf("failed to fetch policy from API: %w", err)}
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// Bound the read: api-url is env-configurable, so a misconfigured
+	// endpoint or interposed proxy could feed an arbitrarily large body.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPolicyResponseBytes))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read API response body: %w", err)
+		return nil, &PolicyFetchError{Class: PolicyFetchTransport, err: fmt.Errorf("failed to read API response body: %w", err)}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned non-OK status %d: %s", resp.StatusCode, string(body))
+		return nil, &PolicyFetchError{
+			Class:      classifyStatus(resp.StatusCode),
+			StatusCode: resp.StatusCode,
+			err:        fmt.Errorf("API returned non-OK status %d: %s", resp.StatusCode, truncateForError(body)),
+			retryAfter: otlp.ParseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	var policy cargowallv1pb.CargoWallPolicy
 	// DiscardUnknown so additive fields/enum values from a newer controller
 	// don't make us drop the entire policy and fall back to local config.
 	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &policy); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal policy response: %w", err)
+		return nil, &PolicyFetchError{Class: PolicyFetchMalformed, err: fmt.Errorf("failed to unmarshal policy response: %w", err)}
 	}
 
 	return &policy, nil
+}
+
+// sleepBackoff waits before retry number `attempt` (1-based): exponential
+// backoff with full jitter, or the server's Retry-After when it's longer.
+// Returns the context error if the total budget expires first, or
+// immediately when the delay itself would outlive the budget — sleeping out
+// the rest of the budget only to return the same error wastes startup time
+// the action's readiness window is counting down.
+func sleepBackoff(ctx context.Context, attempt int, retryAfter time.Duration) error {
+	delay := policyFetchBaseBackoff << (attempt - 1)
+	if delay > 0 {
+		delay += rand.N(delay)
+	}
+	if retryAfter > delay {
+		delay = retryAfter
+	}
+	if deadline, ok := ctx.Deadline(); ok && delay >= time.Until(deadline) {
+		return context.DeadlineExceeded
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(delay):
+		return nil
+	}
+}
+
+// maxPolicyResponseBytes bounds how much of an API response is read (matches
+// the OTLP exporter's response cap); maxErrorBodyBytes bounds how much of a
+// non-OK body is quoted into the error, which flows to logs and — under
+// --api-failure-mode=fail — the failure sentinel the action prints.
+const (
+	maxPolicyResponseBytes = 1 << 20
+	maxErrorBodyBytes      = 1 << 10
+)
+
+// truncateForError renders a response body for inclusion in an error message.
+func truncateForError(body []byte) string {
+	if len(body) > maxErrorBodyBytes {
+		return string(body[:maxErrorBodyBytes]) + "... (truncated)"
+	}
+	return string(body)
 }

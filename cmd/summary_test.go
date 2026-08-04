@@ -28,7 +28,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
 
+	cargowallv1 "github.com/code-cargo/cargowall/pb/cargowall/v1"
 	"github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
@@ -855,23 +857,31 @@ func TestPushToApi_ReportsVersion(t *testing.T) {
 	}
 }
 
-// TestPushToApi_ReportsDowngradeReason confirms the downgrade reason recorded
-// by `cargowall start` under --api-failure-mode=audit rides along on the job
-// push, and is omitted entirely when the run executed at its requested
-// posture (no state file).
-func TestPushToApi_ReportsDowngradeReason(t *testing.T) {
+// TestPushToApi_ReportsDowngrade confirms the structured downgrade record
+// written by `cargowall start` rides along on the job push with its type,
+// failure class, status, and human-readable detail intact — and is omitted
+// entirely when the run executed at its requested posture (no state file).
+func TestPushToApi_ReportsDowngrade(t *testing.T) {
+	status := uint32(503)
 	tests := []struct {
-		name   string
-		reason string
+		name      string
+		downgrade *cargowallv1.CargoWallDowngrade
 	}{
-		{name: "downgraded", reason: "downgraded to audit mode: policy could not be retrieved from https://app.codecargo.com (transport): dial tcp: timeout"},
-		{name: "not downgraded", reason: ""},
+		{name: "downgraded", downgrade: &cargowallv1.CargoWallDowngrade{
+			Type:         data.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK,
+			FailureClass: data.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_SERVER,
+			HttpStatus:   &status,
+			Detail:       "downgraded to audit mode: policy could not be retrieved",
+		}},
+		{name: "not downgraded", downgrade: nil},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, reasonPath := redirectStateFiles(t)
-			if tc.reason != "" {
-				require.NoError(t, os.WriteFile(reasonPath, []byte(tc.reason+"\n"), 0o644))
+			_, downgradePath := redirectStateFiles(t)
+			if tc.downgrade != nil {
+				payload, merr := protojson.Marshal(tc.downgrade)
+				require.NoError(t, merr)
+				require.NoError(t, os.WriteFile(downgradePath, payload, 0o644))
 			}
 
 			var got map[string]any
@@ -886,11 +896,16 @@ func TestPushToApi_ReportsDowngradeReason(t *testing.T) {
 			_, err := c.pushToApi(nil, nil)
 			require.NoError(t, err)
 
-			if tc.reason == "" {
-				assert.NotContains(t, got, "downgrade_reason", "downgrade_reason must be omitted when the run was not downgraded")
+			if tc.downgrade == nil {
+				assert.NotContains(t, got, "downgrade", "downgrade must be omitted when the run was not downgraded")
 				return
 			}
-			assert.Equal(t, tc.reason, got["downgrade_reason"], "reason must be pushed trimmed of the trailing newline")
+			d, ok := got["downgrade"].(map[string]any)
+			require.True(t, ok, "downgrade must be a structured object, got %T", got["downgrade"])
+			assert.Equal(t, "CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK", d["type"])
+			assert.Equal(t, "CARGO_WALL_FETCH_FAILURE_CLASS_SERVER", d["failure_class"])
+			assert.Equal(t, float64(503), d["http_status"])
+			assert.Equal(t, tc.downgrade.Detail, d["detail"])
 		})
 	}
 }

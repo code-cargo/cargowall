@@ -79,6 +79,80 @@ func (x *GetCargoWallActionJobRunPolicyRequest) GetVersion() string {
 	return ""
 }
 
+// CargoWallDowngrade records how and why a run's effective posture was
+// downgraded from the requested one, so the dashboard can badge degraded
+// runs and count them by type/failure class without parsing prose.
+type CargoWallDowngrade struct {
+	state        protoimpl.MessageState          `protogen:"open.v1"`
+	Type         data.CargoWallDowngradeType     `protobuf:"varint,1,opt,name=type,proto3,enum=grpc.cargowall.v1.CargoWallDowngradeType" json:"type,omitempty"`
+	FailureClass data.CargoWallFetchFailureClass `protobuf:"varint,2,opt,name=failure_class,json=failureClass,proto3,enum=grpc.cargowall.v1.CargoWallFetchFailureClass" json:"failure_class,omitempty"`
+	// HTTP status when a response was received (5xx/429); absent on
+	// transport failures.
+	HttpStatus *uint32 `protobuf:"varint,3,opt,name=http_status,json=httpStatus,proto3,oneof" json:"http_status,omitempty"`
+	// Human-readable detail for display only — never parsed.
+	Detail        string `protobuf:"bytes,4,opt,name=detail,proto3" json:"detail,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CargoWallDowngrade) Reset() {
+	*x = CargoWallDowngrade{}
+	mi := &file_cargo_wall_action_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CargoWallDowngrade) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CargoWallDowngrade) ProtoMessage() {}
+
+func (x *CargoWallDowngrade) ProtoReflect() protoreflect.Message {
+	mi := &file_cargo_wall_action_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CargoWallDowngrade.ProtoReflect.Descriptor instead.
+func (*CargoWallDowngrade) Descriptor() ([]byte, []int) {
+	return file_cargo_wall_action_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *CargoWallDowngrade) GetType() data.CargoWallDowngradeType {
+	if x != nil {
+		return x.Type
+	}
+	return data.CargoWallDowngradeType(0)
+}
+
+func (x *CargoWallDowngrade) GetFailureClass() data.CargoWallFetchFailureClass {
+	if x != nil {
+		return x.FailureClass
+	}
+	return data.CargoWallFetchFailureClass(0)
+}
+
+func (x *CargoWallDowngrade) GetHttpStatus() uint32 {
+	if x != nil && x.HttpStatus != nil {
+		return *x.HttpStatus
+	}
+	return 0
+}
+
+func (x *CargoWallDowngrade) GetDetail() string {
+	if x != nil {
+		return x.Detail
+	}
+	return ""
+}
+
 type CargoWallActionJobSummary struct {
 	state                  protoimpl.MessageState `protogen:"open.v1"`
 	TotalConnections       uint32                 `protobuf:"varint,1,opt,name=total_connections,json=totalConnections,proto3" json:"total_connections,omitempty"`
@@ -93,7 +167,7 @@ type CargoWallActionJobSummary struct {
 
 func (x *CargoWallActionJobSummary) Reset() {
 	*x = CargoWallActionJobSummary{}
-	mi := &file_cargo_wall_action_proto_msgTypes[1]
+	mi := &file_cargo_wall_action_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -105,7 +179,7 @@ func (x *CargoWallActionJobSummary) String() string {
 func (*CargoWallActionJobSummary) ProtoMessage() {}
 
 func (x *CargoWallActionJobSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_cargo_wall_action_proto_msgTypes[1]
+	mi := &file_cargo_wall_action_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -118,7 +192,7 @@ func (x *CargoWallActionJobSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CargoWallActionJobSummary.ProtoReflect.Descriptor instead.
 func (*CargoWallActionJobSummary) Descriptor() ([]byte, []int) {
-	return file_cargo_wall_action_proto_rawDescGZIP(), []int{1}
+	return file_cargo_wall_action_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *CargoWallActionJobSummary) GetTotalConnections() uint32 {
@@ -178,7 +252,7 @@ type CargoWallActionStep struct {
 
 func (x *CargoWallActionStep) Reset() {
 	*x = CargoWallActionStep{}
-	mi := &file_cargo_wall_action_proto_msgTypes[2]
+	mi := &file_cargo_wall_action_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -190,7 +264,7 @@ func (x *CargoWallActionStep) String() string {
 func (*CargoWallActionStep) ProtoMessage() {}
 
 func (x *CargoWallActionStep) ProtoReflect() protoreflect.Message {
-	mi := &file_cargo_wall_action_proto_msgTypes[2]
+	mi := &file_cargo_wall_action_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -203,7 +277,7 @@ func (x *CargoWallActionStep) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CargoWallActionStep.ProtoReflect.Descriptor instead.
 func (*CargoWallActionStep) Descriptor() ([]byte, []int) {
-	return file_cargo_wall_action_proto_rawDescGZIP(), []int{2}
+	return file_cargo_wall_action_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *CargoWallActionStep) GetId() string {
@@ -277,7 +351,7 @@ type CargoWallActionEvent struct {
 
 func (x *CargoWallActionEvent) Reset() {
 	*x = CargoWallActionEvent{}
-	mi := &file_cargo_wall_action_proto_msgTypes[3]
+	mi := &file_cargo_wall_action_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -289,7 +363,7 @@ func (x *CargoWallActionEvent) String() string {
 func (*CargoWallActionEvent) ProtoMessage() {}
 
 func (x *CargoWallActionEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_cargo_wall_action_proto_msgTypes[3]
+	mi := &file_cargo_wall_action_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -302,7 +376,7 @@ func (x *CargoWallActionEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CargoWallActionEvent.ProtoReflect.Descriptor instead.
 func (*CargoWallActionEvent) Descriptor() ([]byte, []int) {
-	return file_cargo_wall_action_proto_rawDescGZIP(), []int{3}
+	return file_cargo_wall_action_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *CargoWallActionEvent) GetTimestamp() *timestamppb.Timestamp {
@@ -398,19 +472,19 @@ type CreateCargoWallActionJobRequest struct {
 	// "develop"/"dev" for unreleased builds). Absent when reported by an agent
 	// predating version reporting.
 	Version *string `protobuf:"bytes,10,opt,name=version,proto3,oneof" json:"version,omitempty"`
-	// Human-readable reason the run's effective mode was downgraded from the
-	// requested posture (e.g. to audit under --api-failure-mode=audit because
-	// the policy could not be retrieved). Absent when the run executed at its
+	// Present when the run's effective posture was downgraded from the
+	// requested one (e.g. to audit under --api-failure-mode=audit because the
+	// policy could not be retrieved). Absent when the run executed at its
 	// requested posture.
-	DowngradeReason *string                      `protobuf:"bytes,11,opt,name=downgrade_reason,json=downgradeReason,proto3,oneof" json:"downgrade_reason,omitempty"`
-	Steps           []*CreateCargoWallActionStep `protobuf:"bytes,100,rep,name=steps,proto3" json:"steps,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	Downgrade     *CargoWallDowngrade          `protobuf:"bytes,11,opt,name=downgrade,proto3,oneof" json:"downgrade,omitempty"`
+	Steps         []*CreateCargoWallActionStep `protobuf:"bytes,100,rep,name=steps,proto3" json:"steps,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CreateCargoWallActionJobRequest) Reset() {
 	*x = CreateCargoWallActionJobRequest{}
-	mi := &file_cargo_wall_action_proto_msgTypes[4]
+	mi := &file_cargo_wall_action_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -422,7 +496,7 @@ func (x *CreateCargoWallActionJobRequest) String() string {
 func (*CreateCargoWallActionJobRequest) ProtoMessage() {}
 
 func (x *CreateCargoWallActionJobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cargo_wall_action_proto_msgTypes[4]
+	mi := &file_cargo_wall_action_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -435,7 +509,7 @@ func (x *CreateCargoWallActionJobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateCargoWallActionJobRequest.ProtoReflect.Descriptor instead.
 func (*CreateCargoWallActionJobRequest) Descriptor() ([]byte, []int) {
-	return file_cargo_wall_action_proto_rawDescGZIP(), []int{4}
+	return file_cargo_wall_action_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *CreateCargoWallActionJobRequest) GetJobRunId() uint64 {
@@ -508,11 +582,11 @@ func (x *CreateCargoWallActionJobRequest) GetVersion() string {
 	return ""
 }
 
-func (x *CreateCargoWallActionJobRequest) GetDowngradeReason() string {
-	if x != nil && x.DowngradeReason != nil {
-		return *x.DowngradeReason
+func (x *CreateCargoWallActionJobRequest) GetDowngrade() *CargoWallDowngrade {
+	if x != nil {
+		return x.Downgrade
 	}
-	return ""
+	return nil
 }
 
 func (x *CreateCargoWallActionJobRequest) GetSteps() []*CreateCargoWallActionStep {
@@ -536,7 +610,7 @@ type CreateCargoWallActionStep struct {
 
 func (x *CreateCargoWallActionStep) Reset() {
 	*x = CreateCargoWallActionStep{}
-	mi := &file_cargo_wall_action_proto_msgTypes[5]
+	mi := &file_cargo_wall_action_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -548,7 +622,7 @@ func (x *CreateCargoWallActionStep) String() string {
 func (*CreateCargoWallActionStep) ProtoMessage() {}
 
 func (x *CreateCargoWallActionStep) ProtoReflect() protoreflect.Message {
-	mi := &file_cargo_wall_action_proto_msgTypes[5]
+	mi := &file_cargo_wall_action_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -561,7 +635,7 @@ func (x *CreateCargoWallActionStep) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateCargoWallActionStep.ProtoReflect.Descriptor instead.
 func (*CreateCargoWallActionStep) Descriptor() ([]byte, []int) {
-	return file_cargo_wall_action_proto_rawDescGZIP(), []int{5}
+	return file_cargo_wall_action_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *CreateCargoWallActionStep) GetName() string {
@@ -610,7 +684,7 @@ type CreateCargoWallActionJobResponse struct {
 
 func (x *CreateCargoWallActionJobResponse) Reset() {
 	*x = CreateCargoWallActionJobResponse{}
-	mi := &file_cargo_wall_action_proto_msgTypes[6]
+	mi := &file_cargo_wall_action_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -622,7 +696,7 @@ func (x *CreateCargoWallActionJobResponse) String() string {
 func (*CreateCargoWallActionJobResponse) ProtoMessage() {}
 
 func (x *CreateCargoWallActionJobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cargo_wall_action_proto_msgTypes[6]
+	mi := &file_cargo_wall_action_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -635,7 +709,7 @@ func (x *CreateCargoWallActionJobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateCargoWallActionJobResponse.ProtoReflect.Descriptor instead.
 func (*CreateCargoWallActionJobResponse) Descriptor() ([]byte, []int) {
-	return file_cargo_wall_action_proto_rawDescGZIP(), []int{6}
+	return file_cargo_wall_action_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *CreateCargoWallActionJobResponse) GetJobId() string {
@@ -663,14 +737,21 @@ var File_cargo_wall_action_proto protoreflect.FileDescriptor
 
 const file_cargo_wall_action_proto_rawDesc = "" +
 	"\n" +
-	"\x17cargo_wall_action.proto\x12\x11grpc.cargowall.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a&data/cargo_wall_action_type_enum.proto\x1a,data/cargo_wall_auto_allowed_type_enum.proto\x1a)data/cargo_wall_event_category_enum.proto\x1a%data/cargo_wall_job_status_enum.proto\x1a\x1fdata/cargo_wall_mode_enum.proto\x1a\x10cargo_wall.proto\"|\n" +
+	"\x17cargo_wall_action.proto\x12\x11grpc.cargowall.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a&data/cargo_wall_action_type_enum.proto\x1a,data/cargo_wall_auto_allowed_type_enum.proto\x1a)data/cargo_wall_downgrade_type_enum.proto\x1a)data/cargo_wall_event_category_enum.proto\x1a.data/cargo_wall_fetch_failure_class_enum.proto\x1a%data/cargo_wall_job_status_enum.proto\x1a\x1fdata/cargo_wall_mode_enum.proto\x1a\x10cargo_wall.proto\"|\n" +
 	"%GetCargoWallActionJobRunPolicyRequest\x12\x1c\n" +
 	"\ajob_key\x18\x01 \x01(\tH\x00R\x06jobKey\x88\x01\x01\x12\x1d\n" +
 	"\aversion\x18\x02 \x01(\tH\x01R\aversion\x88\x01\x01B\n" +
 	"\n" +
 	"\b_job_keyB\n" +
 	"\n" +
-	"\b_version\"\xc3\x02\n" +
+	"\b_version\"\xf5\x01\n" +
+	"\x12CargoWallDowngrade\x12=\n" +
+	"\x04type\x18\x01 \x01(\x0e2).grpc.cargowall.v1.CargoWallDowngradeTypeR\x04type\x12R\n" +
+	"\rfailure_class\x18\x02 \x01(\x0e2-.grpc.cargowall.v1.CargoWallFetchFailureClassR\ffailureClass\x12$\n" +
+	"\vhttp_status\x18\x03 \x01(\rH\x00R\n" +
+	"httpStatus\x88\x01\x01\x12\x16\n" +
+	"\x06detail\x18\x04 \x01(\tR\x06detailB\x0e\n" +
+	"\f_http_status\"\xc3\x02\n" +
 	"\x19CargoWallActionJobSummary\x12+\n" +
 	"\x11total_connections\x18\x01 \x01(\rR\x10totalConnections\x12/\n" +
 	"\x13allowed_connections\x18\x02 \x01(\rR\x12allowedConnections\x12-\n" +
@@ -711,7 +792,7 @@ const file_cargo_wall_action_proto_rawDesc = "" +
 	"\r_matched_ruleB\n" +
 	"\n" +
 	"\b_processB\x14\n" +
-	"\x12_auto_allowed_type\"\xc1\x05\n" +
+	"\x12_auto_allowed_type\"\xd4\x05\n" +
 	"\x1fCreateCargoWallActionJobRequest\x12!\n" +
 	"\n" +
 	"job_run_id\x18\x01 \x01(\x04H\x00R\bjobRunId\x88\x01\x01\x12\x19\n" +
@@ -725,13 +806,14 @@ const file_cargo_wall_action_proto_rawDesc = "" +
 	"\fcompleted_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAt\x12=\n" +
 	"\x06status\x18\t \x01(\x0e2%.grpc.cargowall.v1.CargoWallJobStatusR\x06status\x12\x1d\n" +
 	"\aversion\x18\n" +
-	" \x01(\tH\x01R\aversion\x88\x01\x01\x12.\n" +
-	"\x10downgrade_reason\x18\v \x01(\tH\x02R\x0fdowngradeReason\x88\x01\x01\x12B\n" +
+	" \x01(\tH\x01R\aversion\x88\x01\x01\x12H\n" +
+	"\tdowngrade\x18\v \x01(\v2%.grpc.cargowall.v1.CargoWallDowngradeH\x02R\tdowngrade\x88\x01\x01\x12B\n" +
 	"\x05steps\x18d \x03(\v2,.grpc.cargowall.v1.CreateCargoWallActionStepR\x05stepsB\r\n" +
 	"\v_job_run_idB\n" +
 	"\n" +
-	"\b_versionB\x13\n" +
-	"\x11_downgrade_reason\"\xac\x02\n" +
+	"\b_versionB\f\n" +
+	"\n" +
+	"_downgrade\"\xac\x02\n" +
 	"\x19CreateCargoWallActionStep\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06number\x18\x02 \x01(\x05R\x06number\x12>\n" +
@@ -761,51 +843,57 @@ func file_cargo_wall_action_proto_rawDescGZIP() []byte {
 	return file_cargo_wall_action_proto_rawDescData
 }
 
-var file_cargo_wall_action_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_cargo_wall_action_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_cargo_wall_action_proto_goTypes = []any{
 	(*GetCargoWallActionJobRunPolicyRequest)(nil), // 0: grpc.cargowall.v1.GetCargoWallActionJobRunPolicyRequest
-	(*CargoWallActionJobSummary)(nil),             // 1: grpc.cargowall.v1.CargoWallActionJobSummary
-	(*CargoWallActionStep)(nil),                   // 2: grpc.cargowall.v1.CargoWallActionStep
-	(*CargoWallActionEvent)(nil),                  // 3: grpc.cargowall.v1.CargoWallActionEvent
-	(*CreateCargoWallActionJobRequest)(nil),       // 4: grpc.cargowall.v1.CreateCargoWallActionJobRequest
-	(*CreateCargoWallActionStep)(nil),             // 5: grpc.cargowall.v1.CreateCargoWallActionStep
-	(*CreateCargoWallActionJobResponse)(nil),      // 6: grpc.cargowall.v1.CreateCargoWallActionJobResponse
-	(*timestamppb.Timestamp)(nil),                 // 7: google.protobuf.Timestamp
-	(data.CargoWallActionType)(0),                 // 8: grpc.cargowall.v1.CargoWallActionType
-	(data.CargoWallEventCategory)(0),              // 9: grpc.cargowall.v1.CargoWallEventCategory
-	(data.CargoWallAutoAllowedType)(0),            // 10: grpc.cargowall.v1.CargoWallAutoAllowedType
-	(data.CargoWallMode)(0),                       // 11: grpc.cargowall.v1.CargoWallMode
-	(data.CargoWallJobStatus)(0),                  // 12: grpc.cargowall.v1.CargoWallJobStatus
-	(*CargoWallPolicy)(nil),                       // 13: grpc.cargowall.v1.CargoWallPolicy
+	(*CargoWallDowngrade)(nil),                    // 1: grpc.cargowall.v1.CargoWallDowngrade
+	(*CargoWallActionJobSummary)(nil),             // 2: grpc.cargowall.v1.CargoWallActionJobSummary
+	(*CargoWallActionStep)(nil),                   // 3: grpc.cargowall.v1.CargoWallActionStep
+	(*CargoWallActionEvent)(nil),                  // 4: grpc.cargowall.v1.CargoWallActionEvent
+	(*CreateCargoWallActionJobRequest)(nil),       // 5: grpc.cargowall.v1.CreateCargoWallActionJobRequest
+	(*CreateCargoWallActionStep)(nil),             // 6: grpc.cargowall.v1.CreateCargoWallActionStep
+	(*CreateCargoWallActionJobResponse)(nil),      // 7: grpc.cargowall.v1.CreateCargoWallActionJobResponse
+	(data.CargoWallDowngradeType)(0),              // 8: grpc.cargowall.v1.CargoWallDowngradeType
+	(data.CargoWallFetchFailureClass)(0),          // 9: grpc.cargowall.v1.CargoWallFetchFailureClass
+	(*timestamppb.Timestamp)(nil),                 // 10: google.protobuf.Timestamp
+	(data.CargoWallActionType)(0),                 // 11: grpc.cargowall.v1.CargoWallActionType
+	(data.CargoWallEventCategory)(0),              // 12: grpc.cargowall.v1.CargoWallEventCategory
+	(data.CargoWallAutoAllowedType)(0),            // 13: grpc.cargowall.v1.CargoWallAutoAllowedType
+	(data.CargoWallMode)(0),                       // 14: grpc.cargowall.v1.CargoWallMode
+	(data.CargoWallJobStatus)(0),                  // 15: grpc.cargowall.v1.CargoWallJobStatus
+	(*CargoWallPolicy)(nil),                       // 16: grpc.cargowall.v1.CargoWallPolicy
 }
 var file_cargo_wall_action_proto_depIdxs = []int32{
-	7,  // 0: grpc.cargowall.v1.CargoWallActionStep.created_at:type_name -> google.protobuf.Timestamp
-	7,  // 1: grpc.cargowall.v1.CargoWallActionStep.started_at:type_name -> google.protobuf.Timestamp
-	7,  // 2: grpc.cargowall.v1.CargoWallActionStep.completed_at:type_name -> google.protobuf.Timestamp
-	3,  // 3: grpc.cargowall.v1.CargoWallActionStep.events:type_name -> grpc.cargowall.v1.CargoWallActionEvent
-	7,  // 4: grpc.cargowall.v1.CargoWallActionEvent.timestamp:type_name -> google.protobuf.Timestamp
-	8,  // 5: grpc.cargowall.v1.CargoWallActionEvent.action:type_name -> grpc.cargowall.v1.CargoWallActionType
-	9,  // 6: grpc.cargowall.v1.CargoWallActionEvent.category:type_name -> grpc.cargowall.v1.CargoWallEventCategory
-	10, // 7: grpc.cargowall.v1.CargoWallActionEvent.auto_allowed_type:type_name -> grpc.cargowall.v1.CargoWallAutoAllowedType
-	11, // 8: grpc.cargowall.v1.CreateCargoWallActionJobRequest.mode:type_name -> grpc.cargowall.v1.CargoWallMode
-	8,  // 9: grpc.cargowall.v1.CreateCargoWallActionJobRequest.default_action:type_name -> grpc.cargowall.v1.CargoWallActionType
-	1,  // 10: grpc.cargowall.v1.CreateCargoWallActionJobRequest.summary:type_name -> grpc.cargowall.v1.CargoWallActionJobSummary
-	7,  // 11: grpc.cargowall.v1.CreateCargoWallActionJobRequest.started_at:type_name -> google.protobuf.Timestamp
-	7,  // 12: grpc.cargowall.v1.CreateCargoWallActionJobRequest.completed_at:type_name -> google.protobuf.Timestamp
-	12, // 13: grpc.cargowall.v1.CreateCargoWallActionJobRequest.status:type_name -> grpc.cargowall.v1.CargoWallJobStatus
-	5,  // 14: grpc.cargowall.v1.CreateCargoWallActionJobRequest.steps:type_name -> grpc.cargowall.v1.CreateCargoWallActionStep
-	7,  // 15: grpc.cargowall.v1.CreateCargoWallActionStep.started_at:type_name -> google.protobuf.Timestamp
-	7,  // 16: grpc.cargowall.v1.CreateCargoWallActionStep.completed_at:type_name -> google.protobuf.Timestamp
-	3,  // 17: grpc.cargowall.v1.CreateCargoWallActionStep.events:type_name -> grpc.cargowall.v1.CargoWallActionEvent
-	4,  // 18: grpc.cargowall.v1.CargoWallActionJobService.CreateCargoWallActionJob:input_type -> grpc.cargowall.v1.CreateCargoWallActionJobRequest
-	0,  // 19: grpc.cargowall.v1.CargoWallActionJobService.GetCargoWallActionJobRunPolicy:input_type -> grpc.cargowall.v1.GetCargoWallActionJobRunPolicyRequest
-	6,  // 20: grpc.cargowall.v1.CargoWallActionJobService.CreateCargoWallActionJob:output_type -> grpc.cargowall.v1.CreateCargoWallActionJobResponse
-	13, // 21: grpc.cargowall.v1.CargoWallActionJobService.GetCargoWallActionJobRunPolicy:output_type -> grpc.cargowall.v1.CargoWallPolicy
-	20, // [20:22] is the sub-list for method output_type
-	18, // [18:20] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	8,  // 0: grpc.cargowall.v1.CargoWallDowngrade.type:type_name -> grpc.cargowall.v1.CargoWallDowngradeType
+	9,  // 1: grpc.cargowall.v1.CargoWallDowngrade.failure_class:type_name -> grpc.cargowall.v1.CargoWallFetchFailureClass
+	10, // 2: grpc.cargowall.v1.CargoWallActionStep.created_at:type_name -> google.protobuf.Timestamp
+	10, // 3: grpc.cargowall.v1.CargoWallActionStep.started_at:type_name -> google.protobuf.Timestamp
+	10, // 4: grpc.cargowall.v1.CargoWallActionStep.completed_at:type_name -> google.protobuf.Timestamp
+	4,  // 5: grpc.cargowall.v1.CargoWallActionStep.events:type_name -> grpc.cargowall.v1.CargoWallActionEvent
+	10, // 6: grpc.cargowall.v1.CargoWallActionEvent.timestamp:type_name -> google.protobuf.Timestamp
+	11, // 7: grpc.cargowall.v1.CargoWallActionEvent.action:type_name -> grpc.cargowall.v1.CargoWallActionType
+	12, // 8: grpc.cargowall.v1.CargoWallActionEvent.category:type_name -> grpc.cargowall.v1.CargoWallEventCategory
+	13, // 9: grpc.cargowall.v1.CargoWallActionEvent.auto_allowed_type:type_name -> grpc.cargowall.v1.CargoWallAutoAllowedType
+	14, // 10: grpc.cargowall.v1.CreateCargoWallActionJobRequest.mode:type_name -> grpc.cargowall.v1.CargoWallMode
+	11, // 11: grpc.cargowall.v1.CreateCargoWallActionJobRequest.default_action:type_name -> grpc.cargowall.v1.CargoWallActionType
+	2,  // 12: grpc.cargowall.v1.CreateCargoWallActionJobRequest.summary:type_name -> grpc.cargowall.v1.CargoWallActionJobSummary
+	10, // 13: grpc.cargowall.v1.CreateCargoWallActionJobRequest.started_at:type_name -> google.protobuf.Timestamp
+	10, // 14: grpc.cargowall.v1.CreateCargoWallActionJobRequest.completed_at:type_name -> google.protobuf.Timestamp
+	15, // 15: grpc.cargowall.v1.CreateCargoWallActionJobRequest.status:type_name -> grpc.cargowall.v1.CargoWallJobStatus
+	1,  // 16: grpc.cargowall.v1.CreateCargoWallActionJobRequest.downgrade:type_name -> grpc.cargowall.v1.CargoWallDowngrade
+	6,  // 17: grpc.cargowall.v1.CreateCargoWallActionJobRequest.steps:type_name -> grpc.cargowall.v1.CreateCargoWallActionStep
+	10, // 18: grpc.cargowall.v1.CreateCargoWallActionStep.started_at:type_name -> google.protobuf.Timestamp
+	10, // 19: grpc.cargowall.v1.CreateCargoWallActionStep.completed_at:type_name -> google.protobuf.Timestamp
+	4,  // 20: grpc.cargowall.v1.CreateCargoWallActionStep.events:type_name -> grpc.cargowall.v1.CargoWallActionEvent
+	5,  // 21: grpc.cargowall.v1.CargoWallActionJobService.CreateCargoWallActionJob:input_type -> grpc.cargowall.v1.CreateCargoWallActionJobRequest
+	0,  // 22: grpc.cargowall.v1.CargoWallActionJobService.GetCargoWallActionJobRunPolicy:input_type -> grpc.cargowall.v1.GetCargoWallActionJobRunPolicyRequest
+	7,  // 23: grpc.cargowall.v1.CargoWallActionJobService.CreateCargoWallActionJob:output_type -> grpc.cargowall.v1.CreateCargoWallActionJobResponse
+	16, // 24: grpc.cargowall.v1.CargoWallActionJobService.GetCargoWallActionJobRunPolicy:output_type -> grpc.cargowall.v1.CargoWallPolicy
+	23, // [23:25] is the sub-list for method output_type
+	21, // [21:23] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_cargo_wall_action_proto_init() }
@@ -815,17 +903,18 @@ func file_cargo_wall_action_proto_init() {
 	}
 	file_cargo_wall_proto_init()
 	file_cargo_wall_action_proto_msgTypes[0].OneofWrappers = []any{}
-	file_cargo_wall_action_proto_msgTypes[2].OneofWrappers = []any{}
+	file_cargo_wall_action_proto_msgTypes[1].OneofWrappers = []any{}
 	file_cargo_wall_action_proto_msgTypes[3].OneofWrappers = []any{}
 	file_cargo_wall_action_proto_msgTypes[4].OneofWrappers = []any{}
 	file_cargo_wall_action_proto_msgTypes[5].OneofWrappers = []any{}
+	file_cargo_wall_action_proto_msgTypes[6].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cargo_wall_action_proto_rawDesc), len(file_cargo_wall_action_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -647,12 +647,10 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 		req.Version = &c.Version
 	}
 
-	// Carry the downgrade reason left by `cargowall start` (a separate
-	// process invocation) so the dashboard can show why a job ran degraded
-	// (e.g. "downgraded to audit mode: policy could not be retrieved").
-	if reason := readDowngradeReason(); reason != "" {
-		req.DowngradeReason = &reason
-	}
+	// Carry the downgrade record left by `cargowall start` (a separate
+	// process invocation) so the dashboard can badge degraded runs and
+	// count them by type/failure class.
+	req.Downgrade = readDowngrade()
 
 	// Set timestamps from first/last events
 	if len(allEvents) > 0 {
@@ -701,15 +699,19 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 	return result.WorkflowRunUrl, nil
 }
 
-// readDowngradeReason returns the downgrade reason recorded by `cargowall
-// start`, or "" when the run executed at its requested posture (file absent
-// or unreadable — best-effort by design).
-func readDowngradeReason() string {
-	data, err := os.ReadFile(downgradeReasonFile)
+// readDowngrade returns the downgrade record written by `cargowall start`,
+// or nil when the run executed at its requested posture (file absent or
+// unreadable — best-effort by design).
+func readDowngrade() *cargowallv1.CargoWallDowngrade {
+	data, err := os.ReadFile(downgradeFile)
 	if err != nil {
-		return ""
+		return nil
 	}
-	return strings.TrimSpace(string(data))
+	var d cargowallv1.CargoWallDowngrade
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(data, &d); err != nil {
+		return nil
+	}
+	return &d
 }
 
 func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {

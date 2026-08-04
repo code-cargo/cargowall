@@ -41,6 +41,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/code-cargo/cargowall/bpf"
+	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
 	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/dns"
@@ -643,13 +644,53 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 // redirect it.
 var modeFile = "/tmp/cargowall-mode"
 
-// downgradeReasonFile carries the human-readable reason for an
-// --api-failure-mode=audit downgrade from `cargowall start` to `cargowall
-// summary` (separate process invocations), which pushes it to the SaaS so
-// the dashboard can show why a job ran degraded. A var so tests can
-// redirect it; shared by the writer in handlePolicyFetchFailure and the
-// reader in pushToApi.
-var downgradeReasonFile = "/tmp/cargowall-downgrade-reason"
+// downgradeFile carries a protojson-encoded CargoWallDowngrade record from
+// `cargowall start` to `cargowall summary` (separate process invocations),
+// which attaches it to the SaaS push so the dashboard can badge degraded
+// runs and count them by type/failure class without parsing prose. A var so
+// tests can redirect it; shared by the writer in handlePolicyFetchFailure
+// and the reader in pushToApi.
+var downgradeFile = "/tmp/cargowall-downgrade"
+
+// writeDowngradeFile records the structured downgrade for the summary push.
+func writeDowngradeFile(d *cargowallv1pb.CargoWallDowngrade, logger *slog.Logger) {
+	data, err := protojson.Marshal(d)
+	if err == nil {
+		err = writeSentinel(downgradeFile, data)
+	}
+	if err != nil {
+		logger.Warn("Failed to write downgrade file", "path", downgradeFile, "error", err)
+	}
+}
+
+// protoFetchFailureClass maps a retrieval-failure class to its wire enum.
+// Non-retrieval classes never produce a downgrade record, so they map to
+// UNSPECIFIED by construction.
+func protoFetchFailureClass(c PolicyFetchClass) datapb.CargoWallFetchFailureClass {
+	switch c {
+	case PolicyFetchTransport:
+		return datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_TRANSPORT
+	case PolicyFetchServer:
+		return datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_SERVER
+	case PolicyFetchMalformed:
+		return datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_MALFORMED
+	}
+	return datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_UNSPECIFIED
+}
+
+// downgradeRecord builds the CargoWallDowngrade for a retrieval failure.
+func downgradeRecord(typ datapb.CargoWallDowngradeType, fe *PolicyFetchError, detail string) *cargowallv1pb.CargoWallDowngrade {
+	d := &cargowallv1pb.CargoWallDowngrade{
+		Type:         typ,
+		FailureClass: protoFetchFailureClass(fe.Class),
+		Detail:       detail,
+	}
+	if fe.StatusCode != 0 {
+		status := uint32(fe.StatusCode)
+		d.HttpStatus = &status
+	}
+	return d
+}
 
 // startupInterrupted reports whether a shutdown signal arrived while startup
 // was still in progress. Callers return nil and unwind through their defers
@@ -667,7 +708,7 @@ func startupInterrupted(ctx context.Context, logger *slog.Logger, phase string) 
 // removeStaleStateFiles clears the state files a previous run may have left
 // behind, warning (not failing) on anything but absence.
 func removeStaleStateFiles(cmd *StartCmd, logger *slog.Logger) {
-	for _, path := range []string{cmd.ReadyFile, cmd.FailureFile, modeFile, downgradeReasonFile} {
+	for _, path := range []string{cmd.ReadyFile, cmd.FailureFile, modeFile, downgradeFile} {
 		if path == "" {
 			continue
 		}
@@ -840,12 +881,10 @@ func handlePolicyFetchFailure(cmd *StartCmd, auditLogger *events.AuditLogger, fe
 				logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
 			}
 		}
-		// Also recorded as the downgrade reason: if the action lets the job
-		// proceed (or the post step runs before teardown), the summary push
-		// tells the dashboard the run was locked down and why.
-		if werr := writeSentinel(downgradeReasonFile, []byte(reason)); werr != nil {
-			logger.Warn("Failed to write downgrade reason file", "path", downgradeReasonFile, "error", werr)
-		}
+		// Also recorded as a structured downgrade: if the action lets the
+		// job proceed (or the post step runs before teardown), the summary
+		// push tells the dashboard the run was locked down and why.
+		writeDowngradeFile(downgradeRecord(datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_LOCKDOWN, fe, reason), logger)
 		// No mode file: lockdown is not a SaaS-resolved posture, and the
 		// failure sentinel already carries the state the action needs.
 		return
@@ -856,12 +895,10 @@ func handlePolicyFetchFailure(cmd *StartCmd, auditLogger *events.AuditLogger, fe
 		if auditLogger != nil {
 			auditLogger.SetAuditMode(true)
 		}
-		// Record why the run degraded so the summary push can carry it to
-		// the SaaS dashboard.
+		// Record the downgrade so the summary push can carry it to the
+		// SaaS dashboard.
 		reason := fmt.Sprintf("downgraded to audit mode: policy could not be retrieved from %s (%s): %v", cmd.ApiUrl, fe.Class, fetchErr)
-		if werr := writeSentinel(downgradeReasonFile, []byte(reason)); werr != nil {
-			logger.Warn("Failed to write downgrade reason file", "path", downgradeReasonFile, "error", werr)
-		}
+		writeDowngradeFile(downgradeRecord(datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK, fe, reason), logger)
 		logger.Warn("API policy fetch failed — downgrading to audit mode (--api-failure-mode=audit)", attrs...)
 	default: // "local"
 		logger.Warn("API policy fetch failed, falling back to env/file config", attrs...)

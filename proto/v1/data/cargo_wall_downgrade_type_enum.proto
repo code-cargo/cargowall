@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+option csharp_namespace = "Controller.Data.Pb.CargoWall.V1";
+option go_package = "github.com/code-cargo/cargowall/pb/cargowall/v1/data";
+
+package grpc.cargowall.v1;
+
+// How a run's effective posture was downgraded from the requested one when
+// the policy could not be retrieved (--api-failure-mode, cargowall#96).
+enum CargoWallDowngradeType {
+  CARGO_WALL_DOWNGRADE_TYPE_UNSPECIFIED = 0;
+  // --api-failure-mode=audit: enforcement downgraded to audit-only.
+  CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK = 1;
+  // --api-failure-mode=fail: run locked down to deny-all, ready withheld.
+  CARGO_WALL_DOWNGRADE_TYPE_LOCKDOWN = 2;
+  // Run enforced a cached last-known-good policy (cargowall#97).
+  CARGO_WALL_DOWNGRADE_TYPE_CACHED_POLICY = 3;
+}

@@ -32,7 +32,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
 
+	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
+	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/firewall"
@@ -42,17 +45,27 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// redirectStateFiles points the effective-mode and downgrade-reason state
-// files at tempdir paths for the duration of the test, restoring the real
-// paths on cleanup.
-func redirectStateFiles(t *testing.T) (modePath, reasonPath string) {
+// redirectStateFiles points the effective-mode and downgrade state files at
+// tempdir paths for the duration of the test, restoring the real paths on
+// cleanup.
+func redirectStateFiles(t *testing.T) (modePath, downgradePath string) {
 	t.Helper()
-	oldMode, oldReason := modeFile, downgradeReasonFile
+	oldMode, oldDowngrade := modeFile, downgradeFile
 	dir := t.TempDir()
 	modeFile = filepath.Join(dir, "cargowall-mode")
-	downgradeReasonFile = filepath.Join(dir, "cargowall-downgrade-reason")
-	t.Cleanup(func() { modeFile, downgradeReasonFile = oldMode, oldReason })
-	return modeFile, downgradeReasonFile
+	downgradeFile = filepath.Join(dir, "cargowall-downgrade")
+	t.Cleanup(func() { modeFile, downgradeFile = oldMode, oldDowngrade })
+	return modeFile, downgradeFile
+}
+
+// readDowngradeFile parses the protojson downgrade record a test run wrote.
+func readDowngradeFile(t *testing.T, path string) *cargowallv1pb.CargoWallDowngrade {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err, "downgrade record must be written")
+	var d cargowallv1pb.CargoWallDowngrade
+	require.NoError(t, protojson.Unmarshal(data, &d))
+	return &d
 }
 
 // TestLoadCIConfig_ApiFailureModes is the (error class × --api-failure-mode)
@@ -70,6 +83,17 @@ func TestLoadCIConfig_ApiFailureModes(t *testing.T) {
 		respOK         = 200
 	)
 
+	// Short aliases to keep the table readable.
+	const (
+		dtNone      = datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_UNSPECIFIED
+		dtAudit     = datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK
+		dtLockdown  = datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_LOCKDOWN
+		fcNone      = datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_UNSPECIFIED
+		fcTransport = datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_TRANSPORT
+		fcServer    = datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_SERVER
+		fcMalformed = datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_MALFORMED
+	)
+
 	tests := []struct {
 		name          string
 		resp          int
@@ -79,25 +103,29 @@ func TestLoadCIConfig_ApiFailureModes(t *testing.T) {
 		wantLockdown  bool
 		wantSentinel  bool
 		wantModeFile  string // "" = file must not exist
-		wantReason    string // required downgrade-reason substring; "" = file must not exist
+		// wantDowngrade is the expected downgrade record type;
+		// UNSPECIFIED = the downgrade file must not exist.
+		wantDowngrade datapb.CargoWallDowngradeType
+		// wantClass is the expected failure class on the downgrade record.
+		wantClass datapb.CargoWallFetchFailureClass
 	}{
-		{"server error, local keeps enforce", 500, "local", false, false, false, false, "enforce", ""},
-		{"server error, empty mode defaults to local", 500, "", false, false, false, false, "enforce", ""},
-		{"server error, audit downgrades", 500, "audit", false, true, false, false, "audit", "downgraded to audit mode"},
-		{"server error, fail locks down", 500, "fail", false, false, true, true, "", "policy lockdown"},
-		{"transport error, audit downgrades", respTransport, "audit", false, true, false, false, "audit", "downgraded to audit mode"},
-		{"transport error, fail locks down", respTransport, "fail", false, false, true, true, "", "policy lockdown"},
-		{"unloadable policy, audit downgrades", respUnloadable, "audit", false, true, false, false, "audit", "downgraded to audit mode"},
-		{"404 not onboarded, audit must not downgrade", 404, "audit", false, false, false, false, "", ""},
-		{"404 not onboarded, fail must not lock down", 404, "fail", false, false, false, false, "", ""},
-		{"401 unauthorized, fail must not lock down", 401, "fail", false, false, false, false, "", ""},
-		{"400 precondition, audit must not downgrade", 400, "audit", false, false, false, false, "", ""},
-		{"success ignores failure mode", respOK, "fail", true, true, false, false, "audit", ""},
+		{"server error, local keeps enforce", 500, "local", false, false, false, false, "enforce", dtNone, fcNone},
+		{"server error, empty mode defaults to local", 500, "", false, false, false, false, "enforce", dtNone, fcNone},
+		{"server error, audit downgrades", 500, "audit", false, true, false, false, "audit", dtAudit, fcServer},
+		{"server error, fail locks down", 500, "fail", false, false, true, true, "", dtLockdown, fcServer},
+		{"transport error, audit downgrades", respTransport, "audit", false, true, false, false, "audit", dtAudit, fcTransport},
+		{"transport error, fail locks down", respTransport, "fail", false, false, true, true, "", dtLockdown, fcTransport},
+		{"unloadable policy, audit downgrades", respUnloadable, "audit", false, true, false, false, "audit", dtAudit, fcMalformed},
+		{"404 not onboarded, audit must not downgrade", 404, "audit", false, false, false, false, "", dtNone, fcNone},
+		{"404 not onboarded, fail must not lock down", 404, "fail", false, false, false, false, "", dtNone, fcNone},
+		{"401 unauthorized, fail must not lock down", 401, "fail", false, false, false, false, "", dtNone, fcNone},
+		{"400 precondition, audit must not downgrade", 400, "audit", false, false, false, false, "", dtNone, fcNone},
+		{"success ignores failure mode", respOK, "fail", true, true, false, false, "audit", dtNone, fcNone},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			modePath, reasonPath := redirectStateFiles(t)
+			modePath, downgradePath := redirectStateFiles(t)
 			failurePath := filepath.Join(t.TempDir(), "cargowall-failed")
 
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -155,13 +183,20 @@ func TestLoadCIConfig_ApiFailureModes(t *testing.T) {
 				assert.Equal(t, tc.wantModeFile, string(data))
 			}
 
-			if tc.wantReason != "" {
-				data, rerr := os.ReadFile(reasonPath)
-				require.NoError(t, rerr, "posture change must record its reason for the summary push")
-				assert.Contains(t, string(data), tc.wantReason)
+			if tc.wantDowngrade != dtNone {
+				d := readDowngradeFile(t, downgradePath)
+				assert.Equal(t, tc.wantDowngrade, d.Type)
+				assert.Equal(t, tc.wantClass, d.FailureClass)
+				assert.NotEmpty(t, d.Detail, "human-readable detail must ride along")
+				if tc.resp > 0 {
+					require.NotNil(t, d.HttpStatus, "status must be recorded when a response was received")
+					assert.Equal(t, uint32(tc.resp), *d.HttpStatus)
+				} else if tc.resp == respTransport {
+					assert.Nil(t, d.HttpStatus, "no status on transport failures")
+				}
 			} else {
-				_, serr := os.Stat(reasonPath)
-				assert.True(t, os.IsNotExist(serr), "downgrade reason must only be written on a posture change")
+				_, serr := os.Stat(downgradePath)
+				assert.True(t, os.IsNotExist(serr), "downgrade record must only be written on a posture change")
 			}
 		})
 	}
@@ -210,7 +245,7 @@ func TestLoadCIConfig_LockdownSkipsLocalConfig(t *testing.T) {
 // sentinel/state files while the process is unwinding.
 func TestLoadCIConfig_CancelledContextSkipsPostureHandling(t *testing.T) {
 	setFastPolicyRetries(t)
-	modePath, reasonPath := redirectStateFiles(t)
+	modePath, downgradePath := redirectStateFiles(t)
 	failurePath := filepath.Join(t.TempDir(), "cargowall-failed")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -228,7 +263,7 @@ func TestLoadCIConfig_CancelledContextSkipsPostureHandling(t *testing.T) {
 	assert.False(t, loaded)
 	assert.False(t, cmd.policyLockdown, "cancellation must not enter lockdown")
 	assert.False(t, cmd.AuditMode)
-	for _, p := range []string{failurePath, reasonPath, modePath} {
+	for _, p := range []string{failurePath, downgradePath, modePath} {
 		_, err := os.Stat(p)
 		assert.True(t, os.IsNotExist(err), "no state file may be written while unwinding: %s", p)
 	}
@@ -295,14 +330,14 @@ func TestWriteSentinel_RefusesPrePlantedTargets(t *testing.T) {
 // sentinel is a fail-open, a stale failure sentinel a false abort) must all
 // be cleared at process entry, and absence must be a no-op.
 func TestRemoveStaleStateFiles(t *testing.T) {
-	modePath, reasonPath := redirectStateFiles(t)
+	modePath, downgradePath := redirectStateFiles(t)
 	dir := t.TempDir()
 	cmd := &StartCmd{
 		ReadyFile:   filepath.Join(dir, "ready"),
 		FailureFile: filepath.Join(dir, "failed"),
 	}
 
-	stale := []string{cmd.ReadyFile, cmd.FailureFile, modePath, reasonPath}
+	stale := []string{cmd.ReadyFile, cmd.FailureFile, modePath, downgradePath}
 	for _, p := range stale {
 		require.NoError(t, os.WriteFile(p, []byte("stale"), 0o644))
 	}

@@ -4,7 +4,9 @@ import "google/api/annotations.proto";
 import "google/protobuf/timestamp.proto";
 import "data/cargo_wall_action_type_enum.proto";
 import "data/cargo_wall_auto_allowed_type_enum.proto";
+import "data/cargo_wall_downgrade_type_enum.proto";
 import "data/cargo_wall_event_category_enum.proto";
+import "data/cargo_wall_fetch_failure_class_enum.proto";
 import "data/cargo_wall_job_status_enum.proto";
 import "data/cargo_wall_mode_enum.proto";
 import "cargo_wall.proto";
@@ -37,6 +39,19 @@ message GetCargoWallActionJobRunPolicyRequest {
   // "develop"/"dev" for unreleased builds). Absent when reported by an agent
   // predating version reporting.
   optional string version = 2;
+}
+
+// CargoWallDowngrade records how and why a run's effective posture was
+// downgraded from the requested one, so the dashboard can badge degraded
+// runs and count them by type/failure class without parsing prose.
+message CargoWallDowngrade {
+  CargoWallDowngradeType type = 1;
+  CargoWallFetchFailureClass failure_class = 2;
+  // HTTP status when a response was received (5xx/429); absent on
+  // transport failures.
+  optional uint32 http_status = 3;
+  // Human-readable detail for display only — never parsed.
+  string detail = 4;
 }
 
 message CargoWallActionJobSummary {
@@ -92,11 +107,11 @@ message CreateCargoWallActionJobRequest {
   // predating version reporting.
   optional string version = 10;
 
-  // Human-readable reason the run's effective mode was downgraded from the
-  // requested posture (e.g. to audit under --api-failure-mode=audit because
-  // the policy could not be retrieved). Absent when the run executed at its
+  // Present when the run's effective posture was downgraded from the
+  // requested one (e.g. to audit under --api-failure-mode=audit because the
+  // policy could not be retrieved). Absent when the run executed at its
   // requested posture.
-  optional string downgrade_reason = 11;
+  optional CargoWallDowngrade downgrade = 11;
 
   repeated CreateCargoWallActionStep steps = 100;
 }

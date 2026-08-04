@@ -79,8 +79,14 @@ jobs:
         run: |
           test "$(cat /tmp/cargowall-mode)" = "audit" \
             || { echo "::error::mode file must say audit, got: $(cat /tmp/cargowall-mode 2>&1)"; exit 1; }
-          grep -q "downgraded to audit mode" /tmp/cargowall-downgrade-reason \
-            || { echo "::error::downgrade reason missing"; exit 1; }
+          # Structured downgrade record: protojson CargoWallDowngrade with
+          # type + failure class + human-readable detail.
+          grep -q "CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK" /tmp/cargowall-downgrade \
+            || { echo "::error::downgrade record missing or wrong type"; cat /tmp/cargowall-downgrade 2>&1; exit 1; }
+          grep -q "CARGO_WALL_FETCH_FAILURE_CLASS_SERVER" /tmp/cargowall-downgrade \
+            || { echo "::error::downgrade record must carry the failure class"; exit 1; }
+          grep -q "downgraded to audit mode" /tmp/cargowall-downgrade \
+            || { echo "::error::downgrade record must carry the human-readable detail"; exit 1; }
           test ! -f /tmp/cargowall-failed \
             || { echo "::error::failure sentinel must not exist in audit mode"; exit 1; }
 

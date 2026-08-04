@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -382,4 +383,29 @@ func TestStartCmd_AfterApply_BothPresetsSet_OnlyGithubHostsAllowed(t *testing.T)
 	assert.True(t, cmd.AutoAllowGitHubHosts, "github-action wins, so GitHub hosts should be allowed")
 	assert.False(t, cmd.AutoAllowGitlabHosts, "GitLab hosts must NOT be allowed when GitHub preset wins")
 	assert.True(t, cmd.AutoAllowCloudMetadata, "shared plumbing should still be enabled")
+}
+
+// TestStartCmd_ApiFailureModeFlag exercises the kong wiring for the #96
+// flags: the enum rejects unknown postures, and the defaults keep the flag
+// inert when unset ("local" = pre-#96 behavior).
+func TestStartCmd_ApiFailureModeFlag(t *testing.T) {
+	parse := func(args ...string) (*CLI, error) {
+		cli := &CLI{}
+		parser, err := kong.New(cli, kong.Vars{"version": "test"})
+		require.NoError(t, err)
+		_, err = parser.Parse(args)
+		return cli, err
+	}
+
+	cli, err := parse("start", "--dns-upstream", "8.8.8.8:53")
+	require.NoError(t, err)
+	assert.Equal(t, "local", cli.Start.ApiFailureMode, "default must stay local so the flag is inert when unset")
+	assert.Equal(t, "/tmp/cargowall-failed", cli.Start.FailureFile)
+
+	cli, err = parse("start", "--dns-upstream", "8.8.8.8:53", "--api-failure-mode", "audit")
+	require.NoError(t, err)
+	assert.Equal(t, "audit", cli.Start.ApiFailureMode)
+
+	_, err = parse("start", "--dns-upstream", "8.8.8.8:53", "--api-failure-mode", "abort")
+	require.Error(t, err, "kong enum must reject unknown failure modes")
 }

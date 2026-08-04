@@ -18,9 +18,11 @@ package cmd
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -231,6 +233,49 @@ func TestFetchPolicyFromAPI_RetriesServerErrorThenSucceeds(t *testing.T) {
 	require.NotNil(t, policy)
 	assert.Equal(t, datapb.CargoWallMode_CARGO_WALL_MODE_ENFORCE, policy.Mode)
 	assert.Equal(t, int32(3), attempts.Load())
+}
+
+// TestFetchPolicyFromAPI_RetryAfterBeyondBudgetFailsFast: a Retry-After
+// longer than the remaining fetch budget must return the error immediately
+// instead of sleeping out the budget — the action's readiness window is
+// counting down, and the sleep could only reproduce the same error.
+func TestFetchPolicyFromAPI_RetryAfterBeyondBudgetFailsFast(t *testing.T) {
+	setFastPolicyRetries(t)
+	oldBudget := policyFetchTotalBudget
+	policyFetchTotalBudget = 500 * time.Millisecond
+	t.Cleanup(func() { policyFetchTotalBudget = oldBudget })
+
+	srv, attempts := countingServer(t, func(w http.ResponseWriter, _ int32) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+
+	start := time.Now()
+	_, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
+	elapsed := time.Since(start)
+
+	var fe *PolicyFetchError
+	require.ErrorAs(t, err, &fe)
+	assert.Equal(t, PolicyFetchServer, fe.Class)
+	assert.Equal(t, int32(1), attempts.Load(), "no further attempt fits inside the budget")
+	assert.Less(t, elapsed, 2*time.Second, "must not sleep out the Retry-After")
+}
+
+// TestFetchPolicyFromAPI_TruncatesHugeErrorBody: a non-OK body is quoted into
+// the error, which flows to logs and the failure sentinel — it must be
+// bounded, not embedded wholesale.
+func TestFetchPolicyFromAPI_TruncatesHugeErrorBody(t *testing.T) {
+	setFastPolicyRetries(t)
+	huge := strings.Repeat("x", 64*1024)
+	srv, _ := countingServer(t, func(w http.ResponseWriter, _ int32) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, huge)
+	})
+
+	_, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "(truncated)")
+	assert.Less(t, len(err.Error()), maxErrorBodyBytes+256, "error must carry at most the truncated snippet")
 }
 
 // TestParseRetryAfter covers the shared parser the fetch retry loop relies

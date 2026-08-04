@@ -34,6 +34,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/firewall"
 )
 
@@ -201,6 +202,119 @@ func TestLoadCIConfig_LockdownSkipsLocalConfig(t *testing.T) {
 			assert.Equal(t, tc.wantAction, cm.GetDefaultAction())
 		})
 	}
+}
+
+// TestLoadCIConfig_CancelledContextSkipsPostureHandling guards the SIGTERM
+// unwind path: a fetch killed by shutdown-signal cancellation must not be
+// misreported as an outage — no lockdown, no audit downgrade, and no
+// sentinel/state files while the process is unwinding.
+func TestLoadCIConfig_CancelledContextSkipsPostureHandling(t *testing.T) {
+	setFastPolicyRetries(t)
+	modePath, reasonPath := redirectStateFiles(t)
+	failurePath := filepath.Join(t.TempDir(), "cargowall-failed")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cmd := &StartCmd{
+		GithubAction:   true,
+		ApiUrl:         "http://127.0.0.1:1",
+		Token:          "test-token",
+		ApiFailureMode: "fail",
+		FailureFile:    failurePath,
+	}
+	loaded := loadCIConfig(ctx, cmd, config.NewConfigManager(), nil, "", quietLogger())
+
+	assert.False(t, loaded)
+	assert.False(t, cmd.policyLockdown, "cancellation must not enter lockdown")
+	assert.False(t, cmd.AuditMode)
+	for _, p := range []string{failurePath, reasonPath, modePath} {
+		_, err := os.Stat(p)
+		assert.True(t, os.IsNotExist(err), "no state file may be written while unwinding: %s", p)
+	}
+}
+
+// TestLoadCIConfig_AuditDowngradeSyncsAuditLogger: the DNS proxy consults the
+// audit logger (not cmd.AuditMode) at query time, so the downgrade branch
+// must re-sync it or DNS filtering keeps refusing while eBPF goes permissive.
+func TestLoadCIConfig_AuditDowngradeSyncsAuditLogger(t *testing.T) {
+	setFastPolicyRetries(t)
+	redirectStateFiles(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	auditLogger, err := events.NewAuditLogger(filepath.Join(t.TempDir(), "audit.ndjson"), false)
+	require.NoError(t, err)
+	t.Cleanup(func() { auditLogger.Close() })
+
+	cmd := &StartCmd{
+		GithubAction:   true,
+		ApiUrl:         srv.URL,
+		Token:          "test-token",
+		ApiFailureMode: "audit",
+		FailureFile:    filepath.Join(t.TempDir(), "cargowall-failed"),
+	}
+	loadCIConfig(context.Background(), cmd, config.NewConfigManager(), auditLogger, "", quietLogger())
+
+	assert.True(t, cmd.AuditMode)
+	assert.True(t, auditLogger.IsAuditMode(), "audit logger must be re-synced on downgrade")
+}
+
+// TestWriteSentinel_RefusesPrePlantedTargets: sentinels are written as root
+// to fixed paths in world-writable /tmp — O_EXCL must refuse both a
+// pre-planted plain file and a symlink instead of following it.
+func TestWriteSentinel_RefusesPrePlantedTargets(t *testing.T) {
+	dir := t.TempDir()
+
+	existing := filepath.Join(dir, "existing")
+	require.NoError(t, os.WriteFile(existing, []byte("old"), 0o644))
+	require.Error(t, writeSentinel(existing, []byte("new")))
+	data, err := os.ReadFile(existing)
+	require.NoError(t, err)
+	assert.Equal(t, "old", string(data), "pre-existing content must be untouched")
+
+	target := filepath.Join(dir, "target")
+	require.NoError(t, os.WriteFile(target, []byte("victim"), 0o644))
+	link := filepath.Join(dir, "link")
+	require.NoError(t, os.Symlink(target, link))
+	require.Error(t, writeSentinel(link, []byte("pwn")))
+	data, err = os.ReadFile(target)
+	require.NoError(t, err)
+	assert.Equal(t, "victim", string(data), "symlink target must not be overwritten")
+
+	fresh := filepath.Join(dir, "fresh")
+	require.NoError(t, writeSentinel(fresh, []byte("ok")))
+	data, err = os.ReadFile(fresh)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", string(data))
+}
+
+// TestRemoveStaleStateFiles: a persistent runner's leftovers (a stale ready
+// sentinel is a fail-open, a stale failure sentinel a false abort) must all
+// be cleared at process entry, and absence must be a no-op.
+func TestRemoveStaleStateFiles(t *testing.T) {
+	modePath, reasonPath := redirectStateFiles(t)
+	dir := t.TempDir()
+	cmd := &StartCmd{
+		ReadyFile:   filepath.Join(dir, "ready"),
+		FailureFile: filepath.Join(dir, "failed"),
+	}
+
+	stale := []string{cmd.ReadyFile, cmd.FailureFile, modePath, reasonPath}
+	for _, p := range stale {
+		require.NoError(t, os.WriteFile(p, []byte("stale"), 0o644))
+	}
+
+	removeStaleStateFiles(cmd, quietLogger())
+	for _, p := range stale {
+		_, err := os.Stat(p)
+		assert.True(t, os.IsNotExist(err), "stale state file must be removed: %s", p)
+	}
+
+	// Idempotent when nothing is stale.
+	removeStaleStateFiles(cmd, quietLogger())
 }
 
 // Regression test for the nil-ports security bug: when an existing IP's

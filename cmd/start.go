@@ -109,6 +109,26 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Arm signal handling BEFORE the first host mutation (Docker DNS config,
+	// iptables redirect below). A SIGTERM during startup — the action kills
+	// the process when its readiness wait times out — used to hit Go's
+	// default disposition: instant death, no defers, leaving the DNAT rules
+	// pointed at a dead proxy and daemon.json rewritten, i.e. a runner with
+	// broken DNS for the rest of the job. Now a startup-window signal cancels
+	// ctx; the startupInterrupted checkpoints below unwind through the
+	// deferred teardowns instead.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			logger.Info("Received shutdown signal", "signal", sig.String())
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	var dnsServer *dns.Server
 	var dockerBridgeIP string
 	// Tracks whether the iptables DNS redirect is actually in place, so the
@@ -315,6 +335,10 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		logger.Warn("Audit mode enabled but no audit log path specified (--audit-log)")
 	}
 
+	if startupInterrupted(ctx, logger, "config load") {
+		return nil
+	}
+
 	// Find network interface
 	ifname := cmd.Interface
 	if ifname == "" {
@@ -448,8 +472,8 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		existing := scanExistingForStartup(cmd, logger)
 
 		if cmd.PrepopulateDNSCache {
-			reverseDNSExistingConnections(existing, configMgr, cacheResolver, logger)
-			prePopulateDNSCache(configMgr, dnsServer, cacheResolver, logger)
+			reverseDNSExistingConnections(ctx, existing, configMgr, cacheResolver, logger)
+			prePopulateDNSCache(ctx, configMgr, dnsServer, cacheResolver, logger)
 		}
 
 		// Flush systemd-resolved's cache now that the redirect is installed
@@ -477,6 +501,10 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	// Re-scan just before attach so connections established during the DNS
 	// pre-population window survive.
 	rescanAndGateDelta(cmd, gatedExisting, configMgr, fw, auditLogger, logger)
+
+	if startupInterrupted(ctx, logger, "pre-attach") {
+		return nil
+	}
 
 	// Attach the TC egress program only AFTER the maps are fully programmed
 	// (default action + static allowlist + auto-allow infra + tracked hostnames +
@@ -544,6 +572,10 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		}
 	}
 
+	if startupInterrupted(ctx, logger, "pre-ready") {
+		return nil
+	}
+
 	// Write pidfile BEFORE the ready sentinel so a `wait-ready` then `stop
 	// --pidfile X` sequence never races.
 	//
@@ -568,7 +600,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		// load tells the action why. The process stays alive on purpose —
 		// the runner remains deny-all locked down (fail-closed) until the
 		// job tears it down, and shutdown runs the full teardown path
-		// (signal handler below is armed) instead of an abrupt exit.
+		// instead of an abrupt exit.
 		logger.Error("CargoWall running in POLICY LOCKDOWN (default-deny) — ready sentinel withheld, see failure sentinel",
 			"failure_file", cmd.FailureFile)
 	case hooks != nil && hooks.Ready != nil:
@@ -583,10 +615,9 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		logger.Info("CargoWall ready")
 	}
 
-	// Handle signals for graceful shutdown
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	<-c
+	// Block until the signal goroutine (armed at the top of startup) cancels
+	// the context on SIGINT/SIGTERM.
+	<-ctx.Done()
 
 	logger.Info("Shutting down TC firewall")
 
@@ -619,6 +650,19 @@ var modeFile = "/tmp/cargowall-mode"
 // redirect it; shared by the writer in handlePolicyFetchFailure and the
 // reader in pushToApi.
 var downgradeReasonFile = "/tmp/cargowall-downgrade-reason"
+
+// startupInterrupted reports whether a shutdown signal arrived while startup
+// was still in progress. Callers return nil and unwind through their defers
+// (DNS redirect, Docker DNS, sudoers) instead of continuing to bring the
+// firewall up — the action has already given up on this process, so finishing
+// startup would only delay handing back a clean runner.
+func startupInterrupted(ctx context.Context, logger *slog.Logger, phase string) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	logger.Info("Shutdown requested during startup — unwinding", "phase", phase)
+	return true
+}
 
 // removeStaleStateFiles clears the state files a previous run may have left
 // behind, warning (not failing) on anything but absence.
@@ -717,6 +761,12 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 			}
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				// The fetch died because a shutdown signal cancelled the
+				// context, not because of the network — don't misreport a
+				// posture change (or write sentinels) while unwinding.
+				return false
+			}
 			handlePolicyFetchFailure(cmd, auditLogger, err, logger)
 		}
 	}
@@ -1075,13 +1125,14 @@ func autoAllowCodeCargoAPI(apiURL string, configMgr *config.Manager, logger *slo
 
 // reverseDNSExistingConnections performs reverse DNS lookups for each
 // scanned existing-connection IP via the cache resolver, updating the config
-// manager's DNS mappings.
-func reverseDNSExistingConnections(conns existingConns, configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) {
+// manager's DNS mappings. Derives from ctx so a startup-window shutdown
+// signal drains the lookup loop promptly.
+func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) {
 	if len(conns) == 0 {
 		return
 	}
 
-	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	lookupCtx, lookupCancel := context.WithTimeout(ctx, 10*time.Second)
 	for ip := range conns {
 		rCtx, rCancel := context.WithTimeout(lookupCtx, 1*time.Second)
 		if names, err := cacheResolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
@@ -1099,11 +1150,11 @@ func reverseDNSExistingConnections(conns existingConns, configMgr *config.Manage
 // so that connections established before cargowall started are not incorrectly
 // blocked. Phase 1 queries systemd-resolved's stub for cached IPs and pushes
 // them into BPF maps. Phase 2 resolves through the DNS proxy for round-robin IPs.
-func prePopulateDNSCache(configMgr *config.Manager, dnsServer *dns.Server, cacheResolver *net.Resolver, logger *slog.Logger) {
+func prePopulateDNSCache(ctx context.Context, configMgr *config.Manager, dnsServer *dns.Server, cacheResolver *net.Resolver, logger *slog.Logger) {
 	// Phase 1: Query systemd-resolved's stub listener (127.0.0.53) to get
 	// the CACHED IPs — the exact IPs running processes are currently using.
 	// This is loopback traffic so the BPF TC filter on eth0 doesn't touch it.
-	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	cacheCtx, cacheCancel := context.WithTimeout(ctx, 10*time.Second)
 	for hostname := range configMgr.GetTrackedHostnames() {
 		lookupCtx, lookupCancel := context.WithTimeout(cacheCtx, 2*time.Second)
 		if ips, err := cacheResolver.LookupHost(lookupCtx, hostname); err == nil {
@@ -1130,7 +1181,7 @@ func prePopulateDNSCache(configMgr *config.Manager, dnsServer *dns.Server, cache
 			return d.DialContext(ctx, "udp", "127.0.0.1:53")
 		},
 	}
-	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	resolveCtx, resolveCancel := context.WithTimeout(ctx, 15*time.Second)
 	for hostname := range configMgr.GetTrackedHostnames() {
 		lookupCtx, lookupCancel := context.WithTimeout(resolveCtx, 3*time.Second)
 		if _, err := resolver.LookupHost(lookupCtx, hostname); err != nil {

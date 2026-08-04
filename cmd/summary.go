@@ -700,8 +700,10 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 }
 
 // readDowngrade returns the downgrade record written by `cargowall start`,
-// or nil when the run executed at its requested posture (file absent or
-// unreadable — best-effort by design).
+// or nil when the run executed at its requested posture (file absent).
+// Best-effort by design: a corrupt record is dropped rather than failing
+// the push, but leaves a trace for the day a downgrade mysteriously never
+// reaches the dashboard.
 func readDowngrade() *cargowallv1.CargoWallDowngrade {
 	data, err := os.ReadFile(downgradeFile)
 	if err != nil {
@@ -709,6 +711,7 @@ func readDowngrade() *cargowallv1.CargoWallDowngrade {
 	}
 	var d cargowallv1.CargoWallDowngrade
 	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(data, &d); err != nil {
+		slog.Debug("Downgrade record unreadable — omitting from push", "path", downgradeFile, "error", err)
 		return nil
 	}
 	return &d

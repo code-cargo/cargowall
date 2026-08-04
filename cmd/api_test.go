@@ -278,6 +278,24 @@ func TestFetchPolicyFromAPI_TruncatesHugeErrorBody(t *testing.T) {
 	assert.Less(t, len(err.Error()), maxErrorBodyBytes+256, "error must carry at most the truncated snippet")
 }
 
+// TestFetchPolicyFromAPI_RedirectChainCapped: the real API never redirects,
+// so a redirect loop (misconfigured api-url, captive portal) must be cut
+// short and classified as a transport failure instead of following the
+// default 10 hops per attempt.
+func TestFetchPolicyFromAPI_RedirectChainCapped(t *testing.T) {
+	setFastPolicyRetries(t)
+	srv, _ := countingServer(t, func(w http.ResponseWriter, _ int32) {
+		w.Header().Set("Location", "/api/cargowall/v1/action/policy")
+		w.WriteHeader(http.StatusFound)
+	})
+
+	_, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
+	var fe *PolicyFetchError
+	require.ErrorAs(t, err, &fe)
+	assert.Equal(t, PolicyFetchTransport, fe.Class)
+	assert.Contains(t, err.Error(), "stopped after 3 redirects")
+}
+
 // TestParseRetryAfter covers the shared parser the fetch retry loop relies
 // on: delta-seconds and future HTTP-date forms are honoured, past dates and
 // garbage defer to the computed backoff.

@@ -161,7 +161,18 @@ func fetchPolicyFromAPI(ctx context.Context, apiUrl, token, jobKey, version stri
 	ctx, cancel := context.WithTimeout(ctx, policyFetchTotalBudget)
 	defer cancel()
 
-	client := &http.Client{}
+	client := &http.Client{
+		// The real API never redirects; a misconfigured api-url bouncing
+		// through a redirect chain (proxies, captive portals) would burn
+		// per-attempt budget, so cap the chain short instead of following
+		// the default 10 hops.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("stopped after 3 redirects")
+			}
+			return nil
+		},
+	}
 	var lastErr *PolicyFetchError
 	for attempt := range policyFetchAttempts {
 		if attempt > 0 {

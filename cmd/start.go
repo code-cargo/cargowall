@@ -737,13 +737,17 @@ func writeSentinel(path string, content []byte) error {
 // writeModeFile records the effective enforcement mode for the action's
 // summary step. Written on both the API-success and fallback paths — a job
 // downgraded to audit by --api-failure-mode=audit must not keep reporting
-// "enforce" in the workflow summary and dashboard.
-func writeModeFile(auditMode bool) {
+// "enforce" in the workflow summary and dashboard. Best-effort: a failed
+// write only costs summary accuracy, but leave a trace for the day the
+// summary step reports a stale posture.
+func writeModeFile(auditMode bool, logger *slog.Logger) {
 	mode := "enforce"
 	if auditMode {
 		mode = "audit"
 	}
-	_ = writeSentinel(modeFile, []byte(mode))
+	if err := writeSentinel(modeFile, []byte(mode)); err != nil {
+		logger.Debug("Failed to write effective-mode file", "path", modeFile, "error", err)
+	}
 }
 
 // loadCIConfig handles CI config priority:
@@ -792,7 +796,7 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 				}
 				// Record the effective mode so the summary step picks up
 				// the SaaS-overridden value.
-				writeModeFile(cmd.AuditMode)
+				writeModeFile(cmd.AuditMode, logger)
 
 				apiPolicyLoaded = true
 				logger.Info("Policy loaded from CodeCargo API",
@@ -903,7 +907,7 @@ func handlePolicyFetchFailure(cmd *StartCmd, auditLogger *events.AuditLogger, fe
 	default: // "local"
 		logger.Warn("API policy fetch failed, falling back to env/file config", attrs...)
 	}
-	writeModeFile(cmd.AuditMode)
+	writeModeFile(cmd.AuditMode, logger)
 }
 
 // applyAutoAllowHelpers invokes each enabled auto-allow helper and updates

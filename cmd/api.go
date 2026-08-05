@@ -130,6 +130,11 @@ func classifyStatus(code int) PolicyFetchClass {
 // with the old single 30s attempt, a hung fetch timed the action out and the
 // fallback posture was unreachable in exactly the case it exists for. Vars so
 // tests can shrink the delays.
+//
+// policyFetchAttempts is a ceiling, not a guarantee: the total budget wins,
+// so under a full per-attempt hang only two attempts issue (5s + backoff +
+// 5s ≈ the budget). All three run in the common case retries exist for —
+// fast transient failures (5xx, connection refused).
 var (
 	policyFetchAttempts       = 3
 	policyFetchAttemptTimeout = 5 * time.Second
@@ -237,7 +242,8 @@ func fetchPolicyOnce(ctx context.Context, client *http.Client, endpoint, token s
 }
 
 // sleepBackoff waits before retry number `attempt` (1-based): exponential
-// backoff with full jitter, or the server's Retry-After when it's longer.
+// backoff with equal jitter (uniform in [delay, 2·delay), so retries never
+// stampede at zero), or the server's Retry-After when it's longer.
 // Returns the context error if the total budget expires first, or
 // immediately when the delay itself would outlive the budget — sleeping out
 // the rest of the budget only to return the same error wastes startup time
@@ -270,10 +276,28 @@ const (
 	maxErrorBodyBytes      = 1 << 10
 )
 
-// truncateForError renders a response body for inclusion in an error message.
+// truncateForError renders a response body for inclusion in an error
+// message. The content is attacker-influenced (api-url is env-configurable),
+// and the error flows into the failure sentinel and from there verbatim into
+// CI logs — so beyond bounding the length, control characters are stripped:
+// without newlines the body can never start a log line, which is what a
+// `::`-prefixed GitHub Actions workflow-command injection would need. The
+// truncation point is repaired to valid UTF-8 so no mangled rune leaks out.
 func truncateForError(body []byte) string {
+	truncated := false
 	if len(body) > maxErrorBodyBytes {
-		return string(body[:maxErrorBodyBytes]) + "... (truncated)"
+		body = body[:maxErrorBodyBytes]
+		truncated = true
 	}
-	return string(body)
+	s := strings.ToValidUTF8(string(body), "�")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+	if truncated {
+		s += "... (truncated)"
+	}
+	return s
 }

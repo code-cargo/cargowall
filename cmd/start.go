@@ -31,6 +31,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -54,8 +55,28 @@ import (
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
 
-func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
+func StartCargoWall(cmd *StartCmd, hooks *StartHooks) (err error) {
 	logger := cmd.Logger
+
+	// Any fatal startup error publishes the failure sentinel, not just the
+	// policy-lockdown path: without this, `wait-ready` burns its full timeout
+	// and reports a generic "timed out" for eBPF-unsupported, DNS-bind,
+	// TC-attach, and every other startup failure. Lockdown writes its own
+	// richer sentinel and returns nil, so the two writers never collide.
+	defer func() {
+		if err != nil && cmd.FailureFile != "" {
+			reason := "cargowall startup failed: " + err.Error() + "\n"
+			if werr := writeSentinel(cmd.FailureFile, []byte(reason)); werr != nil {
+				logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
+			}
+		}
+	}()
+
+	// Host mutations register their undo here as well as in a defer: the
+	// graceful path runs the defers, and the second-signal force path runs
+	// forceTeardown() — sync.OnceFunc guarantees each undo executes at most
+	// once whichever path gets there first.
+	teardowns := &teardownList{}
 
 	// Clear stale state files from a previous run FIRST, before any fallible
 	// startup work. These files are how the action observes this process:
@@ -79,11 +100,11 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		if err := writePidfile(cmd.Pidfile, os.Getpid()); err != nil {
 			return fmt.Errorf("write pidfile %s: %w (cargowall stop --pidfile will not work)", cmd.Pidfile, err)
 		}
-		defer func() {
+		defer teardowns.add(func() {
 			if err := os.Remove(cmd.Pidfile); err != nil && !errors.Is(err, os.ErrNotExist) {
 				logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", err)
 			}
-		}()
+		})()
 	}
 
 	// Check eBPF capabilities early to provide clear error messages
@@ -136,6 +157,14 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// The DNS proxy gets its OWN context, cancelled by defer-LIFO only after
+	// the teardown defers below it have run. Sharing the signal ctx killed
+	// the :53 listeners the instant shutdown began — leaving the DNAT rule
+	// pointing at a dead proxy for the ~10s worst case of logger + OTLP
+	// shutdown, which need working DNS for hostname endpoints.
+	dnsCtx, dnsCancel := context.WithCancel(context.Background())
+	defer dnsCancel()
+
 	// Arm signal handling BEFORE the first host mutation (Docker DNS config,
 	// iptables redirect below). A SIGTERM during startup — the action kills
 	// the process when its readiness wait times out — used to hit Go's
@@ -158,10 +187,24 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		// Some startup phases (Docker restart, iptables under a wedged
 		// xtables lock) are not context-aware, so the graceful unwind can
 		// lag the first signal by tens of seconds. A second signal means
-		// "stop waiting" — exit immediately, accepting that defers are
-		// skipped, rather than appearing unkillable to the caller.
+		// "stop waiting" — but a bare os.Exit here would skip every defer
+		// and leave sudoers locked down, the DNAT rule pointing at a dead
+		// proxy, and daemon.json rewritten, with no process left to undo
+		// any of it. Instead force the registered host-mutation undos
+		// (each runs at most once, shared with the defers) inside a bound,
+		// then exit.
 		sig := <-sigCh
-		logger.Error("Received second shutdown signal — forcing exit without teardown", "signal", sig.String())
+		logger.Error("Received second shutdown signal — forcing host-mutation teardown, then exiting", "signal", sig.String())
+		done := make(chan struct{})
+		go func() {
+			teardowns.forceAll()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			logger.Error("Forced teardown did not finish in time — exiting anyway")
+		}
 		os.Exit(1)
 	}()
 
@@ -207,17 +250,17 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 				if err := network.ConfigureDockerDNS(dockerBridgeIP, logger); err != nil {
 					logger.Warn("Failed to configure Docker DNS", "error", err)
 				}
-				defer func() {
+				defer teardowns.add(func() {
 					if err := network.RestoreDockerDNS(logger); err != nil {
 						logger.Warn("Failed to restore Docker DNS", "error", err)
 					}
-				}()
+				})()
 			}
 		}
 
 		dnsErrCh := make(chan error, 1)
 		go func() {
-			if err := dnsServer.Start(ctx); err != nil {
+			if err := dnsServer.Start(dnsCtx); err != nil {
 				dnsErrCh <- err
 			}
 		}()
@@ -244,11 +287,11 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 				logger.Warn("Failed to set up DNS redirect (iptables)", "error", err)
 			} else {
 				dnsRedirectActive = true
-				defer func() {
+				defer teardowns.add(func() {
 					if err := network.TeardownDNSRedirect(logger); err != nil {
 						logger.Warn("Failed to tear down DNS redirect", "error", err)
 					}
-				}()
+				})()
 			}
 		}
 	}
@@ -588,11 +631,11 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	// restored on every return path, not just signal-driven shutdown.
 	if cmd.SudoLockdown {
 		if enabled, cfg := enableSudoLockdown(cmd, logger); enabled {
-			defer func() {
+			defer teardowns.add(func() {
 				if err := lockdown.DisableSudoLockdown(cfg, logger); err != nil {
 					logger.Warn("Failed to disable sudo lockdown", "error", err)
 				}
-			}()
+			})()
 		}
 	}
 
@@ -709,6 +752,38 @@ func downgradeRecord(typ datapb.CargoWallDowngradeType, fe *PolicyFetchError, de
 		d.HttpStatus = &status
 	}
 	return d
+}
+
+// teardownList holds the undo operations for host mutations (iptables DNAT,
+// daemon.json, sudoers, pidfile). Each add() wraps the undo in sync.OnceFunc
+// and returns it for the caller's defer, while also recording it so the
+// second-signal force path can run every registered undo — whichever path
+// executes first wins, the other is a no-op.
+type teardownList struct {
+	mu  sync.Mutex
+	fns []func()
+}
+
+// add registers an undo and returns the once-wrapped func for the caller to
+// defer.
+func (t *teardownList) add(fn func()) func() {
+	wrapped := sync.OnceFunc(fn)
+	t.mu.Lock()
+	t.fns = append(t.fns, wrapped)
+	t.mu.Unlock()
+	return wrapped
+}
+
+// forceAll runs every registered undo in reverse registration order
+// (mirroring defer LIFO). Safe against concurrent defer execution: each undo
+// runs at most once across both paths.
+func (t *teardownList) forceAll() {
+	t.mu.Lock()
+	fns := slices.Clone(t.fns)
+	t.mu.Unlock()
+	for i := len(fns) - 1; i >= 0; i-- {
+		fns[i]()
+	}
 }
 
 // startupInterrupted reports whether a shutdown signal arrived while startup
@@ -906,10 +981,9 @@ func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLog
 	case "fail":
 		cmd.policyLockdown = true
 		configMgr.SetAuditMode(false)
-		// Re-sync the audit logger like the API-success and audit branches:
-		// the DNS proxy consults auditLogger.IsAuditMode at query time, so a
-		// run started with --audit-mode would otherwise keep permissive DNS
-		// query filtering inside the fail-closed posture.
+		// Re-sync the audit logger's event labeling (would_deny vs deny) —
+		// enforcement posture itself lives on configMgr, which the DNS proxy
+		// consults directly.
 		if auditLogger != nil {
 			auditLogger.SetAuditMode(false)
 		}

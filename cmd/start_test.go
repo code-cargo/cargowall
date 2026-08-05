@@ -1050,3 +1050,42 @@ func TestRescanAndGateDelta_FlagOffDoesNotScan(t *testing.T) {
 	fw := firewall.NewMockFirewall(t)
 	rescanAndGateDelta(&StartCmd{}, nil, config.NewConfigManager(), fw, nil, quietLogger())
 }
+
+// TestTeardownList_OnceAcrossPaths: each registered undo runs at most once
+// whether the graceful defer or the second-signal force path executes first —
+// the property that makes forceAll safe to race against defers.
+func TestTeardownList_OnceAcrossPaths(t *testing.T) {
+	td := &teardownList{}
+	var order []string
+	a := td.add(func() { order = append(order, "a") })
+	b := td.add(func() { order = append(order, "b") })
+
+	b()           // graceful defer ran b first
+	td.forceAll() // force path must run a but not re-run b
+	a()           // late defer for a is now a no-op
+
+	assert.Equal(t, []string{"b", "a"}, order)
+}
+
+// TestStartCargoWall_FatalErrorWritesFailureSentinel: ANY fatal startup error
+// must publish the failure sentinel so wait-ready fails fast with the reason
+// instead of burning its timeout. Driven through the earliest fatal path
+// (eBPF unsupported in the unprivileged test environment).
+func TestStartCargoWall_FatalErrorWritesFailureSentinel(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires an unprivileged environment so the eBPF capability check fails")
+	}
+	redirectStateFiles(t)
+	failurePath := filepath.Join(t.TempDir(), "cargowall-failed")
+
+	cmd := &StartCmd{
+		Logger:      quietLogger(),
+		FailureFile: failurePath,
+	}
+	err := StartCargoWall(cmd, nil)
+	require.Error(t, err)
+
+	data, rerr := os.ReadFile(failurePath)
+	require.NoError(t, rerr, "fatal startup error must write the failure sentinel")
+	assert.Contains(t, string(data), "cargowall startup failed")
+}

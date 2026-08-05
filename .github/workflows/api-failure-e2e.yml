@@ -25,6 +25,11 @@ on:
       - "cmd/**"
       - "pkg/config/**"
       - "pkg/dns/**"
+      # sigterm-unwind exists to prove pkg/network's DNAT teardown runs, and
+      # fail-lockdown asserts pkg/firewall enforcement — changes there must
+      # run the jobs written to cover them.
+      - "pkg/network/**"
+      - "pkg/firewall/**"
       - ".github/workflows/api-failure-e2e.yml"
   workflow_dispatch:
 
@@ -375,15 +380,20 @@ jobs:
           sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' \
             || { echo "::error::DNS redirect never appeared"; cat /tmp/cargowall.log; exit 1; }
 
+          # $CARGO is sudo's pid; the REAL cargowall pid is in the pidfile
+          # (written at process entry). Signal through sudo (it forwards),
+          # but assert liveness on the real process — asserting on sudo would
+          # only prove the wrapper exited.
+          CARGO_REAL=$(cat /tmp/cargowall.pid)
           sudo kill "$CARGO"
           # The unwind runs the registered defers; give it a bounded window.
           # (ps, not `kill -0`: the process is root-owned, so kill -0 from
           # this shell would report EPERM and fake an exit.)
           for i in $(seq 1 30); do
-            ps -p "$CARGO" > /dev/null 2>&1 || break
+            ps -p "$CARGO_REAL" > /dev/null 2>&1 || break
             sleep 1
           done
-          if ps -p "$CARGO" > /dev/null 2>&1; then
+          if ps -p "$CARGO_REAL" > /dev/null 2>&1; then
             echo "::error::cargowall did not exit after SIGTERM"; exit 1
           fi
 

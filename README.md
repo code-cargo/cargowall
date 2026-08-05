@@ -235,6 +235,8 @@ Useful flags (most available as env vars — see `cargowall start --help`):
 | `--dns-upstream` | `CARGOWALL_DNS_UPSTREAM` | Upstream DNS server (required) |
 | `--audit-mode` | `CARGOWALL_AUDIT_MODE` | Log only — don't block (recommended for rollout) |
 | `--audit-log` | `CARGOWALL_AUDIT_LOG` | NDJSON audit log path |
+| `--api-failure-mode` | `CARGOWALL_API_FAILURE_MODE` | Posture when the CodeCargo policy can't be retrieved: `local` (default — use env/file config), `audit` (downgrade to audit mode), `fail` (deny-all lockdown: ready sentinel withheld, failure sentinel written, process stays up). Only genuine retrieval failures trigger it — a 404/401/400 always falls back to local config |
+| `--failure-file` | `CARGOWALL_FAILURE_FILE` | Failure sentinel path — written with a human-readable reason when startup fails or `--api-failure-mode=fail` locks down; `cargowall wait-ready` fails fast on it |
 | `--pidfile` | `CARGOWALL_PIDFILE` | Write the cargowall pid here so `cargowall stop` can target it |
 | `--debug` | — | Verbose logging |
 | `--github-action` | `CARGOWALL_GITHUB_ACTION` | GitHub Actions preset (expands the orthogonal flags below) |

@@ -142,7 +142,10 @@ type StartCmd struct {
 	// withholds the ready sentinel) so the action's wait loop can fail the
 	// job fast with that reason instead of timing out — under
 	// --sudo-lockdown, process state is deliberately unobservable to the
-	// action, so the sentinel pair is the only signal it gets.
+	// action, so the sentinel pair is the only signal it gets. The sentinel
+	// signals the DECISION to lock down, published early for fail-fast;
+	// deny-all enforcement engages when the TC program attaches shortly
+	// after (see the write site in handlePolicyFetchFailure).
 	FailureFile string `help:"Path to write the failure sentinel file when --api-failure-mode=fail enters policy lockdown" default:"/tmp/cargowall-failed" env:"CARGOWALL_FAILURE_FILE"`
 }
 

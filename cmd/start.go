@@ -998,6 +998,16 @@ func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLog
 		}
 		logger.Error("API policy fetch failed — entering policy lockdown (--api-failure-mode=fail): default-deny with only CI infrastructure auto-allows, local config ignored, ready sentinel withheld", attrs...)
 		reason := fmt.Sprintf("cargowall entered policy lockdown (default-deny; CI infrastructure auto-allows remain active): policy fetch from %s failed (%s) and --api-failure-mode=fail: %v", cmd.ApiUrl, fe.Class, fetchErr)
+		// SEMANTICS: the sentinel is published at the DECISION, not at
+		// enforcement. TC attach happens well after config load (DNS
+		// pre-population and the Docker restart sit in between), so a
+		// consumer must read this file as "cargowall will lock down and
+		// will never become ready" — NOT "deny-all is already enforcing".
+		// Publishing after attach would be the stronger guarantee, but it
+		// would land past wait-ready's 30s default and defeat the
+		// fail-fast purpose; the intended flow (the watcher fails the job
+		// on this sentinel, so no build steps run) makes the pre-attach
+		// window harmless.
 		if cmd.FailureFile != "" {
 			if werr := writeSentinel(cmd.FailureFile, []byte(reason+"\n")); werr != nil {
 				logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)

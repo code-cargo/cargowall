@@ -129,12 +129,27 @@ func processAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
-// owns reports whether a state file was written by this run. An explicit
-// `pid=N` stamp is authoritative in both directions; otherwise fall back to
-// the mtime anchor.
+// owns reports whether a state file was written by this run, in three tiers:
+//
+//  1. A pidfile tells us this run's pid outright, so a stamp must match it.
+//  2. With no pidfile (the default), a stamp whose process is STILL ALIVE
+//     identifies a live run with no timing assumption — that is what keeps
+//     standalone `wait-ready` working when it runs long after startup, e.g.
+//     `start` in one CI step and `wait-ready` in a later one, or a human
+//     checking status. Guarding the ready file on the reader's clock alone
+//     would time out against a healthy, already-ready cargowall.
+//  3. A stamp whose process is gone falls through to the mtime anchor rather
+//     than being rejected outright: a fatal-error sentinel is written moments
+//     before the process exits, and a concurrent waiter must still see it.
+//     The anchor is what rejects a previous job's leftovers.
 func (r runIdentity) owns(data stateFile) bool {
-	if pid, ok := sentinelPid(data.data); ok && r.hasPid {
-		return pid == r.pid
+	if pid, ok := sentinelPid(data.data); ok {
+		if r.hasPid {
+			return pid == r.pid
+		}
+		if processAlive(pid) {
+			return true
+		}
 	}
 	return !data.modTime.Before(r.anchor.Add(-staleSlack))
 }

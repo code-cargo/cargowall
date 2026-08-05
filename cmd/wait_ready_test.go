@@ -253,3 +253,74 @@ func TestWaitForReady_PidfileAnchorRejectsPreviousRunSentinel(t *testing.T) {
 		t.Fatalf("previous run's sentinel must be ignored (timeout expected), got %v", err)
 	}
 }
+
+// Regression: `cargowall start` in one step and `wait-ready` in a later one,
+// with no --pidfile (the default). The ready sentinel carries a live pid, so
+// it must be trusted no matter how long ago it was written — guarding it on
+// the reader's own clock would time out against a healthy, already-ready
+// cargowall, which a bare os.Stat never did.
+func TestWaitForReady_StandaloneTrustsLiveStampedReadyFile(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+
+	// This test process stands in for a live cargowall run.
+	if err := os.WriteFile(readyPath, fmt.Appendf(nil, "pid=%d\n", os.Getpid()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(readyPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	// No pidfile configured — the default.
+	if err := waitForReady(readyPath, "", "", 500*time.Millisecond, 10*time.Millisecond); err != nil {
+		t.Fatalf("a live run's ready sentinel must be trusted regardless of age, got %v", err)
+	}
+}
+
+// The stale direction still holds without a pidfile: a ready file left by a
+// run whose process is gone must not unblock a build (that is the fail-open
+// case), so it falls through to the mtime anchor and is rejected.
+func TestWaitForReady_StandaloneRejectsDeadStampedReadyFile(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+
+	if err := os.WriteFile(readyPath, []byte("pid=4194304\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(readyPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	err := waitForReady(readyPath, "", "", 100*time.Millisecond, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("a dead run's leftover ready sentinel must not unblock the build")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected timeout, got %v", err)
+	}
+}
+
+// A fatal-error sentinel is written moments before the process exits, so by
+// the time a concurrent waiter reads it the stamped pid is already dead. It
+// must still be trusted via the mtime anchor — this is the fail-fast path
+// for every non-lockdown startup failure.
+func TestWaitForReady_TrustsFreshSentinelFromExitedProcess(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "never-appears")
+	failurePath := filepath.Join(dir, "failed")
+
+	// Dead pid, but written just now (i.e. after this wait began).
+	if err := os.WriteFile(failurePath, []byte("pid=4194304\ncargowall startup failed: TC attach\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := waitForReady(readyPath, failurePath, "", 2*time.Second, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected the failure sentinel to be reported")
+	}
+	if !strings.Contains(err.Error(), "TC attach") {
+		t.Fatalf("a freshly written sentinel must be trusted even though its writer exited, got %v", err)
+	}
+}

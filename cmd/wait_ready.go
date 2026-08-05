@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -107,11 +108,25 @@ func readRunIdentity(pidfilePath string, waitStart time.Time) runIdentity {
 	if err != nil || !fi.Mode().IsRegular() {
 		return id
 	}
-	id.anchor = fi.ModTime()
-	if pid, perr := readPidfile(pidfilePath); perr == nil {
-		id.pid, id.hasPid = pid, true
+	pid, perr := readPidfile(pidfilePath)
+	if perr != nil || !processAlive(pid) {
+		// A pidfile whose process is gone is a SIGKILLed run's leftover.
+		// Trusting it as an anchor would legitimize that same run's
+		// leftover sentinel (necessarily newer than its own pidfile) and
+		// abort a healthy job with the previous run's reason. Fall back to
+		// the reader's clock, which correctly rejects both.
+		return id
 	}
+	id.anchor = fi.ModTime()
+	id.pid, id.hasPid = pid, true
 	return id
+}
+
+// processAlive reports whether pid exists. EPERM counts as alive: cargowall
+// runs as root and wait-ready often does not.
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // owns reports whether a state file was written by this run. An explicit

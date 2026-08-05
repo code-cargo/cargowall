@@ -1065,7 +1065,39 @@ func TestTeardownList_OnceAcrossPaths(t *testing.T) {
 	td.forceAll() // force path must run a but not re-run b
 	a()           // late defer for a is now a no-op
 
-	assert.Equal(t, []string{"b", "a"}, order)
+	assert.Equal(t, []string{"b", "a"}, order, "each undo runs exactly once across both paths")
+}
+
+// forceAll must run undos in reverse registration order (defer LIFO), with
+// nothing pre-run — the previous test cannot show this, since its only
+// remaining undo is a single function.
+func TestTeardownList_ForceAllRunsInReverseOrder(t *testing.T) {
+	td := &teardownList{}
+	var order []string
+	for _, name := range []string{"first", "second", "third"} {
+		td.add(func() { order = append(order, name) })
+	}
+
+	td.forceAll()
+
+	assert.Equal(t, []string{"third", "second", "first"}, order)
+}
+
+// An undo registered WHILE forceAll is running (main is still mid-startup,
+// e.g. attaching TC or enabling sudo lockdown) must still execute — a
+// one-shot snapshot would skip it and strand that mutation.
+func TestTeardownList_ForceAllPicksUpLateRegistrations(t *testing.T) {
+	td := &teardownList{}
+	var order []string
+	td.add(func() {
+		order = append(order, "early")
+		// Simulates startup registering another undo after forceAll began.
+		td.add(func() { order = append(order, "late") })
+	})
+
+	td.forceAll()
+
+	assert.Equal(t, []string{"early", "late"}, order, "late registrations must not be skipped")
 }
 
 // TestStartCargoWall_FatalErrorWritesFailureSentinel: ANY fatal startup error

@@ -354,3 +354,23 @@ func TestFetchPolicyFromAPI_UnenumeratedClientErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestFetchPolicyFromAPI_OversizedResponseIsServerError: an oversized 200
+// must be reported as a server-side failure, not silently truncated into a
+// parse error — "malformed" is terminal (never retried) and would let a
+// healthy API drive a lockdown while blaming a response it never sent.
+func TestFetchPolicyFromAPI_OversizedResponseIsServerError(t *testing.T) {
+	setFastPolicyRetries(t)
+	// Valid JSON prefix, then padding past the cap.
+	huge := `{"mode": "CARGO_WALL_MODE_AUDIT", "pad": "` + strings.Repeat("x", maxPolicyResponseBytes) + `"}`
+	srv, attempts := countingServer(t, func(w http.ResponseWriter, _ int32) {
+		_, _ = io.WriteString(w, huge)
+	})
+
+	_, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
+	var fe *PolicyFetchError
+	require.ErrorAs(t, err, &fe)
+	assert.Equal(t, PolicyFetchServer, fe.Class, "an oversized response is a server-side anomaly, not malformed")
+	assert.Contains(t, err.Error(), "exceeds")
+	assert.Equal(t, int32(3), attempts.Load(), "server class is retried")
+}

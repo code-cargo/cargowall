@@ -61,23 +61,26 @@ import (
 // tens of seconds past wait-ready's timeout, defeating the fail-fast purpose
 // on exactly the paths it exists for.
 func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
-	err := startCargoWall(cmd, hooks)
+	teardowns := &teardownList{}
+	err := startCargoWall(cmd, hooks, teardowns)
+	// Written BEFORE the pidfile is removed: wait-ready anchors sentinel
+	// freshness to the pidfile, so publishing after its removal would make
+	// a genuine sentinel look like a previous run's leftover.
 	if err != nil && cmd.FailureFile != "" {
 		if werr := writeFailureSentinel(cmd.FailureFile, "cargowall startup failed: "+err.Error()); werr != nil {
 			cmd.Logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
 		}
 	}
+	if cmd.Pidfile != "" {
+		if rerr := os.Remove(cmd.Pidfile); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			cmd.Logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", rerr)
+		}
+	}
 	return err
 }
 
-func startCargoWall(cmd *StartCmd, hooks *StartHooks) error {
+func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) error {
 	logger := cmd.Logger
-
-	// Host mutations register their undo here as well as in a defer: the
-	// graceful path runs the defers, and the second-signal force path runs
-	// forceTeardown() — sync.OnceFunc guarantees each undo executes at most
-	// once whichever path gets there first.
-	teardowns := &teardownList{}
 
 	// Clear stale state files from a previous run FIRST, before any fallible
 	// startup work. These files are how the action observes this process:
@@ -101,11 +104,15 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		if err := writePidfile(cmd.Pidfile, os.Getpid()); err != nil {
 			return fmt.Errorf("write pidfile %s: %w (cargowall stop --pidfile will not work)", cmd.Pidfile, err)
 		}
-		defer teardowns.add(func() {
+		// NOT deferred here: the pidfile must outlive the inner function so
+		// the fatal-path sentinel (written by the caller, after this
+		// returns) can still be anchored to it by wait-ready. The caller
+		// removes it; the force path has it via teardowns.
+		teardowns.add(func() {
 			if err := os.Remove(cmd.Pidfile); err != nil && !errors.Is(err, os.ErrNotExist) {
 				logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", err)
 			}
-		})()
+		})
 	}
 
 	// Check eBPF capabilities early to provide clear error messages
@@ -208,6 +215,11 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		}()
 		select {
 		case <-done:
+		case sig := <-sigCh:
+			// Keep listening while the forced teardown runs: a caller that
+			// signals again must not find the process unresponsive, which
+			// is the very complaint the force path answers.
+			logger.Error("Received third shutdown signal — abandoning teardown and exiting now", "signal", sig.String())
 		case <-time.After(15 * time.Second):
 			logger.Error("Forced teardown did not finish in time — exiting anyway")
 		}
@@ -253,14 +265,18 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 				// even on ConfigureDockerDNS failure — best-effort matches
 				// the previous shutdown semantic and guards against partial
 				// writes to daemon.json that the user expects rolled back.
-				if err := network.ConfigureDockerDNS(dockerBridgeIP, logger); err != nil {
-					logger.Warn("Failed to configure Docker DNS", "error", err)
-				}
+				// Registered BEFORE the mutation: a signal landing inside
+				// ConfigureDockerDNS must not leave daemon.json rewritten
+				// with no undo registered. RestoreDockerDNS is best-effort
+				// and safe when the write never happened.
 				defer teardowns.add(func() {
 					if err := network.RestoreDockerDNS(logger); err != nil {
 						logger.Warn("Failed to restore Docker DNS", "error", err)
 					}
 				})()
+				if err := network.ConfigureDockerDNS(dockerBridgeIP, logger); err != nil {
+					logger.Warn("Failed to configure Docker DNS", "error", err)
+				}
 			}
 		}
 
@@ -289,15 +305,20 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		// Teardown is deferred immediately so the rule never outlives the
 		// process — including across error-return paths below.
 		if cmd.DNSRedirectIptables {
+			// Registered BEFORE the mutation: iptables -A can partially
+			// apply, and a signal landing mid-install must still leave a
+			// registered undo. Deleting rules that were never added is a
+			// logged no-op.
+			teardownRedirect := teardowns.add(func() {
+				if err := network.TeardownDNSRedirect(logger); err != nil {
+					logger.Warn("Failed to tear down DNS redirect", "error", err)
+				}
+			})
+			defer teardownRedirect()
 			if err := network.SetupDNSRedirect(logger); err != nil {
 				logger.Warn("Failed to set up DNS redirect (iptables)", "error", err)
 			} else {
 				dnsRedirectActive = true
-				defer teardowns.add(func() {
-					if err := network.TeardownDNSRedirect(logger); err != nil {
-						logger.Warn("Failed to tear down DNS redirect", "error", err)
-					}
-				})()
 			}
 		}
 	}
@@ -645,13 +666,18 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	// Disable is deferred immediately on success so /etc/sudoers gets
 	// restored on every return path, not just signal-driven shutdown.
 	if cmd.SudoLockdown {
-		if enabled, cfg := enableSudoLockdown(cmd, logger); enabled {
-			defer teardowns.add(func() {
-				if err := lockdown.DisableSudoLockdown(cfg, logger); err != nil {
-					logger.Warn("Failed to disable sudo lockdown", "error", err)
-				}
-			})()
-		}
+		// Registered BEFORE the mutation, and against the config the
+		// enable path will use: enableSudoLockdown rewrites /etc/sudoers.d
+		// before it returns, so registering afterwards leaves a window
+		// where a force-exit strands the runner with restricted sudoers —
+		// the teardown whose loss is hardest to recover from by hand.
+		cfg := sudoLockdownConfig(cmd, logger)
+		defer teardowns.add(func() {
+			if err := lockdown.DisableSudoLockdown(cfg, logger); err != nil {
+				logger.Debug("Sudo lockdown teardown reported an error (may not have been enabled)", "error", err)
+			}
+		})()
+		enableSudoLockdown(cfg, logger)
 	}
 
 	// Restart Docker daemon so containers pick up the DNS configuration
@@ -804,12 +830,24 @@ func (t *teardownList) add(fn func()) func() {
 // forceAll runs every registered undo in reverse registration order
 // (mirroring defer LIFO). Safe against concurrent defer execution: each undo
 // runs at most once across both paths.
+//
+// It loops until the list stops growing rather than iterating one snapshot:
+// startup registers undos as it goes, so a snapshot taken while main is
+// mid-mutation would permanently skip whatever registers next — leaving the
+// runner with the very state (restricted sudoers, orphaned clsact filter)
+// this path exists to undo.
 func (t *teardownList) forceAll() {
-	t.mu.Lock()
-	fns := slices.Clone(t.fns)
-	t.mu.Unlock()
-	for i := len(fns) - 1; i >= 0; i-- {
-		fns[i]()
+	for done := 0; ; {
+		t.mu.Lock()
+		fns := slices.Clone(t.fns)
+		t.mu.Unlock()
+		if len(fns) == done {
+			return
+		}
+		for i := len(fns) - 1; i >= done; i-- {
+			fns[i]()
+		}
+		done = len(fns)
 	}
 }
 
@@ -1520,17 +1558,23 @@ func parseSudoAllowCommands(input string, logger *slog.Logger) []string {
 // enableSudoLockdown parses allowed commands from cmd.SudoAllowCommands,
 // builds a lockdown config, and enables sudo lockdown. Returns whether
 // lockdown was successfully enabled and the config (for cleanup).
-func enableSudoLockdown(cmd *StartCmd, logger *slog.Logger) (bool, *lockdown.SudoLockdownConfig) {
-	cfg := &lockdown.SudoLockdownConfig{
+func sudoLockdownConfig(cmd *StartCmd, logger *slog.Logger) *lockdown.SudoLockdownConfig {
+	return &lockdown.SudoLockdownConfig{
 		AllowCommands: parseSudoAllowCommands(cmd.SudoAllowCommands, logger),
 		Username:      "", // Auto-detect
 	}
+}
+
+// enableSudoLockdown applies the lockdown. The caller registers the undo
+// against the same config BEFORE calling this, so a signal landing mid-write
+// can never strand the runner with a restricted sudoers file.
+func enableSudoLockdown(cfg *lockdown.SudoLockdownConfig, logger *slog.Logger) bool {
 	if err := lockdown.EnableSudoLockdown(cfg, logger); err != nil {
 		logger.Warn("Failed to enable sudo lockdown", "error", err)
 		// Continue without lockdown - it's a hardening feature, not critical
-		return false, cfg
+		return false
 	}
-	return true, cfg
+	return true
 }
 
 // detectSystemdResolvedUpstreams reads /run/systemd/resolve/resolv.conf

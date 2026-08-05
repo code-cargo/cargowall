@@ -13,6 +13,9 @@ name: api-failure-e2e
 #   not-onboarded    404 + fail → must NOT lock down; env/file config runs
 #   sigterm-unwind   SIGTERM while the fetch hangs mid-startup → defers run:
 #                    no leaked DNAT rules, no misreported sentinels, DNS works
+#   double-sigterm-  a SECOND SIGTERM during a slow graceful unwind → the
+#   force            force path restores every host mutation (sudoers, DNAT,
+#                    daemon.json, TC filter) before exiting
 #
 # NOTE: like otel-e2e, these jobs must NOT start with
 # code-cargo/cargowall-action — each job runs its own cargowall instance and
@@ -30,6 +33,9 @@ on:
       # run the jobs written to cover them.
       - "pkg/network/**"
       - "pkg/firewall/**"
+      # the legacy-clsact teardown these jobs protect lives in pkg/tc
+      - "pkg/tc/**"
+      - "bpf/**"
       - ".github/workflows/api-failure-e2e.yml"
   workflow_dispatch:
 
@@ -452,4 +458,118 @@ jobs:
           path: |
             /tmp/cargowall.log
             /tmp/mockapi.log
+          if-no-files-found: ignore
+
+  double-sigterm-force:
+    name: Second SIGTERM force-tears down host mutations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
+      # Blackholed OTLP endpoint: the exporter's 5s shutdown (plus the
+      # logger's) stretches the GRACEFUL unwind, guaranteeing the process is
+      # still alive when the second signal lands so the force path is the
+      # one that actually restores host state.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://10.255.255.1:4318
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build cargowall
+        run: make build
+
+      - name: Write firewall policy
+        run: |
+          sudo mkdir -p /etc/cargowall
+          sudo tee /etc/cargowall/config.json > /dev/null <<'EOF'
+          {
+            "defaultAction": "deny",
+            "rules": [
+              {"type":"cidr","value":"8.8.8.8/32","ports":[{"port":53,"protocol":"udp"}],"action":"allow"}
+            ]
+          }
+          EOF
+
+      - name: Start cargowall with sudo lockdown (audit mode keeps the runner usable)
+        run: |
+          sudo -E ./bin/cargowall start \
+            --github-action \
+            --config /etc/cargowall/config.json \
+            --dns-upstream 8.8.8.8:53 \
+            --sudo-lockdown \
+            --audit-mode \
+            --pidfile /tmp/cargowall.pid > /tmp/cargowall.log 2>&1 &
+          ./bin/cargowall wait-ready --timeout 120s
+
+      - name: Assert the host mutations are in place
+        run: |
+          sudo test -f /etc/sudoers.d/zz-cargowall-lockdown \
+            || { echo "::error::sudo lockdown was not applied — nothing to force-restore"; exit 1; }
+          sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' \
+            || { echo "::error::DNS redirect not installed"; exit 1; }
+          sudo test -f /etc/docker/daemon.json.cargowall.bak \
+            || echo "note: docker DNS interception inactive on this runner"
+
+      - name: Generate traffic so the OTLP exporter has records to flush
+        run: |
+          # Queued records make the blackholed exporter's Shutdown block for
+          # its full 5s bound, which is the window the second signal needs.
+          curl -sS --max-time 15 -o /dev/null https://example.com || true
+          curl -sS --max-time 15 -o /dev/null https://github.com || true
+
+      - name: Send two SIGTERMs, forcing the second-signal teardown path
+        run: |
+          CARGO_REAL=$(cat /tmp/cargowall.pid)
+          sudo kill "$CARGO_REAL"
+          # Land the second signal while the graceful unwind is still inside
+          # the blackholed OTLP shutdown. The 1s gap is deliberate: SIGTERM
+          # is a standard signal, so a second one sent before the first is
+          # delivered would be coalesced away by the kernel and never reach
+          # the handler.
+          sleep 1
+          sudo kill "$CARGO_REAL" 2>/dev/null || echo "process already gone — force path may not have been exercised"
+          for i in $(seq 1 60); do
+            ps -p "$CARGO_REAL" > /dev/null 2>&1 || break
+            sleep 1
+          done
+          if ps -p "$CARGO_REAL" > /dev/null 2>&1; then
+            echo "::error::cargowall did not exit after the second SIGTERM"; exit 1
+          fi
+          grep -q "second shutdown signal" /tmp/cargowall.log \
+            || { echo "::error::the force-teardown path did not run — this job proves nothing without it"; tail -20 /tmp/cargowall.log; exit 1; }
+
+      - name: Assert every host mutation was undone by the force path
+        run: |
+          # Sudoers is the highest-stakes undo: a runner left locked down
+          # cannot be repaired by the job itself.
+          if sudo test -f /etc/sudoers.d/zz-cargowall-lockdown; then
+            echo "::error::sudoers still locked down after forced teardown"; exit 1
+          fi
+          sudo -n true \
+            || { echo "::error::sudo is still restricted after forced teardown"; exit 1; }
+          if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
+            echo "::error::DNAT rules leaked through the forced teardown"; exit 1
+          fi
+          if sudo test -f /etc/docker/daemon.json.cargowall.bak; then
+            echo "::error::daemon.json backup left behind — Docker DNS not restored"; exit 1
+          fi
+          # The TC program must be gone too (the legacy-clsact filter is the
+          # one that outlives the process if its undo is skipped).
+          IFACE=$(ip route show default | awk '{print $5; exit}')
+          if sudo tc filter show dev "$IFACE" egress 2>/dev/null | grep -q bpf; then
+            echo "::error::TC egress filter still attached after forced teardown"; exit 1
+          fi
+          getent hosts example.com > /dev/null \
+            || { echo "::error::DNS broken after forced teardown"; exit 1; }
+          echo "all host mutations undone by the second-signal force path"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: double-sigterm-force-logs
+          path: /tmp/cargowall.log
           if-no-files-found: ignore

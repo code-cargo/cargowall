@@ -17,8 +17,10 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -150,26 +152,27 @@ func TestWaitForReady_ReadyWinsOverFailure(t *testing.T) {
 	}
 }
 
-// With a pidfile anchor, a sentinel written before wait-ready started but
-// after THIS run's pidfile is trusted — the launcher may do arbitrary work
-// between `cargowall start` and `wait-ready`, and the reader's own clock
-// must not discard a genuine failure.
+// With a LIVE pidfile anchor, a sentinel written before wait-ready started
+// is trusted when its pid stamp matches — the launcher may do arbitrary work
+// between `cargowall start` and `wait-ready`, and the reader's own clock must
+// not discard a genuine failure.
 func TestWaitForReady_PidfileAnchorTrustsOlderSentinel(t *testing.T) {
 	dir := t.TempDir()
 	readyPath := filepath.Join(dir, "ready")
 	pidPath := filepath.Join(dir, "pid")
 	failurePath := filepath.Join(dir, "failed")
 
-	// Simulate a run that started 10 minutes ago: pidfile at t-10m, failure
-	// sentinel at t-5m — both long before wait-ready is invoked.
-	if err := os.WriteFile(pidPath, []byte("1234"), 0o644); err != nil {
+	// This test process stands in for a live cargowall run.
+	livePid := os.Getpid()
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(livePid)+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	pidTime := time.Now().Add(-10 * time.Minute)
 	if err := os.Chtimes(pidPath, pidTime, pidTime); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(failurePath, []byte("policy lockdown reason\n"), 0o644); err != nil {
+	sentinel := fmt.Sprintf("pid=%d\npolicy lockdown reason\n", livePid)
+	if err := os.WriteFile(failurePath, []byte(sentinel), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	sentinelTime := time.Now().Add(-5 * time.Minute)
@@ -182,7 +185,42 @@ func TestWaitForReady_PidfileAnchorTrustsOlderSentinel(t *testing.T) {
 		t.Fatal("expected failure-sentinel error")
 	}
 	if !strings.Contains(err.Error(), "policy lockdown reason") {
-		t.Fatalf("sentinel newer than the pidfile must be trusted, got %v", err)
+		t.Fatalf("a live run's own sentinel must be trusted, got %v", err)
+	}
+}
+
+// A DEAD pidfile is a SIGKILLed run's leftover: trusting it as an anchor
+// would legitimize that same run's leftover sentinel (necessarily newer than
+// its own pidfile) and abort a healthy job with the previous run's reason.
+func TestWaitForReady_DeadPidfileDoesNotLegitimizeStaleSentinel(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+	pidPath := filepath.Join(dir, "pid")
+	failurePath := filepath.Join(dir, "failed")
+
+	// A pid that cannot be running (max_pid+1 style sentinel value).
+	if err := os.WriteFile(pidPath, []byte("4194304\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pidTime := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(pidPath, pidTime, pidTime); err != nil {
+		t.Fatal(err)
+	}
+	// The dead run's sentinel: newer than its pidfile, older than this wait.
+	if err := os.WriteFile(failurePath, []byte("pid=4194304\nprevious run's reason\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sentinelTime := time.Now().Add(-59 * time.Minute)
+	if err := os.Chtimes(failurePath, sentinelTime, sentinelTime); err != nil {
+		t.Fatal(err)
+	}
+
+	err := waitForReady(readyPath, failurePath, pidPath, 100*time.Millisecond, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("a dead run's pidfile+sentinel pair must be rejected, got %v", err)
 	}
 }
 
@@ -194,15 +232,16 @@ func TestWaitForReady_PidfileAnchorRejectsPreviousRunSentinel(t *testing.T) {
 	pidPath := filepath.Join(dir, "pid")
 	failurePath := filepath.Join(dir, "failed")
 
-	if err := os.WriteFile(failurePath, []byte("stale reason from last job\n"), 0o644); err != nil {
+	// A leftover sentinel stamped with a DIFFERENT pid than this run's.
+	if err := os.WriteFile(failurePath, []byte("pid=4194304\nstale reason from last job\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	old := time.Now().Add(-1 * time.Hour)
 	if err := os.Chtimes(failurePath, old, old); err != nil {
 		t.Fatal(err)
 	}
-	// This run's pidfile is fresh.
-	if err := os.WriteFile(pidPath, []byte("1234"), 0o644); err != nil {
+	// This run's pidfile is live and fresh.
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

@@ -562,9 +562,19 @@ jobs:
           if sudo test -f /etc/docker/daemon.json.cargowall.bak; then
             echo "::error::daemon.json backup left behind — Docker DNS not restored"; exit 1
           fi
+          # Probe by cargowall's own program name, not a bare "bpf" match:
+          # runners carry foreign bpf filters, and on TCX kernels (6.6+, which
+          # includes ubuntu-latest) `tc filter show` does not display cargowall
+          # at all — only bpftool does. Checking both covers the TCX and the
+          # legacy-clsact attach paths.
           IFACE=$(ip route show default | awk '{print $5; exit}')
-          if sudo tc filter show dev "$IFACE" egress 2>/dev/null | grep -q bpf; then
-            echo "::error::TC egress filter still attached after forced teardown"; exit 1
+          echo "--- bpftool net show ---"; sudo bpftool net show 2>&1 | head -20 || true
+          echo "--- tc filter show dev $IFACE egress ---"; sudo tc filter show dev "$IFACE" egress 2>&1 | head -10 || true
+          if sudo bpftool net show 2>/dev/null | grep -q tc_egress; then
+            echo "::error::cargowall TC program still attached after forced teardown"; exit 1
+          fi
+          if sudo tc filter show dev "$IFACE" egress 2>/dev/null | grep -q tc_egress; then
+            echo "::error::cargowall clsact filter still attached after forced teardown"; exit 1
           fi
           getent hosts example.com > /dev/null \
             || { echo "::error::DNS broken after forced teardown"; exit 1; }

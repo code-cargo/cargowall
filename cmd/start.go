@@ -590,7 +590,16 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to attach TC egress: %w", err)
 	}
-	defer egressLink.Close()
+	// Registered with teardowns, not a bare defer: on TCX kernels the link
+	// dies with the process fd anyway, but the legacy clsact fallback
+	// (kernels <6.6) installs a netlink cls_bpf filter that OUTLIVES the
+	// process — a force-exit that skipped this would leave the filter
+	// attached and enforcing with nothing left to remove it.
+	defer teardowns.add(func() {
+		if cerr := egressLink.Close(); cerr != nil {
+			logger.Warn("Failed to detach TC egress", "error", cerr)
+		}
+	})()
 
 	// Log appropriate config source
 	switch {

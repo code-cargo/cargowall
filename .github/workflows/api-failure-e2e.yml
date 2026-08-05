@@ -45,6 +45,10 @@ jobs:
     name: Retrieval failure downgrades to audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Shared by both binaries: `start` binds it via kong env, and
+    # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -154,6 +158,10 @@ jobs:
     name: Retrieval failure locks down under fail
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Shared by both binaries: `start` binds it via kong env, and
+    # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -251,6 +259,10 @@ jobs:
     name: 404 must not change posture even under fail
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Shared by both binaries: `start` binds it via kong env, and
+    # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -336,6 +348,10 @@ jobs:
     name: SIGTERM mid-fetch unwinds host mutations
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Shared by both binaries: `start` binds it via kong env, and
+    # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 

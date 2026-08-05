@@ -122,11 +122,40 @@ func readRunIdentity(pidfilePath string, waitStart time.Time) runIdentity {
 	return id
 }
 
-// processAlive reports whether pid exists. EPERM counts as alive: cargowall
-// runs as root and wait-ready often does not.
+// processAlive reports whether pid is a live CARGOWALL process. Liveness
+// alone would trust a recycled pid now held by something unrelated — and on
+// the ready-file path that means unblocking a build with no firewall
+// attached, so the check verifies identity too and the fail-open direction
+// becomes unreachable rather than merely improbable.
+//
+// EPERM counts as alive: cargowall runs as root and wait-ready often does
+// not. /proc/<pid>/comm is world-readable, so identity is checkable either
+// way.
 func processAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	if err := syscall.Kill(pid, 0); err != nil && !errors.Is(err, syscall.EPERM) {
+		return false
+	}
+	comm, err := procComm(pid)
+	if err != nil {
+		return false
+	}
+	// wait-ready IS the cargowall binary, so its own comm is the expected
+	// value. That keeps this correct for a renamed or vendored binary, and
+	// under `go test`, where both sides are the test binary.
+	if self, serr := procComm(os.Getpid()); serr == nil && comm == self {
+		return true
+	}
+	return comm == "cargowall"
+}
+
+// procComm returns a process's executable name (comm), which the kernel
+// truncates to 15 characters.
+func procComm(pid int) (string, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 // owns reports whether a state file was written by this run, in three tiers:

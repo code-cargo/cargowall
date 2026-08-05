@@ -19,11 +19,14 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestWaitForReady_AlreadyExists(t *testing.T) {
@@ -322,5 +325,38 @@ func TestWaitForReady_TrustsFreshSentinelFromExitedProcess(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "TC attach") {
 		t.Fatalf("a freshly written sentinel must be trusted even though its writer exited, got %v", err)
+	}
+}
+
+// Tier 2 must verify IDENTITY, not just liveness: a leftover ready file
+// whose pid has been recycled by an unrelated process must not unblock the
+// build. Without the /proc/<pid>/comm check this is a fail-open — a build
+// running with no firewall attached.
+func TestWaitForReady_RecycledPidOnForeignProcessNotTrusted(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+
+	// A live process that is definitively not cargowall.
+	foreign := exec.Command("sleep", "30")
+	require.NoError(t, foreign.Start())
+	t.Cleanup(func() {
+		_ = foreign.Process.Kill()
+		_, _ = foreign.Process.Wait()
+	})
+
+	if err := os.WriteFile(readyPath, fmt.Appendf(nil, "pid=%d\n", foreign.Process.Pid), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(readyPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	err := waitForReady(readyPath, "", "", 100*time.Millisecond, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("a recycled pid held by a foreign process must not be trusted")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected timeout, got %v", err)
 	}
 }

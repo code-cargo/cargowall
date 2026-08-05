@@ -7,6 +7,11 @@ name: api-failure-e2e
 # Jobs (each on a fresh VM so scenarios can't contaminate each other):
 #   audit-downgrade  retrieval failure + audit → firewall up, mode file says
 #                    audit, downgrade reason recorded, traffic not blocked
+#   hung-downgrade   hanging API (accepts, never responds) + audit → the
+#                    per-attempt deadline and total fetch budget cut the
+#                    hang short and the run reaches ready, downgraded with
+#                    class TRANSPORT, inside the action's 30s readiness
+#                    window
 #   fail-lockdown    retrieval failure + fail → process stays ALIVE in
 #                    deny-all, failure sentinel written, ready withheld,
 #                    wait-ready fails fast with the reason, clean teardown
@@ -161,6 +166,110 @@ jobs:
           path: |
             /tmp/cargowall.log
             /tmp/cargowall-noauditlog.log
+            /tmp/cargowall.ndjson
+            /tmp/mockapi.log
+          if-no-files-found: ignore
+
+  hung-downgrade:
+    name: Hung fetch downgrades to audit inside the readiness window
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Shared by both binaries: `start` binds it via kong env, and
+    # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build cargowall
+        run: make build
+
+      - name: Start hanging policy API (accepts, never responds)
+        run: |
+          nohup python3 -c '
+          import socket
+          conns = []
+          s = socket.socket()
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(("127.0.0.1", 18080)); s.listen(16)
+          while True:
+              c, _ = s.accept(); conns.append(c)
+          ' > /tmp/mockapi.log 2>&1 &
+          # Probe with a bare TCP connect (curl would hang on this server).
+          # The probe is what keeps the job honest: an unbound port would
+          # fail every attempt fast with ECONNREFUSED — same TRANSPORT
+          # class, same audit downgrade — and the deadline → budget
+          # truncation path this job exists to time would never run. The
+          # deadline-exceeded grep below backstops this.
+          for i in $(seq 1 15); do
+            timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/18080' && break
+            sleep 1
+          done
+
+      - name: Start cargowall (hanging API + audit) — ready must land inside the window
+        run: |
+          sudo -E ./bin/cargowall start \
+            --github-action \
+            --dns-upstream 8.8.8.8:53 \
+            --api-url http://127.0.0.1:18080 \
+            --token dummy-token \
+            --api-failure-mode audit \
+            --audit-log /tmp/cargowall.ndjson \
+            --pidfile /tmp/cargowall.pid > /tmp/cargowall.log 2>&1 &
+          # The 30s cap IS the assertion: with the old single 30s attempt a
+          # hung API consumed the action's whole readiness wait, so the
+          # fallback posture was unreachable in exactly the case it exists
+          # for. The fetch budget (~10s under a full hang) must leave room
+          # for the rest of startup — DNS pre-population, Docker restart,
+          # eBPF attach — on a real runner. The outer timeout only guards
+          # against wait-ready itself wedging.
+          timeout 35s ./bin/cargowall wait-ready --timeout 30s \
+            || { echo "::error::not ready within 30s — the fetch budget is not leaving room for startup"; tail -50 /tmp/cargowall.log; exit 1; }
+
+      - name: Assert transport-classified audit downgrade
+        run: |
+          test "$(cat /tmp/cargowall-mode)" = "audit" \
+            || { echo "::error::mode file must say audit, got: $(cat /tmp/cargowall-mode 2>&1)"; exit 1; }
+          grep -q "CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK" /tmp/cargowall-downgrade \
+            || { echo "::error::downgrade record missing or wrong type"; cat /tmp/cargowall-downgrade 2>&1; exit 1; }
+          # A hang is killed by the per-attempt deadline before any response
+          # arrives, so it must surface as TRANSPORT (no status), not SERVER.
+          grep -q "CARGO_WALL_FETCH_FAILURE_CLASS_TRANSPORT" /tmp/cargowall-downgrade \
+            || { echo "::error::downgrade record must classify the hang as transport"; cat /tmp/cargowall-downgrade 2>&1; exit 1; }
+          # The record's detail embeds the fetch error. A deadline kill says
+          # "context deadline exceeded"; a fast ECONNREFUSED (stub never
+          # bound) would say "connection refused" — this is what proves the
+          # hang path actually ran.
+          grep -q "context deadline exceeded" /tmp/cargowall-downgrade \
+            || { echo "::error::downgrade must be driven by the per-attempt deadline, not a fast transport error"; cat /tmp/cargowall-downgrade 2>&1; exit 1; }
+          test ! -f /tmp/cargowall-failed \
+            || { echo "::error::failure sentinel must not exist in audit mode"; exit 1; }
+
+      - name: Assert audit posture reached both datapaths
+        run: |
+          # example.com matches no rule: in audit mode the lookup (DNS
+          # datapath) and the connection (TC datapath) must both succeed,
+          # and the event must land in the audit log.
+          curl -sS --max-time 20 -o /dev/null https://example.com \
+            || { echo "::error::audit mode must not block a non-policy hostname"; exit 1; }
+          sleep 2
+          grep -q "example.com" /tmp/cargowall.ndjson \
+            || { echo "::error::no audit event recorded for example.com"; exit 1; }
+
+      - name: Stop cargowall
+        run: sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hung-downgrade-logs
+          path: |
+            /tmp/cargowall.log
             /tmp/cargowall.ndjson
             /tmp/mockapi.log
           if-no-files-found: ignore

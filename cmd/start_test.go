@@ -17,24 +17,379 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
 
+	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
+	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/firewall"
 )
 
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// redirectStateFiles points the effective-mode and downgrade state files at
+// tempdir paths for the duration of the test, restoring the real paths on
+// cleanup.
+func redirectStateFiles(t *testing.T) (modePath, downgradePath string) {
+	t.Helper()
+	oldMode, oldDowngrade := modeFile, downgradeFile
+	dir := t.TempDir()
+	modeFile = filepath.Join(dir, "cargowall-mode")
+	downgradeFile = filepath.Join(dir, "cargowall-downgrade")
+	t.Cleanup(func() { modeFile, downgradeFile = oldMode, oldDowngrade })
+	return modeFile, downgradeFile
+}
+
+// readDowngradeFile parses the protojson downgrade record a test run wrote.
+func readDowngradeFile(t *testing.T, path string) *cargowallv1pb.CargoWallDowngrade {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err, "downgrade record must be written")
+	var d cargowallv1pb.CargoWallDowngrade
+	require.NoError(t, protojson.Unmarshal(data, &d))
+	return &d
+}
+
+// TestLoadCIConfig_ApiFailureModes is the (error class × --api-failure-mode)
+// posture table: only genuine retrieval failures (transport / server /
+// malformed) may downgrade to audit or abort. Authoritative answers — 404
+// not-onboarded (the everyday case for users without a CodeCargo account,
+// since api-url defaults to the SaaS), 401/403 bad token, 400 inactive repo —
+// must keep today's env/file fallback no matter what the flag says.
+func TestLoadCIConfig_ApiFailureModes(t *testing.T) {
+	setFastPolicyRetries(t)
+
+	const (
+		respTransport  = -1 // server closed before the request: no HTTP response
+		respUnloadable = -2 // 200 whose policy LoadConfigFromCargoWall rejects
+		respOK         = 200
+	)
+
+	// Short aliases to keep the table readable.
+	const (
+		dtNone      = datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_UNSPECIFIED
+		dtAudit     = datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK
+		dtLockdown  = datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_LOCKDOWN
+		fcNone      = datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_UNSPECIFIED
+		fcTransport = datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_TRANSPORT
+		fcServer    = datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_SERVER
+		fcMalformed = datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_MALFORMED
+	)
+
+	tests := []struct {
+		name          string
+		resp          int
+		failureMode   string
+		wantLoaded    bool
+		wantAuditMode bool
+		wantLockdown  bool
+		wantSentinel  bool
+		wantModeFile  string // "" = file must not exist
+		// wantDowngrade is the expected downgrade record type;
+		// UNSPECIFIED = the downgrade file must not exist.
+		wantDowngrade datapb.CargoWallDowngradeType
+		// wantClass is the expected failure class on the downgrade record.
+		wantClass datapb.CargoWallFetchFailureClass
+	}{
+		// Local fallback writes NO mode file: absence means "no SaaS-derived
+		// posture", and local runs at exactly the posture the flags request —
+		// matching the identical env/file outcome after a 404.
+		{"server error, local keeps enforce", 500, "local", false, false, false, false, "", dtNone, fcNone},
+		{"server error, empty mode defaults to local", 500, "", false, false, false, false, "", dtNone, fcNone},
+		{"server error, audit downgrades", 500, "audit", false, true, false, false, "audit", dtAudit, fcServer},
+		{"server error, fail locks down", 500, "fail", false, false, true, true, "", dtLockdown, fcServer},
+		{"transport error, audit downgrades", respTransport, "audit", false, true, false, false, "audit", dtAudit, fcTransport},
+		{"transport error, fail locks down", respTransport, "fail", false, false, true, true, "", dtLockdown, fcTransport},
+		{"unloadable policy, audit downgrades", respUnloadable, "audit", false, true, false, false, "audit", dtAudit, fcMalformed},
+		{"404 not onboarded, audit must not downgrade", 404, "audit", false, false, false, false, "", dtNone, fcNone},
+		{"404 not onboarded, fail must not lock down", 404, "fail", false, false, false, false, "", dtNone, fcNone},
+		{"401 unauthorized, fail must not lock down", 401, "fail", false, false, false, false, "", dtNone, fcNone},
+		{"400 precondition, audit must not downgrade", 400, "audit", false, false, false, false, "", dtNone, fcNone},
+		{"success ignores failure mode", respOK, "fail", true, true, false, false, "audit", dtNone, fcNone},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			modePath, downgradePath := redirectStateFiles(t)
+			failurePath := filepath.Join(t.TempDir(), "cargowall-failed")
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch tc.resp {
+				case respUnloadable:
+					// Rule type left unspecified → LoadConfigFromCargoWall
+					// rejects the policy after a successful fetch.
+					_, _ = w.Write([]byte(`{"mode": "CARGO_WALL_MODE_ENFORCE", "rules": [{"value": "1.2.3.4/32"}]}`))
+				case respOK:
+					_, _ = w.Write([]byte(`{"mode": "CARGO_WALL_MODE_AUDIT", "default_action": "CARGO_WALL_ACTION_TYPE_DENY"}`))
+				default:
+					w.WriteHeader(tc.resp)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			apiURL := srv.URL
+			if tc.resp == respTransport {
+				srv.Close()
+			}
+
+			cmd := &StartCmd{
+				GithubAction:   true,
+				ApiUrl:         apiURL,
+				Token:          "test-token",
+				ApiFailureMode: tc.failureMode,
+				FailureFile:    failurePath,
+				Config:         filepath.Join(t.TempDir(), "no-config.json"),
+			}
+
+			cm := config.NewConfigManager()
+			loaded := loadCIConfig(context.Background(), cmd, cm, nil, "", quietLogger())
+
+			assert.Equal(t, tc.wantLoaded, loaded)
+			assert.Equal(t, tc.wantAuditMode, cm.IsAuditMode(), "posture lives on the config manager")
+			assert.Equal(t, tc.wantLockdown, cmd.policyLockdown)
+
+			if tc.wantSentinel {
+				data, rerr := os.ReadFile(failurePath)
+				require.NoError(t, rerr, "fail mode must write the failure sentinel")
+				assert.Contains(t, string(data), "policy fetch")
+			} else {
+				_, serr := os.Stat(failurePath)
+				assert.True(t, os.IsNotExist(serr), "failure sentinel must not be written")
+			}
+
+			if tc.wantModeFile == "" {
+				// Absent in lockdown AND on non-retrieval fallbacks: file
+				// absence has always meant "no SaaS policy in play" to the
+				// summary step, and the everyday not-onboarded case must
+				// keep that contract.
+				_, serr := os.Stat(modePath)
+				assert.True(t, os.IsNotExist(serr), "mode file must not be written")
+			} else {
+				data, rerr := os.ReadFile(modePath)
+				require.NoError(t, rerr, "mode file must be written")
+				assert.Equal(t, tc.wantModeFile, string(data))
+			}
+
+			if tc.wantDowngrade != dtNone {
+				d := readDowngradeFile(t, downgradePath)
+				assert.Equal(t, tc.wantDowngrade, d.Type)
+				assert.Equal(t, tc.wantClass, d.FailureClass)
+				assert.NotEmpty(t, d.Detail, "human-readable detail must ride along")
+				if tc.resp > 0 {
+					require.NotNil(t, d.HttpStatus, "status must be recorded when a response was received")
+					assert.Equal(t, uint32(tc.resp), *d.HttpStatus)
+				} else if tc.resp == respTransport {
+					assert.Nil(t, d.HttpStatus, "no status on transport failures")
+				}
+			} else {
+				_, serr := os.Stat(downgradePath)
+				assert.True(t, os.IsNotExist(serr), "downgrade record must only be written on a posture change")
+			}
+		})
+	}
+}
+
+// TestLoadCIConfig_LockdownSkipsLocalConfig: --api-failure-mode=fail means
+// "do not trust local config" — in lockdown the env/file fallback must be
+// skipped so the deny-all bootstrap stays in force, while "local" mode picks
+// the same env config up.
+func TestLoadCIConfig_LockdownSkipsLocalConfig(t *testing.T) {
+	setFastPolicyRetries(t)
+	t.Setenv("CARGOWALL_DEFAULT_ACTION", "allow")
+
+	for _, tc := range []struct {
+		failureMode string
+		wantAction  config.Action
+	}{
+		{"fail", config.ActionDeny},
+		{"local", config.ActionAllow},
+	} {
+		t.Run(tc.failureMode, func(t *testing.T) {
+			redirectStateFiles(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			t.Cleanup(srv.Close)
+
+			cmd := &StartCmd{
+				GithubAction:   true,
+				ApiUrl:         srv.URL,
+				Token:          "test-token",
+				ApiFailureMode: tc.failureMode,
+				FailureFile:    filepath.Join(t.TempDir(), "cargowall-failed"),
+			}
+			cm := config.NewConfigManager()
+			loadCIConfig(context.Background(), cmd, cm, nil, "", quietLogger())
+
+			assert.Equal(t, tc.wantAction, cm.GetDefaultAction())
+		})
+	}
+}
+
+// TestLoadCIConfig_CancelledContextSkipsPostureHandling guards the SIGTERM
+// unwind path: a fetch killed by shutdown-signal cancellation must not be
+// misreported as an outage — no lockdown, no audit downgrade, and no
+// sentinel/state files while the process is unwinding.
+func TestLoadCIConfig_CancelledContextSkipsPostureHandling(t *testing.T) {
+	setFastPolicyRetries(t)
+	modePath, downgradePath := redirectStateFiles(t)
+	failurePath := filepath.Join(t.TempDir(), "cargowall-failed")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cmd := &StartCmd{
+		GithubAction:   true,
+		ApiUrl:         "http://127.0.0.1:1",
+		Token:          "test-token",
+		ApiFailureMode: "fail",
+		FailureFile:    failurePath,
+	}
+	cm := config.NewConfigManager()
+	loaded := loadCIConfig(ctx, cmd, cm, nil, "", quietLogger())
+
+	assert.False(t, loaded)
+	assert.False(t, cmd.policyLockdown, "cancellation must not enter lockdown")
+	assert.False(t, cm.IsAuditMode())
+	for _, p := range []string{failurePath, downgradePath, modePath} {
+		_, err := os.Stat(p)
+		assert.True(t, os.IsNotExist(err), "no state file may be written while unwinding: %s", p)
+	}
+}
+
+// TestLoadCIConfig_FailureModesSyncAuditLogger: the DNS proxy consults the
+// audit logger (not cmd.AuditMode) at query time, so BOTH posture-changing
+// branches must re-sync it — audit (enforce→audit: DNS filtering must go
+// permissive) and fail (audit→lockdown: DNS filtering must go strict, or a
+// run started with --audit-mode keeps a DNS-tunnel escape hatch inside the
+// fail-closed posture).
+func TestLoadCIConfig_FailureModesSyncAuditLogger(t *testing.T) {
+	setFastPolicyRetries(t)
+
+	tests := []struct {
+		name          string
+		failureMode   string
+		initialAudit  bool
+		wantAuditMode bool
+	}{
+		{"audit downgrade flips logger on", "audit", false, true},
+		{"fail lockdown flips logger off", "fail", true, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			redirectStateFiles(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			t.Cleanup(srv.Close)
+
+			auditLogger, err := events.NewAuditLogger(filepath.Join(t.TempDir(), "audit.ndjson"), tc.initialAudit)
+			require.NoError(t, err)
+			t.Cleanup(func() { auditLogger.Close() })
+
+			cmd := &StartCmd{
+				GithubAction:   true,
+				ApiUrl:         srv.URL,
+				Token:          "test-token",
+				ApiFailureMode: tc.failureMode,
+				FailureFile:    filepath.Join(t.TempDir(), "cargowall-failed"),
+			}
+			// Mirror StartCargoWall: the CLI flag seeds the manager.
+			cm := config.NewConfigManager()
+			cm.SetAuditMode(tc.initialAudit)
+			loadCIConfig(context.Background(), cmd, cm, auditLogger, "", quietLogger())
+
+			assert.Equal(t, tc.wantAuditMode, cm.IsAuditMode())
+			assert.Equal(t, tc.wantAuditMode, auditLogger.IsAuditMode(), "audit logger must be re-synced with the effective posture")
+		})
+	}
+}
+
+// TestWriteSentinel_AtomicReplaceIsSymlinkSafe: sentinels are written as
+// root to fixed paths in world-writable /tmp. The temp-file+rename publish
+// must replace a pre-planted symlink (or plain file) at the path itself
+// without ever following it — the planted target's content stays untouched —
+// and must leave no temp litter behind.
+func TestWriteSentinel_AtomicReplaceIsSymlinkSafe(t *testing.T) {
+	dir := t.TempDir()
+
+	// Pre-planted plain file: replaced, not followed or refused.
+	existing := filepath.Join(dir, "existing")
+	require.NoError(t, os.WriteFile(existing, []byte("planted"), 0o644))
+	require.NoError(t, writeSentinel(existing, []byte("new")))
+	data, err := os.ReadFile(existing)
+	require.NoError(t, err)
+	assert.Equal(t, "new", string(data))
+
+	// Pre-planted symlink: the LINK is replaced by a regular file; the
+	// target an attacker chose is never written through.
+	target := filepath.Join(dir, "target")
+	require.NoError(t, os.WriteFile(target, []byte("victim"), 0o644))
+	link := filepath.Join(dir, "link")
+	require.NoError(t, os.Symlink(target, link))
+	require.NoError(t, writeSentinel(link, []byte("ok")))
+	data, err = os.ReadFile(target)
+	require.NoError(t, err)
+	assert.Equal(t, "victim", string(data), "symlink target must not be written through")
+	fi, err := os.Lstat(link)
+	require.NoError(t, err)
+	assert.True(t, fi.Mode().IsRegular(), "path must now be a regular file, not the symlink")
+	data, err = os.ReadFile(link)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", string(data))
+
+	// No temp files left behind.
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	assert.ElementsMatch(t, []string{"existing", "target", "link"}, names)
+}
+
+// TestRemoveStaleStateFiles: a persistent runner's leftovers (a stale ready
+// sentinel is a fail-open, a stale failure sentinel a false abort) must all
+// be cleared at process entry, and absence must be a no-op.
+func TestRemoveStaleStateFiles(t *testing.T) {
+	modePath, downgradePath := redirectStateFiles(t)
+	dir := t.TempDir()
+	cmd := &StartCmd{
+		ReadyFile:   filepath.Join(dir, "ready"),
+		FailureFile: filepath.Join(dir, "failed"),
+	}
+
+	stale := []string{cmd.ReadyFile, cmd.FailureFile, modePath, downgradePath}
+	for _, p := range stale {
+		require.NoError(t, os.WriteFile(p, []byte("stale"), 0o644))
+	}
+
+	removeStaleStateFiles(cmd, quietLogger())
+	for _, p := range stale {
+		_, err := os.Stat(p)
+		assert.True(t, os.IsNotExist(err), "stale state file must be removed: %s", p)
+	}
+
+	// Idempotent when nothing is stale.
+	removeStaleStateFiles(cmd, quietLogger())
 }
 
 // Regression test for the nil-ports security bug: when an existing IP's
@@ -695,4 +1050,116 @@ func TestRescanAndGateDelta_FlagOffDoesNotScan(t *testing.T) {
 
 	fw := firewall.NewMockFirewall(t)
 	rescanAndGateDelta(&StartCmd{}, nil, config.NewConfigManager(), fw, nil, quietLogger())
+}
+
+// TestTeardownList_OnceAcrossPaths: each registered undo runs at most once
+// whether the graceful defer or the second-signal force path executes first —
+// the property that makes forceAll safe to race against defers.
+func TestTeardownList_OnceAcrossPaths(t *testing.T) {
+	td := &teardownList{}
+	var order []string
+	a := td.add(func() { order = append(order, "a") })
+	b := td.add(func() { order = append(order, "b") })
+
+	b()           // graceful defer ran b first
+	td.forceAll() // force path must run a but not re-run b
+	a()           // late defer for a is now a no-op
+
+	assert.Equal(t, []string{"b", "a"}, order, "each undo runs exactly once across both paths")
+}
+
+// forceAll must run undos in reverse registration order (defer LIFO), with
+// nothing pre-run — the previous test cannot show this, since its only
+// remaining undo is a single function.
+func TestTeardownList_ForceAllRunsInReverseOrder(t *testing.T) {
+	td := &teardownList{}
+	var order []string
+	for _, name := range []string{"first", "second", "third"} {
+		td.add(func() { order = append(order, name) })
+	}
+
+	td.forceAll()
+
+	assert.Equal(t, []string{"third", "second", "first"}, order)
+}
+
+// An undo registered WHILE forceAll is running (main is still mid-startup,
+// e.g. attaching TC or enabling sudo lockdown) must still execute — a
+// one-shot snapshot would skip it and strand that mutation.
+func TestTeardownList_ForceAllPicksUpLateRegistrations(t *testing.T) {
+	td := &teardownList{}
+	var order []string
+	td.add(func() {
+		order = append(order, "early")
+		// Simulates startup registering another undo after forceAll began.
+		td.add(func() { order = append(order, "late") })
+	})
+
+	td.forceAll()
+
+	assert.Equal(t, []string{"early", "late"}, order, "late registrations must not be skipped")
+}
+
+// TestStartCargoWall_FatalErrorWritesFailureSentinel: ANY fatal startup error
+// must publish the failure sentinel so wait-ready fails fast with the reason
+// instead of burning its timeout. Driven through the earliest fatal path
+// (eBPF unsupported in the unprivileged test environment).
+func TestStartCargoWall_FatalErrorWritesFailureSentinel(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires an unprivileged environment so the eBPF capability check fails")
+	}
+	redirectStateFiles(t)
+	failurePath := filepath.Join(t.TempDir(), "cargowall-failed")
+
+	cmd := &StartCmd{
+		Logger:      quietLogger(),
+		FailureFile: failurePath,
+	}
+	err := StartCargoWall(cmd, nil)
+	require.Error(t, err)
+
+	data, rerr := os.ReadFile(failurePath)
+	require.NoError(t, rerr, "fatal startup error must write the failure sentinel")
+	assert.Contains(t, string(data), "cargowall startup failed")
+}
+
+// A hostname-less --api-url must still bootstrap the deny-all config:
+// lockdown skips the env/file fallback, so without the bootstrap the manager
+// would hold a nil config where every Ensure*Allowed no-ops — a blackhole
+// with no DNS or CI-infra allows, contradicting the lockdown contract.
+func TestLoadCIConfig_LockdownBootstrapsWithHostnamelessApiUrl(t *testing.T) {
+	setFastPolicyRetries(t)
+	redirectStateFiles(t)
+
+	cmd := &StartCmd{
+		GithubAction:   true,
+		ApiUrl:         "api.codecargo.io", // no scheme → url.Hostname() == ""
+		Token:          "test-token",
+		ApiFailureMode: ApiFailureModeFail,
+		FailureFile:    filepath.Join(t.TempDir(), "cargowall-failed"),
+		DNSUpstream:    "8.8.8.8:53",
+	}
+	cm := config.NewConfigManager()
+	loadCIConfig(context.Background(), cmd, cm, nil, "", quietLogger())
+
+	require.True(t, cmd.policyLockdown, "an unsupported scheme is a transport failure")
+	assert.Equal(t, config.ActionDeny, cm.GetDefaultAction())
+	// EnsureDNSAllowed runs at the end of loadCIConfig; it no-ops on a nil
+	// config, so a non-empty rule set proves the bootstrap happened.
+	assert.NotEmpty(t, cm.GetResolvedRules(), "lockdown must still carry the DNS/infra allows it advertises")
+}
+
+// The pid stamped into a sentinel identifies its run exactly — a leftover
+// pidfile from a SIGKILLed run cannot legitimize that run's sentinel, which
+// mtime-only anchoring could not prevent.
+func TestWriteFailureSentinel_StampsPidAndSanitizes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "failed")
+	require.NoError(t, writeFailureSentinel(path, "boom\n::error::injected"))
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	first, rest, _ := strings.Cut(string(data), "\n")
+	assert.Equal(t, fmt.Sprintf("pid=%d", os.Getpid()), first)
+	assert.NotContains(t, rest, "\n::error::", "control characters must be stripped from the reason")
+	assert.Contains(t, rest, "::error::injected", "the text itself is kept, just never at a line start")
 }

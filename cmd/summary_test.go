@@ -19,6 +19,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,7 +29,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
 
+	cargowallv1 "github.com/code-cargo/cargowall/pb/cargowall/v1"
 	"github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
@@ -420,10 +423,55 @@ func TestSummary_ReadAuditLog_EmptyFile(t *testing.T) {
 	assert.Empty(t, result)
 }
 
+// A missing audit log is NOT an error: the action omits --audit-log under
+// audit-summary:false, and the SaaS push (job record, mode, status, version,
+// downgrade) must still happen with zero events.
 func TestSummary_ReadAuditLog_NonExistentFile(t *testing.T) {
 	cmd := &SummaryCmd{AuditLog: "/nonexistent/path/audit.jsonl"}
-	_, err := cmd.readAuditLog()
-	assert.Error(t, err)
+	auditEvents, err := cmd.readAuditLog()
+	require.NoError(t, err, "absent audit log must not block the summary run")
+	assert.Empty(t, auditEvents)
+}
+
+// TestSummary_Run_MissingAuditLogStillPushes is the end-to-end guard for the
+// audit-summary:false configuration: with no audit log on disk, Run must
+// still push the job record — carrying the effective mode and any downgrade
+// record — rather than erroring out before pushToApi.
+func TestSummary_Run_MissingAuditLogStillPushes(t *testing.T) {
+	_, downgradePath := redirectStateFiles(t)
+	d := &cargowallv1.CargoWallDowngrade{
+		Type:         data.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK,
+		FailureClass: data.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_TRANSPORT,
+		Detail:       "downgraded to audit mode: policy could not be retrieved",
+	}
+	payload, err := protojson.Marshal(d)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(downgradePath, payload, 0o644))
+
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"job_id": "job-1", "workflow_run_url": "https://app.codecargo.io/run/1"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &SummaryCmd{
+		AuditLog: filepath.Join(t.TempDir(), "never-written.ndjson"),
+		Steps:    "[]",
+		ApiUrl:   srv.URL,
+		Token:    "test-token",
+		JobName:  "build",
+		Mode:     "audit",
+		output:   io.Discard,
+	}
+	require.NoError(t, c.Run())
+
+	require.NotNil(t, got, "the push must reach the API despite the missing audit log")
+	assert.Equal(t, "CARGO_WALL_MODE_AUDIT", got["mode"])
+	dg, ok := got["downgrade"].(map[string]any)
+	require.True(t, ok, "downgrade record must ride along on a zero-event push")
+	assert.Equal(t, "CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK", dg["type"])
 }
 
 // --- eventDestination ---
@@ -851,6 +899,59 @@ func TestPushToApi_ReportsVersion(t *testing.T) {
 			if summary, ok := got["summary"].(map[string]any); ok {
 				assert.NotContains(t, summary, "version")
 			}
+		})
+	}
+}
+
+// TestPushToApi_ReportsDowngrade confirms the structured downgrade record
+// written by `cargowall start` rides along on the job push with its type,
+// failure class, status, and human-readable detail intact — and is omitted
+// entirely when the run executed at its requested posture (no state file).
+func TestPushToApi_ReportsDowngrade(t *testing.T) {
+	status := uint32(503)
+	tests := []struct {
+		name      string
+		downgrade *cargowallv1.CargoWallDowngrade
+	}{
+		{name: "downgraded", downgrade: &cargowallv1.CargoWallDowngrade{
+			Type:         data.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK,
+			FailureClass: data.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_SERVER,
+			HttpStatus:   &status,
+			Detail:       "downgraded to audit mode: policy could not be retrieved",
+		}},
+		{name: "not downgraded", downgrade: nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, downgradePath := redirectStateFiles(t)
+			if tc.downgrade != nil {
+				payload, merr := protojson.Marshal(tc.downgrade)
+				require.NoError(t, merr)
+				require.NoError(t, os.WriteFile(downgradePath, payload, 0o644))
+			}
+
+			var got map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"job_id": "job-1"}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			c := &SummaryCmd{ApiUrl: srv.URL, Token: "test-token", JobName: "build", Mode: "audit"}
+			_, err := c.pushToApi(nil, nil)
+			require.NoError(t, err)
+
+			if tc.downgrade == nil {
+				assert.NotContains(t, got, "downgrade", "downgrade must be omitted when the run was not downgraded")
+				return
+			}
+			d, ok := got["downgrade"].(map[string]any)
+			require.True(t, ok, "downgrade must be a structured object, got %T", got["downgrade"])
+			assert.Equal(t, "CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK", d["type"])
+			assert.Equal(t, "CARGO_WALL_FETCH_FAILURE_CLASS_SERVER", d["failure_class"])
+			assert.Equal(t, float64(503), d["http_status"])
+			assert.Equal(t, tc.downgrade.Detail, d["detail"])
 		})
 	}
 }

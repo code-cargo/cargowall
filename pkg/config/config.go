@@ -169,6 +169,16 @@ type Manager struct {
 	ipLastSeen       map[string]time.Time           // Track when each IP was last seen
 	trackedHostnames map[string]Action              // Track hostnames we have rules for (hostname -> action)
 	maxCacheSize     int                            // Maximum number of IPs to cache
+
+	// auditMode is the run's enforcement posture and lives here — next to
+	// DefaultAction — as the single source of truth both datapaths consult:
+	// the DNS proxy reads it per query, and user space writes it into the
+	// eBPF audit-mode map at sync time. Seeded from the CLI flag, then
+	// overridden by whichever policy source wins (SaaS API, hook, or an
+	// --api-failure-mode posture change). Keeping it off the audit logger
+	// (a pure reporting sink) is deliberate: a logging toggle once changed
+	// enforcement because posture rode on the logger.
+	auditMode bool
 }
 
 // NewConfigManager creates a new configuration manager
@@ -563,9 +573,22 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 	}); err != nil {
 		return err
 	}
+
+	// Map the policy's mode onto the posture, only after the policy loaded
+	// successfully — a rejected policy must not flip posture. UNSPECIFIED
+	// (older controllers, partial policies) leaves the current posture (the
+	// CLI seed) in place.
+	switch cargoWall.Mode {
+	case datapb.CargoWallMode_CARGO_WALL_MODE_AUDIT:
+		cm.SetAuditMode(true)
+	case datapb.CargoWallMode_CARGO_WALL_MODE_ENFORCE:
+		cm.SetAuditMode(false)
+	}
+
 	slog.Info("Loaded CargoWall config from state machine",
 		"rules", len(rules),
 		"defaultAction", defaultAction,
+		"mode", cargoWall.Mode.String(),
 		"searchDomains", len(searchDomains))
 	return nil
 }
@@ -864,6 +887,21 @@ func (cm *Manager) GetDefaultAction() Action {
 		return ActionDeny // Default to deny if not specified
 	}
 	return cm.config.DefaultAction
+}
+
+// SetAuditMode sets the run's enforcement posture (see the field comment).
+func (cm *Manager) SetAuditMode(enabled bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.auditMode = enabled
+}
+
+// IsAuditMode reports the run's enforcement posture: audit logs would-block
+// verdicts without blocking, enforce blocks.
+func (cm *Manager) IsAuditMode() bool {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.auditMode
 }
 
 // LookupHostnameByIP finds the hostname associated with an IP address

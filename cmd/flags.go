@@ -62,6 +62,13 @@ type StartCmd struct {
 	Version        string                      `kong:"-"` // Version passed from main
 	Hooks          *StartHooks                 `kong:"-"`
 
+	// policyLockdown is set during config load when --api-failure-mode=fail
+	// could not retrieve the policy: the firewall attaches with the deny-all
+	// bootstrap config (env/file fallback skipped) and the ready sentinel is
+	// withheld so the action fails the job with the failure sentinel's
+	// reason. Unexported: internal state, not a flag.
+	policyLockdown bool
+
 	// Configuration
 	Config    string `help:"Path to configuration file" default:"/etc/cargowall/config.json" env:"CARGOWALL_CONFIG"`
 	Interface string `help:"Network interface to attach to (auto-detect if empty)" env:"CARGOWALL_INTERFACE"`
@@ -69,6 +76,29 @@ type StartCmd struct {
 	Token  string `help:"codecargo token" env:"CODECARGO_AUTH_TOKEN"`
 	ApiUrl string `help:"CodeCargo API URL to fetch policy from" name:"api-url" env:"CARGOWALL_API_URL"`
 	JobKey string `help:"CI job key for job-level policy resolution" name:"job-key" env:"CARGOWALL_JOB_KEY"`
+
+	// ApiFailureMode acts only on genuine retrieval failures
+	// (transport/server/malformed) — an authoritative "not onboarded" 404 or
+	// a token misconfiguration never changes posture, so the default api-url
+	// being attempted on every run can't disable enforcement for users
+	// without a CodeCargo account. The default must stay "local" (today's
+	// behavior) so the flag is inert when unset.
+	//
+	// "fail" deliberately keeps the process ALIVE in a deny-all lockdown
+	// rather than aborting: an aborted binary can only signal failure and
+	// hope the watcher reacts, and its worst case (watcher missing or
+	// outdated) is an unprotected build. A live lockdown's worst case is an
+	// over-blocked build — the correct failure direction — and shutdown
+	// always runs the full teardown path. Lockdown is deny-all for the
+	// build's traffic, but the CI infrastructure auto-allows (GitHub/GitLab
+	// hosts, cloud metadata, the CodeCargo API) stay active — the runner
+	// must keep functioning to report the failure.
+	// Validated in AfterApply rather than with kong's enum: an env-bound
+	// enum rejects a set-but-EMPTY value (the `env: X: ${{ inputs.y }}`
+	// shape with an unset input) instead of falling back to the default,
+	// and a parse failure means the process never starts — no sentinel, no
+	// posture, just a generic wait-ready timeout.
+	ApiFailureMode string `help:"Posture when the policy cannot be retrieved from the CodeCargo API: audit (downgrade to audit mode), local (use env/file config as-is), fail (lock down to deny-all and signal failure)" name:"api-failure-mode" default:"local" env:"CARGOWALL_API_FAILURE_MODE"`
 
 	// Runtime options
 	DisableDNSTracking bool   `help:"Disable DNS tracking and hostname resolution" default:"false"`
@@ -93,7 +123,10 @@ type StartCmd struct {
 	SudoLockdown      bool   `help:"Enable sudo lockdown to prevent firewall bypass" default:"false" env:"CARGOWALL_SUDO_LOCKDOWN"`
 	SudoAllowCommands string `help:"Comma-separated list of command paths to allow via sudo when lockdown is enabled (e.g. /usr/bin/apt-get,/usr/bin/docker)" default:"" env:"CARGOWALL_SUDO_ALLOW_COMMANDS"`
 
-	// Audit mode and logging
+	// Audit mode and logging. AuditMode is only the CLI seed: at startup it
+	// is copied into config.Manager, which is the single source of truth
+	// for the run's effective posture from then on (policy sources may
+	// override it). Nothing should read this field after config load.
 	AuditMode bool   `help:"Monitor and log connections without blocking (audit only)" default:"false" env:"CARGOWALL_AUDIT_MODE"`
 	AuditLog  string `help:"Path to write JSON audit log for step correlation" env:"CARGOWALL_AUDIT_LOG"`
 
@@ -108,6 +141,17 @@ type StartCmd struct {
 	// ReadyFile path is shared with `cargowall wait-ready` via the same
 	// default and env var, so the two subcommands always agree.
 	ReadyFile string `help:"Path to write the readiness sentinel file" default:"/tmp/cargowall-ready" env:"CARGOWALL_READY_FILE"`
+
+	// FailureFile mirrors ReadyFile: when --api-failure-mode=fail enters
+	// policy lockdown the binary writes a human-readable reason here (and
+	// withholds the ready sentinel) so the action's wait loop can fail the
+	// job fast with that reason instead of timing out — under
+	// --sudo-lockdown, process state is deliberately unobservable to the
+	// action, so the sentinel pair is the only signal it gets. The sentinel
+	// signals the DECISION to lock down, published early for fail-fast;
+	// deny-all enforcement engages when the TC program attaches shortly
+	// after (see the write site in handlePolicyFetchFailure).
+	FailureFile string `help:"Path to write the failure sentinel file when --api-failure-mode=fail enters policy lockdown" default:"/tmp/cargowall-failed" env:"CARGOWALL_FAILURE_FILE"`
 }
 
 // CIMode is the active CI integration mode, derived from which preset flag
@@ -144,8 +188,30 @@ func (c *StartCmd) AfterApply() error {
 	case CIModeGitlabCI:
 		c.applyCIPreset(CIModeGitlabCI)
 	}
+	// An empty value (unset env var, or one set from an unset CI input)
+	// means "not configured" — take the default rather than refusing to
+	// start.
+	if c.ApiFailureMode == "" {
+		c.ApiFailureMode = ApiFailureModeLocal
+	}
+	switch c.ApiFailureMode {
+	case ApiFailureModeLocal, ApiFailureModeAudit, ApiFailureModeFail:
+	default:
+		return fmt.Errorf("--api-failure-mode must be one of %q, %q, %q (got %q)",
+			ApiFailureModeAudit, ApiFailureModeLocal, ApiFailureModeFail, c.ApiFailureMode)
+	}
 	return nil
 }
+
+// --api-failure-mode values.
+const (
+	// ApiFailureModeLocal keeps today's behavior: env/file config as-is.
+	ApiFailureModeLocal = "local"
+	// ApiFailureModeAudit downgrades the run to audit mode.
+	ApiFailureModeAudit = "audit"
+	// ApiFailureModeFail enters deny-all policy lockdown.
+	ApiFailureModeFail = "fail"
+)
 
 // applyCIPreset turns on the plumbing flags shared by both CI presets, then
 // sets the host auto-allow flag specific to the named CI.

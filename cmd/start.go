@@ -31,6 +31,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,6 +42,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/code-cargo/cargowall/bpf"
+	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
 	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/dns"
@@ -53,8 +55,65 @@ import (
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
 
+// StartCargoWall brings the firewall up and blocks until shutdown. Any fatal
+// error publishes the failure sentinel BEFORE the teardown unwind begins —
+// not in a defer, which would run last (LIFO) and could push the sentinel
+// tens of seconds past wait-ready's timeout, defeating the fail-fast purpose
+// on exactly the paths it exists for.
 func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
+	teardowns := &teardownList{}
+	err := startCargoWall(cmd, hooks, teardowns)
+	// Written BEFORE the pidfile is removed: wait-ready anchors sentinel
+	// freshness to the pidfile, so publishing after its removal would make
+	// a genuine sentinel look like a previous run's leftover.
+	if err != nil && cmd.FailureFile != "" {
+		if werr := writeFailureSentinel(cmd.FailureFile, "cargowall startup failed: "+err.Error()); werr != nil {
+			cmd.Logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
+		}
+	}
+	if cmd.Pidfile != "" {
+		if rerr := os.Remove(cmd.Pidfile); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			cmd.Logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", rerr)
+		}
+	}
+	return err
+}
+
+func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) error {
 	logger := cmd.Logger
+
+	// Clear stale state files from a previous run FIRST, before any fallible
+	// startup work. These files are how the action observes this process:
+	// a stale ready sentinel would make an --api-failure-mode=fail abort
+	// fail-open (the wait loop sees the old file and unblocks the build with
+	// no firewall attached), a stale failure sentinel would abort a healthy
+	// run, and a stale mode file would feed the summary step the previous
+	// job's posture.
+	removeStaleStateFiles(cmd, logger)
+
+	// Write the pidfile at process entry, not just before ready: the failure
+	// sentinel can be published during config load (--api-failure-mode=fail),
+	// and a consumer that fails fast on it must be able to run `cargowall
+	// stop --pidfile` immediately — a late pidfile would leave a root
+	// deny-all process holding the host mutations past job end.
+	//
+	// Failure to write is fatal — the user opted into --pidfile expecting
+	// `cargowall stop` to work later; silently best-effort would leave them
+	// with a useful-looking startup but a broken teardown.
+	if cmd.Pidfile != "" {
+		if err := writePidfile(cmd.Pidfile, os.Getpid()); err != nil {
+			return fmt.Errorf("write pidfile %s: %w (cargowall stop --pidfile will not work)", cmd.Pidfile, err)
+		}
+		// NOT deferred here: the pidfile must outlive the inner function so
+		// the fatal-path sentinel (written by the caller, after this
+		// returns) can still be anchored to it by wait-ready. The caller
+		// removes it; the force path has it via teardowns.
+		teardowns.add(func() {
+			if err := os.Remove(cmd.Pidfile); err != nil && !errors.Is(err, os.ErrNotExist) {
+				logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", err)
+			}
+		})
+	}
 
 	// Check eBPF capabilities early to provide clear error messages
 	caps := cargowallEbpf.Detect()
@@ -93,12 +152,79 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		// Try to continue anyway - it might work with current limits
 	}
 
-	// Create configuration manager
+	// Create configuration manager and seed the enforcement posture from the
+	// CLI flag. From here on, config.Manager is the single source of truth
+	// for posture — config load (SaaS API, hook, --api-failure-mode) may
+	// override it, the DNS proxy consults it per query, and user space
+	// writes it into the eBPF audit-mode map at sync time. cmd.AuditMode is
+	// never read again after this line.
 	configMgr := config.NewConfigManager()
+	configMgr.SetAuditMode(cmd.AuditMode)
 
 	// Start DNS proxy server BEFORE loading config (since config resolution needs DNS)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// The DNS proxy gets its OWN context, cancelled by defer-LIFO only after
+	// the teardown defers below it have run. Sharing the signal ctx killed
+	// the :53 listeners the instant shutdown began — leaving the DNAT rule
+	// pointing at a dead proxy for the ~10s worst case of logger + OTLP
+	// shutdown, which need working DNS for hostname endpoints.
+	dnsCtx, dnsCancel := context.WithCancel(context.Background())
+	defer dnsCancel()
+
+	// Arm signal handling BEFORE the first host mutation (Docker DNS config,
+	// iptables redirect below). A SIGTERM during startup — the action kills
+	// the process when its readiness wait times out — used to hit Go's
+	// default disposition: instant death, no defers, leaving the DNAT rules
+	// pointed at a dead proxy and daemon.json rewritten, i.e. a runner with
+	// broken DNS for the rest of the job. Now a startup-window signal cancels
+	// ctx; the startupInterrupted checkpoints below unwind through the
+	// deferred teardowns instead.
+	// Buffer 2: the goroutine below performs two sequential receives, and
+	// os/signal drops a signal that arrives while the buffer is full — with
+	// buffer 1 a rapid double-signal would lose the second and park the
+	// goroutine forever on a receive that never completes, making the force
+	// path unreachable.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			logger.Info("Received shutdown signal", "signal", sig.String())
+			cancel()
+		case <-ctx.Done():
+			return
+		}
+		// Some startup phases (Docker restart, iptables under a wedged
+		// xtables lock) are not context-aware, so the graceful unwind can
+		// lag the first signal by tens of seconds. A second signal means
+		// "stop waiting" — but a bare os.Exit here would skip every defer
+		// and leave sudoers locked down, the DNAT rule pointing at a dead
+		// proxy, and daemon.json rewritten, with no process left to undo
+		// any of it. Instead force the registered host-mutation undos
+		// (each runs at most once, shared with the defers) inside a bound,
+		// then exit.
+		sig := <-sigCh
+		logger.Error("Received second shutdown signal — forcing host-mutation teardown, then exiting", "signal", sig.String())
+		done := make(chan struct{})
+		go func() {
+			teardowns.forceAll()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case sig := <-sigCh:
+			// Keep listening while the forced teardown runs: a caller that
+			// signals again must not find the process unresponsive, which
+			// is the very complaint the force path answers.
+			logger.Error("Received third shutdown signal — abandoning teardown and exiting now", "signal", sig.String())
+		case <-time.After(15 * time.Second):
+			logger.Error("Forced teardown did not finish in time — exiting anyway")
+		}
+		os.Exit(1)
+	}()
 
 	var dnsServer *dns.Server
 	var dockerBridgeIP string
@@ -139,20 +265,24 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 				// even on ConfigureDockerDNS failure — best-effort matches
 				// the previous shutdown semantic and guards against partial
 				// writes to daemon.json that the user expects rolled back.
-				if err := network.ConfigureDockerDNS(dockerBridgeIP, logger); err != nil {
-					logger.Warn("Failed to configure Docker DNS", "error", err)
-				}
-				defer func() {
+				// Registered BEFORE the mutation: a signal landing inside
+				// ConfigureDockerDNS must not leave daemon.json rewritten
+				// with no undo registered. RestoreDockerDNS is best-effort
+				// and safe when the write never happened.
+				defer teardowns.add(func() {
 					if err := network.RestoreDockerDNS(logger); err != nil {
 						logger.Warn("Failed to restore Docker DNS", "error", err)
 					}
-				}()
+				})()
+				if err := network.ConfigureDockerDNS(dockerBridgeIP, logger); err != nil {
+					logger.Warn("Failed to configure Docker DNS", "error", err)
+				}
 			}
 		}
 
 		dnsErrCh := make(chan error, 1)
 		go func() {
-			if err := dnsServer.Start(ctx); err != nil {
+			if err := dnsServer.Start(dnsCtx); err != nil {
 				dnsErrCh <- err
 			}
 		}()
@@ -175,15 +305,20 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		// Teardown is deferred immediately so the rule never outlives the
 		// process — including across error-return paths below.
 		if cmd.DNSRedirectIptables {
+			// Registered BEFORE the mutation: iptables -A can partially
+			// apply, and a signal landing mid-install must still leave a
+			// registered undo. Deleting rules that were never added is a
+			// logged no-op.
+			teardownRedirect := teardowns.add(func() {
+				if err := network.TeardownDNSRedirect(logger); err != nil {
+					logger.Warn("Failed to tear down DNS redirect", "error", err)
+				}
+			})
+			defer teardownRedirect()
 			if err := network.SetupDNSRedirect(logger); err != nil {
 				logger.Warn("Failed to set up DNS redirect (iptables)", "error", err)
 			} else {
 				dnsRedirectActive = true
-				defer func() {
-					if err := network.TeardownDNSRedirect(logger); err != nil {
-						logger.Warn("Failed to tear down DNS redirect", "error", err)
-					}
-				}()
 			}
 		}
 	}
@@ -192,13 +327,13 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	var notificationTracker *events.NotificationTracker
 
 	// Initialize audit logger if audit log path is specified. Defer the
-	// audit-mode log line until after config load — loadCIConfig may flip
-	// cmd.AuditMode from the API policy, and we want the log to reflect
-	// the final effective mode rather than the initial CLI flag.
+	// audit-mode log line until after config load — the manager's posture
+	// may be flipped by the API policy, and we want the log to reflect the
+	// final effective mode rather than the initial CLI seed.
 	var auditLogger *events.AuditLogger
 	if cmd.AuditLog != "" {
 		var err error
-		auditLogger, err = events.NewAuditLogger(cmd.AuditLog, cmd.AuditMode)
+		auditLogger, err = events.NewAuditLogger(cmd.AuditLog, configMgr.IsAuditMode())
 		if err != nil {
 			return fmt.Errorf("failed to create audit logger: %w", err)
 		}
@@ -215,7 +350,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	if otelExporter != nil {
 		if auditLogger == nil {
 			var err error
-			auditLogger, err = events.NewAuditLogger("", cmd.AuditMode)
+			auditLogger, err = events.NewAuditLogger("", configMgr.IsAuditMode())
 			if err != nil {
 				return fmt.Errorf("failed to create audit event hub: %w", err)
 			}
@@ -232,17 +367,6 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			}
 		}()
 		logger.Info("OpenTelemetry log export enabled", "endpoint", otelExporter.Endpoint())
-	}
-
-	// Late-allow reconciliation (#83): buffer recently blocked connections so
-	// the DNS enforcement path can re-report them as late-allowed once it
-	// opens the firewall for their destination IP. Registered as an audit
-	// sink here — before ProcessBlockedEvents starts — so no blocked event is
-	// missed.
-	if dnsServer != nil && auditLogger != nil {
-		recentBlocks := events.NewRecentBlocks(0)
-		auditLogger.AddSink(recentBlocks)
-		dnsServer.SetRecentBlocks(recentBlocks)
 	}
 
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
@@ -263,6 +387,11 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			if err := configMgr.LoadConfigFromCargoWall(policy); err != nil {
 				return fmt.Errorf("failed to load CargoWall config: %w", err)
 			}
+			// LoadConfigFromCargoWall mapped the policy's mode onto the
+			// manager's posture; re-sync the logger's event labeling.
+			if auditLogger != nil {
+				auditLogger.SetAuditMode(configMgr.IsAuditMode())
+			}
 		}
 
 		if hookSmClient != nil {
@@ -277,18 +406,34 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		}
 	}
 
-	// Log the effective audit mode now that loadCIConfig has had a chance
-	// to override cmd.AuditMode from the API policy.
-	switch {
-	case cmd.AuditLog != "" && cmd.AuditMode:
+	// Late-allow reconciliation (#83): buffer recently blocked connections so
+	// the DNS enforcement path can re-report them as late-allowed once it
+	// opens the firewall for their destination IP. Registered as an audit
+	// sink here — before ProcessBlockedEvents starts — so no blocked event is
+	// missed.
+	if dnsServer != nil && auditLogger != nil {
+		recentBlocks := events.NewRecentBlocks(0)
+		auditLogger.AddSink(recentBlocks)
+		dnsServer.SetRecentBlocks(recentBlocks)
+	}
+
+	// Log the effective posture now that config load has settled it on the
+	// manager (the SaaS API, hook, or --api-failure-mode may have overridden
+	// the CLI flag).
+	switch auditMode := configMgr.IsAuditMode(); {
+	case cmd.AuditLog != "" && auditMode:
 		logger.Info("Running in AUDIT MODE - connections will be logged but NOT blocked",
 			"audit_log", cmd.AuditLog)
 	case cmd.AuditLog != "":
 		logger.Info("Audit logging enabled", "audit_log", cmd.AuditLog)
-	case cmd.AuditMode && otelExporter != nil:
+	case auditMode && otelExporter != nil:
 		logger.Info("Running in AUDIT MODE - connections will be exported via OTLP but NOT blocked")
-	case cmd.AuditMode:
+	case auditMode:
 		logger.Warn("Audit mode enabled but no audit log path specified (--audit-log)")
+	}
+
+	if startupInterrupted(ctx, logger, "config load") {
+		return nil
 	}
 
 	// Find network interface
@@ -367,11 +512,13 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		return fmt.Errorf("failed to set default action: %w", err)
 	}
 
-	// Set audit mode if enabled
-	if cmd.AuditMode {
-		if err := fw.SetAuditMode(true); err != nil {
-			return fmt.Errorf("failed to set audit mode: %w", err)
-		}
+	// Write the manager's posture into the eBPF audit-mode map,
+	// unconditionally in both directions — a one-branch "only when true"
+	// call would silently keep audit mode if a SaaS policy said enforce
+	// after the CLI said audit. (The DNS proxy needs no equivalent: it
+	// consults the manager per query.)
+	if err := fw.SetAuditMode(configMgr.IsAuditMode()); err != nil {
+		return fmt.Errorf("failed to set audit mode: %w", err)
 	}
 
 	// Populate CIDR rules from configuration
@@ -424,8 +571,8 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		existing := scanExistingForStartup(cmd, logger)
 
 		if cmd.PrepopulateDNSCache {
-			reverseDNSExistingConnections(existing, configMgr, cacheResolver, logger)
-			prePopulateDNSCache(configMgr, dnsServer, cacheResolver, logger)
+			reverseDNSExistingConnections(ctx, existing, configMgr, cacheResolver, logger)
+			prePopulateDNSCache(ctx, configMgr, dnsServer, cacheResolver, logger)
 		}
 
 		// Flush systemd-resolved's cache now that the redirect is installed
@@ -454,6 +601,10 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	// pre-population window survive.
 	rescanAndGateDelta(cmd, gatedExisting, configMgr, fw, auditLogger, logger)
 
+	if startupInterrupted(ctx, logger, "pre-attach") {
+		return nil
+	}
+
 	// Attach the TC egress program only AFTER the maps are fully programmed
 	// (default action + static allowlist + auto-allow infra + tracked hostnames +
 	// existing connections). The BPF maps exist independently of the link, so
@@ -466,7 +617,16 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	if err != nil {
 		return fmt.Errorf("failed to attach TC egress: %w", err)
 	}
-	defer egressLink.Close()
+	// Registered with teardowns, not a bare defer: on TCX kernels the link
+	// dies with the process fd anyway, but the legacy clsact fallback
+	// (kernels <6.6) installs a netlink cls_bpf filter that OUTLIVES the
+	// process — a force-exit that skipped this would leave the filter
+	// attached and enforcing with nothing left to remove it.
+	defer teardowns.add(func() {
+		if cerr := egressLink.Close(); cerr != nil {
+			logger.Warn("Failed to detach TC egress", "error", cerr)
+		}
+	})()
 
 	// Log appropriate config source
 	switch {
@@ -492,6 +652,10 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			"config_path", cmd.Config)
 	}
 
+	if startupInterrupted(ctx, logger, "post-attach") {
+		return nil
+	}
+
 	// Apply policy-sourced sudo lockdown settings (overrides CLI flags)
 	if sl := configMgr.GetSudoLockdown(); sl != nil {
 		cmd.SudoLockdown = sl.Enabled
@@ -502,13 +666,18 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	// Disable is deferred immediately on success so /etc/sudoers gets
 	// restored on every return path, not just signal-driven shutdown.
 	if cmd.SudoLockdown {
-		if enabled, cfg := enableSudoLockdown(cmd, logger); enabled {
-			defer func() {
-				if err := lockdown.DisableSudoLockdown(cfg, logger); err != nil {
-					logger.Warn("Failed to disable sudo lockdown", "error", err)
-				}
-			}()
-		}
+		// Registered BEFORE the mutation, and against the config the
+		// enable path will use: enableSudoLockdown rewrites /etc/sudoers.d
+		// before it returns, so registering afterwards leaves a window
+		// where a force-exit strands the runner with restricted sudoers —
+		// the teardown whose loss is hardest to recover from by hand.
+		cfg := sudoLockdownConfig(cmd, logger)
+		defer teardowns.add(func() {
+			if err := lockdown.DisableSudoLockdown(cfg, logger); err != nil {
+				logger.Debug("Sudo lockdown teardown reported an error (may not have been enabled)", "error", err)
+			}
+		})()
+		enableSudoLockdown(cfg, logger)
 	}
 
 	// Restart Docker daemon so containers pick up the DNS configuration
@@ -520,39 +689,51 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 		}
 	}
 
-	// Write pidfile BEFORE the ready sentinel so a `wait-ready` then `stop
-	// --pidfile X` sequence never races.
-	//
-	// Failure to write is fatal — the user opted into --pidfile expecting
-	// `cargowall stop` to work later; silently best-effort would leave them
-	// with a useful-looking startup but a broken teardown.
-	if cmd.Pidfile != "" {
-		if err := writePidfile(cmd.Pidfile, os.Getpid()); err != nil {
-			return fmt.Errorf("write pidfile %s: %w (cargowall stop --pidfile will not work)", cmd.Pidfile, err)
-		}
-		defer func() {
-			if err := os.Remove(cmd.Pidfile); err != nil && !errors.Is(err, os.ErrNotExist) {
-				logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", err)
-			}
-		}()
+	if startupInterrupted(ctx, logger, "pre-ready") {
+		return nil
 	}
 
-	if hooks != nil && hooks.Ready != nil {
+	switch {
+	case cmd.policyLockdown:
+		// Deliberately no ready sentinel: "ready" means the requested policy
+		// is enforced, and it is not. The failure sentinel written at config
+		// load tells the action why. The process stays alive on purpose —
+		// the runner remains deny-all locked down (fail-closed, with only
+		// the CI infrastructure auto-allows reachable) until the job tears
+		// it down, and shutdown runs the full teardown path instead of an
+		// abrupt exit.
+		logger.Error("CargoWall running in POLICY LOCKDOWN (default-deny; CI infrastructure auto-allows remain active) — ready sentinel withheld, see failure sentinel",
+			"failure_file", cmd.FailureFile)
+	case hooks != nil && hooks.Ready != nil:
 		if err := hooks.Ready(); err != nil {
 			return fmt.Errorf("ready hook failed: %w", err)
 		}
-	} else {
-		if err := os.WriteFile(cmd.ReadyFile, nil, 0o660); err != nil {
+		logger.Info("CargoWall ready")
+	default:
+		// writeSentinel, not a plain WriteFile: the ready sentinel is the
+		// most security-critical of the state files (a followed symlink here
+		// is a root-privileged truncation of an attacker-chosen target).
+		// The pid is stamped so a reader can distinguish this run's sentinel
+		// from a previous job's leftover — trusting a stale ready file is
+		// the fail-open direction (build runs with no firewall attached).
+		if err := writeSentinel(cmd.ReadyFile, []byte(fmt.Sprintf("pid=%d\n", os.Getpid()))); err != nil {
 			return fmt.Errorf("writing ready file %s: %w", cmd.ReadyFile, err)
 		}
+		// Remove it on the way out: a ready file that outlives its firewall
+		// is exactly what the stale-file hygiene at startup exists to undo,
+		// and the next run's cleanup cannot win a race against a concurrent
+		// wait-ready.
+		defer teardowns.add(func() {
+			if rerr := os.Remove(cmd.ReadyFile); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+				logger.Warn("Failed to remove ready sentinel on shutdown", "path", cmd.ReadyFile, "error", rerr)
+			}
+		})()
+		logger.Info("CargoWall ready")
 	}
 
-	logger.Info("CargoWall ready")
-
-	// Handle signals for graceful shutdown
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	<-c
+	// Block until the signal goroutine (armed at the top of startup) cancels
+	// the context on SIGINT/SIGTERM.
+	<-ctx.Done()
 
 	logger.Info("Shutting down TC firewall")
 
@@ -571,10 +752,219 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	return nil
 }
 
+// modeFile is where the effective enforcement mode ("enforce"/"audit") is
+// recorded for the action's summary step, which reads it to report the mode
+// in the workflow summary and push it to the SaaS. The path is hardcoded in
+// the cargowall-action repo too — keep them in sync. A var so tests can
+// redirect it.
+var modeFile = "/tmp/cargowall-mode"
+
+// downgradeFile carries a protojson-encoded CargoWallDowngrade record from
+// `cargowall start` to `cargowall summary` (separate process invocations),
+// which attaches it to the SaaS push so the dashboard can badge degraded
+// runs and count them by type/failure class without parsing prose. A var so
+// tests can redirect it; shared by the writer in handlePolicyFetchFailure
+// and the reader in pushToApi.
+var downgradeFile = "/tmp/cargowall-downgrade"
+
+// writeDowngradeFile records the structured downgrade for the summary push.
+func writeDowngradeFile(d *cargowallv1pb.CargoWallDowngrade, logger *slog.Logger) {
+	data, err := protojson.Marshal(d)
+	if err == nil {
+		err = writeSentinel(downgradeFile, data)
+	}
+	if err != nil {
+		logger.Warn("Failed to write downgrade file", "path", downgradeFile, "error", err)
+	}
+}
+
+// protoFetchFailureClass maps a retrieval-failure class to its wire enum.
+// Non-retrieval classes never produce a downgrade record, so they map to
+// UNSPECIFIED by construction.
+func protoFetchFailureClass(c PolicyFetchClass) datapb.CargoWallFetchFailureClass {
+	switch c {
+	case PolicyFetchTransport:
+		return datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_TRANSPORT
+	case PolicyFetchServer:
+		return datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_SERVER
+	case PolicyFetchMalformed:
+		return datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_MALFORMED
+	}
+	return datapb.CargoWallFetchFailureClass_CARGO_WALL_FETCH_FAILURE_CLASS_UNSPECIFIED
+}
+
+// downgradeRecord builds the CargoWallDowngrade for a retrieval failure.
+func downgradeRecord(typ datapb.CargoWallDowngradeType, fe *PolicyFetchError, detail string) *cargowallv1pb.CargoWallDowngrade {
+	d := &cargowallv1pb.CargoWallDowngrade{
+		Type:         typ,
+		FailureClass: protoFetchFailureClass(fe.Class),
+		Detail:       detail,
+	}
+	if fe.StatusCode != 0 {
+		status := uint32(fe.StatusCode)
+		d.HttpStatus = &status
+	}
+	return d
+}
+
+// teardownList holds the undo operations for host mutations (iptables DNAT,
+// daemon.json, sudoers, pidfile). Each add() wraps the undo in sync.OnceFunc
+// and returns it for the caller's defer, while also recording it so the
+// second-signal force path can run every registered undo — whichever path
+// executes first wins, the other is a no-op.
+type teardownList struct {
+	mu  sync.Mutex
+	fns []func()
+}
+
+// add registers an undo and returns the once-wrapped func for the caller to
+// defer.
+func (t *teardownList) add(fn func()) func() {
+	wrapped := sync.OnceFunc(fn)
+	t.mu.Lock()
+	t.fns = append(t.fns, wrapped)
+	t.mu.Unlock()
+	return wrapped
+}
+
+// forceAll runs every registered undo in reverse registration order
+// (mirroring defer LIFO). Safe against concurrent defer execution: each undo
+// runs at most once across both paths.
+//
+// It loops until the list stops growing rather than iterating one snapshot:
+// startup registers undos as it goes, so a snapshot taken while main is
+// mid-mutation would permanently skip whatever registers next — leaving the
+// runner with the very state (restricted sudoers, orphaned clsact filter)
+// this path exists to undo.
+func (t *teardownList) forceAll() {
+	for done := 0; ; {
+		t.mu.Lock()
+		fns := slices.Clone(t.fns)
+		t.mu.Unlock()
+		if len(fns) == done {
+			return
+		}
+		for i := len(fns) - 1; i >= done; i-- {
+			fns[i]()
+		}
+		done = len(fns)
+	}
+}
+
+// startupInterrupted reports whether a shutdown signal arrived while startup
+// was still in progress. Callers return nil and unwind through their defers
+// (DNS redirect, Docker DNS, sudoers) instead of continuing to bring the
+// firewall up — the action has already given up on this process, so finishing
+// startup would only delay handing back a clean runner.
+func startupInterrupted(ctx context.Context, logger *slog.Logger, phase string) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	logger.Info("Shutdown requested during startup — unwinding", "phase", phase)
+	return true
+}
+
+// removeStaleStateFiles clears the state files a previous run may have left
+// behind, warning (not failing) on anything but absence.
+func removeStaleStateFiles(cmd *StartCmd, logger *slog.Logger) {
+	for _, path := range []string{cmd.ReadyFile, cmd.FailureFile, modeFile, downgradeFile} {
+		if path == "" {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("Failed to remove stale state file", "path", path, "error", err)
+		}
+	}
+}
+
+// maxSentinelReasonBytes bounds a reason written into a state file: the text
+// can carry an eBPF verifier dump or an attacker-influenced API body, and it
+// is echoed verbatim into CI logs by the consumer.
+const maxSentinelReasonBytes = 4096
+
+// writeFailureSentinel publishes the failure sentinel: the writer's pid on
+// the first line (so a reader can tell THIS run's sentinel from a previous
+// run's leftover by comparing against the pidfile, which mtime alone cannot
+// do after a SIGKILL), then a bounded, control-character-stripped reason —
+// unsanitized text here reaches CI logs, where an embedded newline plus a
+// `::`-prefixed line is a workflow-command injection.
+func writeFailureSentinel(path, reason string) error {
+	return writeSentinel(path, []byte(fmt.Sprintf("pid=%d\n%s\n", os.Getpid(), sanitizeReason(reason))))
+}
+
+// sanitizeReason bounds a reason and strips control characters (including
+// newlines) so it can never start a log line at the consumer.
+func sanitizeReason(s string) string {
+	truncated := false
+	if len(s) > maxSentinelReasonBytes {
+		s = s[:maxSentinelReasonBytes]
+		truncated = true
+	}
+	s = strings.ToValidUTF8(s, "�")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+	if truncated {
+		s += "... (truncated)"
+	}
+	return s
+}
+
+// writeSentinel atomically publishes a state file: the content is written to
+// a private temp file in the same directory and renamed into place. These
+// files are written as root into world-writable /tmp, and rename replaces
+// whatever occupies the path — an attacker-planted symlink or plain file —
+// without ever following it. Atomic publication also means a concurrent
+// poller (the action's wait loop, `cargowall wait-ready`) can never observe
+// a partially-written file.
+func writeSentinel(path string, content []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once the rename has succeeded
+	if _, err := f.Write(content); err != nil {
+		f.Close()
+		return err
+	}
+	// CreateTemp uses 0600; the readers (action wait loop, summary step) may
+	// be unprivileged.
+	if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// writeModeFile records the effective enforcement mode for the action's
+// summary step. Written on both the API-success and fallback paths — a job
+// downgraded to audit by --api-failure-mode=audit must not keep reporting
+// "enforce" in the workflow summary and dashboard. Best-effort: a failed
+// write only costs summary accuracy, but leave a trace for the day the
+// summary step reports a stale posture.
+func writeModeFile(auditMode bool, logger *slog.Logger) {
+	mode := "enforce"
+	if auditMode {
+		mode = "audit"
+	}
+	if err := writeSentinel(modeFile, []byte(mode)); err != nil {
+		logger.Debug("Failed to write effective-mode file", "path", modeFile, "error", err)
+	}
+}
+
 // loadCIConfig handles CI config priority:
 // (1) SaaS API fetch + bootstrap + mode override + state file,
 // (2) env vars, (3) config file. Calls EnsureDNSAllowed at end.
-// Returns true if SaaS API policy was loaded. Mutates cmd.AuditMode in place.
+// Returns true if SaaS API policy was loaded. Posture changes land on
+// configMgr (the single source of truth); under --api-failure-mode=fail
+// cmd.policyLockdown is set in place.
 func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, dockerBridgeIP string, logger *slog.Logger) bool {
 	logger.Info("Running in CI mode", "mode", string(cmd.CIMode()))
 
@@ -583,43 +973,40 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 	// Priority 1: SaaS API (when api-url + token are set)
 	if cmd.ApiUrl != "" && cmd.Token != "" {
 		// Bootstrap an empty config so EnsureHostnameAllowed can add rules
-		// before the real policy is loaded. The API hostname must be
-		// allowed through DNS filtering for the policy fetch to succeed.
+		// before the real policy is loaded. Unconditional: every
+		// Ensure*Allowed helper no-ops while cm.config is nil, so skipping
+		// this for a hostname-less api-url would leave lockdown (which also
+		// skips the env/file fallback) with a nil config — a total
+		// blackhole with no DNS or infra allows, contradicting the
+		// documented "CI infrastructure auto-allows remain active".
+		configMgr.LoadConfigFromRules(nil, config.ActionDeny)
+		// The API hostname must be allowed through DNS filtering for the
+		// policy fetch to succeed.
 		if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
-			configMgr.LoadConfigFromRules(nil, config.ActionDeny)
 			configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
 		}
 
 		logger.Info("Fetching policy from CodeCargo API", "api_url", cmd.ApiUrl, "job_key", cmd.JobKey, "version", cmd.Version)
 		policy, err := fetchPolicyFromAPI(ctx, cmd.ApiUrl, cmd.Token, cmd.JobKey, cmd.Version)
-		if err != nil {
-			logger.Warn("API policy fetch failed, falling back to env/file config", "error", err)
-		} else {
+		if err == nil {
 			if policyJSON, jsonErr := protojson.Marshal(policy); jsonErr == nil {
 				logger.Info("Raw policy from API", "policy", string(policyJSON))
 			}
-			if err := configMgr.LoadConfigFromCargoWall(policy); err != nil {
-				logger.Warn("Failed to load API policy into config, falling back to env/file config", "error", err)
+			if loadErr := configMgr.LoadConfigFromCargoWall(policy); loadErr != nil {
+				// A policy we can't load is as good as one we couldn't
+				// retrieve — classify it malformed so the failure-mode
+				// handling below treats both identically.
+				err = &PolicyFetchError{Class: PolicyFetchMalformed, err: loadErr}
 			} else {
-				// Override audit mode from the API response's mode field
-				switch policy.Mode {
-				case datapb.CargoWallMode_CARGO_WALL_MODE_AUDIT:
-					cmd.AuditMode = true
-				case datapb.CargoWallMode_CARGO_WALL_MODE_ENFORCE:
-					cmd.AuditMode = false
-				}
-				// Update the audit logger with the mode from the SaaS policy,
-				// since it was created before the policy was fetched.
+				// LoadConfigFromCargoWall mapped the policy's mode onto the
+				// manager's posture; re-sync the audit logger's event
+				// labeling, which was configured before the fetch.
 				if auditLogger != nil {
-					auditLogger.SetAuditMode(cmd.AuditMode)
+					auditLogger.SetAuditMode(configMgr.IsAuditMode())
 				}
-				// Write effective mode to a state file so the summary
-				// step picks up the SaaS-overridden value.
-				modeStr := "enforce"
-				if cmd.AuditMode {
-					modeStr = "audit"
-				}
-				_ = os.WriteFile("/tmp/cargowall-mode", []byte(modeStr), 0o644)
+				// Record the effective mode so the summary step picks up
+				// the SaaS-overridden value.
+				writeModeFile(configMgr.IsAuditMode(), logger)
 
 				apiPolicyLoaded = true
 				logger.Info("Policy loaded from CodeCargo API",
@@ -628,10 +1015,21 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 					"rules", len(policy.Rules))
 			}
 		}
+		if err != nil {
+			if ctx.Err() != nil {
+				// The fetch died because a shutdown signal cancelled the
+				// context, not because of the network — don't misreport a
+				// posture change (or write sentinels) while unwinding.
+				return false
+			}
+			handlePolicyFetchFailure(cmd, configMgr, auditLogger, err, logger)
+		}
 	}
 
-	// Priority 2: env vars, Priority 3: config file
-	if !apiPolicyLoaded {
+	// Priority 2: env vars, Priority 3: config file. Skipped in policy
+	// lockdown: --api-failure-mode=fail means "do not trust local config",
+	// so the deny-all bootstrap loaded before the fetch stays in force.
+	if !apiPolicyLoaded && !cmd.policyLockdown {
 		if err := configMgr.LoadFromEnv(); err != nil {
 			logger.Debug("No environment config found, trying file", "error", err)
 			if err := configMgr.LoadConfig(cmd.Config); err != nil {
@@ -653,6 +1051,96 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 	configMgr.EnsureDNSAllowed(dnsIPs)
 
 	return apiPolicyLoaded
+}
+
+// handlePolicyFetchFailure applies the --api-failure-mode posture to a failed
+// policy fetch. Only genuine retrieval failures (transport/server/malformed)
+// may change posture; an authoritative "not onboarded" 404, a rejected token,
+// or an inactive repository always keeps today's env/file fallback regardless
+// of the flag — the default api-url is attempted on every run, and a naive
+// "any error → audit" would silently disable enforcement for every user
+// without a CodeCargo account. Under "fail" the process deliberately keeps
+// running: it enters policy lockdown (deny-all, ready sentinel withheld,
+// failure sentinel written) instead of aborting, so the worst case is an
+// over-blocked build rather than an unprotected one.
+func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, fetchErr error, logger *slog.Logger) {
+	var fe *PolicyFetchError
+	if !errors.As(fetchErr, &fe) || !fe.Class.IsRetrievalFailure() {
+		attrs := []any{"error", fetchErr}
+		if fe != nil {
+			attrs = append(attrs, "class", fe.Class, "status", fe.StatusCode)
+		}
+		if fe != nil && fe.Class == PolicyFetchUnauthorized {
+			// Louder than the generic fallback: a rejected token is a
+			// configuration error the user needs to fix, not an outage.
+			logger.Error("CodeCargo API rejected the token — check CODECARGO_AUTH_TOKEN; using env/file config", attrs...)
+		} else {
+			logger.Warn("No API policy for this run, using env/file config", attrs...)
+		}
+		// No mode file here: absence has always meant "no SaaS policy in
+		// play" to the summary step, and the everyday not-onboarded case
+		// must keep that contract.
+		return
+	}
+
+	attrs := []any{"class", fe.Class, "status", fe.StatusCode, "error", fetchErr}
+	switch cmd.ApiFailureMode {
+	case ApiFailureModeFail:
+		cmd.policyLockdown = true
+		configMgr.SetAuditMode(false)
+		// Re-sync the audit logger's event labeling (would_deny vs deny) —
+		// enforcement posture itself lives on configMgr, which the DNS proxy
+		// consults directly.
+		if auditLogger != nil {
+			auditLogger.SetAuditMode(false)
+		}
+		logger.Error("API policy fetch failed — entering policy lockdown (--api-failure-mode=fail): default-deny with only CI infrastructure auto-allows, local config ignored, ready sentinel withheld", attrs...)
+		reason := fmt.Sprintf("cargowall entered policy lockdown (default-deny; CI infrastructure auto-allows remain active): policy fetch from %s failed (%s) and --api-failure-mode=fail: %v", cmd.ApiUrl, fe.Class, fetchErr)
+		// SEMANTICS: the sentinel is published at the DECISION, not at
+		// enforcement. TC attach happens well after config load (DNS
+		// pre-population and the Docker restart sit in between), so a
+		// consumer must read this file as "cargowall will lock down and
+		// will never become ready" — NOT "deny-all is already enforcing".
+		// Publishing after attach would be the stronger guarantee, but it
+		// would land past wait-ready's 30s default and defeat the
+		// fail-fast purpose; the intended flow (the watcher fails the job
+		// on this sentinel, so no build steps run) makes the pre-attach
+		// window harmless.
+		if cmd.FailureFile != "" {
+			if werr := writeFailureSentinel(cmd.FailureFile, reason); werr != nil {
+				logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
+			}
+		}
+		// Also recorded as a structured downgrade: if the action lets the
+		// job proceed (or the post step runs before teardown), the summary
+		// push tells the dashboard the run was locked down and why.
+		writeDowngradeFile(downgradeRecord(datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_LOCKDOWN, fe, reason), logger)
+		// No mode file: lockdown is not a SaaS-resolved posture, and the
+		// failure sentinel already carries the state the action needs.
+		return
+	case ApiFailureModeAudit:
+		configMgr.SetAuditMode(true)
+		// Re-sync the audit logger, which was constructed from the initial
+		// flag before config load (the API-success path does the same).
+		if auditLogger != nil {
+			auditLogger.SetAuditMode(true)
+		}
+		// Record the downgrade so the summary push can carry it to the
+		// SaaS dashboard.
+		reason := fmt.Sprintf("downgraded to audit mode: policy could not be retrieved from %s (%s): %v", cmd.ApiUrl, fe.Class, fetchErr)
+		writeDowngradeFile(downgradeRecord(datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK, fe, reason), logger)
+		// The mode file is written ONLY here among the fallback branches:
+		// its contract is "present iff the effective posture diverges from
+		// what the flags requested via a SaaS-derived decision". The local
+		// fallback runs at exactly the posture the action already knows, so
+		// writing "enforce" there would report a SaaS-resolved posture the
+		// SaaS never produced — and differ from the identical env/file
+		// outcome after a 404, which correctly writes nothing.
+		writeModeFile(configMgr.IsAuditMode(), logger)
+		logger.Warn("API policy fetch failed — downgrading to audit mode (--api-failure-mode=audit)", attrs...)
+	default: // ApiFailureModeLocal
+		logger.Warn("API policy fetch failed, falling back to env/file config", attrs...)
+	}
 }
 
 // applyAutoAllowHelpers invokes each enabled auto-allow helper and updates
@@ -911,13 +1399,14 @@ func autoAllowCodeCargoAPI(apiURL string, configMgr *config.Manager, logger *slo
 
 // reverseDNSExistingConnections performs reverse DNS lookups for each
 // scanned existing-connection IP via the cache resolver, updating the config
-// manager's DNS mappings.
-func reverseDNSExistingConnections(conns existingConns, configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) {
+// manager's DNS mappings. Derives from ctx so a startup-window shutdown
+// signal drains the lookup loop promptly.
+func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) {
 	if len(conns) == 0 {
 		return
 	}
 
-	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	lookupCtx, lookupCancel := context.WithTimeout(ctx, 10*time.Second)
 	for ip := range conns {
 		rCtx, rCancel := context.WithTimeout(lookupCtx, 1*time.Second)
 		if names, err := cacheResolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
@@ -935,11 +1424,11 @@ func reverseDNSExistingConnections(conns existingConns, configMgr *config.Manage
 // so that connections established before cargowall started are not incorrectly
 // blocked. Phase 1 queries systemd-resolved's stub for cached IPs and pushes
 // them into BPF maps. Phase 2 resolves through the DNS proxy for round-robin IPs.
-func prePopulateDNSCache(configMgr *config.Manager, dnsServer *dns.Server, cacheResolver *net.Resolver, logger *slog.Logger) {
+func prePopulateDNSCache(ctx context.Context, configMgr *config.Manager, dnsServer *dns.Server, cacheResolver *net.Resolver, logger *slog.Logger) {
 	// Phase 1: Query systemd-resolved's stub listener (127.0.0.53) to get
 	// the CACHED IPs — the exact IPs running processes are currently using.
 	// This is loopback traffic so the BPF TC filter on eth0 doesn't touch it.
-	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	cacheCtx, cacheCancel := context.WithTimeout(ctx, 10*time.Second)
 	for hostname := range configMgr.GetTrackedHostnames() {
 		lookupCtx, lookupCancel := context.WithTimeout(cacheCtx, 2*time.Second)
 		if ips, err := cacheResolver.LookupHost(lookupCtx, hostname); err == nil {
@@ -966,7 +1455,7 @@ func prePopulateDNSCache(configMgr *config.Manager, dnsServer *dns.Server, cache
 			return d.DialContext(ctx, "udp", "127.0.0.1:53")
 		},
 	}
-	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	resolveCtx, resolveCancel := context.WithTimeout(ctx, 15*time.Second)
 	for hostname := range configMgr.GetTrackedHostnames() {
 		lookupCtx, lookupCancel := context.WithTimeout(resolveCtx, 3*time.Second)
 		if _, err := resolver.LookupHost(lookupCtx, hostname); err != nil {
@@ -1069,17 +1558,23 @@ func parseSudoAllowCommands(input string, logger *slog.Logger) []string {
 // enableSudoLockdown parses allowed commands from cmd.SudoAllowCommands,
 // builds a lockdown config, and enables sudo lockdown. Returns whether
 // lockdown was successfully enabled and the config (for cleanup).
-func enableSudoLockdown(cmd *StartCmd, logger *slog.Logger) (bool, *lockdown.SudoLockdownConfig) {
-	cfg := &lockdown.SudoLockdownConfig{
+func sudoLockdownConfig(cmd *StartCmd, logger *slog.Logger) *lockdown.SudoLockdownConfig {
+	return &lockdown.SudoLockdownConfig{
 		AllowCommands: parseSudoAllowCommands(cmd.SudoAllowCommands, logger),
 		Username:      "", // Auto-detect
 	}
+}
+
+// enableSudoLockdown applies the lockdown. The caller registers the undo
+// against the same config BEFORE calling this, so a signal landing mid-write
+// can never strand the runner with a restricted sudoers file.
+func enableSudoLockdown(cfg *lockdown.SudoLockdownConfig, logger *slog.Logger) bool {
 	if err := lockdown.EnableSudoLockdown(cfg, logger); err != nil {
 		logger.Warn("Failed to enable sudo lockdown", "error", err)
 		// Continue without lockdown - it's a hardening feature, not critical
-		return false, cfg
+		return false
 	}
-	return true, cfg
+	return true
 }
 
 // detectSystemdResolvedUpstreams reads /run/systemd/resolve/resolv.conf

@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+option csharp_namespace = "Controller.Data.Pb.CargoWall.V1";
+option go_package = "github.com/code-cargo/cargowall/pb/cargowall/v1/data";
+
+package grpc.cargowall.v1;
+
+// Why the policy could not be retrieved. Only genuine retrieval failures
+// appear here by construction: authoritative answers (404 not-onboarded,
+// 401/403 bad token, 400 inactive repository) never change posture and so
+// never produce a downgrade record.
+enum CargoWallFetchFailureClass {
+  CARGO_WALL_FETCH_FAILURE_CLASS_UNSPECIFIED = 0;
+  // No HTTP response: connect/timeout/body-read failure.
+  CARGO_WALL_FETCH_FAILURE_CLASS_TRANSPORT = 1;
+  // Server-side failure: 5xx, 429, or an unexpected status.
+  CARGO_WALL_FETCH_FAILURE_CLASS_SERVER = 2;
+  // The response could not be parsed or loaded as a policy.
+  CARGO_WALL_FETCH_FAILURE_CLASS_MALFORMED = 3;
+}

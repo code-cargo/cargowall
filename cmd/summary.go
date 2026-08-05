@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -162,6 +163,16 @@ func (c *SummaryCmd) Run() error {
 func (c *SummaryCmd) readAuditLog() ([]events.AuditEvent, error) {
 	file, err := os.Open(c.AuditLog)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No audit log at all — e.g. the action ran `start` without
+			// --audit-log (audit-summary: false). The push must still
+			// happen: the job record, effective mode, status, version, and
+			// any downgrade record are independent of event collection, and
+			// dropping them made every audit-summary:false job invisible to
+			// the dashboard.
+			slog.Info("Audit log absent — proceeding with zero events", "path", c.AuditLog)
+			return nil, nil
+		}
 		return nil, err
 	}
 	defer file.Close()
@@ -647,6 +658,11 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 		req.Version = &c.Version
 	}
 
+	// Carry the downgrade record left by `cargowall start` (a separate
+	// process invocation) so the dashboard can badge degraded runs and
+	// count them by type/failure class.
+	req.Downgrade = readDowngrade()
+
 	// Set timestamps from first/last events
 	if len(allEvents) > 0 {
 		req.StartedAt = timestamppb.New(allEvents[0].Timestamp)
@@ -668,15 +684,19 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.Token)
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	// Bounded like the policy fetch: api-url is user-supplied, and a hung
+	// endpoint would otherwise block the post step until the job timeout,
+	// losing the summary push entirely.
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to push audit results to API: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxPolicyResponseBytes))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("API returned non-OK status %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("API returned non-OK status %d: %s", resp.StatusCode, truncateForError(body))
 	}
 
 	var result cargowallv1.CreateCargoWallActionJobResponse
@@ -692,6 +712,27 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 		"workflow_run_id", result.WorkflowRunId,
 		"workflow_run_link", result.WorkflowRunUrl)
 	return result.WorkflowRunUrl, nil
+}
+
+// readDowngrade returns the downgrade record written by `cargowall start`,
+// or nil when the run executed at its requested posture (file absent).
+// Best-effort by design: a corrupt record is dropped rather than failing
+// the push, but leaves a trace for the day a downgrade mysteriously never
+// reaches the dashboard.
+func readDowngrade() *cargowallv1.CargoWallDowngrade {
+	// Read defensively like the sentinel readers: the path is fixed and
+	// world-writable, so a planted symlink (e.g. to /dev/zero) or an
+	// oversized file must not be followed or slurped.
+	sf, ok := readStateFile(downgradeFile)
+	if !ok {
+		return nil
+	}
+	var d cargowallv1.CargoWallDowngrade
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(sf.data, &d); err != nil {
+		slog.Debug("Downgrade record unreadable — omitting from push", "path", downgradeFile, "error", err)
+		return nil
+	}
+	return &d
 }
 
 func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {

@@ -1,0 +1,602 @@
+name: api-failure-e2e
+
+# End-to-end verification of --api-failure-mode (#96) on a real runner: the
+# actual binary, real eBPF TC attach, real iptables DNS redirect, and a local
+# mock of the CodeCargo policy API driving each failure class.
+#
+# Jobs (each on a fresh VM so scenarios can't contaminate each other):
+#   audit-downgrade  retrieval failure + audit → firewall up, mode file says
+#                    audit, downgrade reason recorded, traffic not blocked
+#   fail-lockdown    retrieval failure + fail → process stays ALIVE in
+#                    deny-all, failure sentinel written, ready withheld,
+#                    wait-ready fails fast with the reason, clean teardown
+#   not-onboarded    404 + fail → must NOT lock down; env/file config runs
+#   sigterm-unwind   SIGTERM while the fetch hangs mid-startup → defers run:
+#                    no leaked DNAT rules, no misreported sentinels, DNS works
+#   double-sigterm-  a SECOND SIGTERM during a slow graceful unwind → the
+#   force            force path restores every host mutation (sudoers, DNAT,
+#                    daemon.json, TC filter) before exiting
+#
+# NOTE: like otel-e2e, these jobs must NOT start with
+# code-cargo/cargowall-action — each job runs its own cargowall instance and
+# two instances would fight over the TC hook and DNS redirect.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "cmd/**"
+      - "pkg/config/**"
+      - "pkg/dns/**"
+      # sigterm-unwind exists to prove pkg/network's DNAT teardown runs, and
+      # fail-lockdown asserts pkg/firewall enforcement — changes there must
+      # run the jobs written to cover them.
+      - "pkg/network/**"
+      - "pkg/firewall/**"
+      # the legacy-clsact teardown these jobs protect lives in pkg/tc
+      - "pkg/tc/**"
+      - "bpf/**"
+      - ".github/workflows/api-failure-e2e.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: api-failure-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  audit-downgrade:
+    name: Retrieval failure downgrades to audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Shared by both binaries: `start` binds it via kong env, and
+    # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build cargowall
+        run: make build
+
+      - name: Start mock policy API (always 500)
+        run: |
+          nohup python3 -c '
+          import http.server
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(500); self.end_headers(); self.wfile.write(b"boom")
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()
+          ' > /tmp/mockapi.log 2>&1 &
+          # Bind probe, not a bare sleep: a slow-to-bind mock would turn the
+          # intended 500 into ECONNREFUSED and fail the assertion below.
+          for i in $(seq 1 15); do
+            curl -s -o /dev/null http://127.0.0.1:18080 && break
+            sleep 1
+          done
+          curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080 | grep -q 500
+
+      - name: Start cargowall (api-failure-mode=audit)
+        run: |
+          sudo -E ./bin/cargowall start \
+            --github-action \
+            --dns-upstream 8.8.8.8:53 \
+            --api-url http://127.0.0.1:18080 \
+            --token dummy-token \
+            --api-failure-mode audit \
+            --audit-log /tmp/cargowall.ndjson \
+            --pidfile /tmp/cargowall.pid > /tmp/cargowall.log 2>&1 &
+          ./bin/cargowall wait-ready --timeout 90s
+
+      - name: Assert audit downgrade surfaced to state files
+        run: |
+          test "$(cat /tmp/cargowall-mode)" = "audit" \
+            || { echo "::error::mode file must say audit, got: $(cat /tmp/cargowall-mode 2>&1)"; exit 1; }
+          # Structured downgrade record: protojson CargoWallDowngrade with
+          # type + failure class + human-readable detail.
+          grep -q "CARGO_WALL_DOWNGRADE_TYPE_AUDIT_FALLBACK" /tmp/cargowall-downgrade \
+            || { echo "::error::downgrade record missing or wrong type"; cat /tmp/cargowall-downgrade 2>&1; exit 1; }
+          grep -q "CARGO_WALL_FETCH_FAILURE_CLASS_SERVER" /tmp/cargowall-downgrade \
+            || { echo "::error::downgrade record must carry the failure class"; exit 1; }
+          grep -q "downgraded to audit mode" /tmp/cargowall-downgrade \
+            || { echo "::error::downgrade record must carry the human-readable detail"; exit 1; }
+          test ! -f /tmp/cargowall-failed \
+            || { echo "::error::failure sentinel must not exist in audit mode"; exit 1; }
+
+      - name: Assert audit mode logs but does not block
+        run: |
+          # example.com matches no rule: in audit mode the lookup and the
+          # connection must both succeed, and the event must land in the log.
+          curl -sS --max-time 20 -o /dev/null https://example.com
+          sleep 2
+          grep -q "example.com" /tmp/cargowall.ndjson \
+            || { echo "::error::no audit event recorded for example.com"; exit 1; }
+
+      - name: Stop cargowall
+        run: sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
+
+      # Second leg: the field-reported configuration (`audit-summary: false`
+      # → the action omits --audit-log). Audit posture must be honoured by
+      # BOTH datapaths with no audit logger present — a name outside the
+      # policy must resolve AND connect. This is the regression where a
+      # logging toggle disabled audit mode in DNS query filtering.
+      - name: Clear state files between runs (the action does this per job)
+        run: sudo rm -f /tmp/cargowall-ready /tmp/cargowall-failed /tmp/cargowall-mode /tmp/cargowall-downgrade /tmp/cargowall.pid
+
+      - name: Start cargowall again WITHOUT --audit-log (audit-summary:false shape)
+        run: |
+          sudo -E ./bin/cargowall start \
+            --github-action \
+            --dns-upstream 8.8.8.8:53 \
+            --api-url http://127.0.0.1:18080 \
+            --token dummy-token \
+            --api-failure-mode audit \
+            --pidfile /tmp/cargowall.pid > /tmp/cargowall-noauditlog.log 2>&1 &
+          ./bin/cargowall wait-ready --timeout 90s
+
+      - name: Assert audit mode is honoured without an audit logger
+        run: |
+          test "$(cat /tmp/cargowall-mode)" = "audit" \
+            || { echo "::error::mode file must say audit, got: $(cat /tmp/cargowall-mode 2>&1)"; exit 1; }
+          # The reported symptom was NXDOMAIN/REFUSED on every non-policy
+          # name: resolution and connection must both succeed in audit mode.
+          curl -sS --max-time 20 -o /dev/null https://example.com \
+            || { echo "::error::audit mode without --audit-log must not block (DNS or TC)"; exit 1; }
+
+      - name: Stop cargowall (second leg)
+        run: sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: audit-downgrade-logs
+          path: |
+            /tmp/cargowall.log
+            /tmp/cargowall-noauditlog.log
+            /tmp/cargowall.ndjson
+            /tmp/mockapi.log
+          if-no-files-found: ignore
+
+  fail-lockdown:
+    name: Retrieval failure locks down under fail
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Shared by both binaries: `start` binds it via kong env, and
+    # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build cargowall
+        run: make build
+
+      - name: Start mock policy API (always 500)
+        run: |
+          nohup python3 -c '
+          import http.server
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(500); self.end_headers(); self.wfile.write(b"boom")
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()
+          ' > /tmp/mockapi.log 2>&1 &
+          # Probe readiness: a slow-to-bind mock would turn the intended 500
+          # into an ECONNREFUSED transport failure — same posture here, but
+          # keep the failure class the job claims to test honest.
+          for i in $(seq 1 15); do
+            curl -s -o /dev/null http://127.0.0.1:18080 && break
+            sleep 1
+          done
+
+      - name: Start cargowall (api-failure-mode=fail) — wait-ready must fail fast with the reason
+        run: |
+          sudo -E ./bin/cargowall start \
+            --github-action \
+            --dns-upstream 8.8.8.8:53 \
+            --api-url http://127.0.0.1:18080 \
+            --token dummy-token \
+            --api-failure-mode fail \
+            --pidfile /tmp/cargowall.pid > /tmp/cargowall.log 2>&1 &
+          set +e
+          out=$(./bin/cargowall wait-ready --timeout 90s 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          test $rc -ne 0 || { echo "::error::wait-ready must fail in lockdown"; exit 1; }
+          echo "$out" | grep -q "policy lockdown" \
+            || { echo "::error::wait-ready error must carry the sentinel reason"; exit 1; }
+
+      - name: Assert lockdown state (sentinels, liveness)
+        run: |
+          grep -q "policy lockdown" /tmp/cargowall-failed \
+            || { echo "::error::failure sentinel missing or without reason"; exit 1; }
+          test ! -f /tmp/cargowall-ready \
+            || { echo "::error::ready sentinel must be withheld in lockdown"; exit 1; }
+          test ! -f /tmp/cargowall-mode \
+            || { echo "::error::mode file must not be written in lockdown"; exit 1; }
+          # The process must be ALIVE — the pidfile is written at process
+          # entry, so this is purely a liveness handle, not a startup gate.
+          test -f /tmp/cargowall.pid \
+            || { echo "::error::pidfile missing"; exit 1; }
+          sudo kill -0 "$(cat /tmp/cargowall.pid)" \
+            || { echo "::error::cargowall must stay alive in lockdown"; exit 1; }
+
+      - name: Assert deny-all enforcement
+        run: |
+          # The failure sentinel unblocks wait-ready during config load, but
+          # the TC attach happens later (prepopulate + Docker restart sit in
+          # between) — retry until enforcement engages instead of racing it.
+          for i in $(seq 1 12); do
+            if ! curl -sS --max-time 10 -o /dev/null https://example.com; then
+              echo "example.com correctly blocked"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::example.com still reachable after ~60s — lockdown is not enforcing"; exit 1
+
+      - name: Stop cargowall and assert clean teardown
+        run: |
+          sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
+          if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
+            echo "::error::DNS DNAT rules leaked after stop"; exit 1
+          fi
+          getent hosts example.com > /dev/null \
+            || { echo "::error::DNS broken after teardown"; exit 1; }
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fail-lockdown-logs
+          path: |
+            /tmp/cargowall.log
+            /tmp/mockapi.log
+          if-no-files-found: ignore
+
+  not-onboarded:
+    name: 404 must not change posture even under fail
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Shared by both binaries: `start` binds it via kong env, and
+    # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build cargowall
+        run: make build
+
+      - name: Start mock policy API (always 404)
+        run: |
+          nohup python3 -c '
+          import http.server
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(404); self.end_headers(); self.wfile.write(b"not onboarded")
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()
+          ' > /tmp/mockapi.log 2>&1 &
+          # Probe readiness: this job's whole point is the 404 class — a
+          # slow-to-bind mock would produce a transport failure instead,
+          # which IS a retrieval failure and would lock the run down,
+          # inverting what the job proves.
+          for i in $(seq 1 15); do
+            curl -s -o /dev/null http://127.0.0.1:18080 && break
+            sleep 1
+          done
+          curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080 | grep -q 404
+
+      - name: Write local firewall policy
+        run: |
+          sudo mkdir -p /etc/cargowall
+          sudo tee /etc/cargowall/config.json > /dev/null <<'EOF'
+          {
+            "defaultAction": "deny",
+            "rules": [
+              {"type":"hostname","value":"example.com","ports":[{"port":443,"protocol":"tcp"}],"action":"allow"},
+              {"type":"cidr","value":"8.8.8.8/32","ports":[{"port":53,"protocol":"udp"}],"action":"allow"}
+            ]
+          }
+          EOF
+
+      - name: Start cargowall (404 + api-failure-mode=fail) — must come up on local config
+        run: |
+          sudo -E ./bin/cargowall start \
+            --github-action \
+            --config /etc/cargowall/config.json \
+            --dns-upstream 8.8.8.8:53 \
+            --api-url http://127.0.0.1:18080 \
+            --token dummy-token \
+            --api-failure-mode fail \
+            --pidfile /tmp/cargowall.pid > /tmp/cargowall.log 2>&1 &
+          ./bin/cargowall wait-ready --timeout 90s
+
+      - name: Assert no posture change and local config in force
+        run: |
+          test ! -f /tmp/cargowall-failed \
+            || { echo "::error::404 must not trigger lockdown"; exit 1; }
+          test ! -f /tmp/cargowall-mode \
+            || { echo "::error::mode file must be absent when no SaaS policy is in play"; exit 1; }
+          # Local config allows example.com and denies everything else.
+          curl -sS --max-time 20 -o /dev/null https://example.com \
+            || { echo "::error::example.com is allowed by local config and must work"; exit 1; }
+          if curl -sS --max-time 15 -o /dev/null https://httpbin.org; then
+            echo "::error::httpbin.org must be denied by the local deny-all default"; exit 1
+          fi
+
+      - name: Stop cargowall
+        run: sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: not-onboarded-logs
+          path: |
+            /tmp/cargowall.log
+            /tmp/mockapi.log
+          if-no-files-found: ignore
+
+  sigterm-unwind:
+    name: SIGTERM mid-fetch unwinds host mutations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Shared by both binaries: `start` binds it via kong env, and
+    # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build cargowall
+        run: make build
+
+      - name: Start hanging policy API (accepts, never responds)
+        run: |
+          nohup python3 -c '
+          import socket
+          conns = []
+          s = socket.socket()
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(("127.0.0.1", 18080)); s.listen(16)
+          while True:
+              c, _ = s.accept(); conns.append(c)
+          ' > /tmp/mockapi.log 2>&1 &
+          # Probe with a bare TCP connect (curl would hang on this server):
+          # if the port isn't bound yet, cargowall's fetch fails fast with
+          # ECONNREFUSED instead of hanging, and the SIGTERM below could land
+          # after the failure sentinel is written — breaking the "cancelled
+          # fetch must not be misreported" assertion.
+          for i in $(seq 1 15); do
+            timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/18080' && break
+            sleep 1
+          done
+
+      - name: SIGTERM cargowall while the fetch hangs, assert clean unwind
+        run: |
+          sudo -E ./bin/cargowall start \
+            --github-action \
+            --dns-upstream 8.8.8.8:53 \
+            --api-url http://127.0.0.1:18080 \
+            --token dummy-token \
+            --api-failure-mode fail \
+            --pidfile /tmp/cargowall.pid > /tmp/cargowall.log 2>&1 &
+          CARGO=$!
+
+          # Wait for the DNS redirect to be installed — proof we are past the
+          # host mutations and inside the (hanging, ~10s) policy fetch.
+          # Poll at 200ms: the hanging fetch only holds startup for the 10s
+          # policyFetchTotalBudget, so a 1s-granularity poll plus command
+          # overhead could let lockdown be decided before the kill lands.
+          for i in $(seq 1 150); do
+            sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' && break
+            sleep 0.2
+          done
+          sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' \
+            || { echo "::error::DNS redirect never appeared"; cat /tmp/cargowall.log; exit 1; }
+
+          # $CARGO is sudo's pid; the REAL cargowall pid is in the pidfile
+          # (written at process entry). Signal through sudo (it forwards),
+          # but assert liveness on the real process — asserting on sudo would
+          # only prove the wrapper exited.
+          CARGO_REAL=$(cat /tmp/cargowall.pid)
+          sudo kill "$CARGO"
+          # The unwind runs the registered defers; give it a bounded window.
+          # (ps, not `kill -0`: the process is root-owned, so kill -0 from
+          # this shell would report EPERM and fake an exit.)
+          for i in $(seq 1 30); do
+            ps -p "$CARGO_REAL" > /dev/null 2>&1 || break
+            sleep 1
+          done
+          if ps -p "$CARGO_REAL" > /dev/null 2>&1; then
+            echo "::error::cargowall did not exit after SIGTERM"; exit 1
+          fi
+
+      - name: Assert host state restored and no misreported sentinels
+        run: |
+          if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
+            echo "::error::DNAT rules leaked — startup SIGTERM did not run teardown"; exit 1
+          fi
+          # The cancelled fetch must not be misreported as an outage: even
+          # with api-failure-mode=fail, no failure sentinel may be written.
+          test ! -f /tmp/cargowall-failed \
+            || { echo "::error::cancelled fetch misreported as lockdown"; exit 1; }
+          test ! -f /tmp/cargowall-ready \
+            || { echo "::error::ready sentinel must not exist"; exit 1; }
+          getent hosts example.com > /dev/null \
+            || { echo "::error::DNS broken after startup unwind"; exit 1; }
+          curl -sS --max-time 20 -o /dev/null https://example.com \
+            || { echo "::error::network broken after startup unwind"; exit 1; }
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sigterm-unwind-logs
+          path: |
+            /tmp/cargowall.log
+            /tmp/mockapi.log
+          if-no-files-found: ignore
+
+  double-sigterm-force:
+    name: Second SIGTERM force-tears down host mutations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGOWALL_PIDFILE: /tmp/cargowall.pid
+      # Blackholed OTLP endpoint: with records queued, the exporter's 5s
+      # shutdown stretches the GRACEFUL unwind, guaranteeing the process is
+      # still alive when the second signal lands so the force path is the
+      # one that actually restores host state.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://10.255.255.1:4318
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build cargowall
+        run: make build
+
+      - name: Write firewall policy
+        run: |
+          sudo mkdir -p /etc/cargowall
+          sudo tee /etc/cargowall/config.json > /dev/null <<'EOF'
+          {
+            "defaultAction": "deny",
+            "rules": [
+              {"type":"cidr","value":"8.8.8.8/32","ports":[{"port":53,"protocol":"udp"}],"action":"allow"}
+            ]
+          }
+          EOF
+
+      - name: Start cargowall under a root wrapper that will send both signals
+        run: |
+          # Once sudo lockdown is active the runner user cannot `sudo kill`
+          # (that is the point of the feature), so the signals must come from
+          # an already-root process — same shape as the sudo-lockdown jobs in
+          # ci.yml. Audit mode keeps the runner usable throughout.
+          sudo -E bash -c '
+            ./bin/cargowall start \
+              --github-action \
+              --config /etc/cargowall/config.json \
+              --dns-upstream 8.8.8.8:53 \
+              --sudo-lockdown \
+              --sudo-allow-commands "/usr/sbin/iptables,/usr/sbin/ip6tables" \
+              --audit-mode \
+              --pidfile /tmp/cargowall.pid > /tmp/cargowall.log 2>&1 &
+            CW_PID=$!
+            while [ ! -f /tmp/cargowall-sigterm ]; do sleep 1; done
+            kill -TERM $CW_PID
+            # The 1s gap is deliberate: SIGTERM is a standard signal, so a
+            # second one sent before the first is delivered would be
+            # coalesced by the kernel and never reach the handler.
+            sleep 1
+            kill -TERM $CW_PID 2>/dev/null || true
+            wait $CW_PID 2>/dev/null || true
+            touch /tmp/cargowall-exited
+          ' &
+          ./bin/cargowall wait-ready --timeout 120s
+
+      - name: Assert sudo lockdown and the DNS redirect are in place
+        run: |
+          # An allow-listed command still works...
+          sudo -n /usr/sbin/iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' \
+            || { echo "::error::DNS redirect not installed"; exit 1; }
+          # ...while anything else is denied. That IS the lockdown, and it
+          # needs no privileged file access to observe.
+          if sudo -n /usr/bin/id -u > /dev/null 2>&1; then
+            echo "::error::sudo lockdown not active — nothing to force-restore"; exit 1
+          fi
+          echo "sudo lockdown active, DNS redirect installed"
+
+      - name: Generate traffic so the OTLP exporter has records to flush
+        run: |
+          curl -sS --max-time 15 -o /dev/null https://example.com || true
+          curl -sS --max-time 15 -o /dev/null https://github.com || true
+
+      - name: Trigger both SIGTERMs and wait for exit
+        run: |
+          touch /tmp/cargowall-sigterm
+          for i in $(seq 1 60); do
+            test -f /tmp/cargowall-exited && break
+            sleep 1
+          done
+          test -f /tmp/cargowall-exited \
+            || { echo "::error::cargowall did not exit after the second SIGTERM"; tail -30 /tmp/cargowall.log; exit 1; }
+          grep -q "second shutdown signal" /tmp/cargowall.log \
+            || { echo "::error::the force-teardown path did not run — this job proves nothing without it"; tail -30 /tmp/cargowall.log; exit 1; }
+
+      - name: Assert every host mutation was undone by the force path
+        run: |
+          # Sudoers is the highest-stakes undo: a runner left locked down
+          # cannot repair itself. Arbitrary sudo working again is the proof.
+          sudo -n /usr/bin/id -u > /dev/null \
+            || { echo "::error::sudo still restricted after forced teardown"; exit 1; }
+          if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
+            echo "::error::DNAT rules leaked through the forced teardown"; exit 1
+          fi
+          if sudo test -f /etc/docker/daemon.json.cargowall.bak; then
+            echo "::error::daemon.json backup left behind — Docker DNS not restored"; exit 1
+          fi
+          # Probe for cargowall's program by WHOLE WORD: the runner image
+          # carries its own unrelated clsact filter named tc_egress_traffic,
+          # which a substring match on "tc_egress" (or a bare "bpf" match)
+          # falsely trips on. Underscores are word characters, so -w
+          # distinguishes the two.
+          #
+          # Coverage note: on TCX kernels (6.6+, which the runners use)
+          # `tc filter show` never displays cargowall at all and the kernel
+          # detaches the link when the process exits — the exit assertion
+          # above is the real guarantee there. This check is what catches a
+          # leaked filter on the legacy-clsact path (<6.6), which is the
+          # path that can actually outlive the process. bpftool covers both
+          # but is not installed on GitHub runners, so it is best-effort.
+          IFACE=$(ip route show default | awk '{print $5; exit}')
+          echo "--- tc filter show dev $IFACE egress ---"
+          sudo tc filter show dev "$IFACE" egress 2>&1 | head -10 || true
+          if sudo tc filter show dev "$IFACE" egress 2>/dev/null | grep -qw tc_egress; then
+            echo "::error::cargowall clsact filter still attached after forced teardown"; exit 1
+          fi
+          if command -v bpftool > /dev/null 2>&1 && sudo bpftool net show > /tmp/bpftool-net.txt 2>/dev/null; then
+            echo "--- bpftool net show ---"; head -20 /tmp/bpftool-net.txt
+            if grep -qw tc_egress /tmp/bpftool-net.txt; then
+              echo "::error::cargowall TC program still attached after forced teardown"; exit 1
+            fi
+          else
+            echo "note: bpftool unavailable — TCX detach is guaranteed by process exit, asserted above"
+          fi
+          getent hosts example.com > /dev/null \
+            || { echo "::error::DNS broken after forced teardown"; exit 1; }
+          echo "all host mutations undone by the second-signal force path"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: double-sigterm-force-logs
+          path: /tmp/cargowall.log
+          if-no-files-found: ignore

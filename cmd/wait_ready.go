@@ -17,10 +17,10 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -63,17 +63,14 @@ func waitForReady(path, failurePath, pidfilePath string, timeout, interval time.
 	start := time.Now()
 	deadline := start.Add(timeout)
 	for {
-		_, err := os.Stat(path)
-		if err == nil {
+		run := readRunIdentity(pidfilePath, start)
+
+		if data, ok := readStateFile(path); ok && run.owns(data) {
 			return nil
 		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat %s: %w", path, err)
-		}
 		if failurePath != "" {
-			anchor := failureSentinelAnchor(pidfilePath, start)
-			if reason, ok := readFailureSentinel(failurePath, anchor); ok {
-				return fmt.Errorf("cargowall reported startup failure: %s", reason)
+			if data, ok := readStateFile(failurePath); ok && run.owns(data) {
+				return fmt.Errorf("cargowall reported startup failure: %s", sentinelReason(data.data))
 			}
 		}
 		if time.Now().After(deadline) {
@@ -83,43 +80,102 @@ func waitForReady(path, failurePath, pidfilePath string, timeout, interval time.
 	}
 }
 
-// failureSentinelAnchor returns the time a trustworthy failure sentinel must
-// postdate. Preferred anchor: the pidfile's mtime — `cargowall start` writes
-// it at process entry and the sentinel strictly after, so "sentinel newer
-// than pidfile" identifies THIS run's sentinel no matter how long the
-// launcher dawdled between starting cargowall and running wait-ready.
-// Without a pidfile (not configured, or start hasn't written it yet) fall
-// back to this reader's own start time, which is only safe for the tight
-// `start & ; wait-ready` launch shape. Re-evaluated every poll so the
-// pidfile appearing mid-wait upgrades the anchor.
-func failureSentinelAnchor(pidfilePath string, waitStart time.Time) time.Time {
-	if pidfilePath != "" {
-		if fi, err := os.Lstat(pidfilePath); err == nil && fi.Mode().IsRegular() {
-			return fi.ModTime()
-		}
-	}
-	return waitStart
+// runIdentity is what this reader knows about the cargowall run it is
+// waiting on: the pid from the pidfile when available, and the time a
+// trustworthy sentinel must postdate.
+type runIdentity struct {
+	pid    int
+	hasPid bool
+	anchor time.Time
 }
 
-// readFailureSentinel returns the failure reason and true when a trustworthy
-// sentinel exists. The path lives in world-writable /tmp, so it is read
+// readRunIdentity resolves the current run's identity. Preferred: the
+// pidfile — `cargowall start` writes it at process entry and stamps the same
+// pid into every sentinel, so an exact pid match identifies THIS run's
+// sentinel with no timing assumptions at all (mtime alone cannot: a
+// SIGKILLed run leaves a pidfile whose own sentinel is necessarily newer).
+// Its mtime is the fallback anchor for sentinels written by an older binary
+// that doesn't stamp a pid; with no pidfile at all, this reader's start time
+// is the last resort, safe only for the tight `start & ; wait-ready` shape.
+// Re-read every poll so a pidfile appearing mid-wait upgrades the identity.
+func readRunIdentity(pidfilePath string, waitStart time.Time) runIdentity {
+	id := runIdentity{anchor: waitStart}
+	if pidfilePath == "" {
+		return id
+	}
+	fi, err := os.Lstat(pidfilePath)
+	if err != nil || !fi.Mode().IsRegular() {
+		return id
+	}
+	id.anchor = fi.ModTime()
+	if pid, perr := readPidfile(pidfilePath); perr == nil {
+		id.pid, id.hasPid = pid, true
+	}
+	return id
+}
+
+// owns reports whether a state file was written by this run. An explicit
+// `pid=N` stamp is authoritative in both directions; otherwise fall back to
+// the mtime anchor.
+func (r runIdentity) owns(data stateFile) bool {
+	if pid, ok := sentinelPid(data.data); ok && r.hasPid {
+		return pid == r.pid
+	}
+	return !data.modTime.Before(r.anchor.Add(-staleSlack))
+}
+
+// stateFile is a defensively-read state file: content plus mtime.
+type stateFile struct {
+	data    []byte
+	modTime time.Time
+}
+
+// readStateFile reads a cargowall state file from world-writable /tmp
 // defensively: symlinks and non-regular files are ignored (Lstat +
-// O_NOFOLLOW), sentinels older than the anchor (modulo staleSlack) are
-// treated as another run's leftovers, and the reason quoted into CI logs is
-// bounded.
-func readFailureSentinel(path string, anchor time.Time) (string, bool) {
+// O_NOFOLLOW) and the read is bounded.
+func readStateFile(path string) (stateFile, bool) {
 	fi, err := os.Lstat(path)
-	if err != nil || !fi.Mode().IsRegular() || fi.ModTime().Before(anchor.Add(-staleSlack)) {
-		return "", false
+	if err != nil || !fi.Mode().IsRegular() {
+		return stateFile{}, false
 	}
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return "", false
+		return stateFile{}, false
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, 4096))
+	data, err := io.ReadAll(io.LimitReader(f, 8192))
 	if err != nil {
-		return "", false
+		return stateFile{}, false
 	}
-	return strings.TrimSpace(string(data)), true
+	return stateFile{data: data, modTime: fi.ModTime()}, true
+}
+
+// sentinelPid extracts the `pid=N` stamp from a sentinel's first line.
+func sentinelPid(data []byte) (int, bool) {
+	first, _, _ := strings.Cut(string(data), "\n")
+	rest, ok := strings.CutPrefix(strings.TrimSpace(first), "pid=")
+	if !ok {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(rest)
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+// sentinelReason renders a sentinel's human-readable reason for CI logs:
+// the pid stamp is dropped, control characters are stripped (the file is
+// world-writable, and an embedded newline plus a `::` prefix is a workflow
+// command injection), and the result is bounded and never empty.
+func sentinelReason(data []byte) string {
+	body := string(data)
+	if first, rest, found := strings.Cut(body, "\n"); found && strings.HasPrefix(strings.TrimSpace(first), "pid=") {
+		body = rest
+	}
+	reason := sanitizeReason(strings.TrimSpace(body))
+	if reason == "" {
+		return "(no reason recorded)"
+	}
+	return reason
 }

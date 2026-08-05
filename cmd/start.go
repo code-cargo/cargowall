@@ -55,22 +55,23 @@ import (
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
 
-func StartCargoWall(cmd *StartCmd, hooks *StartHooks) (err error) {
-	logger := cmd.Logger
-
-	// Any fatal startup error publishes the failure sentinel, not just the
-	// policy-lockdown path: without this, `wait-ready` burns its full timeout
-	// and reports a generic "timed out" for eBPF-unsupported, DNS-bind,
-	// TC-attach, and every other startup failure. Lockdown writes its own
-	// richer sentinel and returns nil, so the two writers never collide.
-	defer func() {
-		if err != nil && cmd.FailureFile != "" {
-			reason := "cargowall startup failed: " + err.Error() + "\n"
-			if werr := writeSentinel(cmd.FailureFile, []byte(reason)); werr != nil {
-				logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
-			}
+// StartCargoWall brings the firewall up and blocks until shutdown. Any fatal
+// error publishes the failure sentinel BEFORE the teardown unwind begins —
+// not in a defer, which would run last (LIFO) and could push the sentinel
+// tens of seconds past wait-ready's timeout, defeating the fail-fast purpose
+// on exactly the paths it exists for.
+func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
+	err := startCargoWall(cmd, hooks)
+	if err != nil && cmd.FailureFile != "" {
+		if werr := writeFailureSentinel(cmd.FailureFile, "cargowall startup failed: "+err.Error()); werr != nil {
+			cmd.Logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
 		}
-	}()
+	}
+	return err
+}
+
+func startCargoWall(cmd *StartCmd, hooks *StartHooks) error {
+	logger := cmd.Logger
 
 	// Host mutations register their undo here as well as in a defer: the
 	// graceful path runs the defers, and the second-signal force path runs
@@ -173,7 +174,12 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) (err error) {
 	// broken DNS for the rest of the job. Now a startup-window signal cancels
 	// ctx; the startupInterrupted checkpoints below unwind through the
 	// deferred teardowns instead.
-	sigCh := make(chan os.Signal, 1)
+	// Buffer 2: the goroutine below performs two sequential receives, and
+	// os/signal drops a signal that arrives while the buffer is full — with
+	// buffer 1 a rapid double-signal would lose the second and park the
+	// goroutine forever on a receive that never completes, making the force
+	// path unreachable.
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 	go func() {
@@ -681,9 +687,21 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) (err error) {
 		// writeSentinel, not a plain WriteFile: the ready sentinel is the
 		// most security-critical of the state files (a followed symlink here
 		// is a root-privileged truncation of an attacker-chosen target).
-		if err := writeSentinel(cmd.ReadyFile, nil); err != nil {
+		// The pid is stamped so a reader can distinguish this run's sentinel
+		// from a previous job's leftover — trusting a stale ready file is
+		// the fail-open direction (build runs with no firewall attached).
+		if err := writeSentinel(cmd.ReadyFile, []byte(fmt.Sprintf("pid=%d\n", os.Getpid()))); err != nil {
 			return fmt.Errorf("writing ready file %s: %w", cmd.ReadyFile, err)
 		}
+		// Remove it on the way out: a ready file that outlives its firewall
+		// is exactly what the stale-file hygiene at startup exists to undo,
+		// and the next run's cleanup cannot win a race against a concurrent
+		// wait-ready.
+		defer teardowns.add(func() {
+			if rerr := os.Remove(cmd.ReadyFile); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+				logger.Warn("Failed to remove ready sentinel on shutdown", "path", cmd.ReadyFile, "error", rerr)
+			}
+		})()
 		logger.Info("CargoWall ready")
 	}
 
@@ -821,6 +839,42 @@ func removeStaleStateFiles(cmd *StartCmd, logger *slog.Logger) {
 	}
 }
 
+// maxSentinelReasonBytes bounds a reason written into a state file: the text
+// can carry an eBPF verifier dump or an attacker-influenced API body, and it
+// is echoed verbatim into CI logs by the consumer.
+const maxSentinelReasonBytes = 4096
+
+// writeFailureSentinel publishes the failure sentinel: the writer's pid on
+// the first line (so a reader can tell THIS run's sentinel from a previous
+// run's leftover by comparing against the pidfile, which mtime alone cannot
+// do after a SIGKILL), then a bounded, control-character-stripped reason —
+// unsanitized text here reaches CI logs, where an embedded newline plus a
+// `::`-prefixed line is a workflow-command injection.
+func writeFailureSentinel(path, reason string) error {
+	return writeSentinel(path, []byte(fmt.Sprintf("pid=%d\n%s\n", os.Getpid(), sanitizeReason(reason))))
+}
+
+// sanitizeReason bounds a reason and strips control characters (including
+// newlines) so it can never start a log line at the consumer.
+func sanitizeReason(s string) string {
+	truncated := false
+	if len(s) > maxSentinelReasonBytes {
+		s = s[:maxSentinelReasonBytes]
+		truncated = true
+	}
+	s = strings.ToValidUTF8(s, "�")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+	if truncated {
+		s += "... (truncated)"
+	}
+	return s
+}
+
 // writeSentinel atomically publishes a state file: the content is written to
 // a private temp file in the same directory and renamed into place. These
 // files are written as root into world-writable /tmp, and rename replaces
@@ -881,10 +935,16 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 	// Priority 1: SaaS API (when api-url + token are set)
 	if cmd.ApiUrl != "" && cmd.Token != "" {
 		// Bootstrap an empty config so EnsureHostnameAllowed can add rules
-		// before the real policy is loaded. The API hostname must be
-		// allowed through DNS filtering for the policy fetch to succeed.
+		// before the real policy is loaded. Unconditional: every
+		// Ensure*Allowed helper no-ops while cm.config is nil, so skipping
+		// this for a hostname-less api-url would leave lockdown (which also
+		// skips the env/file fallback) with a nil config — a total
+		// blackhole with no DNS or infra allows, contradicting the
+		// documented "CI infrastructure auto-allows remain active".
+		configMgr.LoadConfigFromRules(nil, config.ActionDeny)
+		// The API hostname must be allowed through DNS filtering for the
+		// policy fetch to succeed.
 		if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
-			configMgr.LoadConfigFromRules(nil, config.ActionDeny)
 			configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
 		}
 
@@ -987,7 +1047,7 @@ func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLog
 
 	attrs := []any{"class", fe.Class, "status", fe.StatusCode, "error", fetchErr}
 	switch cmd.ApiFailureMode {
-	case "fail":
+	case ApiFailureModeFail:
 		cmd.policyLockdown = true
 		configMgr.SetAuditMode(false)
 		// Re-sync the audit logger's event labeling (would_deny vs deny) —
@@ -1009,7 +1069,7 @@ func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLog
 		// on this sentinel, so no build steps run) makes the pre-attach
 		// window harmless.
 		if cmd.FailureFile != "" {
-			if werr := writeSentinel(cmd.FailureFile, []byte(reason+"\n")); werr != nil {
+			if werr := writeFailureSentinel(cmd.FailureFile, reason); werr != nil {
 				logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
 			}
 		}
@@ -1020,7 +1080,7 @@ func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLog
 		// No mode file: lockdown is not a SaaS-resolved posture, and the
 		// failure sentinel already carries the state the action needs.
 		return
-	case "audit":
+	case ApiFailureModeAudit:
 		configMgr.SetAuditMode(true)
 		// Re-sync the audit logger, which was constructed from the initial
 		// flag before config load (the API-success path does the same).
@@ -1040,7 +1100,7 @@ func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLog
 		// outcome after a 404, which correctly writes nothing.
 		writeModeFile(configMgr.IsAuditMode(), logger)
 		logger.Warn("API policy fetch failed — downgrading to audit mode (--api-failure-mode=audit)", attrs...)
-	default: // "local"
+	default: // ApiFailureModeLocal
 		logger.Warn("API policy fetch failed, falling back to env/file config", attrs...)
 	}
 }

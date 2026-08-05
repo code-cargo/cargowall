@@ -69,7 +69,12 @@ jobs:
               def log_message(self, *a): pass
           http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()
           ' > /tmp/mockapi.log 2>&1 &
-          sleep 1
+          # Bind probe, not a bare sleep: a slow-to-bind mock would turn the
+          # intended 500 into ECONNREFUSED and fail the assertion below.
+          for i in $(seq 1 15); do
+            curl -s -o /dev/null http://127.0.0.1:18080 && break
+            sleep 1
+          done
           curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080 | grep -q 500
 
       - name: Start cargowall (api-failure-mode=audit)
@@ -144,7 +149,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: audit-downgrade-logs
           path: |
@@ -247,7 +252,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fail-lockdown-logs
           path: |
@@ -336,7 +341,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: not-onboarded-logs
           path: |
@@ -396,9 +401,12 @@ jobs:
 
           # Wait for the DNS redirect to be installed — proof we are past the
           # host mutations and inside the (hanging, ~10s) policy fetch.
-          for i in $(seq 1 30); do
+          # Poll at 200ms: the hanging fetch only holds startup for the 10s
+          # policyFetchTotalBudget, so a 1s-granularity poll plus command
+          # overhead could let lockdown be decided before the kill lands.
+          for i in $(seq 1 150); do
             sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' && break
-            sleep 1
+            sleep 0.2
           done
           sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' \
             || { echo "::error::DNS redirect never appeared"; cat /tmp/cargowall.log; exit 1; }
@@ -438,7 +446,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sigterm-unwind-logs
           path: |

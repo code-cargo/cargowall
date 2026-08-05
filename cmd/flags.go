@@ -93,7 +93,12 @@ type StartCmd struct {
 	// build's traffic, but the CI infrastructure auto-allows (GitHub/GitLab
 	// hosts, cloud metadata, the CodeCargo API) stay active — the runner
 	// must keep functioning to report the failure.
-	ApiFailureMode string `help:"Posture when the policy cannot be retrieved from the CodeCargo API: audit (downgrade to audit mode), local (use env/file config as-is), fail (lock down to deny-all and signal failure)" name:"api-failure-mode" enum:"audit,local,fail" default:"local" env:"CARGOWALL_API_FAILURE_MODE"`
+	// Validated in AfterApply rather than with kong's enum: an env-bound
+	// enum rejects a set-but-EMPTY value (the `env: X: ${{ inputs.y }}`
+	// shape with an unset input) instead of falling back to the default,
+	// and a parse failure means the process never starts — no sentinel, no
+	// posture, just a generic wait-ready timeout.
+	ApiFailureMode string `help:"Posture when the policy cannot be retrieved from the CodeCargo API: audit (downgrade to audit mode), local (use env/file config as-is), fail (lock down to deny-all and signal failure)" name:"api-failure-mode" default:"local" env:"CARGOWALL_API_FAILURE_MODE"`
 
 	// Runtime options
 	DisableDNSTracking bool   `help:"Disable DNS tracking and hostname resolution" default:"false"`
@@ -183,8 +188,30 @@ func (c *StartCmd) AfterApply() error {
 	case CIModeGitlabCI:
 		c.applyCIPreset(CIModeGitlabCI)
 	}
+	// An empty value (unset env var, or one set from an unset CI input)
+	// means "not configured" — take the default rather than refusing to
+	// start.
+	if c.ApiFailureMode == "" {
+		c.ApiFailureMode = ApiFailureModeLocal
+	}
+	switch c.ApiFailureMode {
+	case ApiFailureModeLocal, ApiFailureModeAudit, ApiFailureModeFail:
+	default:
+		return fmt.Errorf("--api-failure-mode must be one of %q, %q, %q (got %q)",
+			ApiFailureModeAudit, ApiFailureModeLocal, ApiFailureModeFail, c.ApiFailureMode)
+	}
 	return nil
 }
+
+// --api-failure-mode values.
+const (
+	// ApiFailureModeLocal keeps today's behavior: env/file config as-is.
+	ApiFailureModeLocal = "local"
+	// ApiFailureModeAudit downgrades the run to audit mode.
+	ApiFailureModeAudit = "audit"
+	// ApiFailureModeFail enters deny-all policy lockdown.
+	ApiFailureModeFail = "fail"
+)
 
 // applyCIPreset turns on the plumbing flags shared by both CI presets, then
 // sets the host auto-allow flag specific to the named CI.

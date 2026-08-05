@@ -306,3 +306,51 @@ func TestParseRetryAfter(t *testing.T) {
 	assert.Equal(t, time.Duration(0), otlp.ParseRetryAfter("-5"))
 	assert.Greater(t, otlp.ParseRetryAfter(time.Now().Add(time.Hour).UTC().Format(http.TimeFormat)), 55*time.Minute)
 }
+
+// TestFetchPolicyFromAPI_UnenumeratedClientErrors: a 4xx the API contract
+// doesn't define is still an ANSWER — something understood the request and
+// refused it — so it must not be a retrieval failure. Classifying these as
+// server-side would let a misconfigured proxy or WAF (402/405/410/451, or a
+// 3xx that outlived the redirect cap) drive a deny-all lockdown or silently
+// disable enforcement under --api-failure-mode=audit. 408/429 are the
+// exceptions: they explicitly mean "try again".
+func TestFetchPolicyFromAPI_UnenumeratedClientErrors(t *testing.T) {
+	setFastPolicyRetries(t)
+
+	tests := []struct {
+		status        int
+		wantClass     PolicyFetchClass
+		wantRetrieval bool
+		wantAttempts  int32
+	}{
+		{http.StatusPaymentRequired, PolicyFetchPrecondition, false, 1},
+		{http.StatusMethodNotAllowed, PolicyFetchPrecondition, false, 1},
+		{http.StatusConflict, PolicyFetchPrecondition, false, 1},
+		{http.StatusGone, PolicyFetchPrecondition, false, 1},
+		{http.StatusUnprocessableEntity, PolicyFetchPrecondition, false, 1},
+		{http.StatusUnavailableForLegalReasons, PolicyFetchPrecondition, false, 1},
+		{http.StatusProxyAuthRequired, PolicyFetchPrecondition, false, 1},
+		// Explicit retry signals stay retryable retrieval failures.
+		{http.StatusRequestTimeout, PolicyFetchServer, true, 3},
+		{http.StatusTooManyRequests, PolicyFetchServer, true, 3},
+		// A 3xx that survived the redirect cap is not an authoritative
+		// client refusal — treat it as a server-side anomaly.
+		{http.StatusMovedPermanently, PolicyFetchServer, true, 3},
+	}
+	for _, tc := range tests {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			srv, attempts := countingServer(t, func(w http.ResponseWriter, _ int32) {
+				// No Location header: Go returns the 3xx as-is.
+				w.WriteHeader(tc.status)
+			})
+
+			_, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
+			var fe *PolicyFetchError
+			require.ErrorAs(t, err, &fe)
+			assert.Equal(t, tc.wantClass, fe.Class)
+			assert.Equal(t, tc.wantRetrieval, fe.Class.IsRetrievalFailure(),
+				"an authoritative refusal must not be able to change posture")
+			assert.Equal(t, tc.wantAttempts, attempts.Load())
+		})
+	}
+}

@@ -110,8 +110,21 @@ func (e *PolicyFetchError) Error() string {
 func (e *PolicyFetchError) Unwrap() error { return e.err }
 
 // classifyStatus maps a non-200 status to a fetch class. The API contract
-// only returns 400/401/403/404 intentionally; anything else unexpected (odd
-// proxies, load balancers) is treated as a server-side failure like 429/5xx.
+// returns 400/401/403/404 intentionally; those are answers, not outages.
+//
+// Every OTHER 4xx is also an answer — the request reached something that
+// understood and refused it (a proxy, WAF, or load balancer speaking 402,
+// 405, 410, 451, …). Classifying those as `server` would make them
+// retrieval failures, so a misconfigured intermediary could drive a
+// deny-all lockdown or silently disable enforcement under `audit` — the
+// exact "authoritative refusal must not change posture" rule the 404 carve-
+// out exists for. They fall back to env/file config with a loud log
+// instead, mapped to `precondition` (a client-side configuration state).
+//
+// The two exceptions are 408 and 429, which explicitly mean "try again":
+// they stay `server` so the retry loop and the failure-mode knob treat them
+// as the transient conditions they are. 5xx and anything else unexpected
+// (including a 3xx that survived the redirect cap) stay `server` too.
 func classifyStatus(code int) PolicyFetchClass {
 	switch code {
 	case http.StatusBadRequest:
@@ -120,9 +133,13 @@ func classifyStatus(code int) PolicyFetchClass {
 		return PolicyFetchUnauthorized
 	case http.StatusNotFound:
 		return PolicyFetchNotOnboarded
-	default:
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
 		return PolicyFetchServer
 	}
+	if code >= 400 && code < 500 {
+		return PolicyFetchPrecondition
+	}
+	return PolicyFetchServer
 }
 
 // Retry schedule for fetchPolicyFromAPI. The action's readiness wait is 30s,
@@ -217,9 +234,19 @@ func fetchPolicyOnce(ctx context.Context, client *http.Client, endpoint, token s
 
 	// Bound the read: api-url is env-configurable, so a misconfigured
 	// endpoint or interposed proxy could feed an arbitrarily large body.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPolicyResponseBytes))
+	// Read one byte past the cap so hitting it is detectable — a silently
+	// truncated policy would parse as "malformed" and drive a posture
+	// change while blaming a response the server never sent.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPolicyResponseBytes+1))
 	if err != nil {
 		return nil, &PolicyFetchError{Class: PolicyFetchTransport, err: fmt.Errorf("failed to read API response body: %w", err)}
+	}
+	if len(body) > maxPolicyResponseBytes {
+		return nil, &PolicyFetchError{
+			Class:      PolicyFetchServer,
+			StatusCode: resp.StatusCode,
+			err:        fmt.Errorf("API response exceeds the %d-byte limit", maxPolicyResponseBytes),
+		}
 	}
 
 	if resp.StatusCode != http.StatusOK {

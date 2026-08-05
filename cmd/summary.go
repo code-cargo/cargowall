@@ -684,15 +684,19 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.Token)
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	// Bounded like the policy fetch: api-url is user-supplied, and a hung
+	// endpoint would otherwise block the post step until the job timeout,
+	// losing the summary push entirely.
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to push audit results to API: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxPolicyResponseBytes))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("API returned non-OK status %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("API returned non-OK status %d: %s", resp.StatusCode, truncateForError(body))
 	}
 
 	var result cargowallv1.CreateCargoWallActionJobResponse
@@ -716,12 +720,15 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 // the push, but leaves a trace for the day a downgrade mysteriously never
 // reaches the dashboard.
 func readDowngrade() *cargowallv1.CargoWallDowngrade {
-	data, err := os.ReadFile(downgradeFile)
-	if err != nil {
+	// Read defensively like the sentinel readers: the path is fixed and
+	// world-writable, so a planted symlink (e.g. to /dev/zero) or an
+	// oversized file must not be followed or slurped.
+	sf, ok := readStateFile(downgradeFile)
+	if !ok {
 		return nil
 	}
 	var d cargowallv1.CargoWallDowngrade
-	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(data, &d); err != nil {
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(sf.data, &d); err != nil {
 		slog.Debug("Downgrade record unreadable — omitting from push", "path", downgradeFile, "error", err)
 		return nil
 	}

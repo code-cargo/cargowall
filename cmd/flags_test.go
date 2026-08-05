@@ -409,3 +409,26 @@ func TestStartCmd_ApiFailureModeFlag(t *testing.T) {
 	_, err = parse("start", "--dns-upstream", "8.8.8.8:53", "--api-failure-mode", "abort")
 	require.Error(t, err, "kong enum must reject unknown failure modes")
 }
+
+// An env var that is SET BUT EMPTY (the `env: X: ${{ inputs.y }}` shape with
+// an unset input) must fall back to the default, not refuse to start: a parse
+// failure means no process, no sentinel, and a generic wait-ready timeout.
+func TestStartCmd_ApiFailureMode_EmptyEnvFallsBackToDefault(t *testing.T) {
+	t.Setenv("CARGOWALL_API_FAILURE_MODE", "")
+
+	cli := &CLI{}
+	parser, err := kong.New(cli, kong.Vars{"version": "test"})
+	require.NoError(t, err)
+	_, err = parser.Parse([]string{"start", "--dns-upstream", "8.8.8.8:53"})
+	require.NoError(t, err, "an empty env value must not fail parsing")
+	assert.Equal(t, ApiFailureModeLocal, cli.Start.ApiFailureMode)
+}
+
+// Invalid values are still rejected — just in AfterApply rather than by
+// kong's enum, so the empty case above can be special-cased.
+func TestStartCmd_ApiFailureMode_InvalidRejected(t *testing.T) {
+	cmd := &StartCmd{ApiFailureMode: "abort"}
+	err := cmd.AfterApply()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "api-failure-mode")
+}

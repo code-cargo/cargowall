@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -1088,4 +1089,45 @@ func TestStartCargoWall_FatalErrorWritesFailureSentinel(t *testing.T) {
 	data, rerr := os.ReadFile(failurePath)
 	require.NoError(t, rerr, "fatal startup error must write the failure sentinel")
 	assert.Contains(t, string(data), "cargowall startup failed")
+}
+
+// A hostname-less --api-url must still bootstrap the deny-all config:
+// lockdown skips the env/file fallback, so without the bootstrap the manager
+// would hold a nil config where every Ensure*Allowed no-ops — a blackhole
+// with no DNS or CI-infra allows, contradicting the lockdown contract.
+func TestLoadCIConfig_LockdownBootstrapsWithHostnamelessApiUrl(t *testing.T) {
+	setFastPolicyRetries(t)
+	redirectStateFiles(t)
+
+	cmd := &StartCmd{
+		GithubAction:   true,
+		ApiUrl:         "api.codecargo.io", // no scheme → url.Hostname() == ""
+		Token:          "test-token",
+		ApiFailureMode: ApiFailureModeFail,
+		FailureFile:    filepath.Join(t.TempDir(), "cargowall-failed"),
+		DNSUpstream:    "8.8.8.8:53",
+	}
+	cm := config.NewConfigManager()
+	loadCIConfig(context.Background(), cmd, cm, nil, "", quietLogger())
+
+	require.True(t, cmd.policyLockdown, "an unsupported scheme is a transport failure")
+	assert.Equal(t, config.ActionDeny, cm.GetDefaultAction())
+	// EnsureDNSAllowed runs at the end of loadCIConfig; it no-ops on a nil
+	// config, so a non-empty rule set proves the bootstrap happened.
+	assert.NotEmpty(t, cm.GetResolvedRules(), "lockdown must still carry the DNS/infra allows it advertises")
+}
+
+// The pid stamped into a sentinel identifies its run exactly — a leftover
+// pidfile from a SIGKILLed run cannot legitimize that run's sentinel, which
+// mtime-only anchoring could not prevent.
+func TestWriteFailureSentinel_StampsPidAndSanitizes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "failed")
+	require.NoError(t, writeFailureSentinel(path, "boom\n::error::injected"))
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	first, rest, _ := strings.Cut(string(data), "\n")
+	assert.Equal(t, fmt.Sprintf("pid=%d", os.Getpid()), first)
+	assert.NotContains(t, rest, "\n::error::", "control characters must be stripped from the reason")
+	assert.Contains(t, rest, "::error::injected", "the text itself is kept, just never at a line start")
 }

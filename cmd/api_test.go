@@ -199,6 +199,85 @@ func TestFetchPolicyFromAPI_TransportErrorClassified(t *testing.T) {
 	assert.True(t, fe.Class.IsRetrievalFailure())
 }
 
+// TestFetchPolicyFromAPI_HangClassifiedTransportWithinBudget: a server that
+// accepts and never responds must be killed by the per-attempt deadline,
+// classified transport (retryable), and truncated by the total budget — the
+// hung fetch is the scenario the retry schedule exists for (a single 30s
+// attempt used to consume the action's whole readiness window). With the
+// budget at 2× the per-attempt timeout (the production 10s/5s ratio), a full
+// hang fits only two attempts: policyFetchAttempts is a ceiling, not a
+// guarantee (api.go).
+func TestFetchPolicyFromAPI_HangClassifiedTransportWithinBudget(t *testing.T) {
+	setFastPolicyRetries(t)
+	oldBudget := policyFetchTotalBudget
+	policyFetchTotalBudget = 2 * policyFetchAttemptTimeout
+	t.Cleanup(func() { policyFetchTotalBudget = oldBudget })
+
+	block := make(chan struct{})
+	srv, attempts := countingServer(t, func(http.ResponseWriter, int32) {
+		<-block // hold the response open past every deadline
+	})
+	// Registered after countingServer so it runs first (cleanup is LIFO):
+	// srv.Close waits for in-flight handlers, which only return once block
+	// closes.
+	t.Cleanup(func() { close(block) })
+
+	start := time.Now()
+	_, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
+	elapsed := time.Since(start)
+
+	var fe *PolicyFetchError
+	require.ErrorAs(t, err, &fe)
+	assert.Equal(t, PolicyFetchTransport, fe.Class)
+	assert.Zero(t, fe.StatusCode)
+	assert.True(t, fe.Class.IsRetrievalFailure())
+	assert.Equal(t, int32(2), attempts.Load(),
+		"timeout + backoff + timeout ≈ the budget: no third attempt fits")
+	assert.GreaterOrEqual(t, elapsed, 2*policyFetchAttemptTimeout,
+		"both attempts must have been killed by a deadline, not failed fast")
+	assert.Less(t, elapsed, policyFetchTotalBudget+time.Second,
+		"a full hang must be bounded by the total budget, not attempts × timeout")
+}
+
+// TestFetchPolicyFromAPI_SlowTrickleBodyClassifiedTransport: the per-attempt
+// deadline must cover the body read, not just the response headers —
+// otherwise a slowloris-style policy endpoint (200, one byte, then stall)
+// would hold startup past the budget. The stalled read is transport (the
+// retryable "never got the response" class), NOT malformed — the terminal
+// class must stay reserved for bodies the server actually finished sending.
+func TestFetchPolicyFromAPI_SlowTrickleBodyClassifiedTransport(t *testing.T) {
+	setFastPolicyRetries(t)
+	oldBudget := policyFetchTotalBudget
+	policyFetchTotalBudget = 2 * policyFetchAttemptTimeout
+	t.Cleanup(func() { policyFetchTotalBudget = oldBudget })
+
+	block := make(chan struct{})
+	srv, attempts := countingServer(t, func(w http.ResponseWriter, _ int32) {
+		_, _ = w.Write([]byte("{"))
+		// Flush past the server's buffering so client.Do returns and the
+		// deadline is genuinely racing the BODY read, not the headers.
+		_ = http.NewResponseController(w).Flush()
+		<-block // headers and one byte are on the wire; stall the rest
+	})
+	// Registered after countingServer so it runs first (cleanup is LIFO):
+	// srv.Close waits for in-flight handlers, which only return once block
+	// closes.
+	t.Cleanup(func() { close(block) })
+
+	start := time.Now()
+	_, err := fetchPolicyFromAPI(context.Background(), srv.URL, "test-token", "", "")
+	elapsed := time.Since(start)
+
+	var fe *PolicyFetchError
+	require.ErrorAs(t, err, &fe)
+	assert.Equal(t, PolicyFetchTransport, fe.Class,
+		"a stalled body read is transport, not malformed")
+	assert.True(t, fe.Class.IsRetrievalFailure())
+	assert.Equal(t, int32(2), attempts.Load(),
+		"each stalled read burns a full attempt timeout, so the budget truncates identically to a full hang")
+	assert.Less(t, elapsed, policyFetchTotalBudget+time.Second)
+}
+
 // TestFetchPolicyFromAPI_MalformedBodyNotRetried: an unparsable 200 body is a
 // retrieval failure (the policy exists but can't be used) yet retrying is
 // pointless — the server answered consistently.

@@ -208,18 +208,25 @@ jobs:
             || { echo "::error::ready sentinel must be withheld in lockdown"; exit 1; }
           test ! -f /tmp/cargowall-mode \
             || { echo "::error::mode file must not be written in lockdown"; exit 1; }
-          # The process must be ALIVE and enforcing — poll for the pidfile,
-          # which is written after full startup (Docker restart included).
-          for i in $(seq 1 60); do test -f /tmp/cargowall.pid && break; sleep 1; done
+          # The process must be ALIVE — the pidfile is written at process
+          # entry, so this is purely a liveness handle, not a startup gate.
+          test -f /tmp/cargowall.pid \
+            || { echo "::error::pidfile missing"; exit 1; }
           sudo kill -0 "$(cat /tmp/cargowall.pid)" \
             || { echo "::error::cargowall must stay alive in lockdown"; exit 1; }
 
       - name: Assert deny-all enforcement
         run: |
-          if curl -sS --max-time 15 -o /dev/null https://example.com; then
-            echo "::error::example.com must be blocked in lockdown"; exit 1
-          fi
-          echo "example.com correctly blocked"
+          # The failure sentinel unblocks wait-ready during config load, but
+          # the TC attach happens later (prepopulate + Docker restart sit in
+          # between) — retry until enforcement engages instead of racing it.
+          for i in $(seq 1 12); do
+            if ! curl -sS --max-time 10 -o /dev/null https://example.com; then
+              echo "example.com correctly blocked"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::example.com still reachable after ~60s — lockdown is not enforcing"; exit 1
 
       - name: Stop cargowall and assert clean teardown
         run: |

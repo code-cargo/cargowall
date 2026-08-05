@@ -81,6 +81,58 @@ func TestWaitForReady_FailureSentinelFailsFast(t *testing.T) {
 	}
 }
 
+// A failure sentinel left behind by a PREVIOUS run must not abort this one:
+// wait-ready runs as a separate process and can poll before `cargowall
+// start` reaches its stale-file cleanup, so the reader itself ignores
+// sentinels older than its own start.
+func TestWaitForReady_StaleFailureSentinelIgnored(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+	failurePath := filepath.Join(dir, "failed")
+	if err := os.WriteFile(failurePath, []byte("previous run's reason\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(failurePath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	err := waitForReady(readyPath, failurePath, 100*time.Millisecond, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("stale sentinel must be ignored (timeout expected), got %v", err)
+	}
+}
+
+// A symlink planted at the failure-sentinel path in world-writable /tmp must
+// be ignored, not followed — following would quote an attacker-chosen file's
+// contents into the CI log.
+func TestWaitForReady_SymlinkFailureSentinelIgnored(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+	target := filepath.Join(dir, "secret")
+	if err := os.WriteFile(target, []byte("root-only-contents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	failurePath := filepath.Join(dir, "failed")
+	if err := os.Symlink(target, failurePath); err != nil {
+		t.Fatal(err)
+	}
+
+	err := waitForReady(readyPath, failurePath, 100*time.Millisecond, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "root-only-contents") {
+		t.Fatalf("symlink target must not be read: %v", err)
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("symlink sentinel must be ignored (timeout expected), got %v", err)
+	}
+}
+
 // The ready sentinel wins when both exist — a completed startup must not be
 // reported as failed because a concurrent watcher raced the state files.
 func TestWaitForReady_ReadyWinsOverFailure(t *testing.T) {

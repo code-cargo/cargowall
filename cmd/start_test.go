@@ -109,8 +109,11 @@ func TestLoadCIConfig_ApiFailureModes(t *testing.T) {
 		// wantClass is the expected failure class on the downgrade record.
 		wantClass datapb.CargoWallFetchFailureClass
 	}{
-		{"server error, local keeps enforce", 500, "local", false, false, false, false, "enforce", dtNone, fcNone},
-		{"server error, empty mode defaults to local", 500, "", false, false, false, false, "enforce", dtNone, fcNone},
+		// Local fallback writes NO mode file: absence means "no SaaS-derived
+		// posture", and local runs at exactly the posture the flags request —
+		// matching the identical env/file outcome after a 404.
+		{"server error, local keeps enforce", 500, "local", false, false, false, false, "", dtNone, fcNone},
+		{"server error, empty mode defaults to local", 500, "", false, false, false, false, "", dtNone, fcNone},
 		{"server error, audit downgrades", 500, "audit", false, true, false, false, "audit", dtAudit, fcServer},
 		{"server error, fail locks down", 500, "fail", false, false, true, true, "", dtLockdown, fcServer},
 		{"transport error, audit downgrades", respTransport, "audit", false, true, false, false, "audit", dtAudit, fcTransport},
@@ -155,10 +158,11 @@ func TestLoadCIConfig_ApiFailureModes(t *testing.T) {
 				Config:         filepath.Join(t.TempDir(), "no-config.json"),
 			}
 
-			loaded := loadCIConfig(context.Background(), cmd, config.NewConfigManager(), nil, "", quietLogger())
+			cm := config.NewConfigManager()
+			loaded := loadCIConfig(context.Background(), cmd, cm, nil, "", quietLogger())
 
 			assert.Equal(t, tc.wantLoaded, loaded)
-			assert.Equal(t, tc.wantAuditMode, cmd.AuditMode)
+			assert.Equal(t, tc.wantAuditMode, cm.IsAuditMode(), "posture lives on the config manager")
 			assert.Equal(t, tc.wantLockdown, cmd.policyLockdown)
 
 			if tc.wantSentinel {
@@ -258,72 +262,107 @@ func TestLoadCIConfig_CancelledContextSkipsPostureHandling(t *testing.T) {
 		ApiFailureMode: "fail",
 		FailureFile:    failurePath,
 	}
-	loaded := loadCIConfig(ctx, cmd, config.NewConfigManager(), nil, "", quietLogger())
+	cm := config.NewConfigManager()
+	loaded := loadCIConfig(ctx, cmd, cm, nil, "", quietLogger())
 
 	assert.False(t, loaded)
 	assert.False(t, cmd.policyLockdown, "cancellation must not enter lockdown")
-	assert.False(t, cmd.AuditMode)
+	assert.False(t, cm.IsAuditMode())
 	for _, p := range []string{failurePath, downgradePath, modePath} {
 		_, err := os.Stat(p)
 		assert.True(t, os.IsNotExist(err), "no state file may be written while unwinding: %s", p)
 	}
 }
 
-// TestLoadCIConfig_AuditDowngradeSyncsAuditLogger: the DNS proxy consults the
-// audit logger (not cmd.AuditMode) at query time, so the downgrade branch
-// must re-sync it or DNS filtering keeps refusing while eBPF goes permissive.
-func TestLoadCIConfig_AuditDowngradeSyncsAuditLogger(t *testing.T) {
+// TestLoadCIConfig_FailureModesSyncAuditLogger: the DNS proxy consults the
+// audit logger (not cmd.AuditMode) at query time, so BOTH posture-changing
+// branches must re-sync it — audit (enforce→audit: DNS filtering must go
+// permissive) and fail (audit→lockdown: DNS filtering must go strict, or a
+// run started with --audit-mode keeps a DNS-tunnel escape hatch inside the
+// fail-closed posture).
+func TestLoadCIConfig_FailureModesSyncAuditLogger(t *testing.T) {
 	setFastPolicyRetries(t)
-	redirectStateFiles(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	t.Cleanup(srv.Close)
 
-	auditLogger, err := events.NewAuditLogger(filepath.Join(t.TempDir(), "audit.ndjson"), false)
-	require.NoError(t, err)
-	t.Cleanup(func() { auditLogger.Close() })
-
-	cmd := &StartCmd{
-		GithubAction:   true,
-		ApiUrl:         srv.URL,
-		Token:          "test-token",
-		ApiFailureMode: "audit",
-		FailureFile:    filepath.Join(t.TempDir(), "cargowall-failed"),
+	tests := []struct {
+		name          string
+		failureMode   string
+		initialAudit  bool
+		wantAuditMode bool
+	}{
+		{"audit downgrade flips logger on", "audit", false, true},
+		{"fail lockdown flips logger off", "fail", true, false},
 	}
-	loadCIConfig(context.Background(), cmd, config.NewConfigManager(), auditLogger, "", quietLogger())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			redirectStateFiles(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			t.Cleanup(srv.Close)
 
-	assert.True(t, cmd.AuditMode)
-	assert.True(t, auditLogger.IsAuditMode(), "audit logger must be re-synced on downgrade")
+			auditLogger, err := events.NewAuditLogger(filepath.Join(t.TempDir(), "audit.ndjson"), tc.initialAudit)
+			require.NoError(t, err)
+			t.Cleanup(func() { auditLogger.Close() })
+
+			cmd := &StartCmd{
+				GithubAction:   true,
+				ApiUrl:         srv.URL,
+				Token:          "test-token",
+				ApiFailureMode: tc.failureMode,
+				FailureFile:    filepath.Join(t.TempDir(), "cargowall-failed"),
+			}
+			// Mirror StartCargoWall: the CLI flag seeds the manager.
+			cm := config.NewConfigManager()
+			cm.SetAuditMode(tc.initialAudit)
+			loadCIConfig(context.Background(), cmd, cm, auditLogger, "", quietLogger())
+
+			assert.Equal(t, tc.wantAuditMode, cm.IsAuditMode())
+			assert.Equal(t, tc.wantAuditMode, auditLogger.IsAuditMode(), "audit logger must be re-synced with the effective posture")
+		})
+	}
 }
 
-// TestWriteSentinel_RefusesPrePlantedTargets: sentinels are written as root
-// to fixed paths in world-writable /tmp — O_EXCL must refuse both a
-// pre-planted plain file and a symlink instead of following it.
-func TestWriteSentinel_RefusesPrePlantedTargets(t *testing.T) {
+// TestWriteSentinel_AtomicReplaceIsSymlinkSafe: sentinels are written as
+// root to fixed paths in world-writable /tmp. The temp-file+rename publish
+// must replace a pre-planted symlink (or plain file) at the path itself
+// without ever following it — the planted target's content stays untouched —
+// and must leave no temp litter behind.
+func TestWriteSentinel_AtomicReplaceIsSymlinkSafe(t *testing.T) {
 	dir := t.TempDir()
 
+	// Pre-planted plain file: replaced, not followed or refused.
 	existing := filepath.Join(dir, "existing")
-	require.NoError(t, os.WriteFile(existing, []byte("old"), 0o644))
-	require.Error(t, writeSentinel(existing, []byte("new")))
+	require.NoError(t, os.WriteFile(existing, []byte("planted"), 0o644))
+	require.NoError(t, writeSentinel(existing, []byte("new")))
 	data, err := os.ReadFile(existing)
 	require.NoError(t, err)
-	assert.Equal(t, "old", string(data), "pre-existing content must be untouched")
+	assert.Equal(t, "new", string(data))
 
+	// Pre-planted symlink: the LINK is replaced by a regular file; the
+	// target an attacker chose is never written through.
 	target := filepath.Join(dir, "target")
 	require.NoError(t, os.WriteFile(target, []byte("victim"), 0o644))
 	link := filepath.Join(dir, "link")
 	require.NoError(t, os.Symlink(target, link))
-	require.Error(t, writeSentinel(link, []byte("pwn")))
+	require.NoError(t, writeSentinel(link, []byte("ok")))
 	data, err = os.ReadFile(target)
 	require.NoError(t, err)
-	assert.Equal(t, "victim", string(data), "symlink target must not be overwritten")
-
-	fresh := filepath.Join(dir, "fresh")
-	require.NoError(t, writeSentinel(fresh, []byte("ok")))
-	data, err = os.ReadFile(fresh)
+	assert.Equal(t, "victim", string(data), "symlink target must not be written through")
+	fi, err := os.Lstat(link)
+	require.NoError(t, err)
+	assert.True(t, fi.Mode().IsRegular(), "path must now be a regular file, not the symlink")
+	data, err = os.ReadFile(link)
 	require.NoError(t, err)
 	assert.Equal(t, "ok", string(data))
+
+	// No temp files left behind.
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	assert.ElementsMatch(t, []string{"existing", "target", "link"}, names)
 }
 
 // TestRemoveStaleStateFiles: a persistent runner's leftovers (a stale ready

@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -162,6 +163,16 @@ func (c *SummaryCmd) Run() error {
 func (c *SummaryCmd) readAuditLog() ([]events.AuditEvent, error) {
 	file, err := os.Open(c.AuditLog)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No audit log at all — e.g. the action ran `start` without
+			// --audit-log (audit-summary: false). The push must still
+			// happen: the job record, effective mode, status, version, and
+			// any downgrade record are independent of event collection, and
+			// dropping them made every audit-summary:false job invisible to
+			// the dashboard.
+			slog.Info("Audit log absent — proceeding with zero events", "path", c.AuditLog)
+			return nil, nil
+		}
 		return nil, err
 	}
 	defer file.Close()

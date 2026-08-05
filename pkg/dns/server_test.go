@@ -1478,6 +1478,80 @@ func TestHandleDNSQuery_FilteringEnforceBlocks(t *testing.T) {
 	assert.Equal(t, dns.RcodeRefused, w.msg.Rcode, "blocked domain should get REFUSED")
 }
 
+// The reported field bug (`audit-summary: false` → no --audit-log → audit
+// mode stopped being honoured): in audit mode with NO audit logger, a
+// filtered query must be forwarded, not REFUSED. Enforcement posture lives
+// on the server itself — a logging toggle must never change it. The cache is
+// pre-populated so the fall-through resolves without a live upstream.
+func TestHandleDNSQuery_AuditModeForwardsWithoutAuditLogger(t *testing.T) {
+	cfg := config.NewConfigManager()
+	err := cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny)
+	require.NoError(t, err)
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+	cfg.SetAuditMode(true) // audit posture on the manager, deliberately no SetAuditLogger
+
+	cachedResp := makeCachedResponse("notallowed.example.com.", "10.0.0.2")
+	cacheKey := server.generateCacheKey(&dns.Msg{
+		Question: []dns.Question{{Name: "notallowed.example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+	})
+	server.dnsCache.Put(cacheKey, &dnsCacheEntry{msg: cachedResp.Copy()}, 5*time.Minute)
+
+	query := new(dns.Msg)
+	query.SetQuestion("notallowed.example.com.", dns.TypeA)
+	query.Id = 3333
+
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+
+	server.handleDNSQuery(w, query)
+
+	w.AssertExpectations(t)
+	require.NotNil(t, w.msg)
+	assert.Equal(t, dns.RcodeSuccess, w.msg.Rcode, "audit mode must forward, not REFUSE, regardless of audit-logger presence")
+}
+
+// The inverse coupling guard: an audit logger that itself carries
+// auditMode=true must NOT drag the server into audit posture. Only the
+// server's own SetAuditMode decides enforcement; the logger is reporting.
+func TestHandleDNSQuery_AuditLoggerStateDoesNotDecidePosture(t *testing.T) {
+	cfg := config.NewConfigManager()
+	err := cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny)
+	require.NoError(t, err)
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+	cfg.SetAuditMode(false) // enforce posture on the manager
+
+	tmpFile, err := os.CreateTemp(t.TempDir(), "audit-*.json")
+	require.NoError(t, err)
+	tmpFile.Close()
+	auditLogger, err := events.NewAuditLogger(tmpFile.Name(), true) // logger in audit mode
+	require.NoError(t, err)
+	t.Cleanup(func() { auditLogger.Close() })
+	server.SetAuditLogger(auditLogger)
+
+	query := new(dns.Msg)
+	query.SetQuestion("evil.tunnel.example.com.", dns.TypeA)
+	query.Id = 4444
+
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+
+	server.handleDNSQuery(w, query)
+
+	w.AssertExpectations(t)
+	require.NotNil(t, w.msg)
+	assert.Equal(t, dns.RcodeRefused, w.msg.Rcode, "enforce posture must REFUSE even when the audit logger is in audit mode")
+}
+
 // #65: a DNS-path audit record must report the canonical lowercase hostname,
 // not the raw wire case, so it agrees with the connection-event path (which
 // logs the lowercase IP->hostname mapping). A mixed-case blocked query is the
@@ -1549,8 +1623,10 @@ func TestHandleDNSQuery_FilteringAuditModePassesThrough(t *testing.T) {
 	mockFw := firewall.NewMockFirewall(t)
 	server := newTestServer(t, cfg, mockFw)
 	server.filterQueries = true
+	// Posture lives on the config manager; the audit logger is a pure
+	// reporting sink and is attached separately.
+	cfg.SetAuditMode(true)
 
-	// Create a real audit logger in audit mode
 	tmpFile, err := os.CreateTemp(t.TempDir(), "audit-*.json")
 	require.NoError(t, err)
 	tmpFile.Close()

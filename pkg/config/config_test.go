@@ -4187,3 +4187,52 @@ func TestLoadConfig_PreservesDNSCacheAcrossReload(t *testing.T) {
 		t.Errorf("DNS reverse cache lost across reload: got %q, want github.com", got)
 	}
 }
+
+// TestLoadConfigFromCargoWall_ModeMapsToPosture: the manager is the single
+// source of truth for the run's enforcement posture, and a successfully
+// loaded policy's mode must land on it. UNSPECIFIED (older controllers)
+// leaves the seeded posture untouched, and a rejected policy must never
+// flip posture.
+func TestLoadConfigFromCargoWall_ModeMapsToPosture(t *testing.T) {
+	tests := []struct {
+		name string
+		mode datapb.CargoWallMode
+		seed bool
+		want bool
+	}{
+		{"audit overrides enforce seed", datapb.CargoWallMode_CARGO_WALL_MODE_AUDIT, false, true},
+		{"enforce overrides audit seed", datapb.CargoWallMode_CARGO_WALL_MODE_ENFORCE, true, false},
+		{"unspecified keeps enforce seed", datapb.CargoWallMode_CARGO_WALL_MODE_UNSPECIFIED, false, false},
+		{"unspecified keeps audit seed", datapb.CargoWallMode_CARGO_WALL_MODE_UNSPECIFIED, true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := NewConfigManager()
+			cm.SetAuditMode(tc.seed)
+			if err := cm.LoadConfigFromCargoWall(&cargowallv1pb.CargoWallPolicy{Mode: tc.mode}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := cm.IsAuditMode(); got != tc.want {
+				t.Fatalf("IsAuditMode() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A policy the loader rejects must not flip posture: mode mapping happens
+// only after the rules validate.
+func TestLoadConfigFromCargoWall_RejectedPolicyKeepsPosture(t *testing.T) {
+	cm := NewConfigManager()
+	cm.SetAuditMode(false)
+	err := cm.LoadConfigFromCargoWall(&cargowallv1pb.CargoWallPolicy{
+		Mode: datapb.CargoWallMode_CARGO_WALL_MODE_AUDIT,
+		// Rule type unspecified → rejected.
+		Rules: []*cargowallv1pb.CargoWallPolicy_Rule{{Value: "1.2.3.4/32"}},
+	})
+	if err == nil {
+		t.Fatal("expected the policy to be rejected")
+	}
+	if cm.IsAuditMode() {
+		t.Fatal("rejected policy must not change posture")
+	}
+}

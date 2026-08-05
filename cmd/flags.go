@@ -89,7 +89,10 @@ type StartCmd struct {
 	// hope the watcher reacts, and its worst case (watcher missing or
 	// outdated) is an unprotected build. A live lockdown's worst case is an
 	// over-blocked build — the correct failure direction — and shutdown
-	// always runs the full teardown path.
+	// always runs the full teardown path. Lockdown is deny-all for the
+	// build's traffic, but the CI infrastructure auto-allows (GitHub/GitLab
+	// hosts, cloud metadata, the CodeCargo API) stay active — the runner
+	// must keep functioning to report the failure.
 	ApiFailureMode string `help:"Posture when the policy cannot be retrieved from the CodeCargo API: audit (downgrade to audit mode), local (use env/file config as-is), fail (lock down to deny-all and signal failure)" name:"api-failure-mode" enum:"audit,local,fail" default:"local" env:"CARGOWALL_API_FAILURE_MODE"`
 
 	// Runtime options
@@ -115,7 +118,10 @@ type StartCmd struct {
 	SudoLockdown      bool   `help:"Enable sudo lockdown to prevent firewall bypass" default:"false" env:"CARGOWALL_SUDO_LOCKDOWN"`
 	SudoAllowCommands string `help:"Comma-separated list of command paths to allow via sudo when lockdown is enabled (e.g. /usr/bin/apt-get,/usr/bin/docker)" default:"" env:"CARGOWALL_SUDO_ALLOW_COMMANDS"`
 
-	// Audit mode and logging
+	// Audit mode and logging. AuditMode is only the CLI seed: at startup it
+	// is copied into config.Manager, which is the single source of truth
+	// for the run's effective posture from then on (policy sources may
+	// override it). Nothing should read this field after config load.
 	AuditMode bool   `help:"Monitor and log connections without blocking (audit only)" default:"false" env:"CARGOWALL_AUDIT_MODE"`
 	AuditLog  string `help:"Path to write JSON audit log for step correlation" env:"CARGOWALL_AUDIT_LOG"`
 

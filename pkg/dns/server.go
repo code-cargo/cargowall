@@ -75,7 +75,10 @@ type Server struct {
 	// see preResolveCNAMETarget). Presence-only; the value is unused.
 	preResolved *lruCache[string, struct{}]
 
-	// Audit logger for DNS events
+	// Audit logger for DNS events. Reporting only — enforcement posture is
+	// read from config.Manager (the single source of truth, next to
+	// DefaultAction) at query time. Coupling posture to this logger once
+	// made a logging toggle (--audit-log absent) change enforcement.
 	auditLogger *events.AuditLogger
 
 	// Recently blocked connections awaiting late-allow reconciliation once
@@ -121,7 +124,8 @@ func (s *Server) SetFirewall(fw firewall.Firewall) {
 	s.firewall = fw
 }
 
-// SetAuditLogger sets the audit logger for DNS events
+// SetAuditLogger sets the audit logger for DNS events. Reporting only —
+// enforcement posture is read from config.Manager.IsAuditMode.
 func (s *Server) SetAuditLogger(auditLogger *events.AuditLogger) {
 	s.auditLogger = auditLogger
 }
@@ -351,8 +355,9 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		// case shown in the block logs and the LogDNSBlocked audit record.
 		domain := strings.ToLower(strings.TrimSuffix(r.Question[0].Name, "."))
 		if !s.isQueryAllowed(domain, r.Question[0].Qtype) {
-			// Check if we're in audit mode - log but don't block
-			isAuditMode := s.auditLogger != nil && s.auditLogger.IsAuditMode()
+			// Check the run's posture (single source of truth on the config
+			// manager) - in audit mode, log but don't block
+			isAuditMode := s.config.IsAuditMode()
 
 			if isAuditMode {
 				s.logger.Info("DNS query would be blocked (audit mode)",

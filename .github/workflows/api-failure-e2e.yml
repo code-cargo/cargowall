@@ -102,6 +102,37 @@ jobs:
       - name: Stop cargowall
         run: sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
 
+      # Second leg: the field-reported configuration (`audit-summary: false`
+      # → the action omits --audit-log). Audit posture must be honoured by
+      # BOTH datapaths with no audit logger present — a name outside the
+      # policy must resolve AND connect. This is the regression where a
+      # logging toggle disabled audit mode in DNS query filtering.
+      - name: Clear state files between runs (the action does this per job)
+        run: sudo rm -f /tmp/cargowall-ready /tmp/cargowall-failed /tmp/cargowall-mode /tmp/cargowall-downgrade /tmp/cargowall.pid
+
+      - name: Start cargowall again WITHOUT --audit-log (audit-summary:false shape)
+        run: |
+          sudo -E ./bin/cargowall start \
+            --github-action \
+            --dns-upstream 8.8.8.8:53 \
+            --api-url http://127.0.0.1:18080 \
+            --token dummy-token \
+            --api-failure-mode audit \
+            --pidfile /tmp/cargowall.pid > /tmp/cargowall-noauditlog.log 2>&1 &
+          ./bin/cargowall wait-ready --timeout 90s
+
+      - name: Assert audit mode is honoured without an audit logger
+        run: |
+          test "$(cat /tmp/cargowall-mode)" = "audit" \
+            || { echo "::error::mode file must say audit, got: $(cat /tmp/cargowall-mode 2>&1)"; exit 1; }
+          # The reported symptom was NXDOMAIN/REFUSED on every non-policy
+          # name: resolution and connection must both succeed in audit mode.
+          curl -sS --max-time 20 -o /dev/null https://example.com \
+            || { echo "::error::audit mode without --audit-log must not block (DNS or TC)"; exit 1; }
+
+      - name: Stop cargowall (second leg)
+        run: sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -109,6 +140,7 @@ jobs:
           name: audit-downgrade-logs
           path: |
             /tmp/cargowall.log
+            /tmp/cargowall-noauditlog.log
             /tmp/cargowall.ndjson
             /tmp/mockapi.log
           if-no-files-found: ignore
@@ -137,7 +169,13 @@ jobs:
               def log_message(self, *a): pass
           http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()
           ' > /tmp/mockapi.log 2>&1 &
-          sleep 1
+          # Probe readiness: a slow-to-bind mock would turn the intended 500
+          # into an ECONNREFUSED transport failure — same posture here, but
+          # keep the failure class the job claims to test honest.
+          for i in $(seq 1 15); do
+            curl -s -o /dev/null http://127.0.0.1:18080 && break
+            sleep 1
+          done
 
       - name: Start cargowall (api-failure-mode=fail) — wait-ready must fail fast with the reason
         run: |
@@ -221,7 +259,15 @@ jobs:
               def log_message(self, *a): pass
           http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()
           ' > /tmp/mockapi.log 2>&1 &
-          sleep 1
+          # Probe readiness: this job's whole point is the 404 class — a
+          # slow-to-bind mock would produce a transport failure instead,
+          # which IS a retrieval failure and would lock the run down,
+          # inverting what the job proves.
+          for i in $(seq 1 15); do
+            curl -s -o /dev/null http://127.0.0.1:18080 && break
+            sleep 1
+          done
+          curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080 | grep -q 404
 
       - name: Write local firewall policy
         run: |
@@ -299,7 +345,15 @@ jobs:
           while True:
               c, _ = s.accept(); conns.append(c)
           ' > /tmp/mockapi.log 2>&1 &
-          sleep 1
+          # Probe with a bare TCP connect (curl would hang on this server):
+          # if the port isn't bound yet, cargowall's fetch fails fast with
+          # ECONNREFUSED instead of hanging, and the SIGTERM below could land
+          # after the failure sentinel is written — breaking the "cancelled
+          # fetch must not be misreported" assertion.
+          for i in $(seq 1 15); do
+            timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/18080' && break
+            sleep 1
+          done
 
       - name: SIGTERM cargowall while the fetch hangs, assert clean unwind
         run: |

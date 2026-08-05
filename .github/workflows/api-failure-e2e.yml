@@ -466,8 +466,8 @@ jobs:
     timeout-minutes: 15
     env:
       CARGOWALL_PIDFILE: /tmp/cargowall.pid
-      # Blackholed OTLP endpoint: the exporter's 5s shutdown (plus the
-      # logger's) stretches the GRACEFUL unwind, guaranteeing the process is
+      # Blackholed OTLP endpoint: with records queued, the exporter's 5s
+      # shutdown stretches the GRACEFUL unwind, guaranteeing the process is
       # still alive when the second signal lands so the force path is the
       # one that actually restores host state.
       OTEL_EXPORTER_OTLP_ENDPOINT: http://10.255.255.1:4318
@@ -493,71 +493,75 @@ jobs:
           }
           EOF
 
-      - name: Start cargowall with sudo lockdown (audit mode keeps the runner usable)
+      - name: Start cargowall under a root wrapper that will send both signals
         run: |
-          sudo -E ./bin/cargowall start \
-            --github-action \
-            --config /etc/cargowall/config.json \
-            --dns-upstream 8.8.8.8:53 \
-            --sudo-lockdown \
-            --audit-mode \
-            --pidfile /tmp/cargowall.pid > /tmp/cargowall.log 2>&1 &
+          # Once sudo lockdown is active the runner user cannot `sudo kill`
+          # (that is the point of the feature), so the signals must come from
+          # an already-root process — same shape as the sudo-lockdown jobs in
+          # ci.yml. Audit mode keeps the runner usable throughout.
+          sudo -E bash -c '
+            ./bin/cargowall start \
+              --github-action \
+              --config /etc/cargowall/config.json \
+              --dns-upstream 8.8.8.8:53 \
+              --sudo-lockdown \
+              --sudo-allow-commands "/usr/sbin/iptables,/usr/sbin/ip6tables" \
+              --audit-mode \
+              --pidfile /tmp/cargowall.pid > /tmp/cargowall.log 2>&1 &
+            CW_PID=$!
+            while [ ! -f /tmp/cargowall-sigterm ]; do sleep 1; done
+            kill -TERM $CW_PID
+            # The 1s gap is deliberate: SIGTERM is a standard signal, so a
+            # second one sent before the first is delivered would be
+            # coalesced by the kernel and never reach the handler.
+            sleep 1
+            kill -TERM $CW_PID 2>/dev/null || true
+            wait $CW_PID 2>/dev/null || true
+            touch /tmp/cargowall-exited
+          ' &
           ./bin/cargowall wait-ready --timeout 120s
 
-      - name: Assert the host mutations are in place
+      - name: Assert sudo lockdown and the DNS redirect are in place
         run: |
-          sudo test -f /etc/sudoers.d/zz-cargowall-lockdown \
-            || { echo "::error::sudo lockdown was not applied — nothing to force-restore"; exit 1; }
-          sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' \
+          # An allow-listed command still works...
+          sudo -n /usr/sbin/iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' \
             || { echo "::error::DNS redirect not installed"; exit 1; }
-          sudo test -f /etc/docker/daemon.json.cargowall.bak \
-            || echo "note: docker DNS interception inactive on this runner"
+          # ...while anything else is denied. That IS the lockdown, and it
+          # needs no privileged file access to observe.
+          if sudo -n /usr/bin/id -u > /dev/null 2>&1; then
+            echo "::error::sudo lockdown not active — nothing to force-restore"; exit 1
+          fi
+          echo "sudo lockdown active, DNS redirect installed"
 
       - name: Generate traffic so the OTLP exporter has records to flush
         run: |
-          # Queued records make the blackholed exporter's Shutdown block for
-          # its full 5s bound, which is the window the second signal needs.
           curl -sS --max-time 15 -o /dev/null https://example.com || true
           curl -sS --max-time 15 -o /dev/null https://github.com || true
 
-      - name: Send two SIGTERMs, forcing the second-signal teardown path
+      - name: Trigger both SIGTERMs and wait for exit
         run: |
-          CARGO_REAL=$(cat /tmp/cargowall.pid)
-          sudo kill "$CARGO_REAL"
-          # Land the second signal while the graceful unwind is still inside
-          # the blackholed OTLP shutdown. The 1s gap is deliberate: SIGTERM
-          # is a standard signal, so a second one sent before the first is
-          # delivered would be coalesced away by the kernel and never reach
-          # the handler.
-          sleep 1
-          sudo kill "$CARGO_REAL" 2>/dev/null || echo "process already gone — force path may not have been exercised"
+          touch /tmp/cargowall-sigterm
           for i in $(seq 1 60); do
-            ps -p "$CARGO_REAL" > /dev/null 2>&1 || break
+            test -f /tmp/cargowall-exited && break
             sleep 1
           done
-          if ps -p "$CARGO_REAL" > /dev/null 2>&1; then
-            echo "::error::cargowall did not exit after the second SIGTERM"; exit 1
-          fi
+          test -f /tmp/cargowall-exited \
+            || { echo "::error::cargowall did not exit after the second SIGTERM"; tail -30 /tmp/cargowall.log; exit 1; }
           grep -q "second shutdown signal" /tmp/cargowall.log \
-            || { echo "::error::the force-teardown path did not run — this job proves nothing without it"; tail -20 /tmp/cargowall.log; exit 1; }
+            || { echo "::error::the force-teardown path did not run — this job proves nothing without it"; tail -30 /tmp/cargowall.log; exit 1; }
 
       - name: Assert every host mutation was undone by the force path
         run: |
           # Sudoers is the highest-stakes undo: a runner left locked down
-          # cannot be repaired by the job itself.
-          if sudo test -f /etc/sudoers.d/zz-cargowall-lockdown; then
-            echo "::error::sudoers still locked down after forced teardown"; exit 1
-          fi
-          sudo -n true \
-            || { echo "::error::sudo is still restricted after forced teardown"; exit 1; }
+          # cannot repair itself. Arbitrary sudo working again is the proof.
+          sudo -n /usr/bin/id -u > /dev/null \
+            || { echo "::error::sudo still restricted after forced teardown"; exit 1; }
           if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
             echo "::error::DNAT rules leaked through the forced teardown"; exit 1
           fi
           if sudo test -f /etc/docker/daemon.json.cargowall.bak; then
             echo "::error::daemon.json backup left behind — Docker DNS not restored"; exit 1
           fi
-          # The TC program must be gone too (the legacy-clsact filter is the
-          # one that outlives the process if its undo is skipped).
           IFACE=$(ip route show default | awk '{print $5; exit}')
           if sudo tc filter show dev "$IFACE" egress 2>/dev/null | grep -q bpf; then
             echo "::error::TC egress filter still attached after forced teardown"; exit 1

@@ -261,9 +261,27 @@ func rulePortCovered(ports []config.Port, port uint16, proto config.ProtocolType
 	return false
 }
 
+// IsProtocolBlock reports whether a raw event is the non-TCP/UDP protocol
+// block shape, where dst_port carries the protocol number rather than a port.
+// Single source of truth for that encoding: processEvent branches on it and
+// container enrichment keys its origin-record lookup off it.
+func (e *BpfBlockedEvent) IsProtocolBlock() bool {
+	return e.Allowed == 0 && e.SrcPort == 0 && e.DstPort < 256
+}
+
+// ContainerEnricher adopts container attribution onto a TC event that arrived
+// with no socket identity (pid 0, ordinal 0) — the signature of a NATed
+// container flow, whose socket sits behind a netns crossing the TC hook
+// cannot see. Implementations join against pre-NAT origin records (see
+// pkg/containers). Enrich runs on the ring-buffer reader goroutine and must
+// not block.
+type ContainerEnricher interface {
+	Enrich(audit *AuditEvent, event *BpfBlockedEvent)
+}
+
 // processEvent handles a single blocked/allowed event from the ring buffer.
 func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *NotificationTracker,
-	auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger,
+	auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger, enricher ContainerEnricher,
 ) {
 	if len(raw) < int(unsafe.Sizeof(BpfBlockedEvent{})) {
 		return
@@ -456,6 +474,13 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		StepOrdinal: event.StepOrdinal,
 	}
 
+	// pid=0 AND ordinal=0 is the no-socket-at-TC signature (NATed container
+	// flows, plus rare map_sock_pid evictions); anything with either field
+	// set was attributed normally and must not be second-guessed.
+	if enricher != nil && event.Pid == 0 && event.StepOrdinal == 0 {
+		enricher.Enrich(&audit, event)
+	}
+
 	if event.Allowed == 1 {
 		// Check if this connection was allowed by an auto-added rule.
 		// Pass the event's L4 protocol so the port match is protocol-aware
@@ -485,7 +510,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 				logger.Error("Failed to write audit log", "error", err)
 			}
 		}
-	} else if event.SrcPort == 0 && event.DstPort < 256 {
+	} else if event.IsProtocolBlock() {
 		// Non-TCP/UDP protocol block — dst_port contains the protocol number
 		protocolName := getProtocolName(uint8(event.DstPort))
 		logConnEvent(logger, "Protocol blocked", cnameChain,
@@ -591,8 +616,9 @@ func logConnEvent(logger *slog.Logger, msg string, cnameChain []string, attrs ..
 	logger.Info(msg, append(attrs, cnameLogAttr(cnameChain)...)...)
 }
 
-// ProcessBlockedEvents processes blocked connection events
-func ProcessBlockedEvents(rd *ringbuf.Reader, configMgr *config.Manager, notificationTracker *NotificationTracker, auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger) {
+// ProcessBlockedEvents processes blocked connection events. enricher is
+// optional (nil-safe) container attribution — see ContainerEnricher.
+func ProcessBlockedEvents(rd *ringbuf.Reader, configMgr *config.Manager, notificationTracker *NotificationTracker, auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger, enricher ContainerEnricher) {
 	for {
 		record, err := rd.Read()
 		if err != nil {
@@ -603,6 +629,6 @@ func ProcessBlockedEvents(rd *ringbuf.Reader, configMgr *config.Manager, notific
 			continue
 		}
 
-		processEvent(record.RawSample, configMgr, notificationTracker, auditLogger, fw, logger)
+		processEvent(record.RawSample, configMgr, notificationTracker, auditLogger, fw, logger, enricher)
 	}
 }

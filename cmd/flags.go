@@ -124,6 +124,10 @@ type StartCmd struct {
 	StepOrdinalBase uint32 `help:"Base for step ordinal numbering; ordinals are opaque per-step-subtree IDs correlated to plan steps via step_boundary cmdlines, not by position" default:"1" env:"CARGOWALL_STEP_ORDINAL_BASE"`
 	RunnerWorkerPID int    `help:"PID of the Runner.Worker process (0 = auto-discover by process name)" default:"0" env:"CARGOWALL_RUNNER_WORKER_PID"`
 
+	// Container attribution (issue #106, phase 3a — audit-only)
+	ContainerAttribution bool `help:"Correlate Docker containers and execs to workflow steps for audit attribution via a root-cgroup egress observer (requires --step-attribution; implied by --github-action)" default:"false" env:"CARGOWALL_CONTAINER_ATTRIBUTION"`
+	BPFStats             bool `help:"Collect kernel BPF runtime statistics and log per-program overhead at shutdown (small global cost while enabled)" name:"bpf-stats" default:"false" env:"CARGOWALL_BPF_STATS"`
+
 	// Sudo lockdown (CI security hardening)
 	SudoLockdown      bool   `help:"Enable sudo lockdown to prevent firewall bypass" default:"false" env:"CARGOWALL_SUDO_LOCKDOWN"`
 	SudoAllowCommands string `help:"Comma-separated list of command paths to allow via sudo when lockdown is enabled (e.g. /usr/bin/apt-get,/usr/bin/docker)" default:"" env:"CARGOWALL_SUDO_ALLOW_COMMANDS"`
@@ -233,6 +237,10 @@ func (c *StartCmd) applyCIPreset(mode CIMode) {
 		// process. Degrades to a warning when the worker or kernel BTF is
 		// missing, so it is safe to imply here.
 		c.StepAttribution = true
+		// Container attribution rides on step attribution and degrades the
+		// same way (audit-only observer + docker-events tagging, warn-only on
+		// any failure), so it is equally safe to imply.
+		c.ContainerAttribution = true
 	case CIModeGitlabCI:
 		c.AutoAllowGitlabHosts = true
 	}

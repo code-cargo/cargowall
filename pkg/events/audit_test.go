@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -187,6 +188,109 @@ func TestAuditLogger_StepBoundary(t *testing.T) {
 	// normalization in LogEvent must skip them.
 	assert.False(t, events[0].Blocked)
 	assert.False(t, events[0].WouldDeny)
+}
+
+func TestAuditLogger_ContainerAttribution(t *testing.T) {
+	// Container attributions are telemetry markers describing no connection,
+	// so the enforce/audit verdict normalization must leave both flags false
+	// in BOTH modes — a normalized WouldDeny/Blocked=true would count a mere
+	// tagging event as a policy outcome downstream.
+	for name, auditMode := range map[string]bool{"enforce": false, "audit": true} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "audit.jsonl")
+			logger, err := NewAuditLogger(path, auditMode)
+			require.NoError(t, err)
+			defer logger.Close()
+
+			sink := &fakeSink{}
+			logger.AddSink(sink)
+
+			err = logger.LogEvent(AuditEvent{
+				EventType:       EventContainerAttribution,
+				StepOrdinal:     4,
+				ContainerID:     "abc123def456",
+				ContainerOrigin: true,
+				AttributionKind: "start",
+				TagLatencyMS:    12.5,
+				Privileged:      true,
+			})
+			require.NoError(t, err)
+
+			events := readAuditEvents(t, path)
+			require.Len(t, events, 1)
+			assert.Equal(t, EventContainerAttribution, events[0].EventType)
+			assert.False(t, events[0].Blocked)
+			assert.False(t, events[0].WouldDeny)
+			// The new fields must round-trip through the JSONL file intact.
+			assert.Equal(t, uint32(4), events[0].StepOrdinal)
+			assert.Equal(t, "abc123def456", events[0].ContainerID)
+			assert.True(t, events[0].ContainerOrigin)
+			assert.Equal(t, "start", events[0].AttributionKind)
+			assert.Equal(t, 12.5, events[0].TagLatencyMS)
+			assert.True(t, events[0].Privileged)
+			// The sink sees the same normalized (untouched) verdict flags.
+			require.Len(t, sink.events, 1)
+			assert.False(t, sink.events[0].Blocked)
+			assert.False(t, sink.events[0].WouldDeny)
+		})
+	}
+}
+
+// containerFieldKeys are the JSON keys added for container attribution
+// (issue #106); all additive and omitempty so old and new daemons/summaries
+// interoperate.
+var containerFieldKeys = []string{
+	`"container_id"`, `"container_origin"`, `"attribution_kind"`,
+	`"tag_latency_ms"`, `"privileged"`,
+}
+
+func TestAuditEvent_ContainerFieldsJSONRoundTrip(t *testing.T) {
+	// Explicit UTC timestamp so the whole-struct equality below isn't
+	// hostage to wall-clock monotonic readings or local-zone identity.
+	src := AuditEvent{
+		Timestamp:       time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
+		EventType:       EventContainerAttribution,
+		ContainerID:     "abc123def456",
+		ContainerOrigin: true,
+		AttributionKind: "exec",
+		TagLatencyMS:    3.25,
+		Privileged:      true,
+	}
+	data, err := json.Marshal(src)
+	require.NoError(t, err)
+	for _, key := range containerFieldKeys {
+		assert.Contains(t, string(data), key)
+	}
+
+	var got AuditEvent
+	require.NoError(t, json.Unmarshal(data, &got))
+	assert.Equal(t, src, got)
+}
+
+func TestAuditEvent_ContainerFieldsOmittedWhenZero(t *testing.T) {
+	// Zero values must not serialize: keeps non-container audit lines
+	// byte-identical to the pre-#106 shape.
+	data, err := json.Marshal(AuditEvent{EventType: EventConnectionBlocked})
+	require.NoError(t, err)
+	for _, key := range containerFieldKeys {
+		assert.NotContains(t, string(data), key)
+	}
+}
+
+func TestAuditEvent_LegacyLineWithoutContainerFieldsDecodes(t *testing.T) {
+	// A line written by a pre-#106 daemon must decode cleanly with the new
+	// fields at their zero values.
+	legacy := `{"timestamp":"2026-08-01T12:00:00Z","event_type":"connection_blocked",` +
+		`"dst_ip":"1.2.3.4","dst_port":443,"would_deny":false,"blocked":true}`
+	var ev AuditEvent
+	require.NoError(t, json.Unmarshal([]byte(legacy), &ev))
+	assert.Equal(t, EventConnectionBlocked, ev.EventType)
+	assert.True(t, ev.Blocked)
+	assert.Empty(t, ev.ContainerID)
+	assert.False(t, ev.ContainerOrigin)
+	assert.Empty(t, ev.AttributionKind)
+	assert.Zero(t, ev.TagLatencyMS)
+	assert.False(t, ev.Privileged)
 }
 
 func TestAuditLogger_DNSBlocked(t *testing.T) {

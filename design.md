@@ -396,6 +396,9 @@ sequenceDiagram
 | `cg_connect6` | cgroup/connect6 | Maps IPv6 TCP socket cookie → PID |
 | `cg_sendmsg4` | cgroup/sendmsg4 | Maps IPv4 UDP socket cookie → PID |
 | `cg_sendmsg6` | cgroup/sendmsg6 | Maps IPv6 UDP socket cookie → PID |
+| `step_fork` / `step_exit` | tp_btf tracepoints (stepbpf.c, separate collection; needs kernel BTF) | Step attribution: mint/inherit per-step process tags, drop at exit |
+| `cg_sock_create` | cgroup/sock_create (stepbpf.c) | Copies the creating thread's step tag onto each socket cookie |
+| `cg_origin_egress` | cgroup_skb/egress (originbpf.c, separate collection) | Flow-origin observer (issue #106, audit-only): records pre-NAT flow origins (cookie, cgroup id, container source IP) so container traffic — invisible to the TC cookie join after netns+NAT — can be attributed in userspace; always returns allow |
 
 ## Audit Mode
 
@@ -449,6 +452,35 @@ The DNS proxy handles Kubernetes service discovery by:
 - `ConfigureDockerDNS(bridgeIP)` writes `{"dns": ["<bridgeIP>"]}` to `/etc/docker/daemon.json` (with backup)
 - Docker daemon requires a full restart (`systemctl restart docker`) for DNS changes — SIGHUP is not sufficient
 - `RestoreDockerDNS()` restores the original daemon.json from backup on shutdown
+
+### Container Attribution (issue #106, phase 3a — audit-only)
+
+Bridge-networked container packets cross a netns and NAT before `tc_egress`
+sees them, so the socket-cookie join yields nothing there (pid 0, ordinal 0).
+Phase 3a closes the attribution gap without touching enforcement:
+
+- `pkg/containers` subscribes to Docker events over `/var/run/docker.sock`
+  (stdlib HTTP client, no docker dependency), resolves each container/exec
+  workload's host PID, confirms identity via `/proc/<pid>/cgroup`, and tags
+  the process subtree with the step ordinal active at the event's `timeNano`
+  (`steps.Tracker.OrdinalAt` / `TagContainerProcess`). From there the
+  existing `cg_sock_create` hook tags container sockets and kernel fork
+  inheritance covers descendants.
+- `pkg/origin` owns the `cg_origin_egress` observer: pre-NAT flow-origin
+  records (socket cookie, cgroup id, container source IP) resolved against
+  the pid/step maps at read time and kept in a bounded join store. TC events
+  arriving with no socket identity are enriched from it (`Enrich`), keyed on
+  what MASQUERADE preserves (dst tuple, usually the source port). Only the
+  record's socket-tag ordinal is ever copied — never "current step" — so
+  traffic from the start→tag window lands in the container tier, not a step.
+- Container DNS: queries arriving on the bridge listener are attributed by
+  container IP (`SetContainerLookup`); the host-netns sockdiag path is never
+  consulted for them.
+- Unattributable container traffic gets its own summary tier ("Container
+  traffic (unattributed…)"), checked before every looser bucket.
+- Scope boundaries: docker-in-docker attribution stops at the outer
+  container; `--privileged` containers are flagged in the audit stream;
+  enforcement stays TC-only (the observer always returns allow).
 
 ## GitHub Actions Integration
 

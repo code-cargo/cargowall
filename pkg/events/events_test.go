@@ -511,7 +511,7 @@ func TestProcessEvent_IPv4BlockedTCP(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, nil, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -547,7 +547,7 @@ func TestProcessEvent_IPv4AllowedTCP(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -580,7 +580,7 @@ func TestProcessEvent_ProtocolBlocked(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, nil, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -613,7 +613,7 @@ func TestProcessEvent_LateResolvedIPAddedToFirewall(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, nil, fw, newTestLogger())
+	processEvent(raw, cm, nil, nil, fw, newTestLogger(), nil)
 
 	require.Len(t, fw.addedIPs, 1)
 	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
@@ -649,7 +649,7 @@ func TestProcessEvent_LateResolvedIPInheritsRulePorts(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, nil, fw, newTestLogger())
+	processEvent(raw, cm, nil, nil, fw, newTestLogger(), nil)
 
 	require.Len(t, fw.addedIPs, 1)
 	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
@@ -688,7 +688,7 @@ func TestProcessEvent_LateResolvedIPv6InheritsRulePorts(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, nil, fw, newTestLogger())
+	processEvent(raw, cm, nil, nil, fw, newTestLogger(), nil)
 
 	require.Len(t, fw.addedIPs, 1)
 	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
@@ -731,7 +731,7 @@ func TestProcessEvent_LateResolvedEmitsLateAllowedAudit(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -787,7 +787,7 @@ func TestProcessEvent_LateResolvedMatchedRuleIsRulePatternNotHostname(t *testing
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -832,7 +832,7 @@ func TestProcessEvent_BlockedNoMatchStillLogsBlocked(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger(), nil)
 
 	require.Empty(t, fw.addedIPs, "late-add must not fire when no allow rule matches")
 
@@ -879,7 +879,7 @@ func TestProcessEvent_CNAMEDerivedAttributesToOrigin(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -931,7 +931,7 @@ func TestProcessEvent_CNAMEDerivedBlockedAttributesToOrigin(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -983,7 +983,7 @@ func TestProcessEvent_LateResolvedDstPortNotInRulePortsStaysBlocked(t *testing.T
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger(), nil)
 
 	// AddIP still fires (so future port-443 retries succeed), but this
 	// connection's audit/notification must reflect the genuine block.
@@ -1032,7 +1032,7 @@ func TestProcessEvent_LateResolvedUDPEventNotAllowedByTCPRule(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1078,7 +1078,7 @@ func TestProcessEvent_LateResolvedTCPEventAllowedByTCPRule(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1122,7 +1122,7 @@ func TestProcessEvent_LateResolvedTCPEventAllowedByProtocolAllRule(t *testing.T)
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, tracker, auditLogger, fw, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1160,7 +1160,7 @@ func TestProcessEvent_IPv6Event(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1173,7 +1173,7 @@ func TestProcessEvent_TooShortBuffer(t *testing.T) {
 	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
 
 	// Should not panic — processEvent should return early for short buffers
-	processEvent([]byte{0x04}, cm, nil, nil, nil, newTestLogger())
+	processEvent([]byte{0x04}, cm, nil, nil, nil, newTestLogger(), nil)
 }
 
 func TestProcessEvent_AutoAllowedType(t *testing.T) {
@@ -1201,7 +1201,7 @@ func TestProcessEvent_AutoAllowedType(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1237,7 +1237,7 @@ func TestProcessEvent_NoAutoAllowedTypeForUserRule(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1272,7 +1272,7 @@ func TestProcessEvent_MidStreamBlocked(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger(), nil)
 
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
@@ -1315,7 +1315,7 @@ func TestProcessEvent_MidStreamLateAllowFires(t *testing.T) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSMu.Unlock()
 
-	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger())
+	processEvent(raw, cm, nil, auditLogger, fw, newTestLogger(), nil)
 
 	require.Len(t, fw.addedIPs, 1)
 	assert.Equal(t, config.ActionAllow, fw.addedIPs[0].action)
@@ -1324,4 +1324,178 @@ func TestProcessEvent_MidStreamLateAllowFires(t *testing.T) {
 	events := readAuditEvents(t, auditPath)
 	require.Len(t, events, 1)
 	assert.Equal(t, EventConnectionLateAllowed, events[0].EventType)
+}
+
+// --- IsProtocolBlock tests (issue #106 phase 3a) ---
+
+func TestBpfBlockedEvent_IsProtocolBlock(t *testing.T) {
+	tests := []struct {
+		name     string
+		event    BpfBlockedEvent
+		expected bool
+	}{
+		// The canonical shape: blocked, no source port, dst_port carries the
+		// L4 protocol number instead of a real port.
+		{"icmp_protocol_block", BpfBlockedEvent{Allowed: 0, SrcPort: 0, DstPort: 1}, true},
+		// The boundary is DstPort < 256 (protocol numbers are one byte):
+		// 255 is still a protocol number, 256 is a real port.
+		{"proto_255_still_protocol", BpfBlockedEvent{Allowed: 0, SrcPort: 0, DstPort: 255}, true},
+		{"port_256_is_connection", BpfBlockedEvent{Allowed: 0, SrcPort: 0, DstPort: 256}, false},
+		// Protocol number 0 (HOPOPT) satisfies the encoding too.
+		{"proto_zero", BpfBlockedEvent{}, true},
+		// Allowed traffic is never a protocol block regardless of shape.
+		{"allowed_low_dst_port", BpfBlockedEvent{Allowed: 1, SrcPort: 0, DstPort: 1}, false},
+		// A source port means a real connection tuple, even to a low port.
+		{"src_port_set_low_dst", BpfBlockedEvent{Allowed: 0, SrcPort: 54321, DstPort: 80}, false},
+		{"blocked_tcp_syn", BpfBlockedEvent{Allowed: 0, SrcPort: 54321, DstPort: 443}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.event.IsProtocolBlock())
+		})
+	}
+}
+
+// --- ContainerEnricher tests (issue #106 phase 3a) ---
+
+// fakeEnricher counts Enrich calls and stamps recognizable attribution onto
+// the audit base, so tests can verify the mutation flows through to the
+// event each outcome branch logs.
+type fakeEnricher struct {
+	calls int
+}
+
+func (f *fakeEnricher) Enrich(audit *AuditEvent, _ *BpfBlockedEvent) {
+	f.calls++
+	audit.StepOrdinal = 9
+	audit.ContainerOrigin = true
+	audit.ContainerID = "abc123def456"
+}
+
+// orphanEvent returns the no-socket-at-TC signature (pid 0, ordinal 0) that
+// gates enrichment; callers override the verdict/tuple fields per branch.
+func orphanEvent() BpfBlockedEvent {
+	return BpfBlockedEvent{
+		IpVersion: 4,
+		Allowed:   0,
+		IpProto:   unix.IPPROTO_TCP,
+		SrcIp:     ipv4ToUint32("10.0.0.1"),
+		DstIp:     ipv4ToUint32("93.184.216.34"),
+		SrcPort:   54321,
+		DstPort:   443,
+		// Pid and StepOrdinal stay 0: the NATed-container-flow signature.
+	}
+}
+
+func TestProcessEvent_EnricherRunsForOrphanBlockedEvent(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	enr := &fakeEnricher{}
+	raw := makeBpfEvent(orphanEvent())
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger(), enr)
+
+	assert.Equal(t, 1, enr.calls, "orphan event (pid=0, ordinal=0) must be enriched exactly once")
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionBlocked, events[0].EventType)
+	// The enricher's mutations must land on the logged event: enrichment
+	// runs on the shared audit base before the outcome branches stamp their
+	// event type.
+	assert.Equal(t, uint32(9), events[0].StepOrdinal)
+	assert.True(t, events[0].ContainerOrigin)
+	assert.Equal(t, "abc123def456", events[0].ContainerID)
+}
+
+// The allowed branch logs from the same enriched base — locks in that
+// enrichment happens before the verdict fan-out, not inside one branch.
+func TestProcessEvent_EnricherRunsForOrphanAllowedEvent(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLogger, err := NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionAllow))
+
+	enr := &fakeEnricher{}
+	ev := orphanEvent()
+	ev.Allowed = 1
+	raw := makeBpfEvent(ev)
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(raw, cm, nil, auditLogger, nil, newTestLogger(), enr)
+
+	assert.Equal(t, 1, enr.calls)
+
+	events := readAuditEvents(t, auditPath)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventConnectionAllowed, events[0].EventType)
+	assert.Equal(t, uint32(9), events[0].StepOrdinal)
+	assert.True(t, events[0].ContainerOrigin)
+	assert.Equal(t, "abc123def456", events[0].ContainerID)
+}
+
+func TestProcessEvent_EnricherSkippedWhenAttributed(t *testing.T) {
+	// Either identity field set means the TC hook saw the socket and
+	// attribution already happened; the enricher must not second-guess it.
+	tests := []struct {
+		name    string
+		pid     uint32
+		ordinal uint32
+	}{
+		{"pid_set", 1234, 0},
+		{"ordinal_set", 0, 5},
+		{"both_set", 1234, 5},
+	}
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			enr := &fakeEnricher{}
+			ev := orphanEvent()
+			ev.Pid = tt.pid
+			ev.StepOrdinal = tt.ordinal
+			raw := makeBpfEvent(ev)
+
+			reverseDNSMu.Lock()
+			reverseDNSCache = make(map[string]time.Time)
+			reverseDNSMu.Unlock()
+
+			processEvent(raw, cm, nil, nil, nil, newTestLogger(), enr)
+
+			assert.Zero(t, enr.calls, "attributed events must not be enriched")
+		})
+	}
+}
+
+func TestProcessEvent_NilEnricherOrphanEventNoPanic(t *testing.T) {
+	// The daemon runs enricher-less when the containers watcher is absent
+	// (docker not installed, watcher failed): the nil guard must hold on the
+	// exact signature that would otherwise trigger enrichment.
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	processEvent(makeBpfEvent(orphanEvent()), cm, nil, nil, nil, newTestLogger(), nil)
 }

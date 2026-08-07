@@ -39,22 +39,46 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/code-cargo/cargowall/bpf"
 	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
 	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/containers"
 	"github.com/code-cargo/cargowall/pkg/dns"
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/firewall"
 	"github.com/code-cargo/cargowall/pkg/lockdown"
 	"github.com/code-cargo/cargowall/pkg/network"
+	"github.com/code-cargo/cargowall/pkg/origin"
 	"github.com/code-cargo/cargowall/pkg/otlp"
 	"github.com/code-cargo/cargowall/pkg/steps"
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
+
+// logProgStats logs one BPF program's kernel runtime counters (meaningful
+// only while --bpf-stats had accounting enabled). The avg-ns-per-run figure
+// is the 3a per-packet-overhead deliverable; tc_egress is logged alongside
+// the observer as the in-house baseline.
+func logProgStats(logger *slog.Logger, name string, prog *ebpf.Program) {
+	stats, err := prog.Stats()
+	if err != nil {
+		logger.Debug("BPF program stats unavailable", "program", name, "error", err)
+		return
+	}
+	var avgNs int64
+	if stats.RunCount > 0 {
+		avgNs = stats.Runtime.Nanoseconds() / int64(stats.RunCount)
+	}
+	logger.Info("BPF program stats",
+		"program", name,
+		"run_count", stats.RunCount,
+		"runtime_ns", stats.Runtime.Nanoseconds(),
+		"avg_ns", avgNs)
+}
 
 // StartCargoWall brings the firewall up and blocks until shutdown. Any fatal
 // error publishes the failure sentinel BEFORE the teardown unwind begins —
@@ -258,8 +282,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			if err != nil {
 				logger.Debug("Docker bridge not found, container DNS filtering unavailable", "error", err)
 			} else {
-				// Add docker bridge IP as additional listen address
-				dnsServer.AddListenAddr(dockerBridgeIP + ":53")
+				// Add docker bridge IP as additional listen address, marked
+				// container-serving so queries arriving there attribute via
+				// the container-IP lookup, never the host-netns sockdiag path.
+				dnsServer.AddContainerListenAddr(dockerBridgeIP + ":53")
 				logger.Info("Docker DNS interception enabled", "docker_bridge", dockerBridgeIP)
 
 				// Configure Docker to use our DNS proxy. Restore is deferred
@@ -515,6 +541,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// created them so audit events carry a causal step ordinal. Optional by
 	// design — it needs kernel BTF and a Runner.Worker process, and a failure
 	// here must never degrade enforcement, so it only warns.
+	var stepTracker *steps.Tracker
 	if cmd.StepAttribution {
 		tracker, err := steps.Start(&objs, steps.Options{
 			WorkerPID:   cmd.RunnerWorkerPID,
@@ -523,6 +550,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		if err != nil {
 			logger.Warn("Step attribution disabled", "error", err)
 		} else {
+			stepTracker = tracker
 			defer tracker.Close()
 			logger.Info("Step attribution enabled",
 				"worker_pid", tracker.WorkerPID(),
@@ -532,6 +560,54 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			if dnsServer != nil {
 				dnsServer.SetStepLookup(tracker.StepForClient)
 			}
+		}
+	}
+
+	// Container attribution, kernel half (issue #106, phase 3a): the
+	// audit-only cgroup_skb/egress origin observer. Loaded here — before the
+	// event reader starts — so the join store exists before the first
+	// verdict event; the docker-events tracker that classifies its records
+	// starts later (after the dockerd restart) and late-binds into the
+	// enricher shell. Requires step attribution: without step tags the
+	// observer's ordinals would always be zero, and the 64-entry step-map
+	// shrink above would make tagging meaningless anyway. Warn-only
+	// throughout — nothing here may degrade enforcement.
+	var originObserver *origin.Observer
+	var containerEnricher *containers.Enricher
+	var enricherArg events.ContainerEnricher
+	if cmd.ContainerAttribution {
+		if stepTracker == nil {
+			logger.Warn("Container attribution disabled (requires active step attribution)")
+		} else {
+			containerEnricher = &containers.Enricher{}
+			enricherArg = containerEnricher
+			obs, err := origin.Start(&objs, logger)
+			if err != nil {
+				logger.Warn("Container origin observer disabled", "error", err)
+			} else {
+				originObserver = obs
+				defer obs.Close()
+				logger.Info("Container origin observer attached")
+			}
+		}
+	}
+
+	// BPF runtime stats (3a telemetry): global kernel accounting while
+	// enabled; the per-program numbers land in one shutdown log line each.
+	// Registered after the observer's Close defer so the stats read runs
+	// while the programs are still alive.
+	if cmd.BPFStats {
+		statsCloser, err := ebpf.EnableStats(unix.BPF_STATS_RUN_TIME)
+		if err != nil {
+			logger.Warn("BPF runtime stats unavailable", "error", err)
+		} else {
+			defer statsCloser.Close()
+			defer func() {
+				logProgStats(logger, "tc_egress", objs.TcEgress)
+				if originObserver != nil {
+					logProgStats(logger, "cg_origin_egress", originObserver.Program())
+				}
+			}()
 		}
 	}
 
@@ -546,7 +622,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	defer rd.Close()
 
 	// Start the event reader before the firewall is enforcing so no events are missed.
-	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, logger)
+	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, logger, enricherArg)
 
 	// Set default action through firewall
 	defaultAction := configMgr.GetDefaultAction()
@@ -728,6 +804,24 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	if cmd.DockerDNSInterception && dockerBridgeIP != "" {
 		if err := network.RestartDockerDaemon(logger); err != nil {
 			logger.Warn("Failed to restart Docker daemon for DNS config", "error", err)
+		}
+	}
+
+	// Container attribution, userspace half: docker-events tracking, process
+	// tagging, and container identity. Started after the dockerd restart
+	// above so the event subscription isn't severed by it; the tracker's
+	// reconnect loop covers everything else. Warn-only, like steps.Start.
+	if cmd.ContainerAttribution && stepTracker != nil {
+		ctr, err := containers.Start(ctx, containers.Options{}, stepTracker, originObserver, auditLogger, logger)
+		if err != nil {
+			logger.Warn("Container attribution disabled", "error", err)
+		} else {
+			defer ctr.Close()
+			containerEnricher.Bind(ctr)
+			if dnsServer != nil && dockerBridgeIP != "" {
+				dnsServer.SetContainerLookup(ctr.LookupClient)
+			}
+			logger.Info("Container attribution enabled")
 		}
 	}
 

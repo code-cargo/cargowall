@@ -3490,3 +3490,230 @@ func TestHandleDNSQuery_DerivedReconcileRespectsOriginDenyPorts(t *testing.T) {
 	// pass can't mislabel it either.
 	assert.Empty(t, recentBlocks.TakeMatching("192.0.2.30", nil, nil, false))
 }
+
+// ---------------------------------------------------------------------------
+// Container-origin attribution (issue #106)
+// ---------------------------------------------------------------------------
+
+// addrResponseWriter is a minimal dns.ResponseWriter with configurable
+// local/remote addresses, so a handler test can steer a query onto the
+// container-serving listener (MockResponseWriter pins LocalAddr to
+// 127.0.0.1). Records the written response like MockResponseWriter does.
+type addrResponseWriter struct {
+	local  net.Addr
+	remote net.Addr
+	msg    *dns.Msg
+}
+
+func (w *addrResponseWriter) LocalAddr() net.Addr { return w.local }
+
+func (w *addrResponseWriter) RemoteAddr() net.Addr { return w.remote }
+
+func (w *addrResponseWriter) WriteMsg(m *dns.Msg) error { w.msg = m; return nil }
+
+func (w *addrResponseWriter) Write([]byte) (int, error) { return 0, nil }
+
+func (w *addrResponseWriter) Close() error { return nil }
+
+func (w *addrResponseWriter) TsigStatus() error { return nil }
+
+func (w *addrResponseWriter) TsigTimersOnly(bool) {}
+
+func (w *addrResponseWriter) Hijack() {}
+
+// newAddrResponseWriter models a UDP query that arrived on listenerIP:53
+// from clientIP:clientPort.
+func newAddrResponseWriter(listenerIP, clientIP string, clientPort int) *addrResponseWriter {
+	return &addrResponseWriter{
+		local:  &net.UDPAddr{IP: net.ParseIP(listenerIP), Port: 53},
+		remote: &net.UDPAddr{IP: net.ParseIP(clientIP), Port: clientPort},
+	}
+}
+
+// recordingSink captures every audit event the logger fans out, avoiding a
+// tempfile round-trip. No lock: handleDNSQuery runs synchronously on the
+// test goroutine, so Consume never races the assertions.
+type recordingSink struct {
+	evs []events.AuditEvent
+}
+
+func (r *recordingSink) Consume(ev events.AuditEvent) { r.evs = append(r.evs, ev) }
+
+// newContainerAttributionServer builds a Server via NewServer — the
+// literal-style newTestServer skips containerListenerIPs, which
+// AddContainerListenAddr requires — with query filtering on, a
+// deny-by-default config (so blocked.example.com REFUSEs without upstream
+// I/O), and a file-less audit logger feeding the returned sink. auditMode
+// sets BOTH the config posture and the logger's flag, mirroring production
+// wiring.
+func newContainerAttributionServer(t *testing.T, auditMode bool) (*Server, *recordingSink) {
+	t.Helper()
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+	cfg.SetAuditMode(auditMode)
+
+	server := NewServer(cfg, firewall.NewMockFirewall(t), "8.8.8.8:53", "127.0.0.1:53", slog.Default())
+	server.EnableQueryFiltering(true)
+
+	auditLogger, err := events.NewAuditLogger("", auditMode) // file-less: sink only
+	require.NoError(t, err)
+	t.Cleanup(func() { auditLogger.Close() })
+	sink := &recordingSink{}
+	auditLogger.AddSink(sink)
+	server.SetAuditLogger(auditLogger)
+	return server, sink
+}
+
+// blockedContainerQuery runs one blocked-domain query through the handler
+// with the given response writer and returns the single audit event it must
+// have produced.
+func blockedContainerQuery(t *testing.T, server *Server, sink *recordingSink, w *addrResponseWriter) events.AuditEvent {
+	t.Helper()
+	query := new(dns.Msg)
+	query.SetQuestion("blocked.example.com.", dns.TypeA)
+	server.handleDNSQuery(w, query)
+	require.NotNil(t, w.msg, "handler must write a response")
+	require.Len(t, sink.evs, 1, "exactly one dns_blocked audit event")
+	return sink.evs[0]
+}
+
+// A blocked query arriving on the container listener is attributed via the
+// container lookup (keyed on the client address), and the sockdiag step
+// lookup — which cannot see a container-netns socket and could wildcard-hit
+// an unrelated host socket — must never run.
+func TestHandleDNSQuery_ContainerListenerUsesContainerLookup(t *testing.T) {
+	server, sink := newContainerAttributionServer(t, false)
+	server.AddContainerListenAddr("172.17.0.1:53")
+
+	stepLookupCalls := 0
+	server.SetStepLookup(func(net.Addr) uint32 { stepLookupCalls++; return 7 })
+	var lookupAddr net.Addr
+	server.SetContainerLookup(func(addr net.Addr) (uint32, string, bool) {
+		lookupAddr = addr
+		return 3, "abc123def456", true
+	})
+
+	w := newAddrResponseWriter("172.17.0.1", "172.17.0.2", 41234)
+	ev := blockedContainerQuery(t, server, sink, w)
+
+	assert.Equal(t, dns.RcodeRefused, w.msg.Rcode, "enforce mode still REFUSEs container queries")
+	assert.Equal(t, events.EventDNSBlocked, ev.EventType)
+	assert.Equal(t, "blocked.example.com", ev.DstHostname)
+	assert.True(t, ev.ContainerOrigin, "container-listener queries are container-origin")
+	assert.Equal(t, uint32(3), ev.StepOrdinal, "ordinal comes from the container lookup")
+	assert.Equal(t, "abc123def456", ev.ContainerID)
+
+	require.NotNil(t, lookupAddr, "container lookup must be consulted")
+	assert.Equal(t, "172.17.0.2:41234", lookupAddr.String(),
+		"container lookup keys on the client (container veth) address")
+	assert.Zero(t, stepLookupCalls,
+		"sockdiag step lookup must never run for container-listener queries")
+}
+
+// When the container lookup can't identify the client (or was never
+// installed), the event still records container origin — that classification
+// is per-listener, not per-lookup — with no ordinal and no container id, so
+// the summary routes it to the container tier instead of a looser bucket.
+func TestHandleDNSQuery_ContainerListenerLookupMissStaysContainerOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		install bool
+	}{
+		{name: "lookup returns ok=false", install: true},
+		{name: "no lookup installed", install: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, sink := newContainerAttributionServer(t, false)
+			server.AddContainerListenAddr("172.17.0.1:53")
+
+			stepLookupCalls := 0
+			server.SetStepLookup(func(net.Addr) uint32 { stepLookupCalls++; return 7 })
+			if tc.install {
+				server.SetContainerLookup(func(net.Addr) (uint32, string, bool) { return 0, "", false })
+			}
+
+			w := newAddrResponseWriter("172.17.0.1", "172.17.0.3", 42345)
+			ev := blockedContainerQuery(t, server, sink, w)
+
+			assert.Equal(t, dns.RcodeRefused, w.msg.Rcode)
+			assert.True(t, ev.ContainerOrigin, "container origin is independent of lookup success")
+			assert.Zero(t, ev.StepOrdinal, "failed lookup leaves the event unattributed")
+			assert.Empty(t, ev.ContainerID)
+			assert.Zero(t, stepLookupCalls,
+				"a container-lookup miss must not fall back to the sockdiag path")
+		})
+	}
+}
+
+// A query on the host listener keeps the unchanged sockdiag path even when a
+// container listener and lookup are installed on the same server — the
+// routing is per-listener, not per-server.
+func TestHandleDNSQuery_HostListenerKeepsSockdiagPath(t *testing.T) {
+	server, sink := newContainerAttributionServer(t, false)
+	server.AddContainerListenAddr("172.17.0.1:53")
+
+	server.SetStepLookup(func(net.Addr) uint32 { return 5 })
+	containerLookupCalls := 0
+	server.SetContainerLookup(func(net.Addr) (uint32, string, bool) {
+		containerLookupCalls++
+		return 9, "cafe12345678", true
+	})
+
+	w := newAddrResponseWriter("127.0.0.1", "127.0.0.1", 51234)
+	ev := blockedContainerQuery(t, server, sink, w)
+
+	assert.Equal(t, dns.RcodeRefused, w.msg.Rcode)
+	assert.False(t, ev.ContainerOrigin, "host-listener queries are not container-origin")
+	assert.Equal(t, uint32(5), ev.StepOrdinal, "host path unchanged: sockdiag lookup attributes the query")
+	assert.Empty(t, ev.ContainerID)
+	assert.Zero(t, containerLookupCalls, "container lookup must not run for host-listener queries")
+}
+
+// AddListenAddr (plain) must NOT mark its IP as container-serving: the
+// explicit-marking design means a future non-container extra listener keeps
+// host-path attribution for its clients.
+func TestHandleDNSQuery_PlainAddListenAddrStaysHostPath(t *testing.T) {
+	server, sink := newContainerAttributionServer(t, false)
+	server.AddListenAddr("172.17.0.1:53") // plain, not AddContainerListenAddr
+
+	server.SetStepLookup(func(net.Addr) uint32 { return 5 })
+	containerLookupCalls := 0
+	server.SetContainerLookup(func(net.Addr) (uint32, string, bool) {
+		containerLookupCalls++
+		return 9, "cafe12345678", true
+	})
+
+	w := newAddrResponseWriter("172.17.0.1", "172.17.0.2", 43456)
+	ev := blockedContainerQuery(t, server, sink, w)
+
+	assert.False(t, ev.ContainerOrigin, "plain extra listener must not classify clients as containers")
+	assert.Equal(t, uint32(5), ev.StepOrdinal, "plain listener uses the host sockdiag path")
+	assert.Empty(t, ev.ContainerID)
+	assert.Zero(t, containerLookupCalls)
+}
+
+// Audit mode: the blocked branch still logs the container-attributed event,
+// then falls through and forwards the query (served from cache here so no
+// upstream I/O is needed).
+func TestHandleDNSQuery_ContainerListenerAuditModeStillTagsAndForwards(t *testing.T) {
+	server, sink := newContainerAttributionServer(t, true)
+	server.AddContainerListenAddr("172.17.0.1:53")
+	server.SetContainerLookup(func(net.Addr) (uint32, string, bool) {
+		return 4, "cafe12345678", true
+	})
+	seedCachedResponse(server, "blocked.example.com.",
+		makeCachedResponse("blocked.example.com.", "192.0.2.99"))
+
+	w := newAddrResponseWriter("172.17.0.1", "172.17.0.2", 44567)
+	ev := blockedContainerQuery(t, server, sink, w)
+
+	assert.Equal(t, dns.RcodeSuccess, w.msg.Rcode, "audit mode forwards instead of REFUSING")
+	assert.Equal(t, events.EventDNSBlocked, ev.EventType)
+	assert.True(t, ev.ContainerOrigin)
+	assert.Equal(t, uint32(4), ev.StepOrdinal)
+	assert.Equal(t, "cafe12345678", ev.ContainerID)
+	assert.True(t, ev.WouldDeny, "audit-mode logger marks would-deny")
+	assert.False(t, ev.Blocked)
+}

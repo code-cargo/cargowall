@@ -19,10 +19,15 @@ package steps
 import (
 	"log/slog"
 	"os"
+	"os/exec"
+	"runtime"
 	"testing"
+	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/events"
 )
@@ -145,4 +150,132 @@ func TestStart_RejectsNilObjects(t *testing.T) {
 	_, err := Start(nil, Options{OrdinalBase: 1}, nil, slog.Default())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "nil TC BPF objects")
+}
+
+// --- OrdinalAt tests (issue #106 phase 3a) ---
+
+// appendBoundaryCapped drives the same recordBoundary that run() calls, so
+// the ring-cap tests below exercise the production trim, not a mirror.
+func appendBoundaryCapped(tr *Tracker, b boundary) {
+	tr.recordBoundary(b.ordinal, b.at)
+}
+
+func TestOrdinalAt(t *testing.T) {
+	tr := &Tracker{}
+	base := time.Now()
+
+	// No boundaries observed yet: everything is untagged.
+	assert.Zero(t, tr.OrdinalAt(base))
+
+	tr.boundaryMu.Lock()
+	tr.boundaries = []boundary{
+		{ordinal: 3, at: base},
+		{ordinal: 4, at: base.Add(10 * time.Second)},
+		{ordinal: 5, at: base.Add(20 * time.Second)},
+	}
+	tr.boundaryMu.Unlock()
+
+	// Before the first boundary: 0, which callers treat as untagged so the
+	// attribution degrades to the stricter tier rather than guessing.
+	assert.Zero(t, tr.OrdinalAt(base.Add(-time.Second)))
+	// Exactly at a boundary: that step is already active ("at or before").
+	assert.Equal(t, uint32(3), tr.OrdinalAt(base))
+	assert.Equal(t, uint32(4), tr.OrdinalAt(base.Add(10*time.Second)))
+	// Between boundaries: the earlier step is the one still running.
+	assert.Equal(t, uint32(4), tr.OrdinalAt(base.Add(15*time.Second)))
+	// After the last boundary: the latest step.
+	assert.Equal(t, uint32(5), tr.OrdinalAt(base.Add(time.Hour)))
+}
+
+func TestOrdinalAt_RingOverflowKeepsNewest(t *testing.T) {
+	tr := &Tracker{}
+	base := time.Now()
+	total := boundaryHistory + 10
+	for i := range total {
+		appendBoundaryCapped(tr, boundary{
+			ordinal: uint32(i + 1),
+			at:      base.Add(time.Duration(i) * time.Second),
+		})
+	}
+
+	tr.boundaryMu.Lock()
+	n := len(tr.boundaries)
+	tr.boundaryMu.Unlock()
+	assert.Equal(t, boundaryHistory, n, "ring must stay capped at boundaryHistory")
+
+	// The newest boundary survives the trim...
+	assert.Equal(t, uint32(total), tr.OrdinalAt(base.Add(time.Duration(total)*time.Second)))
+	// ...and a time that falls where a trimmed entry used to sit resolves to
+	// 0 (untagged), never to a stale evicted ordinal: entries 0..9 were
+	// trimmed, so the oldest survivor is at base+10s.
+	assert.Zero(t, tr.OrdinalAt(base.Add(5*time.Second)))
+}
+
+// --- TagContainerProcess tests (issue #106 phase 3a) ---
+
+// newTaskMap creates a real BPF hash map with map_task_step's key/value
+// shape. Map creation needs CAP_BPF (kernel.unprivileged_bpf_disabled is 2
+// on typical hosts), so the tests below skip when unprivileged and only run
+// under sudo/CAP_BPF.
+func newTaskMap(t *testing.T) *ebpf.Map {
+	t.Helper()
+	m, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  4,
+		MaxEntries: 128,
+	})
+	if err != nil {
+		t.Skipf("cannot create BPF map (needs CAP_BPF, run under sudo): %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	return m
+}
+
+func TestTagContainerProcess_LeaderOverwriteDescendantCreateOnly(t *testing.T) {
+	m := newTaskMap(t)
+	tr := &Tracker{taskMap: m}
+
+	// Pin this goroutine to one OS thread so its tid is guaranteed to exist
+	// in /proc/<pid>/task both when pre-seeding and when asserting — the Go
+	// runtime creates and parks threads at will, so any other tid could race.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	selfTid := uint32(unix.Gettid())
+
+	// Two descendants of the leader (this test process): one already carries
+	// an ordinal — standing in for a child the fork tracepoint tagged — and
+	// one is untagged.
+	startSleeper := func() int {
+		cmd := exec.Command("sleep", "30")
+		require.NoError(t, cmd.Start())
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+		return cmd.Process.Pid
+	}
+	preTaggedPid := startSleeper()
+	untaggedPid := startSleeper()
+
+	// Pre-seed: our own tid simulates a stale leader entry (exec re-tag into
+	// a long-lived container / recycled tid), the first child a
+	// kernel-inherited descendant tag.
+	require.NoError(t, m.Put(selfTid, uint32(99)))
+	require.NoError(t, m.Put(uint32(preTaggedPid), uint32(7)))
+
+	tr.TagContainerProcess(os.Getpid(), 42)
+
+	// Leader threads are written UpdateAny: the stale ordinal must be replaced.
+	var got uint32
+	require.NoError(t, m.Lookup(selfTid, &got))
+	assert.Equal(t, uint32(42), got, "leader tid must be overwritten (UpdateAny)")
+
+	// Descendants are create-only: a kernel-inherited ordinal survives...
+	require.NoError(t, m.Lookup(uint32(preTaggedPid), &got))
+	assert.Equal(t, uint32(7), got, "pre-tagged descendant must keep its ordinal (UpdateNoExist)")
+
+	// ...while an untagged descendant picks up the container's ordinal.
+	require.NoError(t, m.Lookup(uint32(untaggedPid), &got))
+	assert.Equal(t, uint32(42), got, "untagged descendant must be tagged")
 }

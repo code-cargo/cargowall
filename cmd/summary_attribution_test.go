@@ -109,7 +109,7 @@ func TestSummary_Run_CausalGroupingAndCounts(t *testing.T) {
 	assert.Contains(t, out, "| Connections blocked | 1 | 3 |")
 	// Untagged dockerd traffic lands in the labeled docker bucket, not a
 	// generic unattributed dump and not a step it raced into.
-	assert.Contains(t, out, "Docker-mediated (daemon-created sockets")
+	assert.Contains(t, out, "Docker daemon (host-side sockets")
 	assert.NotContains(t, out, "Unattributed (no socket tag")
 }
 
@@ -161,6 +161,9 @@ func TestSummary_RenderAndPushGroupingsAgree(t *testing.T) {
 		{Timestamp: base.Add(5 * time.Second), EventType: events.EventConnectionBlocked, DstIP: "6.6.6.6", DstPort: 443, Protocol: "TCP", Process: "leftover", StepOrdinal: events.StepOrdinalPreDaemon},
 		// Tagged but unresolved (no boundary mapped this ordinal).
 		{Timestamp: base.Add(6 * time.Second), EventType: events.EventConnectionBlocked, DstIP: "7.7.7.7", DstPort: 443, Protocol: "TCP", Process: "orphan", StepOrdinal: 99},
+		// Untagged container-origin traffic; the dockerd process name proves
+		// ContainerOrigin outranks the docker bucket in both presenters.
+		{Timestamp: base.Add(7 * time.Second), EventType: events.EventConnectionBlocked, DstIP: "8.8.8.8", DstPort: 443, Protocol: "TCP", Process: "dockerd", ContainerOrigin: true},
 	}
 
 	// destination(group label) per event IP, for each presenter. Render
@@ -197,6 +200,7 @@ func TestSummary_RenderAndPushGroupingsAgree(t *testing.T) {
 	assert.Equal(t, bucketRunner, renderDest["5.5.5.5"])
 	assert.Equal(t, bucketPreDaemon, renderDest["6.6.6.6"])
 	assert.Equal(t, "#99", renderDest["7.7.7.7"])
+	assert.Equal(t, bucketContainerUnattr, renderDest["8.8.8.8"])
 }
 
 func TestSummary_BuildCausalPushGroups(t *testing.T) {
@@ -461,4 +465,124 @@ func TestSummary_BuildCausalPushGroups_DuplicateStepNames(t *testing.T) {
 	assert.Equal(t, "1.1.1.1", groups[0].Events[0].DstIP)
 	require.Len(t, groups[1].Events, 1, "second Run is a distinct group despite the shared name")
 	assert.Equal(t, "2.2.2.2", groups[1].Events[0].DstIP)
+}
+
+// --- Container attribution (issue #106) ---
+
+// ContainerOrigin must be checked FIRST: container traffic without a step tag
+// belongs in the container tier even when the process name or an auto-allow
+// classification would otherwise claim it — falling through to a looser
+// bucket would hide unattributable container traffic among daemon/infra rows.
+func TestSummary_UntaggedBucketLabel(t *testing.T) {
+	tests := []struct {
+		name string
+		ev   events.AuditEvent
+		want string
+	}{
+		{
+			// Precedence: ContainerOrigin beats BOTH later arms at once.
+			name: "container origin outranks dockerd process and auto-allow",
+			ev:   events.AuditEvent{ContainerOrigin: true, Process: "dockerd", AutoAllowedType: "cloud_metadata"},
+			want: bucketContainerUnattr,
+		},
+		{
+			name: "dockerd without container origin stays daemon traffic",
+			ev:   events.AuditEvent{Process: "dockerd"},
+			want: bucketDocker,
+		},
+		{
+			name: "auto-allowed platform endpoint",
+			ev:   events.AuditEvent{Process: "python3", AutoAllowedType: "cloud_metadata"},
+			want: bucketAutoInfra,
+		},
+		{
+			name: "plain untagged traffic is genuinely unexplained",
+			ev:   events.AuditEvent{Process: "curl"},
+			want: bucketUnknown,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, untaggedBucketLabel(tt.ev))
+		})
+	}
+}
+
+// End to end: an ordinal-0 container-origin block renders under the container
+// bucket heading — not "Unattributed" and (despite the dockerd process name)
+// not the Docker-daemon bucket.
+func TestSummary_Run_ContainerOriginUntaggedLandsInContainerBucket(t *testing.T) {
+	base := time.Now()
+	out := runSummary(t, []events.AuditEvent{
+		{Timestamp: base, EventType: events.EventStepBoundary, PID: 10, StepOrdinal: 1, Process: "bash -e /tmp/a.sh"},
+		{Timestamp: base.Add(time.Second), EventType: events.EventConnectionBlocked, DstIP: "203.0.113.9", DstPort: 443, Protocol: "TCP", Process: "dockerd", Blocked: true, ContainerOrigin: true},
+	})
+	assert.Contains(t, out, `#### Step: "Container traffic (unattributed`,
+		"container-origin traffic gets its own tier")
+	assert.Contains(t, out, "203.0.113.9")
+	assert.NotContains(t, out, "Unattributed (no socket tag",
+		"must not fall through to the generic unattributed bucket")
+	assert.NotContains(t, out, "Docker daemon (host-side sockets",
+		"container origin outranks the dockerd process name end to end")
+}
+
+// A container-origin event WITH a resolved ordinal is a fully attributed
+// event: it lands in its step's group like any tagged traffic, and the
+// container bucket never appears.
+func TestSummary_Run_ContainerOriginWithOrdinalLandsInStepGroup(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	enc := json.NewEncoder(f)
+	evts := []events.AuditEvent{
+		{Timestamp: base.Add(1 * time.Second), EventType: events.EventStepBoundary, PID: 10, StepOrdinal: 1, Process: "bash -e /tmp/build.sh"},
+		{Timestamp: base.Add(2 * time.Second), EventType: events.EventConnectionBlocked, DstIP: "203.0.113.7", DstPort: 443, Protocol: "TCP", Process: "python3", StepOrdinal: 1, ContainerOrigin: true, ContainerID: "abc123456789", Blocked: true},
+	}
+	for _, ev := range evts {
+		require.NoError(t, enc.Encode(ev))
+	}
+	require.NoError(t, f.Close())
+
+	steps := `[{"name":"build","number":1,"started_at":"2025-01-01T10:00:00Z","completed_at":"2025-01-01T10:00:10Z"}]`
+	var buf bytes.Buffer
+	cmdSum := &SummaryCmd{AuditLog: path, Steps: steps, output: &buf}
+	require.NoError(t, cmdSum.Run())
+	out := buf.String()
+
+	assert.Contains(t, out, `#### Step: "#1 - build"`, "step-tagged container traffic groups under its step")
+	assert.Contains(t, out, "203.0.113.7")
+	assert.NotContains(t, out, "Container traffic (unattributed",
+		"a resolved ordinal keeps the event out of the container bucket")
+}
+
+// container_attribution events are telemetry markers, not connections: the
+// summary must run fine with them in the log and render nothing from them —
+// no destination-less row, no effect on the counts table.
+func TestSummary_Run_ContainerAttributionEventsRenderNothing(t *testing.T) {
+	base := time.Now()
+	out := runSummary(t, []events.AuditEvent{
+		{Timestamp: base, EventType: events.EventStepBoundary, PID: 10, StepOrdinal: 1, Process: "bash -e /tmp/a.sh"},
+		{Timestamp: base.Add(time.Second), EventType: events.EventContainerAttribution, StepOrdinal: 1, ContainerID: "deadbeef4242", AttributionKind: "start", TagLatencyMS: 12.5},
+		{Timestamp: base.Add(2 * time.Second), EventType: events.EventConnectionBlocked, DstIP: "198.51.100.4", DstPort: 443, Protocol: "TCP", Process: "curl", StepOrdinal: 1, Blocked: true},
+	})
+	assert.Contains(t, out, "198.51.100.4", "the real connection still renders")
+	assert.NotContains(t, out, "deadbeef4242",
+		"the attribution marker's container id must not surface as a table row")
+	assert.NotContains(t, out, "container_attribution", "no raw event-type leakage")
+	assert.Contains(t, out, "| Connections blocked | 1 | 1 |",
+		"counts cover only real connection events")
+}
+
+// A log holding only boundaries and attribution markers has zero network
+// activity; like the boundary-only case, it must take the concise "no events"
+// path instead of rendering a summary of zeros.
+func TestSummary_Run_AttributionOnlyLogPrintsNoEventsMessage(t *testing.T) {
+	base := time.Now()
+	out := runSummary(t, []events.AuditEvent{
+		{Timestamp: base, EventType: events.EventStepBoundary, PID: 10, StepOrdinal: 1, Process: "bash -e /tmp/a.sh"},
+		{Timestamp: base.Add(time.Second), EventType: events.EventContainerAttribution, StepOrdinal: 1, ContainerID: "deadbeef4242", AttributionKind: "start"},
+	})
+	assert.Contains(t, out, "No network events were logged during this workflow run.")
+	assert.NotContains(t, out, "Events by Step")
 }

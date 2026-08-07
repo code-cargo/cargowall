@@ -90,6 +90,10 @@ type Tracker struct {
 	logger        *slog.Logger
 	done          chan struct{}
 
+	// Boundary history for OrdinalAt — see the boundary type.
+	boundaryMu sync.Mutex
+	boundaries []boundary
+
 	// DNS-path lookup guards — see StepForClient.
 	stepCacheMu  sync.Mutex
 	stepCache    map[stepCacheKey]stepCacheEntry
@@ -269,14 +273,14 @@ func (t *Tracker) seedExisting() {
 		self[pid] = true
 	}
 
-	t.tagTasks(t.workerPID, events.StepOrdinalRunner)
+	t.tagTasks(t.workerPID, events.StepOrdinalRunner, ebpf.UpdateNoExist)
 	for _, root := range children[t.workerPID] {
 		for _, pid := range subtreePids(root, children) {
 			ordinal := events.StepOrdinalPreDaemon
 			if self[pid] {
 				ordinal = events.StepOrdinalRunner
 			}
-			t.tagTasks(pid, ordinal)
+			t.tagTasks(pid, ordinal, ebpf.UpdateNoExist)
 		}
 	}
 
@@ -284,7 +288,7 @@ func (t *Tracker) seedExisting() {
 	// traffic as infrastructure. Create-only, so a no-op when the loop
 	// above already covered us.
 	for _, pid := range subtreePids(os.Getpid(), children) {
-		t.tagTasks(pid, events.StepOrdinalRunner)
+		t.tagTasks(pid, events.StepOrdinalRunner, ebpf.UpdateNoExist)
 	}
 }
 
@@ -297,9 +301,11 @@ func subtreePids(pid int, children map[int][]int) []int {
 	return pids
 }
 
-// tagTasks writes ordinal for every thread of pid. Create-only (BPF_NOEXIST):
-// a tid the fork tracepoint already tagged keeps its kernel-assigned ordinal.
-func (t *Tracker) tagTasks(pid int, ordinal uint32) {
+// tagTasks writes ordinal for every thread of pid. Seeding passes
+// UpdateNoExist so a tid the fork tracepoint already tagged keeps its
+// kernel-assigned ordinal; container leaders pass UpdateAny (see
+// TagContainerProcess for why overwrite is safe there and only there).
+func (t *Tracker) tagTasks(pid int, ordinal uint32, flags ebpf.MapUpdateFlags) {
 	tids, err := os.ReadDir("/proc/" + strconv.Itoa(pid) + "/task")
 	if err != nil {
 		return // process exited mid-scan
@@ -309,8 +315,67 @@ func (t *Tracker) tagTasks(pid int, ordinal uint32) {
 		if err != nil {
 			continue
 		}
-		_ = t.taskMap.Update(uint32(n), ordinal, ebpf.UpdateNoExist)
+		_ = t.taskMap.Update(uint32(n), ordinal, flags)
 	}
+}
+
+// TagContainerProcess tags a container workload subtree rooted at pid.
+// Container ancestry runs through containerd-shim, never Runner.Worker, so
+// kernel fork-inheritance cannot reach these processes — this is the
+// userspace bridge that puts the launching step's ordinal on them, after
+// which sock_create tags their sockets like any other tagged task.
+//
+// The leader's threads are written with UpdateAny: a freshly shim-forked
+// leader is untagged in the normal case, an exec re-tag into a long-lived
+// container must replace the container's older ordinal, and overwrite
+// self-heals a stale entry left by a recycled tid. Descendants are
+// create-only — children forked after an earlier tag already carry correct
+// kernel-inherited ordinals that must never be clobbered.
+func (t *Tracker) TagContainerProcess(pid int, ordinal uint32) {
+	t.tagTasks(pid, ordinal, ebpf.UpdateAny)
+	children := buildChildrenMap()
+	for _, p := range subtreePids(pid, children)[1:] {
+		t.tagTasks(p, ordinal, ebpf.UpdateNoExist)
+	}
+}
+
+// boundary records one step_child_event as observed by run(), stamped with
+// wall-clock receive time so external event streams that carry their own
+// timestamps (Docker's timeNano) can be resolved against the step that was
+// active when the event happened, not whichever step is active when a
+// possibly backlogged stream gets processed.
+type boundary struct {
+	ordinal uint32
+	at      time.Time
+}
+
+// boundaryHistory bounds the ring; ordinals are monotonic so old entries
+// only matter for as long as an external event could plausibly be delayed.
+const boundaryHistory = 256
+
+// recordBoundary appends one observed boundary, trimming the ring to
+// boundaryHistory (append reallocation keeps the retained backing bounded).
+func (t *Tracker) recordBoundary(ordinal uint32, at time.Time) {
+	t.boundaryMu.Lock()
+	defer t.boundaryMu.Unlock()
+	t.boundaries = append(t.boundaries, boundary{ordinal: ordinal, at: at})
+	if len(t.boundaries) > boundaryHistory {
+		t.boundaries = t.boundaries[1:]
+	}
+}
+
+// OrdinalAt returns the ordinal of the latest step boundary observed at or
+// before tm, or 0 when tm predates every observed boundary (callers treat 0
+// as untagged, which degrades to the stricter attribution tier by design).
+func (t *Tracker) OrdinalAt(tm time.Time) uint32 {
+	t.boundaryMu.Lock()
+	defer t.boundaryMu.Unlock()
+	for i := len(t.boundaries) - 1; i >= 0; i-- {
+		if !t.boundaries[i].at.After(tm) {
+			return t.boundaries[i].ordinal
+		}
+	}
+	return 0
 }
 
 // run consumes new-step notifications and re-reports them as audit events
@@ -331,6 +396,11 @@ func (t *Tracker) run() {
 			continue
 		}
 		ev := (*stepChildEvent)(unsafe.Pointer(&record.RawSample[0]))
+
+		// Record the boundary before the cmdline retry loop below (which can
+		// sleep tens of ms) so OrdinalAt callers racing a fresh boundary
+		// resolve against it promptly.
+		t.recordBoundary(ev.Ordinal, time.Now())
 
 		cmdline := sanitizeCmdline(t.stepCmdline(int(ev.Tgid)))
 		t.logger.Info("Workflow step process started",

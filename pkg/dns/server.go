@@ -59,6 +59,16 @@ type Server struct {
 	// func(net.Addr) uint32.
 	stepLookup atomic.Value
 
+	// Container-origin attribution (issue #106). containerListenerIPs marks
+	// which listen addresses serve containers (the docker bridge IP): a
+	// query arriving there comes from a container netns, where the sockdiag
+	// stepLookup cannot see the client socket — the container lookup keys on
+	// the client IP instead. Written only before Start (via
+	// AddContainerListenAddr); containerLookup is atomic for the same
+	// late-install reason as stepLookup. Holds a ContainerLookup.
+	containerListenerIPs map[string]bool
+	containerLookup      atomic.Value
+
 	// Track hostname to IP mappings for updates (no automatic removal)
 	hostnameIPs      map[string]map[string]bool // hostname -> set of IPs
 	hostnameIPsMutex sync.RWMutex
@@ -119,10 +129,11 @@ func NewServer(cfg *config.Manager, fw firewall.Firewall, upstream, listenAddr s
 				},
 			},
 		},
-		hostnameIPs:  make(map[string]map[string]bool),
-		dnsCache:     newLRUCache[string, *dnsCacheEntry](10000),
-		cnameAllowed: newLRUCache[string, derivedAllow](10000),
-		preResolved:  newLRUCache[string, struct{}](1000),
+		hostnameIPs:          make(map[string]map[string]bool),
+		dnsCache:             newLRUCache[string, *dnsCacheEntry](10000),
+		cnameAllowed:         newLRUCache[string, derivedAllow](10000),
+		preResolved:          newLRUCache[string, struct{}](1000),
+		containerListenerIPs: make(map[string]bool),
 	}
 }
 
@@ -160,6 +171,48 @@ func (s *Server) SetRecentBlocks(rb *events.RecentBlocks) {
 // This is used for Docker container DNS (listening on docker bridge IP).
 func (s *Server) AddListenAddr(addr string) {
 	s.additionalAddrs = append(s.additionalAddrs, addr)
+}
+
+// ContainerLookup resolves a container-origin DNS client address (the
+// container's veth IP — the source of both direct bridge queries and the
+// embedded resolver's external forwards) to its step attribution.
+type ContainerLookup func(addr net.Addr) (stepOrdinal uint32, containerID string, ok bool)
+
+// SetContainerLookup installs the container-client resolver
+// (containers.Tracker.LookupClient). Same late-install contract as
+// SetStepLookup.
+func (s *Server) SetContainerLookup(lookup ContainerLookup) {
+	if lookup == nil {
+		return // atomic.Value cannot store nil; absent means unattributed anyway
+	}
+	s.containerLookup.Store(lookup)
+}
+
+// AddContainerListenAddr adds a listen address AND marks it as
+// container-serving, so queries arriving there are attributed via the
+// container lookup instead of the host-netns sockdiag path (which cannot see
+// a container's client socket, and whose wildcard fallback could even
+// mis-hit an unrelated host socket on the same ephemeral port). Explicit
+// marking rather than inference: a future non-container extra listener must
+// not silently classify its clients as containers. Call before Start.
+func (s *Server) AddContainerListenAddr(addr string) {
+	s.AddListenAddr(addr)
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		s.containerListenerIPs[host] = true
+	}
+}
+
+// isContainerListener reports whether the query arrived on a
+// container-serving listener.
+func (s *Server) isContainerListener(w dns.ResponseWriter) bool {
+	if len(s.containerListenerIPs) == 0 || w.LocalAddr() == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(w.LocalAddr().String())
+	if err != nil {
+		return false
+	}
+	return s.containerListenerIPs[host]
 }
 
 // EnableQueryFiltering enables DNS query filtering.
@@ -387,19 +440,28 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 					"from", w.RemoteAddr().String())
 			}
 
-			// Log to audit file if configured. The querying step is resolved
-			// from the client socket while the client is still blocked in its
-			// recv, so the sock_diag lookup sees a live socket.
+			// Log to audit file if configured. A host client's step is
+			// resolved from its socket while it is still blocked in its recv,
+			// so the sock_diag lookup sees a live socket. A container client
+			// has no visible socket in the host netns — its query is keyed on
+			// the container IP instead, and never touches the sockdiag path.
 			if s.auditLogger != nil {
-				var stepOrdinal uint32
-				if lookup, ok := s.stepLookup.Load().(func(net.Addr) uint32); ok {
-					stepOrdinal = lookup(w.RemoteAddr())
-				}
-				if err := s.auditLogger.LogEvent(events.AuditEvent{
+				ev := events.AuditEvent{
 					EventType:   events.EventDNSBlocked,
 					DstHostname: domain,
-					StepOrdinal: stepOrdinal,
-				}); err != nil {
+				}
+				if s.isContainerListener(w) {
+					ev.ContainerOrigin = true
+					if lookup, ok := s.containerLookup.Load().(ContainerLookup); ok {
+						if ordinal, containerID, found := lookup(w.RemoteAddr()); found {
+							ev.StepOrdinal = ordinal
+							ev.ContainerID = containerID
+						}
+					}
+				} else if lookup, ok := s.stepLookup.Load().(func(net.Addr) uint32); ok {
+					ev.StepOrdinal = lookup(w.RemoteAddr())
+				}
+				if err := s.auditLogger.LogEvent(ev); err != nil {
 					s.logger.Error("Failed to write DNS audit log", "error", err)
 				}
 			}

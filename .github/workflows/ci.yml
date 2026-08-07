@@ -158,6 +158,12 @@ jobs:
 
       - name: Start CargoWall via Action
         uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        env:
+          # 3a telemetry: per-program overhead numbers (cg_origin_egress vs
+          # the tc_egress baseline) land in the daemon's shutdown log during
+          # the action's post step. Informational — shared-runner variance
+          # makes ns thresholds flaky, so nothing asserts on them.
+          CARGOWALL_BPF_STATS: 'true'
         with:
           mode: enforce
           offline: 'true'
@@ -227,6 +233,44 @@ jobs:
           fi
           echo "✅ Docker container blocked from example.com"
 
+      - name: Container attribution scenarios (issue #106)
+        run: |
+          # The `sleep 1` inside each container puts the docker-events
+          # tagging window behind us before the workload opens sockets: the
+          # start→tag window is a documented 3a scope boundary (such traffic
+          # lands in the stricter container tier), not what these assertions
+          # measure.
+
+          # Concurrent containers hitting DISTINCT blocked destinations —
+          # proves per-container attribution doesn't cross wires under
+          # concurrency. TEST-NET-2 IPs skip DNS entirely (deterministic TC
+          # block, and SYN retransmits give the origin-record join several
+          # shots) and can never carry real traffic.
+          : > /tmp/cargowall-concurrent-cids
+          for ip in 198.51.100.7 198.51.100.8 198.51.100.9; do
+            CID=$(docker run -d --rm alpine:latest sh -c "sleep 1; wget -q --timeout=6 http://$ip/ || true; sleep 2")
+            echo "$ip ${CID:0:12}" >> /tmp/cargowall-concurrent-cids
+          done
+
+          # Attributed container DNS: blocked at the resolver, so the
+          # dns_blocked record is where container DNS attribution shows up.
+          docker run --rm alpine:latest sh -c 'sleep 1; wget -q --timeout=5 https://container-dns-probe.example.com || true'
+
+          # Give the three detached containers time to finish their fetches.
+          sleep 12
+          cat /tmp/cargowall-concurrent-cids
+
+          # Exec re-tag: container born in THIS step, exec'd from the NEXT
+          # step — the exec traffic must attribute to the next step's
+          # ordinal, never this one's.
+          CID=$(docker run -d --name cargowall-exec-test alpine:latest sleep 120)
+          echo "${CID:0:12}" > /tmp/cargowall-exec-test-cid
+
+      - name: Container exec attribution (separate step on purpose)
+        run: |
+          docker exec cargowall-exec-test sh -c 'sleep 1; wget -q --timeout=6 http://198.51.100.44/ || true'
+          docker rm -f cargowall-exec-test
+
       - name: Validate audit log events
         run: |
           AUDIT_LOG=/tmp/cargowall-audit.json
@@ -277,12 +321,77 @@ jobs:
             EVENTS_VALID=false
           fi
 
+          # --- Container attribution (issue #106, phase 3a) ---
+          # The daemon degrades to a warning when container attribution
+          # can't start, so — as with step attribution above — these are the
+          # assertions that catch a silent degrade on the environment that
+          # matters. Ordinal bounds match the step assertions (real ordinal:
+          # >0, below the sentinel margin).
+
+          # Every container/exec tagging emits a container_attribution
+          # marker; at least one must carry a real ordinal and a measured
+          # tag latency.
+          CONTAINER_ATTR_COUNT=$(jq -s '[.[] | select(.event_type == "container_attribution") | select((.step_ordinal // 0) > 0 and (.step_ordinal // 0) < 4294901758) | select((.tag_latency_ms // -1) >= 0)] | length' "$AUDIT_LOG")
+          echo "container_attribution events with real ordinal: $CONTAINER_ATTR_COUNT"
+          if [ "$CONTAINER_ATTR_COUNT" -eq 0 ]; then
+            echo "❌ No container_attribution events with a real step ordinal (container attribution silently degraded?)"
+            EVENTS_VALID=false
+          fi
+
+          # Container DNS: the resolver-blocked probe must be attributed to
+          # its container and step (this is the "map the forwarded queries"
+          # deliverable — a container's blocked DNS is no longer ordinal 0).
+          DNS_CONTAINER_COUNT=$(jq -s '[.[] | select(.event_type == "dns_blocked" and .container_origin == true) | select((.step_ordinal // 0) > 0 and (.step_ordinal // 0) < 4294901758) | select(.container_id != null and .container_id != "")] | length' "$AUDIT_LOG")
+          echo "container-attributed dns_blocked events: $DNS_CONTAINER_COUNT"
+          if [ "$DNS_CONTAINER_COUNT" -eq 0 ]; then
+            echo "❌ No dns_blocked events carry container attribution"
+            EVENTS_VALID=false
+          fi
+
+          # Concurrent-container correctness: each TEST-NET destination's
+          # blocked connection events must carry exactly the container that
+          # fetched it (captured at docker run time), with one shared real
+          # ordinal across all three (same step launched them).
+          while read -r ip cid; do
+            MATCHED=$(jq -s --arg ip "$ip" --arg cid "$cid" '[.[] | select(.event_type | test("^connection_")) | select(.dst_ip == $ip and .container_origin == true and .container_id == $cid) | select((.step_ordinal // 0) > 0 and (.step_ordinal // 0) < 4294901758)] | length' "$AUDIT_LOG")
+            CROSSED=$(jq -s --arg ip "$ip" --arg cid "$cid" '[.[] | select(.event_type | test("^connection_")) | select(.dst_ip == $ip and (.container_id // "") != "" and .container_id != $cid)] | length' "$AUDIT_LOG")
+            echo "dst $ip: container $cid attributed=$MATCHED crossed=$CROSSED"
+            if [ "$MATCHED" -eq 0 ]; then
+              echo "❌ No attributed connection events for $ip / $cid"
+              EVENTS_VALID=false
+            fi
+            if [ "$CROSSED" -ne 0 ]; then
+              echo "❌ Events for $ip attributed to a DIFFERENT container — join keys crossed wires"
+              EVENTS_VALID=false
+            fi
+          done < /tmp/cargowall-concurrent-cids
+          SHARED_ORDS=$(jq -s '[.[] | select(.event_type | test("^connection_")) | select(.dst_ip == "198.51.100.7" or .dst_ip == "198.51.100.8" or .dst_ip == "198.51.100.9") | select(.container_origin == true) | .step_ordinal] | unique | length' "$AUDIT_LOG")
+          echo "distinct ordinals across the three concurrent containers: $SHARED_ORDS"
+          if [ "$SHARED_ORDS" -ne 1 ]; then
+            echo "❌ Concurrent containers launched by one step must share one ordinal"
+            EVENTS_VALID=false
+          fi
+
+          # Exec re-tag: the exec attribution for the long-lived container
+          # must carry a LATER ordinal than its start attribution (the exec
+          # came from a later step).
+          EXEC_CID=$(cat /tmp/cargowall-exec-test-cid)
+          START_ORD=$(jq -s --arg cid "$EXEC_CID" '[.[] | select(.event_type == "container_attribution" and .container_id == $cid and .attribution_kind == "start")][0].step_ordinal // 0' "$AUDIT_LOG")
+          EXEC_ORD=$(jq -s --arg cid "$EXEC_CID" '[.[] | select(.event_type == "container_attribution" and .container_id == $cid and .attribution_kind == "exec")][0].step_ordinal // 0' "$AUDIT_LOG")
+          echo "exec-test container $EXEC_CID: start_ordinal=$START_ORD exec_ordinal=$EXEC_ORD"
+          if [ "$START_ORD" -eq 0 ] || [ "$EXEC_ORD" -eq 0 ] || [ "$EXEC_ORD" -le "$START_ORD" ]; then
+            echo "❌ Exec re-tag failed: exec ordinal must be a later step than the start ordinal"
+            EVENTS_VALID=false
+          fi
+
           # Evidence dump: the raw attribution rows, so a passing run shows
           # first-hand what was tagged (and a failing one shows what wasn't).
           echo "--- step_boundary events ---"
           jq -c 'select(.event_type == "step_boundary") | {step_ordinal, pid, process}' "$AUDIT_LOG"
+          echo "--- container_attribution events ---"
+          jq -c 'select(.event_type == "container_attribution") | {attribution_kind, container_id, step_ordinal, pid, tag_latency_ms, privileged}' "$AUDIT_LOG"
           echo "--- attributed connection events ---"
-          jq -c 'select(.event_type | test("^connection_")) | {step_ordinal: (.step_ordinal // 0), event_type, dst_hostname, dst_ip, dst_port, process}' "$AUDIT_LOG"
+          jq -c 'select(.event_type | test("^connection_")) | {step_ordinal: (.step_ordinal // 0), event_type, dst_hostname, dst_ip, dst_port, process, container_id: (.container_id // ""), container_origin: (.container_origin // false)}' "$AUDIT_LOG"
 
           if [ "$EVENTS_VALID" = true ]; then
             echo "✅ Audit log contains expected event types"

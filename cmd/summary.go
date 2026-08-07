@@ -114,6 +114,13 @@ func (c *SummaryCmd) Run() error {
 		}
 	}
 
+	// Resolve ordinals against the GitHub-REPORTED step times, BEFORE the
+	// backfill below synthesizes completed_at values: a backfilled end
+	// (the next step's start) makes every window abut its successor, and
+	// the resolver's window tie-breaker would then capture rounding-early
+	// boundaries that belong to the next step.
+	ordinalSteps := resolveOrdinalSteps(stepBoundaries, steps)
+
 	// Every push path ships per-step timestamps, so the null-completed_at
 	// backfill must run before ANY of them — including the zero-network
 	// early return below, whose pushToApi(nil, steps) uses steps directly
@@ -169,7 +176,6 @@ func (c *SummaryCmd) Run() error {
 	// same assignment rule (assignCausal), so the two can't disagree. Temporal
 	// correlation is the legacy fallback for attribution-off runs and old
 	// logs, never an intermediate for the causal path.
-	ordinalSteps := resolveOrdinalSteps(stepBoundaries, steps)
 	var renderGroups, pushGroups []StepEvents
 	if len(stepBoundaries) > 0 {
 		renderGroups = causalGroups(regularEvents, steps, ordinalSteps)

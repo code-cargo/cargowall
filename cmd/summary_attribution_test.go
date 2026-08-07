@@ -293,20 +293,80 @@ func TestSummary_ResolveOrdinalSteps_CompositeMultipleBoundariesPerStep(t *testi
 	}
 	boundaries := []events.AuditEvent{
 		{EventType: events.EventStepBoundary, StepOrdinal: 1, Timestamp: base.Add(100 * time.Millisecond)},
-		// Later run: blocks of the composite: mid-window, and — the case
-		// that distinguishes the rule ORDER — inside the window while also
-		// within rounding slack of deploy's recorded start. The recorded
-		// window wins; deploy must not claim it.
+		// Later run: blocks of the composite, mid-window and OUTSIDE the
+		// rounding-slack band of deploy's start. (A composite block that
+		// forks inside that band is indistinguishable from deploy's own
+		// rounding-early fork on timestamps alone and goes to deploy by
+		// design — see the tie-breakers and #103.)
 		{EventType: events.EventStepBoundary, StepOrdinal: 2, Timestamp: base.Add(3 * time.Second)},
-		{EventType: events.EventStepBoundary, StepOrdinal: 3, Timestamp: base.Add(9 * time.Second)},
+		{EventType: events.EventStepBoundary, StepOrdinal: 3, Timestamp: base.Add(7 * time.Second)},
 		// The genuinely next step.
 		{EventType: events.EventStepBoundary, StepOrdinal: 4, Timestamp: base.Add(10*time.Second + 100*time.Millisecond)},
 	}
 	idx := resolveOrdinalSteps(boundaries, steps)
 	assert.Equal(t, 0, idx[1])
 	assert.Equal(t, 0, idx[2], "second boundary in the window maps to the same step")
-	assert.Equal(t, 0, idx[3], "in-window beats within-slack-of-next: composite's last block stays composite's")
+	assert.Equal(t, 0, idx[3], "third boundary too")
 	assert.Equal(t, 1, idx[4], "later mappings must not shift")
+}
+
+// Sequential steps ABUT: prev's recorded completed_at equals the next
+// step's started_at — natively (GitHub reports whole seconds) and after
+// backfill. A boundary a fraction before the next step's start is that
+// step's own rounding-early fork; prev's inclusive window must NOT capture
+// it, or every such boundary (the common Actions shape) shifts one step
+// left. Inside the slack band, next wins by design.
+func TestSummary_ResolveOrdinalSteps_RoundingRescueBeatsAbuttingWindow(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	steps := []GitHubStep{
+		{Name: "build", Number: 1, StartedAt: base, CompletedAt: base.Add(10 * time.Second)},
+		{Name: "deploy", Number: 2, StartedAt: base.Add(10 * time.Second), CompletedAt: base.Add(20 * time.Second)},
+	}
+	boundaries := []events.AuditEvent{
+		{EventType: events.EventStepBoundary, StepOrdinal: 1, Timestamp: base.Add(time.Second)},
+		// 200ms before deploy's recorded start — inside build's inclusive
+		// window because the windows abut.
+		{EventType: events.EventStepBoundary, StepOrdinal: 2, Timestamp: base.Add(10*time.Second - 200*time.Millisecond)},
+	}
+	idx := resolveOrdinalSteps(boundaries, steps)
+	assert.Equal(t, 0, idx[1])
+	assert.Equal(t, 1, idx[2], "rounding-early boundary belongs to deploy despite build's abutting window")
+}
+
+// Locks the Run-order contract end to end: ordinals resolve against the
+// GitHub-REPORTED step times BEFORE backfillStepCompletion synthesizes
+// completed_at values — a backfilled end (next step's start) would place
+// every rounding-early boundary inside the previous step's window and
+// shift its traffic one step left.
+func TestSummary_Run_ResolvesAgainstReportedTimesNotBackfilled(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	enc := json.NewEncoder(f)
+	evts := []events.AuditEvent{
+		{Timestamp: base.Add(time.Second), EventType: events.EventStepBoundary, PID: 10, StepOrdinal: 1, Process: "bash -e /tmp/build.sh"},
+		// Deploy's fork, 200ms before its recorded start.
+		{Timestamp: base.Add(10*time.Second - 200*time.Millisecond), EventType: events.EventStepBoundary, PID: 11, StepOrdinal: 2, Process: "bash -e /tmp/deploy.sh"},
+		{Timestamp: base.Add(12 * time.Second), EventType: events.EventConnectionBlocked, DstIP: "9.9.9.9", DstPort: 443, Protocol: "TCP", Process: "curl", StepOrdinal: 2, Blocked: true},
+	}
+	for _, ev := range evts {
+		require.NoError(t, enc.Encode(ev))
+	}
+	require.NoError(t, f.Close())
+
+	// completed_at deliberately null on both steps — the shape GitHub
+	// reports mid-job, and exactly what the backfill synthesizes over.
+	stepsJSON := `[{"name":"build","number":1,"started_at":"2025-01-01T10:00:00Z"},` +
+		`{"name":"deploy","number":2,"started_at":"2025-01-01T10:00:10Z"}]`
+	var buf bytes.Buffer
+	cmdSum := &SummaryCmd{AuditLog: path, Steps: stepsJSON, output: &buf}
+	require.NoError(t, cmdSum.Run())
+	out := buf.String()
+
+	assert.Contains(t, out, `#### Step: "#2 - deploy"`, "the early boundary resolves to deploy, not build")
+	assert.Contains(t, out, "| #2 | deploy |", "attribution table agrees")
+	assert.NotContains(t, out, `"#2 - build"`)
 }
 
 // Skipped steps (`if:`-guarded — GitHub reports zero timestamps) never ran

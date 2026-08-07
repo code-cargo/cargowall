@@ -31,6 +31,12 @@ import (
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
+// resolveRoundingSlack is how far before a step's recorded start a boundary
+// may fire and still be treated as that step's own rounding error rather
+// than a mid-step transient fork. GitHub step timings are truncated to the
+// second, so the genuine gap is under 1s; 2s leaves margin for clock skew.
+const resolveRoundingSlack = 2 * time.Second
+
 // resolveOrdinalSteps maps each causal step ordinal to a step INDEX (not a
 // name — GitHub step names repeat, e.g. several unnamed "Run" steps, so a
 // name can't identify a group). Callers derive the display name from the
@@ -50,13 +56,14 @@ import (
 // otherwise tie). It is NOT injective: a composite action runs several
 // `run:` blocks — several worker forks, several boundaries — under one
 // reported step, so a boundary landing inside the previous match's window
-// maps to that same step rather than consuming the next one.
-// resolveRoundingSlack is how far before a step's recorded start a boundary
-// may fire and still be treated as that step's own rounding error rather
-// than a mid-step transient fork. GitHub step timings are truncated to the
-// second, so the genuine gap is under 1s; 2s leaves margin for clock skew.
-const resolveRoundingSlack = 2 * time.Second
-
+// maps to that same step rather than consuming the next one — except
+// within resolveRoundingSlack of the next step's start, where the next
+// step wins (see the tie-breakers in the body).
+//
+// Pass GitHub-REPORTED step times only: backfilled completed_at values
+// (the next step's start) make every window abut its successor, which
+// would hand the window tie-breaker synthetic evidence — Run resolves
+// BEFORE backfillStepCompletion for exactly this reason.
 func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep) map[uint32]int {
 	boundaries := make([]events.AuditEvent, len(stepBoundaries))
 	copy(boundaries, stepBoundaries)
@@ -79,37 +86,44 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 				best = i
 			}
 		}
-		// Unmatched boundary: three tie-breakers, strongest evidence first.
+		// The next step that actually ran, needed by the tie-breakers
+		// below. Skipped steps (`if:`-guarded — zero StartedAt) never ran
+		// and never fork, so scan past them.
+		nextIdx := -1
+		for j := prev + 1; j < len(steps); j++ {
+			if !steps[j].StartedAt.IsZero() {
+				nextIdx = j
+				break
+			}
+		}
+		nearNext := nextIdx >= 0 && steps[nextIdx].StartedAt.After(b.Timestamp) &&
+			steps[nextIdx].StartedAt.Sub(b.Timestamp) <= resolveRoundingSlack
+
+		// Unmatched boundary: ordered tie-breakers.
 		//
-		// 1. Inside prev's RECORDED window: another direct worker fork of
+		// 1. Rounding rescue: within slack of the next step's recorded
+		//    start, the boundary is that step's own fork (GitHub truncates
+		//    step times to the second). This wins even inside prev's
+		//    recorded window: sequential steps ABUT — prev's end equals
+		//    next's start, natively and after backfill — so the window
+		//    rule would otherwise capture every rounding-early boundary
+		//    and systematically shift attribution one step left. Inside
+		//    this shared band timestamps cannot distinguish a composite's
+		//    final block from the next step's early fork; next-wins is
+		//    the deliberate choice until cmdline correlation (#103) can
+		//    tell them apart.
+		if best == -1 && nearNext {
+			best = nextIdx
+		}
+		// 2. Inside prev's RECORDED window: another direct worker fork of
 		//    the same reported step — composite actions run one fork per
 		//    `run:` block (this also absorbs transient runtime forks,
 		//    empirically real — see steps.Options.OrdinalBase — into
 		//    whatever step was running rather than letting them shift the
-		//    mapping). Checked BEFORE the rounding rescue: the recorded
-		//    timestamps place the boundary in prev, and preferring the
-		//    next step here would misattribute a composite's later blocks
-		//    — its last block often forks within slack of the next step's
-		//    recorded start.
+		//    mapping).
 		if best == -1 && prev >= 0 && !steps[prev].StartedAt.After(b.Timestamp) &&
 			!steps[prev].CompletedAt.IsZero() && !b.Timestamp.After(steps[prev].CompletedAt) {
 			best = prev
-		}
-		// 2. Rounding rescue: GitHub truncates step times to the second,
-		//    so a step's own boundary can fire a fraction before its
-		//    recorded start; claim the next step that actually ran.
-		//    Skipped steps (`if:`-guarded — zero StartedAt) never ran and
-		//    never fork, so scan past them to the next real candidate.
-		if best == -1 {
-			for j := prev + 1; j < len(steps); j++ {
-				if steps[j].StartedAt.IsZero() {
-					continue
-				}
-				if steps[j].StartedAt.Sub(b.Timestamp) <= resolveRoundingSlack {
-					best = j
-				}
-				break
-			}
 		}
 		// 3. Just past prev's recorded end (or prev's end unknown):
 		//    end-side rounding of the same step. Farther than slack is a

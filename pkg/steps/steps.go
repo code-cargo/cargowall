@@ -31,7 +31,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -87,6 +89,12 @@ type Tracker struct {
 	auditLogger   *events.AuditLogger
 	logger        *slog.Logger
 	done          chan struct{}
+
+	// DNS-path lookup guards — see StepForClient.
+	stepCacheMu  sync.Mutex
+	stepCache    map[stepCacheKey]stepCacheEntry
+	diagSem      chan struct{}
+	diagWarnOnce sync.Once
 }
 
 // Start loads the step-attribution collection against tcObjs' shared maps,
@@ -136,6 +144,8 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		auditLogger:   auditLogger,
 		logger:        logger,
 		done:          make(chan struct{}),
+		stepCache:     make(map[stepCacheKey]stepCacheEntry),
+		diagSem:       make(chan struct{}, diagConcurrency),
 	}
 
 	// The three shared maps are owned by the tcbpf collection; replacing them
@@ -327,7 +337,12 @@ func (t *Tracker) run() {
 			"pid", ev.Tgid,
 			"cmdline", cmdline)
 		if t.auditLogger != nil {
-			if err := t.auditLogger.LogStepBoundary(ev.Ordinal, ev.Tgid, cmdline); err != nil {
+			if err := t.auditLogger.LogEvent(events.AuditEvent{
+				EventType:   events.EventStepBoundary,
+				Process:     cmdline,
+				PID:         ev.Tgid,
+				StepOrdinal: ev.Ordinal,
+			}); err != nil {
 				t.logger.Error("Failed to write audit log", "error", err)
 			}
 		}
@@ -335,19 +350,37 @@ func (t *Tracker) run() {
 }
 
 // sanitizeCmdline reduces an emitted command line to its first two argv
-// tokens. Boundary events describe Runner.Worker's direct children, whose
-// argv is interpreter + script/action path in every standard case — the
-// exact prefix step correlation needs — while later arguments are where
-// flags and values (and therefore secrets passed on a command line, e.g.
-// docker args) could appear. Everything written to logs, the audit JSONL,
-// or the summary goes through this; the full string stays internal to the
+// tokens plus any runner-generated script or action paths from later
+// positions. Boundary events describe Runner.Worker's direct children: the
+// step's own script path — the correlation token plan matching needs —
+// lives under the runner's _temp (run: steps, composite blocks) or
+// _actions (JS actions) directories, and sits at argv[2+] whenever shell
+// flags are in play (`bash --noprofile --norc -e -o pipefail x.sh` is the
+// standard run-step shape). Those paths are runner-named, so they cannot
+// carry secret values; every other later token is where flags and values
+// (and therefore secrets passed on a command line, e.g. docker args) could
+// appear, and is dropped. Everything written to logs, the audit JSONL, or
+// the summary goes through this; the full string stays internal to the
 // fork→exec retry comparison.
 func sanitizeCmdline(cmdline string) string {
 	fields := strings.Fields(cmdline)
 	if len(fields) <= 2 {
 		return cmdline
 	}
-	return fields[0] + " " + fields[1] + " …"
+	kept := append([]string(nil), fields[:2]...)
+	dropped := false
+	for _, f := range fields[2:] {
+		if strings.Contains(f, "/_temp/") || strings.Contains(f, "/_actions/") {
+			kept = append(kept, f)
+		} else {
+			dropped = true
+		}
+	}
+	out := strings.Join(kept, " ")
+	if dropped {
+		out += " ..."
+	}
+	return out
 }
 
 // stepCmdline reads the child's command line, retrying briefly while it
@@ -494,7 +527,13 @@ func readCmdline(pid int) string {
 		s := strings.TrimRight(strings.ReplaceAll(string(data), "\x00", " "), " ")
 		const maxLen = 256
 		if len(s) > maxLen {
-			s = s[:maxLen] + "…"
+			// Back off to a rune boundary so the cap can't split a
+			// multi-byte character; ASCII marker keeps the JSONL 7-bit.
+			cut := maxLen
+			for cut > 0 && !utf8.RuneStart(s[cut]) {
+				cut--
+			}
+			s = s[:cut] + "..."
 		}
 		if s != "" {
 			return s

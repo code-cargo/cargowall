@@ -60,10 +60,10 @@ type AuditEvent struct {
 	DstIP           string         `json:"dst_ip,omitempty"`
 	DstHostname     string         `json:"dst_hostname,omitempty"`
 	DstPort         uint16         `json:"dst_port,omitempty"`
-	Protocol        string         `json:"protocol,omitempty"`
+	Protocol        string         `json:"protocol,omitempty"` // L4 protocol name ("TCP"/"UDP", see getProtocolName; the blocked protocol itself for protocol_blocked) — shipped to the summary backend and part of the dedup key, so a real value beats a hardcoded literal
 	Process         string         `json:"process,omitempty"`
 	PID             uint32         `json:"pid,omitempty"`
-	MatchedRule     string         `json:"matched_rule,omitempty"`
+	MatchedRule     string         `json:"matched_rule,omitempty"` // the matching rule's Value (pattern string for glob rules), which can differ from the resolved DstHostname (e.g. rule `*.compute-1.amazonaws.com` matching `ec2-1-2-3-4.compute-1...`)
 	AutoAllowedType string         `json:"auto_allowed_type,omitempty"`
 	CNAMEChain      []string       `json:"cname_chain,omitempty"`  // CNAME chain origin..target when DstHostname was reached via a CNAME of an allowed host
 	MidStream       bool           `json:"mid_stream,omitempty"`   // set on connection_blocked when the drop was a non-SYN TCP segment (established connection killed mid-stream, e.g. a pre-existing socket whose dst was never seeded)
@@ -114,10 +114,21 @@ func (a *AuditLogger) AddSink(s EventSink) {
 	a.sinks = append(a.sinks, s)
 }
 
-// LogEvent writes an audit event to the log file
+// LogEvent normalizes and writes one audit event; it is the single logging
+// entry point — call sites build an AuditEvent with the fields they know
+// and hand it over (adding a field means adding a field, not re-threading
+// every constructor signature). A zero Timestamp is stamped with the
+// current time; late-allow reconciliation (#83) passes an explicit one to
+// date the event at the original blocked attempt, so step correlation
+// reflects when the connection actually happened and the event supersedes
+// every blocked record at or before it.
 func (a *AuditLogger) LogEvent(event AuditEvent) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now()
+	}
 
 	// Set the block status based on audit mode.
 	// Skip for events that set their own flags (allowed, existing connection,
@@ -156,143 +167,6 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 		return a.file.Sync()
 	}
 	return nil
-}
-
-// LogConnectionBlocked logs a blocked connection event. `protocol` is the L4
-// protocol of the dropped packet (typically "TCP" or "UDP" — see
-// getProtocolName); the field is shipped to the summary backend and rendered
-// in the UI's Baseline Entries table, so a real value beats a generic literal.
-func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string, stepOrdinal uint32) error {
-	return a.LogEvent(AuditEvent{
-		Timestamp:   time.Now(),
-		EventType:   EventConnectionBlocked,
-		SrcIP:       srcIP,
-		DstIP:       dstIP,
-		DstHostname: hostname,
-		DstPort:     dstPort,
-		Protocol:    protocol,
-		Process:     process,
-		PID:         pid,
-		CNAMEChain:  cnameChain,
-		StepOrdinal: stepOrdinal,
-	})
-}
-
-// LogConnectionBlockedMidStream logs a blocked non-SYN TCP segment — an
-// established connection killed mid-stream. Kept as EventConnectionBlocked
-// (with MidStream set) so the RecentBlocks reconciler, summary pipeline, and
-// OTLP mapping treat it like any other block.
-func (a *AuditLogger) LogConnectionBlockedMidStream(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string, stepOrdinal uint32) error {
-	return a.LogEvent(AuditEvent{
-		Timestamp:   time.Now(),
-		EventType:   EventConnectionBlocked,
-		SrcIP:       srcIP,
-		DstIP:       dstIP,
-		DstHostname: hostname,
-		DstPort:     dstPort,
-		Protocol:    protocol,
-		Process:     process,
-		PID:         pid,
-		CNAMEChain:  cnameChain,
-		MidStream:   true,
-		StepOrdinal: stepOrdinal,
-	})
-}
-
-// LogConnectionLateAllowed logs a connection that BPF initially dropped but
-// that we then opened the firewall for after late hostname resolution matched
-// an allow rule. The original SYN was lost, but the next retry will succeed.
-// `protocol` is the L4 protocol of the dropped packet — see LogConnectionBlocked.
-// `matchedRule` is the rule's Value (pattern string for glob rules, configured
-// hostname for plain rules), which can differ from the resolved DstHostname
-// (e.g. rule `*.compute-1.amazonaws.com` matching `ec2-1-2-3-4.compute-1...`).
-func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string, stepOrdinal uint32) error {
-	return a.LogConnectionLateAllowedAt(time.Now(), srcIP, dstIP, hostname, matchedRule, dstPort, process, pid, protocol, cnameChain, stepOrdinal)
-}
-
-// LogConnectionLateAllowedAt is LogConnectionLateAllowed with an explicit
-// event timestamp. Late-allow reconciliation (#83) dates the event at the
-// original blocked attempt rather than the reconcile time, so step
-// correlation in the summary reflects when the connection actually happened
-// and so the event supersedes every blocked record at or before it.
-func (a *AuditLogger) LogConnectionLateAllowedAt(ts time.Time, srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string, stepOrdinal uint32) error {
-	return a.LogEvent(AuditEvent{
-		Timestamp:   ts,
-		EventType:   EventConnectionLateAllowed,
-		SrcIP:       srcIP,
-		DstIP:       dstIP,
-		DstHostname: hostname,
-		DstPort:     dstPort,
-		Protocol:    protocol,
-		Process:     process,
-		PID:         pid,
-		MatchedRule: matchedRule,
-		CNAMEChain:  cnameChain,
-		StepOrdinal: stepOrdinal,
-	})
-}
-
-// LogConnectionAllowed logs an allowed TCP/UDP connection event. `protocol`
-// is the L4 protocol from the BPF event (typically "TCP" or "UDP" — see
-// getProtocolName); the field is shipped to the summary backend and feeds
-// the dedup key, so a real value beats a hardcoded literal (auto-allowed DNS
-// on :53 is the canonical UDP example).
-func (a *AuditLogger) LogConnectionAllowed(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, autoAllowedType, protocol string, cnameChain []string, stepOrdinal uint32) error {
-	return a.LogEvent(AuditEvent{
-		Timestamp:       time.Now(),
-		EventType:       EventConnectionAllowed,
-		SrcIP:           srcIP,
-		DstIP:           dstIP,
-		DstHostname:     hostname,
-		DstPort:         dstPort,
-		Protocol:        protocol,
-		Process:         process,
-		PID:             pid,
-		AutoAllowedType: autoAllowedType,
-		CNAMEChain:      cnameChain,
-		StepOrdinal:     stepOrdinal,
-	})
-}
-
-// LogProtocolBlocked logs a blocked protocol event
-func (a *AuditLogger) LogProtocolBlocked(srcIP, dstIP, hostname, protocol, process string, pid uint32, cnameChain []string, stepOrdinal uint32) error {
-	return a.LogEvent(AuditEvent{
-		Timestamp:   time.Now(),
-		EventType:   EventProtocolBlocked,
-		SrcIP:       srcIP,
-		DstIP:       dstIP,
-		DstHostname: hostname,
-		Protocol:    protocol,
-		Process:     process,
-		PID:         pid,
-		CNAMEChain:  cnameChain,
-		StepOrdinal: stepOrdinal,
-	})
-}
-
-// LogStepBoundary records the start of a new workflow step: the step_fork
-// tracepoint saw Runner.Worker fork a new direct child and the reconciler
-// resolved its command line. Attribution metadata only — never a verdict.
-func (a *AuditLogger) LogStepBoundary(stepOrdinal, pid uint32, process string) error {
-	return a.LogEvent(AuditEvent{
-		Timestamp:   time.Now(),
-		EventType:   EventStepBoundary,
-		Process:     process,
-		PID:         pid,
-		StepOrdinal: stepOrdinal,
-	})
-}
-
-// LogDNSBlocked logs a blocked DNS query. stepOrdinal attributes the query
-// to the step whose process sent it (0 = unresolved), via the DNS proxy's
-// client-socket lookup — DNS events have no TC packet to carry a tag.
-func (a *AuditLogger) LogDNSBlocked(domain string, stepOrdinal uint32) error {
-	return a.LogEvent(AuditEvent{
-		Timestamp:   time.Now(),
-		EventType:   EventDNSBlocked,
-		DstHostname: domain,
-		StepOrdinal: stepOrdinal,
-	})
 }
 
 // LogExistingConnection logs a pre-existing connection that was found at startup

@@ -113,12 +113,21 @@ func TestStart_RejectsOrdinalBaseNearSentinels(t *testing.T) {
 }
 
 func TestSanitizeCmdline(t *testing.T) {
-	// Interpreter + script path — the standard step shape — is preserved.
+	// Short command lines pass through untouched.
 	assert.Equal(t, "/usr/bin/bash -e", sanitizeCmdline("/usr/bin/bash -e"))
 	assert.Equal(t, "bash", sanitizeCmdline("bash"))
 	assert.Equal(t, "", sanitizeCmdline(""))
-	// Anything beyond argv[1] is where flags/values (secrets) could live.
-	assert.Equal(t, "docker run …",
+	// The runner's own script/action paths are the correlation token and
+	// must survive from ANY argv position: the standard run-step shape
+	// buries the script behind several shell flags.
+	assert.Equal(t,
+		"/usr/bin/bash --noprofile /home/runner/work/_temp/abc123.sh ...",
+		sanitizeCmdline("/usr/bin/bash --noprofile --norc -e -o pipefail /home/runner/work/_temp/abc123.sh"))
+	assert.Equal(t,
+		"node --enable-source-maps /home/runner/work/_actions/actions/checkout/v4/dist/index.js ...",
+		sanitizeCmdline("node --enable-source-maps --no-warnings /home/runner/work/_actions/actions/checkout/v4/dist/index.js"))
+	// Anything else beyond argv[1] is where flags/values (secrets) could live.
+	assert.Equal(t, "docker run ...",
 		sanitizeCmdline("docker run -e API_TOKEN=hunter2 alpine"))
 	assert.NotContains(t, sanitizeCmdline("cmd sub --token hunter2"), "hunter2")
 }

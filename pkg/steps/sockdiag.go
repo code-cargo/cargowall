@@ -18,6 +18,7 @@ package steps
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"syscall"
 	"time"
@@ -66,11 +67,24 @@ const (
 
 // lookupSocketCookie dumps the kernel's socket table for (family, proto)
 // and returns the cookie of the socket bound to srcIP:srcPort. Ephemeral
-// ports make the match unique in practice; the first hit wins.
-func lookupSocketCookie(family, proto uint8, srcIP net.IP, srcPort uint16) (uint64, bool) {
+// ports make the match unique in practice; the first hit wins. A non-nil
+// error means the dump itself failed (netlink unavailable — e.g. a kernel
+// without CONFIG_INET_DIAG — send/recv failure, timeout), as opposed to a
+// clean dump with no matching socket, so the caller can surface systemic
+// breakage instead of conflating it with "socket not found".
+//
+// An unconnected client (bare sendto, e.g. dig or dnspython — glibc/musl/Go
+// resolvers all connect) is auto-bound to the wildcard address, so the
+// table shows 0.0.0.0/:: where the wire carried the routed source. Such a
+// socket is accepted by port alone, but only when the dump completes with
+// exactly one wildcard candidate — misattribution is worse than none.
+// (A dual-stack [::]:port socket sending v4-mapped traffic lands in the
+// AF_INET6 table while a v4 query prompts an AF_INET dump; out of scope —
+// per-family sockets are what the unconnected tools actually use.)
+func lookupSocketCookie(family, proto uint8, srcIP net.IP, srcPort uint16) (uint64, bool, error) {
 	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_SOCK_DIAG)
 	if err != nil {
-		return 0, false
+		return 0, false, fmt.Errorf("netlink socket: %w", err)
 	}
 	defer unix.Close(fd)
 
@@ -80,7 +94,7 @@ func lookupSocketCookie(family, proto uint8, srcIP net.IP, srcPort uint16) (uint
 	// which the caller already treats as ordinal 0 (untagged).
 	tv := unix.NsecToTimeval((500 * time.Millisecond).Nanoseconds())
 	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
-		return 0, false
+		return 0, false, fmt.Errorf("set recv timeout: %w", err)
 	}
 
 	req := inetDiagReqV2{
@@ -100,7 +114,7 @@ func lookupSocketCookie(family, proto uint8, srcIP net.IP, srcPort uint16) (uint
 	// ID stays zero for a dump.
 
 	if err := unix.Sendto(fd, buf, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
-		return 0, false
+		return 0, false, fmt.Errorf("netlink send: %w", err)
 	}
 
 	var want [16]byte
@@ -110,41 +124,104 @@ func lookupSocketCookie(family, proto uint8, srcIP net.IP, srcPort uint16) (uint
 		copy(want[:], srcIP.To16())
 	}
 
+	// Wildcard-bound fallback candidate (see the function comment). A
+	// bound-then-connected socket gets a concrete source from the route,
+	// so an all-zero source reliably means unconnected.
+	var wildCookie uint64
+	wildCount := 0
+
 	rb := make([]byte, 64*1024)
 	for {
 		n, _, err := unix.Recvfrom(fd, rb, 0)
-		if err != nil || n <= 0 {
-			return 0, false
+		if err != nil {
+			return 0, false, fmt.Errorf("netlink recv: %w", err)
+		}
+		if n <= 0 {
+			return 0, false, fmt.Errorf("netlink recv: empty read")
 		}
 		msgs, err := syscall.ParseNetlinkMessage(rb[:n])
 		if err != nil {
-			return 0, false
+			return 0, false, fmt.Errorf("netlink parse: %w", err)
 		}
 		for _, m := range msgs {
 			switch m.Header.Type {
-			case unix.NLMSG_DONE, unix.NLMSG_ERROR:
-				return 0, false
+			case unix.NLMSG_DONE:
+				if wildCount == 1 {
+					return wildCookie, true, nil
+				}
+				return 0, false, nil
+			case unix.NLMSG_ERROR:
+				// nlmsgerr carries a negated errno in its first 4 bytes;
+				// EOPNOTSUPP here is the CONFIG_INET_DIAG-less kernel.
+				if len(m.Data) >= 4 {
+					if errno := int32(binary.NativeEndian.Uint32(m.Data[0:4])); errno < 0 {
+						return 0, false, fmt.Errorf("netlink error: %w", syscall.Errno(-errno))
+					}
+				}
+				return 0, false, fmt.Errorf("netlink error response")
 			}
 			if len(m.Data) < sizeofInetDiagMsg {
 				continue
 			}
 			d := m.Data
 			sport := uint16(d[4])<<8 | uint16(d[5]) // big-endian in the sock id
-			var src [16]byte
-			copy(src[:], d[8:24])
-			if sport != srcPort || src != want {
+			if sport != srcPort {
 				continue
 			}
+			var src [16]byte
+			copy(src[:], d[8:24])
 			cookieLo := binary.NativeEndian.Uint32(d[44:48])
 			cookieHi := binary.NativeEndian.Uint32(d[48:52])
-			return uint64(cookieLo) | uint64(cookieHi)<<32, true
+			cookie := uint64(cookieLo) | uint64(cookieHi)<<32
+			if src == want {
+				return cookie, true, nil
+			}
+			if src == [16]byte{} {
+				wildCookie = cookie
+				wildCount++
+			}
 		}
 	}
+}
+
+// stepCacheTTL bounds reuse of a client-address resolution. A cookie is
+// stable for its socket's lifetime; the risk is the ephemeral (ip, port)
+// being reused by a NEW socket inside the window, which the size of the
+// ephemeral range makes unlikely within seconds even under churn. Kept
+// short regardless: the cache exists to shed query floods (many blocked
+// queries from one client socket), not for steady-state savings.
+const stepCacheTTL = 2 * time.Second
+
+// stepCacheCap bounds the cache map — a flood of one-query client sockets
+// would otherwise grow it without limit. Reset-on-full is crude, but the
+// cache is purely a load shed and repopulates immediately.
+const stepCacheCap = 4096
+
+// diagConcurrency bounds simultaneous socket-table dumps (each can hold a
+// resolver handler goroutine for up to the 500ms recv timeout).
+const diagConcurrency = 4
+
+type stepCacheKey struct {
+	ip    [16]byte
+	port  uint16
+	proto uint8
+}
+
+type stepCacheEntry struct {
+	ordinal uint32
+	expires time.Time
 }
 
 // StepForClient resolves the step ordinal of the process owning the local
 // socket behind addr (a DNS client seen by the proxy). Returns 0 when the
 // socket can't be found or carries no tag — callers treat 0 as untagged.
+//
+// The blocked-query path is adversarial by definition (query floods are
+// what filtering exists for), so the netlink dump is guarded twice: a
+// short-TTL cache absorbs repeat queries from the same client socket, and
+// a semaphore sheds excess concurrent dumps to untagged (uncached, so a
+// quieter moment can still resolve that client) rather than stacking them
+// under the resolver's handler goroutines.
 func (t *Tracker) StepForClient(addr net.Addr) uint32 {
 	var ip net.IP
 	var port int
@@ -161,13 +238,50 @@ func (t *Tracker) StepForClient(addr net.Addr) uint32 {
 	if ip.To4() != nil {
 		family = unix.AF_INET
 	}
-	cookie, ok := lookupSocketCookie(family, proto, ip, uint16(port))
-	if !ok {
+
+	var key stepCacheKey
+	copy(key.ip[:], ip.To16())
+	key.port = uint16(port)
+	key.proto = proto
+
+	now := time.Now()
+	t.stepCacheMu.Lock()
+	if e, ok := t.stepCache[key]; ok && now.Before(e.expires) {
+		t.stepCacheMu.Unlock()
+		return e.ordinal
+	}
+	t.stepCacheMu.Unlock()
+
+	select {
+	case t.diagSem <- struct{}{}:
+	default:
 		return 0
 	}
+	defer func() { <-t.diagSem }()
+
 	var ordinal uint32
-	if err := t.sockMap.Lookup(cookie, &ordinal); err != nil {
-		return 0
+	cookie, found, err := lookupSocketCookie(family, proto, ip, uint16(port))
+	switch {
+	case err != nil:
+		// One warning for the run: a systemically broken lookup (e.g. a
+		// kernel without CONFIG_INET_DIAG) must be distinguishable in the
+		// logs from the routine no-match path.
+		t.diagWarnOnce.Do(func() {
+			t.logger.Warn("Step attribution: socket-cookie lookup failed; DNS events will be untagged",
+				"error", err)
+		})
+	case found:
+		if lerr := t.sockMap.Lookup(cookie, &ordinal); lerr != nil {
+			ordinal = 0
+		}
 	}
+
+	// Cache negative results too — unattributable floods are the hot case.
+	t.stepCacheMu.Lock()
+	if len(t.stepCache) >= stepCacheCap {
+		clear(t.stepCache)
+	}
+	t.stepCache[key] = stepCacheEntry{ordinal: ordinal, expires: now.Add(stepCacheTTL)}
+	t.stepCacheMu.Unlock()
 	return ordinal
 }

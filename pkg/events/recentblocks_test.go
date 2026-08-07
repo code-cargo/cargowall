@@ -202,7 +202,11 @@ func TestRecentBlocks_AsAuditSink(t *testing.T) {
 	defer al.Close()
 	al.AddSink(rb)
 
-	require.NoError(t, al.LogConnectionBlocked("10.0.0.1", "20.209.112.225", "", 443, "MainThread", 2411, "TCP", nil, 3))
+	require.NoError(t, al.LogEvent(AuditEvent{
+		EventType: EventConnectionBlocked,
+		SrcIP:     "10.0.0.1", DstIP: "20.209.112.225", DstPort: 443,
+		Protocol: "TCP", Process: "MainThread", PID: 2411, StepOrdinal: 3,
+	}))
 
 	taken := rb.TakeMatching("20.209.112.225", nil, nil, false)
 	require.Len(t, taken, 1)
@@ -223,7 +227,11 @@ func TestRecentBlocks_MidStreamBlockIsReconcilable(t *testing.T) {
 	defer al.Close()
 	al.AddSink(rb)
 
-	require.NoError(t, al.LogConnectionBlockedMidStream("10.0.0.1", "20.209.112.225", "", 443, "curl", 42, "TCP", nil, 0))
+	require.NoError(t, al.LogEvent(AuditEvent{
+		EventType: EventConnectionBlocked,
+		SrcIP:     "10.0.0.1", DstIP: "20.209.112.225", DstPort: 443,
+		Protocol: "TCP", Process: "curl", PID: 42, MidStream: true,
+	}))
 
 	taken := rb.TakeMatching("20.209.112.225", nil, nil, false)
 	require.Len(t, taken, 1)

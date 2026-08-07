@@ -155,10 +155,16 @@ func (c *SummaryCmd) Run() error {
 		auditMode = c.Mode == "audit"
 	}
 
+	// Both grouping paths ship per-step timestamps to the SaaS, so the
+	// null-completed_at backfill must run regardless of which path groups
+	// the events (GitHub always reports null for the step that is still
+	// running — the post step this command executes in).
+	backfillStepCompletion(steps, regularEvents)
+
 	// Assign events to steps. When step boundaries exist, group causally —
 	// each event under the step whose process created its socket — for both
 	// the render and the SaaS push, from the same flat event stream and the
-	// same classifier (classifyCausal), so the two can't disagree. Temporal
+	// same assignment rule (assignCausal), so the two can't disagree. Temporal
 	// correlation is the legacy fallback for attribution-off runs and old
 	// logs, never an intermediate for the causal path.
 	ordinalSteps := resolveOrdinalSteps(stepBoundaries, steps)
@@ -271,13 +277,14 @@ func reconcileLateAllowedBlocks(auditEvents []events.AuditEvent) []events.AuditE
 	return kept
 }
 
-func (c *SummaryCmd) correlateEventsToSteps(auditEvents []events.AuditEvent, steps []GitHubStep) []StepEvents {
-	// GitHub API returns step timestamps with second precision, but audit events
-	// use time.Now() with sub-second precision. Fix up step boundaries so events
-	// aren't silently dropped at second boundaries.
-	//
-	// Also handle steps with null completed_at (in-progress or API eventual
-	// consistency) by inferring the end time from the next step's started_at.
+// backfillStepCompletion fills null completed_at values (GitHub reports null
+// for the in-progress step — always the case for the job's own final steps —
+// and API eventual consistency can lag others) from the next step's start,
+// or just past the last event for the final step. Mutates steps in place.
+// Run calls it for BOTH grouping paths: the SaaS push ships these
+// timestamps per step, so the causal path needs the backfill as much as the
+// temporal one (which additionally uses the windows for event assignment).
+func backfillStepCompletion(steps []GitHubStep, auditEvents []events.AuditEvent) {
 	var maxEventTime time.Time
 	for _, e := range auditEvents {
 		if e.Timestamp.After(maxEventTime) {
@@ -295,6 +302,14 @@ func (c *SummaryCmd) correlateEventsToSteps(auditEvents []events.AuditEvent, ste
 			}
 		}
 	}
+}
+
+func (c *SummaryCmd) correlateEventsToSteps(auditEvents []events.AuditEvent, steps []GitHubStep) []StepEvents {
+	// GitHub API returns step timestamps with second precision, but audit events
+	// use time.Now() with sub-second precision. Fix up step boundaries so events
+	// aren't silently dropped at second boundaries. Idempotent when Run has
+	// already backfilled; kept here because tests call this directly.
+	backfillStepCompletion(steps, auditEvents)
 
 	// Create step events map keyed by index to handle duplicate step names
 	stepEventsMap := make(map[int]*StepEvents)
@@ -542,10 +557,23 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 	// count them by type/failure class.
 	req.Downgrade = readDowngrade()
 
-	// Set timestamps from first/last events
+	// Job window from the extreme event timestamps. Min/max, not first and
+	// last: causal grouping orders events by step (scaffold first, buckets
+	// appended), so positional endpoints could invert the window — e.g. one
+	// pre-daemon bucket event flattening after the last scaffold step would
+	// send started_at after completed_at.
 	if len(allEvents) > 0 {
-		req.StartedAt = timestamppb.New(allEvents[0].Timestamp)
-		req.CompletedAt = timestamppb.New(allEvents[len(allEvents)-1].Timestamp)
+		first, last := allEvents[0].Timestamp, allEvents[0].Timestamp
+		for _, e := range allEvents[1:] {
+			if e.Timestamp.Before(first) {
+				first = e.Timestamp
+			}
+			if e.Timestamp.After(last) {
+				last = e.Timestamp
+			}
+		}
+		req.StartedAt = timestamppb.New(first)
+		req.CompletedAt = timestamppb.New(last)
 	}
 
 	// Marshal using protojson for HTTP/JSON transcoding compatibility

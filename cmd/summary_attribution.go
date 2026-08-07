@@ -24,6 +24,7 @@ package cmd
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/code-cargo/cargowall/pkg/events"
 )
@@ -40,11 +41,20 @@ import (
 // wrong: long-lived sockets and post-job uploads land in whatever step is
 // current when packets flow).
 //
-// The assignment is monotonic: boundaries and steps are both ordered, and
-// two boundaries can never belong to the same step, so each boundary only
-// considers steps after the previous match. This disambiguates steps that
-// start within the same second — the GitHub API reports second-granularity
-// timings, and back-to-back cheap steps otherwise tie.
+// The assignment is monotonic — boundaries and steps are both ordered, so
+// each boundary first considers steps after the previous match, which
+// disambiguates steps that start within the same second (the GitHub API
+// reports second-granularity timings, and back-to-back cheap steps
+// otherwise tie). It is NOT injective: a composite action runs several
+// `run:` blocks — several worker forks, several boundaries — under one
+// reported step, so a boundary landing inside the previous match's window
+// maps to that same step rather than consuming the next one.
+// resolveRoundingSlack is how far before a step's recorded start a boundary
+// may fire and still be treated as that step's own rounding error rather
+// than a mid-step transient fork. GitHub step timings are truncated to the
+// second, so the genuine gap is under 1s; 2s leaves margin for clock skew.
+const resolveRoundingSlack = 2 * time.Second
+
 func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep) map[uint32]int {
 	boundaries := make([]events.AuditEvent, len(stepBoundaries))
 	copy(boundaries, stepBoundaries)
@@ -68,9 +78,31 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 			}
 		}
 		// Rounding can put a boundary a fraction before its own step's
-		// recorded start; the next unassigned step is then the right one.
+		// recorded start (GitHub reports second granularity); a near-miss
+		// claims the next unassigned step. Proximity-gated: an ungated
+		// fallback would let any unmatched boundary claim the next step
+		// and shift every later mapping by one.
 		if best == -1 && prev+1 < len(steps) {
-			best = prev + 1
+			next := steps[prev+1]
+			if !next.StartedAt.IsZero() && next.StartedAt.Sub(b.Timestamp) <= resolveRoundingSlack {
+				best = prev + 1
+			}
+		}
+		// A boundary during the previous match's window is another direct
+		// worker fork inside the same reported step — composite actions
+		// run one fork per `run:` block — so it maps to the same index
+		// (and the push then merges its events into that step). This also
+		// absorbs transient runtime forks (empirically real — see
+		// steps.Options.OrdinalBase) into whatever step was running,
+		// rather than letting them shift the mapping. Bounded by prev's
+		// completion (+ rounding slack) when known: a fork in the gap
+		// AFTER prev ended belongs to no step and stays unresolved, its
+		// events rendered as a bare "#N" group.
+		if best == -1 && prev >= 0 && !steps[prev].StartedAt.After(b.Timestamp) {
+			end := steps[prev].CompletedAt
+			if end.IsZero() || b.Timestamp.Sub(end) <= resolveRoundingSlack {
+				best = prev
+			}
 		}
 		if best >= 0 {
 			idx[b.StepOrdinal] = best
@@ -112,24 +144,32 @@ const (
 	causalBucketed                    // runner / pre-daemon / untagged-by-cause
 )
 
-// classifyCausal is the single assignment rule behind BOTH the rendered
-// summary and the SaaS push, so the two groupings can never drift. For
-// causalBucketed it returns the canonical bucket label; the step/ordinal
-// classes carry identity in the event's own ordinal and each presenter
-// routes them (render groups by ordinal, push fills the step scaffold).
-func classifyCausal(ev events.AuditEvent, ordinalSteps map[uint32]int) (causalClass, string) {
+// causalAssignment is where one event lands. Per class exactly one payload
+// field is meaningful: step for causalStep, the event's own ordinal for
+// causalOrdinal, bucket for causalBucketed.
+type causalAssignment struct {
+	class  causalClass
+	step   int    // index into steps; valid iff class == causalStep
+	bucket string // canonical bucket label; valid iff class == causalBucketed
+}
+
+// assignCausal is the single assignment rule behind BOTH the rendered
+// summary and the SaaS push, so the two groupings can never drift: it
+// decides everything (including the resolved step index), and the
+// presenters only route and format the decision.
+func assignCausal(ev events.AuditEvent, ordinalSteps map[uint32]int) causalAssignment {
 	switch ev.StepOrdinal {
 	case events.StepOrdinalNone:
-		return causalBucketed, untaggedBucketLabel(ev)
+		return causalAssignment{class: causalBucketed, bucket: untaggedBucketLabel(ev)}
 	case events.StepOrdinalRunner:
-		return causalBucketed, bucketRunner
+		return causalAssignment{class: causalBucketed, bucket: bucketRunner}
 	case events.StepOrdinalPreDaemon:
-		return causalBucketed, bucketPreDaemon
+		return causalAssignment{class: causalBucketed, bucket: bucketPreDaemon}
 	default:
-		if _, ok := ordinalSteps[ev.StepOrdinal]; ok {
-			return causalStep, ""
+		if i, ok := ordinalSteps[ev.StepOrdinal]; ok {
+			return causalAssignment{class: causalStep, step: i}
 		}
-		return causalOrdinal, ""
+		return causalAssignment{class: causalOrdinal}
 	}
 }
 
@@ -170,8 +210,8 @@ func causalGroups(regular []events.AuditEvent, steps []GitHubStep, ordinalSteps 
 	var ordinals []uint32
 	byBucket := make(map[string][]events.AuditEvent)
 	for _, ev := range regular {
-		if class, bucket := classifyCausal(ev, ordinalSteps); class == causalBucketed {
-			byBucket[bucket] = append(byBucket[bucket], ev)
+		if a := assignCausal(ev, ordinalSteps); a.class == causalBucketed {
+			byBucket[a.bucket] = append(byBucket[a.bucket], ev)
 			continue
 		}
 		if _, seen := byOrdinal[ev.StepOrdinal]; !seen {
@@ -183,11 +223,17 @@ func causalGroups(regular []events.AuditEvent, steps []GitHubStep, ordinalSteps 
 
 	var groups []StepEvents
 	for _, ord := range ordinals {
-		label := fmt.Sprintf("#%d", ord)
-		if name := ordinalStepName(steps, ordinalSteps, ord); name != "" {
-			label = fmt.Sprintf("#%d — %s", ord, name)
+		// Carry the resolved step's timestamps so the heading renders its
+		// time range, exactly like the temporal grouping's headings.
+		step := GitHubStep{Name: fmt.Sprintf("#%d", ord)}
+		if i, ok := ordinalSteps[ord]; ok && i < len(steps) {
+			if steps[i].Name != "" {
+				step.Name = fmt.Sprintf("#%d - %s", ord, steps[i].Name)
+			}
+			step.StartedAt = steps[i].StartedAt
+			step.CompletedAt = steps[i].CompletedAt
 		}
-		groups = append(groups, StepEvents{Step: GitHubStep{Name: label}, Events: byOrdinal[ord]})
+		groups = append(groups, StepEvents{Step: step, Events: byOrdinal[ord]})
 	}
 	for _, b := range bucketOrder {
 		if evs := byBucket[b]; len(evs) > 0 {
@@ -212,29 +258,32 @@ func buildCausalPushGroups(regular []events.AuditEvent, steps []GitHubStep, ordi
 		groups[i] = StepEvents{Step: s}
 	}
 
+	// Indices, not pointers: extra() appends to groups, and a reallocation
+	// would leave a previously taken *StepEvents pointing at the old array.
 	extraIdx := map[string]int{}
-	extra := func(label string) *StepEvents {
+	extra := func(label string) int {
 		if i, ok := extraIdx[label]; ok {
-			return &groups[i]
+			return i
 		}
 		groups = append(groups, StepEvents{Step: GitHubStep{Name: label}})
 		extraIdx[label] = len(groups) - 1
-		return &groups[len(groups)-1]
+		return len(groups) - 1
 	}
 
 	for _, ev := range regular {
-		var g *StepEvents
-		switch class, bucket := classifyCausal(ev, ordinalSteps); class {
+		var gi int
+		switch a := assignCausal(ev, ordinalSteps); a.class {
 		case causalStep:
-			// Key on the resolved step INDEX, never the name: two steps can
-			// share a name, and a name lookup would collapse them into one.
-			g = &groups[ordinalSteps[ev.StepOrdinal]]
+			// The assignment carries the step INDEX, never a name: two
+			// steps can share a name, and a name lookup would collapse
+			// them into one.
+			gi = a.step
 		case causalOrdinal:
-			g = extra(fmt.Sprintf("#%d", ev.StepOrdinal))
+			gi = extra(fmt.Sprintf("#%d", ev.StepOrdinal))
 		default: // causalBucketed
-			g = extra(bucket)
+			gi = extra(a.bucket)
 		}
-		g.Events = append(g.Events, ev)
+		groups[gi].Events = append(groups[gi].Events, ev)
 	}
 
 	deduplicateStepEvents(groups)

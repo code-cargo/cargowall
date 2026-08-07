@@ -44,7 +44,8 @@ func TestLookupSocketCookie_UDP(t *testing.T) {
 	require.NoError(t, sockErr)
 
 	local := conn.LocalAddr().(*net.UDPAddr)
-	cookie, ok := lookupSocketCookie(unix.AF_INET, unix.IPPROTO_UDP, local.IP, uint16(local.Port))
+	cookie, ok, err := lookupSocketCookie(unix.AF_INET, unix.IPPROTO_UDP, local.IP, uint16(local.Port))
+	require.NoError(t, err)
 	require.True(t, ok, "socket must be found by source address")
 	assert.Equal(t, wantCookie, cookie)
 }
@@ -67,13 +68,43 @@ func TestLookupSocketCookie_TCP(t *testing.T) {
 	require.NoError(t, sockErr)
 
 	local := conn.LocalAddr().(*net.TCPAddr)
-	cookie, ok := lookupSocketCookie(unix.AF_INET, unix.IPPROTO_TCP, local.IP, uint16(local.Port))
+	cookie, ok, err := lookupSocketCookie(unix.AF_INET, unix.IPPROTO_TCP, local.IP, uint16(local.Port))
+	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, wantCookie, cookie)
 }
 
 func TestLookupSocketCookie_NotFound(t *testing.T) {
-	// Port 1 with no socket bound: dump completes without a match.
-	_, ok := lookupSocketCookie(unix.AF_INET, unix.IPPROTO_UDP, net.IPv4(127, 0, 0, 1), 1)
+	// Port 1 with no socket bound: dump completes cleanly without a match,
+	// which must NOT surface as an error (errors mean the dump itself broke).
+	_, ok, err := lookupSocketCookie(unix.AF_INET, unix.IPPROTO_UDP, net.IPv4(127, 0, 0, 1), 1)
+	require.NoError(t, err)
 	assert.False(t, ok)
+}
+
+// A bare-sendto client (dig-style, never connected) is auto-bound to the
+// wildcard address, so the kernel table shows 0.0.0.0 where the proxy saw
+// the routed source. The unique-wildcard fallback must still resolve it to
+// exactly the kernel-assigned cookie.
+func TestLookupSocketCookie_UnconnectedUDPWildcard(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	raw, err := conn.SyscallConn()
+	require.NoError(t, err)
+	var wantCookie uint64
+	var sockErr error
+	require.NoError(t, raw.Control(func(fd uintptr) {
+		wantCookie, sockErr = unix.GetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_COOKIE)
+	}))
+	require.NoError(t, sockErr)
+
+	// Look up by the proxy's view — a concrete source IP that can never
+	// equal the socket's wildcard bind address, forcing the fallback.
+	local := conn.LocalAddr().(*net.UDPAddr)
+	cookie, ok, err := lookupSocketCookie(unix.AF_INET, unix.IPPROTO_UDP, net.IPv4(127, 0, 0, 1), uint16(local.Port))
+	require.NoError(t, err)
+	require.True(t, ok, "wildcard-bound socket must be found by port")
+	assert.Equal(t, wantCookie, cookie)
 }

@@ -441,6 +441,21 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	pid := event.Pid
 	comm := lookupProcessName(pid)
 
+	// One audit record underlies every outcome branch below: each branch
+	// stamps its event type and type-specific fields onto this base and
+	// hands it to LogEvent (which fills the timestamp and verdict flags).
+	audit := AuditEvent{
+		SrcIP:       srcIP,
+		DstIP:       dstIP,
+		DstHostname: hostname,
+		DstPort:     event.DstPort,
+		Protocol:    getProtocolName(event.IpProto),
+		Process:     comm,
+		PID:         pid,
+		CNAMEChain:  cnameChain,
+		StepOrdinal: event.StepOrdinal,
+	}
+
 	if event.Allowed == 1 {
 		// Check if this connection was allowed by an auto-added rule.
 		// Pass the event's L4 protocol so the port match is protocol-aware
@@ -464,7 +479,9 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			"pid", pid)
 
 		if auditLogger != nil {
-			if err := auditLogger.LogConnectionAllowed(srcIP, dstIP, hostname, event.DstPort, comm, pid, autoAllowedType, getProtocolName(event.IpProto), cnameChain, event.StepOrdinal); err != nil {
+			audit.EventType = EventConnectionAllowed
+			audit.AutoAllowedType = autoAllowedType
+			if err := auditLogger.LogEvent(audit); err != nil {
 				logger.Error("Failed to write audit log", "error", err)
 			}
 		}
@@ -482,7 +499,10 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 
 		// Log to audit file if configured
 		if auditLogger != nil {
-			if err := auditLogger.LogProtocolBlocked(srcIP, dstIP, hostname, protocolName, comm, pid, cnameChain, event.StepOrdinal); err != nil {
+			audit.EventType = EventProtocolBlocked
+			audit.Protocol = protocolName
+			audit.DstPort = 0 // carried the protocol number, not a port
+			if err := auditLogger.LogEvent(audit); err != nil {
 				logger.Error("Failed to write audit log", "error", err)
 			}
 		}
@@ -508,7 +528,9 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			"matched_rule", matchedRule)
 
 		if auditLogger != nil {
-			if err := auditLogger.LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRule, event.DstPort, comm, pid, getProtocolName(event.IpProto), cnameChain, event.StepOrdinal); err != nil {
+			audit.EventType = EventConnectionLateAllowed
+			audit.MatchedRule = matchedRule
+			if err := auditLogger.LogEvent(audit); err != nil {
 				logger.Error("Failed to write audit log", "error", err)
 			}
 		}
@@ -531,15 +553,14 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			"process", comm,
 			"pid", pid)
 
-		// Log to audit file if configured
+		// Log to audit file if configured. Mid-stream kills stay
+		// EventConnectionBlocked (with MidStream set) so the RecentBlocks
+		// reconciler, summary pipeline, and OTLP mapping treat them like
+		// any other block.
 		if auditLogger != nil {
-			var err error
-			if midStream {
-				err = auditLogger.LogConnectionBlockedMidStream(srcIP, dstIP, hostname, event.DstPort, comm, pid, getProtocolName(event.IpProto), cnameChain, event.StepOrdinal)
-			} else {
-				err = auditLogger.LogConnectionBlocked(srcIP, dstIP, hostname, event.DstPort, comm, pid, getProtocolName(event.IpProto), cnameChain, event.StepOrdinal)
-			}
-			if err != nil {
+			audit.EventType = EventConnectionBlocked
+			audit.MidStream = midStream
+			if err := auditLogger.LogEvent(audit); err != nil {
 				logger.Error("Failed to write audit log", "error", err)
 			}
 		}

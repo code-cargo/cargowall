@@ -267,8 +267,10 @@ jobs:
 
           # Every curl above ran in a post-attach `run:` step, so its
           # connection events must carry a real (small) step ordinal — not 0
-          # (untagged) and not the runner/pre-daemon sentinels.
-          STEP_TAGGED_COUNT=$(jq -s '[.[] | select(.event_type | test("^connection_")) | select((.step_ordinal // 0) > 0 and (.step_ordinal // 0) < 4294900000)] | length' "$AUDIT_LOG")
+          # (untagged) and not the runner/pre-daemon sentinels. The upper
+          # bound is pkg/steps maxOrdinalBase (0xFFFFFFFE minus the 2^16
+          # sentinel margin = 4294901758): no real ordinal can start there.
+          STEP_TAGGED_COUNT=$(jq -s '[.[] | select(.event_type | test("^connection_")) | select((.step_ordinal // 0) > 0 and (.step_ordinal // 0) < 4294901758)] | length' "$AUDIT_LOG")
           echo "connection events with a real step_ordinal: $STEP_TAGGED_COUNT"
           if [ "$STEP_TAGGED_COUNT" -eq 0 ]; then
             echo "❌ No connection events carry a step ordinal"

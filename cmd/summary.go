@@ -14,6 +14,10 @@
 
 //go:build linux
 
+// Job summary pipeline: audit log I/O, late-allow reconciliation, the legacy
+// temporal step correlation, dedup, and the SaaS push. Causal step
+// attribution lives in summary_attribution.go; markdown rendering lives in
+// summary_render.go.
 package cmd
 
 import (
@@ -26,7 +30,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -93,12 +96,49 @@ func (c *SummaryCmd) Run() error {
 	// counted or pushed as denies (#83).
 	auditEvents = reconcileLateAllowedBlocks(auditEvents)
 
-	if len(auditEvents) == 0 {
+	// Separate existing connection events from regular events. Step
+	// boundaries are process markers, not connections — they'd render as
+	// destination-less rows in the entries table, so they stay out of the
+	// connection pipeline. They are not discarded: resolveOrdinalSteps maps
+	// their ordinals to GitHub steps (driving both groupings), and
+	// generateStepAttributionSection renders them as their own table.
+	var existingConnEvents, regularEvents, stepBoundaries []events.AuditEvent
+	for _, event := range auditEvents {
+		switch event.EventType {
+		case events.EventExistingConnection:
+			existingConnEvents = append(existingConnEvents, event)
+		case events.EventStepBoundary:
+			stepBoundaries = append(stepBoundaries, event)
+		default:
+			regularEvents = append(regularEvents, event)
+		}
+	}
+
+	// Resolve ordinals against the GitHub-REPORTED step times, BEFORE the
+	// backfill below synthesizes completed_at values: a backfilled end
+	// (the next step's start) makes every window abut its successor, and
+	// the resolver's window tie-breaker would then capture rounding-early
+	// boundaries that belong to the next step.
+	ordinalSteps := resolveOrdinalSteps(stepBoundaries, steps)
+
+	// Every push path ships per-step timestamps, so the null-completed_at
+	// backfill must run before ANY of them — including the zero-network
+	// early return below, whose pushToApi(nil, steps) uses steps directly
+	// (GitHub always reports null for the step that is still running — the
+	// post step this command executes in; next-step-start inference needs
+	// no events).
+	backfillStepCompletion(steps, regularEvents)
+
+	// "No network events" check runs on the classified sets: with step
+	// attribution on, the audit log always contains step_boundary rows, so
+	// raw-log emptiness would never trigger and a zero-network job would
+	// render a full summary of zeros instead of this concise message.
+	if len(regularEvents) == 0 && len(existingConnEvents) == 0 {
 		// Best-effort API push — log warning on failure but don't fail the summary
 		var workflowRunLink string
 		if c.ApiUrl != "" {
 			var err error
-			workflowRunLink, err = c.pushToApi(nil, steps)
+			workflowRunLink, err = c.pushToApi(nil, steps, nil)
 			if err != nil {
 				slog.Warn("Best-effort API push failed", "error", err)
 			}
@@ -112,16 +152,6 @@ func (c *SummaryCmd) Run() error {
 			fmt.Fprintln(c.output, "No network events were logged during this workflow run.")
 		}
 		return nil
-	}
-
-	// Separate existing connection events from regular events
-	var existingConnEvents, regularEvents []events.AuditEvent
-	for _, event := range auditEvents {
-		if event.EventType == events.EventExistingConnection {
-			existingConnEvents = append(existingConnEvents, event)
-		} else {
-			regularEvents = append(regularEvents, event)
-		}
 	}
 
 	// Determine if audit mode by checking blocked-type events for WouldDeny=true.
@@ -140,22 +170,43 @@ func (c *SummaryCmd) Run() error {
 		auditMode = c.Mode == "audit"
 	}
 
-	// Correlate events to steps (includes all steps, even empty ones)
-	stepEvents := c.correlateEventsToSteps(regularEvents, steps)
-	deduplicateStepEvents(stepEvents)
+	// Assign events to steps. When step boundaries exist, group causally —
+	// each event under the step whose process created its socket — for both
+	// the render and the SaaS push, from the same flat event stream and the
+	// same assignment rule (assignCausal), so the two can't disagree. Temporal
+	// correlation is the legacy fallback for attribution-off runs and old
+	// logs, never an intermediate for the causal path.
+	var renderGroups, pushGroups []StepEvents
+	if len(stepBoundaries) > 0 {
+		renderGroups = causalGroups(regularEvents, steps, ordinalSteps)
+		pushGroups = buildCausalPushGroups(regularEvents, steps, ordinalSteps)
+	} else {
+		temporal := c.correlateEventsToSteps(regularEvents, steps)
+		deduplicateStepEvents(temporal)
+		renderGroups, pushGroups = temporal, temporal
+	}
 
 	// Best-effort API push before summary so the link is available for the header
 	var workflowRunLink string
 	if c.ApiUrl != "" {
 		var err error
-		workflowRunLink, err = c.pushToApi(stepEvents, steps)
+		workflowRunLink, err = c.pushToApi(pushGroups, steps, regularEvents)
 		if err != nil {
 			slog.Warn("Best-effort API push failed", "error", err)
 		}
 	}
 
 	// Generate summary
-	c.generateSummary(stepEvents, existingConnEvents, auditMode, workflowRunLink)
+	c.generateSummary(summaryData{
+		groups:          renderGroups,
+		rawEvents:       regularEvents,
+		existingConn:    existingConnEvents,
+		stepBoundaries:  stepBoundaries,
+		steps:           steps,
+		ordinalSteps:    ordinalSteps,
+		auditMode:       auditMode,
+		workflowRunLink: workflowRunLink,
+	})
 
 	return nil
 }
@@ -234,13 +285,14 @@ func reconcileLateAllowedBlocks(auditEvents []events.AuditEvent) []events.AuditE
 	return kept
 }
 
-func (c *SummaryCmd) correlateEventsToSteps(auditEvents []events.AuditEvent, steps []GitHubStep) []StepEvents {
-	// GitHub API returns step timestamps with second precision, but audit events
-	// use time.Now() with sub-second precision. Fix up step boundaries so events
-	// aren't silently dropped at second boundaries.
-	//
-	// Also handle steps with null completed_at (in-progress or API eventual
-	// consistency) by inferring the end time from the next step's started_at.
+// backfillStepCompletion fills null completed_at values (GitHub reports null
+// for the in-progress step — always the case for the job's own final steps —
+// and API eventual consistency can lag others) from the next step's start,
+// or just past the last event for the final step. Mutates steps in place.
+// Run calls it for BOTH grouping paths: the SaaS push ships these
+// timestamps per step, so the causal path needs the backfill as much as the
+// temporal one (which additionally uses the windows for event assignment).
+func backfillStepCompletion(steps []GitHubStep, auditEvents []events.AuditEvent) {
 	var maxEventTime time.Time
 	for _, e := range auditEvents {
 		if e.Timestamp.After(maxEventTime) {
@@ -258,6 +310,14 @@ func (c *SummaryCmd) correlateEventsToSteps(auditEvents []events.AuditEvent, ste
 			}
 		}
 	}
+}
+
+func (c *SummaryCmd) correlateEventsToSteps(auditEvents []events.AuditEvent, steps []GitHubStep) []StepEvents {
+	// GitHub API returns step timestamps with second precision, but audit events
+	// use time.Now() with sub-second precision. Fix up step boundaries so events
+	// aren't silently dropped at second boundaries. Idempotent when Run has
+	// already backfilled; kept here because tests call this directly.
+	backfillStepCompletion(steps, auditEvents)
 
 	// Create step events map keyed by index to handle duplicate step names
 	stepEventsMap := make(map[int]*StepEvents)
@@ -362,164 +422,6 @@ func deduplicateStepEvents(stepEvents []StepEvents) {
 	}
 }
 
-func (c *SummaryCmd) generateSummary(stepEvents []StepEvents, existingConnEvents []events.AuditEvent, auditMode bool, workflowRunLink string) {
-	// Count totals
-	var totalBlocked, totalConnectionsAllowed, totalDNSBlocked, totalProtocolBlocked, totalAutoAllowed int
-	for _, se := range stepEvents {
-		for _, event := range se.Events {
-			switch event.EventType {
-			case events.EventConnectionBlocked:
-				totalBlocked++
-			case events.EventConnectionAllowed, events.EventConnectionLateAllowed:
-				totalConnectionsAllowed++
-				if event.AutoAllowedType != "" {
-					totalAutoAllowed++
-				}
-			case events.EventProtocolBlocked:
-				totalProtocolBlocked++
-			case events.EventDNSBlocked:
-				totalDNSBlocked++
-			}
-		}
-	}
-
-	// Print header
-	if auditMode {
-		fmt.Fprintln(c.output, "## CargoWall (Audit Mode - No Blocking)")
-		fmt.Fprintln(c.output)
-		fmt.Fprintln(c.output, "> Running in audit mode. Connections shown below were **logged but NOT blocked**.")
-		fmt.Fprintln(c.output, "> Switch to `mode: enforce` to block these connections.")
-	} else {
-		fmt.Fprintln(c.output, "## CargoWall (Enforce Mode)")
-	}
-	fmt.Fprintln(c.output)
-
-	// When a SaaS link is available, condense output: just header + link
-	if workflowRunLink != "" {
-		fmt.Fprintf(c.output, "[View full details on CodeCargo](%s)\n", workflowRunLink)
-		return
-	}
-
-	// Print summary table
-	fmt.Fprintln(c.output, "### Summary")
-	fmt.Fprintln(c.output, "| Metric | Count |")
-	fmt.Fprintln(c.output, "|--------|-------|")
-	if auditMode {
-		fmt.Fprintf(c.output, "| Connections that would be denied | %d |\n", totalBlocked)
-		fmt.Fprintf(c.output, "| Protocols that would be denied | %d |\n", totalProtocolBlocked)
-		fmt.Fprintf(c.output, "| DNS queries that would be denied | %d |\n", totalDNSBlocked)
-	} else {
-		fmt.Fprintf(c.output, "| Connections blocked | %d |\n", totalBlocked)
-		fmt.Fprintf(c.output, "| Protocols blocked | %d |\n", totalProtocolBlocked)
-		fmt.Fprintf(c.output, "| DNS queries blocked | %d |\n", totalDNSBlocked)
-	}
-	fmt.Fprintf(c.output, "| Connections allowed | %d |\n", totalConnectionsAllowed)
-	if totalAutoAllowed > 0 {
-		fmt.Fprintf(c.output, "| Auto-allowed connections | %d |\n", totalAutoAllowed)
-	}
-	if len(existingConnEvents) > 0 {
-		fmt.Fprintf(c.output, "| Pre-existing connections | %d |\n", len(existingConnEvents))
-	}
-	fmt.Fprintln(c.output)
-
-	// Print pre-existing connections section if any
-	if len(existingConnEvents) > 0 {
-		c.generateExistingConnectionsSection(existingConnEvents)
-	}
-
-	// Print events by step (only steps with events for the markdown summary)
-	fmt.Fprintln(c.output, "### Events by Step")
-	fmt.Fprintln(c.output)
-
-	for _, se := range stepEvents {
-		if len(se.Events) == 0 {
-			continue
-		}
-
-		timeRange := ""
-		if !se.Step.StartedAt.IsZero() && !se.Step.CompletedAt.IsZero() {
-			timeRange = fmt.Sprintf(" (%s - %s)",
-				se.Step.StartedAt.Format("15:04:05"),
-				se.Step.CompletedAt.Format("15:04:05"))
-		}
-		fmt.Fprintf(c.output, "#### Step: \"%s\"%s\n", se.Step.Name, timeRange)
-		fmt.Fprintln(c.output)
-
-		// Build unique entries keyed by (destination, event_type, process)
-		type entryKey struct {
-			dest      string
-			eventType events.AuditEventType
-			process   string
-		}
-		type summaryEntry struct {
-			dest        string
-			typeLabel   string
-			blocked     bool
-			autoAllowed bool
-			process     string
-		}
-
-		entries := make(map[entryKey]*summaryEntry)
-		var sorted []*summaryEntry
-		for _, event := range se.Events {
-			dest := c.eventDestination(event)
-			key := entryKey{dest: dest, eventType: event.EventType, process: event.Process}
-			if _, ok := entries[key]; !ok {
-				e := &summaryEntry{
-					dest:        dest,
-					typeLabel:   c.eventTypeLabel(event.EventType),
-					blocked:     !event.EventType.IsConnectionAllowed(),
-					autoAllowed: event.AutoAllowedType != "",
-					process:     event.Process,
-				}
-				entries[key] = e
-				sorted = append(sorted, e)
-			}
-		}
-
-		// Sort: blocked first, then alphabetically by destination
-		sort.Slice(sorted, func(i, j int) bool {
-			if sorted[i].blocked != sorted[j].blocked {
-				return sorted[i].blocked
-			}
-			return sorted[i].dest < sorted[j].dest
-		})
-
-		if len(sorted) > 0 {
-			fmt.Fprintln(c.output, "| Destination | Type | Status | Process |")
-			fmt.Fprintln(c.output, "|-------------|------|--------|---------|")
-			for _, e := range sorted {
-				var status string
-				if e.blocked {
-					if auditMode {
-						status = ":warning: Would deny"
-					} else {
-						status = ":x: Blocked"
-					}
-				} else if e.autoAllowed {
-					status = ":white_check_mark: Allowed (auto)"
-				} else {
-					status = ":white_check_mark: Allowed"
-				}
-				process := e.process
-				if process == "" {
-					process = "-"
-				}
-				fmt.Fprintf(c.output, "| %s | %s | %s | %s |\n", e.dest, e.typeLabel, status, process)
-			}
-			fmt.Fprintln(c.output)
-		} else {
-			fmt.Fprintln(c.output, "No network events recorded")
-			fmt.Fprintln(c.output)
-		}
-	}
-
-	// In audit mode, suggest allowlist additions
-	if auditMode && (totalBlocked > 0 || totalDNSBlocked > 0) {
-		c.generateAllowlistSuggestions(stepEvents)
-	}
-}
-
 func computeSummary(allEvents []events.AuditEvent, mode data.CargoWallMode) *cargowallv1.CargoWallActionJobSummary {
 	var allowed, blocked, autoAllowed uint32
 	hostnames := make(map[string]struct{})
@@ -555,7 +457,12 @@ func computeSummary(allEvents []events.AuditEvent, mode data.CargoWallMode) *car
 	}
 }
 
-func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (string, error) {
+// rawEvents is the PRE-dedup event stream; the job window is computed from
+// it because the grouped events have already been deduplicated (first
+// occurrence kept), so their max timestamp would end the window at the
+// first retry of the last destination rather than the job's real last
+// network activity. Nil falls back to the grouped events (legacy callers).
+func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep, rawEvents []events.AuditEvent) (string, error) {
 	if c.Token == "" {
 		return "", fmt.Errorf("no token provided, skipping API push")
 	}
@@ -663,10 +570,28 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 	// count them by type/failure class.
 	req.Downgrade = readDowngrade()
 
-	// Set timestamps from first/last events
-	if len(allEvents) > 0 {
-		req.StartedAt = timestamppb.New(allEvents[0].Timestamp)
-		req.CompletedAt = timestamppb.New(allEvents[len(allEvents)-1].Timestamp)
+	// Job window from the extreme event timestamps. Min/max, not first and
+	// last: causal grouping orders events by step (scaffold first, buckets
+	// appended), so positional endpoints could invert the window — e.g. one
+	// pre-daemon bucket event flattening after the last scaffold step would
+	// send started_at after completed_at. Over the raw stream when the
+	// caller provided it — see the rawEvents doc above.
+	window := rawEvents
+	if window == nil {
+		window = allEvents
+	}
+	if len(window) > 0 {
+		first, last := window[0].Timestamp, window[0].Timestamp
+		for _, e := range window[1:] {
+			if e.Timestamp.Before(first) {
+				first = e.Timestamp
+			}
+			if e.Timestamp.After(last) {
+				last = e.Timestamp
+			}
+		}
+		req.StartedAt = timestamppb.New(first)
+		req.CompletedAt = timestamppb.New(last)
 	}
 
 	// Marshal using protojson for HTTP/JSON transcoding compatibility
@@ -735,6 +660,14 @@ func readDowngrade() *cargowallv1.CargoWallDowngrade {
 	return &d
 }
 
+// auditEventToProto converts one audit event to the wire type.
+//
+// StepOrdinal is deliberately NOT sent: ordinals are run-local counters, so
+// they carry no meaning the server can act on across runs. Causal
+// attribution reaches the SaaS through the grouping instead — each event
+// ships under the step its ordinal resolved to. When the server needs step
+// identity it can key on (per-step policy), that will be the stable YAML
+// step `id:`, added to the schema then rather than a counter now.
 func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {
 	actionType := data.CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW
 	switch e.EventType {
@@ -807,138 +740,4 @@ func mapAutoAllowedType(s string) (data.CargoWallAutoAllowedType, bool) {
 	default:
 		return data.CargoWallAutoAllowedType_CARGO_WALL_AUTO_ALLOWED_TYPE_UNSPECIFIED, false
 	}
-}
-
-func (c *SummaryCmd) eventDestination(event events.AuditEvent) string {
-	// Protocol blocks (ICMP, GRE, etc.) show as "hostname (PROTOCOL)" or "IP (PROTOCOL)"
-	if event.EventType == events.EventProtocolBlocked {
-		dest := event.DstHostname
-		if dest == "" {
-			dest = event.DstIP
-		}
-		return fmt.Sprintf("%s (%s)", dest, event.Protocol)
-	}
-	dest := event.DstHostname
-	if dest == "" {
-		dest = event.DstIP
-	}
-	if event.DstPort > 0 {
-		dest = fmt.Sprintf("%s:%d", dest, event.DstPort)
-	}
-	return dest
-}
-
-func (c *SummaryCmd) eventTypeLabel(eventType events.AuditEventType) string {
-	switch eventType {
-	case events.EventConnectionBlocked, events.EventConnectionAllowed, events.EventConnectionLateAllowed:
-		return "Connection"
-	case events.EventProtocolBlocked:
-		return "Protocol"
-	case events.EventDNSBlocked:
-		return "DNS"
-	default:
-		return string(eventType)
-	}
-}
-
-func (c *SummaryCmd) generateAllowlistSuggestions(stepEvents []StepEvents) {
-	// Count occurrences of each destination
-	destCounts := make(map[string]int)
-	for _, se := range stepEvents {
-		for _, event := range se.Events {
-			if event.EventType == events.EventConnectionBlocked || event.EventType == events.EventDNSBlocked {
-				dest := event.DstHostname
-				if dest == "" {
-					dest = event.DstIP
-				}
-				destCounts[dest]++
-			}
-		}
-	}
-
-	if len(destCounts) == 0 {
-		return
-	}
-
-	// Sort by count descending
-	type destCount struct {
-		dest  string
-		count int
-	}
-	var sorted []destCount
-	for dest, count := range destCounts {
-		sorted = append(sorted, destCount{dest, count})
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].count > sorted[j].count
-	})
-
-	fmt.Fprintln(c.output, "### Recommended Allowlist Additions")
-	fmt.Fprintln(c.output, "Based on this audit, consider adding these hosts if they are legitimate:")
-	fmt.Fprintln(c.output)
-	for _, dc := range sorted {
-		attempts := "attempt"
-		if dc.count > 1 {
-			attempts = "attempts"
-		}
-		fmt.Fprintf(c.output, "- `%s` (%d connection %s)\n", dc.dest, dc.count, attempts)
-	}
-	fmt.Fprintln(c.output)
-	fmt.Fprintln(c.output, "Add these to your workflow with:")
-	fmt.Fprintln(c.output, "```yaml")
-	fmt.Fprintln(c.output, "- uses: code-cargo/cargowall-action@latest")
-	fmt.Fprintln(c.output, "  with:")
-	fmt.Fprintln(c.output, "    allowed-hosts: |")
-	for i, dc := range sorted {
-		if i >= 5 {
-			fmt.Fprintln(c.output, "      # ... and more")
-			break
-		}
-		// Check if it looks like an IP
-		if strings.Count(dc.dest, ".") == 3 && !strings.Contains(dc.dest, "/") {
-			continue // Skip raw IPs in example
-		}
-		fmt.Fprintf(c.output, "      %s\n", dc.dest)
-	}
-	fmt.Fprintln(c.output, "```")
-}
-
-func (c *SummaryCmd) generateExistingConnectionsSection(existingConnEvents []events.AuditEvent) {
-	fmt.Fprintln(c.output, "### Pre-Existing Connections")
-	fmt.Fprintln(c.output)
-	fmt.Fprintln(c.output, "These connections were already established when CargoWall started:")
-	fmt.Fprintln(c.output)
-	fmt.Fprintln(c.output, "| IP | Hostname | Status |")
-	fmt.Fprintln(c.output, "|----|----------|--------|")
-
-	// Sort: connections matching rules first, then by hostname
-	sort.Slice(existingConnEvents, func(i, j int) bool {
-		// Connections with matched rules come first
-		iMatched := existingConnEvents[i].MatchedRule != ""
-		jMatched := existingConnEvents[j].MatchedRule != ""
-		if iMatched != jMatched {
-			return iMatched
-		}
-		// Within same match status, sort by hostname
-		return existingConnEvents[i].DstHostname < existingConnEvents[j].DstHostname
-	})
-
-	for _, event := range existingConnEvents {
-		ip := event.DstIP
-		hostname := event.DstHostname
-		if hostname == "" {
-			hostname = "-"
-		}
-		matchedRule := event.MatchedRule
-
-		var status string
-		if matchedRule != "" {
-			status = fmt.Sprintf(":white_check_mark: Allowed (matches %s)", matchedRule)
-		} else {
-			status = ":white_check_mark: Allowed"
-		}
-
-		fmt.Fprintf(c.output, "| %s | %s | %s |\n", ip, hostname, status)
-	}
-	fmt.Fprintln(c.output)
 }

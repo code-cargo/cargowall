@@ -142,6 +142,27 @@ func TestExporter_ShutdownFlushesQueuedEvents(t *testing.T) {
 	assert.Equal(t, "application/x-protobuf", c.headers[0].Get("Content-Type"))
 }
 
+func TestExporter_StepBoundaryNotExported(t *testing.T) {
+	c := newCollector(t)
+	e := New(testConfig(c.server.URL), "test", discardLogger())
+
+	// Boundary markers are dropped at the sink; connection events flow.
+	e.Consume(events.AuditEvent{
+		Timestamp:   time.Now(),
+		EventType:   events.EventStepBoundary,
+		Process:     "bash -e /home/runner/work/_temp/x.sh",
+		PID:         42,
+		StepOrdinal: 3,
+	})
+	e.Consume(testEvent())
+	require.NoError(t, e.Shutdown(context.Background()))
+
+	reqs := c.recorded()
+	require.Len(t, reqs, 1)
+	assert.Len(t, reqs[0].ResourceLogs[0].ScopeLogs[0].LogRecords, 1,
+		"only the connection event may reach the collector")
+}
+
 func TestExporter_BatchesBySize(t *testing.T) {
 	c := newCollector(t)
 	e := New(testConfig(c.server.URL), "test", discardLogger())

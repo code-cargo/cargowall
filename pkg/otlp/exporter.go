@@ -102,6 +102,16 @@ func (e *Exporter) Endpoint() string {
 // Shutdown closing the queue (a bare closed-flag check would race and panic
 // on send-to-closed-channel); it is only ever held for a non-blocking send.
 func (e *Exporter) Consume(ev events.AuditEvent) {
+	// Step boundaries are process markers, not connections: exported
+	// unfiltered they'd stamp cargowall.verdict="allow" (LogEvent skips
+	// verdict normalization for them) and inflate any allow-counting
+	// dashboard by one record per workflow step. Per-connection events
+	// already carry cargowall.step_ordinal, which is the correlation key
+	// that matters; a proper boundary schema can come with the SaaS step
+	// tier.
+	if ev.EventType == events.EventStepBoundary {
+		return
+	}
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()

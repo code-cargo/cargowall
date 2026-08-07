@@ -43,13 +43,14 @@ const maxRecentBlocks = 4096
 // reconciliation event dated At supersedes every recorded retry for the tuple
 // (the summary drops blocked events at or before the late-allowed timestamp).
 type RecentBlock struct {
-	SrcIP    string
-	DstIP    string
-	DstPort  uint16
-	Protocol string // audit protocol name, "TCP" or "UDP"
-	Process  string
-	PID      uint32
-	At       time.Time
+	SrcIP       string
+	DstIP       string
+	DstPort     uint16
+	Protocol    string // audit protocol name, "TCP" or "UDP"
+	Process     string
+	PID         uint32
+	StepOrdinal uint32
+	At          time.Time
 }
 
 type recentBlockKey struct {
@@ -123,13 +124,14 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 		rb.byIP[event.DstIP] = byKey
 	}
 	byKey[key] = RecentBlock{
-		SrcIP:    event.SrcIP,
-		DstIP:    event.DstIP,
-		DstPort:  event.DstPort,
-		Protocol: event.Protocol,
-		Process:  event.Process,
-		PID:      event.PID,
-		At:       event.Timestamp,
+		SrcIP:       event.SrcIP,
+		DstIP:       event.DstIP,
+		DstPort:     event.DstPort,
+		Protocol:    event.Protocol,
+		Process:     event.Process,
+		PID:         event.PID,
+		StepOrdinal: event.StepOrdinal,
+		At:          event.Timestamp,
 	}
 }
 

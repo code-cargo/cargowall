@@ -54,6 +54,13 @@ type TcBpfPortVal struct {
 	Pad    [3]uint8
 }
 
+type TcBpfStepState struct {
+	_           structs.HostLayout
+	WorkerTgid  uint32
+	Enabled     uint32
+	NextOrdinal uint64
+}
+
 // LoadTcBpf returns the embedded CollectionSpec for TcBpf.
 func LoadTcBpf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_TcBpfBytes)
@@ -118,12 +125,16 @@ type TcBpfMapSpecs struct {
 	MapPorts           *ebpf.MapSpec `ebpf:"map_ports"`
 	MapPortsV6         *ebpf.MapSpec `ebpf:"map_ports_v6"`
 	MapSockPid         *ebpf.MapSpec `ebpf:"map_sock_pid"`
+	MapSockStep        *ebpf.MapSpec `ebpf:"map_sock_step"`
+	MapStepState       *ebpf.MapSpec `ebpf:"map_step_state"`
+	MapTaskStep        *ebpf.MapSpec `ebpf:"map_task_step"`
 }
 
 // TcBpfVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TcBpfVariableSpecs struct {
+	BtfAnchorBlockedEvent *ebpf.VariableSpec `ebpf:"btf_anchor_blocked_event"`
 }
 
 // TcBpfObjects contains all objects after they have been loaded into the kernel.
@@ -156,6 +167,9 @@ type TcBpfMaps struct {
 	MapPorts           *ebpf.Map `ebpf:"map_ports"`
 	MapPortsV6         *ebpf.Map `ebpf:"map_ports_v6"`
 	MapSockPid         *ebpf.Map `ebpf:"map_sock_pid"`
+	MapSockStep        *ebpf.Map `ebpf:"map_sock_step"`
+	MapStepState       *ebpf.Map `ebpf:"map_step_state"`
+	MapTaskStep        *ebpf.Map `ebpf:"map_task_step"`
 }
 
 func (m *TcBpfMaps) Close() error {
@@ -170,6 +184,9 @@ func (m *TcBpfMaps) Close() error {
 		m.MapPorts,
 		m.MapPortsV6,
 		m.MapSockPid,
+		m.MapSockStep,
+		m.MapStepState,
+		m.MapTaskStep,
 	)
 }
 
@@ -177,6 +194,7 @@ func (m *TcBpfMaps) Close() error {
 //
 // It can be passed to LoadTcBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TcBpfVariables struct {
+	BtfAnchorBlockedEvent *ebpf.Variable `ebpf:"btf_anchor_blocked_event"`
 }
 
 // TcBpfPrograms contains all programs after they have been loaded into the kernel.

@@ -930,19 +930,19 @@ func TestMapSockPidReadWrite(t *testing.T) {
 
 // bpfBlockedEvent matches the C struct blocked_event for decoding ring buffer records.
 type bpfBlockedEvent struct {
-	IpVersion uint8
-	Allowed   uint8
-	IpProto   uint8
-	Flags     uint8 // EVENT_FLAG_* bits
-	SrcIp     uint32
-	DstIp     uint32
-	SrcPort   uint16
-	DstPort   uint16
-	SrcIp6    [16]byte
-	DstIp6    [16]byte
-	Timestamp uint64
-	Pid       uint32
-	Pad2      uint32
+	IpVersion   uint8
+	Allowed     uint8
+	IpProto     uint8
+	Flags       uint8 // EVENT_FLAG_* bits
+	SrcIp       uint32
+	DstIp       uint32
+	SrcPort     uint16
+	DstPort     uint16
+	SrcIp6      [16]byte
+	DstIp6      [16]byte
+	Timestamp   uint64
+	Pid         uint32
+	StepOrdinal uint32 // step tag copied from map_sock_step (0 = untagged)
 }
 
 func TestEventPidZeroWhenNoCookieMapping(t *testing.T) {

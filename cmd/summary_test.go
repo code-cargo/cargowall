@@ -243,6 +243,32 @@ func TestSummary_DeduplicateStepEvents_AutoAllowedTypeBackfilled(t *testing.T) {
 	assert.Equal(t, ts, stepEvents[0].Events[0].Timestamp, "representative is still the first-seen event")
 }
 
+// --- Run: empty-network paths ---
+
+// runSummary executes a full SummaryCmd.Run against an audit log written
+// from the given events, returning the rendered output.
+func runSummary(t *testing.T, evts []events.AuditEvent) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	enc := json.NewEncoder(f)
+	for _, ev := range evts {
+		require.NoError(t, enc.Encode(ev))
+	}
+	require.NoError(t, f.Close())
+
+	var buf bytes.Buffer
+	cmd := &SummaryCmd{AuditLog: path, Steps: "[]", output: &buf}
+	require.NoError(t, cmd.Run())
+	return buf.String()
+}
+
+func TestSummary_Run_EmptyLogPrintsNoEventsMessage(t *testing.T) {
+	out := runSummary(t, nil)
+	assert.Contains(t, out, "No network events were logged during this workflow run.")
+}
+
 // --- correlateEventsToSteps ---
 
 func TestSummary_CorrelateEventsToSteps_EventInStep(t *testing.T) {
@@ -782,7 +808,7 @@ func TestSummary_GenerateSummary_CondensedWithLink(t *testing.T) {
 	var buf bytes.Buffer
 	cmd := &SummaryCmd{output: &buf}
 
-	cmd.generateSummary(stepEvents, existing, false, "https://app.codecargo.io/run/123")
+	cmd.generateSummary(summaryData{groups: stepEvents, existingConn: existing, workflowRunLink: "https://app.codecargo.io/run/123"})
 
 	out := buf.String()
 	// Header present
@@ -801,7 +827,7 @@ func TestSummary_GenerateSummary_FullWithoutLink(t *testing.T) {
 	var buf bytes.Buffer
 	cmd := &SummaryCmd{output: &buf}
 
-	cmd.generateSummary(stepEvents, existing, false, "")
+	cmd.generateSummary(summaryData{groups: stepEvents, existingConn: existing})
 
 	out := buf.String()
 	// Detailed sections present
@@ -826,7 +852,7 @@ func TestSummary_GenerateSummary_CondensedAuditMode(t *testing.T) {
 	var buf bytes.Buffer
 	cmd := &SummaryCmd{output: &buf}
 
-	cmd.generateSummary(stepEvents, nil, true, "https://app.codecargo.io/run/456")
+	cmd.generateSummary(summaryData{groups: stepEvents, auditMode: true, workflowRunLink: "https://app.codecargo.io/run/456"})
 
 	out := buf.String()
 	// Audit mode header and banner
@@ -857,9 +883,81 @@ func TestPushToApi_IgnoresUnknownResponseField(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c := &SummaryCmd{ApiUrl: srv.URL, Token: "test-token", JobName: "build"}
-	url, err := c.pushToApi(nil, nil)
+	url, err := c.pushToApi(nil, nil, nil)
 	require.NoError(t, err, "unknown response fields must not break URL extraction")
 	assert.Equal(t, "https://app.codecargo.io/run/789", url)
+}
+
+// A zero-network job takes the early-return push path; its steps must still
+// ship backfilled completed_at values (GitHub reports null for the step
+// that is still running, and the backfill runs before EVERY push path).
+func TestSummary_Run_QuietJobPushesBackfilledCompletedAt(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"job_id": "job-1"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	require.NoError(t, os.WriteFile(path, nil, 0o644))
+
+	stepsJSON := `[{"name":"build","number":1,"started_at":"2025-01-01T10:00:00Z"},` +
+		`{"name":"post","number":2,"started_at":"2025-01-01T10:00:10Z"}]`
+	var buf bytes.Buffer
+	c := &SummaryCmd{AuditLog: path, Steps: stepsJSON, ApiUrl: srv.URL, Token: "t", JobName: "j", output: &buf}
+	require.NoError(t, c.Run())
+
+	pushed := got["steps"].([]any)
+	require.Len(t, pushed, 2)
+	first := pushed[0].(map[string]any)
+	assert.Equal(t, "2025-01-01T10:00:10Z", first["completed_at"],
+		"null completed_at backfilled from the next step's start, even with zero events")
+}
+
+// The job window must span the extreme RAW event timestamps. Causal
+// grouping orders events by step with buckets appended last, so positional
+// first/last would invert started_at/completed_at whenever an early event
+// (e.g. a pre-daemon block) flattens after the last scaffold step — and the
+// grouped events are post-dedup (first occurrence kept), so a window over
+// them would end at the first retry rather than the job's last activity.
+func TestPushToApi_JobWindowIsMinMaxOverRawEvents(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"job_id": "job-1"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	blocked := func(ts time.Time, ip string) events.AuditEvent {
+		return events.AuditEvent{Timestamp: ts, EventType: events.EventConnectionBlocked, DstIP: ip, DstPort: 443, Protocol: "TCP"}
+	}
+	// The earliest event sits in the LAST group — the shape
+	// buildCausalPushGroups produces for pre-daemon traffic — and the
+	// grouped events have already lost the +45s retry to dedup.
+	groups := []StepEvents{
+		{Step: GitHubStep{Name: "build"}, Events: []events.AuditEvent{blocked(base.Add(30*time.Second), "1.1.1.1")}},
+		{Step: GitHubStep{Name: bucketPreDaemon}, Events: []events.AuditEvent{blocked(base, "2.2.2.2")}},
+	}
+	raw := []events.AuditEvent{
+		blocked(base.Add(30*time.Second), "1.1.1.1"),
+		blocked(base.Add(45*time.Second), "1.1.1.1"), // retry dedup dropped
+		blocked(base, "2.2.2.2"),
+	}
+
+	c := &SummaryCmd{ApiUrl: srv.URL, Token: "test-token", JobName: "build"}
+	_, err := c.pushToApi(groups, nil, raw)
+	require.NoError(t, err)
+
+	started, err := time.Parse(time.RFC3339, got["started_at"].(string))
+	require.NoError(t, err)
+	completed, err := time.Parse(time.RFC3339, got["completed_at"].(string))
+	require.NoError(t, err)
+	assert.Equal(t, base, started.UTC(), "started_at is the earliest raw event, wherever it sits")
+	assert.Equal(t, base.Add(45*time.Second), completed.UTC(), "completed_at is the latest RAW event, surviving dedup")
 }
 
 // TestPushToApi_ReportsVersion confirms the agent version (#92) rides along on
@@ -887,7 +985,7 @@ func TestPushToApi_ReportsVersion(t *testing.T) {
 			t.Cleanup(srv.Close)
 
 			c := &SummaryCmd{ApiUrl: srv.URL, Token: "test-token", JobName: "build", Version: tc.version}
-			_, err := c.pushToApi(nil, nil)
+			_, err := c.pushToApi(nil, nil, nil)
 			require.NoError(t, err)
 
 			if tc.version == "" {
@@ -939,7 +1037,7 @@ func TestPushToApi_ReportsDowngrade(t *testing.T) {
 			t.Cleanup(srv.Close)
 
 			c := &SummaryCmd{ApiUrl: srv.URL, Token: "test-token", JobName: "build", Mode: "audit"}
-			_, err := c.pushToApi(nil, nil)
+			_, err := c.pushToApi(nil, nil, nil)
 			require.NoError(t, err)
 
 			if tc.downgrade == nil {

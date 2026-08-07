@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -51,6 +52,12 @@ type Server struct {
 
 	// DNS query filtering (blocks DNS tunneling)
 	filterQueries bool // When true, only forward queries for allowed domains
+
+	// Atomic because it is installed via SetStepLookup after the server is
+	// already answering queries (step attribution starts later in startup),
+	// so handler goroutines read it concurrently with the write. Holds a
+	// func(net.Addr) uint32.
+	stepLookup atomic.Value
 
 	// Track hostname to IP mappings for updates (no automatic removal)
 	hostnameIPs      map[string]map[string]bool // hostname -> set of IPs
@@ -128,6 +135,17 @@ func (s *Server) SetFirewall(fw firewall.Firewall) {
 // enforcement posture is read from config.Manager.IsAuditMode.
 func (s *Server) SetAuditLogger(auditLogger *events.AuditLogger) {
 	s.auditLogger = auditLogger
+}
+
+// SetStepLookup installs a resolver from a DNS client address to the step
+// ordinal of the process that owns the client socket (steps.Tracker's
+// sock_diag path). Used to attribute dns_blocked events causally; nil or a
+// failed lookup leaves the event untagged.
+func (s *Server) SetStepLookup(lookup func(net.Addr) uint32) {
+	if lookup == nil {
+		return // atomic.Value cannot store nil; absent means untagged anyway
+	}
+	s.stepLookup.Store(lookup)
 }
 
 // SetRecentBlocks attaches the buffer of recently blocked connections that
@@ -352,7 +370,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	if s.filterQueries && len(r.Question) > 0 {
 		// Lowercased for reporting consistency (#65): isQueryAllowed and
 		// MatchHostnameRule fold case internally, so this only affects the
-		// case shown in the block logs and the LogDNSBlocked audit record.
+		// case shown in the block logs and the dns_blocked audit record.
 		domain := strings.ToLower(strings.TrimSuffix(r.Question[0].Name, "."))
 		if !s.isQueryAllowed(domain, r.Question[0].Qtype) {
 			// Check the run's posture (single source of truth on the config
@@ -369,9 +387,19 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 					"from", w.RemoteAddr().String())
 			}
 
-			// Log to audit file if configured
+			// Log to audit file if configured. The querying step is resolved
+			// from the client socket while the client is still blocked in its
+			// recv, so the sock_diag lookup sees a live socket.
 			if s.auditLogger != nil {
-				if err := s.auditLogger.LogDNSBlocked(domain); err != nil {
+				var stepOrdinal uint32
+				if lookup, ok := s.stepLookup.Load().(func(net.Addr) uint32); ok {
+					stepOrdinal = lookup(w.RemoteAddr())
+				}
+				if err := s.auditLogger.LogEvent(events.AuditEvent{
+					EventType:   events.EventDNSBlocked,
+					DstHostname: domain,
+					StepOrdinal: stepOrdinal,
+				}); err != nil {
 					s.logger.Error("Failed to write DNS audit log", "error", err)
 				}
 			}
@@ -969,8 +997,23 @@ func (s *Server) reconcileRecentBlocks(ip net.IP, hostname, matchedRule string, 
 			"process", b.Process,
 			"pid", b.PID,
 			"matched_rule", matchedRule)
-		if err := s.auditLogger.LogConnectionLateAllowedAt(b.At, b.SrcIP, b.DstIP, hostname,
-			matchedRule, b.DstPort, b.Process, b.PID, b.Protocol, cnameChain); err != nil {
+		// Dated at the original blocked attempt (b.At), not reconcile time,
+		// so the event supersedes every blocked record at or before it and
+		// step correlation reflects when the connection actually happened.
+		if err := s.auditLogger.LogEvent(events.AuditEvent{
+			Timestamp:   b.At,
+			EventType:   events.EventConnectionLateAllowed,
+			SrcIP:       b.SrcIP,
+			DstIP:       b.DstIP,
+			DstHostname: hostname,
+			DstPort:     b.DstPort,
+			Protocol:    b.Protocol,
+			Process:     b.Process,
+			PID:         b.PID,
+			MatchedRule: matchedRule,
+			CNAMEChain:  cnameChain,
+			StepOrdinal: b.StepOrdinal,
+		}); err != nil {
 			s.logger.Error("Failed to write audit log", "error", err)
 		}
 	}

@@ -209,6 +209,37 @@ func TestLogRecordFromEvent_ExistingConnection(t *testing.T) {
 	assert.Equal(t, "existing connection would deny 93.184.216.34", wouldDeny.Body.GetStringValue())
 }
 
+func TestLogRecordFromEvent_StepOrdinal(t *testing.T) {
+	base := events.AuditEvent{
+		Timestamp: time.Now(),
+		EventType: events.EventConnectionBlocked,
+		DstIP:     "1.2.3.4",
+		Protocol:  "TCP",
+	}
+
+	base.StepOrdinal = 7
+	attrs := attrMap(t, logRecordFromEvent(base).Attributes)
+	require.NotNil(t, attrs["cargowall.step_ordinal"])
+	assert.Equal(t, int64(7), attrs["cargowall.step_ordinal"].GetIntValue())
+	assert.Nil(t, attrs["cargowall.step_scope"])
+
+	// Sentinels export as a scope label, never as a bogus step id.
+	base.StepOrdinal = events.StepOrdinalRunner
+	attrs = attrMap(t, logRecordFromEvent(base).Attributes)
+	assert.Nil(t, attrs["cargowall.step_ordinal"])
+	assert.Equal(t, "runner", attrs["cargowall.step_scope"].GetStringValue())
+
+	base.StepOrdinal = events.StepOrdinalPreDaemon
+	attrs = attrMap(t, logRecordFromEvent(base).Attributes)
+	assert.Nil(t, attrs["cargowall.step_ordinal"])
+	assert.Equal(t, "pre_daemon", attrs["cargowall.step_scope"].GetStringValue())
+
+	base.StepOrdinal = events.StepOrdinalNone
+	attrs = attrMap(t, logRecordFromEvent(base).Attributes)
+	assert.Nil(t, attrs["cargowall.step_ordinal"])
+	assert.Nil(t, attrs["cargowall.step_scope"])
+}
+
 func TestBuildResource(t *testing.T) {
 	res := buildResource(Config{
 		ServiceName:   "cargowall",

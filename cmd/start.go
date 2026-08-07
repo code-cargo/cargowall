@@ -52,6 +52,7 @@ import (
 	"github.com/code-cargo/cargowall/pkg/lockdown"
 	"github.com/code-cargo/cargowall/pkg/network"
 	"github.com/code-cargo/cargowall/pkg/otlp"
+	"github.com/code-cargo/cargowall/pkg/steps"
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
 
@@ -448,8 +449,25 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	logger.Info("Using network interface", "interface", ifname)
 
 	// Load TC eBPF objects
+	spec, err := bpf.LoadTcBpf()
+	if err != nil {
+		return fmt.Errorf("failed to load TC eBPF spec: %w", err)
+	}
+	// The step-attribution maps preallocate ~7MB of kernel memory at their
+	// full size (LRU hash always preallocates). Shrink them when the feature
+	// is off — every non-GitHub run — but never when it is on: stepbpf.c
+	// declares the full sizes and MapReplacements rejects mismatched specs.
+	if !cmd.StepAttribution {
+		// Present unless the generated spec is stale (go generate not run);
+		// verify-bpf-generated-code guards that, but don't panic if it slips.
+		for _, name := range []string{"map_task_step", "map_sock_step"} {
+			if m := spec.Maps[name]; m != nil {
+				m.MaxEntries = 64
+			}
+		}
+	}
 	var objs bpf.TcBpfObjects
-	if err := bpf.LoadTcBpfObjects(&objs, &ebpf.CollectionOptions{
+	if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
 			KernelTypes: nil,
 			LogLevel:    ebpf.LogLevelBranch | ebpf.LogLevelStats,
@@ -490,6 +508,30 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			logger.Warn("Failed to attach cgroup program (PID tracking disabled)", "program", cp.name, "error", err)
 		} else {
 			defer l.Close()
+		}
+	}
+
+	// Step attribution: tag processes/sockets with the workflow step that
+	// created them so audit events carry a causal step ordinal. Optional by
+	// design — it needs kernel BTF and a Runner.Worker process, and a failure
+	// here must never degrade enforcement, so it only warns.
+	if cmd.StepAttribution {
+		tracker, err := steps.Start(&objs, steps.Options{
+			WorkerPID:   cmd.RunnerWorkerPID,
+			OrdinalBase: uint64(cmd.StepOrdinalBase),
+		}, auditLogger, logger)
+		if err != nil {
+			logger.Warn("Step attribution disabled", "error", err)
+		} else {
+			defer tracker.Close()
+			logger.Info("Step attribution enabled",
+				"worker_pid", tracker.WorkerPID(),
+				"ordinal_base", cmd.StepOrdinalBase)
+			// DNS events have no TC packet to carry a tag; the proxy
+			// resolves the querying step from the client socket instead.
+			if dnsServer != nil {
+				dnsServer.SetStepLookup(tracker.StepForClient)
+			}
 		}
 	}
 

@@ -94,7 +94,8 @@ type Tracker struct {
 	stepCacheMu  sync.Mutex
 	stepCache    map[stepCacheKey]stepCacheEntry
 	diagSem      chan struct{}
-	diagWarnOnce sync.Once
+	diagWarnMu   sync.Mutex
+	diagLastWarn string
 }
 
 // Start loads the step-attribution collection against tcObjs' shared maps,
@@ -356,12 +357,11 @@ func (t *Tracker) run() {
 // lives under the runner's _temp (run: steps, composite blocks) or
 // _actions (JS actions) directories, and sits at argv[2+] whenever shell
 // flags are in play (`bash --noprofile --norc -e -o pipefail x.sh` is the
-// standard run-step shape). Those paths are runner-named, so they cannot
-// carry secret values; every other later token is where flags and values
-// (and therefore secrets passed on a command line, e.g. docker args) could
-// appear, and is dropped. Everything written to logs, the audit JSONL, or
-// the summary goes through this; the full string stays internal to the
-// fork→exec retry comparison.
+// standard run-step shape). Every other later token is where flags and
+// values (and therefore secrets passed on a command line, e.g. docker
+// args) could appear, and is dropped. Everything written to logs, the
+// audit JSONL, or the summary goes through this; the full string stays
+// internal to the fork→exec retry comparison.
 func sanitizeCmdline(cmdline string) string {
 	fields := strings.Fields(cmdline)
 	if len(fields) <= 2 {
@@ -370,7 +370,7 @@ func sanitizeCmdline(cmdline string) string {
 	kept := append([]string(nil), fields[:2]...)
 	dropped := false
 	for _, f := range fields[2:] {
-		if strings.Contains(f, "/_temp/") || strings.Contains(f, "/_actions/") {
+		if isRunnerPath(f) {
 			kept = append(kept, f)
 		} else {
 			dropped = true
@@ -381,6 +381,20 @@ func sanitizeCmdline(cmdline string) string {
 		out += " ..."
 	}
 	return out
+}
+
+// isRunnerPath reports whether an argv token is a bare absolute path into
+// the runner's _temp/_actions trees — the shape of the script and action
+// paths the runner itself passes. Anchored, not a substring test: a
+// user-controlled value merely EMBEDDING those substrings (a URL with a
+// query string, a --flag=value, a volume spec) must not ride through the
+// redaction, so anything that isn't a plain absolute path ('=' from
+// flag-or-env values, ':' from URLs and mount specs) is rejected.
+func isRunnerPath(tok string) bool {
+	if !strings.HasPrefix(tok, "/") || strings.ContainsAny(tok, "=:") {
+		return false
+	}
+	return strings.Contains(tok, "/_temp/") || strings.Contains(tok, "/_actions/")
 }
 
 // stepCmdline reads the child's command line, retrying briefly while it
@@ -528,10 +542,17 @@ func readCmdline(pid int) string {
 		const maxLen = 256
 		if len(s) > maxLen {
 			// Back off to a rune boundary so the cap can't split a
-			// multi-byte character; ASCII marker keeps the JSONL 7-bit.
+			// multi-byte character. Bounded to one rune's width: cmdline
+			// is arbitrary bytes, not guaranteed UTF-8, and a long run of
+			// continuation-range bytes must not walk the cut back
+			// further — if no boundary is that close, it isn't UTF-8 and
+			// the cap lands on the raw byte.
 			cut := maxLen
-			for cut > 0 && !utf8.RuneStart(s[cut]) {
+			for cut > maxLen-utf8.UTFMax && !utf8.RuneStart(s[cut]) {
 				cut--
+			}
+			if !utf8.RuneStart(s[cut]) {
+				cut = maxLen
 			}
 			s = s[:cut] + "..."
 		}

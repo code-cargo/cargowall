@@ -293,18 +293,42 @@ func TestSummary_ResolveOrdinalSteps_CompositeMultipleBoundariesPerStep(t *testi
 	}
 	boundaries := []events.AuditEvent{
 		{EventType: events.EventStepBoundary, StepOrdinal: 1, Timestamp: base.Add(100 * time.Millisecond)},
-		// Second and third run: blocks of the composite, mid-window and
-		// far outside rounding slack of deploy's start.
+		// Later run: blocks of the composite: mid-window, and — the case
+		// that distinguishes the rule ORDER — inside the window while also
+		// within rounding slack of deploy's recorded start. The recorded
+		// window wins; deploy must not claim it.
 		{EventType: events.EventStepBoundary, StepOrdinal: 2, Timestamp: base.Add(3 * time.Second)},
-		{EventType: events.EventStepBoundary, StepOrdinal: 3, Timestamp: base.Add(6 * time.Second)},
+		{EventType: events.EventStepBoundary, StepOrdinal: 3, Timestamp: base.Add(9 * time.Second)},
 		// The genuinely next step.
 		{EventType: events.EventStepBoundary, StepOrdinal: 4, Timestamp: base.Add(10*time.Second + 100*time.Millisecond)},
 	}
 	idx := resolveOrdinalSteps(boundaries, steps)
 	assert.Equal(t, 0, idx[1])
 	assert.Equal(t, 0, idx[2], "second boundary in the window maps to the same step")
-	assert.Equal(t, 0, idx[3], "third boundary too")
+	assert.Equal(t, 0, idx[3], "in-window beats within-slack-of-next: composite's last block stays composite's")
 	assert.Equal(t, 1, idx[4], "later mappings must not shift")
+}
+
+// Skipped steps (`if:`-guarded — GitHub reports zero timestamps) never ran
+// and never fork; the rounding rescue must scan past them to the step that
+// actually ran, not die on the first zero-StartedAt entry (which would
+// absorb the next real step's boundary into the PREVIOUS step).
+func TestSummary_ResolveOrdinalSteps_SlackRescueScansPastSkippedSteps(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	steps := []GitHubStep{
+		{Name: "build", Number: 1, StartedAt: base, CompletedAt: base.Add(18 * time.Second)},
+		{Name: "skipped", Number: 2}, // zero StartedAt/CompletedAt
+		{Name: "deploy", Number: 3, StartedAt: base.Add(20 * time.Second)},
+	}
+	boundaries := []events.AuditEvent{
+		{EventType: events.EventStepBoundary, StepOrdinal: 1, Timestamp: base.Add(time.Second)},
+		// Deploy's own fork, 100ms before its recorded start — and within
+		// end-side slack of build, which must NOT win.
+		{EventType: events.EventStepBoundary, StepOrdinal: 2, Timestamp: base.Add(20*time.Second - 100*time.Millisecond)},
+	}
+	idx := resolveOrdinalSteps(boundaries, steps)
+	assert.Equal(t, 0, idx[1])
+	assert.Equal(t, 2, idx[2], "rescue skips the zero-StartedAt step and lands on deploy")
 }
 
 // A worker fork in the gap AFTER a step completed (and well before the next
@@ -329,6 +353,32 @@ func TestSummary_ResolveOrdinalSteps_InterStepGapBoundaryStaysUnresolved(t *test
 	_, resolved := idx[2]
 	assert.False(t, resolved, "gap boundary maps to neither neighbor")
 	assert.Equal(t, 1, idx[3], "later mappings must not shift")
+}
+
+// With the mapping deliberately non-injective, a composite's several
+// ordinals must form ONE render group keyed by step index, so render and
+// push dedup at the same scope and their unique counts cannot drift (the
+// divergence found in review: markdown said 2, the SaaS summary said 1).
+func TestSummary_CausalGroups_CompositeOrdinalsMergeAndDedupTogether(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	steps := []GitHubStep{
+		{Name: "composite", Number: 1, StartedAt: base, CompletedAt: base.Add(10 * time.Second)},
+	}
+	ordinalSteps := map[uint32]int{1: 0, 2: 0}
+	// Both of the composite's run: blocks hit the SAME blocked destination.
+	evts := []events.AuditEvent{
+		{Timestamp: base.Add(time.Second), EventType: events.EventConnectionBlocked, DstIP: "9.9.9.9", DstPort: 443, Protocol: "TCP", Process: "curl", StepOrdinal: 1},
+		{Timestamp: base.Add(5 * time.Second), EventType: events.EventConnectionBlocked, DstIP: "9.9.9.9", DstPort: 443, Protocol: "TCP", Process: "curl", StepOrdinal: 2},
+	}
+
+	render := causalGroups(evts, steps, ordinalSteps)
+	require.Len(t, render, 1, "one group per resolved step, not per ordinal")
+	assert.Equal(t, "#1,#2 - composite", render[0].Step.Name)
+	assert.Len(t, render[0].Events, 1, "dedup collapses across the composite's ordinals")
+
+	push := buildCausalPushGroups(evts, steps, ordinalSteps)
+	require.Len(t, push, 1)
+	assert.Len(t, push[0].Events, 1, "push dedups at the same scope: unique counts agree")
 }
 
 // Two steps sharing a name (unnamed "Run" steps are common) must remain

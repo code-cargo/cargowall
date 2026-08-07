@@ -130,6 +130,15 @@ func TestSanitizeCmdline(t *testing.T) {
 	assert.Equal(t, "docker run ...",
 		sanitizeCmdline("docker run -e API_TOKEN=hunter2 alpine"))
 	assert.NotContains(t, sanitizeCmdline("cmd sub --token hunter2"), "hunter2")
+	// The path match is anchored: user-controlled tokens merely EMBEDDING
+	// /_temp/ or /_actions/ (URLs, --flag=value, volume specs) must not
+	// ride through the redaction.
+	assert.NotContains(t,
+		sanitizeCmdline("curl -s https://host/_temp/upload?token=SECRET"), "SECRET")
+	assert.NotContains(t,
+		sanitizeCmdline("tool run --out=/home/runner/work/_temp/SECRET.json"), "SECRET")
+	assert.NotContains(t,
+		sanitizeCmdline("docker run -v /home/x/_temp/SECRET:/mnt alpine"), "SECRET")
 }
 
 func TestStart_RejectsNilObjects(t *testing.T) {

@@ -23,7 +23,9 @@ package cmd
 
 import (
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/code-cargo/cargowall/pkg/events"
@@ -77,27 +79,42 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 				best = i
 			}
 		}
-		// Rounding can put a boundary a fraction before its own step's
-		// recorded start (GitHub reports second granularity); a near-miss
-		// claims the next unassigned step. Proximity-gated: an ungated
-		// fallback would let any unmatched boundary claim the next step
-		// and shift every later mapping by one.
-		if best == -1 && prev+1 < len(steps) {
-			next := steps[prev+1]
-			if !next.StartedAt.IsZero() && next.StartedAt.Sub(b.Timestamp) <= resolveRoundingSlack {
-				best = prev + 1
+		// Unmatched boundary: three tie-breakers, strongest evidence first.
+		//
+		// 1. Inside prev's RECORDED window: another direct worker fork of
+		//    the same reported step — composite actions run one fork per
+		//    `run:` block (this also absorbs transient runtime forks,
+		//    empirically real — see steps.Options.OrdinalBase — into
+		//    whatever step was running rather than letting them shift the
+		//    mapping). Checked BEFORE the rounding rescue: the recorded
+		//    timestamps place the boundary in prev, and preferring the
+		//    next step here would misattribute a composite's later blocks
+		//    — its last block often forks within slack of the next step's
+		//    recorded start.
+		if best == -1 && prev >= 0 && !steps[prev].StartedAt.After(b.Timestamp) &&
+			!steps[prev].CompletedAt.IsZero() && !b.Timestamp.After(steps[prev].CompletedAt) {
+			best = prev
+		}
+		// 2. Rounding rescue: GitHub truncates step times to the second,
+		//    so a step's own boundary can fire a fraction before its
+		//    recorded start; claim the next step that actually ran.
+		//    Skipped steps (`if:`-guarded — zero StartedAt) never ran and
+		//    never fork, so scan past them to the next real candidate.
+		if best == -1 {
+			for j := prev + 1; j < len(steps); j++ {
+				if steps[j].StartedAt.IsZero() {
+					continue
+				}
+				if steps[j].StartedAt.Sub(b.Timestamp) <= resolveRoundingSlack {
+					best = j
+				}
+				break
 			}
 		}
-		// A boundary during the previous match's window is another direct
-		// worker fork inside the same reported step — composite actions
-		// run one fork per `run:` block — so it maps to the same index
-		// (and the push then merges its events into that step). This also
-		// absorbs transient runtime forks (empirically real — see
-		// steps.Options.OrdinalBase) into whatever step was running,
-		// rather than letting them shift the mapping. Bounded by prev's
-		// completion (+ rounding slack) when known: a fork in the gap
-		// AFTER prev ended belongs to no step and stays unresolved, its
-		// events rendered as a bare "#N" group.
+		// 3. Just past prev's recorded end (or prev's end unknown):
+		//    end-side rounding of the same step. Farther than slack is a
+		//    fork in the inter-step gap that belongs to no step; it stays
+		//    unresolved and renders as its bare "#N" group.
 		if best == -1 && prev >= 0 && !steps[prev].StartedAt.After(b.Timestamp) {
 			end := steps[prev].CompletedAt
 			if end.IsZero() || b.Timestamp.Sub(end) <= resolveRoundingSlack {
@@ -200,40 +217,67 @@ var dockerProcesses = map[string]bool{
 }
 
 // causalGroups builds the rendered "Events by Step" grouping from flat
-// events: resolved and unresolved step ordinals first (ascending, labeled
-// "#N — name" when the name resolved, "#N" otherwise), then the fixed-order
-// buckets. Collapsed (empty groups dropped) and re-deduplicated. Takes flat
-// events directly — the temporal correlation is legacy-only, never an
-// intermediate for this path.
+// events: resolved ordinals grouped by their STEP INDEX — a composite's
+// several ordinals form ONE group (labeled "#2,#3 - name"), so dedup runs
+// at the same scope as the push and the two report identical unique counts
+// — then unresolved ordinals as bare "#N" groups, all ordered by smallest
+// ordinal, then the fixed-order buckets. Collapsed (empty groups dropped)
+// and re-deduplicated. Takes flat events directly — the temporal
+// correlation is legacy-only, never an intermediate for this path.
 func causalGroups(regular []events.AuditEvent, steps []GitHubStep, ordinalSteps map[uint32]int) []StepEvents {
+	byStep := make(map[int][]events.AuditEvent)
+	stepOrds := make(map[int][]uint32)
 	byOrdinal := make(map[uint32][]events.AuditEvent)
-	var ordinals []uint32
 	byBucket := make(map[string][]events.AuditEvent)
 	for _, ev := range regular {
-		if a := assignCausal(ev, ordinalSteps); a.class == causalBucketed {
+		switch a := assignCausal(ev, ordinalSteps); a.class {
+		case causalStep:
+			byStep[a.step] = append(byStep[a.step], ev)
+			if !slices.Contains(stepOrds[a.step], ev.StepOrdinal) {
+				stepOrds[a.step] = append(stepOrds[a.step], ev.StepOrdinal)
+			}
+		case causalOrdinal:
+			byOrdinal[ev.StepOrdinal] = append(byOrdinal[ev.StepOrdinal], ev)
+		default: // causalBucketed
 			byBucket[a.bucket] = append(byBucket[a.bucket], ev)
-			continue
 		}
-		if _, seen := byOrdinal[ev.StepOrdinal]; !seen {
-			ordinals = append(ordinals, ev.StepOrdinal)
-		}
-		byOrdinal[ev.StepOrdinal] = append(byOrdinal[ev.StepOrdinal], ev)
 	}
-	sort.Slice(ordinals, func(i, j int) bool { return ordinals[i] < ordinals[j] })
 
-	var groups []StepEvents
-	for _, ord := range ordinals {
+	// Chronological order for step and bare-ordinal groups alike: ordinals
+	// are fork-ordered, so a group's smallest ordinal is its position.
+	type keyedGroup struct {
+		key uint32
+		se  StepEvents
+	}
+	var ordered []keyedGroup
+	for i, evs := range byStep {
+		ords := stepOrds[i]
+		slices.Sort(ords)
+		labels := make([]string, len(ords))
+		for k, o := range ords {
+			labels[k] = fmt.Sprintf("#%d", o)
+		}
+		name := strings.Join(labels, ",")
+		if steps[i].Name != "" {
+			name += " - " + steps[i].Name
+		}
 		// Carry the resolved step's timestamps so the heading renders its
 		// time range, exactly like the temporal grouping's headings.
-		step := GitHubStep{Name: fmt.Sprintf("#%d", ord)}
-		if i, ok := ordinalSteps[ord]; ok && i < len(steps) {
-			if steps[i].Name != "" {
-				step.Name = fmt.Sprintf("#%d - %s", ord, steps[i].Name)
-			}
-			step.StartedAt = steps[i].StartedAt
-			step.CompletedAt = steps[i].CompletedAt
-		}
-		groups = append(groups, StepEvents{Step: step, Events: byOrdinal[ord]})
+		ordered = append(ordered, keyedGroup{key: ords[0], se: StepEvents{
+			Step:   GitHubStep{Name: name, StartedAt: steps[i].StartedAt, CompletedAt: steps[i].CompletedAt},
+			Events: evs,
+		}})
+	}
+	for ord, evs := range byOrdinal {
+		ordered = append(ordered, keyedGroup{key: ord, se: StepEvents{
+			Step: GitHubStep{Name: fmt.Sprintf("#%d", ord)}, Events: evs,
+		}})
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].key < ordered[j].key })
+
+	var groups []StepEvents
+	for _, g := range ordered {
+		groups = append(groups, g.se)
 	}
 	for _, b := range bucketOrder {
 		if evs := byBucket[b]; len(evs) > 0 {

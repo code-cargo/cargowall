@@ -370,7 +370,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	if s.filterQueries && len(r.Question) > 0 {
 		// Lowercased for reporting consistency (#65): isQueryAllowed and
 		// MatchHostnameRule fold case internally, so this only affects the
-		// case shown in the block logs and the LogDNSBlocked audit record.
+		// case shown in the block logs and the dns_blocked audit record.
 		domain := strings.ToLower(strings.TrimSuffix(r.Question[0].Name, "."))
 		if !s.isQueryAllowed(domain, r.Question[0].Qtype) {
 			// Check the run's posture (single source of truth on the config

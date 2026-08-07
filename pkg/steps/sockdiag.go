@@ -152,13 +152,17 @@ func lookupSocketCookie(family, proto uint8, srcIP net.IP, srcPort uint16) (uint
 				return 0, false, nil
 			case unix.NLMSG_ERROR:
 				// nlmsgerr carries a negated errno in its first 4 bytes;
-				// EOPNOTSUPP here is the CONFIG_INET_DIAG-less kernel.
+				// EOPNOTSUPP here is the CONFIG_INET_DIAG-less kernel. A
+				// zero/positive code shouldn't occur on a dump — surface
+				// the raw value rather than a detail-free message.
 				if len(m.Data) >= 4 {
-					if errno := int32(binary.NativeEndian.Uint32(m.Data[0:4])); errno < 0 {
+					errno := int32(binary.NativeEndian.Uint32(m.Data[0:4]))
+					if errno < 0 {
 						return 0, false, fmt.Errorf("netlink error: %w", syscall.Errno(-errno))
 					}
+					return 0, false, fmt.Errorf("netlink error response (code %d)", errno)
 				}
-				return 0, false, fmt.Errorf("netlink error response")
+				return 0, false, fmt.Errorf("netlink error response (truncated)")
 			}
 			if len(m.Data) < sizeofInetDiagMsg {
 				continue
@@ -263,13 +267,19 @@ func (t *Tracker) StepForClient(addr net.Addr) uint32 {
 	cookie, found, err := lookupSocketCookie(family, proto, ip, uint16(port))
 	switch {
 	case err != nil:
-		// One warning for the run: a systemically broken lookup (e.g. a
-		// kernel without CONFIG_INET_DIAG) must be distinguishable in the
-		// logs from the routine no-match path.
-		t.diagWarnOnce.Do(func() {
+		// Warn once per DISTINCT failure, not once ever: a transient
+		// first error (one recv timeout) must not permanently mask a
+		// later systemic one (EOPNOTSUPP on a CONFIG_INET_DIAG-less
+		// kernel), while identical repeats stay suppressed.
+		msg := err.Error()
+		t.diagWarnMu.Lock()
+		changed := msg != t.diagLastWarn
+		t.diagLastWarn = msg
+		t.diagWarnMu.Unlock()
+		if changed {
 			t.logger.Warn("Step attribution: socket-cookie lookup failed; DNS events will be untagged",
 				"error", err)
-		})
+		}
 	case found:
 		if lerr := t.sockMap.Lookup(cookie, &ordinal); lerr != nil {
 			ordinal = 0
@@ -277,11 +287,15 @@ func (t *Tracker) StepForClient(addr net.Addr) uint32 {
 	}
 
 	// Cache negative results too — unattributable floods are the hot case.
+	// Expiry from a fresh clock, not the pre-dump `now`: the dump itself
+	// can take a large fraction of the TTL (500ms recv timeout per round
+	// trip), and stamping from before it would shorten — or entirely
+	// consume — the shed window exactly where dumps are slowest.
 	t.stepCacheMu.Lock()
 	if len(t.stepCache) >= stepCacheCap {
 		clear(t.stepCache)
 	}
-	t.stepCache[key] = stepCacheEntry{ordinal: ordinal, expires: now.Add(stepCacheTTL)}
+	t.stepCache[key] = stepCacheEntry{ordinal: ordinal, expires: time.Now().Add(stepCacheTTL)}
 	t.stepCacheMu.Unlock()
 	return ordinal
 }

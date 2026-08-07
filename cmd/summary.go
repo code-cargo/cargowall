@@ -114,6 +114,14 @@ func (c *SummaryCmd) Run() error {
 		}
 	}
 
+	// Every push path ships per-step timestamps, so the null-completed_at
+	// backfill must run before ANY of them — including the zero-network
+	// early return below, whose pushToApi(nil, steps) uses steps directly
+	// (GitHub always reports null for the step that is still running — the
+	// post step this command executes in; next-step-start inference needs
+	// no events).
+	backfillStepCompletion(steps, regularEvents)
+
 	// "No network events" check runs on the classified sets: with step
 	// attribution on, the audit log always contains step_boundary rows, so
 	// raw-log emptiness would never trigger and a zero-network job would
@@ -123,7 +131,7 @@ func (c *SummaryCmd) Run() error {
 		var workflowRunLink string
 		if c.ApiUrl != "" {
 			var err error
-			workflowRunLink, err = c.pushToApi(nil, steps)
+			workflowRunLink, err = c.pushToApi(nil, steps, nil)
 			if err != nil {
 				slog.Warn("Best-effort API push failed", "error", err)
 			}
@@ -155,12 +163,6 @@ func (c *SummaryCmd) Run() error {
 		auditMode = c.Mode == "audit"
 	}
 
-	// Both grouping paths ship per-step timestamps to the SaaS, so the
-	// null-completed_at backfill must run regardless of which path groups
-	// the events (GitHub always reports null for the step that is still
-	// running — the post step this command executes in).
-	backfillStepCompletion(steps, regularEvents)
-
 	// Assign events to steps. When step boundaries exist, group causally —
 	// each event under the step whose process created its socket — for both
 	// the render and the SaaS push, from the same flat event stream and the
@@ -182,7 +184,7 @@ func (c *SummaryCmd) Run() error {
 	var workflowRunLink string
 	if c.ApiUrl != "" {
 		var err error
-		workflowRunLink, err = c.pushToApi(pushGroups, steps)
+		workflowRunLink, err = c.pushToApi(pushGroups, steps, regularEvents)
 		if err != nil {
 			slog.Warn("Best-effort API push failed", "error", err)
 		}
@@ -449,7 +451,12 @@ func computeSummary(allEvents []events.AuditEvent, mode data.CargoWallMode) *car
 	}
 }
 
-func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (string, error) {
+// rawEvents is the PRE-dedup event stream; the job window is computed from
+// it because the grouped events have already been deduplicated (first
+// occurrence kept), so their max timestamp would end the window at the
+// first retry of the last destination rather than the job's real last
+// network activity. Nil falls back to the grouped events (legacy callers).
+func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep, rawEvents []events.AuditEvent) (string, error) {
 	if c.Token == "" {
 		return "", fmt.Errorf("no token provided, skipping API push")
 	}
@@ -561,10 +568,15 @@ func (c *SummaryCmd) pushToApi(stepEvents []StepEvents, steps []GitHubStep) (str
 	// last: causal grouping orders events by step (scaffold first, buckets
 	// appended), so positional endpoints could invert the window — e.g. one
 	// pre-daemon bucket event flattening after the last scaffold step would
-	// send started_at after completed_at.
-	if len(allEvents) > 0 {
-		first, last := allEvents[0].Timestamp, allEvents[0].Timestamp
-		for _, e := range allEvents[1:] {
+	// send started_at after completed_at. Over the raw stream when the
+	// caller provided it — see the rawEvents doc above.
+	window := rawEvents
+	if window == nil {
+		window = allEvents
+	}
+	if len(window) > 0 {
+		first, last := window[0].Timestamp, window[0].Timestamp
+		for _, e := range window[1:] {
 			if e.Timestamp.Before(first) {
 				first = e.Timestamp
 			}

@@ -253,6 +253,35 @@ jobs:
             EVENTS_VALID=false
           fi
 
+          # Step attribution runs against the real Runner.Worker on this job
+          # (the action passes --github-action, which implies it). The daemon
+          # deliberately degrades to a warning when attribution can't start,
+          # so these are the only assertions that catch a silent degrade on
+          # the environment that matters.
+          STEP_BOUNDARY_COUNT=$(jq -s '[.[] | select(.event_type == "step_boundary")] | length' "$AUDIT_LOG")
+          echo "step_boundary events: $STEP_BOUNDARY_COUNT"
+          if [ "$STEP_BOUNDARY_COUNT" -eq 0 ]; then
+            echo "❌ No step_boundary events found (step attribution silently degraded?)"
+            EVENTS_VALID=false
+          fi
+
+          # Every curl above ran in a post-attach `run:` step, so its
+          # connection events must carry a real (small) step ordinal — not 0
+          # (untagged) and not the runner/pre-daemon sentinels.
+          STEP_TAGGED_COUNT=$(jq -s '[.[] | select(.event_type | test("^connection_")) | select((.step_ordinal // 0) > 0 and (.step_ordinal // 0) < 4294900000)] | length' "$AUDIT_LOG")
+          echo "connection events with a real step_ordinal: $STEP_TAGGED_COUNT"
+          if [ "$STEP_TAGGED_COUNT" -eq 0 ]; then
+            echo "❌ No connection events carry a step ordinal"
+            EVENTS_VALID=false
+          fi
+
+          # Evidence dump: the raw attribution rows, so a passing run shows
+          # first-hand what was tagged (and a failing one shows what wasn't).
+          echo "--- step_boundary events ---"
+          jq -c 'select(.event_type == "step_boundary") | {step_ordinal, pid, process}' "$AUDIT_LOG"
+          echo "--- attributed connection events ---"
+          jq -c 'select(.event_type | test("^connection_")) | {step_ordinal: (.step_ordinal // 0), event_type, dst_hostname, dst_ip, dst_port, process}' "$AUDIT_LOG"
+
           if [ "$EVENTS_VALID" = true ]; then
             echo "✅ Audit log contains expected event types"
           else

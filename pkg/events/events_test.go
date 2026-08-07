@@ -455,8 +455,9 @@ func (m *mockFirewallUpdater) AddIP(ip net.IP, action config.Action, ports []con
 //
 // Caveat: binary.Write emits struct fields back-to-back with no implicit
 // alignment padding. That matches the in-memory layout only when the struct
-// has no implicit padding — currently guaranteed by the explicit Pad1/Pad2
-// fields sized to the next field's alignment. makeBpfEventCompileCheck below
+// has no implicit padding — currently guaranteed because every field is
+// naturally aligned (the trailing StepOrdinal fills what was once explicit
+// padding). makeBpfEventCompileCheck below
 // asserts this invariant so a future field addition that introduces implicit
 // padding fails loudly instead of silently producing the wrong bytes.
 func makeBpfEvent(event BpfBlockedEvent) []byte {

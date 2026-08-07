@@ -119,8 +119,14 @@ struct blocked_event {
     __u8 dst_ip6[16];
     __u64 timestamp;
     __u32 pid;         // process ID (looked up via /proc in userspace)
-    __u32 _pad2;       // align to 64 bytes to match Go struct layout
+    __u32 step_ordinal; // workflow step ordinal from map_sock_step (0 = untagged);
+                        // occupies the former pad word, keeping the 64-byte layout
 } __attribute__((packed));
+
+// BTF anchor: blocked_event is only ever a function-local cast, which clang
+// drops from BTF. The unused global keeps it visible so userspace tests can
+// verify the layout against the Go mirror (TestBlockedEventLayoutMatchesBTF).
+const struct blocked_event *btf_anchor_blocked_event __attribute__((unused));
 
 
 // Default action map (0 = deny, 1 = allow)
@@ -212,6 +218,70 @@ struct {
     __uint(max_entries, 4096);
 } map_midstream_seen_v6 SEC(".maps");
 
+// ---- Step attribution (per-workflow-step audit) ----
+//
+// Runner.Worker forks one direct child process per workflow step. The
+// step_fork tracepoint (stepbpf.c, loaded separately because it needs kernel
+// BTF) tags each such child with a monotonically increasing step ordinal;
+// every other fork inherits the forking thread's tag, so a step's entire
+// process subtree — including daemonized survivors — carries its ordinal.
+// The cgroup hooks below copy the tag onto each socket cookie at creation,
+// and TC embeds it in events. Attribution only: no verdict consults these
+// maps. Ordinals stay attached to userspace confidence/state via the
+// reconciler; the kernel only ever increments and copies.
+
+// Reserved ordinal values. Documentation of the map value space only — no
+// BPF program compares against them; they are written and interpreted by
+// userspace (pkg/steps seeds them, pkg/events mirrors them as StepOrdinal*),
+// and steps.Start bounds --step-ordinal-base away from them.
+#define STEP_ORD_RUNNER    0xFFFFFFFFu  // Runner.Worker itself (infra traffic)
+#define STEP_ORD_PREDAEMON 0xFFFFFFFEu  // worker children that predate cargowall
+
+struct step_state {
+    __u32 worker_tgid;   // Runner.Worker tgid (0 = not discovered)
+    __u32 enabled;       // 0 = feature off, all step hooks no-op
+    __u64 next_ordinal;  // next step ordinal, atomically incremented
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, struct step_state);
+    __uint(max_entries, 1);
+} map_step_state SEC(".maps");
+
+// tid → step ordinal. Keyed by thread id (not tgid) so lookups from any hook
+// use the calling thread directly; every task inherits its tag at fork and
+// drops it at exit, so per-tid entries stay bounded by live task count.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 32768);
+} map_task_step SEC(".maps");
+
+// socket cookie → step ordinal, written at socket creation/connect.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u64);
+    __type(value, __u32);
+    __uint(max_entries, 65536);
+} map_sock_step SEC(".maps");
+
+// Helper: copy the calling thread's step tag onto a socket cookie.
+// Shared by the connect/sendmsg hooks below (fallback for sockets created
+// before attach) and cg_sock_create in stepbpf.c (primary path).
+static __always_inline void step_tag_socket(__u64 cookie) {
+    __u32 sk = 0;
+    struct step_state *st = bpf_map_lookup_elem(&map_step_state, &sk);
+    if (!st || !st->enabled)
+        return;
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+    __u32 *ord = bpf_map_lookup_elem(&map_task_step, &tid);
+    if (ord)
+        bpf_map_update_elem(&map_sock_step, &cookie, ord, BPF_ANY);
+}
+
 
 // Helper: check audit mode and return appropriate action
 static __always_inline int check_audit_or_block(void) {
@@ -273,6 +343,8 @@ static __always_inline void submit_event_v4(struct __sk_buff *skb, __u32 src_ip,
         __u64 cookie = bpf_get_socket_cookie(skb);
         __u32 *pid = bpf_map_lookup_elem(&map_sock_pid, &cookie);
         evt->pid = pid ? *pid : 0;
+        __u32 *ord = bpf_map_lookup_elem(&map_sock_step, &cookie);
+        evt->step_ordinal = ord ? *ord : 0;
         bpf_ringbuf_submit(evt, 0);
     }
 }
@@ -309,6 +381,8 @@ static __always_inline void submit_event_v6(struct __sk_buff *skb, __u8 src_ip6[
         __u64 cookie = bpf_get_socket_cookie(skb);
         __u32 *pid = bpf_map_lookup_elem(&map_sock_pid, &cookie);
         evt->pid = pid ? *pid : 0;
+        __u32 *ord = bpf_map_lookup_elem(&map_sock_step, &cookie);
+        evt->step_ordinal = ord ? *ord : 0;
         bpf_ringbuf_submit(evt, 0);
     }
 }
@@ -689,6 +763,7 @@ int cg_connect4(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
+    step_tag_socket(cookie);
     return 1;
 }
 
@@ -697,6 +772,7 @@ int cg_connect6(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
+    step_tag_socket(cookie);
     return 1;
 }
 
@@ -707,6 +783,7 @@ int cg_sendmsg4(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
+    step_tag_socket(cookie);
     return 1;
 }
 
@@ -715,6 +792,7 @@ int cg_sendmsg6(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
+    step_tag_socket(cookie);
     return 1;
 }
 

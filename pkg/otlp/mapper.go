@@ -133,6 +133,18 @@ func logRecordFromEvent(ev events.AuditEvent) *logspb.LogRecord {
 	if ev.MidStream {
 		attrs = append(attrs, boolAttr("cargowall.mid_stream", true))
 	}
+	// Real step ordinals export as an int for per-step grouping; the two
+	// reserved sentinels export as a scope label instead of a meaningless
+	// 4294967294/4294967295 that dashboards would treat as a step id.
+	switch ev.StepOrdinal {
+	case events.StepOrdinalNone:
+	case events.StepOrdinalRunner:
+		attrs = append(attrs, stringAttr("cargowall.step_scope", "runner"))
+	case events.StepOrdinalPreDaemon:
+		attrs = append(attrs, stringAttr("cargowall.step_scope", "pre_daemon"))
+	default:
+		attrs = append(attrs, intAttr("cargowall.step_ordinal", int64(ev.StepOrdinal)))
+	}
 	attrs = append(
 		attrs,
 		boolAttr("cargowall.would_deny", ev.WouldDeny),

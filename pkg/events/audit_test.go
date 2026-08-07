@@ -48,7 +48,7 @@ func TestAuditLogger_EnforceMode(t *testing.T) {
 	require.NoError(t, err)
 	defer logger.Close()
 
-	err = logger.LogConnectionBlocked("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1234, "TCP", nil)
+	err = logger.LogConnectionBlocked("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1234, "TCP", nil, 7)
 	require.NoError(t, err)
 
 	events := readAuditEvents(t, path)
@@ -63,6 +63,7 @@ func TestAuditLogger_EnforceMode(t *testing.T) {
 	// The protocol must be threaded through verbatim — a regression to the
 	// old hardcoded "TCP/UDP" string mislabels CRL/OCSP entries in the UI.
 	assert.Equal(t, "TCP", events[0].Protocol)
+	assert.Equal(t, uint32(7), events[0].StepOrdinal)
 }
 
 func TestAuditLogger_AuditMode(t *testing.T) {
@@ -71,7 +72,7 @@ func TestAuditLogger_AuditMode(t *testing.T) {
 	require.NoError(t, err)
 	defer logger.Close()
 
-	err = logger.LogConnectionBlocked("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1234, "UDP", nil)
+	err = logger.LogConnectionBlocked("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1234, "UDP", nil, 0)
 	require.NoError(t, err)
 
 	events := readAuditEvents(t, path)
@@ -89,7 +90,7 @@ func TestAuditLogger_ConnectionLateAllowed(t *testing.T) {
 
 	// Pattern rule ("*.example.com") matched the resolved subdomain
 	// ("api.example.com") — MatchedRule must be the rule, not the hostname.
-	err = logger.LogConnectionLateAllowed("10.0.0.1", "93.184.216.34", "api.example.com", "*.example.com", 443, "curl", 1234, "TCP", nil)
+	err = logger.LogConnectionLateAllowed("10.0.0.1", "93.184.216.34", "api.example.com", "*.example.com", 443, "curl", 1234, "TCP", nil, 0)
 	require.NoError(t, err)
 
 	events := readAuditEvents(t, path)
@@ -110,7 +111,7 @@ func TestAuditLogger_AllowedEventDoesNotOverrideFlags(t *testing.T) {
 	require.NoError(t, err)
 	defer logger.Close()
 
-	err = logger.LogConnectionAllowed("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1, "", "TCP", nil)
+	err = logger.LogConnectionAllowed("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1, "", "TCP", nil, 0)
 	require.NoError(t, err)
 
 	events := readAuditEvents(t, path)
@@ -131,7 +132,7 @@ func TestAuditLogger_AllowedEventAutoAllowedType(t *testing.T) {
 
 	// DNS allow on :53 — the canonical UDP allow case. Was logged as "TCP"
 	// before the protocol parameter was threaded through.
-	err = logger.LogConnectionAllowed("10.0.0.1", "8.8.8.8", "", 53, "dns", 1, "dns", "UDP", nil)
+	err = logger.LogConnectionAllowed("10.0.0.1", "8.8.8.8", "", 53, "dns", 1, "dns", "UDP", nil, 0)
 	require.NoError(t, err)
 
 	events := readAuditEvents(t, path)
@@ -141,13 +142,34 @@ func TestAuditLogger_AllowedEventAutoAllowedType(t *testing.T) {
 	assert.Equal(t, "UDP", events[0].Protocol)
 }
 
+func TestAuditLogger_StepBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := NewAuditLogger(path, false) // enforce mode
+	require.NoError(t, err)
+	defer logger.Close()
+
+	err = logger.LogStepBoundary(4, 31337, "bash -e /home/runner/work/_temp/abc.sh")
+	require.NoError(t, err)
+
+	events := readAuditEvents(t, path)
+	require.Len(t, events, 1)
+	assert.Equal(t, EventStepBoundary, events[0].EventType)
+	assert.Equal(t, uint32(4), events[0].StepOrdinal)
+	assert.Equal(t, uint32(31337), events[0].PID)
+	assert.Equal(t, "bash -e /home/runner/work/_temp/abc.sh", events[0].Process)
+	// Step boundaries describe no connection: the enforce/audit flag
+	// normalization in LogEvent must skip them.
+	assert.False(t, events[0].Blocked)
+	assert.False(t, events[0].WouldDeny)
+}
+
 func TestAuditLogger_DNSBlocked(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 	logger, err := NewAuditLogger(path, false)
 	require.NoError(t, err)
 	defer logger.Close()
 
-	err = logger.LogDNSBlocked("evil.com")
+	err = logger.LogDNSBlocked("evil.com", 3)
 	require.NoError(t, err)
 
 	events := readAuditEvents(t, path)
@@ -155,6 +177,7 @@ func TestAuditLogger_DNSBlocked(t *testing.T) {
 	assert.Equal(t, EventDNSBlocked, events[0].EventType)
 	assert.Equal(t, "evil.com", events[0].DstHostname)
 	assert.True(t, events[0].Blocked)
+	assert.Equal(t, uint32(3), events[0].StepOrdinal, "DNS blocks carry the querying step's ordinal")
 }
 
 func TestAuditLogger_ExistingConnection(t *testing.T) {
@@ -191,7 +214,7 @@ func TestAuditLogger_ProtocolBlocked(t *testing.T) {
 	require.NoError(t, err)
 	defer logger.Close()
 
-	err = logger.LogProtocolBlocked("10.0.0.1", "10.0.0.2", "", "ICMP", "ping", 99, nil)
+	err = logger.LogProtocolBlocked("10.0.0.1", "10.0.0.2", "", "ICMP", "ping", 99, nil, 0)
 	require.NoError(t, err)
 
 	events := readAuditEvents(t, path)
@@ -248,8 +271,8 @@ func TestAuditLogger_SinkReceivesNormalizedEvents(t *testing.T) {
 	sink := &fakeSink{}
 	logger.AddSink(sink)
 
-	require.NoError(t, logger.LogConnectionBlocked("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1234, "TCP", nil))
-	require.NoError(t, logger.LogConnectionAllowed("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1234, "", "TCP", nil))
+	require.NoError(t, logger.LogConnectionBlocked("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1234, "TCP", nil, 0))
+	require.NoError(t, logger.LogConnectionAllowed("10.0.0.1", "93.184.216.34", "example.com", 443, "curl", 1234, "", "TCP", nil, 0))
 
 	require.Len(t, sink.events, 2)
 	// Sink must see the event after audit-mode normalization, matching the file.
@@ -276,7 +299,7 @@ func TestAuditLogger_FileLess(t *testing.T) {
 	sink := &fakeSink{}
 	logger.AddSink(sink)
 
-	require.NoError(t, logger.LogDNSBlocked("blocked.example.com"))
+	require.NoError(t, logger.LogDNSBlocked("blocked.example.com", 0))
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, EventDNSBlocked, sink.events[0].EventType)
 	assert.True(t, sink.events[0].Blocked)

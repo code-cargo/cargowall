@@ -202,13 +202,14 @@ func TestRecentBlocks_AsAuditSink(t *testing.T) {
 	defer al.Close()
 	al.AddSink(rb)
 
-	require.NoError(t, al.LogConnectionBlocked("10.0.0.1", "20.209.112.225", "", 443, "MainThread", 2411, "TCP", nil))
+	require.NoError(t, al.LogConnectionBlocked("10.0.0.1", "20.209.112.225", "", 443, "MainThread", 2411, "TCP", nil, 3))
 
 	taken := rb.TakeMatching("20.209.112.225", nil, nil, false)
 	require.Len(t, taken, 1)
 	assert.Equal(t, "10.0.0.1", taken[0].SrcIP)
 	assert.Equal(t, "MainThread", taken[0].Process)
 	assert.Equal(t, uint32(2411), taken[0].PID)
+	assert.Equal(t, uint32(3), taken[0].StepOrdinal, "step attribution must survive the reconcile round-trip")
 	assert.False(t, taken[0].At.IsZero())
 }
 
@@ -222,7 +223,7 @@ func TestRecentBlocks_MidStreamBlockIsReconcilable(t *testing.T) {
 	defer al.Close()
 	al.AddSink(rb)
 
-	require.NoError(t, al.LogConnectionBlockedMidStream("10.0.0.1", "20.209.112.225", "", 443, "curl", 42, "TCP", nil))
+	require.NoError(t, al.LogConnectionBlockedMidStream("10.0.0.1", "20.209.112.225", "", 443, "curl", 42, "TCP", nil, 0))
 
 	taken := rb.TakeMatching("20.209.112.225", nil, nil, false)
 	require.Len(t, taken, 1)

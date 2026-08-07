@@ -51,6 +51,7 @@ type Server struct {
 
 	// DNS query filtering (blocks DNS tunneling)
 	filterQueries bool // When true, only forward queries for allowed domains
+	stepLookup    func(net.Addr) uint32
 
 	// Track hostname to IP mappings for updates (no automatic removal)
 	hostnameIPs      map[string]map[string]bool // hostname -> set of IPs
@@ -134,6 +135,14 @@ func (s *Server) SetAuditLogger(auditLogger *events.AuditLogger) {
 // the enforcement path reconciles as late-allowed when it opens the firewall
 // for their destination IP (#83). Requires an audit logger to emit the
 // reconciliation events.
+// SetStepLookup installs a resolver from a DNS client address to the step
+// ordinal of the process that owns the client socket (steps.Tracker's
+// sock_diag path). Used to attribute dns_blocked events causally; nil or a
+// failed lookup leaves the event untagged.
+func (s *Server) SetStepLookup(lookup func(net.Addr) uint32) {
+	s.stepLookup = lookup
+}
+
 func (s *Server) SetRecentBlocks(rb *events.RecentBlocks) {
 	s.recentBlocks = rb
 }
@@ -369,9 +378,15 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 					"from", w.RemoteAddr().String())
 			}
 
-			// Log to audit file if configured
+			// Log to audit file if configured. The querying step is resolved
+			// from the client socket while the client is still blocked in its
+			// recv, so the sock_diag lookup sees a live socket.
 			if s.auditLogger != nil {
-				if err := s.auditLogger.LogDNSBlocked(domain); err != nil {
+				var stepOrdinal uint32
+				if s.stepLookup != nil {
+					stepOrdinal = s.stepLookup(w.RemoteAddr())
+				}
+				if err := s.auditLogger.LogDNSBlocked(domain, stepOrdinal); err != nil {
 					s.logger.Error("Failed to write DNS audit log", "error", err)
 				}
 			}
@@ -970,7 +985,7 @@ func (s *Server) reconcileRecentBlocks(ip net.IP, hostname, matchedRule string, 
 			"pid", b.PID,
 			"matched_rule", matchedRule)
 		if err := s.auditLogger.LogConnectionLateAllowedAt(b.At, b.SrcIP, b.DstIP, hostname,
-			matchedRule, b.DstPort, b.Process, b.PID, b.Protocol, cnameChain); err != nil {
+			matchedRule, b.DstPort, b.Process, b.PID, b.Protocol, cnameChain, b.StepOrdinal); err != nil {
 			s.logger.Error("Failed to write audit log", "error", err)
 		}
 	}

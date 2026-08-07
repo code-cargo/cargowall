@@ -32,6 +32,17 @@ const (
 	EventProtocolBlocked       AuditEventType = "protocol_blocked"
 	EventDNSBlocked            AuditEventType = "dns_blocked"
 	EventExistingConnection    AuditEventType = "existing_connection"
+	EventStepBoundary          AuditEventType = "step_boundary"
+)
+
+// Step-ordinal sentinels, mirroring STEP_ORD_* in tcbpf.c. Real workflow
+// steps get small ordinals starting at the daemon's --step-ordinal-base
+// (opaque causal group IDs — correlate to plan steps via step_boundary
+// events, not by position); 0 means the traffic's socket was never tagged.
+const (
+	StepOrdinalNone      uint32 = 0
+	StepOrdinalPreDaemon uint32 = 0xFFFFFFFE // worker children that predate cargowall
+	StepOrdinalRunner    uint32 = 0xFFFFFFFF // Runner.Worker itself / cargowall infra
 )
 
 // IsConnectionAllowed reports whether the event type represents an allow
@@ -54,10 +65,11 @@ type AuditEvent struct {
 	PID             uint32         `json:"pid,omitempty"`
 	MatchedRule     string         `json:"matched_rule,omitempty"`
 	AutoAllowedType string         `json:"auto_allowed_type,omitempty"`
-	CNAMEChain      []string       `json:"cname_chain,omitempty"` // CNAME chain origin..target when DstHostname was reached via a CNAME of an allowed host
-	MidStream       bool           `json:"mid_stream,omitempty"`  // set on connection_blocked when the drop was a non-SYN TCP segment (established connection killed mid-stream, e.g. a pre-existing socket whose dst was never seeded)
-	WouldDeny       bool           `json:"would_deny"`            // true in audit mode (would have been denied)
-	Blocked         bool           `json:"blocked"`               // true in enforce mode (actually blocked)
+	CNAMEChain      []string       `json:"cname_chain,omitempty"`  // CNAME chain origin..target when DstHostname was reached via a CNAME of an allowed host
+	MidStream       bool           `json:"mid_stream,omitempty"`   // set on connection_blocked when the drop was a non-SYN TCP segment (established connection killed mid-stream, e.g. a pre-existing socket whose dst was never seeded)
+	WouldDeny       bool           `json:"would_deny"`             // true in audit mode (would have been denied)
+	Blocked         bool           `json:"blocked"`                // true in enforce mode (actually blocked)
+	StepOrdinal     uint32         `json:"step_ordinal,omitempty"` // workflow step that (transitively) created the socket — causal, not temporal; see StepOrdinal* sentinels
 }
 
 // EventSink receives every audit event after the audit/enforce mode flags
@@ -110,10 +122,12 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 	// Set the block status based on audit mode.
 	// Skip for events that set their own flags (allowed, existing connection,
 	// late-allowed — where the connection was initially dropped by BPF but a
-	// subsequent rule match opened the firewall, so the policy outcome is allow).
+	// subsequent rule match opened the firewall, so the policy outcome is allow)
+	// and for step boundaries, which describe no connection at all.
 	if event.EventType != EventConnectionAllowed &&
 		event.EventType != EventConnectionLateAllowed &&
-		event.EventType != EventExistingConnection {
+		event.EventType != EventExistingConnection &&
+		event.EventType != EventStepBoundary {
 		if a.auditMode {
 			event.WouldDeny = true
 			event.Blocked = false
@@ -148,7 +162,7 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 // protocol of the dropped packet (typically "TCP" or "UDP" — see
 // getProtocolName); the field is shipped to the summary backend and rendered
 // in the UI's Baseline Entries table, so a real value beats a generic literal.
-func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
+func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string, stepOrdinal uint32) error {
 	return a.LogEvent(AuditEvent{
 		Timestamp:   time.Now(),
 		EventType:   EventConnectionBlocked,
@@ -160,6 +174,7 @@ func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPor
 		Process:     process,
 		PID:         pid,
 		CNAMEChain:  cnameChain,
+		StepOrdinal: stepOrdinal,
 	})
 }
 
@@ -167,7 +182,7 @@ func (a *AuditLogger) LogConnectionBlocked(srcIP, dstIP, hostname string, dstPor
 // established connection killed mid-stream. Kept as EventConnectionBlocked
 // (with MidStream set) so the RecentBlocks reconciler, summary pipeline, and
 // OTLP mapping treat it like any other block.
-func (a *AuditLogger) LogConnectionBlockedMidStream(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
+func (a *AuditLogger) LogConnectionBlockedMidStream(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string, stepOrdinal uint32) error {
 	return a.LogEvent(AuditEvent{
 		Timestamp:   time.Now(),
 		EventType:   EventConnectionBlocked,
@@ -180,6 +195,7 @@ func (a *AuditLogger) LogConnectionBlockedMidStream(srcIP, dstIP, hostname strin
 		PID:         pid,
 		CNAMEChain:  cnameChain,
 		MidStream:   true,
+		StepOrdinal: stepOrdinal,
 	})
 }
 
@@ -190,8 +206,8 @@ func (a *AuditLogger) LogConnectionBlockedMidStream(srcIP, dstIP, hostname strin
 // `matchedRule` is the rule's Value (pattern string for glob rules, configured
 // hostname for plain rules), which can differ from the resolved DstHostname
 // (e.g. rule `*.compute-1.amazonaws.com` matching `ec2-1-2-3-4.compute-1...`).
-func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
-	return a.LogConnectionLateAllowedAt(time.Now(), srcIP, dstIP, hostname, matchedRule, dstPort, process, pid, protocol, cnameChain)
+func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string, stepOrdinal uint32) error {
+	return a.LogConnectionLateAllowedAt(time.Now(), srcIP, dstIP, hostname, matchedRule, dstPort, process, pid, protocol, cnameChain, stepOrdinal)
 }
 
 // LogConnectionLateAllowedAt is LogConnectionLateAllowed with an explicit
@@ -199,7 +215,7 @@ func (a *AuditLogger) LogConnectionLateAllowed(srcIP, dstIP, hostname, matchedRu
 // original blocked attempt rather than the reconcile time, so step
 // correlation in the summary reflects when the connection actually happened
 // and so the event supersedes every blocked record at or before it.
-func (a *AuditLogger) LogConnectionLateAllowedAt(ts time.Time, srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string) error {
+func (a *AuditLogger) LogConnectionLateAllowedAt(ts time.Time, srcIP, dstIP, hostname, matchedRule string, dstPort uint16, process string, pid uint32, protocol string, cnameChain []string, stepOrdinal uint32) error {
 	return a.LogEvent(AuditEvent{
 		Timestamp:   ts,
 		EventType:   EventConnectionLateAllowed,
@@ -212,6 +228,7 @@ func (a *AuditLogger) LogConnectionLateAllowedAt(ts time.Time, srcIP, dstIP, hos
 		PID:         pid,
 		MatchedRule: matchedRule,
 		CNAMEChain:  cnameChain,
+		StepOrdinal: stepOrdinal,
 	})
 }
 
@@ -220,7 +237,7 @@ func (a *AuditLogger) LogConnectionLateAllowedAt(ts time.Time, srcIP, dstIP, hos
 // getProtocolName); the field is shipped to the summary backend and feeds
 // the dedup key, so a real value beats a hardcoded literal (auto-allowed DNS
 // on :53 is the canonical UDP example).
-func (a *AuditLogger) LogConnectionAllowed(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, autoAllowedType, protocol string, cnameChain []string) error {
+func (a *AuditLogger) LogConnectionAllowed(srcIP, dstIP, hostname string, dstPort uint16, process string, pid uint32, autoAllowedType, protocol string, cnameChain []string, stepOrdinal uint32) error {
 	return a.LogEvent(AuditEvent{
 		Timestamp:       time.Now(),
 		EventType:       EventConnectionAllowed,
@@ -233,11 +250,12 @@ func (a *AuditLogger) LogConnectionAllowed(srcIP, dstIP, hostname string, dstPor
 		PID:             pid,
 		AutoAllowedType: autoAllowedType,
 		CNAMEChain:      cnameChain,
+		StepOrdinal:     stepOrdinal,
 	})
 }
 
 // LogProtocolBlocked logs a blocked protocol event
-func (a *AuditLogger) LogProtocolBlocked(srcIP, dstIP, hostname, protocol, process string, pid uint32, cnameChain []string) error {
+func (a *AuditLogger) LogProtocolBlocked(srcIP, dstIP, hostname, protocol, process string, pid uint32, cnameChain []string, stepOrdinal uint32) error {
 	return a.LogEvent(AuditEvent{
 		Timestamp:   time.Now(),
 		EventType:   EventProtocolBlocked,
@@ -248,15 +266,32 @@ func (a *AuditLogger) LogProtocolBlocked(srcIP, dstIP, hostname, protocol, proce
 		Process:     process,
 		PID:         pid,
 		CNAMEChain:  cnameChain,
+		StepOrdinal: stepOrdinal,
 	})
 }
 
-// LogDNSBlocked logs a blocked DNS query
-func (a *AuditLogger) LogDNSBlocked(domain string) error {
+// LogStepBoundary records the start of a new workflow step: the step_fork
+// tracepoint saw Runner.Worker fork a new direct child and the reconciler
+// resolved its command line. Attribution metadata only — never a verdict.
+func (a *AuditLogger) LogStepBoundary(stepOrdinal, pid uint32, process string) error {
+	return a.LogEvent(AuditEvent{
+		Timestamp:   time.Now(),
+		EventType:   EventStepBoundary,
+		Process:     process,
+		PID:         pid,
+		StepOrdinal: stepOrdinal,
+	})
+}
+
+// LogDNSBlocked logs a blocked DNS query. stepOrdinal attributes the query
+// to the step whose process sent it (0 = unresolved), via the DNS proxy's
+// client-socket lookup — DNS events have no TC packet to carry a tag.
+func (a *AuditLogger) LogDNSBlocked(domain string, stepOrdinal uint32) error {
 	return a.LogEvent(AuditEvent{
 		Timestamp:   time.Now(),
 		EventType:   EventDNSBlocked,
 		DstHostname: domain,
+		StepOrdinal: stepOrdinal,
 	})
 }
 

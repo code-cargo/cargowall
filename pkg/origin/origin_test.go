@@ -18,20 +18,34 @@ package origin
 
 import (
 	"fmt"
+	"log/slog"
+	"os"
+	"regexp"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/code-cargo/cargowall/bpf"
 )
 
-// newTestObserver builds an Observer with only the join store live — nil
-// pid/step maps exercise the guard insert uses when resolution is
-// unavailable (records stay usable, identities zero).
+// newTestObserver builds an Observer with the join store and the verdict
+// queue live — nil pid/step maps exercise the guard insert uses when
+// resolution is unavailable (records stay usable, identities zero). The
+// reporting worker is NOT started; tests that need it run reportLoop
+// themselves.
 func newTestObserver() *Observer {
-	return &Observer{flows: make(map[flowKey][]Record)}
+	return &Observer{
+		flows:      make(map[flowKey][]Record),
+		hot:        make(map[flowKey]struct{}),
+		verdictCh:  make(chan Record, verdictQueueDepth),
+		reportDone: make(chan struct{}),
+		logger:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
 }
 
-func v4Event(cookie uint64, srcIP, dstIP uint32, srcPort, dstPort uint16) *originEvent {
-	return &originEvent{
+func v4Event(cookie uint64, srcIP, dstIP uint32, srcPort, dstPort uint16) *bpf.OriginEvent {
+	return &bpf.OriginEvent{
 		Cookie:    cookie,
 		CgroupID:  100 + cookie,
 		Timestamp: cookie, // monotonic enough for ordering assertions
@@ -41,7 +55,7 @@ func v4Event(cookie uint64, srcIP, dstIP uint32, srcPort, dstPort uint16) *origi
 		DstPort:   dstPort,
 		IpVersion: 4,
 		IpProto:   6,
-		Flags:     flagTCPSyn,
+		Flags:     bpf.OriginFlagTCPSyn,
 	}
 }
 
@@ -128,7 +142,7 @@ func TestStoreKeyCapEvictsOldestKey(t *testing.T) {
 
 func TestInsertResolvesV6Source(t *testing.T) {
 	o := newTestObserver()
-	ev := &originEvent{
+	ev := &bpf.OriginEvent{
 		Cookie:    7,
 		IpVersion: 6,
 		IpProto:   6,
@@ -151,11 +165,11 @@ func TestInsertResolvesV6Source(t *testing.T) {
 func TestKeyIncludesEveryDiscriminator(t *testing.T) {
 	fields := []struct {
 		name string
-		ev   *originEvent
+		ev   *bpf.OriginEvent
 	}{
 		{"base", v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)},
 		{"port", v4Event(2, 0xAC110002, 0x8C527203, 40001, 8443)},
-		{"proto", func() *originEvent { e := v4Event(3, 0xAC110002, 0x8C527203, 40001, 443); e.IpProto = 17; return e }()},
+		{"proto", func() *bpf.OriginEvent { e := v4Event(3, 0xAC110002, 0x8C527203, 40001, 443); e.IpProto = 17; return e }()},
 		{"dst", v4Event(4, 0xAC110002, 0x8C527204, 40001, 443)},
 	}
 	o := newTestObserver()
@@ -163,4 +177,97 @@ func TestKeyIncludesEveryDiscriminator(t *testing.T) {
 		o.insert(f.ev)
 	}
 	require.Len(t, o.flows, len(fields), fmt.Sprintf("each variant must occupy its own key: %v", o.flows))
+}
+
+// The join store must be populated BEFORE the verdict sink can observe the
+// record. In shadow mode (the default under --container-attribution) a
+// would-block packet is passed and TC adjudicates it concurrently; if the
+// sink ran first — it may spend 500ms in a PTR lookup — the TC event's
+// Enrich would find no join candidate and file the flow as unattributed.
+// The sink here performs the same lookup a TC event would.
+func TestInsertStoresBeforeReporting(t *testing.T) {
+	o := newTestObserver()
+	go o.reportLoop()
+	defer func() {
+		close(o.verdictCh)
+		<-o.reportDone
+	}()
+
+	seen := make(chan []Record, 1)
+	o.SetVerdictSink(func(rec Record) {
+		seen <- o.LookupV4(0x8C527203, rec.DstPort, rec.Proto, rec.SrcPort)
+	})
+
+	ev := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	ev.Verdict = uint8(VerdictWouldBlock)
+	o.insert(ev)
+
+	got := <-seen
+	require.Len(t, got, 1, "the sink must observe the record already in the join store")
+	require.Equal(t, uint64(1), got[0].Cookie)
+	require.Equal(t, VerdictWouldBlock, got[0].Verdict)
+	require.Equal(t, uint64(1), o.blocked.Load())
+}
+
+// A slow (or absent) reporting worker must never block insert: the send is
+// non-blocking and overflow costs only the report.
+func TestInsertNeverBlocksOnFullVerdictQueue(t *testing.T) {
+	o := newTestObserver() // reportLoop deliberately not started
+	for i := range verdictQueueDepth + 5 {
+		ev := v4Event(uint64(i+1), 0xAC110002, 0x8C527203, uint16(40000+i), 443)
+		ev.Verdict = uint8(VerdictBlock)
+		o.insert(ev) // would deadlock here without the non-blocking send
+	}
+	require.Equal(t, uint64(5), o.verdictsDropped.Load())
+	require.Equal(t, uint64(verdictQueueDepth+5), o.blocked.Load())
+}
+
+// Eviction is second-chance, not pure FIFO: a key re-emitted since eviction
+// last considered it survives one rotation, so the hot destinations a build
+// hammers are not the first casualties of a wide fan-out of one-shot keys.
+func TestStoreEvictionGivesRefreshedKeysASecondChance(t *testing.T) {
+	o := newTestObserver()
+	for i := range storeMaxKeys {
+		o.insert(v4Event(uint64(i+1), 0xAC110002, uint32(0x0A000000+i), 40001, 443))
+	}
+	// Refresh the OLDEST key (the 10s re-emit for a long-lived hot flow).
+	o.insert(v4Event(1, 0xAC110002, 0x0A000000, 40001, 443))
+
+	// The next new key must evict the idle second key, not the hot first.
+	o.insert(v4Event(9999, 0xAC110002, 0x0B000000, 40001, 443))
+	require.NotNil(t, o.LookupV4(0x0A000000, 443, 6, 0), "refreshed key must survive eviction")
+	require.Nil(t, o.LookupV4(0x0A000001, 443, 6, 0), "idle key is the victim")
+	require.LessOrEqual(t, len(o.flows), storeMaxKeys)
+}
+
+// TestOriginConstantsMatchBpfSource pins the Go constants to the C source
+// the way TestDNSProxyFWMarkMatchesGoConstant pins the firewall mark: the
+// ORIGIN_MODE_*, ORIGIN_VERDICT_* and ORIGIN_FLAG_* values are mirrored in
+// three places (originbpf.c, this package, bpf/origin_event.go), and a
+// drift would mislabel every verdict userspace reports.
+func TestOriginConstantsMatchBpfSource(t *testing.T) {
+	src, err := os.ReadFile("../../bpf/originbpf.c")
+	require.NoError(t, err)
+
+	defines := map[string]uint64{
+		"ORIGIN_MODE_OBSERVE":        uint64(ModeObserve),
+		"ORIGIN_MODE_SHADOW":         uint64(ModeShadow),
+		"ORIGIN_MODE_ENFORCE":        uint64(ModeEnforce),
+		"ORIGIN_VERDICT_NONE":        uint64(VerdictNone),
+		"ORIGIN_VERDICT_ALLOW":       uint64(VerdictAllow),
+		"ORIGIN_VERDICT_WOULD_BLOCK": uint64(VerdictWouldBlock),
+		"ORIGIN_VERDICT_BLOCK":       uint64(VerdictBlock),
+		"ORIGIN_FLAG_TCP_SYN":        uint64(bpf.OriginFlagTCPSyn),
+		"ORIGIN_FLAG_TCP_MIDSTREAM":  uint64(bpf.OriginFlagTCPMidstream),
+		"ORIGIN_CFG_KEY_MODE":        uint64(cfgKeyMode),
+		"ORIGIN_CFG_KEY_LO_CARVEOUT": uint64(cfgKeyLoCarveout),
+	}
+	for name, want := range defines {
+		re := regexp.MustCompile(`(?m)^#define ` + name + `\s+(0x[0-9A-Fa-f]+|\d+)\b`)
+		m := re.FindStringSubmatch(string(src))
+		require.NotNil(t, m, "originbpf.c must #define %s", name)
+		got, err := strconv.ParseUint(m[1], 0, 64)
+		require.NoError(t, err)
+		require.Equal(t, want, got, "%s drifted between originbpf.c and the Go mirror", name)
+	}
 }

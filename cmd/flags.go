@@ -124,9 +124,17 @@ type StartCmd struct {
 	StepOrdinalBase uint32 `help:"Base for step ordinal numbering; ordinals are opaque per-step-subtree IDs correlated to plan steps via step_boundary cmdlines, not by position" default:"1" env:"CARGOWALL_STEP_ORDINAL_BASE"`
 	RunnerWorkerPID int    `help:"PID of the Runner.Worker process (0 = auto-discover by process name)" default:"0" env:"CARGOWALL_RUNNER_WORKER_PID"`
 
-	// Container attribution (issue #106, phase 3a — audit-only)
-	ContainerAttribution bool `help:"Correlate Docker containers and execs to workflow steps for audit attribution via a root-cgroup egress observer (requires --step-attribution; implied by --github-action)" default:"false" env:"CARGOWALL_CONTAINER_ATTRIBUTION"`
+	// Container attribution (issue #106). On its own this is audit-only:
+	// the root-cgroup hook reports what it would block (shadow mode) and
+	// blocks nothing. --cgroup-enforce below is what makes it authoritative.
+	ContainerAttribution bool `help:"Correlate Docker containers and execs to workflow steps via a root-cgroup egress hook, and report what that hook would block (does not block anything by itself — see --cgroup-enforce; requires --step-attribution; implied by --github-action)" default:"false" env:"CARGOWALL_CONTAINER_ATTRIBUTION"`
 	BPFStats             bool `help:"Collect kernel BPF runtime statistics and log per-program overhead at shutdown (small global cost while enabled)" name:"bpf-stats" default:"false" env:"CARGOWALL_BPF_STATS"`
+	// Container enforcement (issue #106, phase 3b). Off by default: with
+	// container attribution on, the cgroup hook runs in SHADOW mode, which
+	// reports what it would block without blocking anything. Turning this on
+	// makes that hook authoritative for traffic with a local socket, with TC
+	// egress remaining attached as the fail-closed backstop.
+	CgroupEnforce bool `help:"Enforce egress policy at the root-cgroup hook (pre-NAT, socket context) instead of only reporting what it would block; TC egress remains a backstop (requires --container-attribution)" default:"false" env:"CARGOWALL_CGROUP_ENFORCE"`
 
 	// Sudo lockdown (CI security hardening)
 	SudoLockdown      bool   `help:"Enable sudo lockdown to prevent firewall bypass" default:"false" env:"CARGOWALL_SUDO_LOCKDOWN"`
@@ -208,6 +216,14 @@ func (c *StartCmd) AfterApply() error {
 	default:
 		return fmt.Errorf("--api-failure-mode must be one of %q, %q, %q (got %q)",
 			ApiFailureModeAudit, ApiFailureModeLocal, ApiFailureModeFail, c.ApiFailureMode)
+	}
+	// Refuse rather than silently downgrade: an operator who asked for
+	// enforcement believes pre-NAT/loopback/bridge egress is policed, and a
+	// run that quietly dropped that request is indistinguishable from one
+	// that honored it. (Runs after preset expansion, so --github-action —
+	// which implies --container-attribution — satisfies the requirement.)
+	if c.CgroupEnforce && !c.ContainerAttribution {
+		return fmt.Errorf("--cgroup-enforce requires --container-attribution")
 	}
 	return nil
 }

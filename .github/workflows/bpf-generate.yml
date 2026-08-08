@@ -6,6 +6,7 @@ on:
       - "bpf/tcbpf.c"
       - "bpf/stepbpf.c"
       - "bpf/originbpf.c"
+      - "bpf/verdict.h"
       - "bpf/vmlinux.h"
       - ".github/workflows/bpf-generate.yml"
 

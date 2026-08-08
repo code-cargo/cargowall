@@ -15,7 +15,11 @@
 //go:build linux
 
 // Package containers correlates Docker containers and execs to workflow
-// steps (issue #106, phase 3a — audit-only). Container process ancestry runs
+// steps (issue #106). It is an ATTRIBUTION package: it supplies container
+// identity, and never decides policy. Enforcement lives at the hooks
+// (bpf/tcbpf.c, bpf/originbpf.c) and connection outcomes are reported by
+// pkg/events; this package only decorates them with the container a flow
+// came from. Container process ancestry runs
 // through containerd-shim, never Runner.Worker, so the kernel-side fork
 // inheritance that powers step attribution cannot reach them; this package
 // closes the gap from userspace: it subscribes to Docker events, resolves
@@ -29,12 +33,12 @@
 // Every path here is best-effort: a failure means untagged traffic, which
 // classifies to the container-unattributed tier — stricter, never looser.
 //
-// Scope boundaries (by design, phase 3a): docker-in-docker attribution stops
-// at the outer container (inner workloads inherit the outer tag through
-// fork); --privileged containers are host-root equivalent and are flagged in
-// the audit stream rather than constrained; the window between container/
-// exec start and tagging leaves early sockets untagged — the unattributed
-// tier, never a step.
+// Scope boundaries (by design): docker-in-docker attribution stops at the
+// outer container (inner workloads inherit the outer tag through fork);
+// --privileged containers are host-root equivalent and are flagged in the
+// audit stream rather than constrained; the window between container/exec
+// start and tagging leaves early sockets untagged — the unattributed tier,
+// never a step.
 package containers
 
 import (
@@ -44,12 +48,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -85,6 +85,16 @@ func (e *Enricher) Bind(t *Tracker) { e.tracker.Store(t) }
 func (e *Enricher) Enrich(audit *events.AuditEvent, ev *events.BpfBlockedEvent) {
 	if t := e.tracker.Load(); t != nil {
 		t.Enrich(audit, ev)
+	}
+}
+
+// DecorateVerdict adds container identity to a cgroup-hook outcome when the
+// tracker is live. A verdict that beats docker tracking startup simply goes
+// undecorated — it is still reported in full by pkg/events, just without a
+// container id.
+func (e *Enricher) DecorateVerdict(audit *events.AuditEvent, rec origin.Record) {
+	if t := e.tracker.Load(); t != nil {
+		t.DecorateVerdict(audit, rec)
 	}
 }
 
@@ -134,13 +144,21 @@ type Tracker struct {
 
 	cancel context.CancelFunc
 	done   chan struct{}
+	wg     sync.WaitGroup // in-flight exec handlers; Close waits so none outlives the audit logger
+	// Bounds concurrent exec handling: exec-pid resolution can wait out
+	// dockerd's publish race (~up to 1s), and that wait must never park
+	// the shared event stream (see streamOnce).
+	execSem chan struct{}
 
 	mu         sync.Mutex
 	containers map[string]*containerInfo
 	byIP       map[netip.Addr]*containerInfo
 	byCgroup   map[uint64]*containerInfo
-	seenExecs  map[string]bool
-	latencies  []float64 // tag latencies (ms), bounded
+	// seenExecs is keyed by container so remove() drops each container's
+	// whole set — a long job with many docker execs must not accumulate an
+	// unbounded map of 64-char ids.
+	seenExecs map[string]map[string]bool
+	latencies []float64 // tag latencies (ms), bounded
 
 	lastEventNano atomic.Int64
 
@@ -192,10 +210,11 @@ func Start(ctx context.Context, opts Options, tagger StepTagger, observer *origi
 		logger:      logger,
 		opts:        opts,
 		done:        make(chan struct{}),
+		execSem:     make(chan struct{}, 4),
 		containers:  make(map[string]*containerInfo),
 		byIP:        make(map[netip.Addr]*containerInfo),
 		byCgroup:    make(map[uint64]*containerInfo),
-		seenExecs:   make(map[string]bool),
+		seenExecs:   make(map[string]map[string]bool),
 	}
 	// Typed-nil guard: a nil *origin.Observer must stay a nil interface, or
 	// Enrich's nil check would pass and call into a nil receiver.
@@ -216,10 +235,13 @@ func Start(ctx context.Context, opts Options, tagger StepTagger, observer *origi
 	return t, nil
 }
 
-// Close stops the tracker and logs the telemetry summary.
+// Close stops the tracker, waits for in-flight exec handlers (they write
+// audit events, and the audit logger's deferred Close runs after ours),
+// and logs the telemetry summary.
 func (t *Tracker) Close() {
 	t.cancel()
 	<-t.done
+	t.wg.Wait()
 	t.logSummary()
 }
 
@@ -276,8 +298,24 @@ func (t *Tracker) streamOnce(ctx context.Context) error {
 		case strings.HasPrefix(ev.Action, "exec_start"):
 			// Action is "exec_start: <cmd>"; the exec id rides in the actor
 			// attributes (with an inspect-based fallback for daemons that
-			// omit it).
-			t.handleExecStart(ctx, ev.Actor.ID, ev.Actor.Attributes["execID"], ev.TimeNano)
+			// omit it). Handled concurrently: exec-pid resolution can wait
+			// out dockerd's publish race (~1s), and parking the shared
+			// stream on that would delay start tagging for unrelated
+			// containers — exactly the window that files traffic into the
+			// unattributed tier. Bounded by execSem; handlers are
+			// idempotent (seenExecs) so ordering vs die/destroy is safe.
+			containerID, execID, nano := ev.Actor.ID, ev.Actor.Attributes["execID"], ev.TimeNano
+			t.wg.Add(1)
+			go func() {
+				defer t.wg.Done()
+				select {
+				case t.execSem <- struct{}{}:
+					defer func() { <-t.execSem }()
+				case <-ctx.Done():
+					return
+				}
+				t.handleExecStart(ctx, containerID, execID, nano)
+			}()
 		case ev.Action == "die", ev.Action == "destroy":
 			t.remove(ev.Actor.ID)
 		}
@@ -290,11 +328,21 @@ func (t *Tracker) streamOnce(ctx context.Context) error {
 // reconnect) get StepOrdinalPreDaemon — mirroring seedExisting's semantics
 // for pre-daemon processes — and their exec events re-tag real step
 // ordinals from there.
+//
+// It also runs the diff the OTHER way: a tracked container absent from the
+// list lost its die/destroy somewhere the `since` replay cannot reach (a
+// dockerd restart empties the daemon's event buffer). Without the removal
+// its stale byIP entry keeps answering DNS attribution lookups, crediting
+// whatever later occupies that bridge address to a dead container.
 func (t *Tracker) reconcile(ctx context.Context) {
 	list, err := t.client.listContainers(ctx)
 	if err != nil {
 		t.logger.Warn("Cannot list containers for reconciliation", "error", err)
 		return
+	}
+	live := make(map[string]bool, len(list))
+	for _, c := range list {
+		live[c.ID] = true
 	}
 	for _, c := range list {
 		t.mu.Lock()
@@ -303,6 +351,24 @@ func (t *Tracker) reconcile(ctx context.Context) {
 		if !known {
 			t.handleStart(ctx, c.ID, "reconcile", 0)
 		}
+	}
+
+	// A container started after the list call is either absent from
+	// t.containers (its start event is still buffered in the stream — the
+	// sweep leaves it alone) or was added by a handleStart above (in the
+	// list, so live). Only genuinely dead containers are swept.
+	t.mu.Lock()
+	var stale []string
+	for id := range t.containers {
+		if !live[id] {
+			stale = append(stale, id)
+		}
+	}
+	t.mu.Unlock()
+	for _, id := range stale {
+		t.logger.Info("Container removed during reconciliation (die/destroy lost in a stream gap)",
+			"container", shortID(id))
+		t.remove(id)
 	}
 }
 
@@ -413,11 +479,19 @@ func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int
 }
 
 func (t *Tracker) handleExecStart(ctx context.Context, containerID, execID string, timeNano int64) {
-	pid := t.resolveExecPid(ctx, containerID, execID)
-	if pid == 0 {
+	pid, err := t.resolveExecPid(ctx, containerID, execID)
+	if err != nil {
+		if errors.Is(err, errExecAlreadySeen) {
+			// Replayed exec_start after a stream reconnect (docker's `since`
+			// is inclusive): handled once already. A second pass would
+			// re-inspect, double-count execTagged, skew the latency
+			// percentiles with an event minutes old, and re-tag a PID that
+			// may since have been recycled.
+			return
+		}
 		t.tagSkipped.Add(1)
 		t.logger.Debug("Exec PID unresolvable; traffic stays in the container tier",
-			"container", shortID(containerID))
+			"container", shortID(containerID), "error", err)
 		return
 	}
 
@@ -460,48 +534,95 @@ func (t *Tracker) handleExecStart(ctx context.Context, containerID, execID strin
 	})
 }
 
+// errExecAlreadySeen means the exec was handled on a previous delivery — a
+// reconnect replay, not a failure; handleExecStart returns without counting
+// or logging it as a skip.
+var errExecAlreadySeen = errors.New("exec already handled")
+
 // resolveExecPid turns an exec event into the exec leader's host PID. The
 // execID attribute is the fast path; daemons that omit it fall back to
 // diffing the container's live ExecIDs against what we've already handled.
-func (t *Tracker) resolveExecPid(ctx context.Context, containerID, execID string) int {
+// Both paths honour the seenExecs idempotency guard — the replay after a
+// stream reconnect arrives on whichever path the daemon supports.
+// The error exists for the Debug log: an unresolvable exec is expected
+// degradation (exec already exited), but WHICH failure occurred must be
+// diagnosable from a debug run.
+func (t *Tracker) resolveExecPid(ctx context.Context, containerID, execID string) (int, error) {
 	ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
 	defer cancel()
 
 	if execID != "" {
-		t.mu.Lock()
-		t.seenExecs[execID] = true
-		t.mu.Unlock()
-		insp, err := t.client.inspectExec(ictx, execID)
-		if err != nil || insp.Pid == 0 {
-			return 0 // exec already exited: unattributable by design
+		if t.markExecSeen(containerID, execID) {
+			return 0, errExecAlreadySeen
 		}
-		return insp.Pid
+		return t.inspectExecPid(ictx, execID)
 	}
 
 	cinsp, err := t.client.inspectContainer(ictx, containerID)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("container inspect for exec fallback: %w", err)
 	}
 	for _, id := range cinsp.ExecIDs {
-		t.mu.Lock()
-		seen := t.seenExecs[id]
-		if !seen {
-			t.seenExecs[id] = true
-		}
-		t.mu.Unlock()
-		if seen {
+		if t.markExecSeen(containerID, id) {
 			continue
 		}
-		if insp, err := t.client.inspectExec(ictx, id); err == nil && insp.Running && insp.Pid != 0 {
-			return insp.Pid
+		if pid, err := t.inspectExecPid(ictx, id); err == nil {
+			return pid, nil
 		}
 	}
-	return 0
+	return 0, fmt.Errorf("no execID attribute and no unseen running exec among %d", len(cinsp.ExecIDs))
+}
+
+// markExecSeen records execID under its container and reports whether it
+// had already been handled. Per-container keying exists so remove() can
+// reclaim the whole set when the container goes away.
+func (t *Tracker) markExecSeen(containerID, execID string) (seen bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	set := t.seenExecs[containerID]
+	if set == nil {
+		set = make(map[string]bool)
+		t.seenExecs[containerID] = set
+	}
+	seen = set[execID]
+	set[execID] = true
+	return seen
+}
+
+// inspectExecPid reads an exec's leader PID, retrying briefly: dockerd
+// emits exec_start BEFORE it records the process pid from containerd, so an
+// immediate inspect reads Pid 0 for an exec that is very much alive
+// (confirmed against dockerd 28/29; same publish-race shape as the
+// stepCmdline retry in pkg/steps). A genuinely exited exec keeps reading 0
+// and falls out as unattributable — the stricter tier, by design. The retry
+// window is small against any real exec workload and is included in the
+// reported tag latency.
+func (t *Tracker) inspectExecPid(ctx context.Context, execID string) (int, error) {
+	for i := 0; ; i++ {
+		insp, err := t.client.inspectExec(ctx, execID)
+		if err != nil {
+			return 0, fmt.Errorf("exec inspect %s: %w", shortID(execID), err)
+		}
+		if insp.Pid != 0 {
+			return insp.Pid, nil
+		}
+		if i >= 19 {
+			return 0, fmt.Errorf("exec %s has no pid after retries (already exited?)", shortID(execID))
+		}
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("exec %s pid wait: %w", shortID(execID), ctx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func (t *Tracker) remove(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	// Unconditional: exec ids may have been seen for containers the start
+	// handler never registered (inspect raced the container's death).
+	delete(t.seenExecs, id)
 	info := t.containers[id]
 	if info == nil {
 		return
@@ -518,153 +639,24 @@ func (t *Tracker) remove(id string) {
 	// Task-map cleanup is the kernel's sched_process_exit; nothing to undo.
 }
 
+// collectIPs gathers every address docker assigned the container, v4 and
+// v6 alike: the DNS client lookup keys on whichever family the container's
+// resolver socket uses, so an IPv6-enabled bridge must not silently lose
+// DNS attribution while the TC join (cgroup-id based) keeps working.
 func collectIPs(insp containerInspect) []string {
 	ips := []string{}
-	if insp.NetworkSettings.IPAddress != "" {
-		ips = append(ips, insp.NetworkSettings.IPAddress)
-	}
-	for _, nw := range insp.NetworkSettings.Networks {
-		if nw.IPAddress != "" && !slices.Contains(ips, nw.IPAddress) {
-			ips = append(ips, nw.IPAddress)
+	add := func(ip string) {
+		if ip != "" && !slices.Contains(ips, ip) {
+			ips = append(ips, ip)
 		}
+	}
+	add(insp.NetworkSettings.IPAddress)
+	add(insp.NetworkSettings.GlobalIPv6Address)
+	for _, nw := range insp.NetworkSettings.Networks {
+		add(nw.IPAddress)
+		add(nw.GlobalIPv6Address)
 	}
 	return ips
-}
-
-// LookupClient resolves a DNS client address to container attribution: the
-// container IP is the source of both direct bridge queries and the embedded
-// resolver's external forwards. Wired into pkg/dns via SetContainerLookup.
-func (t *Tracker) LookupClient(addr net.Addr) (ordinal uint32, containerID string, ok bool) {
-	var ip netip.Addr
-	switch a := addr.(type) {
-	case *net.UDPAddr:
-		ip, ok = netip.AddrFromSlice(a.IP)
-	case *net.TCPAddr:
-		ip, ok = netip.AddrFromSlice(a.IP)
-	}
-	if !ok {
-		return 0, "", false
-	}
-	ip = ip.Unmap()
-
-	t.mu.Lock()
-	info := t.byIP[ip]
-	t.mu.Unlock()
-	if info == nil {
-		t.dnsMisses.Add(1)
-		return 0, "", false
-	}
-	t.dnsHits.Add(1)
-	return info.effectiveOrdinal, shortID(info.id), true
-}
-
-// Enrich implements events.ContainerEnricher: called for TC events whose
-// socket carried no identity (pid 0, ordinal 0 — the NATed-container
-// signature), it consults the origin observer's pre-NAT records and adopts
-// what the flow's socket actually carried.
-//
-// Invariant: only the origin record's socket-tag ordinal is ever copied —
-// never OrdinalAt or any "current step" notion — so traffic from the window
-// between container start and tagging can only land in the
-// container-unattributed tier, never on a step.
-func (t *Tracker) Enrich(audit *events.AuditEvent, ev *events.BpfBlockedEvent) {
-	if t.observer == nil {
-		return
-	}
-
-	dstPort, srcPort := ev.DstPort, ev.SrcPort
-	if ev.IsProtocolBlock() {
-		// dst_port carried the protocol number; origin records for
-		// non-TCP/UDP protocols carry ports 0 to match.
-		dstPort, srcPort = 0, 0
-	}
-	var recs []origin.Record
-	if ev.IpVersion == 6 {
-		recs = t.observer.LookupV6(ev.DstIp6, dstPort, ev.IpProto, srcPort)
-	} else {
-		recs = t.observer.LookupV4(ev.DstIp, dstPort, ev.IpProto, srcPort)
-	}
-	// A record cannot postdate the TC event it explains (the cgroup hook
-	// runs before TC on the same packet, in the same clock domain).
-	recs = slices.DeleteFunc(recs, func(r origin.Record) bool { return r.Timestamp > ev.Timestamp })
-	if len(recs) == 0 {
-		t.tcNoRecord.Add(1)
-		return
-	}
-
-	t.mu.Lock()
-	classify := func(r origin.Record) *containerInfo {
-		if r.CgroupID != 0 {
-			if info := t.byCgroup[r.CgroupID]; info != nil {
-				return info
-			}
-		}
-		if r.SrcIP.IsValid() {
-			return t.byIP[r.SrcIP]
-		}
-		return nil
-	}
-	first := classify(recs[0])
-	agreed := true
-	for _, r := range recs[1:] {
-		if classify(r) != first || r.StepOrdinal != recs[0].StepOrdinal {
-			agreed = false
-			break
-		}
-	}
-	allContainers := first != nil
-	if !agreed {
-		for _, r := range recs {
-			if classify(r) == nil {
-				allContainers = false
-				break
-			}
-		}
-	}
-	t.mu.Unlock()
-
-	if !agreed {
-		// Candidates disagree: claiming a step would guess. Claim container
-		// origin only when every candidate is a container — the stricter
-		// tier — and nothing otherwise.
-		t.tcAmbiguous.Add(1)
-		if allContainers {
-			audit.ContainerOrigin = true
-		}
-		return
-	}
-
-	rec := recs[0]
-	if rec.StepOrdinal != 0 {
-		audit.StepOrdinal = rec.StepOrdinal
-	}
-	if rec.PID != 0 {
-		audit.PID = rec.PID
-		if audit.Process == "" {
-			audit.Process = readComm(t.opts.ProcRoot, int(rec.PID))
-		}
-	}
-	if first != nil {
-		audit.ContainerOrigin = true
-		audit.ContainerID = shortID(first.id)
-		if rec.StepOrdinal != 0 {
-			t.tcEnriched.Add(1)
-		} else {
-			t.tcContainerOnly.Add(1)
-		}
-	} else if rec.StepOrdinal != 0 || rec.PID != 0 {
-		// Host flow the TC join missed (e.g. map_sock_pid eviction): the
-		// origin record still knows its socket. Pure bonus attribution.
-		t.tcEnriched.Add(1)
-	}
-}
-
-func readComm(procRoot string, pid int) string {
-	comm, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "comm"))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(comm))
 }
 
 func (t *Tracker) logAttribution(ev events.AuditEvent) {

@@ -61,6 +61,23 @@ func TestRecentBlocks_ConsumeOnlyRecordsBlockedTCPUDP(t *testing.T) {
 	assert.Empty(t, rb.TakeMatching("20.0.0.4", nil, nil, false))
 }
 
+// Container identity must survive the buffer round-trip: a reconciled
+// late-allow is a re-report of the recorded attempt, and losing these
+// fields would demote the event from the container tier to unknown in the
+// summary and strip cargowall.container_id from its OTLP record.
+func TestRecentBlocks_CarriesContainerIdentity(t *testing.T) {
+	rb := NewRecentBlocks(0)
+	ev := blockedAuditEvent("20.0.0.1", 443, "TCP", time.Now())
+	ev.ContainerID = "abc123def456"
+	ev.ContainerOrigin = true
+	rb.Consume(ev)
+
+	taken := rb.TakeMatching("20.0.0.1", nil, nil, false)
+	require.Len(t, taken, 1)
+	assert.Equal(t, "abc123def456", taken[0].ContainerID)
+	assert.True(t, taken[0].ContainerOrigin)
+}
+
 func TestRecentBlocks_LatestAttemptWins(t *testing.T) {
 	rb := NewRecentBlocks(0)
 	first := time.Now().Add(-10 * time.Second)

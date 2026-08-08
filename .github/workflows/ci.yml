@@ -384,6 +384,57 @@ jobs:
             EVENTS_VALID=false
           fi
 
+          # --- Cgroup egress hook, shadow mode (issue #106, phase 3b) ---
+          # --github-action implies container attribution, which puts the
+          # cgroup hook in SHADOW: it computes the verdict and reports what
+          # it WOULD block, while TC still governs every packet. These
+          # assertions are the blast-radius gate that must hold before
+          # enforcement is turned on anywhere.
+
+          # It must see the denied destinations the job deliberately visits.
+          WOULD_BLOCK=$(jq -s '[.[] | select(.event_type == "cgroup_would_block")] | length' "$AUDIT_LOG")
+          echo "cgroup_would_block events: $WOULD_BLOCK"
+          if [ "$WOULD_BLOCK" -eq 0 ]; then
+            echo "❌ No cgroup_would_block events (shadow mode silently degraded?)"
+            EVENTS_VALID=false
+          fi
+
+          # Nothing was actually blocked by it: shadow must never claim a block.
+          BAD_FLAGS=$(jq -s '[.[] | select(.event_type == "cgroup_would_block" and .blocked == true)] | length' "$AUDIT_LOG")
+          if [ "$BAD_FLAGS" -ne 0 ]; then
+            echo "❌ cgroup_would_block events marked blocked=true — shadow mode must block nothing"
+            EVENTS_VALID=false
+          fi
+
+          # The blast radius itself: the surfaces this hook adjudicates that
+          # TC never saw — loopback (TC is attached to one interface) and the
+          # docker bridge. A would-block there is a NEW denial that turning
+          # on enforcement would introduce, and would break the runner.
+          #
+          # Deliberately not asserted here: DNS to a resolver the policy
+          # doesn't allow. That is a legitimate denial TC makes too, not
+          # something this hook introduces — asserting on port 53 would
+          # conflate "the cgroup hook newly breaks DNS" with "policy denies
+          # this resolver anyway" and fail spuriously.
+          BLAST=$(jq -s '[.[] | select(.event_type == "cgroup_would_block") | select(((.dst_ip // "") | startswith("127.")) or ((.dst_ip // "") | startswith("172.17.")))] | length' "$AUDIT_LOG")
+          echo "would-blocks on loopback/docker bridge (must be 0): $BLAST"
+          if [ "$BLAST" -ne 0 ]; then
+            echo "❌ Shadow mode would block loopback/bridge traffic — enforcement would break the runner"
+            jq -c 'select(.event_type == "cgroup_would_block") | {dst_ip, dst_port, process, container_id}' "$AUDIT_LOG" | head -20
+            EVENTS_VALID=false
+          fi
+
+          # Allowed destinations must never be would-blocked — that would mean
+          # the cgroup hook and TC disagree about policy.
+          BLAST_ALLOWED=$(jq -s '[.[] | select(.event_type == "cgroup_would_block") | select((.dst_hostname // "") | test("github|githubusercontent|docker"))] | length' "$AUDIT_LOG")
+          if [ "$BLAST_ALLOWED" -ne 0 ]; then
+            echo "❌ Shadow mode would block an ALLOWED host — hook/TC policy divergence"
+            EVENTS_VALID=false
+          fi
+
+          echo "--- cgroup_would_block events ---"
+          jq -c 'select(.event_type == "cgroup_would_block") | {dst_ip, dst_port, protocol, process, step_ordinal, container_id, container_origin}' "$AUDIT_LOG" | head -20
+
           # Evidence dump: the raw attribution rows, so a passing run shows
           # first-hand what was tagged (and a failing one shows what wasn't).
           echo "--- step_boundary events ---"
@@ -432,6 +483,140 @@ jobs:
             echo "❌ Summary command output missing expected content"
             exit 1
           fi
+
+  test-cargowall-cgroup-enforce:
+    name: Integration Test (Cgroup Enforce)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
+
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
+
+      - name: Start CargoWall with cgroup enforcement (issue #106 phase 3b)
+        uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        env:
+          # The whole point of this job: the root-cgroup hook is
+          # authoritative for traffic with a local socket (pre-NAT, socket
+          # context), with TC egress still attached as the fail-closed
+          # backstop for everything else.
+          CARGOWALL_CGROUP_ENFORCE: 'true'
+        with:
+          mode: enforce
+          offline: 'true'
+          allowed-hosts: |
+             docker.io
+             docker.com
+             **.githubusercontent.com
+          binary-path: ./bin/cargowall
+          debug: true
+
+      - name: Loopback must still work
+        run: |
+          # TC is attached to one interface and never saw `lo`; the cgroup
+          # hook does. If the loopback carve-out regresses, enforcement
+          # breaks every local service on the runner — this is the single
+          # highest-blast-radius behavior change in phase 3b.
+          python3 -m http.server 18080 --bind 127.0.0.1 >/dev/null 2>&1 &
+          sleep 2
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18080/ || echo "000")
+          kill %1 2>/dev/null || true
+          if [ "$CODE" != "200" ]; then
+            echo "❌ Loopback blocked under cgroup enforcement (got HTTP '$CODE')"
+            exit 1
+          fi
+          echo "✅ Loopback reachable ($CODE)"
+
+      - name: DNS and allowed hosts must still work
+        run: |
+          # The proxy's own upstream queries are SO_MARK-exempt in the hook;
+          # if that regresses, name resolution dies and everything else with it.
+          getent hosts github.com > /dev/null || { echo "❌ DNS resolution broken"; exit 1; }
+          curl -sf --connect-timeout 10 --max-time 30 https://raw.githubusercontent.com/github/gitignore/main/README.md > /dev/null \
+            || { echo "❌ Allowed host unreachable under cgroup enforcement"; exit 1; }
+          echo "✅ DNS + allowed host reachable"
+
+      - name: Blocked host is still blocked (host socket)
+        run: |
+          # Now enforced by the cgroup hook rather than TC. The drop surfaces
+          # as EPERM at connect() instead of a silent blackhole, so this
+          # fails fast rather than timing out — either way, non-zero.
+          if curl -sf --connect-timeout 5 --max-time 10 https://example.com > /dev/null 2>&1; then
+            echo "❌ example.com should be blocked"
+            exit 1
+          fi
+          echo "✅ example.com blocked"
+
+      - name: Container traffic is enforced and attributed
+        run: |
+          docker pull -q alpine:latest
+          # Allowed destination still reachable from inside a container.
+          docker run --rm alpine:latest sh -c \
+            "wget -q --spider --timeout=15 https://github.com && echo OK || echo FAIL" 2>&1 | grep -q OK \
+            || { echo "❌ Container cannot reach an allowed host under cgroup enforcement"; exit 1; }
+          echo "✅ Container reached github.com"
+
+          # Denied destination: dropped in the container's own netns, before
+          # NAT — so TC never sees the packet and the cgroup hook is the sole
+          # event source for it.
+          RESULT=$(docker run --rm alpine:latest sh -c \
+            "sleep 1; wget -q --timeout=8 http://198.51.100.7/ && echo REACHED || echo BLOCKED" 2>&1) || true
+          if echo "$RESULT" | grep -q REACHED; then
+            echo "❌ Container reached a denied destination"
+            exit 1
+          fi
+          echo "✅ Container blocked from 198.51.100.7"
+
+      - name: Validate enforcement events
+        run: |
+          AUDIT_LOG=/tmp/cargowall-audit.json
+          test -s "$AUDIT_LOG" || { echo "❌ Audit log missing"; exit 1; }
+          VALID=true
+
+          # In enforce mode a cgroup drop reports as a real connection_blocked
+          # (same policy outcome as a TC drop), never as a would-block.
+          WOULD=$(jq -s '[.[] | select(.event_type == "cgroup_would_block")] | length' "$AUDIT_LOG")
+          echo "cgroup_would_block events (expected 0 in enforce): $WOULD"
+          if [ "$WOULD" -ne 0 ]; then
+            echo "❌ Enforce mode emitted would-block events"
+            VALID=false
+          fi
+
+          # The container block must carry native attribution — a real step
+          # ordinal AND a container id — with no TC event to join against,
+          # which is the core phase-3b claim.
+          ATTRIBUTED=$(jq -s '[.[] | select(.event_type == "connection_blocked" and .dst_ip == "198.51.100.7") | select(.container_origin == true) | select((.step_ordinal // 0) > 0 and (.step_ordinal // 0) < 4294901758) | select((.container_id // "") != "")] | length' "$AUDIT_LOG")
+          echo "natively attributed container blocks: $ATTRIBUTED"
+          if [ "$ATTRIBUTED" -eq 0 ]; then
+            echo "❌ Container block lacks native step/container attribution"
+            VALID=false
+          fi
+
+          # Nothing on loopback or an allowed host may be blocked. (DNS to a
+          # resolver the policy doesn't allow is a legitimate denial TC makes
+          # too, so port 53 alone is not the signal — see the shadow job.)
+          BAD=$(jq -s '[.[] | select(.event_type == "connection_blocked") | select(((.dst_ip // "") | startswith("127.")) or ((.dst_hostname // "") | test("github|githubusercontent")))] | length' "$AUDIT_LOG")
+          if [ "$BAD" -ne 0 ]; then
+            echo "❌ Enforcement blocked loopback/allowed traffic:"
+            jq -c 'select(.event_type == "connection_blocked") | {dst_ip, dst_hostname, dst_port, process}' "$AUDIT_LOG" | head -20
+            VALID=false
+          fi
+
+          echo "--- blocked events ---"
+          jq -c 'select(.event_type == "connection_blocked") | {dst_ip, dst_port, process, step_ordinal, container_id, container_origin}' "$AUDIT_LOG" | head -20
+
+          [ "$VALID" = true ] || exit 1
+          echo "✅ Cgroup enforcement events are correct"
 
   test-cargowall-audit:
     name: Integration Test (Audit Mode)

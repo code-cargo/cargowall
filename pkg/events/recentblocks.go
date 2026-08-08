@@ -50,7 +50,13 @@ type RecentBlock struct {
 	Process     string
 	PID         uint32
 	StepOrdinal uint32
-	At          time.Time
+	// Container identity travels with the block: a reconciled late-allow is a
+	// re-report of THIS attempt, and dropping the container fields would
+	// demote it from the container tier to unknown in the summary and strip
+	// cargowall.container_id from its OTLP record.
+	ContainerID     string
+	ContainerOrigin bool
+	At              time.Time
 }
 
 type recentBlockKey struct {
@@ -124,14 +130,16 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 		rb.byIP[event.DstIP] = byKey
 	}
 	byKey[key] = RecentBlock{
-		SrcIP:       event.SrcIP,
-		DstIP:       event.DstIP,
-		DstPort:     event.DstPort,
-		Protocol:    event.Protocol,
-		Process:     event.Process,
-		PID:         event.PID,
-		StepOrdinal: event.StepOrdinal,
-		At:          event.Timestamp,
+		SrcIP:           event.SrcIP,
+		DstIP:           event.DstIP,
+		DstPort:         event.DstPort,
+		Protocol:        event.Protocol,
+		Process:         event.Process,
+		PID:             event.PID,
+		StepOrdinal:     event.StepOrdinal,
+		ContainerID:     event.ContainerID,
+		ContainerOrigin: event.ContainerOrigin,
+		At:              event.Timestamp,
 	}
 }
 

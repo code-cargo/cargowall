@@ -13,6 +13,25 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type OriginBpfLpmKey struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Ip        uint32
+}
+
+type OriginBpfLpmKeyV6 struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Ip        [16]uint8
+}
+
+type OriginBpfLpmVal struct {
+	_            structs.HostLayout
+	Action       uint8
+	PortSpecific uint8
+	Pad          uint16
+}
+
 type OriginBpfOriginSeenKey struct {
 	_         structs.HostLayout
 	Cookie    uint64
@@ -20,6 +39,35 @@ type OriginBpfOriginSeenKey struct {
 	DstPort   uint16
 	IpProto   uint8
 	IpVersion uint8
+}
+
+type OriginBpfOriginSeenVal struct {
+	_        structs.HostLayout
+	LastEmit uint64
+	Verdict  uint8
+	Pad      [7]uint8
+}
+
+type OriginBpfPortKey struct {
+	_     structs.HostLayout
+	Ip    uint32
+	Port  uint16
+	Proto uint8
+	Pad   uint8
+}
+
+type OriginBpfPortKeyV6 struct {
+	_     structs.HostLayout
+	Ip    [16]uint8
+	Port  uint16
+	Proto uint8
+	Pad   uint8
+}
+
+type OriginBpfPortVal struct {
+	_      structs.HostLayout
+	Action uint8
+	Pad    [3]uint8
 }
 
 // LoadOriginBpf returns the embedded CollectionSpec for OriginBpf.
@@ -71,8 +119,15 @@ type OriginBpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type OriginBpfMapSpecs struct {
-	MapOriginEvents *ebpf.MapSpec `ebpf:"map_origin_events"`
-	MapOriginSeen   *ebpf.MapSpec `ebpf:"map_origin_seen"`
+	MapAuditMode     *ebpf.MapSpec `ebpf:"map_audit_mode"`
+	MapCidrs         *ebpf.MapSpec `ebpf:"map_cidrs"`
+	MapCidrsV6       *ebpf.MapSpec `ebpf:"map_cidrs_v6"`
+	MapDefaultAction *ebpf.MapSpec `ebpf:"map_default_action"`
+	MapOriginConfig  *ebpf.MapSpec `ebpf:"map_origin_config"`
+	MapOriginEvents  *ebpf.MapSpec `ebpf:"map_origin_events"`
+	MapOriginSeen    *ebpf.MapSpec `ebpf:"map_origin_seen"`
+	MapPorts         *ebpf.MapSpec `ebpf:"map_ports"`
+	MapPortsV6       *ebpf.MapSpec `ebpf:"map_ports_v6"`
 }
 
 // OriginBpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -102,14 +157,28 @@ func (o *OriginBpfObjects) Close() error {
 //
 // It can be passed to LoadOriginBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type OriginBpfMaps struct {
-	MapOriginEvents *ebpf.Map `ebpf:"map_origin_events"`
-	MapOriginSeen   *ebpf.Map `ebpf:"map_origin_seen"`
+	MapAuditMode     *ebpf.Map `ebpf:"map_audit_mode"`
+	MapCidrs         *ebpf.Map `ebpf:"map_cidrs"`
+	MapCidrsV6       *ebpf.Map `ebpf:"map_cidrs_v6"`
+	MapDefaultAction *ebpf.Map `ebpf:"map_default_action"`
+	MapOriginConfig  *ebpf.Map `ebpf:"map_origin_config"`
+	MapOriginEvents  *ebpf.Map `ebpf:"map_origin_events"`
+	MapOriginSeen    *ebpf.Map `ebpf:"map_origin_seen"`
+	MapPorts         *ebpf.Map `ebpf:"map_ports"`
+	MapPortsV6       *ebpf.Map `ebpf:"map_ports_v6"`
 }
 
 func (m *OriginBpfMaps) Close() error {
 	return _OriginBpfClose(
+		m.MapAuditMode,
+		m.MapCidrs,
+		m.MapCidrsV6,
+		m.MapDefaultAction,
+		m.MapOriginConfig,
 		m.MapOriginEvents,
 		m.MapOriginSeen,
+		m.MapPorts,
+		m.MapPortsV6,
 	)
 }
 

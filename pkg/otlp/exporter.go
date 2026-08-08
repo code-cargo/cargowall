@@ -110,7 +110,9 @@ func (e *Exporter) Consume(ev events.AuditEvent) {
 	// cargowall.step_ordinal and cargowall.container_id, which are the
 	// correlation keys that matter; a proper marker schema can come with
 	// the SaaS step tier.
-	if ev.EventType == events.EventStepBoundary || ev.EventType == events.EventContainerAttribution {
+	if ev.EventType == events.EventStepBoundary ||
+		ev.EventType == events.EventContainerAttribution ||
+		ev.EventType == events.EventCgroupWouldBlock {
 		return
 	}
 	e.mu.Lock()

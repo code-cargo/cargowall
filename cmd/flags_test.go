@@ -366,6 +366,25 @@ func TestStartCmd_AfterApply_OrthogonalFlagsPreservedWhenSetExplicitly(t *testin
 	assert.Equal(t, CIModeNone, cmd.CIMode())
 }
 
+// --cgroup-enforce must never be silently discarded: without container
+// attribution there is no cgroup hook to enforce at, and a startup that
+// quietly dropped the request is indistinguishable from one that honored
+// it. AfterApply refuses instead.
+func TestStartCmd_AfterApply_CgroupEnforceRequiresContainerAttribution(t *testing.T) {
+	cmd := &StartCmd{CgroupEnforce: true}
+	require.ErrorContains(t, cmd.AfterApply(), "--cgroup-enforce requires --container-attribution")
+
+	cmd = &StartCmd{CgroupEnforce: true, ContainerAttribution: true}
+	require.NoError(t, cmd.AfterApply())
+
+	// The GitHub preset implies --container-attribution, satisfying the
+	// requirement; the GitLab preset does not and must still refuse.
+	cmd = &StartCmd{GithubAction: true, CgroupEnforce: true}
+	require.NoError(t, cmd.AfterApply())
+	cmd = &StartCmd{GitlabCI: true, CgroupEnforce: true}
+	require.Error(t, cmd.AfterApply())
+}
+
 func TestStartCmd_CIMode_GithubBeatsGitlabWhenBothSet(t *testing.T) {
 	// Pathological config: both presets set. GitHub wins (arbitrary but
 	// stable). Documented so callers can rely on it.

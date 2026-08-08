@@ -398,7 +398,7 @@ sequenceDiagram
 | `cg_sendmsg6` | cgroup/sendmsg6 | Maps IPv6 UDP socket cookie → PID |
 | `step_fork` / `step_exit` | tp_btf tracepoints (stepbpf.c, separate collection; needs kernel BTF) | Step attribution: mint/inherit per-step process tags, drop at exit |
 | `cg_sock_create` | cgroup/sock_create (stepbpf.c) | Copies the creating thread's step tag onto each socket cookie |
-| `cg_origin_egress` | cgroup_skb/egress (originbpf.c, separate collection) | Flow-origin observer (issue #106, audit-only): records pre-NAT flow origins (cookie, cgroup id, container source IP) so container traffic — invisible to the TC cookie join after netns+NAT — can be attributed in userspace; always returns allow |
+| `cg_origin_egress` | cgroup_skb/egress (originbpf.c, separate collection) | Flow-origin recorder and — in enforce mode — the primary egress verdict (issue #106). Runs in socket context, pre-NAT, inside the originating netns, so it can both attribute and enforce container traffic. Behavior is set by a runtime mode: observe (pass, record only), shadow (compute the verdict, report would-blocks, pass), enforce (drop denied traffic). Shares the rule maps with `tc_egress` via `bpf/verdict.h` |
 
 ## Audit Mode
 
@@ -475,12 +475,88 @@ Phase 3a closes the attribution gap without touching enforcement:
   traffic from the start→tag window lands in the container tier, not a step.
 - Container DNS: queries arriving on the bridge listener are attributed by
   container IP (`SetContainerLookup`); the host-netns sockdiag path is never
-  consulted for them.
+  consulted for them. **Known approximation:** the DNS path attributes a
+  whole container to its *effective* ordinal — birth step, overwritten by
+  each later `docker exec` (last-writer-wins) — because a DNS query carries
+  only the client IP, not a socket tag. TC enrichment does not share this
+  limit (it reads each socket's own tag from the origin record). Phase 3b
+  must not treat DNS-path ordinals as per-socket causal attribution.
 - Unattributable container traffic gets its own summary tier ("Container
   traffic (unattributed…)"), checked before every looser bucket.
 - Scope boundaries: docker-in-docker attribution stops at the outer
-  container; `--privileged` containers are flagged in the audit stream;
-  enforcement stays TC-only (the observer always returns allow).
+  container; `--privileged` containers are flagged in the audit stream.
+
+### Egress enforcement hooks (issue #106, phase 3b)
+
+Phase 3b makes the root-cgroup hook the *primary* egress verdict, with TC
+egress kept attached as a fail-closed backstop. Both hooks compute the same
+decision from the same maps: `bpf/verdict.h` owns the rule/config maps and
+the `verdict_allowed_v4`/`_v6` helpers, and both collections include it —
+a divergence between the primary hook and its backstop would be a security
+bug, so the decision exists once and `TestVerdictParityWithTcEgress` proves
+the two programs agree. `pkg/origin` wires the origin collection to the
+tcbpf collection's map fds with `MapReplacements`, so there is one set of
+kernel maps. (This deliberately reverses phase 3a's standalone-collection
+isolation, whose purpose was to keep a verifier failure from touching
+enforcement; the blast radius is now bounded by the mode gate and the TC
+backstop instead.)
+
+**Mode ladder** (`map_origin_config`, set by userspace, never at attach):
+
+| Mode | Behavior | How it's selected |
+|------|----------|-------------------|
+| observe | Phase-3a behavior: always pass, record flow origins | container attribution off |
+| shadow | Compute the verdict, emit `cgroup_would_block`, still pass | default with `--container-attribution` |
+| enforce | Drop denied traffic here; a drop reports as `connection_blocked` | `--cgroup-enforce` |
+
+Shadow is the default because this hook adjudicates surfaces TC never saw;
+it measures that blast radius in production before anyone relies on
+enforcement. Audit mode (`map_audit_mode`) still overrides everything — it
+never drops, at either hook.
+
+**Ordering.** The program is attached early (the join store needs it) but is
+inert in observe until `enableMode` runs *after* the allowlist, auto-allows,
+and existing-connection gating are programmed — the same
+attach-before-program guard that makes TC attach last.
+
+**What TC still enforces.** Traffic with no local socket in our cgroup root:
+`AF_PACKET`/raw sends, non-IP frames, genuinely forwarded packets, TCP
+minisockets — plus everything, if the cgroup hook fails to load or attach
+(warn-only by design, because TC remains).
+
+**One post-verdict pipeline.** Both hooks feed the same steps in
+`pkg/events` (`outcome.go`): hostname/CNAME resolution, late-allow
+reconciliation, the audit record, and the block notification. `processEvent`
+supplies TC packets; `ReportVerdict` supplies cgroup verdict records. This
+matters because a cgroup drop is the *only* event source for the traffic it
+kills — the packet dies at `ip_finish_output`, before the TC qdisc — so if
+that path were thinner, denials under `--cgroup-enforce` would silently lose
+late-allow self-healing and hostname attribution. Container identity is
+attached as decoration by `pkg/containers`; it never owns the outcome, since
+most cgroup verdicts are host processes with no container at all.
+
+**Shadow mode is intentionally dual-sourced.** In shadow, the cgroup hook
+emits `cgroup_would_block` for a flow *and* TC still enforces it, possibly
+emitting `connection_blocked` for the same flow. Both lines appear in the
+audit log by design — that is how the two hooks' opinions are compared. The
+summary and OTLP exporter exclude would-blocks so counts stay honest, and
+any other consumer must do the same: **never sum `cgroup_would_block` with
+`connection_blocked`**, and never treat a would-block as a policy outcome.
+
+**Behavior changes to know about:**
+- A cgroup drop returns `EPERM` to the sender rather than TC's silent
+  blackhole: `connect()` fails fast instead of timing out, and blocked flows
+  no longer produce SYN retransmits.
+- The hook sees traffic TC never did — loopback (including the DNS proxy's
+  own DNAT'd `127.0.0.1:53`) and the docker bridge. Loopback is carved out
+  both in BPF and as a userspace `127.0.0.0/8` + `::1/128` allow rule;
+  ICMP/ICMPv6 and IPv6 multicast are passed for PMTU and NDP.
+- The DNS proxy's upstream queries carry `SO_MARK 0xCA12` and are exempted
+  before any verdict, so a policy race can never let the proxy self-block
+  the lookups that populate the allowlist.
+- Container traffic denied by policy is dropped pre-NAT, so TC never sees
+  it: the cgroup hook is the sole event source for those blocks, and its
+  events carry native pid/step/container attribution with no join needed.
 
 ## GitHub Actions Integration
 

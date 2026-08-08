@@ -1419,6 +1419,46 @@ func TestProcessEvent_EnricherRunsForOrphanBlockedEvent(t *testing.T) {
 	assert.Equal(t, "abc123def456", events[0].ContainerID)
 }
 
+// identityEnricher rewrites the full identity, like the real container
+// enricher does when an origin record resolves.
+type identityEnricher struct{}
+
+func (identityEnricher) Enrich(audit *AuditEvent, _ *BpfBlockedEvent) {
+	audit.PID = 4242
+	audit.Process = "containerproc"
+	audit.StepOrdinal = 9
+	audit.ContainerOrigin = true
+	audit.ContainerID = "abc123def456"
+}
+
+// The daemon log line and the audit record must observe ONE identity: both
+// are derived from the shared audit base AFTER enrichment. Pins the fix for
+// the dual-identity bug where log lines kept the pre-enrich pid=0/process=""
+// locals while the audit stream carried the enriched values.
+func TestProcessEvent_LogLineObservesEnrichedIdentity(t *testing.T) {
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+
+	reverseDNSMu.Lock()
+	reverseDNSCache = make(map[string]time.Time)
+	reverseDNSMu.Unlock()
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	raw := makeBpfEvent(orphanEvent())
+	processEvent(raw, cm, nil, nil, nil, logger, identityEnricher{})
+
+	out := logBuf.String()
+	assert.Contains(t, out, "Connection blocked")
+	assert.Contains(t, out, "process=containerproc")
+	assert.Contains(t, out, "pid=4242")
+	assert.Contains(t, out, "step_ordinal=9")
+	assert.Contains(t, out, "container_origin=true")
+	assert.Contains(t, out, "container_id=abc123def456")
+	assert.NotContains(t, out, "pid=0", "the pre-enrich identity must not leak into any log attribute")
+}
+
 // The allowed branch logs from the same enriched base — locks in that
 // enrichment happens before the verdict fan-out, not inside one branch.
 func TestProcessEvent_EnricherRunsForOrphanAllowedEvent(t *testing.T) {

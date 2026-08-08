@@ -53,6 +53,7 @@ const (
 	AutoAddedTypeGitHubService       AutoAddedType = "github_service"
 	AutoAddedTypeGitLabService       AutoAddedType = "gitlab_service"
 	AutoAddedTypeCodeCargoService    AutoAddedType = "codecargo_service"
+	AutoAddedTypeLoopback            AutoAddedType = "loopback"
 )
 
 // RuleType represents the type of a firewall rule.
@@ -1640,8 +1641,11 @@ func (cm *Manager) EnsureInfraAllowed(ips []string, ports []Port, autoAddedType 
 	cm.ensureAllowed(ips, ports, autoAddedType)
 }
 
-// ensureAllowed adds CIDR allow rules for the given IPs with the specified ports.
-// If ports is nil, traffic on all ports is allowed.
+// ensureAllowed adds CIDR allow rules for the given addresses with the
+// specified ports. If ports is nil, traffic on all ports is allowed. Each
+// entry may be a bare IP or a CIDR prefix, v4 or v6 — the loopback pair
+// ("127.0.0.0/8", "::1/128") depends on all four shapes working, so an
+// unparseable entry warns instead of vanishing silently.
 func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoAddedType) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -1650,41 +1654,47 @@ func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoA
 		return
 	}
 
-	for _, ip := range ips {
-		if ip == "" {
+	for _, entry := range ips {
+		if entry == "" {
 			continue
 		}
 
-		// Check if a rule already covers this IP
+		var ipnet *net.IPNet
+		if _, parsed, err := net.ParseCIDR(entry); err == nil {
+			ipnet = parsed
+		} else if parsedIP := net.ParseIP(entry); parsedIP != nil {
+			if ip4 := parsedIP.To4(); ip4 != nil {
+				ipnet = &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}
+			} else {
+				ipnet = &net.IPNet{IP: parsedIP.To16(), Mask: net.CIDRMask(128, 128)}
+			}
+		} else {
+			slog.Warn("Cannot auto-allow unparseable infra address",
+				"value", entry, "autoAddedType", autoAddedType)
+			continue
+		}
+		cidr := ipnet.String()
+
+		// Check if a rule already covers this network's base address.
 		if len(ports) == 0 {
-			if cm.hasCIDRRuleAllPorts(ip) {
-				slog.Debug("Allow rule already exists (all ports)", "ip", ip)
+			if cm.hasCIDRRuleAllPorts(ipnet.IP.String()) {
+				slog.Debug("Allow rule already exists (all ports)", "cidr", cidr)
 				continue
 			}
 		} else {
 			covered := true
 			for _, p := range ports {
-				if !cm.hasCIDRRule(ip, p) {
+				if !cm.hasCIDRRule(ipnet.IP.String(), p) {
 					covered = false
 					break
 				}
 			}
 			if covered {
-				slog.Debug("Allow rule already exists", "ip", ip, "ports", ports)
+				slog.Debug("Allow rule already exists", "cidr", cidr, "ports", ports)
 				continue
 			}
 		}
 
-		parsedIP := net.ParseIP(ip)
-		if parsedIP == nil {
-			continue
-		}
-		ip4 := parsedIP.To4()
-		if ip4 == nil {
-			continue // skip IPv6
-		}
-
-		cidr := ip + "/32"
 		cm.config.Rules = append(cm.config.Rules, Rule{
 			Type:          RuleTypeCIDR,
 			Value:         cidr,
@@ -1698,10 +1708,7 @@ func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoA
 			Ports:         ports,
 			Action:        ActionAllow,
 			AutoAddedType: autoAddedType,
-			IPNet: &net.IPNet{
-				IP:   ip4,
-				Mask: net.CIDRMask(32, 32),
-			},
+			IPNet:         ipnet,
 		})
 
 		slog.Info("Auto-added allow rule", "cidr", cidr, "ports", ports, "autoAddedType", autoAddedType)

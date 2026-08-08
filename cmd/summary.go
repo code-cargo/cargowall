@@ -109,11 +109,13 @@ func (c *SummaryCmd) Run() error {
 			existingConnEvents = append(existingConnEvents, event)
 		case events.EventStepBoundary:
 			stepBoundaries = append(stepBoundaries, event)
-		case events.EventContainerAttribution:
-			// Telemetry markers (container/exec tagged), not connections —
-			// in the connection pipeline they'd render as destination-less
-			// rows. The audit log itself carries them for CI assertions and
-			// latency telemetry; the summary renders nothing from them yet.
+		case events.EventContainerAttribution, events.EventCgroupWouldBlock:
+			// Telemetry markers, not connection outcomes. Container/exec
+			// tagging describes no connection at all; a cgroup would-block
+			// describes traffic that was NOT blocked (shadow mode), so
+			// counting it as a block would overstate what the firewall did.
+			// The audit log carries both for CI assertions and blast-radius
+			// measurement; the summary renders nothing from them yet.
 		default:
 			regularEvents = append(regularEvents, event)
 		}

@@ -965,6 +965,57 @@ func TestEnsureInfraAllowed_ICMP(t *testing.T) {
 	}
 }
 
+// The loopback pair ("127.0.0.0/8", "::1/128") arrives as CIDR prefixes, one
+// of them IPv6. Both shapes must land in the rendered config AND the
+// resolved rules — this is the userspace half of the cgroup hook's loopback
+// carve-out (#106 phase 3b), and it used to vanish silently because
+// ensureAllowed only understood bare IPv4 addresses.
+func TestEnsureInfraAllowed_CIDRAndIPv6(t *testing.T) {
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules(nil, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	cm.EnsureInfraAllowed([]string{"127.0.0.0/8", "::1/128"}, nil, AutoAddedTypeLoopback)
+
+	if len(cm.config.Rules) != 2 {
+		t.Fatalf("expected 2 rules, got %d: %+v", len(cm.config.Rules), cm.config.Rules)
+	}
+	if cm.config.Rules[0].Value != "127.0.0.0/8" {
+		t.Errorf("rule[0].Value = %q, want 127.0.0.0/8", cm.config.Rules[0].Value)
+	}
+	if cm.config.Rules[1].Value != "::1/128" {
+		t.Errorf("rule[1].Value = %q, want ::1/128", cm.config.Rules[1].Value)
+	}
+	for i, rr := range cm.resolvedRules {
+		if rr.IPNet == nil {
+			t.Errorf("resolvedRules[%d].IPNet is nil; the rule cannot be programmed into BPF", i)
+		}
+		if rr.AutoAddedType != AutoAddedTypeLoopback {
+			t.Errorf("resolvedRules[%d].AutoAddedType = %q, want %q", i, rr.AutoAddedType, AutoAddedTypeLoopback)
+		}
+	}
+	if len(cm.resolvedRules) != 2 {
+		t.Fatalf("expected 2 resolved rules, got %d", len(cm.resolvedRules))
+	}
+	ones, bits := cm.resolvedRules[1].IPNet.Mask.Size()
+	if ones != 128 || bits != 128 {
+		t.Errorf("v6 mask = /%d (%d bits), want /128 (128 bits)", ones, bits)
+	}
+
+	// Idempotent: a second call must not duplicate either rule.
+	cm.EnsureInfraAllowed([]string{"127.0.0.0/8", "::1/128"}, nil, AutoAddedTypeLoopback)
+	if len(cm.config.Rules) != 2 {
+		t.Errorf("second call duplicated rules: got %d", len(cm.config.Rules))
+	}
+
+	// An unparseable entry warns and is skipped, never appended half-formed.
+	cm.EnsureInfraAllowed([]string{"not-an-address"}, nil, AutoAddedTypeLoopback)
+	if len(cm.config.Rules) != 2 {
+		t.Errorf("unparseable entry changed the rule set: got %d", len(cm.config.Rules))
+	}
+}
+
 func TestLoadConfigFromCargoWall_ICMPRule(t *testing.T) {
 	cm := NewConfigManager()
 
@@ -4045,27 +4096,32 @@ func TestResolveRules_InvalidPatternSilentlyDropped(t *testing.T) {
 	}
 }
 
-// ensureAllowed (used by EnsureDNSAllowed / EnsureInfraAllowed) silently
-// skips empty strings, malformed IPs, and IPv6 addresses. Pin this so
-// auto-allow callers don't have to defend against bad input themselves.
+// ensureAllowed (used by EnsureDNSAllowed / EnsureInfraAllowed) skips empty
+// strings and malformed values (with a warning) but accepts IPv6 — the v6
+// rule maps exist and the loopback carve-out depends on ::1/128 landing.
+// Pin this so auto-allow callers don't have to defend against bad input
+// themselves.
 func TestEnsureAllowed_SkipsInvalidIPs(t *testing.T) {
 	cm := NewConfigManager()
 	if err := cm.LoadConfigFromRules(nil, ActionDeny); err != nil {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
 	}
-	// Mix of one valid + three skipped.
+	// Two valid (one of them IPv6) + two skipped.
 	cm.EnsureDNSAllowed([]string{
 		"",
 		"not-an-ip",
-		"2001:db8::1", // IPv6 — silently skipped (BPF maps are IPv4)
+		"2001:db8::1",
 		"8.8.8.8",
 	})
 	rules := cm.GetResolvedRules()
-	if len(rules) != 1 {
-		t.Fatalf("expected 1 rule (only 8.8.8.8 valid), got %d: %+v", len(rules), rules)
+	if len(rules) != 2 {
+		t.Fatalf("expected 2 rules (v6 + v4), got %d: %+v", len(rules), rules)
 	}
-	if rules[0].Value != "8.8.8.8/32" {
-		t.Errorf("rule value = %q, want %q", rules[0].Value, "8.8.8.8/32")
+	if rules[0].Value != "2001:db8::1/128" {
+		t.Errorf("rule[0] value = %q, want %q", rules[0].Value, "2001:db8::1/128")
+	}
+	if rules[1].Value != "8.8.8.8/32" {
+		t.Errorf("rule[1] value = %q, want %q", rules[1].Value, "8.8.8.8/32")
 	}
 }
 

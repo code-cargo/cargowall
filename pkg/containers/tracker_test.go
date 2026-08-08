@@ -117,7 +117,11 @@ type fakeDaemon struct {
 	mu         sync.Mutex
 	containers map[string]containerInspect
 	execs      map[string]execInspect
-	list       []containerSummary
+	// execPidDelay[id] > 0 makes the next N exec inspects report Pid 0 —
+	// the shape dockerd serves between emitting exec_start and recording
+	// the pid from containerd (the publish race the tracker retries over).
+	execPidDelay map[string]int
+	list         []containerSummary
 
 	eventCh chan dockerEvent
 }
@@ -125,9 +129,10 @@ type fakeDaemon struct {
 func newFakeDaemon(t *testing.T) *fakeDaemon {
 	t.Helper()
 	d := &fakeDaemon{
-		containers: make(map[string]containerInspect),
-		execs:      make(map[string]execInspect),
-		eventCh:    make(chan dockerEvent, 16),
+		containers:   make(map[string]containerInspect),
+		execs:        make(map[string]execInspect),
+		execPidDelay: make(map[string]int),
+		eventCh:      make(chan dockerEvent, 16),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_ping", func(w http.ResponseWriter, _ *http.Request) {
@@ -152,10 +157,16 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 	mux.HandleFunc("/exec/{id}/json", func(w http.ResponseWriter, r *http.Request) {
 		d.mu.Lock()
 		defer d.mu.Unlock()
-		insp, ok := d.execs[r.PathValue("id")]
+		id := r.PathValue("id")
+		insp, ok := d.execs[id]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
+		}
+		if d.execPidDelay[id] > 0 {
+			d.execPidDelay[id]--
+			insp.Pid = 0
+			insp.Running = false
 		}
 		_ = json.NewEncoder(w).Encode(insp)
 	})
@@ -199,6 +210,12 @@ func (d *fakeDaemon) setExec(id string, insp execInspect) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.execs[id] = insp
+}
+
+func (d *fakeDaemon) setExecPidDelay(id string, inspects int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.execPidDelay[id] = inspects
 }
 
 func (d *fakeDaemon) setList(list ...containerSummary) {
@@ -389,6 +406,35 @@ func TestExecStartRetagsEffectiveOrdinal(t *testing.T) {
 	ord, _, ok := f.tracker.LookupClient(&net.UDPAddr{IP: net.ParseIP("172.17.0.4"), Port: 1})
 	require.True(t, ok)
 	assert.Equal(t, uint32(9), ord)
+}
+
+// Pins the fix for the CI failure on PR #109: dockerd emits exec_start
+// BEFORE it records the exec pid from containerd, so the first inspect(s)
+// read Pid 0 for a live exec. The tracker must retry through that window
+// instead of dropping attribution.
+func TestExecStartRetriesUntilDockerdPublishesPid(t *testing.T) {
+	f := newFixture(t)
+	id := strings.Repeat("9", 64)
+	f.addContainer(t, id, 4242, "172.17.0.30", false)
+	f.tagger.setOrdinal(7)
+	f.start(t)
+	f.daemon.push(startEvent(id, time.Now().UnixNano()))
+	f.waitAttribution(t, "start", id)
+
+	execID := strings.Repeat("d", 64)
+	writeProcEntry(t, f.procRoot, 4646, cgroupV2Line(id)+"\n", "sh")
+	f.daemon.setExec(execID, execInspect{ID: execID, Running: true, Pid: 4646, ContainerID: id})
+	f.daemon.setExecPidDelay(execID, 2)
+	f.tagger.setOrdinal(9)
+	f.daemon.push(execStartEvent(id, execID, time.Now().UnixNano()))
+
+	ev := f.waitAttribution(t, "exec", id)
+	assert.Equal(t, uint32(9), ev.StepOrdinal)
+	assert.Equal(t, uint32(4646), ev.PID)
+	// Two Pid-0 inspects at 50ms apart put the measured latency at or above
+	// the retry interval — the honest cost of the publish race.
+	assert.GreaterOrEqual(t, ev.TagLatencyMS, 50.0)
+	assert.Contains(t, f.tagger.tagCalls(), tagCall{pid: 4646, ordinal: 9})
 }
 
 func TestExecStartWithoutExecIDFallsBackToDiff(t *testing.T) {

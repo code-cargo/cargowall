@@ -74,13 +74,14 @@ type containerInspect struct {
 		Running bool `json:"Running"`
 	} `json:"State"`
 	HostConfig struct {
-		Privileged  bool   `json:"Privileged"`
-		NetworkMode string `json:"NetworkMode"`
+		Privileged bool `json:"Privileged"`
 	} `json:"HostConfig"`
 	NetworkSettings struct {
-		IPAddress string `json:"IPAddress"`
-		Networks  map[string]struct {
-			IPAddress string `json:"IPAddress"`
+		IPAddress         string `json:"IPAddress"`
+		GlobalIPv6Address string `json:"GlobalIPv6Address"`
+		Networks          map[string]struct {
+			IPAddress         string `json:"IPAddress"`
+			GlobalIPv6Address string `json:"GlobalIPv6Address"`
 		} `json:"Networks"`
 	} `json:"NetworkSettings"`
 	ExecIDs []string `json:"ExecIDs"`

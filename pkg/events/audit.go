@@ -38,6 +38,13 @@ const (
 	// describing no connection. TagLatencyMS/Privileged/AttributionKind are
 	// only meaningful on this type.
 	EventContainerAttribution AuditEventType = "container_attribution"
+	// EventCgroupWouldBlock is a connection the cgroup egress hook WOULD have
+	// dropped, reported while that hook is in shadow mode (issue #106 phase
+	// 3b). Nothing was blocked — TC's verdict still governed the packet.
+	// These measure the blast radius of the surfaces the cgroup hook newly
+	// adjudicates (loopback, docker bridge, container netns) before
+	// enforcement is turned on, so they are telemetry, not policy outcomes.
+	EventCgroupWouldBlock AuditEventType = "cgroup_would_block"
 )
 
 // Step-ordinal sentinels, mirroring STEP_ORD_* in tcbpf.c. Real workflow
@@ -150,11 +157,15 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 	// subsequent rule match opened the firewall, so the policy outcome is allow)
 	// and for step boundaries and container attributions, which describe no
 	// connection at all.
+	// cgroup_would_block also sets its own flags: nothing was blocked (the
+	// packet passed in shadow mode), so normalization must not stamp
+	// Blocked=true from the run's enforce posture.
 	if event.EventType != EventConnectionAllowed &&
 		event.EventType != EventConnectionLateAllowed &&
 		event.EventType != EventExistingConnection &&
 		event.EventType != EventStepBoundary &&
-		event.EventType != EventContainerAttribution {
+		event.EventType != EventContainerAttribution &&
+		event.EventType != EventCgroupWouldBlock {
 		if a.auditMode {
 			event.WouldDeny = true
 			event.Blocked = false

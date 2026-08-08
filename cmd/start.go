@@ -46,14 +46,12 @@ import (
 	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
 	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/config"
-	"github.com/code-cargo/cargowall/pkg/containers"
 	"github.com/code-cargo/cargowall/pkg/dns"
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/firewall"
 	"github.com/code-cargo/cargowall/pkg/lockdown"
 	"github.com/code-cargo/cargowall/pkg/network"
-	"github.com/code-cargo/cargowall/pkg/origin"
 	"github.com/code-cargo/cargowall/pkg/otlp"
 	"github.com/code-cargo/cargowall/pkg/steps"
 	"github.com/code-cargo/cargowall/pkg/tc"
@@ -433,6 +431,21 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}
 	}
 
+	// Loopback, all ports, whenever the cgroup egress hook may adjudicate
+	// (issue #106 phase 3b). TC egress is attached to one interface and has
+	// never seen `lo`, so loopback has never been subject to the allowlist;
+	// the cgroup hook fires on it. Without this every local-only flow — the
+	// runner's own services, test listeners, the DNS proxy's DNAT'd
+	// 127.0.0.1:53 — would meet default-deny. The BPF hook also carves
+	// loopback out directly; this is the userspace half of that pair, and it
+	// makes the allowance visible in the rendered policy rather than hidden
+	// in bytecode. MUST run after the config load above — a load replaces
+	// the rendered config wholesale (and ensureAllowed no-ops with no config
+	// loaded at all) — and before UpdateAllowlistTC programs the maps below.
+	if cmd.ContainerAttribution {
+		configMgr.EnsureInfraAllowed([]string{"127.0.0.0/8", "::1/128"}, nil, config.AutoAddedTypeLoopback)
+	}
+
 	// Late-allow reconciliation (#83): buffer recently blocked connections so
 	// the DNS enforcement path can re-report them as late-allowed once it
 	// opens the firewall for their destination IP. Registered as an audit
@@ -563,38 +576,18 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}
 	}
 
-	// Container attribution, kernel half (issue #106, phase 3a): the
-	// audit-only cgroup_skb/egress origin observer. Loaded here — before the
-	// event reader starts — so the join store exists before the first
-	// verdict event; the docker-events tracker that classifies its records
-	// starts later (after the dockerd restart) and late-binds into the
-	// enricher shell. Requires step attribution: without step tags the
-	// observer's ordinals would always be zero, and the 64-entry step-map
-	// shrink above would make tagging meaningless anyway. Warn-only
-	// throughout — nothing here may degrade enforcement.
-	var originObserver *origin.Observer
-	var containerEnricher *containers.Enricher
-	var enricherArg events.ContainerEnricher
-	if cmd.ContainerAttribution {
-		if stepTracker == nil {
-			logger.Warn("Container attribution disabled (requires active step attribution)")
-		} else {
-			containerEnricher = &containers.Enricher{}
-			enricherArg = containerEnricher
-			obs, err := origin.Start(&objs, logger)
-			if err != nil {
-				logger.Warn("Container origin observer disabled", "error", err)
-			} else {
-				originObserver = obs
-				defer obs.Close()
-				logger.Info("Container origin observer attached")
-			}
-		}
-	}
+	// Container attribution (issue #106, phase 3a), kernel half. The
+	// two-phase boot order — observer before the event reader, docker
+	// tracking after the dockerd restart — lives in containerAttribution;
+	// a nil value is the disabled feature and every call below no-ops.
+	attribution := newContainerAttribution(cmd.ContainerAttribution,
+		resolveMode(cmd.ContainerAttribution, cmd.CgroupEnforce),
+		stepTracker, &objs, logger)
+	defer attribution.Close()
 
 	// BPF runtime stats (3a telemetry): global kernel accounting while
 	// enabled; the per-program numbers land in one shutdown log line each.
-	// Registered after the observer's Close defer so the stats read runs
+	// Registered after attribution's Close defer so the stats read runs
 	// while the programs are still alive.
 	if cmd.BPFStats {
 		statsCloser, err := ebpf.EnableStats(unix.BPF_STATS_RUN_TIME)
@@ -604,8 +597,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			defer statsCloser.Close()
 			defer func() {
 				logProgStats(logger, "tc_egress", objs.TcEgress)
-				if originObserver != nil {
-					logProgStats(logger, "cg_origin_egress", originObserver.Program())
+				if p := attribution.observerProgram(); p != nil {
+					logProgStats(logger, "cg_origin_egress", p)
 				}
 			}()
 		}
@@ -622,7 +615,13 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	defer rd.Close()
 
 	// Start the event reader before the firewall is enforcing so no events are missed.
-	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, logger, enricherArg)
+	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, logger, attribution.enricherArg())
+
+	// Route the cgroup hook's verdicts into that same pipeline. Wired here,
+	// once the firewall exists, because late-allow needs it — and before the
+	// hook can leave observe mode, so no verdict is ever reported by a
+	// thinner path than a TC event would take.
+	attribution.wireVerdicts(configMgr, notificationTracker, auditLogger, fw)
 
 	// Set default action through firewall
 	defaultAction := configMgr.GetDefaultAction()
@@ -735,6 +734,13 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	if err != nil {
 		return fmt.Errorf("failed to attach TC egress: %w", err)
 	}
+
+	// Same ordering contract, applied to the cgroup egress hook: it has been
+	// attached since early startup (the join store needs it) but inert in
+	// observe mode. Raising it to shadow/enforce only now — after every rule
+	// above is programmed — is what keeps it clear of the same
+	// attach-before-program race.
+	attribution.enableMode()
 	// Registered with teardowns, not a bare defer: on TCX kernels the link
 	// dies with the process fd anyway, but the legacy clsact fallback
 	// (kernels <6.6) installs a netlink cls_bpf filter that OUTLIVES the
@@ -807,23 +813,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}
 	}
 
-	// Container attribution, userspace half: docker-events tracking, process
-	// tagging, and container identity. Started after the dockerd restart
-	// above so the event subscription isn't severed by it; the tracker's
-	// reconnect loop covers everything else. Warn-only, like steps.Start.
-	if cmd.ContainerAttribution && stepTracker != nil {
-		ctr, err := containers.Start(ctx, containers.Options{}, stepTracker, originObserver, auditLogger, logger)
-		if err != nil {
-			logger.Warn("Container attribution disabled", "error", err)
-		} else {
-			defer ctr.Close()
-			containerEnricher.Bind(ctr)
-			if dnsServer != nil && dockerBridgeIP != "" {
-				dnsServer.SetContainerLookup(ctr.LookupClient)
-			}
-			logger.Info("Container attribution enabled")
-		}
-	}
+	// Container attribution, userspace half — after the dockerd restart
+	// above, for the ordering reasons containerAttribution documents.
+	attribution.startUserspace(ctx, dnsServer, dockerBridgeIP, auditLogger)
 
 	if startupInterrupted(ctx, logger, "pre-ready") {
 		return nil

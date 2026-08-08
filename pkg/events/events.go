@@ -133,6 +133,11 @@ type BpfBlockedEvent struct {
 	StepOrdinal uint32 // workflow step that created the socket (0 = untagged); see StepOrdinal* sentinels
 }
 
+// ProtocolName returns the display name for an IP protocol number, matching
+// what connection events carry. Exported for producers outside this package
+// that build AuditEvents directly (pkg/containers' cgroup-verdict path).
+func ProtocolName(proto uint8) string { return getProtocolName(proto) }
+
 // getProtocolName returns the name of an IP protocol number
 func getProtocolName(proto uint8) string {
 	switch proto {
@@ -304,150 +309,13 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			(event.DstIp>>8)&0xFF, event.DstIp&0xFF)
 	}
 
-	// Look up hostname from config manager
-	hostname := configMgr.LookupHostnameByIP(dstIP)
-	if hostname == "" {
-		logger.Debug("DNS cache miss", "ip", dstIP)
-	} else {
-		logger.Debug("DNS cache hit", "hostname", hostname, "ip", dstIP)
-	}
+	hostname, cnameChain := resolveDestination(configMgr, dstIP, logger)
 
-	// Lazy reverse DNS for IPs not in the cache.
-	// Each unique IP is only looked up once.
-	if hostname == "" {
-		if !reverseDNSAttempted(dstIP) {
-			// Step 1: Try PTR lookup
-			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-			names, err := reverseDNSResolver.LookupAddr(ctx, dstIP)
-			cancel()
-			if err == nil && len(names) > 0 {
-				// Lowercased so an unmatched PTR name is reported in the same
-				// canonical case as forward mappings and tracked-rule matches,
-				// keeping connection-event output consistent (#65). PTR replies
-				// can carry mixed/0x20-randomized case off the wire.
-				ptrName := strings.ToLower(strings.TrimSuffix(names[0], "."))
-				// Try to match PTR result to a tracked hostname
-				if tracked := configMgr.FindTrackedHostname(ptrName); tracked != "" {
-					hostname = tracked
-				} else {
-					hostname = ptrName
-				}
-				configMgr.UpdateDNSMapping(hostname, dstIP)
-				logger.Debug("Lazy reverse DNS resolved", "ip", dstIP, "hostname", hostname)
-			}
-
-			// Step 2: If PTR failed, try forward-matching all tracked hostnames
-			if hostname == "" {
-				if match := configMgr.ForwardMatchIP(dstIP); match != "" {
-					hostname = match
-					configMgr.UpdateDNSMapping(hostname, dstIP)
-					logger.Debug("Forward DNS match resolved", "ip", dstIP, "hostname", hostname)
-				}
-			}
-		}
-	}
-
-	// CNAME attribution: if this IP was reached as a CNAME target of an allowed
-	// host (derived-allow enforcement recorded the chain — see
-	// Manager.RecordCNAMEChain), report the connection under the origin hostname
-	// the user actually allowed (chain[0]) and surface the full chain as a
-	// drill-down field. For an edge IP shared by several allowed origins,
-	// LookupCNAMEChain returns the most recently-resolved one. Done before the
-	// late-allow block so a blocked derived connection on a non-inherited port
-	// also attributes to the origin and runs the late-allow check against the
-	// origin's rule. Setting hostname = chain[0] is a no-op when the resolved
-	// hostname already is the origin (e.g. the IP was later re-mapped in-band),
-	// but we still attach the chain so the drill-down isn't dropped.
-	var cnameChain []string
-	if chain := configMgr.LookupCNAMEChain(dstIP); len(chain) > 0 && chain[0] != "" {
-		cnameChain = chain
-		hostname = chain[0]
-	}
-
-	// Late-add: if a blocked event resolves to a hostname that's actually
-	// allowed (e.g. process bypassed our DNS proxy with a cached IP), open the
-	// firewall so future retries succeed. Only treat the triggering connection
-	// itself as late-allowed when its dst_port is in the rule's allow set —
-	// otherwise the retry will still be blocked and we'd misreport.
-	//
-	// Restricted to TCP/UDP because fw.AddIP exists to open BPF state for TCP
-	// SYN / UDP retries; non-TCP/UDP events can't benefit and we don't want to
-	// pollute the firewall or misreport as late-allowed.
 	var lateAllowed bool
 	var matchedRule string
-	if hostname != "" && event.Allowed == 0 && fw != nil &&
-		(event.IpProto == unix.IPPROTO_TCP || event.IpProto == unix.IPPROTO_UDP) {
-		verdict := configMgr.MatchHostnameRule(hostname)
-		if verdict.HasAllow() {
-			matchedRule = verdict.AllowRule
-			ip := net.ParseIP(dstIP)
-			if ip != nil {
-				// Write the deny side first (if any) so a mixed verdict —
-				// e.g. `*.compute.internal: deny 80` + `bastion: allow 22`
-				// — preserves the deny on its ports even though we're
-				// opening the firewall for the allow side. Order doesn't
-				// matter for correctness (per-port entries are
-				// independent), but writing deny first makes the resulting
-				// BPF state self-consistent if the allow write later
-				// fails.
-				if verdict.HasDeny() {
-					if _, denyErr := fw.AddIP(ip, config.ActionDeny, verdict.DenyPorts); denyErr != nil {
-						logger.Error("Late-resolved deny add failed",
-							"ip", dstIP, "hostname", hostname, "error", denyErr)
-					}
-				}
-
-				changed, err := fw.AddIP(ip, config.ActionAllow, verdict.AllowPorts)
-				if err != nil {
-					// Surface the failure for triage — the event will fall
-					// through to the blocked branch (lateAllowed stays false),
-					// so absence of this log + a "Connection blocked" entry
-					// means the firewall write is the proximate cause.
-					logger.Error("Late-resolved IP add failed",
-						"ip", dstIP, "hostname", hostname, "error", err)
-				} else {
-					if changed {
-						// `changed` covers both "IP was new" and "IP was
-						// present but new per-port entries were written"
-						// (shared-IP-different-ports case) — see
-						// Firewall.AddIP contract.
-						logger.Info("Late-resolved IP firewall state updated",
-							"ip", dstIP, "hostname", hostname, "ports", verdict.AllowPorts)
-					} else {
-						// IP already in the BPF map with matching state —
-						// useful when triaging "why didn't this connection
-						// succeed on retry?".
-						logger.Debug("Late-resolved IP already in firewall",
-							"ip", dstIP, "hostname", hostname, "ports", verdict.AllowPorts)
-					}
-					// Best-effort prediction of "will the retry succeed?" from
-					// this rule's own ports: FirewallImpl reconciles per-port
-					// entries before the LPM no-op check, so on err==nil the
-					// current rule's `ports` are in map_ports even when the IP
-					// was already in the LPM from a different rule with disjoint
-					// ports.
-					//
-					// For a mixed verdict (e.g. `*.foo: deny 80` + `bar:
-					// allow all` on `bar.foo`), AllowPorts may be empty (all
-					// ports) while DenyPorts covers the event's port. The
-					// retry on that port will still be blocked by the deny
-					// side's per-port BPF entry, so it is NOT late-allowed.
-					//
-					// Caveat: this looks only at THIS hostname's verdict, not at
-					// other rules that resolved to the same shared IP. If that IP
-					// already carries a conflicting all-ports grant (e.g. a
-					// different all-ports-deny host shares it), the firewall's
-					// PortSpecific=0 stickiness makes this rule's per-port entry
-					// inert, so the audited late-allow/blocked label can diverge
-					// from the actual BPF verdict for that edge. Enforcement is
-					// unaffected — this only governs the audit/notification.
-					allowMatches := dstPortAllowedByRule(event.DstPort, event.IpProto, verdict.AllowPorts)
-					denyMatches := verdict.HasDeny() &&
-						dstPortAllowedByRule(event.DstPort, event.IpProto, verdict.DenyPorts)
-					lateAllowed = allowMatches && !denyMatches
-				}
-			}
-		}
+	if event.Allowed == 0 {
+		lateAllowed, matchedRule = tryLateAllow(configMgr, fw, hostname, dstIP,
+			event.DstPort, event.IpProto, logger)
 	}
 
 	displayHostname := hostname
@@ -455,21 +323,23 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		displayHostname = dstIP
 	}
 
-	// Extract process info (name looked up from /proc since bpf_get_current_comm is unavailable in TC programs)
-	pid := event.Pid
-	comm := lookupProcessName(pid)
-
-	// One audit record underlies every outcome branch below: each branch
-	// stamps its event type and type-specific fields onto this base and
-	// hands it to LogEvent (which fills the timestamp and verdict flags).
+	// One audit record underlies every outcome branch below — and every
+	// observable channel: each branch stamps its event type and
+	// type-specific fields onto this base, hands it to LogEvent (which
+	// fills the timestamp and verdict flags), and logs through
+	// logConnEvent, which reads identity from this same struct. Identity
+	// lives here and only here, so the enrichment below can never produce
+	// a log line that disagrees with the audit stream. (The process name
+	// is looked up from /proc since bpf_get_current_comm is unavailable in
+	// TC programs.)
 	audit := AuditEvent{
 		SrcIP:       srcIP,
 		DstIP:       dstIP,
 		DstHostname: hostname,
 		DstPort:     event.DstPort,
 		Protocol:    getProtocolName(event.IpProto),
-		Process:     comm,
-		PID:         pid,
+		Process:     lookupProcessName(event.Pid),
+		PID:         event.Pid,
 		CNAMEChain:  cnameChain,
 		StepOrdinal: event.StepOrdinal,
 	}
@@ -481,7 +351,15 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		enricher.Enrich(&audit, event)
 	}
 
-	if event.Allowed == 1 {
+	out := Outcome{
+		Audit:           audit,
+		SrcPort:         event.SrcPort,
+		DisplayHostname: displayHostname,
+		NotifyPort:      event.DstPort,
+	}
+
+	switch {
+	case event.Allowed == 1:
 		// Check if this connection was allowed by an auto-added rule.
 		// Pass the event's L4 protocol so the port match is protocol-aware
 		// (TCP/443 and UDP/443 rules don't conflate). Unknown protocols
@@ -492,109 +370,26 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		if !ok {
 			eventProto = config.ProtocolAll
 		}
-		autoAllowedType := string(configMgr.GetAutoAllowedType(dstIP, event.DstPort, eventProto, hostname))
+		out.Kind = OutcomeAllowed
+		out.Audit.AutoAllowedType = string(configMgr.GetAutoAllowedType(dstIP, event.DstPort, eventProto, hostname))
 
-		// Allowed TCP SYN connection
-		logConnEvent(logger, "Connection allowed", cnameChain,
-			"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
-			"dst", displayHostname,
-			"dst_ip", dstIP,
-			"dst_port", event.DstPort,
-			"process", comm,
-			"pid", pid)
+	case event.IsProtocolBlock():
+		// Non-TCP/UDP protocol block — dst_port carried the protocol number.
+		out.Kind = OutcomeProtocolBlocked
+		out.SrcPort = 0
+		out.ProtocolNum = event.DstPort
+		out.Audit.Protocol = getProtocolName(uint8(event.DstPort))
 
-		if auditLogger != nil {
-			audit.EventType = EventConnectionAllowed
-			audit.AutoAllowedType = autoAllowedType
-			if err := auditLogger.LogEvent(audit); err != nil {
-				logger.Error("Failed to write audit log", "error", err)
-			}
-		}
-	} else if event.IsProtocolBlock() {
-		// Non-TCP/UDP protocol block — dst_port contains the protocol number
-		protocolName := getProtocolName(uint8(event.DstPort))
-		logConnEvent(logger, "Protocol blocked", cnameChain,
-			"src", srcIP,
-			"dst", displayHostname,
-			"dst_ip", dstIP,
-			"protocol", protocolName,
-			"protocol_num", event.DstPort,
-			"process", comm,
-			"pid", pid)
+	case lateAllowed:
+		out.Kind = OutcomeLateAllowed
+		out.Audit.MatchedRule = matchedRule
 
-		// Log to audit file if configured
-		if auditLogger != nil {
-			audit.EventType = EventProtocolBlocked
-			audit.Protocol = protocolName
-			audit.DstPort = 0 // carried the protocol number, not a port
-			if err := auditLogger.LogEvent(audit); err != nil {
-				logger.Error("Failed to write audit log", "error", err)
-			}
-		}
-
-		// Send notification if we have a tracker
-		if notificationTracker != nil {
-			notificationTracker.SendNotification(hostname, dstIP, event.DstPort)
-		}
-	} else if lateAllowed {
-		// Policy outcome is allow (the retry will succeed), so log accordingly
-		// and skip the block notification. matchedRule is the rule's Value
-		// (pattern string for glob rules, configured hostname for plain rules) —
-		// distinct from displayHostname, which is the reported destination: the
-		// CNAME origin when this IP was reached via an allowed host's chain,
-		// otherwise the resolved hostname.
-		logConnEvent(logger, "Connection late-allowed", cnameChain,
-			"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
-			"dst", displayHostname,
-			"dst_ip", dstIP,
-			"dst_port", event.DstPort,
-			"process", comm,
-			"pid", pid,
-			"matched_rule", matchedRule)
-
-		if auditLogger != nil {
-			audit.EventType = EventConnectionLateAllowed
-			audit.MatchedRule = matchedRule
-			if err := auditLogger.LogEvent(audit); err != nil {
-				logger.Error("Failed to write audit log", "error", err)
-			}
-		}
-	} else {
-		// Blocked TCP SYN, UDP, or mid-stream TCP connection. Mid-stream
-		// means an established connection was killed because its destination
-		// isn't allowed (e.g. a pre-existing socket whose IP was never
-		// seeded) — surfaced distinctly so operators can tell a killed
-		// connection from a refused new one.
-		midStream := event.Flags&BpfEventFlagMidstream != 0
-		msg := "Connection blocked"
-		if midStream {
-			msg = "Connection blocked (mid-stream)"
-		}
-		logConnEvent(logger, msg, cnameChain,
-			"src", fmt.Sprintf("%s:%d", srcIP, event.SrcPort),
-			"dst", displayHostname,
-			"dst_ip", dstIP,
-			"dst_port", event.DstPort,
-			"process", comm,
-			"pid", pid)
-
-		// Log to audit file if configured. Mid-stream kills stay
-		// EventConnectionBlocked (with MidStream set) so the RecentBlocks
-		// reconciler, summary pipeline, and OTLP mapping treat them like
-		// any other block.
-		if auditLogger != nil {
-			audit.EventType = EventConnectionBlocked
-			audit.MidStream = midStream
-			if err := auditLogger.LogEvent(audit); err != nil {
-				logger.Error("Failed to write audit log", "error", err)
-			}
-		}
-
-		// Send notification if we have a tracker
-		if notificationTracker != nil {
-			notificationTracker.SendNotification(hostname, dstIP, event.DstPort)
-		}
+	default:
+		out.Kind = OutcomeBlocked
+		out.Audit.MidStream = event.Flags&BpfEventFlagMidstream != 0
 	}
+
+	emitOutcome(out, notificationTracker, auditLogger, logger)
 }
 
 // cnameLogAttr returns the slog key/value pair surfacing the CNAME drill-down
@@ -609,11 +404,20 @@ func cnameLogAttr(chain []string) []any {
 	return []any{"cname_chain", chain}
 }
 
-// logConnEvent emits a connection event at Info, appending the CNAME drill-down
-// attribute when present. Centralizes the append/cnameLogAttr wiring so every
-// event type surfaces cname_chain consistently.
-func logConnEvent(logger *slog.Logger, msg string, cnameChain []string, attrs ...any) {
-	logger.Info(msg, append(attrs, cnameLogAttr(cnameChain)...)...)
+// logConnEvent emits a connection event at Info. Identity and attribution
+// (process, pid, step ordinal, container origin, CNAME chain) come from the
+// audit record — the single source the audit stream also observes — so
+// container enrichment can never make the live log and the audit log
+// disagree about who owned a connection.
+func logConnEvent(logger *slog.Logger, msg string, audit *AuditEvent, attrs ...any) {
+	attrs = append(attrs, "process", audit.Process, "pid", audit.PID)
+	if audit.StepOrdinal != 0 {
+		attrs = append(attrs, "step_ordinal", audit.StepOrdinal)
+	}
+	if audit.ContainerOrigin {
+		attrs = append(attrs, "container_origin", true, "container_id", audit.ContainerID)
+	}
+	logger.Info(msg, append(attrs, cnameLogAttr(audit.CNAMEChain)...)...)
 }
 
 // ProcessBlockedEvents processes blocked connection events. enricher is

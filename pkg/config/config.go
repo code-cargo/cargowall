@@ -1675,16 +1675,20 @@ func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoA
 		}
 		cidr := ipnet.String()
 
-		// Check if a rule already covers this network's base address.
+		// Check if a rule already covers this ENTIRE network. Testing only
+		// the base address would let a narrower existing rule (127.0.0.0/32
+		// containing the base of 127.0.0.0/8) suppress the whole broader
+		// prefix, silently dropping the userspace half of the loopback
+		// carve-out pair.
 		if len(ports) == 0 {
-			if cm.hasCIDRRuleAllPorts(ipnet.IP.String()) {
+			if cm.cidrCoveredLocked(ipnet, nil) {
 				slog.Debug("Allow rule already exists (all ports)", "cidr", cidr)
 				continue
 			}
 		} else {
 			covered := true
 			for _, p := range ports {
-				if !cm.hasCIDRRule(ipnet.IP.String(), p) {
+				if !cm.cidrCoveredLocked(ipnet, &p) {
 					covered = false
 					break
 				}
@@ -1715,62 +1719,34 @@ func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoA
 	}
 }
 
-// hasCIDRRuleAllPorts checks if an existing CIDR rule already covers the given
-// IP on all ports (i.e. has an empty/nil Ports list). Must be called with cm.mu held.
-func (cm *Manager) hasCIDRRuleAllPorts(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-
-	for _, rule := range cm.config.Rules {
-		if rule.Type != RuleTypeCIDR || rule.Action != ActionAllow {
-			continue
-		}
-
-		// normalizeRules promotes bare IPs to explicit /32 or /128 prefixes at
-		// load time, so every valid CIDR rule parses and host routes match via
-		// Contains; the only remaining ParseCIDR failure is a malformed value
-		// resolveRules already skipped, so skip it here too.
-		_, ipnet, err := net.ParseCIDR(rule.Value)
-		if err != nil || !ipnet.Contains(ip) {
-			continue
-		}
-
-		// IP matches — only return true if this rule covers ALL ports
-		if len(rule.Ports) == 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// hasCIDRRule checks if an existing CIDR rule already covers the given IP and port+protocol.
+// cidrCoveredLocked reports whether one existing CIDR rule covers the ENTIRE
+// target network: it must contain the target's base address at an
+// equal-or-broader prefix (same address family). port == nil demands an
+// all-ports allow rule; otherwise an all-ports rule or an explicit port
+// entry both cover.
 // Must be called with cm.mu held.
-func (cm *Manager) hasCIDRRule(ipStr string, port Port) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-
+func (cm *Manager) cidrCoveredLocked(target *net.IPNet, port *Port) bool {
+	tOnes, tBits := target.Mask.Size()
 	for _, rule := range cm.config.Rules {
 		if rule.Type != RuleTypeCIDR {
 			continue
 		}
-
-		// normalizeRules promotes bare IPs to explicit /32 or /128 prefixes at
-		// load time, so every valid CIDR rule parses and host routes match via
-		// Contains; the only remaining ParseCIDR failure is a malformed value
-		// resolveRules already skipped, so skip it here too.
-		_, ipnet, err := net.ParseCIDR(rule.Value)
-		if err != nil || !ipnet.Contains(ip) {
+		if port == nil && rule.Action != ActionAllow {
 			continue
 		}
-
-		// IP matches — check if ports cover our target port+protocol
+		_, rnet, err := net.ParseCIDR(rule.Value)
+		if err != nil || !rnet.Contains(target.IP) {
+			continue
+		}
+		rOnes, rBits := rnet.Mask.Size()
+		if rBits != tBits || rOnes > tOnes {
+			continue // different family, or narrower than the target
+		}
 		if len(rule.Ports) == 0 {
-			// No port restriction means all ports are covered
 			return true
+		}
+		if port == nil {
+			continue // target wants all ports; this rule is port-limited
 		}
 		for _, p := range rule.Ports {
 			if p.Port == port.Port && ProtocolsOverlap(p.Protocol, port.Protocol) {
@@ -1870,7 +1846,7 @@ func (cm *Manager) GetIPToHostnameMap() map[string]string {
 // protocol — that matches any rule that also uses ProtocolAll, plus TCP
 // and UDP rules with the same port. Passing a specific protocol (TCP /
 // UDP / ICMP) narrows the match to rules whose protocol overlaps via
-// ProtocolsOverlap (consistent with hasCIDRRule).
+// ProtocolsOverlap (consistent with cidrCoveredLocked).
 //
 // Hostname rules are checked first, then CIDR rules. This matters when an
 // IP is covered by BOTH (e.g. github.com's resolved IP also falls inside

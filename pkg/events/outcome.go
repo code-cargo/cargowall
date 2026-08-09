@@ -386,6 +386,11 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 	switch {
 	case !rec.Dropped:
 		out.Kind = OutcomeWouldBlock
+		// A would-block keeps the mid-stream flag: shadow mode exists to
+		// predict what enforcement would do, and "would kill an established
+		// flow" is precisely the datum an operator weighs before flipping
+		// --cgroup-enforce. TC's audit-mode would-denies carry it too.
+		out.Audit.MidStream = rec.MidStream
 	case lateAllowed:
 		out.Kind = OutcomeLateAllowed
 		out.Audit.MatchedRule = matchedRule
@@ -400,9 +405,9 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 		out.NotifyPort = uint16(rec.Proto)
 	default:
 		out.Kind = OutcomeBlocked
-		// Mid-stream is a property of a BLOCK — "an established connection
-		// was killed" — so it is stamped only here, exactly as the TC path
-		// does. A late-allowed or would-block record must not carry it.
+		// Mid-stream is a property of a DENIAL — real (here) or predicted
+		// (the would-block arm above) — never of a late-allow, whose whole
+		// point is that the flow is not being killed.
 		out.Audit.MidStream = rec.MidStream
 	}
 

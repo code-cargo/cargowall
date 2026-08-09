@@ -153,9 +153,12 @@ const (
 	// pipeline (up to a 500ms PTR lookup per cold destination), so it must
 	// never run on the reader goroutine — a stalled reader overflows the
 	// 128KB kernel ring and silently loses records. Overflow here drops the
-	// REPORT only (counted and logged); enforcement and the join store are
-	// unaffected.
-	verdictQueueDepth = 1024
+	// REPORT only (counted, logged, and summarized at Close); enforcement
+	// and the join store are unaffected. Sized generously (~120B/record)
+	// because a deep queue is cheap and every dropped report is an audit
+	// event that never happens; Close does not pay for the depth — it
+	// abandons the backlog rather than draining it through the slow sink.
+	verdictQueueDepth = 4096
 )
 
 // Observer owns the loaded collection, its root-cgroup attachment, the
@@ -178,6 +181,10 @@ type Observer struct {
 	// reporting pipeline (see verdictQueueDepth).
 	verdictCh  chan Record
 	reportDone chan struct{}
+	// closing tells reportLoop to stop invoking the (slow) sink and just
+	// count the backlog: Close must never hang behind minutes of queued PTR
+	// lookups while the hook is still attached and teardowns wait.
+	closing atomic.Bool
 
 	mu    sync.Mutex
 	flows map[flowKey][]Record
@@ -253,6 +260,13 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	// always attributable to whoever caused it.
 	o.logAttachedEgressPrograms("pre-attach")
 
+	// Coexistence with other root-cgroup egress programs (Docker's,
+	// systemd's) needs no explicit BPF_F_ALLOW_MULTI here: AttachCgroup
+	// attaches via bpf_link (kernel >= 5.7, under our 5.8 floor), and cgroup
+	// bpf_links always attach with allow-multi semantics; its legacy
+	// PROG_ATTACH fallback — reachable only below the floor — tries
+	// ALLOW_MULTI before anything else. The pre/post program query logged
+	// below is the observational check that nobody was displaced.
 	l, err := link.AttachCgroup(link.CgroupOptions{
 		// Root cgroup, same rationale as the connect/sendmsg hooks: observe
 		// every process on the machine, containers included.
@@ -280,15 +294,21 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	return o, nil
 }
 
-// Close stops the reader, drains the verdict-reporting worker, detaches the
+// Close stops the reader, stops the verdict-reporting worker, detaches the
 // observer, and releases the collection, in that order so the reader never
-// sees a closed map and no queued verdict report is lost at shutdown.
+// sees a closed map. The worker is stopped by ABANDONING its backlog, not
+// draining it: each queued report can cost a 500ms PTR lookup, and a full
+// queue would hold shutdown — and every teardown behind it (iptables DNAT,
+// daemon.json restore) — hostage for minutes while the hook is still
+// attached. Only the report in flight completes; abandoned reports are
+// counted and surfaced in the summary line below.
 func (o *Observer) Close() {
 	if o.reader != nil {
 		_ = o.reader.Close()
 		<-o.done // run() exits promptly on ringbuf.ErrClosed
 	}
 	if o.verdictCh != nil {
+		o.closing.Store(true)
 		close(o.verdictCh) // run() was the only sender and has exited
 		<-o.reportDone
 	}
@@ -296,6 +316,15 @@ func (o *Observer) Close() {
 		_ = o.link.Close()
 	}
 	o.objs.Close()
+	// The shutdown accounting for this hook's verdicts: how many denials it
+	// saw, and how many reports never became audit events (queue overflow
+	// during a denial storm, or backlog abandoned just now). A non-zero
+	// dropped count means audit/late-allow coverage has gaps even though
+	// enforcement and the join store were unaffected.
+	o.logger.Info("Origin observer closed",
+		"records", o.records.Load(),
+		"blocked", o.blocked.Load(),
+		"verdict_reports_dropped", o.verdictsDropped.Load())
 }
 
 // Program exposes the observer program for BPF runtime-stats logging.
@@ -304,8 +333,16 @@ func (o *Observer) Program() *ebpf.Program { return o.objs.CgOriginEgress }
 // SetVerdictSink installs the callback that receives would-block/block
 // records. Must be called before the mode is raised above observe. The sink
 // runs on the reporting worker, never on the ringbuf reader — it may do
-// slow work (hostname resolution, firewall writes, audit I/O).
-func (o *Observer) SetVerdictSink(fn func(Record)) { o.verdicts.Store(&fn) }
+// slow work (hostname resolution, firewall writes, audit I/O). A nil fn
+// uninstalls the sink (a stored pointer to a nil func would pass
+// reportLoop's nil check and panic on invocation).
+func (o *Observer) SetVerdictSink(fn func(Record)) {
+	if fn == nil {
+		o.verdicts.Store(nil)
+		return
+	}
+	o.verdicts.Store(&fn)
+}
 
 // SetMode raises (or lowers) the hook's enforcement posture. Callers MUST
 // only raise it above ModeObserve once the allowlist, DNS/infra auto-allows,
@@ -393,6 +430,12 @@ func (o *Observer) run() {
 func (o *Observer) reportLoop() {
 	defer close(o.reportDone)
 	for rec := range o.verdictCh {
+		if o.closing.Load() {
+			// Shutdown: count the abandoned backlog instead of holding Close
+			// behind one slow sink call per queued record.
+			o.verdictsDropped.Add(1)
+			continue
+		}
 		if fn := o.verdicts.Load(); fn != nil {
 			(*fn)(rec)
 		}
@@ -479,11 +522,16 @@ func (o *Observer) insert(ev *bpf.OriginEvent) {
 		// Second-chance eviction: a key refreshed since it was last
 		// considered is rotated to the back (its hot bit cleared) instead of
 		// evicted, so continuously re-emitted destinations outlive keys idle
-		// since insertion. Terminates: each rotation clears one hot bit.
+		// since insertion. The key just inserted is rotated too, never
+		// evicted — when every other key is hot, a full rotation would
+		// otherwise leave it at the front and evict the very record this
+		// call came to store. Terminates: each rotation clears one hot bit
+		// (the new key gets exactly one free rotation), so a cold victim is
+		// reached within one lap.
 		for len(o.flows) > storeMaxKeys && len(o.fifo) > 0 {
 			victim := o.fifo[0]
 			o.fifo = o.fifo[1:]
-			if _, isHot := o.hot[victim]; isHot {
+			if _, isHot := o.hot[victim]; isHot || victim == key {
 				delete(o.hot, victim)
 				o.fifo = append(o.fifo, victim)
 				continue

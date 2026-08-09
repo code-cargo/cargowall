@@ -45,11 +45,15 @@ const (
 )
 
 // joinResult is resolveJoin's decision. rec and info are meaningful only
-// for joinResolved; info nil there means a host flow.
+// for joinResolved; info nil there means a host flow. pidDropped records
+// that the candidates disagreed on PID and the process claim was zeroed —
+// applyJoin needs it so a host-flow join with nothing left to stamp is
+// still counted (as ambiguity) rather than falling through every counter.
 type joinResult struct {
-	kind joinKind
-	rec  origin.Record
-	info *containerInfo
+	kind       joinKind
+	rec        origin.Record
+	info       *containerInfo
+	pidDropped bool
 }
 
 // resolveJoin is the join-agreement policy, pure so it is testable without
@@ -84,6 +88,7 @@ func resolveJoin(recs []origin.Record, classify func(origin.Record) *containerIn
 	res := joinResult{kind: joinResolved, rec: recs[0], info: first}
 	if !pidsAgree {
 		res.rec.PID = 0 // container and step stand; the process claim does not
+		res.pidDropped = true
 	}
 	return res
 }
@@ -176,6 +181,11 @@ func (t *Tracker) applyJoin(audit *events.AuditEvent, res joinResult) {
 		// Host flow the TC join missed (e.g. map_sock_pid eviction): the
 		// origin record still knows its socket. Pure bonus attribution.
 		t.tcEnriched.Add(1)
+	case res.pidDropped:
+		// Host candidates that agreed on everything except PID: the join
+		// resolved but nothing could be claimed. Counted as ambiguity so
+		// the correlation summary accounts for every joined event.
+		t.tcAmbiguous.Add(1)
 	}
 }
 

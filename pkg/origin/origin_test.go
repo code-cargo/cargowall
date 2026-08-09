@@ -240,6 +240,36 @@ func TestStoreEvictionGivesRefreshedKeysASecondChance(t *testing.T) {
 	require.LessOrEqual(t, len(o.flows), storeMaxKeys)
 }
 
+// When every existing key is hot, a full rotation clears every hot bit —
+// and must then evict an old cold key, never the key this insert came to
+// store (which would discard the record before any TC event could join it).
+func TestStoreEvictionAllHotKeepsNewKey(t *testing.T) {
+	o := newTestObserver()
+	for i := range storeMaxKeys {
+		o.insert(v4Event(uint64(i+1), 0xAC110002, uint32(0x0A000000+i), 40001, 443))
+	}
+	for i := range storeMaxKeys { // refresh every key: the whole store is hot
+		o.insert(v4Event(uint64(i+1), 0xAC110002, uint32(0x0A000000+i), 40001, 443))
+	}
+	o.insert(v4Event(9999, 0xAC110002, 0x0B000000, 40001, 443))
+	require.NotNil(t, o.LookupV4(0x0B000000, 443, 6, 0),
+		"the just-inserted key must never be its own eviction victim")
+	require.LessOrEqual(t, len(o.flows), storeMaxKeys)
+}
+
+// SetVerdictSink(nil) uninstalls the sink; storing a pointer to a nil func
+// would pass reportLoop's nil check and panic on the first block record.
+func TestSetVerdictSinkNilUninstalls(t *testing.T) {
+	o := newTestObserver()
+	go o.reportLoop()
+	o.SetVerdictSink(nil)
+	ev := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	ev.Verdict = uint8(VerdictBlock)
+	o.insert(ev) // must not panic the report worker
+	close(o.verdictCh)
+	<-o.reportDone
+}
+
 // TestOriginConstantsMatchBpfSource pins the Go constants to the C source
 // the way TestDNSProxyFWMarkMatchesGoConstant pins the firewall mark: the
 // ORIGIN_MODE_*, ORIGIN_VERDICT_* and ORIGIN_FLAG_* values are mirrored in

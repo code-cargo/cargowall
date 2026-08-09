@@ -220,10 +220,19 @@ func (c *StartCmd) AfterApply() error {
 	// Refuse rather than silently downgrade: an operator who asked for
 	// enforcement believes pre-NAT/loopback/bridge egress is policed, and a
 	// run that quietly dropped that request is indistinguishable from one
-	// that honored it. (Runs after preset expansion, so --github-action —
-	// which implies --container-attribution — satisfies the requirement.)
+	// that honored it. Both prerequisites are checked — container
+	// attribution AND the step attribution it rides on — because either
+	// being absent statically guarantees newContainerAttribution returns
+	// nil and the requested posture evaporates. (Runs after preset
+	// expansion, so --github-action — which implies both — satisfies the
+	// requirement.) Step attribution can still fail at RUNTIME (no kernel
+	// BTF, no Runner.Worker); that residual downgrade is warned loudly in
+	// newContainerAttribution.
 	if c.CgroupEnforce && !c.ContainerAttribution {
 		return fmt.Errorf("--cgroup-enforce requires --container-attribution")
+	}
+	if c.CgroupEnforce && !c.StepAttribution {
+		return fmt.Errorf("--cgroup-enforce requires --step-attribution (container attribution rides on step attribution)")
 	}
 	return nil
 }

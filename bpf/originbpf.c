@@ -322,8 +322,6 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
     __u32 src_ip = bpf_ntohl(ip_hdr.saddr);
     __u32 dst_ip = bpf_ntohl(ip_hdr.daddr);
     __u8 ip_proto = ip_hdr.protocol;
-    __u8 carve_out = ((dst_ip >> 24) == 127) || (ip_proto == IPPROTO_ICMP) ||
-                     (origin_lo_carveout() && skb->ifindex == LOOPBACK_IFINDEX);
 
     __u16 frag_off = bpf_ntohs(ip_hdr.frag_off);
     __u8 non_first_frag = (frag_off & 0x1FFF) != 0;
@@ -367,18 +365,26 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
 
     __u8 allowed = 1;
     __u8 verdict = ORIGIN_VERDICT_NONE;
-    if (mode != ORIGIN_MODE_OBSERVE && !carve_out) {
-        allowed = verdict_allowed_v4(ip_hdr.daddr, dst_port, ip_proto);
-        verdict = verdict_label(mode, allowed);
-        // Surface our own denials (dedup still applies), for exactly the
-        // shapes tc_egress reports for the same denial: connection attempts
-        // (SYN), killed established flows (midstream), UDP, and other
-        // protocols. Deliberately silent, as at TC: kernel RST replies to
-        // inbound port scans and SYN-ACK replies to inbound handshakes (TCP
-        // with flags 0 — constant noise on a public CI runner), and non-first
-        // fragments (the flow's first packet already carried this verdict).
-        if (!allowed && !non_first_frag && (ip_proto != IPPROTO_TCP || flags != 0))
-            emit = 1;
+    if (mode != ORIGIN_MODE_OBSERVE) {
+        // Carve-out evaluated only when a verdict would be, so observe mode
+        // never pays for it; operand order keeps the config-map lookup
+        // confined to packets actually on the loopback device.
+        __u8 carve_out = ((dst_ip >> 24) == 127) || (ip_proto == IPPROTO_ICMP) ||
+                         (skb->ifindex == LOOPBACK_IFINDEX && origin_lo_carveout());
+        if (!carve_out) {
+            allowed = verdict_allowed_v4(ip_hdr.daddr, dst_port, ip_proto);
+            verdict = verdict_label(mode, allowed);
+            // Surface our own denials (dedup still applies), for exactly the
+            // shapes tc_egress reports for the same denial: connection
+            // attempts (SYN), killed established flows (midstream), UDP, and
+            // other protocols. Deliberately silent, as at TC: kernel RST
+            // replies to inbound port scans and SYN-ACK replies to inbound
+            // handshakes (TCP with flags 0 — constant noise on a public CI
+            // runner), and non-first fragments (the flow's first packet
+            // already carried this verdict).
+            if (!allowed && !non_first_frag && (ip_proto != IPPROTO_TCP || flags != 0))
+                emit = 1;
+        }
     }
 
     if (emit) {
@@ -487,21 +493,23 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
         dst_port = bpf_ntohs(udp_hdr.dest);
     }
 
-    // Local-only traffic that used a non-loopback v6 address (the host's own
-    // global address over lo): same carve-out class as the IPv4 handler; ::1
-    // itself returned above.
-    __u8 carve_out = origin_lo_carveout() && (skb->ifindex == LOOPBACK_IFINDEX);
-
     __u8 allowed = 1;
     __u8 verdict = ORIGIN_VERDICT_NONE;
-    if (mode != ORIGIN_MODE_OBSERVE && !carve_out) {
-        allowed = verdict_allowed_v6(dst_ip6, dst_port, nexthdr);
-        verdict = verdict_label(mode, allowed);
-        // Same denial-surfacing policy as the IPv4 branch: silent for RST /
-        // SYN-ACK replies and non-first fragments, emitted for everything
-        // else this hook denies.
-        if (!allowed && !non_first_frag && (nexthdr != IPPROTO_TCP || flags != 0))
-            emit = 1;
+    if (mode != ORIGIN_MODE_OBSERVE) {
+        // Local-only traffic that used a non-loopback v6 address (the host's
+        // own global address over lo): same carve-out class and same
+        // evaluation-order rationale as the IPv4 handler; ::1 itself
+        // returned above.
+        __u8 carve_out = (skb->ifindex == LOOPBACK_IFINDEX) && origin_lo_carveout();
+        if (!carve_out) {
+            allowed = verdict_allowed_v6(dst_ip6, dst_port, nexthdr);
+            verdict = verdict_label(mode, allowed);
+            // Same denial-surfacing policy as the IPv4 branch: silent for
+            // RST / SYN-ACK replies and non-first fragments, emitted for
+            // everything else this hook denies.
+            if (!allowed && !non_first_frag && (nexthdr != IPPROTO_TCP || flags != 0))
+                emit = 1;
+        }
     }
 
     if (emit) {

@@ -488,7 +488,15 @@ func TestOriginVerdictChangeReemitsWithinInterval(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { rd.Close() })
 
-	// TEST-NET-3: deliverability is irrelevant, only egress adjudication is.
+	// TEST-NET-3 (RFC 5737): reserved and unroutable — deliverability is
+	// irrelevant, only adjudication by THIS test's hook is. Expected side
+	// effect when a production cargowall polices the same machine (CI
+	// runners): the observe-phase datagram below legitimately leaves this
+	// test's cgroup and is then blocked and audited by the runner's TC as
+	// "Connection blocked ... dst=203.0.113.9 process=bpf.test" — one line
+	// per run, noise, not a leak. If the runner's cargowall is itself
+	// cgroup-enforcing, the first write fails with EPERM and this test
+	// skips instead.
 	conn, err := net.Dial("udp4", "203.0.113.9:9999")
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })

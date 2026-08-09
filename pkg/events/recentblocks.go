@@ -50,12 +50,17 @@ type RecentBlock struct {
 	Process     string
 	PID         uint32
 	StepOrdinal uint32
-	// Container identity travels with the block: a reconciled late-allow is a
-	// re-report of THIS attempt, and dropping the container fields would
-	// demote it from the container tier to unknown in the summary and strip
-	// cargowall.container_id from its OTLP record.
+	// Container identity and the CNAME chain travel with the block: a
+	// reconciled late-allow is a re-report of THIS attempt, and any identity
+	// field dropped here is silently demoted in that re-report (container →
+	// unknown tier in the summary, no cargowall.container_id in OTLP, no
+	// CNAME drill-down). When adding a field to AuditEvent that a blocked
+	// event carries, mirror it here and in Consume/reconcileRecentBlocks —
+	// this struct is deliberately a subset, not the whole event, because the
+	// reconcile re-derives destination fields from the NEW resolution.
 	ContainerID     string
 	ContainerOrigin bool
+	CNAMEChain      []string
 	At              time.Time
 }
 
@@ -139,6 +144,7 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 		StepOrdinal:     event.StepOrdinal,
 		ContainerID:     event.ContainerID,
 		ContainerOrigin: event.ContainerOrigin,
+		CNAMEChain:      event.CNAMEChain,
 		At:              event.Timestamp,
 	}
 }

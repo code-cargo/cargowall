@@ -1016,6 +1016,37 @@ func TestEnsureInfraAllowed_CIDRAndIPv6(t *testing.T) {
 	}
 }
 
+// A narrower existing rule that happens to contain the prefix's BASE address
+// must not suppress the broader prefix: with a user rule for 127.0.0.0/32,
+// skipping the /8 would leave 127.1.0.0–127.255.255.255 out of the rendered
+// policy entirely.
+func TestEnsureAllowed_NarrowRuleDoesNotSuppressBroaderPrefix(t *testing.T) {
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeCIDR, Value: "127.0.0.0/32", Action: ActionAllow},
+	}, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	cm.EnsureInfraAllowed([]string{"127.0.0.0/8"}, nil, AutoAddedTypeLoopback)
+	var found bool
+	for _, r := range cm.config.Rules {
+		if r.Value == "127.0.0.0/8" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("broader /8 was suppressed by the narrower /32: %+v", cm.config.Rules)
+	}
+
+	// And now that the /8 itself exists, a repeat call is deduplicated.
+	before := len(cm.config.Rules)
+	cm.EnsureInfraAllowed([]string{"127.0.0.0/8"}, nil, AutoAddedTypeLoopback)
+	if len(cm.config.Rules) != before {
+		t.Errorf("equal-prefix rule was not deduplicated: %d -> %d", before, len(cm.config.Rules))
+	}
+}
+
 func TestLoadConfigFromCargoWall_ICMPRule(t *testing.T) {
 	cm := NewConfigManager()
 

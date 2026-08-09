@@ -161,8 +161,10 @@ func (a *containerAttribution) enableMode() {
 	}
 	if err := a.observer.SetMode(a.mode); err != nil {
 		// Failure leaves the hook in observe: no enforcement from it, TC
-		// still enforcing. Degraded, never fail-open.
-		a.logger.Warn("Container egress hook stays in observe mode", "error", err)
+		// still enforcing. Degraded, never fail-open — and the dropped
+		// target posture is named so a lost --cgroup-enforce is visible.
+		a.logger.Warn("Container egress hook stays in observe mode",
+			"target_mode", a.mode.String(), "error", err)
 	}
 }
 

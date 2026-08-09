@@ -403,7 +403,18 @@ func (s *Server) Start(ctx context.Context) error {
 	// already bound so nothing leaks past the error return.
 	failStart := func(addr, proto string, err error) error {
 		for _, srv := range s.servers {
-			_ = srv.Shutdown()
+			if serr := srv.Shutdown(); serr != nil {
+				// Shutdown refuses until ActivateAndServe has marked the
+				// server started ("server not started") and in that case
+				// does NOT close the conn we bound — close it directly, or
+				// the :53 socket and its serve goroutine outlive the error.
+				if srv.PacketConn != nil {
+					_ = srv.PacketConn.Close()
+				}
+				if srv.Listener != nil {
+					_ = srv.Listener.Close()
+				}
+			}
 		}
 		s.servers = nil
 		return fmt.Errorf("failed to listen on %s/%s: %w", addr, proto, err)
@@ -429,7 +440,10 @@ func (s *Server) Start(ctx context.Context) error {
 					if addr == s.listenAddr {
 						return failStart(addr, proto, err)
 					}
-					s.logger.Error("DNS listener unavailable; continuing without it",
+					s.logger.Error("DNS listener unavailable; continuing without it — "+
+						"clients configured to use this address (docker daemon.json points "+
+						"containers at the bridge listener) will fail to resolve until "+
+						"whatever holds the address is stopped and cargowall restarted",
 						"addr", addr, "proto", proto, "error", err)
 					continue
 				}
@@ -440,7 +454,10 @@ func (s *Server) Start(ctx context.Context) error {
 					if addr == s.listenAddr {
 						return failStart(addr, proto, err)
 					}
-					s.logger.Error("DNS listener unavailable; continuing without it",
+					s.logger.Error("DNS listener unavailable; continuing without it — "+
+						"clients configured to use this address (docker daemon.json points "+
+						"containers at the bridge listener) will fail to resolve until "+
+						"whatever holds the address is stopped and cargowall restarted",
 						"addr", addr, "proto", proto, "error", err)
 					continue
 				}
@@ -1131,6 +1148,13 @@ func (s *Server) reconcileRecentBlocks(ip net.IP, hostname, matchedRule string, 
 			"process", b.Process,
 			"pid", b.PID,
 			"matched_rule", matchedRule)
+		// The caller's chain (from the resolution that opened the firewall)
+		// wins when present; otherwise the chain recorded with the original
+		// blocked attempt is preserved rather than dropped.
+		chain := cnameChain
+		if len(chain) == 0 {
+			chain = b.CNAMEChain
+		}
 		// Dated at the original blocked attempt (b.At), not reconcile time,
 		// so the event supersedes every blocked record at or before it and
 		// step correlation reflects when the connection actually happened.
@@ -1145,7 +1169,7 @@ func (s *Server) reconcileRecentBlocks(ip net.IP, hostname, matchedRule string, 
 			Process:         b.Process,
 			PID:             b.PID,
 			MatchedRule:     matchedRule,
-			CNAMEChain:      cnameChain,
+			CNAMEChain:      chain,
 			StepOrdinal:     b.StepOrdinal,
 			ContainerID:     b.ContainerID,
 			ContainerOrigin: b.ContainerOrigin,

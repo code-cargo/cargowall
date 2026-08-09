@@ -346,17 +346,39 @@ func (t *Tracker) reconcile(ctx context.Context) {
 	}
 	for _, c := range list {
 		t.mu.Lock()
-		_, known := t.containers[c.ID]
+		info := t.containers[c.ID]
 		t.mu.Unlock()
-		if !known {
+		if info == nil {
 			t.handleStart(ctx, c.ID, "reconcile", 0)
+			continue
 		}
+		// A known ID may be a NEW incarnation: docker restart keeps the
+		// container ID but mints a fresh init PID and cgroup, and the
+		// die+start pair can both be lost in the same stream gap. Verify by
+		// init PID; on mismatch re-adopt, or byCgroup keys a dead inode and
+		// the new init process is never tagged.
+		ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
+		insp, ierr := t.client.inspectContainer(ictx, c.ID)
+		cancel()
+		if ierr != nil || insp.State.Pid == 0 || insp.State.Pid == info.initPID {
+			continue
+		}
+		t.logger.Info("Container re-adopted during reconciliation (restarted across a stream gap)",
+			"container", shortID(c.ID), "old_pid", info.initPID, "new_pid", insp.State.Pid)
+		t.remove(c.ID)
+		t.handleStart(ctx, c.ID, "reconcile", 0)
 	}
 
-	// A container started after the list call is either absent from
-	// t.containers (its start event is still buffered in the stream — the
-	// sweep leaves it alone) or was added by a handleStart above (in the
-	// list, so live). Only genuinely dead containers are swept.
+	// The diff the other way: a tracked container absent from the list lost
+	// its die/destroy somewhere the `since` replay cannot reach. A container
+	// started after the list call is either absent from t.containers (its
+	// start event is still buffered in the stream — the sweep leaves it
+	// alone) or was added by a handleStart above (in the list, so live).
+	// Only genuinely dead containers are swept — unless the list came back
+	// EMPTY while we track containers, which on a just-restarted dockerd is
+	// far more plausibly an initializing daemon than a mass die-off; wiping
+	// the indexes on that evidence would permanently demote every live
+	// container (live-restore containers never re-emit a start event).
 	t.mu.Lock()
 	var stale []string
 	for id := range t.containers {
@@ -364,7 +386,13 @@ func (t *Tracker) reconcile(ctx context.Context) {
 			stale = append(stale, id)
 		}
 	}
+	tracked := len(t.containers)
 	t.mu.Unlock()
+	if len(list) == 0 && tracked > 0 {
+		t.logger.Warn("Reconciliation list empty while containers are tracked; keeping indexes (initializing daemon?)",
+			"tracked", tracked)
+		return
+	}
 	for _, id := range stale {
 		t.logger.Info("Container removed during reconciliation (die/destroy lost in a stream gap)",
 			"container", shortID(id))
@@ -562,13 +590,23 @@ func (t *Tracker) resolveExecPid(ctx context.Context, containerID, execID string
 	if err != nil {
 		return 0, fmt.Errorf("container inspect for exec fallback: %w", err)
 	}
+	sawSeen := false
 	for _, id := range cinsp.ExecIDs {
 		if t.markExecSeen(containerID, id) {
+			sawSeen = true
 			continue
 		}
 		if pid, err := t.inspectExecPid(ictx, id); err == nil {
 			return pid, nil
 		}
+	}
+	if sawSeen {
+		// Every live exec was already handled — the signature of a replayed
+		// event after a stream reconnect, so the guard must hold on this
+		// path exactly as on the execID fast path. (Approximation: an
+		// unseen exec that failed inspection alongside a seen one is also
+		// classified as replay; it would have been unattributable anyway.)
+		return 0, errExecAlreadySeen
 	}
 	return 0, fmt.Errorf("no execID attribute and no unseen running exec among %d", len(cinsp.ExecIDs))
 }

@@ -367,18 +367,24 @@ func TestStartCmd_AfterApply_OrthogonalFlagsPreservedWhenSetExplicitly(t *testin
 }
 
 // --cgroup-enforce must never be silently discarded: without container
-// attribution there is no cgroup hook to enforce at, and a startup that
-// quietly dropped the request is indistinguishable from one that honored
-// it. AfterApply refuses instead.
-func TestStartCmd_AfterApply_CgroupEnforceRequiresContainerAttribution(t *testing.T) {
+// attribution (and the step attribution it rides on) there is no cgroup
+// hook to enforce at, and a startup that quietly dropped the request is
+// indistinguishable from one that honored it. AfterApply refuses instead.
+func TestStartCmd_AfterApply_CgroupEnforceRequiresAttributionFlags(t *testing.T) {
 	cmd := &StartCmd{CgroupEnforce: true}
 	require.ErrorContains(t, cmd.AfterApply(), "--cgroup-enforce requires --container-attribution")
 
+	// Container attribution alone is not enough: without step attribution,
+	// newContainerAttribution statically returns nil and enforcement would
+	// evaporate at runtime with only a warning.
 	cmd = &StartCmd{CgroupEnforce: true, ContainerAttribution: true}
+	require.ErrorContains(t, cmd.AfterApply(), "--cgroup-enforce requires --step-attribution")
+
+	cmd = &StartCmd{CgroupEnforce: true, ContainerAttribution: true, StepAttribution: true}
 	require.NoError(t, cmd.AfterApply())
 
-	// The GitHub preset implies --container-attribution, satisfying the
-	// requirement; the GitLab preset does not and must still refuse.
+	// The GitHub preset implies both prerequisites; the GitLab preset
+	// implies neither and must still refuse.
 	cmd = &StartCmd{GithubAction: true, CgroupEnforce: true}
 	require.NoError(t, cmd.AfterApply())
 	cmd = &StartCmd{GitlabCI: true, CgroupEnforce: true}

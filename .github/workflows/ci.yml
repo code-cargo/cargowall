@@ -534,8 +534,12 @@ jobs:
           # cgroup hook's carve-out via the pre-enableMode pre-scan, because
           # docker-event tracking begins only later. Asserted after the
           # other bridge steps below.
+          # --restart unless-stopped: cargowall restarts dockerd to apply
+          # DNS config, and a daemon restart stops policy-less containers —
+          # the server must come back or the later assertion tests container
+          # lifecycle instead of enforcement.
           docker network create cw-pre > /dev/null
-          docker run -d --name cw-pre-server --network cw-pre alpine:latest \
+          docker run -d --name cw-pre-server --restart unless-stopped --network cw-pre alpine:latest \
             sh -c 'while true; do printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" | nc -l -p 8080; done'
 
       - name: Start CargoWall with cgroup enforcement (issue #106 phase 3b)
@@ -671,23 +675,40 @@ jobs:
 
       - name: Pre-existing user-defined bridge must survive enforcement
         run: |
-          # The network and server below were created BEFORE cargowall
-          # started (previous step's job order — see the pre-start step near
-          # the top of this job): their subnet reaches the carve-out via the
-          # pre-scan that runs before enableMode, not via event tracking.
-          # This is the GitHub service-container / compose-stack shape.
+          # The network and server were created BEFORE cargowall started
+          # (see the pre-start step near the top of this job): the subnet
+          # reached the carve-out via the pre-enableMode pre-scan. This is
+          # the GitHub service-container / compose-stack shape. The probe
+          # dials the server's IP, not its name: the target is bridge-subnet
+          # ENFORCEMENT, and the name path drags in embedded-DNS resolution,
+          # which fails for unrelated reasons whenever the server is down
+          # (an unknown name gets forwarded upstream and correctly REFUSED
+          # by the query filter — exactly what a first version of this step
+          # misdiagnosed as an enforcement regression).
+          cleanup() {
+            docker rm -f cw-pre-server > /dev/null 2>&1 || true
+            docker network rm cw-pre > /dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          PRE_IP=""
           for i in 1 2 3 4 5 6 7 8; do
             sleep 1
-            docker run --rm --network cw-pre alpine:latest wget -q -T 5 -O- "http://cw-pre-server:8080/" > /dev/null 2>&1 && {
+            PRE_IP=$(docker inspect -f '{{with index .NetworkSettings.Networks "cw-pre"}}{{.IPAddress}}{{end}}' cw-pre-server 2>/dev/null)
+            [ -n "$PRE_IP" ] && docker inspect -f '{{.State.Running}}' cw-pre-server 2>/dev/null | grep -q true && break
+          done
+          if [ -z "$PRE_IP" ]; then
+            echo "❌ cw-pre-server not running (did the dockerd restart lose it despite --restart?)"
+            docker ps -a | head -10
+            exit 1
+          fi
+          for i in 1 2 3 4 5 6 7 8; do
+            sleep 1
+            docker run --rm --network cw-pre alpine:latest wget -q -T 5 -O- "http://$PRE_IP:8080/" > /dev/null 2>&1 && {
               echo "✅ pre-existing user-defined bridge survives enforcement"
-              docker rm -f cw-pre-server > /dev/null 2>&1 || true
-              docker network rm cw-pre > /dev/null 2>&1 || true
               exit 0
             }
           done
           echo "❌ pre-existing user-defined bridge dead under cgroup enforcement (pre-scan regression)"
-          docker rm -f cw-pre-server > /dev/null 2>&1 || true
-          docker network rm cw-pre > /dev/null 2>&1 || true
           exit 1
 
       - name: Container traffic is enforced and attributed

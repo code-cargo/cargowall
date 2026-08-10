@@ -126,6 +126,11 @@ type containerInfo struct {
 	privileged       bool
 	cgroupID         uint64
 	ips              []netip.Addr
+	// preDaemon marks an adoption via reconcile (StepOrdinalPreDaemon): if
+	// the container's REAL start event later replays from the stream gap,
+	// handleStart upgrades the ordinal from the event's own timestamp
+	// instead of discarding the replay against the `known` guard.
+	preDaemon bool
 }
 
 // shortID is the 12-char id Docker surfaces everywhere user-facing.
@@ -172,7 +177,17 @@ type Tracker struct {
 	seenExecs map[string]map[string]bool
 	// seenSubnets dedups AllowLocalSubnet callbacks: one per subnet, ever.
 	seenSubnets map[string]bool
-	latencies   []float64 // tag latencies (ms), bounded
+	// netDrivers caches network name → (driver == "bridge") so the subnet
+	// carve-out pays at most one inspect per network, not one per container
+	// — the inspect runs on the event-stream goroutine, which must never be
+	// serially parked (same rule execConcurrency exists for).
+	netDrivers map[string]bool
+	// missingCounts tracks consecutive reconcile passes a tracked container
+	// was absent from listContainers; the stale sweep fires only on the
+	// second consecutive absence, so one partial list from a settling
+	// daemon cannot wipe live containers.
+	missingCounts map[string]int
+	latencies     []float64 // tag latencies (ms), bounded
 
 	lastEventNano atomic.Int64
 
@@ -245,6 +260,9 @@ func Start(ctx context.Context, opts Options, tagger StepTagger, observer *origi
 		byCgroup:    make(map[uint64]*containerInfo),
 		seenExecs:   make(map[string]map[string]bool),
 		seenSubnets: make(map[string]bool),
+		netDrivers:  make(map[string]bool),
+
+		missingCounts: make(map[string]int),
 	}
 	// Typed-nil guard: a nil *origin.Observer must stay a nil interface, or
 	// Enrich's nil check would pass and call into a nil receiver.
@@ -282,19 +300,19 @@ func (t *Tracker) run(ctx context.Context) {
 	defer close(t.done)
 	backoff := reconnectBackoff
 	for {
-		start := time.Now()
-		err := t.streamOnce(ctx)
+		healthy, err := t.streamOnce(ctx)
 		if ctx.Err() != nil {
 			return
 		}
-		if time.Since(start) >= streamHealthyAfter {
-			// A session that survived this long was genuinely healthy: the
-			// next hiccup gets the 500ms floor back. Without this, a few
-			// startup flakes pin backoff at maxBackoff for the process
-			// lifetime; with an event-based signal instead, docker's
-			// inclusive `since` replay (at least one redelivered event per
-			// session that connects) would reset it even for a flapping
-			// daemon.
+		if healthy {
+			// A session whose DECODE phase survived streamHealthyAfter was
+			// genuinely healthy: the next hiccup gets the 500ms floor back.
+			// Without this, a few startup flakes pin backoff at maxBackoff
+			// for the process lifetime. The clock deliberately excludes
+			// reconcile (a slow full-fleet reconcile against a wedged daemon
+			// must not launder itself into a health signal) and events
+			// (docker's inclusive `since` replay redelivers at least one per
+			// session, which would reset even a flapping daemon).
 			backoff = reconnectBackoff
 		}
 		t.logger.Warn("Docker event stream interrupted; reconnecting", "error", err, "backoff", backoff)
@@ -307,28 +325,44 @@ func (t *Tracker) run(ctx context.Context) {
 	}
 }
 
-func (t *Tracker) streamOnce(ctx context.Context) error {
+// streamOnce runs one event-stream session. healthy reports whether the
+// decode phase (not reconcile) outlived streamHealthyAfter — run()'s signal
+// for resetting the reconnect backoff.
+func (t *Tracker) streamOnce(ctx context.Context) (healthy bool, err error) {
 	// Open the stream before reconciling: a container starting between the
 	// two is then either in the list or in the buffered stream, never lost.
 	body, err := t.client.events(ctx, t.lastEventNano.Load())
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer body.Close()
 
 	t.reconcile(ctx)
 
+	decodeStart := time.Now()
+	defer func() { healthy = time.Since(decodeStart) >= streamHealthyAfter }()
+
 	dec := json.NewDecoder(body)
 	for {
 		var ev dockerEvent
-		if err := dec.Decode(&ev); err != nil {
-			if errors.Is(err, io.EOF) || ctx.Err() != nil {
-				return err
+		if derr := dec.Decode(&ev); derr != nil {
+			if errors.Is(derr, io.EOF) || ctx.Err() != nil {
+				return healthy, derr // defer above computes healthy
 			}
-			return fmt.Errorf("decode docker event: %w", err)
+			return healthy, fmt.Errorf("decode docker event: %w", derr)
 		}
 		if ev.TimeNano > 0 {
 			t.lastEventNano.Store(ev.TimeNano)
+		}
+		if ev.Type == "network" {
+			// A bridge network created mid-run must be carved BEFORE its
+			// first container's traffic, or that traffic meets enforce-mode
+			// default-deny; container-driven discovery alone misses networks
+			// whose containers are too short-lived to inspect.
+			if ev.Action == "create" {
+				t.handleNetworkCreate(ctx, ev)
+			}
+			continue
 		}
 		if ev.Type != "container" {
 			continue
@@ -456,11 +490,23 @@ func (t *Tracker) reconcile(ctx context.Context) {
 	// far more plausibly an initializing daemon than a mass die-off; wiping
 	// the indexes on that evidence would permanently demote every live
 	// container (live-restore containers never re-emit a start event).
+	// Absence must be seen on TWO consecutive passes before the sweep
+	// fires: a settling daemon can answer /containers/json with a partial
+	// list, and a single partial answer must not wipe live containers
+	// (live-restore containers never re-emit a start event, so a wrong
+	// sweep is permanent). The empty-list guard below is the degenerate
+	// case of the same distrust.
 	t.mu.Lock()
 	var stale []string
 	for id := range t.containers {
-		if !live[id] {
+		if live[id] {
+			delete(t.missingCounts, id)
+			continue
+		}
+		t.missingCounts[id]++
+		if t.missingCounts[id] >= 2 {
 			stale = append(stale, id)
+			delete(t.missingCounts, id)
 		}
 	}
 	tracked := len(t.containers)
@@ -471,7 +517,7 @@ func (t *Tracker) reconcile(ctx context.Context) {
 		return
 	}
 	for _, id := range stale {
-		t.logger.Info("Container removed during reconciliation (die/destroy lost in a stream gap)",
+		t.logger.Info("Container removed during reconciliation (absent from two consecutive lists)",
 			"container", shortID(id))
 		t.remove(id)
 	}
@@ -491,10 +537,18 @@ func (t *Tracker) reconcile(ctx context.Context) {
 
 func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int64) {
 	t.mu.Lock()
-	_, known := t.containers[id]
+	existing := t.containers[id]
 	t.mu.Unlock()
-	if known {
-		return // replayed event after reconnect
+	if existing != nil {
+		// Replayed event after reconnect — usually a no-op, EXCEPT when
+		// reconcile got there first and adopted the container as pre-daemon:
+		// the replayed start carries the real timeNano the sentinel adoption
+		// lacked, and discarding it would leave the container filed under
+		// "started before cargowall" for the run. Upgrade instead.
+		if kind == "start" && timeNano > 0 && existing.preDaemon {
+			t.upgradeReconciledStart(existing, id, timeNano)
+		}
+		return
 	}
 
 	ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
@@ -541,6 +595,7 @@ func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int
 	var ordinal uint32
 	if kind == "reconcile" {
 		ordinal = events.StepOrdinalPreDaemon
+		info.preDaemon = true
 	} else {
 		ordinal = t.tagger.OrdinalAt(time.Unix(0, timeNano))
 	}
@@ -619,6 +674,44 @@ func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int
 		PID:             uint32(info.initPID),
 		TagLatencyMS:    latencyMS,
 		Privileged:      info.privileged,
+	})
+}
+
+// upgradeReconciledStart replaces a pre-daemon sentinel adoption with the
+// real attribution its replayed start event carries: reconcile runs before
+// the since-replay is drained, so a container born in a stream gap is
+// adopted as StepOrdinalPreDaemon moments before its true start event —
+// with the correct event-time ordinal — arrives. Without the upgrade the
+// replay is discarded and the container reports as "started before
+// cargowall" for the rest of the run.
+func (t *Tracker) upgradeReconciledStart(info *containerInfo, id string, timeNano int64) {
+	ordinal := t.tagger.OrdinalAt(time.Unix(0, timeNano))
+	t.mu.Lock()
+	info.preDaemon = false
+	if ordinal == 0 {
+		t.mu.Unlock()
+		return // genuinely pre-step: the sentinel was right
+	}
+	info.birthOrdinal = ordinal
+	if info.effectiveOrdinal == events.StepOrdinalPreDaemon {
+		// Keep a real exec re-tag if one already happened.
+		info.effectiveOrdinal = ordinal
+	}
+	pid := info.initPID
+	t.mu.Unlock()
+
+	// Identity was verified at adoption; the PID has not changed since.
+	t.tagger.TagContainerProcess(pid, ordinal)
+	t.tagged.Add(1)
+	t.logger.Info("Container attribution upgraded from replayed start event",
+		"container", shortID(id), "step_ordinal", ordinal)
+	t.logAttribution(events.AuditEvent{
+		EventType:       events.EventContainerAttribution,
+		ContainerID:     shortID(id),
+		ContainerOrigin: true,
+		AttributionKind: "start",
+		StepOrdinal:     ordinal,
+		PID:             uint32(pid),
 	})
 }
 
@@ -873,23 +966,39 @@ func (t *Tracker) allowSubnetOnce(ctx context.Context, s localSubnet) {
 	if seen {
 		return
 	}
-	if s.network != "" {
+	// The legacy top-level inspect fields (network "") are resolved to the
+	// literal "bridge" network and driver-checked like any other: stock
+	// moby only populates them from the default bridge, but nothing
+	// guarantees that across docker-compatible daemons, and the macvlan
+	// protection must not rest on undocumented daemon behavior.
+	netName := s.network
+	if netName == "" {
+		netName = "bridge"
+	}
+	t.mu.Lock()
+	isBridge, known := t.netDrivers[netName]
+	t.mu.Unlock()
+	if !known {
 		ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
-		nw, err := t.client.inspectNetwork(ictx, s.network)
+		nw, err := t.client.inspectNetwork(ictx, netName)
 		cancel()
 		if err != nil {
 			t.logger.Warn("Cannot inspect network for subnet carve-out; subnet stays adjudicated for now",
-				"network", s.network, "subnet", key, "error", err)
-			return
+				"network", netName, "subnet", key, "error", err)
+			return // unresolved: retried by the next container, not cached
 		}
-		if nw.Driver != "bridge" {
-			t.mu.Lock()
-			t.seenSubnets[key] = true
-			t.mu.Unlock()
-			t.logger.Info("Non-bridge network subnet stays adjudicated (not local-only)",
-				"network", s.network, "driver", nw.Driver, "subnet", key)
-			return
-		}
+		isBridge = nw.Driver == "bridge"
+		t.mu.Lock()
+		t.netDrivers[netName] = isBridge
+		t.mu.Unlock()
+	}
+	if !isBridge {
+		t.mu.Lock()
+		t.seenSubnets[key] = true
+		t.mu.Unlock()
+		t.logger.Info("Non-bridge network subnet stays adjudicated (not local-only)",
+			"network", netName, "subnet", key)
+		return
 	}
 	if err := t.opts.AllowLocalSubnet(s.prefix); err != nil {
 		t.logger.Warn("Local subnet carve-out failed; will retry on the network's next container",
@@ -901,12 +1010,67 @@ func (t *Tracker) allowSubnetOnce(ctx context.Context, s localSubnet) {
 	t.mu.Unlock()
 }
 
-// DiscoverBridgeSubnets returns the bridge-driver subnets of every
-// container currently running. cmd/start.go runs this BEFORE raising the
-// cgroup hook out of observe: docker-event tracking starts only after the
-// dockerd restart, and containers that predate cargowall (GitHub service
-// containers, compose stacks) must not lose bridge-local traffic in that
-// window.
+// handleNetworkCreate carves a just-created bridge network's subnets
+// BEFORE its first container can produce traffic — container-driven
+// discovery alone misses networks whose containers exit faster than an
+// inspect (docker run --rm ... true), and under enforce an uncarved bridge
+// is a broken network.
+func (t *Tracker) handleNetworkCreate(ctx context.Context, ev dockerEvent) {
+	if t.opts.AllowLocalSubnet == nil {
+		return
+	}
+	name := ev.Actor.Attributes["name"]
+	if name == "" {
+		name = ev.Actor.ID
+	}
+	ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
+	nw, err := t.client.inspectNetwork(ictx, name)
+	cancel()
+	if err != nil {
+		t.logger.Warn("Cannot inspect created network; its subnets stay adjudicated until a container appears",
+			"network", name, "error", err)
+		return
+	}
+	isBridge := nw.Driver == "bridge"
+	t.mu.Lock()
+	t.netDrivers[name] = isBridge
+	t.mu.Unlock()
+	if !isBridge {
+		return
+	}
+	for _, cfg := range nw.IPAM.Config {
+		prefix, perr := netip.ParsePrefix(cfg.Subnet)
+		if perr != nil {
+			continue
+		}
+		prefix = prefix.Masked()
+		key := prefix.String()
+		t.mu.Lock()
+		seen := t.seenSubnets[key]
+		t.mu.Unlock()
+		if seen {
+			continue
+		}
+		if aerr := t.opts.AllowLocalSubnet(prefix); aerr != nil {
+			t.logger.Warn("Local subnet carve-out failed; will retry via container discovery",
+				"subnet", key, "error", aerr)
+			continue
+		}
+		t.mu.Lock()
+		t.seenSubnets[key] = true
+		t.mu.Unlock()
+	}
+}
+
+// DiscoverBridgeSubnets returns every bridge-driver network's IPAM
+// subnets. cmd/start.go runs this BEFORE raising the cgroup hook out of
+// observe: docker-event tracking starts only after the dockerd restart, and
+// networks that predate cargowall — including ones whose containers are
+// stopped, or are stopped by that very restart — must not lose bridge-local
+// traffic in the window before tracking begins. Enumerating networks
+// rather than containers means one API call, no per-container inspects on
+// the timing-sensitive startup path, and no dependency on anything being
+// alive to inspect.
 func DiscoverBridgeSubnets(ctx context.Context, socket string) ([]netip.Prefix, error) {
 	if socket == "" {
 		socket = "/var/run/docker.sock"
@@ -919,41 +1083,28 @@ func DiscoverBridgeSubnets(ctx context.Context, socket string) ([]netip.Prefix, 
 		return nil, fmt.Errorf("docker daemon unreachable: %w", err)
 	}
 	lctx, cancel := context.WithTimeout(ctx, unaryTimeout)
-	list, err := c.listContainers(lctx)
+	nets, err := c.listNetworks(lctx)
 	cancel()
 	if err != nil {
-		return nil, fmt.Errorf("list containers: %w", err)
+		return nil, fmt.Errorf("list networks: %w", err)
 	}
-
-	bridgeDriver := map[string]bool{} // network name → driver == "bridge"
 	seen := map[netip.Prefix]bool{}
 	var out []netip.Prefix
-	for _, sum := range list {
-		ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
-		insp, ierr := c.inspectContainer(ictx, sum.ID)
-		cancel()
-		if ierr != nil {
-			continue // best-effort: the tracker re-covers it once running
+	for _, nw := range nets {
+		if nw.Driver != "bridge" {
+			continue
 		}
-		for _, s := range collectSubnets(insp) {
-			if seen[s.prefix] {
+		for _, cfg := range nw.IPAM.Config {
+			prefix, perr := netip.ParsePrefix(cfg.Subnet)
+			if perr != nil {
 				continue
 			}
-			if s.network != "" {
-				isBridge, known := bridgeDriver[s.network]
-				if !known {
-					nctx, cancel := context.WithTimeout(ctx, unaryTimeout)
-					nw, nerr := c.inspectNetwork(nctx, s.network)
-					cancel()
-					isBridge = nerr == nil && nw.Driver == "bridge"
-					bridgeDriver[s.network] = isBridge
-				}
-				if !isBridge {
-					continue
-				}
+			prefix = prefix.Masked()
+			if seen[prefix] {
+				continue
 			}
-			seen[s.prefix] = true
-			out = append(out, s.prefix)
+			seen[prefix] = true
+			out = append(out, prefix)
 		}
 	}
 	return out, nil

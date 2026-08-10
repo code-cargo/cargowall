@@ -155,6 +155,10 @@ const (
 	// the same registry). Overflow drops the oldest: a missed join, tiered
 	// stricter.
 	perKeyMax = 8
+	// evictRotationBudget caps second-chance rotations per insert. 64 is
+	// far above any organic mix of hot keys at the front of the queue,
+	// while keeping the reader's worst case O(64) instead of O(4096).
+	evictRotationBudget = 64
 	// verdictQueueDepth bounds the buffer between the ringbuf reader and the
 	// verdict-reporting worker. Reporting runs the full post-verdict
 	// pipeline (up to a 500ms PTR lookup per cold destination), so it must
@@ -573,14 +577,26 @@ func (o *Observer) insert(ev *bpf.OriginEvent) {
 	entries, existed := o.flows[key]
 	// A re-emit for a known socket (the 10s refresh interval in originbpf.c)
 	// replaces its entry; a new socket prepends. Newest-first order is the
-	// Lookup contract.
+	// Lookup contract. The replaced entry's ORIGINAL timestamp is kept:
+	// Enrich discards candidates newer than the TC event it explains, and a
+	// refresh landing while the TC reader is backlogged must not turn the
+	// only joinable record into one that postdates the event — the flow has
+	// existed since the first emit, and that is what the timestamp answers.
 	for i, e := range entries {
 		if e.Cookie == rec.Cookie {
+			if e.Timestamp < rec.Timestamp {
+				rec.Timestamp = e.Timestamp
+			}
 			entries = append(entries[:i], entries[i+1:]...)
 			break
 		}
 	}
-	entries = append([]Record{rec}, entries...)
+	// In-place prepend: reuses the slice's backing array once it has grown
+	// to perKeyMax capacity, so the reader's hot path stops allocating per
+	// record.
+	entries = append(entries, Record{})
+	copy(entries[1:], entries)
+	entries[0] = rec
 	if len(entries) > perKeyMax {
 		entries = entries[:perKeyMax]
 	}
@@ -596,17 +612,22 @@ func (o *Observer) insert(ev *bpf.OriginEvent) {
 		// since insertion. The key just inserted is rotated too, never
 		// evicted — when every other key is hot, a full rotation would
 		// otherwise leave it at the front and evict the very record this
-		// call came to store. Terminates: each rotation clears one hot bit
-		// (the new key gets exactly one free rotation), so a cold victim is
-		// reached within one lap.
+		// call came to store. The rotation budget bounds the worst case: an
+		// all-hot store would otherwise cost O(storeMaxKeys) map ops on the
+		// ringbuf reader, under the same mutex Enrich contends on; when the
+		// budget runs out, the current victim is evicted hot — one unfairly
+		// lost join beats a stalled reader.
+		rotations := 0
 		for len(o.flows) > storeMaxKeys && len(o.fifo) > 0 {
 			victim := o.fifo[0]
 			o.fifo = o.fifo[1:]
-			if _, isHot := o.hot[victim]; isHot || victim == key {
+			if _, isHot := o.hot[victim]; (isHot || victim == key) && rotations < evictRotationBudget {
+				rotations++
 				delete(o.hot, victim)
 				o.fifo = append(o.fifo, victim)
 				continue
 			}
+			delete(o.hot, victim)
 			delete(o.flows, victim)
 		}
 	}

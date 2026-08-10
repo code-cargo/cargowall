@@ -106,17 +106,42 @@ func TestLookupMissesDisjointTuples(t *testing.T) {
 func TestReEmitReplacesSameSocketEntry(t *testing.T) {
 	o := newTestObserver()
 	o.insert(v4Event(1, 0xAC110002, 0x8C527203, 40001, 443))
-	old := o.LookupV4(0x8C527203, 443, 6, 40001)[0].Timestamp
 
-	// The 10s re-emit for the same socket must refresh, not duplicate.
+	// The 10s re-emit for the same socket must refresh, not duplicate. The
+	// refreshed record's fields replace the old — EXCEPT the timestamp,
+	// which keeps first-seen so a backlogged TC event can still join (see
+	// TestReEmitKeepsOriginalTimestampForJoins).
 	refresh := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
 	refresh.Timestamp = 999
+	refresh.Flags = 0 // established-flow refresh: no SYN flag
 	o.insert(refresh)
 
 	got := o.LookupV4(0x8C527203, 443, 6, 0)
+	require.Len(t, got, 1, "refresh must replace, never duplicate")
+	require.False(t, got[0].TCPSyn, "the refreshed record's fields win")
+	require.Equal(t, uint64(1), got[0].Timestamp, "except the first-seen timestamp")
+}
+
+// A same-cookie refresh (the 10s re-emit, or a verdict change) must keep
+// the ORIGINAL timestamp: Enrich discards candidates newer than the TC
+// event they explain, and a refresh landing while the TC reader is
+// backlogged must not turn the flow's only record into one that postdates
+// the event.
+func TestReEmitKeepsOriginalTimestampForJoins(t *testing.T) {
+	o := newTestObserver()
+	first := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	first.Timestamp = 100
+	o.insert(first)
+
+	refresh := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	refresh.Timestamp = 999 // 10s later; a TC event from t=150 is still unprocessed
+	refresh.Verdict = uint8(VerdictWouldBlock)
+	o.insert(refresh)
+
+	got := o.LookupV4(0x8C527203, 443, 6, 40001)
 	require.Len(t, got, 1)
-	require.NotEqual(t, old, got[0].Timestamp)
-	require.Equal(t, uint64(999), got[0].Timestamp)
+	require.Equal(t, uint64(100), got[0].Timestamp, "replacement keeps the first-seen timestamp")
+	require.Equal(t, VerdictWouldBlock, got[0].Verdict, "everything else refreshes")
 }
 
 func TestPerKeyCapDropsOldest(t *testing.T) {

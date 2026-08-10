@@ -387,6 +387,15 @@ type VerdictRecord struct {
 	// reported as a policy outcome.
 	Dropped bool
 
+	// AuditSuppressed marks a denial that enforce mode would have dropped
+	// but audit posture passed. It reports exactly like a TC denial under
+	// audit — OutcomeBlocked, which the audit logger normalizes to
+	// would_deny=true/blocked=false, with late-allow still running — so the
+	// two hooks encode one run-level posture one way. Without it these
+	// records would read as shadow would-blocks, which summary and OTLP
+	// deliberately discard.
+	AuditSuppressed bool
+
 	// MidStream marks a denial of an established flow rather than a
 	// connection attempt — the hook re-adjudicates every packet, so an
 	// allowlist change can kill a live connection here exactly as at TC.
@@ -417,13 +426,16 @@ type VerdictRecord struct {
 func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTracker *NotificationTracker,
 	auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger,
 ) {
-	// denial = rec.Dropped: shadow-mode would-blocks are hypothetical and
-	// must not open the firewall — nothing was denied and TC's own verdict
-	// still governs the flow. Degraded records ride the SAME pipeline with
-	// the slow work flagged off (see prepareOutcome) rather than a parallel
+	// A denial is a drop OR an audit-suppressed would-have-dropped: both
+	// run late-allow (matching the TC path, where audit-posture denials
+	// self-heal too). Shadow would-blocks are hypothetical and must not
+	// open the firewall — nothing was denied and TC's own verdict still
+	// governs the flow. Degraded records ride the SAME pipeline with the
+	// slow work flagged off (see prepareOutcome) rather than a parallel
 	// construction that could drift from it.
+	denial := rec.Dropped || rec.AuditSuppressed
 	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, logger,
-		rec.Dropped, rec.Degraded, rec.SrcIP, rec.DstIP, rec.SrcPort, rec.DstPort, rec.Proto,
+		denial, rec.Degraded, rec.SrcIP, rec.DstIP, rec.SrcPort, rec.DstPort, rec.Proto,
 		rec.PID, rec.StepOrdinal)
 
 	if rec.Decorate != nil {
@@ -440,7 +452,7 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 	}
 
 	switch {
-	case !rec.Dropped:
+	case !denial:
 		out.Kind = OutcomeWouldBlock
 		// A would-block keeps the mid-stream flag: shadow mode exists to
 		// predict what enforcement would do, and "would kill an established

@@ -544,13 +544,22 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 					EventType:   events.EventDNSBlocked,
 					DstHostname: domain,
 				}
-				if s.isContainerListener(w) {
+				// Container-origin is asserted only when container tracking
+				// is actually wired: the bridge listener exists whenever
+				// --docker-dns-interception is on, but without container
+				// attribution nothing could ever substantiate the claim —
+				// stamping it would misfile host clients of the bridge
+				// address into the container tier. With tracking wired, the
+				// classification stays per-listener (a lookup MISS keeps
+				// container origin: unknown-but-bridge is the unattributed
+				// container tier, and the sockdiag path must never run for
+				// a socket it cannot see).
+				containerLookup, containerWired := s.containerLookup.Load().(ContainerLookup)
+				if s.isContainerListener(w) && containerWired {
 					ev.ContainerOrigin = true
-					if lookup, ok := s.containerLookup.Load().(ContainerLookup); ok {
-						if ordinal, containerID, found := lookup(w.RemoteAddr()); found {
-							ev.StepOrdinal = ordinal
-							ev.ContainerID = containerID
-						}
+					if ordinal, containerID, found := containerLookup(w.RemoteAddr()); found {
+						ev.StepOrdinal = ordinal
+						ev.ContainerID = containerID
 					}
 				} else if lookup, ok := s.stepLookup.Load().(func(net.Addr) uint32); ok {
 					ev.StepOrdinal = lookup(w.RemoteAddr())

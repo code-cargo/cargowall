@@ -562,15 +562,19 @@ any other consumer must do the same: **never sum `cgroup_would_block` with
   policy: subnet values are discovered from container config — i.e.
   workload-influenced — so they must not be able to widen off-host
   enforcement. A carved subnet exempts traffic only at this hook (returning
-  it to its pre-3b unpoliced-locally posture); anything leaving the host
-  still meets TC's untouched verdict, and a test pins that isolation. Only
-  bridge-driver networks are carved (their routes are on-link by
-  construction — an overclaimed `--subnet` redirects that range to the
-  bridge, breaking it locally rather than escaping); macvlan/ipvlan subnets
-  are physical-network space and stay adjudicated. Coverage: the default
-  bridge and pre-existing containers' bridges are carved before the mode is
-  raised (`preallowLocalNetworks`); later networks as the tracker discovers
-  them. Consequence, by design: container↔container and host↔container
+  it to its pre-3b unpoliced-locally posture); traffic leaving via the
+  TC-attached interface still meets TC's untouched verdict, and a test pins
+  that isolation. Because TC attaches to one interface (multi-interface
+  hosts have pre-existing TC blind spots), entries are also validated
+  before writing: only bridge-driver networks (their routes are on-link by
+  construction; macvlan/ipvlan subnets are physical-network space and stay
+  adjudicated), width-capped at /16 (v4) / /64 (v6), and refused when the
+  subnet contains a real host interface address — claiming VPC/LAN space
+  the host lives in is a bypass attempt, not a bridge. Coverage: networks
+  are enumerated directly (GET /networks — no dependency on live
+  containers), before the mode is raised (`preallowLocalNetworks`) and on
+  network-create events thereafter, with per-container discovery as the
+  backstop. Consequence, by design: container↔container and host↔container
   traffic on docker bridges is open under `--cgroup-enforce` — the policy
   governs what leaves the machine, exactly the scope TC enforced;
   inter-container isolation is docker network segmentation's job, not this

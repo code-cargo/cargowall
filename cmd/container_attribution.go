@@ -19,6 +19,7 @@ package cmd
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/netip"
 
 	"github.com/cilium/ebpf"
@@ -131,6 +132,7 @@ func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificat
 		return
 	}
 	enricher := a.enricher
+	targetMode := a.mode
 	a.observer.SetVerdictSink(func(rec origin.Record) {
 		events.ReportVerdict(events.VerdictRecord{
 			SrcIP:       rec.SrcIP.String(),
@@ -141,6 +143,12 @@ func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificat
 			PID:         rec.PID,
 			StepOrdinal: rec.StepOrdinal,
 			Dropped:     rec.Verdict == origin.VerdictBlock,
+			// In enforce mode the ONLY source of a would-block verdict is
+			// audit posture (verdict_label downgrades the drop) — so it must
+			// report exactly like TC's audit-posture denials (a normalized
+			// connection_blocked), not like shadow telemetry that summary
+			// and OTLP discard.
+			AuditSuppressed: targetMode == origin.ModeEnforce && rec.Verdict == origin.VerdictWouldBlock,
 			// Mid-stream comes from the BPF flag, which applies the same
 			// guard as tc_egress's EVENT_FLAG_MIDSTREAM (ACK set, no
 			// SYN/RST). Re-deriving it as "TCP and not SYN" would re-include
@@ -179,11 +187,77 @@ func (a *containerAttribution) enableMode() {
 // so a workload-influenced subnet cannot widen TC's off-host enforcement).
 // Nil-safe: with no observer there is nothing adjudicating, so there is
 // nothing to carve.
+//
+// Validation, because subnet values are workload-influenced (`docker
+// network create --subnet ...` is unprivileged) and TC's single-interface
+// attachment means the "TC still polices what leaves the host" bound has
+// pre-existing blind spots on multi-interface hosts:
+//   - width cap: nothing broader than /16 (v4) or /64 (v6) is carved — a
+//     wider claim exempts address space no real docker bridge needs;
+//   - locality: the subnet must not contain any non-loopback host
+//     interface address, unless that interface's own network IS the subnet
+//     (the bridge's gateway address) — claiming space the host actually
+//     lives in (a VPC/LAN range) is refused.
+//
+// A refused subnet logs loudly and returns nil (decided, not retried): the
+// operator can still allow it explicitly in policy.
 func (a *containerAttribution) allowLocalNetwork(prefix netip.Prefix) error {
 	if a == nil || a.observer == nil {
 		return nil
 	}
+	prefix = prefix.Masked()
+	if (prefix.Addr().Is4() && prefix.Bits() < 16) || (!prefix.Addr().Is4() && prefix.Bits() < 64) {
+		a.logger.Warn("Refusing local-network carve-out: subnet wider than any real docker bridge needs",
+			"subnet", prefix.String())
+		return nil
+	}
+	if conflict := hostAddressInside(prefix); conflict != "" {
+		a.logger.Warn("Refusing local-network carve-out: subnet contains a host interface address (claims real network space)",
+			"subnet", prefix.String(), "conflict", conflict)
+		return nil
+	}
 	return a.observer.AllowLocalNetwork(prefix)
+}
+
+// hostAddressInside reports a non-loopback host interface address contained
+// in prefix whose own network is not exactly prefix — the signature of a
+// carve-out claiming address space the host genuinely lives in. The
+// bridge's own gateway address matches prefix exactly and passes.
+func hostAddressInside(prefix netip.Prefix) string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "" // can't validate: don't block the carve-out on it
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			addr, aok := netip.AddrFromSlice(ipn.IP)
+			if !aok {
+				continue
+			}
+			addr = addr.Unmap()
+			if !prefix.Contains(addr) {
+				continue
+			}
+			ones, _ := ipn.Mask.Size()
+			own, perr := addr.Prefix(ones)
+			if perr == nil && own == prefix {
+				continue // the subnet's own bridge interface
+			}
+			return ifc.Name + "=" + addr.String()
+		}
+	}
+	return ""
 }
 
 // preallowLocalNetworks carves out the local-only networks that exist

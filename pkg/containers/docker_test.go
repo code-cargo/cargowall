@@ -116,9 +116,9 @@ func TestEventsSinceParam(t *testing.T) {
 	body.Close()
 	q := <-queries
 	assert.False(t, q.Has("since"), "a fresh subscription must not constrain the stream")
-	// The daemon-side filter is part of the request contract: only
-	// container-type events are subscribed.
-	assert.JSONEq(t, `{"type":["container"]}`, q.Get("filters"))
+	// The daemon-side filter is part of the request contract: container
+	// events (tracking) and network events (bridge-subnet carve-outs).
+	assert.JSONEq(t, `{"type":["container","network"]}`, q.Get("filters"))
 
 	// 42ns past the epoch second: the fractional part must be zero-padded
 	// to nine digits or the daemon would read .42 as 420ms and replay a

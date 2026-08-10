@@ -102,21 +102,28 @@ type containerSummary struct {
 	ID string `json:"Id"`
 }
 
-// networkInspect carries the one field the subnet carve-out gates on: only
-// bridge-driver networks are local-only by construction (their routes are
-// on-link); macvlan/ipvlan subnets are physical-network address space.
+// networkInspect carries what the subnet carve-out needs: the driver gate
+// (only bridge-driver networks are local-only by construction — their routes
+// are on-link; macvlan/ipvlan subnets are physical-network address space)
+// and the IPAM subnets, so networks can be carved without needing a live
+// container on them.
 type networkInspect struct {
 	Name   string `json:"Name"`
 	Driver string `json:"Driver"`
+	IPAM   struct {
+		Config []struct {
+			Subnet string `json:"Subnet"`
+		} `json:"Config"`
+	} `json:"IPAM"`
 }
 
-// events opens the container-event stream. sinceNano > 0 resumes from that
+// events opens the container+network event stream. sinceNano > 0 resumes from that
 // timestamp so events across a reconnect gap replay (handlers are idempotent
 // and resolve ordinals by event time, so replay is safe). The returned body
 // streams NDJSON until closed or the daemon goes away.
 func (c *dockerClient) events(ctx context.Context, sinceNano int64) (io.ReadCloser, error) {
 	q := url.Values{}
-	q.Set("filters", `{"type":["container"]}`)
+	q.Set("filters", `{"type":["container","network"]}`)
 	if sinceNano > 0 {
 		q.Set("since", fmt.Sprintf("%d.%09d", sinceNano/1e9, sinceNano%1e9))
 	}
@@ -145,10 +152,20 @@ func (c *dockerClient) inspectExec(ctx context.Context, id string) (execInspect,
 	return out, c.get(ctx, "/exec/"+url.PathEscape(id)+"/json", &out)
 }
 
-// inspectNetwork resolves a network name to its driver.
+// inspectNetwork resolves a network name (or id) to its driver and subnets.
 func (c *dockerClient) inspectNetwork(ctx context.Context, name string) (networkInspect, error) {
 	var out networkInspect
 	return out, c.get(ctx, "/networks/"+url.PathEscape(name), &out)
+}
+
+// listNetworks returns every network with driver and IPAM subnets — the
+// authoritative source for the bridge-subnet carve-out: unlike deriving
+// subnets from running containers, it also covers networks whose containers
+// are stopped (or stopped by cargowall's own dockerd restart) or too
+// short-lived to inspect.
+func (c *dockerClient) listNetworks(ctx context.Context) ([]networkInspect, error) {
+	var out []networkInspect
+	return out, c.get(ctx, "/networks", &out)
 }
 
 // listContainers returns running containers (the API default) for the

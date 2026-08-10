@@ -1675,6 +1675,16 @@ func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoA
 		}
 		cidr := ipnet.String()
 
+		// An explicit all-ports DENY covering this network wins: appending
+		// the auto-allow anyway would land a second LPM entry on the same
+		// key (allow written last, allow wins for non-host routes) and make
+		// the rendered policy contradict the operator's rule. Skip loudly.
+		if cm.cidrDenyCoversLocked(ipnet) {
+			slog.Warn("Skipping auto-allow: an explicit all-ports deny rule covers this network",
+				"cidr", cidr, "autoAddedType", autoAddedType)
+			continue
+		}
+
 		// Check if a rule already covers this ENTIRE network. Testing only
 		// the base address would let a narrower existing rule (127.0.0.0/32
 		// containing the base of 127.0.0.0/8) suppress the whole broader
@@ -1717,6 +1727,28 @@ func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoA
 
 		slog.Info("Auto-added allow rule", "cidr", cidr, "ports", ports, "autoAddedType", autoAddedType)
 	}
+}
+
+// cidrDenyCoversLocked reports whether an explicit all-ports deny CIDR rule
+// covers the ENTIRE target network at an equal-or-broader prefix. Used to
+// keep infra auto-allows from silently overriding an operator's deny.
+// Must be called with cm.mu held.
+func (cm *Manager) cidrDenyCoversLocked(target *net.IPNet) bool {
+	tOnes, tBits := target.Mask.Size()
+	for _, rule := range cm.config.Rules {
+		if rule.Type != RuleTypeCIDR || rule.Action != ActionDeny || len(rule.Ports) != 0 {
+			continue
+		}
+		_, rnet, err := net.ParseCIDR(rule.Value)
+		if err != nil || !rnet.Contains(target.IP) {
+			continue
+		}
+		rOnes, rBits := rnet.Mask.Size()
+		if rBits == tBits && rOnes <= tOnes {
+			return true
+		}
+	}
+	return false
 }
 
 // cidrCoveredLocked reports whether one existing CIDR rule covers the ENTIRE

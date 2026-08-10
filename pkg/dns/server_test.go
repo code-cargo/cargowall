@@ -3612,39 +3612,49 @@ func TestHandleDNSQuery_ContainerListenerUsesContainerLookup(t *testing.T) {
 		"sockdiag step lookup must never run for container-listener queries")
 }
 
-// When the container lookup can't identify the client (or was never
-// installed), the event still records container origin — that classification
-// is per-listener, not per-lookup — with no ordinal and no container id, so
+// When container tracking is wired but the lookup can't identify the
+// client, the event still records container origin — that classification is
+// per-listener, not per-lookup — with no ordinal and no container id, so
 // the summary routes it to the container tier instead of a looser bucket.
 func TestHandleDNSQuery_ContainerListenerLookupMissStaysContainerOrigin(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		install bool
-	}{
-		{name: "lookup returns ok=false", install: true},
-		{name: "no lookup installed", install: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			server, sink := newContainerAttributionServer(t, false)
-			server.AddContainerListenAddr("172.17.0.1:53")
+	server, sink := newContainerAttributionServer(t, false)
+	server.AddContainerListenAddr("172.17.0.1:53")
 
-			stepLookupCalls := 0
-			server.SetStepLookup(func(net.Addr) uint32 { stepLookupCalls++; return 7 })
-			if tc.install {
-				server.SetContainerLookup(func(net.Addr) (uint32, string, bool) { return 0, "", false })
-			}
+	stepLookupCalls := 0
+	server.SetStepLookup(func(net.Addr) uint32 { stepLookupCalls++; return 7 })
+	server.SetContainerLookup(func(net.Addr) (uint32, string, bool) { return 0, "", false })
 
-			w := newAddrResponseWriter("172.17.0.1", "172.17.0.3", 42345)
-			ev := blockedContainerQuery(t, server, sink, w)
+	w := newAddrResponseWriter("172.17.0.1", "172.17.0.3", 42345)
+	ev := blockedContainerQuery(t, server, sink, w)
 
-			assert.Equal(t, dns.RcodeRefused, w.msg.Rcode)
-			assert.True(t, ev.ContainerOrigin, "container origin is independent of lookup success")
-			assert.Zero(t, ev.StepOrdinal, "failed lookup leaves the event unattributed")
-			assert.Empty(t, ev.ContainerID)
-			assert.Zero(t, stepLookupCalls,
-				"a container-lookup miss must not fall back to the sockdiag path")
-		})
-	}
+	assert.Equal(t, dns.RcodeRefused, w.msg.Rcode)
+	assert.True(t, ev.ContainerOrigin, "container origin is independent of lookup success")
+	assert.Zero(t, ev.StepOrdinal, "failed lookup leaves the event unattributed")
+	assert.Empty(t, ev.ContainerID)
+	assert.Zero(t, stepLookupCalls,
+		"a container-lookup miss must not fall back to the sockdiag path")
+}
+
+// Without container tracking wired at all (e.g. --docker-dns-interception
+// on a preset that doesn't enable --container-attribution), the bridge
+// listener must NOT assert container origin — nothing could substantiate
+// the claim, and a host process resolving via the bridge address would be
+// misfiled into the container tier. The query falls back to the host
+// sockdiag path instead.
+func TestHandleDNSQuery_ContainerListenerWithoutTrackingStaysHostPath(t *testing.T) {
+	server, sink := newContainerAttributionServer(t, false)
+	server.AddContainerListenAddr("172.17.0.1:53")
+
+	server.SetStepLookup(func(net.Addr) uint32 { return 7 })
+	// No SetContainerLookup: the attribution feature is off.
+
+	w := newAddrResponseWriter("172.17.0.1", "172.17.0.3", 42345)
+	ev := blockedContainerQuery(t, server, sink, w)
+
+	assert.Equal(t, dns.RcodeRefused, w.msg.Rcode)
+	assert.False(t, ev.ContainerOrigin, "container origin must not be asserted when tracking is off")
+	assert.Equal(t, uint32(7), ev.StepOrdinal, "falls back to the host sockdiag path")
+	assert.Empty(t, ev.ContainerID)
 }
 
 // A query on the host listener keeps the unchanged sockdiag path even when a

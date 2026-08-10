@@ -158,13 +158,17 @@ static __always_inline __u8 origin_mode(void) {
 // Local-only networks (docker bridge subnets), carved out of adjudication
 // the way loopback is. OWNED by this collection and deliberately NOT in
 // verdict.h: an entry here must never widen tc_egress. Subnets are
-// discovered from container config at runtime — i.e. they are
+// discovered from network config at runtime — i.e. they are
 // workload-influenced — so the blast radius of a hostile entry must be
 // bounded: carving a subnet out of THIS hook returns that traffic to its
 // pre-3b posture (unpoliced locally, because TC never saw bridge traffic),
-// while anything that actually leaves the host still meets TC's untouched
-// verdict. Userspace writes only bridge-driver network subnets (see
-// pkg/containers), whose routes are on-link by construction.
+// while traffic leaving via the TC-attached interface still meets TC's
+// untouched verdict. That bound is honest, not absolute: TC attaches to
+// ONE interface, so multi-interface hosts have pre-existing TC blind spots
+// — which is why userspace ALSO validates entries before writing them
+// (bridge-driver networks only, width-capped, refused when the subnet
+// contains a real host interface address; see
+// containerAttribution.allowLocalNetwork).
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __type(key, struct lpm_key);

@@ -548,14 +548,44 @@ jobs:
 
       - name: Blocked host is still blocked (host socket)
         run: |
-          # Now enforced by the cgroup hook rather than TC. The drop surfaces
-          # as EPERM at connect() instead of a silent blackhole, so this
-          # fails fast rather than timing out — either way, non-zero.
+          # Now enforced by the cgroup hook rather than TC. For TCP the drop
+          # is NOT fast: the SYN dies in ip_finish_output and connect() only
+          # short-circuits on ECONNREFUSED, so curl runs into its own
+          # --connect-timeout — same UX as TC's blackhole, either way
+          # non-zero. (Fast EPERM is UDP-only; the probe step below pins it.)
           if curl -sf --connect-timeout 5 --max-time 10 https://example.com > /dev/null 2>&1; then
             echo "❌ example.com should be blocked"
             exit 1
           fi
           echo "✅ example.com blocked"
+
+      - name: Deliberate direct-IP block probe (TEST-NET-3)
+        run: |
+          # Prove an enforced drop end to end — deliberately, in THIS job,
+          # because its policy is supplied locally (offline mode): there is
+          # no SaaS push and no notification client, so the denial is
+          # asserted right here and reported nowhere else. The API-backed
+          # jobs must not run this probe — a deliberate block would land in
+          # the product's report for the run.
+          #
+          # 203.0.113.9:9999 is TEST-NET-3 (RFC 5737): reserved, unroutable,
+          # matches no allowlist, and recognizable in any audit log as a
+          # cargowall test artifact (the BPF suite uses the same tuple).
+          # UDP, because only UDP surfaces the drop synchronously: sendto()
+          # returns EPERM from the cgroup hook. The audit record for this
+          # exact tuple is asserted in "Validate enforcement events" below.
+          GOT=$(python3 -c 'import socket
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          try:
+              s.sendto(b"cargowall-ci-probe", ("203.0.113.9", 9999))
+              print("SENT")
+          except OSError as e:
+              print(e.errno)')
+          if [ "$GOT" != "1" ]; then
+            echo "❌ expected EPERM (errno 1) sending to 203.0.113.9:9999, got: $GOT"
+            exit 1
+          fi
+          echo "✅ direct-IP probe denied with EPERM at the socket layer"
 
       - name: Container traffic is enforced and attributed
         run: |
@@ -599,6 +629,17 @@ jobs:
           echo "natively attributed container blocks: $ATTRIBUTED"
           if [ "$ATTRIBUTED" -eq 0 ]; then
             echo "❌ Container block lacks native step/container attribution"
+            VALID=false
+          fi
+
+          # The deliberate TEST-NET-3 probe must have produced its audit
+          # record: the drop already proved enforcement (EPERM), this proves
+          # the cgroup hook is also the event source for what it drops —
+          # "every drop we cause emits a record".
+          PROBE=$(jq -s '[.[] | select(.event_type == "connection_blocked" and .dst_ip == "203.0.113.9" and .dst_port == 9999)] | length' "$AUDIT_LOG")
+          echo "TEST-NET-3 probe blocked events: $PROBE"
+          if [ "$PROBE" -eq 0 ]; then
+            echo "❌ Probe was dropped but produced no connection_blocked audit event"
             VALID=false
           fi
 

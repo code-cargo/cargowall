@@ -133,11 +133,6 @@ type BpfBlockedEvent struct {
 	StepOrdinal uint32 // workflow step that created the socket (0 = untagged); see StepOrdinal* sentinels
 }
 
-// ProtocolName returns the display name for an IP protocol number, matching
-// what connection events carry. Exported for producers outside this package
-// that build AuditEvents directly (pkg/containers' cgroup-verdict path).
-func ProtocolName(proto uint8) string { return getProtocolName(proto) }
-
 // getProtocolName returns the name of an IP protocol number
 func getProtocolName(proto uint8) string {
 	switch proto {
@@ -309,53 +304,17 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			(event.DstIp>>8)&0xFF, event.DstIp&0xFF)
 	}
 
-	hostname, cnameChain := resolveDestination(configMgr, dstIP, logger)
-
-	var lateAllowed bool
-	var matchedRule string
-	if event.Allowed == 0 {
-		lateAllowed, matchedRule = tryLateAllow(configMgr, fw, hostname, dstIP,
-			event.DstPort, event.IpProto, logger)
-	}
-
-	displayHostname := hostname
-	if displayHostname == "" {
-		displayHostname = dstIP
-	}
-
-	// One audit record underlies every outcome branch below — and every
-	// observable channel: each branch stamps its event type and
-	// type-specific fields onto this base, hands it to LogEvent (which
-	// fills the timestamp and verdict flags), and logs through
-	// logConnEvent, which reads identity from this same struct. Identity
-	// lives here and only here, so the enrichment below can never produce
-	// a log line that disagrees with the audit stream. (The process name
-	// is looked up from /proc since bpf_get_current_comm is unavailable in
-	// TC programs.)
-	audit := AuditEvent{
-		SrcIP:       srcIP,
-		DstIP:       dstIP,
-		DstHostname: hostname,
-		DstPort:     event.DstPort,
-		Protocol:    getProtocolName(event.IpProto),
-		Process:     lookupProcessName(event.Pid),
-		PID:         event.Pid,
-		CNAMEChain:  cnameChain,
-		StepOrdinal: event.StepOrdinal,
-	}
+	// The resolve → late-allow → base-audit sequence is shared with the
+	// cgroup hook's ReportVerdict — see prepareOutcome in outcome.go.
+	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, logger,
+		event.Allowed == 0, srcIP, dstIP, event.SrcPort, event.DstPort, event.IpProto,
+		event.Pid, event.StepOrdinal)
 
 	// pid=0 AND ordinal=0 is the no-socket-at-TC signature (NATed container
 	// flows, plus rare map_sock_pid evictions); anything with either field
 	// set was attributed normally and must not be second-guessed.
 	if enricher != nil && event.Pid == 0 && event.StepOrdinal == 0 {
-		enricher.Enrich(&audit, event)
-	}
-
-	out := Outcome{
-		Audit:           audit,
-		SrcPort:         event.SrcPort,
-		DisplayHostname: displayHostname,
-		NotifyPort:      event.DstPort,
+		enricher.Enrich(&out.Audit, event)
 	}
 
 	switch {
@@ -371,7 +330,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			eventProto = config.ProtocolAll
 		}
 		out.Kind = OutcomeAllowed
-		out.Audit.AutoAllowedType = string(configMgr.GetAutoAllowedType(dstIP, event.DstPort, eventProto, hostname))
+		out.Audit.AutoAllowedType = string(configMgr.GetAutoAllowedType(dstIP, event.DstPort, eventProto, out.Audit.DstHostname))
 
 	case event.IsProtocolBlock():
 		// Non-TCP/UDP protocol block — dst_port carried the protocol number.

@@ -246,6 +246,11 @@ func (s *Server) EnableQueryFiltering(enable bool) {
 //     This is the "let cloud-internal names resolve when no hostname rule
 //     covers them" path; traffic is still governed by hostname/CIDR rules.
 //  6. Default action.
+//
+// Every path above is deliberately run-wide: this gate must never grow a
+// step dimension, because DNS client attribution cannot be made per-step
+// causal — see "DNS and per-step policy" in design.md. Per-step tightness
+// belongs at the connection verdict, not here.
 func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 	if !s.filterQueries {
 		return true

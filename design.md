@@ -479,8 +479,10 @@ Phase 3a closes the attribution gap without touching enforcement:
   whole container to its *effective* ordinal — birth step, overwritten by
   each later `docker exec` (last-writer-wins) — because a DNS query carries
   only the client IP, not a socket tag. TC enrichment does not share this
-  limit (it reads each socket's own tag from the origin record). Phase 3b
-  must not treat DNS-path ordinals as per-socket causal attribution.
+  limit (it reads each socket's own tag from the origin record). No phase
+  may treat DNS-path ordinals as per-socket causal attribution or as an
+  enforcement input — the decided split lives in "DNS and per-step policy"
+  below, next to the phase-3b invariants it interacts with.
 - Unattributable container traffic gets its own summary tier ("Container
   traffic (unattributed…)"), checked before every looser bucket.
 - Scope boundaries: docker-in-docker attribution stops at the outer
@@ -544,9 +546,13 @@ any other consumer must do the same: **never sum `cgroup_would_block` with
 `connection_blocked`**, and never treat a would-block as a policy outcome.
 
 **Behavior changes to know about:**
-- A cgroup drop returns `EPERM` to the sender rather than TC's silent
-  blackhole: `connect()` fails fast instead of timing out, and blocked flows
-  no longer produce SYN retransmits.
+- A cgroup drop surfaces at the socket layer rather than TC's silent
+  blackhole — but the UX differs by protocol. UDP `sendto()`/`sendmsg()`
+  fail fast with `EPERM`. TCP does NOT fail fast: the SYN is dropped in
+  `ip_finish_output` and `tcp_connect()` short-circuits only on
+  `ECONNREFUSED`, so the SYN retransmits from the timer and `connect()`
+  eventually returns `ETIMEDOUT` — which is why originbpf.c's emit dedup
+  expects blocked-flow SYN retransmits.
 - The hook sees traffic TC never did — loopback (including the DNS proxy's
   own DNAT'd `127.0.0.1:53`) and the docker bridge. Loopback is carved out
   both in BPF and as a userspace `127.0.0.0/8` + `::1/128` allow rule;
@@ -557,6 +563,75 @@ any other consumer must do the same: **never sum `cgroup_would_block` with
 - Container traffic denied by policy is dropped pre-NAT, so TC never sees
   it: the cgroup hook is the sole event source for those blocks, and its
   events carry native pid/step/container attribution with no join needed.
+
+### DNS and per-step policy (decided 2026-08-08)
+
+**Rule: DNS-path attribution is audit-only. No phase — current or future —
+may use a DNS-derived ordinal as an enforcement input.**
+
+Binding on today's code, not just the future: `Tracker.LookupClient`'s
+ordinal reaches no enforcement path. It DOES fan out as an audit
+approximation (the `dns_blocked` event, and from there the summary's
+per-step grouping, the SaaS push, and OTLP's `cargowall.step_ordinal`), so
+consumers see a per-step-looking label that is really per-container
+last-writer-wins. `DecorateVerdict` is the site one line away from
+regressing this rule: it holds a `*containerInfo` and must keep stamping
+only `ContainerOrigin`/`ContainerID` — never `effectiveOrdinal` — onto
+connection outcomes.
+
+**Why the signal is unfit for policy** (scoped precisely — container
+identity is NOT the problem): a DNS query identifies the *container* (its
+IP is unique per bridge network), but not the *process or step* within it.
+One container spans steps (`effectiveOrdinal` is birth step overwritten by
+each `docker exec`), and for embedded-resolver forwards on user-defined
+networks the querying process's identity is laundered by the proxying
+itself — the forwarding socket lives in the container's netns but is
+created by dockerd, so socket-based lookups don't return "unknown", they
+confidently return dockerd. Per-step granularity from this signal is not
+achievable by any hook placement; per-container granularity is too coarse
+to select policy with.
+
+**The split** (what the per-step phase builds instead):
+- *Query filtering stays run-wide and step-agnostic.* All of today's allow
+  paths — rules, CNAME-derived allowances, search-domain suffixes, the
+  default action — remain without a step dimension. Residual risk, stated
+  honestly: this concedes cross-step DNS exfiltration. A compromised step
+  may query any domain the run allows for anyone, and the connection
+  verdict cannot see that channel (the query rides the proxy, whose
+  upstream socket is mark-exempt). Accepted because the alternative rests
+  on the unfit signal above; revisit only with a genuinely causal
+  mechanism, none of which is currently known.
+- *Per-step tightness is planned at the connection verdict* — future work,
+  none of it exists yet. `verdict.h`'s maps and key structs have no step
+  dimension, and the enforcing hook does not read `map_sock_step`.
+  Constraints that phase must resolve, recorded now so they aren't
+  rediscovered in review: (a) step-keyed rules mean re-keying the rule maps
+  and every writer; (b) the "one decision, parity-tested" invariant above
+  must be renegotiated, because a socket-keyed verdict is computable only
+  at the cgroup hook — post-NAT TC has no socket — so parity would scope to
+  the run-wide baseline with TC remaining the run-wide backstop (the
+  existing degradation posture); (c) selection semantics follow the tagging
+  model: sockets and container processes keep their *creating* step's tag,
+  so a service container started in step 2 is governed by step 2's policy
+  for its lifetime unless re-tagged by exec — per-step policy means "the
+  policy of the step that created it", not "the step active now"; (d) the
+  denial UX above applies — UDP fails fast with `EPERM`, TCP times out.
+
+**Follow-ups deliberately NOT adopted as written** (each has a verified
+flaw; redesign before building):
+- Join-store lookup for direct-bridge DNS clients: the store keys by
+  destination tuple only, and container→gateway traffic is not MASQUERADEd,
+  so distinct netns port spaces can collide on `(bridgeIP, 53, UDP,
+  srcPort)` and name the wrong container with no ambiguity signal; all
+  container DNS shares one key under `perKeyMax`; the ringbuf reader races
+  the query handler; and embedded-resolver forwards resolve to dockerd (see
+  above). Usable only as a hint gated on source-IP agreement with the byIP
+  index, never as a replacement for it.
+- Active-ordinal set per container: requires handling the `exec_die` event
+  (the tracker currently drops it unmatched) plus exec-id→ordinal
+  bookkeeping, or the set only grows. "Strictest member" is undefined over
+  opaque ordinals — on disagreement, degrade to the container-unattributed
+  tier, the codebase's one existing ambiguity vocabulary.
 
 ## GitHub Actions Integration
 

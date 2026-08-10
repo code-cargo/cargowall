@@ -99,6 +99,18 @@ func resolveDestination(configMgr *config.Manager, dstIP string, logger *slog.Lo
 	return hostname, cnameChain
 }
 
+// isTCPOrUDP reports whether proto is one of the two port-bearing L4
+// protocols cargowall reasons about. It is the shared "protocol deny?"
+// discriminator for both hooks' post-verdict handling: a denied non-TCP/UDP
+// protocol reports as a protocol block, and only TCP/UDP can be
+// late-allowed (fw.AddIP opens BPF state for SYN/datagram retries; nothing
+// else benefits). The TC path additionally decodes its wire shape with
+// BpfBlockedEvent.IsProtocolBlock, which answers "did the kernel encode a
+// protocol number in dst_port" — a different question about the same class.
+func isTCPOrUDP(proto uint8) bool {
+	return proto == unix.IPPROTO_TCP || proto == unix.IPPROTO_UDP
+}
+
 // tryLateAllow reconciles a denial against the current ruleset: if the
 // destination actually resolves to an allowed hostname (e.g. a process
 // bypassed the DNS proxy with a cached IP), it opens the firewall so future
@@ -106,14 +118,11 @@ func resolveDestination(configMgr *config.Manager, dstIP string, logger *slog.Lo
 // allowed. Without it, a denial that policy would permit never self-heals —
 // which is why both hooks must run it, not just TC.
 //
-// Restricted to TCP/UDP because fw.AddIP exists to open BPF state for TCP
-// SYN / UDP retries; non-TCP/UDP events can't benefit and we don't want to
-// pollute the firewall or misreport as late-allowed.
+// Restricted to TCP/UDP — see isTCPOrUDP.
 func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, hostname, dstIP string,
 	dstPort uint16, proto uint8, logger *slog.Logger,
 ) (lateAllowed bool, matchedRule string) {
-	if hostname == "" || fw == nil ||
-		(proto != unix.IPPROTO_TCP && proto != unix.IPPROTO_UDP) {
+	if hostname == "" || fw == nil || !isTCPOrUDP(proto) {
 		return false, ""
 	}
 	verdict := configMgr.MatchHostnameRule(hostname)
@@ -301,6 +310,58 @@ func emitOutcome(o Outcome, notificationTracker *NotificationTracker,
 	}
 }
 
+// prepareOutcome runs the post-verdict preparation shared by both hooks:
+// destination resolution, late-allow reconciliation, and the base Outcome
+// with its audit record. Each hook then adds only what is genuinely its own
+// — identity enrichment/decoration and kind selection. Kept as one function
+// so the two preparation paths cannot drift the way the two emission paths
+// once did (see emitOutcome).
+//
+// denial gates tryLateAllow: allowed TC events and shadow-mode would-blocks
+// must never open the firewall.
+//
+// One audit record underlies every outcome branch and every observable
+// channel: the caller stamps its event type and type-specific fields onto
+// this base, emitOutcome hands it to LogEvent and logs through
+// logConnEvent, which reads identity from the same struct — so enrichment
+// can never produce a log line that disagrees with the audit stream. (The
+// process name is looked up from /proc since bpf_get_current_comm is
+// unavailable in TC programs.)
+func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, logger *slog.Logger,
+	denial bool, srcIP, dstIP string, srcPort, dstPort uint16, proto uint8,
+	pid, ordinal uint32,
+) (out Outcome, lateAllowed bool, matchedRule string) {
+	hostname, cnameChain := resolveDestination(configMgr, dstIP, logger)
+
+	if denial {
+		lateAllowed, matchedRule = tryLateAllow(configMgr, fw, hostname, dstIP,
+			dstPort, proto, logger)
+	}
+
+	displayHostname := hostname
+	if displayHostname == "" {
+		displayHostname = dstIP
+	}
+
+	out = Outcome{
+		Audit: AuditEvent{
+			SrcIP:       srcIP,
+			DstIP:       dstIP,
+			DstHostname: hostname,
+			DstPort:     dstPort,
+			Protocol:    getProtocolName(proto),
+			Process:     lookupProcessName(pid),
+			PID:         pid,
+			CNAMEChain:  cnameChain,
+			StepOrdinal: ordinal,
+		},
+		SrcPort:         srcPort,
+		DisplayHostname: displayHostname,
+		NotifyPort:      dstPort,
+	}
+	return out, lateAllowed, matchedRule
+}
+
 // VerdictRecord is one policy outcome reported by a hook that adjudicates in
 // socket context rather than from a packet at TC — today, the root-cgroup
 // egress hook. Addresses are already resolved to strings by the producer,
@@ -343,46 +404,17 @@ type VerdictRecord struct {
 func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTracker *NotificationTracker,
 	auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger,
 ) {
-	hostname, cnameChain := resolveDestination(configMgr, rec.DstIP, logger)
+	// denial = rec.Dropped: shadow-mode would-blocks are hypothetical and
+	// must not open the firewall — nothing was denied and TC's own verdict
+	// still governs the flow.
+	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, logger,
+		rec.Dropped, rec.SrcIP, rec.DstIP, rec.SrcPort, rec.DstPort, rec.Proto,
+		rec.PID, rec.StepOrdinal)
 
-	// Shadow-mode would-blocks are hypothetical: they must not open the
-	// firewall, because nothing was denied and TC's own verdict still
-	// governs the flow.
-	var lateAllowed bool
-	var matchedRule string
-	if rec.Dropped {
-		lateAllowed, matchedRule = tryLateAllow(configMgr, fw, hostname, rec.DstIP,
-			rec.DstPort, rec.Proto, logger)
-	}
-
-	displayHostname := hostname
-	if displayHostname == "" {
-		displayHostname = rec.DstIP
-	}
-
-	audit := AuditEvent{
-		SrcIP:       rec.SrcIP,
-		DstIP:       rec.DstIP,
-		DstHostname: hostname,
-		DstPort:     rec.DstPort,
-		Protocol:    ProtocolName(rec.Proto),
-		Process:     lookupProcessName(rec.PID),
-		PID:         rec.PID,
-		CNAMEChain:  cnameChain,
-		StepOrdinal: rec.StepOrdinal,
-	}
 	if rec.Decorate != nil {
-		rec.Decorate(&audit)
+		rec.Decorate(&out.Audit)
 	}
 
-	out := Outcome{
-		Audit:           audit,
-		SrcPort:         rec.SrcPort,
-		DisplayHostname: displayHostname,
-		NotifyPort:      rec.DstPort,
-	}
-
-	isL4 := rec.Proto == unix.IPPROTO_TCP || rec.Proto == unix.IPPROTO_UDP
 	switch {
 	case !rec.Dropped:
 		out.Kind = OutcomeWouldBlock
@@ -394,7 +426,7 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 	case lateAllowed:
 		out.Kind = OutcomeLateAllowed
 		out.Audit.MatchedRule = matchedRule
-	case !isL4:
+	case !isTCPOrUDP(rec.Proto):
 		// A denied non-TCP/UDP protocol reports in the same shape TC gives
 		// it, so flipping --cgroup-enforce never changes an event's type for
 		// consumers that branch on it. The hook emits ports 0 for these, so

@@ -181,6 +181,11 @@ const (
 	reconnectBackoff = 500 * time.Millisecond
 	maxBackoff       = 5 * time.Second
 	unaryTimeout     = 5 * time.Second
+	// reconcileInspectConcurrency bounds the parallel PID-verification
+	// inspects reconcile issues for already-known containers. Same shape
+	// and rationale as execSem: bounded parallelism against the daemon,
+	// never an unbounded thundering herd, never fully serial.
+	reconcileInspectConcurrency = 4
 )
 
 // Start connects to the Docker daemon and begins tracking. An error means
@@ -344,6 +349,17 @@ func (t *Tracker) reconcile(ctx context.Context) {
 	for _, c := range list {
 		live[c.ID] = true
 	}
+	// Split the list: unknown IDs are adopted (below), known IDs are
+	// verified — a known ID may be a NEW incarnation, because docker
+	// restart keeps the container ID but mints a fresh init PID and cgroup,
+	// and the die+start pair can both be lost in the same stream gap.
+	// Verify by init PID; on mismatch re-adopt, or byCgroup keys a dead
+	// inode and the new init process is never tagged.
+	type incarnation struct {
+		id             string
+		oldPID, newPID int
+	}
+	var toVerify []incarnation
 	for _, c := range list {
 		t.mu.Lock()
 		info := t.containers[c.ID]
@@ -352,21 +368,46 @@ func (t *Tracker) reconcile(ctx context.Context) {
 			t.handleStart(ctx, c.ID, "reconcile", 0)
 			continue
 		}
-		// A known ID may be a NEW incarnation: docker restart keeps the
-		// container ID but mints a fresh init PID and cgroup, and the
-		// die+start pair can both be lost in the same stream gap. Verify by
-		// init PID; on mismatch re-adopt, or byCgroup keys a dead inode and
-		// the new init process is never tagged.
-		ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
-		insp, ierr := t.client.inspectContainer(ictx, c.ID)
-		cancel()
-		if ierr != nil || insp.State.Pid == 0 || insp.State.Pid == info.initPID {
-			continue
-		}
+		toVerify = append(toVerify, incarnation{id: c.ID, oldPID: info.initPID})
+	}
+	// Verification inspects run concurrently, bounded: this whole function
+	// runs on the stream goroutine before event processing resumes, and a
+	// large fleet against a slow daemon must not serialize N unary
+	// timeouts in front of reconnect recovery.
+	var (
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, reconcileInspectConcurrency)
+		mu      sync.Mutex
+		readopt []incarnation
+	)
+	for _, k := range toVerify {
+		wg.Add(1)
+		go func(k incarnation) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
+			insp, ierr := t.client.inspectContainer(ictx, k.id)
+			cancel()
+			if ierr != nil || insp.State.Pid == 0 || insp.State.Pid == k.oldPID {
+				return
+			}
+			k.newPID = insp.State.Pid
+			mu.Lock()
+			readopt = append(readopt, k)
+			mu.Unlock()
+		}(k)
+	}
+	wg.Wait()
+	for _, k := range readopt {
 		t.logger.Info("Container re-adopted during reconciliation (restarted across a stream gap)",
-			"container", shortID(c.ID), "old_pid", info.initPID, "new_pid", insp.State.Pid)
-		t.remove(c.ID)
-		t.handleStart(ctx, c.ID, "reconcile", 0)
+			"container", shortID(k.id), "old_pid", k.oldPID, "new_pid", k.newPID)
+		t.remove(k.id)
+		t.handleStart(ctx, k.id, "reconcile", 0)
 	}
 
 	// The diff the other way: a tracked container absent from the list lost

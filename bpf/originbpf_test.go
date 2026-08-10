@@ -17,6 +17,7 @@
 package bpf
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -411,6 +412,54 @@ func TestOriginEgressLoopbackDeviceCarveOut(t *testing.T) {
 	require.Equal(t, uint32(1), ret, "armed: test skbs ride lo, local-only v6 traffic must pass")
 }
 
+// The local-networks carve-out (map_local_nets): a subnet written there is
+// exempt from THIS hook's adjudication — and, critically, from this hook
+// ONLY. The map is owned by the origin collection and never shared, so a
+// workload-influenced subnet (docker bridge discovery) can exempt local
+// traffic this hook alone sees but can never widen tc_egress's off-host
+// enforcement; the parity test's premise (shared decision) is about the
+// verdict maps, which this deliberately is not part of.
+func TestOriginEgressLocalNetworkCarveOut(t *testing.T) {
+	objs := loadOriginObjects(t)
+	tcObjs := loadBPFObjects(t)
+	seedOriginRules(t, objs)
+	setOriginMode(t, objs, originModeEnforce)
+
+	pkt4 := craftIPv4TCP(t, "10.99.7.3", 443)  // denied dst
+	pkt6 := craftIPv6TCP(t, "fd00:77::3", 443) // denied dst
+
+	ret, _, err := objs.CgOriginEgress.Test(pkt4)
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), ret, "denied v4 dst must drop before the carve-out exists")
+	ret, _, err = objs.CgOriginEgress.Test(pkt6)
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), ret, "denied v6 dst must drop before the carve-out exists")
+
+	require.NoError(t, objs.MapLocalNets.Put(
+		OriginBpfLpmKey{Prefixlen: 24, Ip: ipToU32("10.99.7.0")}, uint8(1)))
+	key6 := OriginBpfLpmKeyV6{Prefixlen: 64}
+	copy(key6.Ip[:], net.ParseIP("fd00:77::").To16())
+	require.NoError(t, objs.MapLocalNetsV6.Put(key6, uint8(1)))
+
+	ret, _, err = objs.CgOriginEgress.Test(pkt4)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), ret, "carved-out v4 subnet must pass at the cgroup hook")
+	ret, _, err = objs.CgOriginEgress.Test(pkt6)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), ret, "carved-out v6 subnet must pass at the cgroup hook")
+
+	// The isolation property: the same destination is still adjudicated by
+	// TC. Program TC with the same deny-all policy and confirm the carve-out
+	// did not leak — this is what makes workload-influenced subnet discovery
+	// safe to wire at all.
+	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(0)))
+	require.NoError(t, tcObjs.MapAuditMode.Put(uint32(0), uint8(0)))
+	tcRet, _, err := tcObjs.TcEgress.Test(pkt4)
+	require.NoError(t, err)
+	require.NotEqual(t, uint32(tcActOK), tcRet,
+		"a local-net carve-out must never widen TC's off-host enforcement")
+}
+
 // Denial reporting must mirror tc_egress's policy, not just its verdict: a
 // killed established flow is emitted (flagged mid-stream), while kernel RST
 // replies to inbound port scans and SYN-ACK replies to inbound handshakes
@@ -488,40 +537,80 @@ func TestOriginVerdictChangeReemitsWithinInterval(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { rd.Close() })
 
-	// TEST-NET-3 (RFC 5737): reserved and unroutable — deliverability is
-	// irrelevant, only adjudication by THIS test's hook is. Expected side
-	// effect when a production cargowall polices the same machine (CI
-	// runners): the observe-phase datagram below legitimately leaves this
-	// test's cgroup and is then blocked and audited by the runner's TC as
-	// "Connection blocked ... dst=203.0.113.9 process=bpf.test" — one line
-	// per run, noise, not a leak. If the runner's cargowall is itself
-	// cgroup-enforcing, the first write fails with EPERM and this test
-	// skips instead.
-	conn, err := net.Dial("udp4", "203.0.113.9:9999")
+	// The probe targets one of the HOST'S OWN non-loopback addresses:
+	// Linux routes that over lo, so the datagram never leaves the machine.
+	// A production cargowall protecting the same host (CI runners dogfood
+	// enforcement) sees it neither at TC (never attached to lo) nor at its
+	// cgroup hook (its ARMED loopback-device carve-out passes lo egress) —
+	// so this test can never inject a blocked event into a real audit
+	// stream or the product's report. THIS test's hook still adjudicates
+	// the same packet precisely because a fresh collection leaves the
+	// carve-out gate unarmed. The socket is deliberately unconnected: the
+	// observe-phase delivery draws an ICMP port-unreachable, which a
+	// connected socket would surface as ECONNREFUSED on the next send —
+	// the enforce-phase error below must be the hook's own EPERM, not that.
+	dstIP := hostOwnIPv4(t)
+	pc, err := net.ListenPacket("udp4", ":0")
 	require.NoError(t, err)
-	t.Cleanup(func() { conn.Close() })
+	t.Cleanup(func() { pc.Close() })
+	dst := &net.UDPAddr{IP: dstIP, Port: 9999}
+	wantDst := binary.BigEndian.Uint32(dstIP)
 
 	findRecord := func(wantVerdict uint8) bool {
 		for _, r := range collectOriginRecords(t, rd, time.Second) {
-			if r.IpVersion == 4 && r.DstIp == 0xCB007109 && r.DstPort == 9999 && r.Verdict == wantVerdict {
+			if r.IpVersion == 4 && r.DstIp == wantDst && r.DstPort == 9999 && r.Verdict == wantVerdict {
 				return true
 			}
 		}
 		return false
 	}
 
-	if _, err := conn.Write([]byte("x")); err != nil {
-		t.Skipf("no route for test egress: %v", err)
+	if _, err := pc.WriteTo([]byte("x"), dst); err != nil {
+		t.Skipf("cannot send probe datagram: %v", err)
 	}
 	require.True(t, findRecord(originVerdictNone), "observe-mode record for the flow must arrive")
 
 	// Same socket, same tuple, well inside the dedup interval — only the
 	// verdict differs. The enforced drop must still produce a record.
 	setOriginMode(t, objs, originModeEnforce)
-	_, werr := conn.Write([]byte("x"))
+	_, werr := pc.WriteTo([]byte("x"), dst)
 	require.Error(t, werr, "enforce mode must drop the denied datagram")
 	require.True(t, findRecord(originVerdictBlock),
 		"the first enforced drop after a verdict change must emit despite the dedup interval")
+}
+
+// hostOwnIPv4 returns one of the host's own non-loopback IPv4 addresses —
+// a destination the host routes over lo, so probe traffic to it never
+// leaves the machine (see the callers for why that matters). KNOWN
+// TRADEOFF: on a host with no such address (IPv6-only, or a hermetic lo-
+// only netns) the callers SKIP, losing the real-socket cookie-join and
+// verdict-change re-emit coverage — accepted because 127.0.0.1 can no
+// longer serve (loopback destinations deliberately never emit records) and
+// every CI runner has an IPv4 address. If a hermetic environment ever
+// matters, add a dummy interface (ip link add + ip addr) instead of
+// weakening the emit suppression.
+func hostOwnIPv4(t *testing.T) net.IP {
+	t.Helper()
+	ifaces, err := net.Interfaces()
+	require.NoError(t, err)
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagLoopback != 0 || ifc.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok {
+				if ip4 := ipn.IP.To4(); ip4 != nil {
+					return ip4
+				}
+			}
+		}
+	}
+	t.Skip("no non-loopback IPv4 address on this host")
+	return nil
 }
 
 // Audit posture is the run's single source of truth for "log, never block".
@@ -795,10 +884,18 @@ func TestOriginRealSocket(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { rd.Close() })
 
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	// The host's own address, not loopback: 127/8 destinations are
+	// deliberately never emitted (nothing joins them and the DNS redirect
+	// would make one dead record per host query), but host-own-IP traffic
+	// rides lo with a non-127 destination and still emits — and, like the
+	// verdict-change test, it never leaves the machine, so a production
+	// cargowall on this host can never observe it.
+	hostIP := hostOwnIPv4(t)
+	ln, err := net.Listen("tcp4", hostIP.String()+":0")
 	require.NoError(t, err)
 	t.Cleanup(func() { ln.Close() })
 	port := uint16(ln.Addr().(*net.TCPAddr).Port)
+	wantDst := binary.BigEndian.Uint32(hostIP)
 
 	conn, err := net.Dial("tcp4", ln.Addr().String())
 	require.NoError(t, err)
@@ -827,7 +924,7 @@ func TestOriginRealSocket(t *testing.T) {
 		require.Equal(t, uint8(4), r.IpVersion)
 		require.Equal(t, uint8(ipprotoTCP), r.IpProto)
 		require.Equal(t, uint8(OriginFlagTCPSyn), r.Flags)
-		require.Equal(t, uint32(0x7F000001), r.DstIp, "dst must be 127.0.0.1")
+		require.Equal(t, wantDst, r.DstIp, "dst must be the host's own address")
 		require.Equal(t, port, r.DstPort)
 		require.NotZero(t, r.CgroupID, "real socket must carry its cgroup id")
 

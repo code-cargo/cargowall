@@ -35,25 +35,49 @@ const (
 // GetDockerBridgeIP returns the IP address of the docker0 bridge interface.
 // This is typically 172.17.0.1 and is used as the gateway for Docker containers.
 func GetDockerBridgeIP() (string, error) {
+	ipnet, err := dockerBridgeIPNet()
+	if err != nil {
+		return "", err
+	}
+	return ipnet.IP.String(), nil
+}
+
+// GetDockerBridgeSubnet returns the default bridge's IPv4 network in CIDR
+// form (e.g. "172.17.0.0/16"). The cgroup egress hook adjudicates bridge
+// traffic TC never saw — host→published-port via docker-proxy, container→
+// container — and under shadow/enforce that local-only class is carved out
+// by subnet (pkg/origin's local-nets map), not discovered one denial at a
+// time.
+func GetDockerBridgeSubnet() (string, error) {
+	ipnet, err := dockerBridgeIPNet()
+	if err != nil {
+		return "", err
+	}
+	network := &net.IPNet{IP: ipnet.IP.Mask(ipnet.Mask), Mask: ipnet.Mask}
+	return network.String(), nil
+}
+
+// dockerBridgeIPNet is the one walk of docker0's addresses — the bridge IP
+// (DNS listener) and the bridge subnet (local-net carve-out) must always
+// come from the same interface and address, or the two halves of docker
+// integration could disagree about which bridge they serve.
+func dockerBridgeIPNet() (*net.IPNet, error) {
 	iface, err := net.InterfaceByName("docker0")
 	if err != nil {
-		return "", fmt.Errorf("docker0 interface not found: %w", err)
+		return nil, fmt.Errorf("docker0 interface not found: %w", err)
 	}
-
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return "", fmt.Errorf("failed to get docker0 addresses: %w", err)
+		return nil, fmt.Errorf("failed to get docker0 addresses: %w", err)
 	}
-
 	for _, addr := range addrs {
 		if ipnet, ok := addr.(*net.IPNet); ok {
 			if ip4 := ipnet.IP.To4(); ip4 != nil {
-				return ip4.String(), nil
+				return &net.IPNet{IP: ip4, Mask: ipnet.Mask}, nil
 			}
 		}
 	}
-
-	return "", fmt.Errorf("no IPv4 address found on docker0")
+	return nil, fmt.Errorf("no IPv4 address found on docker0")
 }
 
 // ConfigureDockerDNS configures Docker to use the specified DNS server.

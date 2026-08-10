@@ -155,6 +155,45 @@ static __always_inline __u8 origin_mode(void) {
     return mode ? *mode : ORIGIN_MODE_OBSERVE;  // absent = inert
 }
 
+// Local-only networks (docker bridge subnets), carved out of adjudication
+// the way loopback is. OWNED by this collection and deliberately NOT in
+// verdict.h: an entry here must never widen tc_egress. Subnets are
+// discovered from container config at runtime — i.e. they are
+// workload-influenced — so the blast radius of a hostile entry must be
+// bounded: carving a subnet out of THIS hook returns that traffic to its
+// pre-3b posture (unpoliced locally, because TC never saw bridge traffic),
+// while anything that actually leaves the host still meets TC's untouched
+// verdict. Userspace writes only bridge-driver network subnets (see
+// pkg/containers), whose routes are on-link by construction.
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct lpm_key);
+    __type(value, __u8);
+    __uint(max_entries, 256);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} map_local_nets SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct lpm_key_v6);
+    __type(value, __u8);
+    __uint(max_entries, 256);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} map_local_nets_v6 SEC(".maps");
+
+static __always_inline __u8 local_net_v4(__u32 dst_ip_nbo) {
+    struct lpm_key key = { .prefixlen = 32, .ip = dst_ip_nbo };
+    return bpf_map_lookup_elem(&map_local_nets, &key) != NULL;
+}
+
+static __always_inline __u8 local_net_v6(const __u8 dst_ip6[16]) {
+    struct lpm_key_v6 key;
+    __builtin_memset(&key, 0, sizeof(key));
+    key.prefixlen = 128;
+    __builtin_memcpy(key.ip, dst_ip6, 16);
+    return bpf_map_lookup_elem(&map_local_nets_v6, &key) != NULL;
+}
+
 // origin_lo_carveout gates the "egressing the loopback device" carve-out.
 // pkg/origin sets it unconditionally at load, before attach, so it is always
 // on in production. It exists as a config byte ONLY because PROG_TEST_RUN
@@ -229,10 +268,16 @@ struct {
     __uint(max_entries, 4096);
 } map_origin_seen SEC(".maps");
 
-// Dedup-then-emit one origin record. A concurrent lookup/update race across
-// CPUs costs at most one duplicate record — not worth an atomic. Ringbuf
-// reservation failure just drops the record: attribution degrades, nothing
-// else does.
+// Dedup-then-emit one origin record. The dedup is stamped only AFTER a
+// successful ringbuf reserve, so a reservation failure leaves it unstamped
+// and the flow's next packet re-attempts immediately — the loss window is
+// one packet, never the 10s interval (in enforce mode the record is a
+// drop's only audit trail). The trade, accepted deliberately: the
+// unstamped window now spans the reserve, so N CPUs racing one flow can
+// emit up to N duplicate records (userspace dedups by cookie in the join
+// store; a duplicate verdict record costs a duplicate audit line), and
+// under a persistently full ring every packet retries the reserve instead
+// of going quiet. Not worth an atomic.
 static __always_inline void origin_emit(struct __sk_buff *skb, __u8 ip_version,
                                         __u8 ip_proto, __u8 flags, __u8 verdict,
                                         __u32 src_ip, __u32 dst_ip,
@@ -255,12 +300,15 @@ static __always_inline void origin_emit(struct __sk_buff *skb, __u8 ip_version,
     struct origin_seen_val *last = bpf_map_lookup_elem(&map_origin_seen, &key);
     if (last && last->verdict == verdict && now - last->last_emit < ORIGIN_EMIT_INTERVAL_NS)
         return;
-    struct origin_seen_val val = { .last_emit = now, .verdict = verdict };
-    bpf_map_update_elem(&map_origin_seen, &key, &val, BPF_ANY);
 
     struct origin_event *evt = bpf_ringbuf_reserve(&map_origin_events, sizeof(*evt), 0);
     if (!evt)
-        return;
+        return;  // dedup NOT stamped: the next packet retries instead of
+                 // going silent for the interval — in enforce mode this
+                 // record is a drop's only audit trail, and a stamped-but-
+                 // lost entry would mute every retransmit for 10s.
+    struct origin_seen_val val = { .last_emit = now, .verdict = verdict };
+    bpf_map_update_elem(&map_origin_seen, &key, &val, BPF_ANY);
     __builtin_memset(evt, 0, sizeof(*evt));
     evt->cookie = cookie;
     evt->cgroup_id = bpf_skb_cgroup_id(skb);
@@ -329,7 +377,15 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
     __u16 src_port = 0;
     __u16 dst_port = 0;
     __u8 flags = 0;
-    __u8 emit = 1;
+    // Loopback destinations never emit: TC never sees lo, so nothing can
+    // join the record — and with the DNS redirect DNATing port 53 to
+    // 127.0.0.1 before this hook, every host DNS query is a fresh socket
+    // (fresh cookie, fresh dedup key) that would otherwise cost one dead
+    // ring record per query. Mirrors the v6 handler's early return for ::1.
+    // ICMP deliberately still emits: a denied external ICMP packet DOES
+    // reach TC as a protocol-block candidate, and that event joins against
+    // this record.
+    __u8 emit = (dst_ip >> 24) != 127;
 
     if (non_first_frag) {
         // No L4 header: ports stay 0 and the verdict falls to the LPM/default
@@ -370,7 +426,8 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
         // never pays for it; operand order keeps the config-map lookup
         // confined to packets actually on the loopback device.
         __u8 carve_out = ((dst_ip >> 24) == 127) || (ip_proto == IPPROTO_ICMP) ||
-                         (skb->ifindex == LOOPBACK_IFINDEX && origin_lo_carveout());
+                         (skb->ifindex == LOOPBACK_IFINDEX && origin_lo_carveout()) ||
+                         local_net_v4(ip_hdr.daddr);
         if (!carve_out) {
             allowed = verdict_allowed_v4(ip_hdr.daddr, dst_port, ip_proto);
             verdict = verdict_label(mode, allowed);
@@ -500,7 +557,8 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
         // own global address over lo): same carve-out class and same
         // evaluation-order rationale as the IPv4 handler; ::1 itself
         // returned above.
-        __u8 carve_out = (skb->ifindex == LOOPBACK_IFINDEX) && origin_lo_carveout();
+        __u8 carve_out = ((skb->ifindex == LOOPBACK_IFINDEX) && origin_lo_carveout()) ||
+                         local_net_v6(dst_ip6);
         if (!carve_out) {
             allowed = verdict_allowed_v6(dst_ip6, dst_port, nexthdr);
             verdict = verdict_label(mode, allowed);

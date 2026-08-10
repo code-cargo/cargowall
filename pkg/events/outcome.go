@@ -318,7 +318,10 @@ func emitOutcome(o Outcome, notificationTracker *NotificationTracker,
 // once did (see emitOutcome).
 //
 // denial gates tryLateAllow: allowed TC events and shadow-mode would-blocks
-// must never open the firewall.
+// must never open the firewall. degraded bounds the whole preparation for a
+// saturated reporting pipeline: no DNS-cache/PTR resolution and no firewall
+// writes — the audit record goes out with the bare IP, because it is the
+// one artifact an enforced drop must never lose.
 //
 // One audit record underlies every outcome branch and every observable
 // channel: the caller stamps its event type and type-specific fields onto
@@ -328,14 +331,17 @@ func emitOutcome(o Outcome, notificationTracker *NotificationTracker,
 // process name is looked up from /proc since bpf_get_current_comm is
 // unavailable in TC programs.)
 func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, logger *slog.Logger,
-	denial bool, srcIP, dstIP string, srcPort, dstPort uint16, proto uint8,
+	denial, degraded bool, srcIP, dstIP string, srcPort, dstPort uint16, proto uint8,
 	pid, ordinal uint32,
 ) (out Outcome, lateAllowed bool, matchedRule string) {
-	hostname, cnameChain := resolveDestination(configMgr, dstIP, logger)
-
-	if denial {
-		lateAllowed, matchedRule = tryLateAllow(configMgr, fw, hostname, dstIP,
-			dstPort, proto, logger)
+	var hostname string
+	var cnameChain []string
+	if !degraded {
+		hostname, cnameChain = resolveDestination(configMgr, dstIP, logger)
+		if denial {
+			lateAllowed, matchedRule = tryLateAllow(configMgr, fw, hostname, dstIP,
+				dstPort, proto, logger)
+		}
 	}
 
 	displayHostname := hostname
@@ -386,6 +392,13 @@ type VerdictRecord struct {
 	// allowlist change can kill a live connection here exactly as at TC.
 	MidStream bool
 
+	// Degraded means the reporting pipeline was saturated and this record
+	// is being delivered on a path that must stay bounded: ReportVerdict
+	// skips hostname resolution, late-allow reconciliation, and the
+	// notification, and writes only the audit record — the one artifact an
+	// enforced drop must never lose.
+	Degraded bool
+
 	// Decorate optionally adds identity the reporting hook cannot know —
 	// container id and origin, supplied by pkg/containers. Nil when no
 	// decorator is wired.
@@ -406,13 +419,24 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 ) {
 	// denial = rec.Dropped: shadow-mode would-blocks are hypothetical and
 	// must not open the firewall — nothing was denied and TC's own verdict
-	// still governs the flow.
+	// still governs the flow. Degraded records ride the SAME pipeline with
+	// the slow work flagged off (see prepareOutcome) rather than a parallel
+	// construction that could drift from it.
 	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, logger,
-		rec.Dropped, rec.SrcIP, rec.DstIP, rec.SrcPort, rec.DstPort, rec.Proto,
+		rec.Dropped, rec.Degraded, rec.SrcIP, rec.DstIP, rec.SrcPort, rec.DstPort, rec.Proto,
 		rec.PID, rec.StepOrdinal)
 
 	if rec.Decorate != nil {
 		rec.Decorate(&out.Audit)
+	}
+
+	if rec.Degraded {
+		// The notification client reaches the SaaS backend — unbounded
+		// network work the degraded contract forbids. Everything else below
+		// is the ordinary path: lateAllowed is necessarily false (skipped in
+		// preparation), so a degraded Block selects OutcomeBlocked or
+		// OutcomeProtocolBlocked exactly as a full one would.
+		notificationTracker = nil
 	}
 
 	switch {

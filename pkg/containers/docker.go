@@ -77,11 +77,15 @@ type containerInspect struct {
 		Privileged bool `json:"Privileged"`
 	} `json:"HostConfig"`
 	NetworkSettings struct {
-		IPAddress         string `json:"IPAddress"`
-		GlobalIPv6Address string `json:"GlobalIPv6Address"`
-		Networks          map[string]struct {
-			IPAddress         string `json:"IPAddress"`
-			GlobalIPv6Address string `json:"GlobalIPv6Address"`
+		IPAddress           string `json:"IPAddress"`
+		IPPrefixLen         int    `json:"IPPrefixLen"`
+		GlobalIPv6Address   string `json:"GlobalIPv6Address"`
+		GlobalIPv6PrefixLen int    `json:"GlobalIPv6PrefixLen"`
+		Networks            map[string]struct {
+			IPAddress           string `json:"IPAddress"`
+			IPPrefixLen         int    `json:"IPPrefixLen"`
+			GlobalIPv6Address   string `json:"GlobalIPv6Address"`
+			GlobalIPv6PrefixLen int    `json:"GlobalIPv6PrefixLen"`
 		} `json:"Networks"`
 	} `json:"NetworkSettings"`
 	ExecIDs []string `json:"ExecIDs"`
@@ -96,6 +100,14 @@ type execInspect struct {
 
 type containerSummary struct {
 	ID string `json:"Id"`
+}
+
+// networkInspect carries the one field the subnet carve-out gates on: only
+// bridge-driver networks are local-only by construction (their routes are
+// on-link); macvlan/ipvlan subnets are physical-network address space.
+type networkInspect struct {
+	Name   string `json:"Name"`
+	Driver string `json:"Driver"`
 }
 
 // events opens the container-event stream. sinceNano > 0 resumes from that
@@ -131,6 +143,12 @@ func (c *dockerClient) inspectContainer(ctx context.Context, id string) (contain
 func (c *dockerClient) inspectExec(ctx context.Context, id string) (execInspect, error) {
 	var out execInspect
 	return out, c.get(ctx, "/exec/"+url.PathEscape(id)+"/json", &out)
+}
+
+// inspectNetwork resolves a network name to its driver.
+func (c *dockerClient) inspectNetwork(ctx context.Context, name string) (networkInspect, error) {
+	var out networkInspect
+	return out, c.get(ctx, "/networks/"+url.PathEscape(name), &out)
 }
 
 // listContainers returns running containers (the API default) for the

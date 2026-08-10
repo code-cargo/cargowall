@@ -104,6 +104,18 @@ type Options struct {
 	Socket     string // Docker daemon socket, default /var/run/docker.sock
 	ProcRoot   string // default /proc
 	CgroupRoot string // default /sys/fs/cgroup
+	// AllowLocalSubnet is called once per BRIDGE-DRIVER subnet discovered
+	// on a tracked container (v4 or v6). Under --cgroup-enforce the hook
+	// adjudicates local-only bridge traffic TC never saw — container→
+	// container on user-defined networks, docker-proxy→container — and the
+	// callback carves those subnets out of THAT HOOK ONLY (origin's
+	// local-nets map, never the shared policy: a workload-influenced subnet
+	// must not be able to widen TC's off-host enforcement). Non-bridge
+	// drivers (macvlan/ipvlan — physical-network address space) are never
+	// passed. An error means the carve-out was not applied; the tracker
+	// retries on the next container of that network. Nil disables
+	// discovery. Called without the tracker lock held.
+	AllowLocalSubnet func(prefix netip.Prefix) error
 }
 
 type containerInfo struct {
@@ -158,7 +170,9 @@ type Tracker struct {
 	// whole set — a long job with many docker execs must not accumulate an
 	// unbounded map of 64-char ids.
 	seenExecs map[string]map[string]bool
-	latencies []float64 // tag latencies (ms), bounded
+	// seenSubnets dedups AllowLocalSubnet callbacks: one per subnet, ever.
+	seenSubnets map[string]bool
+	latencies   []float64 // tag latencies (ms), bounded
 
 	lastEventNano atomic.Int64
 
@@ -181,10 +195,20 @@ const (
 	reconnectBackoff = 500 * time.Millisecond
 	maxBackoff       = 5 * time.Second
 	unaryTimeout     = 5 * time.Second
+	// streamHealthyAfter is how long an event session must survive before
+	// the reconnect backoff resets to its floor. Duration-based on purpose:
+	// an event-based signal is defeated by docker's inclusive `since`
+	// replay, which redelivers at least one event to every session that
+	// gets past connect — pinning a flapping daemon at the 500ms floor.
+	streamHealthyAfter = 30 * time.Second
+	// execConcurrency bounds concurrent exec handling (execSem): exec-pid
+	// resolution can wait out dockerd's publish race, and that wait must
+	// never park the shared event stream.
+	execConcurrency = 4
 	// reconcileInspectConcurrency bounds the parallel PID-verification
 	// inspects reconcile issues for already-known containers. Same shape
-	// and rationale as execSem: bounded parallelism against the daemon,
-	// never an unbounded thundering herd, never fully serial.
+	// and rationale as execConcurrency: bounded parallelism against the
+	// daemon, never an unbounded thundering herd, never fully serial.
 	reconcileInspectConcurrency = 4
 )
 
@@ -215,11 +239,12 @@ func Start(ctx context.Context, opts Options, tagger StepTagger, observer *origi
 		logger:      logger,
 		opts:        opts,
 		done:        make(chan struct{}),
-		execSem:     make(chan struct{}, 4),
+		execSem:     make(chan struct{}, execConcurrency),
 		containers:  make(map[string]*containerInfo),
 		byIP:        make(map[netip.Addr]*containerInfo),
 		byCgroup:    make(map[uint64]*containerInfo),
 		seenExecs:   make(map[string]map[string]bool),
+		seenSubnets: make(map[string]bool),
 	}
 	// Typed-nil guard: a nil *origin.Observer must stay a nil interface, or
 	// Enrich's nil check would pass and call into a nil receiver.
@@ -257,9 +282,20 @@ func (t *Tracker) run(ctx context.Context) {
 	defer close(t.done)
 	backoff := reconnectBackoff
 	for {
+		start := time.Now()
 		err := t.streamOnce(ctx)
 		if ctx.Err() != nil {
 			return
+		}
+		if time.Since(start) >= streamHealthyAfter {
+			// A session that survived this long was genuinely healthy: the
+			// next hiccup gets the 500ms floor back. Without this, a few
+			// startup flakes pin backoff at maxBackoff for the process
+			// lifetime; with an event-based signal instead, docker's
+			// inclusive `since` replay (at least one redelivered event per
+			// session that connects) would reset it even for a flapping
+			// daemon.
+			backoff = reconnectBackoff
 		}
 		t.logger.Warn("Docker event stream interrupted; reconnecting", "error", err, "backoff", backoff)
 		select {
@@ -439,6 +475,18 @@ func (t *Tracker) reconcile(ctx context.Context) {
 			"container", shortID(id))
 		t.remove(id)
 	}
+
+	// seenExecs sets can outlive their container: an exec handler parked in
+	// resolveExecPid may re-create one after remove() ran (a race
+	// markExecSeen deliberately tolerates). The container sweep above walks
+	// t.containers, which such an orphan is not in — prune it here.
+	t.mu.Lock()
+	for id := range t.seenExecs {
+		if !live[id] && t.containers[id] == nil {
+			delete(t.seenExecs, id)
+		}
+	}
+	t.mu.Unlock()
 }
 
 func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int64) {
@@ -468,6 +516,14 @@ func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int
 	for _, ipStr := range collectIPs(insp) {
 		if ip, err := netip.ParseAddr(ipStr); err == nil {
 			info.ips = append(info.ips, ip)
+		}
+	}
+
+	// New bridge subnets are carved out before any tagging concerns: the
+	// network exists whatever the identity check below decides.
+	if t.opts.AllowLocalSubnet != nil {
+		for _, s := range collectSubnets(insp) {
+			t.allowSubnetOnce(ctx, s)
 		}
 	}
 
@@ -523,6 +579,21 @@ func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int
 	}
 
 	t.mu.Lock()
+	// Newest inspect wins a conflicted address: for docker-IPAM recycling
+	// (die/destroy lost in a stream gap) the newcomer genuinely holds the
+	// address, and for manually-assigned duplicates (macvlan/static --ip,
+	// where IPAM guarantees nothing) this matches the pre-existing
+	// last-writer semantics. The displaced holder is NOT untracked — its
+	// cgroup identity and other addresses may be live; if it is truly
+	// dead, reconcile's sweep collects it. Logged after unlock: both
+	// ringbuf reader paths contend on t.mu, and a slow slog handler must
+	// not stall them.
+	var displaced []string
+	for _, ip := range info.ips {
+		if prev := t.byIP[ip]; prev != nil && prev != info {
+			displaced = append(displaced, shortID(prev.id)+" lost "+ip.String())
+		}
+	}
 	t.containers[insp.ID] = info
 	for _, ip := range info.ips {
 		t.byIP[ip] = info
@@ -531,6 +602,10 @@ func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int
 		t.byCgroup[info.cgroupID] = info
 	}
 	t.mu.Unlock()
+
+	for _, d := range displaced {
+		t.logger.Info("Address conflict: newest inspect wins", "displaced", d, "winner", shortID(id))
+	}
 
 	t.logger.Info("Container attributed",
 		"container", shortID(id), "kind", kind, "pid", info.initPID,
@@ -718,24 +793,170 @@ func (t *Tracker) remove(id string) {
 	// Task-map cleanup is the kernel's sched_process_exit; nothing to undo.
 }
 
+// forEachInspectAddr visits every address docker reported for a container:
+// the legacy top-level fields (the default bridge; network name "") and
+// each named network's entry. THE one walker of the NetworkSettings shape —
+// both DNS attribution (collectIPs) and the enforce-mode subnet carve-out
+// (collectSubnets) ride it, so a new address source added here reaches
+// both, and a source added elsewhere is a bug.
+func forEachInspectAddr(insp containerInspect, visit func(network, ip string, prefixLen int)) {
+	visit("", insp.NetworkSettings.IPAddress, insp.NetworkSettings.IPPrefixLen)
+	visit("", insp.NetworkSettings.GlobalIPv6Address, insp.NetworkSettings.GlobalIPv6PrefixLen)
+	for name, nw := range insp.NetworkSettings.Networks {
+		visit(name, nw.IPAddress, nw.IPPrefixLen)
+		visit(name, nw.GlobalIPv6Address, nw.GlobalIPv6PrefixLen)
+	}
+}
+
 // collectIPs gathers every address docker assigned the container, v4 and
 // v6 alike: the DNS client lookup keys on whichever family the container's
 // resolver socket uses, so an IPv6-enabled bridge must not silently lose
 // DNS attribution while the TC join (cgroup-id based) keeps working.
 func collectIPs(insp containerInspect) []string {
 	ips := []string{}
-	add := func(ip string) {
+	forEachInspectAddr(insp, func(_, ip string, _ int) {
 		if ip != "" && !slices.Contains(ips, ip) {
 			ips = append(ips, ip)
 		}
-	}
-	add(insp.NetworkSettings.IPAddress)
-	add(insp.NetworkSettings.GlobalIPv6Address)
-	for _, nw := range insp.NetworkSettings.Networks {
-		add(nw.IPAddress)
-		add(nw.GlobalIPv6Address)
-	}
+	})
 	return ips
+}
+
+// localSubnet is one candidate carve-out: a subnet plus the network it was
+// seen on ("" = the default bridge, which is bridge-driver by definition).
+type localSubnet struct {
+	network string
+	prefix  netip.Prefix
+}
+
+// collectSubnets derives the subnets docker attached the container to, v4
+// and v6, masked. Entries with no prefix length (host networking, daemons
+// that omit it) are dropped — a zero prefix would shape into a catch-all.
+// Driver gating happens later, in allowSubnetOnce: this function only
+// reads the inspect payload.
+func collectSubnets(insp containerInspect) []localSubnet {
+	var subnets []localSubnet
+	forEachInspectAddr(insp, func(network, ipStr string, prefixLen int) {
+		if ipStr == "" || prefixLen <= 0 {
+			return
+		}
+		addr, err := netip.ParseAddr(ipStr)
+		if err != nil {
+			return
+		}
+		prefix, err := addr.Prefix(prefixLen)
+		if err != nil {
+			return // prefixLen wider than the address family
+		}
+		for _, s := range subnets {
+			if s.prefix == prefix {
+				return
+			}
+		}
+		subnets = append(subnets, localSubnet{network: network, prefix: prefix})
+	})
+	return subnets
+}
+
+// allowSubnetOnce runs the once-per-subnet carve-out pipeline: resolve the
+// network's driver (bridge-driver networks are local-only by construction —
+// their routes are on-link; a macvlan/ipvlan subnet is physical-network
+// space and MUST stay adjudicated), then hand the subnet to the callback.
+// seenSubnets is stamped only once the decision is final — a failed driver
+// inspect or a failed carve-out write is retried by the next container on
+// the network.
+func (t *Tracker) allowSubnetOnce(ctx context.Context, s localSubnet) {
+	key := s.prefix.String()
+	t.mu.Lock()
+	seen := t.seenSubnets[key]
+	t.mu.Unlock()
+	if seen {
+		return
+	}
+	if s.network != "" {
+		ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
+		nw, err := t.client.inspectNetwork(ictx, s.network)
+		cancel()
+		if err != nil {
+			t.logger.Warn("Cannot inspect network for subnet carve-out; subnet stays adjudicated for now",
+				"network", s.network, "subnet", key, "error", err)
+			return
+		}
+		if nw.Driver != "bridge" {
+			t.mu.Lock()
+			t.seenSubnets[key] = true
+			t.mu.Unlock()
+			t.logger.Info("Non-bridge network subnet stays adjudicated (not local-only)",
+				"network", s.network, "driver", nw.Driver, "subnet", key)
+			return
+		}
+	}
+	if err := t.opts.AllowLocalSubnet(s.prefix); err != nil {
+		t.logger.Warn("Local subnet carve-out failed; will retry on the network's next container",
+			"subnet", key, "error", err)
+		return
+	}
+	t.mu.Lock()
+	t.seenSubnets[key] = true
+	t.mu.Unlock()
+}
+
+// DiscoverBridgeSubnets returns the bridge-driver subnets of every
+// container currently running. cmd/start.go runs this BEFORE raising the
+// cgroup hook out of observe: docker-event tracking starts only after the
+// dockerd restart, and containers that predate cargowall (GitHub service
+// containers, compose stacks) must not lose bridge-local traffic in that
+// window.
+func DiscoverBridgeSubnets(ctx context.Context, socket string) ([]netip.Prefix, error) {
+	if socket == "" {
+		socket = "/var/run/docker.sock"
+	}
+	c := newDockerClient(socket)
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	err := c.ping(pingCtx)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("docker daemon unreachable: %w", err)
+	}
+	lctx, cancel := context.WithTimeout(ctx, unaryTimeout)
+	list, err := c.listContainers(lctx)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("list containers: %w", err)
+	}
+
+	bridgeDriver := map[string]bool{} // network name → driver == "bridge"
+	seen := map[netip.Prefix]bool{}
+	var out []netip.Prefix
+	for _, sum := range list {
+		ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
+		insp, ierr := c.inspectContainer(ictx, sum.ID)
+		cancel()
+		if ierr != nil {
+			continue // best-effort: the tracker re-covers it once running
+		}
+		for _, s := range collectSubnets(insp) {
+			if seen[s.prefix] {
+				continue
+			}
+			if s.network != "" {
+				isBridge, known := bridgeDriver[s.network]
+				if !known {
+					nctx, cancel := context.WithTimeout(ctx, unaryTimeout)
+					nw, nerr := c.inspectNetwork(nctx, s.network)
+					cancel()
+					isBridge = nerr == nil && nw.Driver == "bridge"
+					bridgeDriver[s.network] = isBridge
+				}
+				if !isBridge {
+					continue
+				}
+			}
+			seen[s.prefix] = true
+			out = append(out, s.prefix)
+		}
+	}
+	return out, nil
 }
 
 func (t *Tracker) logAttribution(ev events.AuditEvent) {

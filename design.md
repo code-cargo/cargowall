@@ -556,7 +556,25 @@ any other consumer must do the same: **never sum `cgroup_would_block` with
 - The hook sees traffic TC never did — loopback (including the DNS proxy's
   own DNAT'd `127.0.0.1:53`) and the docker bridge. Loopback is carved out
   both in BPF and as a userspace `127.0.0.0/8` + `::1/128` allow rule;
-  ICMP/ICMPv6 and IPv6 multicast are passed for PMTU and NDP.
+  ICMP/ICMPv6 and IPv6 multicast are passed for PMTU and NDP. Docker bridge
+  subnets are the same local-only class but are carved out via a map this
+  collection OWNS (`map_local_nets`, never shared with TC) rather than the
+  policy: subnet values are discovered from container config — i.e.
+  workload-influenced — so they must not be able to widen off-host
+  enforcement. A carved subnet exempts traffic only at this hook (returning
+  it to its pre-3b unpoliced-locally posture); anything leaving the host
+  still meets TC's untouched verdict, and a test pins that isolation. Only
+  bridge-driver networks are carved (their routes are on-link by
+  construction — an overclaimed `--subnet` redirects that range to the
+  bridge, breaking it locally rather than escaping); macvlan/ipvlan subnets
+  are physical-network space and stay adjudicated. Coverage: the default
+  bridge and pre-existing containers' bridges are carved before the mode is
+  raised (`preallowLocalNetworks`); later networks as the tracker discovers
+  them. Consequence, by design: container↔container and host↔container
+  traffic on docker bridges is open under `--cgroup-enforce` — the policy
+  governs what leaves the machine, exactly the scope TC enforced;
+  inter-container isolation is docker network segmentation's job, not this
+  firewall's.
 - The DNS proxy's upstream queries carry `SO_MARK 0xCA12` and are exempted
   before any verdict, so a policy race can never let the proxy self-block
   the lookups that populate the allowlist.

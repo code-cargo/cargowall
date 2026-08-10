@@ -271,6 +271,31 @@ jobs:
           docker exec cargowall-exec-test sh -c 'sleep 1; wget -q --timeout=6 http://198.51.100.44/ || true'
           docker rm -f cargowall-exec-test
 
+      - name: Bridge-local traffic (host→published port, container→container)
+        run: |
+          # Generates the two bridge traffic shapes the cgroup hook newly
+          # adjudicates, so the shadow gate's zero-would-blocks-on-172.17.*
+          # assertion below has real traffic to assert on. Without this the
+          # assertion is vacuous: no other CI step publishes a port (host →
+          # docker-proxy → container address) or runs container→container.
+          docker run -d --rm --name cw-bridge-server -p 18083:8080 alpine:latest \
+            sh -c 'while true; do printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" | nc -l -p 8080; done'
+          ok=false
+          for i in 1 2 3 4 5; do
+            sleep 1
+            curl -sf --max-time 5 http://127.0.0.1:18083/ > /dev/null && { ok=true; break; }
+          done
+          $ok || { echo "❌ published container port unreachable"; docker logs cw-bridge-server; exit 1; }
+          SERVER_IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' cw-bridge-server)
+          c2c=false
+          for i in 1 2 3 4 5; do
+            docker run --rm alpine:latest wget -q -T 5 -O- "http://$SERVER_IP:8080/" > /dev/null 2>&1 && { c2c=true; break; }
+            sleep 1
+          done
+          $c2c || { echo "❌ container→container bridge traffic failed"; exit 1; }
+          docker stop cw-bridge-server > /dev/null
+          echo "✅ bridge-local traffic flows (host→published port, container→container)"
+
       - name: Validate audit log events
         run: |
           AUDIT_LOG=/tmp/cargowall-audit.json
@@ -503,6 +528,16 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
+      - name: Pre-create a user-defined bridge (service-container shape)
+        run: |
+          # Created BEFORE cargowall starts: its subnet must reach the
+          # cgroup hook's carve-out via the pre-enableMode pre-scan, because
+          # docker-event tracking begins only later. Asserted after the
+          # other bridge steps below.
+          docker network create cw-pre > /dev/null
+          docker run -d --name cw-pre-server --network cw-pre alpine:latest \
+            sh -c 'while true; do printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" | nc -l -p 8080; done'
+
       - name: Start CargoWall with cgroup enforcement (issue #106 phase 3b)
         uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
         env:
@@ -570,7 +605,11 @@ jobs:
           #
           # 203.0.113.9:9999 is TEST-NET-3 (RFC 5737): reserved, unroutable,
           # matches no allowlist, and recognizable in any audit log as a
-          # cargowall test artifact (the BPF suite uses the same tuple).
+          # cargowall test artifact. (The BPF unit suite deliberately does
+          # NOT use an off-host address — its probe targets the host's own
+          # IP over lo so a production cargowall can never see it; this job
+          # is the one place a real off-host denial is exercised, because
+          # only here is the report guaranteed to stay local.)
           # UDP, because only UDP surfaces the drop synchronously: sendto()
           # returns EPERM from the cgroup hook. The audit record for this
           # exact tuple is asserted in "Validate enforcement events" below.
@@ -586,6 +625,70 @@ jobs:
             exit 1
           fi
           echo "✅ direct-IP probe denied with EPERM at the socket layer"
+
+      - name: Bridge-local traffic must survive enforcement
+        run: |
+          # Host→published-port and container→container ride the docker
+          # bridge — local-only surfaces TC never adjudicated, newly seen by
+          # the enforcing cgroup hook. The carve-outs (default bridge +
+          # pre-existing containers before enableMode, user-defined bridges
+          # via tracker discovery) are what keep them alive; before those
+          # existed, every shape below died with default-deny.
+          cleanup() {
+            docker rm -f cw-bridge-enforce cw-udn-server > /dev/null 2>&1 || true
+            docker network rm cw-udn > /dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          # retry <label> <cmd...>: the servers, the tracker's async subnet
+          # discovery, and busybox nc's between-connections gap all need a
+          # few attempts — a single try here reads as an enforcement bug
+          # when it is only a race.
+          retry() {
+            label="$1"; shift
+            for i in 1 2 3 4 5 6 7 8; do
+              sleep 1
+              "$@" > /dev/null 2>&1 && return 0
+            done
+            echo "❌ $label"
+            return 1
+          }
+          serve='while true; do printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" | nc -l -p 8080; done'
+          docker run -d --name cw-bridge-enforce -p 18084:8080 alpine:latest sh -c "$serve"
+          retry "published port dead under cgroup enforcement" \
+            curl -sf --max-time 5 http://127.0.0.1:18084/
+          SERVER_IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' cw-bridge-enforce)
+          retry "container→container dead under cgroup enforcement" \
+            docker run --rm alpine:latest wget -q -T 5 -O- "http://$SERVER_IP:8080/"
+
+          # User-defined bridge created NOW: its subnet is carved out only
+          # via the tracker's per-container discovery — the path with no
+          # startup-time equivalent.
+          docker network create cw-udn > /dev/null
+          docker run -d --name cw-udn-server --network cw-udn alpine:latest sh -c "$serve"
+          retry "user-defined bridge container→container dead under cgroup enforcement" \
+            docker run --rm --network cw-udn alpine:latest wget -q -T 5 -O- "http://cw-udn-server:8080/"
+          echo "✅ bridge-local traffic survives cgroup enforcement (default + user-defined bridge)"
+
+      - name: Pre-existing user-defined bridge must survive enforcement
+        run: |
+          # The network and server below were created BEFORE cargowall
+          # started (previous step's job order — see the pre-start step near
+          # the top of this job): their subnet reaches the carve-out via the
+          # pre-scan that runs before enableMode, not via event tracking.
+          # This is the GitHub service-container / compose-stack shape.
+          for i in 1 2 3 4 5 6 7 8; do
+            sleep 1
+            docker run --rm --network cw-pre alpine:latest wget -q -T 5 -O- "http://cw-pre-server:8080/" > /dev/null 2>&1 && {
+              echo "✅ pre-existing user-defined bridge survives enforcement"
+              docker rm -f cw-pre-server > /dev/null 2>&1 || true
+              docker network rm cw-pre > /dev/null 2>&1 || true
+              exit 0
+            }
+          done
+          echo "❌ pre-existing user-defined bridge dead under cgroup enforcement (pre-scan regression)"
+          docker rm -f cw-pre-server > /dev/null 2>&1 || true
+          docker network rm cw-pre > /dev/null 2>&1 || true
+          exit 1
 
       - name: Container traffic is enforced and attributed
         run: |
@@ -646,9 +749,9 @@ jobs:
           # Nothing on loopback or an allowed host may be blocked. (DNS to a
           # resolver the policy doesn't allow is a legitimate denial TC makes
           # too, so port 53 alone is not the signal — see the shadow job.)
-          BAD=$(jq -s '[.[] | select(.event_type == "connection_blocked") | select(((.dst_ip // "") | startswith("127.")) or ((.dst_hostname // "") | test("github|githubusercontent")))] | length' "$AUDIT_LOG")
+          BAD=$(jq -s '[.[] | select(.event_type == "connection_blocked") | select(((.dst_ip // "") | startswith("127.")) or ((.dst_ip // "") | test("^172\\.(1[6-9]|2[0-9]|3[01])\\.")) or ((.dst_hostname // "") | test("github|githubusercontent")))] | length' "$AUDIT_LOG")
           if [ "$BAD" -ne 0 ]; then
-            echo "❌ Enforcement blocked loopback/allowed traffic:"
+            echo "❌ Enforcement blocked loopback/bridge/allowed traffic:"
             jq -c 'select(.event_type == "connection_blocked") | {dst_ip, dst_hostname, dst_port, process}' "$AUDIT_LOG" | head -20
             VALID=false
           fi

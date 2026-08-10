@@ -305,9 +305,11 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	}
 
 	// The resolve → late-allow → base-audit sequence is shared with the
-	// cgroup hook's ReportVerdict — see prepareOutcome in outcome.go.
+	// cgroup hook's ReportVerdict — see prepareOutcome in outcome.go. TC
+	// events are never degraded: this reader already owns the full
+	// preparation cost by design.
 	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, logger,
-		event.Allowed == 0, srcIP, dstIP, event.SrcPort, event.DstPort, event.IpProto,
+		event.Allowed == 0, false, srcIP, dstIP, event.SrcPort, event.DstPort, event.IpProto,
 		event.Pid, event.StepOrdinal)
 
 	// pid=0 AND ordinal=0 is the no-socket-at-TC signature (NATed container

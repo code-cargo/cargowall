@@ -123,6 +123,8 @@ type OriginBpfMapSpecs struct {
 	MapCidrs         *ebpf.MapSpec `ebpf:"map_cidrs"`
 	MapCidrsV6       *ebpf.MapSpec `ebpf:"map_cidrs_v6"`
 	MapDefaultAction *ebpf.MapSpec `ebpf:"map_default_action"`
+	MapLocalNets     *ebpf.MapSpec `ebpf:"map_local_nets"`
+	MapLocalNetsV6   *ebpf.MapSpec `ebpf:"map_local_nets_v6"`
 	MapOriginConfig  *ebpf.MapSpec `ebpf:"map_origin_config"`
 	MapOriginEvents  *ebpf.MapSpec `ebpf:"map_origin_events"`
 	MapOriginSeen    *ebpf.MapSpec `ebpf:"map_origin_seen"`
@@ -161,6 +163,8 @@ type OriginBpfMaps struct {
 	MapCidrs         *ebpf.Map `ebpf:"map_cidrs"`
 	MapCidrsV6       *ebpf.Map `ebpf:"map_cidrs_v6"`
 	MapDefaultAction *ebpf.Map `ebpf:"map_default_action"`
+	MapLocalNets     *ebpf.Map `ebpf:"map_local_nets"`
+	MapLocalNetsV6   *ebpf.Map `ebpf:"map_local_nets_v6"`
 	MapOriginConfig  *ebpf.Map `ebpf:"map_origin_config"`
 	MapOriginEvents  *ebpf.Map `ebpf:"map_origin_events"`
 	MapOriginSeen    *ebpf.Map `ebpf:"map_origin_seen"`
@@ -174,6 +178,8 @@ func (m *OriginBpfMaps) Close() error {
 		m.MapCidrs,
 		m.MapCidrsV6,
 		m.MapDefaultAction,
+		m.MapLocalNets,
+		m.MapLocalNetsV6,
 		m.MapOriginConfig,
 		m.MapOriginEvents,
 		m.MapOriginSeen,

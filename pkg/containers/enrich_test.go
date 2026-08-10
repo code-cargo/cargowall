@@ -99,8 +99,10 @@ func TestCollectIPsIncludesIPv6(t *testing.T) {
 	insp.NetworkSettings.IPAddress = "172.17.0.2"
 	insp.NetworkSettings.GlobalIPv6Address = "fd00::2"
 	insp.NetworkSettings.Networks = map[string]struct {
-		IPAddress         string `json:"IPAddress"`
-		GlobalIPv6Address string `json:"GlobalIPv6Address"`
+		IPAddress           string `json:"IPAddress"`
+		IPPrefixLen         int    `json:"IPPrefixLen"`
+		GlobalIPv6Address   string `json:"GlobalIPv6Address"`
+		GlobalIPv6PrefixLen int    `json:"GlobalIPv6PrefixLen"`
 	}{
 		"bridge": {IPAddress: "172.17.0.2", GlobalIPv6Address: "fd00::2"},
 		"custom": {IPAddress: "172.18.0.9", GlobalIPv6Address: "fd01::9"},
@@ -108,4 +110,33 @@ func TestCollectIPsIncludesIPv6(t *testing.T) {
 	got := collectIPs(insp)
 	assert.ElementsMatch(t, []string{"172.17.0.2", "fd00::2", "172.18.0.9", "fd01::9"}, got,
 		"v4 and v6, deduplicated across the default and named networks")
+}
+
+// Bridge subnets feed the enforce-mode carve-out (AllowLocalSubnet):
+// container→container traffic on a user-defined bridge never leaves the
+// host and TC never adjudicated it, so a missed subnet is a broken network
+// under --cgroup-enforce — and each subnet must carry its network name so
+// allowSubnetOnce can gate on the driver.
+func TestCollectSubnetsDerivesBridgeNetworks(t *testing.T) {
+	insp := containerInspect{}
+	insp.NetworkSettings.IPAddress = "172.17.0.2"
+	insp.NetworkSettings.IPPrefixLen = 16
+	insp.NetworkSettings.Networks = map[string]struct {
+		IPAddress           string `json:"IPAddress"`
+		IPPrefixLen         int    `json:"IPPrefixLen"`
+		GlobalIPv6Address   string `json:"GlobalIPv6Address"`
+		GlobalIPv6PrefixLen int    `json:"GlobalIPv6PrefixLen"`
+	}{
+		"custom": {IPAddress: "172.18.0.9", IPPrefixLen: 24, GlobalIPv6Address: "fd01::9", GlobalIPv6PrefixLen: 64},
+		// Zero prefix (host networking, or a daemon that omits it) must not
+		// produce a 0.0.0.0/0-shaped carve-out.
+		"weird": {IPAddress: "10.0.0.5", IPPrefixLen: 0},
+	}
+	got := collectSubnets(insp)
+	var rendered []string
+	for _, s := range got {
+		rendered = append(rendered, s.network+"="+s.prefix.String())
+	}
+	assert.ElementsMatch(t, []string{"=172.17.0.0/16", "custom=172.18.0.0/24", "custom=fd01::/64"}, rendered,
+		"masked network prefixes with their network names, zero-prefix entries dropped")
 }

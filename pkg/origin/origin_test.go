@@ -36,11 +36,13 @@ import (
 // themselves.
 func newTestObserver() *Observer {
 	return &Observer{
-		flows:      make(map[flowKey][]Record),
-		hot:        make(map[flowKey]struct{}),
-		verdictCh:  make(chan Record, verdictQueueDepth),
-		reportDone: make(chan struct{}),
-		logger:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		flows:        make(map[flowKey][]Record),
+		hot:          make(map[flowKey]struct{}),
+		verdictCh:    make(chan Record, verdictQueueDepth),
+		reportDone:   make(chan struct{}),
+		degradedCh:   make(chan Record, degradedQueueDepth),
+		degradedDone: make(chan struct{}),
+		logger:       slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	}
 }
 
@@ -209,17 +211,63 @@ func TestInsertStoresBeforeReporting(t *testing.T) {
 	require.Equal(t, uint64(1), o.blocked.Load())
 }
 
-// A slow (or absent) reporting worker must never block insert: the send is
-// non-blocking and overflow costs only the report.
-func TestInsertNeverBlocksOnFullVerdictQueue(t *testing.T) {
-	o := newTestObserver() // reportLoop deliberately not started
-	for i := range verdictQueueDepth + 5 {
-		ev := v4Event(uint64(i+1), 0xAC110002, 0x8C527203, uint16(40000+i), 443)
+// Slow (or absent) reporting workers must never block insert: both lanes'
+// sends are non-blocking. Overflowing the main queue diverts Blocks to the
+// must-audit lane; only overflowing BOTH finally drops a Block's report —
+// while would-blocks never enter the must-audit lane at all.
+func TestInsertNeverBlocksOnFullVerdictQueues(t *testing.T) {
+	o := newTestObserver() // neither worker started
+	total := verdictQueueDepth + degradedQueueDepth + 5
+	for i := range total {
+		ev := v4Event(uint64(i+1), 0xAC110002, 0x8C527203, uint16(40000+i%20000), 443)
 		ev.Verdict = uint8(VerdictBlock)
-		o.insert(ev) // would deadlock here without the non-blocking send
+		o.insert(ev) // would deadlock here without the non-blocking sends
 	}
-	require.Equal(t, uint64(5), o.verdictsDropped.Load())
-	require.Equal(t, uint64(verdictQueueDepth+5), o.blocked.Load())
+	require.Len(t, o.degradedCh, degradedQueueDepth, "main-queue overflow diverts Blocks to the must-audit lane")
+	require.Equal(t, uint64(5), o.verdictsDropped.Load(), "dropped only when both lanes are full")
+	require.Equal(t, uint64(total), o.blocked.Load())
+
+	// Would-blocks are dual-sourced by TC: overflow drops them directly,
+	// never displacing a Block from the must-audit lane.
+	ev := v4Event(uint64(total+1), 0xAC110002, 0x8C527203, 40001, 443)
+	ev.Verdict = uint8(VerdictWouldBlock)
+	o.insert(ev)
+	require.Equal(t, uint64(6), o.verdictsDropped.Load())
+	require.Len(t, o.degradedCh, degradedQueueDepth)
+}
+
+// The must-audit lane delivers overflowed Blocks with Record.Degraded set,
+// on its own worker — the ringbuf reader (insert's caller) never runs the
+// sink even when the main queue is saturated.
+func TestDegradedLaneDeliversOverflowedBlocks(t *testing.T) {
+	o := newTestObserver()
+	go o.degradedLoop() // main reportLoop deliberately not started
+
+	delivered := make(chan Record, 8)
+	o.SetVerdictSink(func(rec Record) { delivered <- rec })
+
+	// Fill the main queue so the next Block overflows into the lane.
+	for i := range verdictQueueDepth {
+		ev := v4Event(uint64(i+1), 0xAC110002, 0x8C527203, uint16(40000+i%20000), 443)
+		ev.Verdict = uint8(VerdictBlock)
+		o.insert(ev)
+	}
+	ev := v4Event(99999, 0xAC110002, 0x0A000063, 40001, 443)
+	ev.Verdict = uint8(VerdictBlock)
+	o.insert(ev)
+
+	got := <-delivered
+	require.True(t, got.Degraded, "overflow deliveries must be marked degraded")
+	require.Equal(t, uint64(99999), got.Cookie)
+	require.Equal(t, VerdictBlock, got.Verdict)
+
+	// Drain the worker BEFORE reading counters: the sink send happens-before
+	// the test's receive, but the counter increment follows the sink call
+	// with no such edge — degradedDone is the synchronization point.
+	close(o.degradedCh)
+	<-o.degradedDone
+	require.Equal(t, uint64(1), o.verdictsDegraded.Load())
+	require.Zero(t, o.verdictsDropped.Load(), "diverted, not dropped")
 }
 
 // Eviction is second-chance, not pure FIFO: a key re-emitted since eviction

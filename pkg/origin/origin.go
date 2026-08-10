@@ -123,6 +123,13 @@ type Record struct {
 	//     this record in the join store for container enrichment. That is
 	//     why the store is updated before the sink is notified.
 	Verdict Verdict
+	// Degraded marks a report delivered via the must-audit overflow lane
+	// (main queue full, or backlog diverted at Close): the sink must do
+	// only bounded work — no hostname resolution, no firewall writes, no
+	// notification — so the lane keeps up mid-storm and drains fast at
+	// shutdown. It exists so an enforce-mode drop ALWAYS produces an audit
+	// record, even when the reporting pipeline is saturated.
+	Degraded bool
 }
 
 // flowKey indexes the store by the fields NAT preserves: MASQUERADE rewrites
@@ -155,10 +162,17 @@ const (
 	// 128KB kernel ring and silently loses records. Overflow here drops the
 	// REPORT only (counted, logged, and summarized at Close); enforcement
 	// and the join store are unaffected. Sized generously (~120B/record)
-	// because a deep queue is cheap and every dropped report is an audit
-	// event that never happens; Close does not pay for the depth — it
-	// abandons the backlog rather than draining it through the slow sink.
+	// because a deep queue is cheap; Close does not pay for the depth —
+	// the backlog diverts to the must-audit lane instead of draining
+	// through the slow sink.
 	verdictQueueDepth = 4096
+	// degradedQueueDepth bounds the must-audit overflow lane: when
+	// verdictCh is full, VerdictBlock reports queue here for bounded
+	// degraded delivery on their own worker — never on the ringbuf reader,
+	// which must stay free to drain the kernel ring even mid-storm. Only
+	// when BOTH lanes are saturated is a Block's report finally dropped
+	// (counted; enforcement and the join store are still unaffected).
+	degradedQueueDepth = 1024
 )
 
 // Observer owns the loaded collection, its root-cgroup attachment, the
@@ -181,9 +195,14 @@ type Observer struct {
 	// reporting pipeline (see verdictQueueDepth).
 	verdictCh  chan Record
 	reportDone chan struct{}
-	// closing tells reportLoop to stop invoking the (slow) sink and just
-	// count the backlog: Close must never hang behind minutes of queued PTR
-	// lookups while the hook is still attached and teardowns wait.
+	// degradedCh is the must-audit overflow lane (see degradedQueueDepth);
+	// degradedLoop delivers its records with Record.Degraded set.
+	degradedCh   chan Record
+	degradedDone chan struct{}
+	// closing tells reportLoop to stop invoking the (slow) sink and divert
+	// the backlog to the must-audit lane: Close must never hang behind
+	// minutes of queued PTR lookups while the hook is still attached and
+	// teardowns wait.
 	closing atomic.Bool
 
 	mu    sync.Mutex
@@ -193,9 +212,11 @@ type Observer struct {
 	// key gets one rotation to the back of fifo instead of eviction.
 	hot map[flowKey]struct{}
 
-	records         atomic.Uint64
-	blocked         atomic.Uint64
-	verdictsDropped atomic.Uint64
+	records           atomic.Uint64
+	blocked           atomic.Uint64
+	verdictsDropped   atomic.Uint64 // runtime overflow of BOTH lanes: reports lost mid-run
+	verdictsDegraded  atomic.Uint64 // Blocks delivered via the must-audit lane
+	verdictsAbandoned atomic.Uint64 // would-block reports discarded by Close's backlog policy
 }
 
 // Start loads the origin collection, attaches the observer at the root
@@ -210,14 +231,16 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	}
 
 	o := &Observer{
-		sockPid:    tcObjs.MapSockPid,
-		sockStep:   tcObjs.MapSockStep,
-		logger:     logger,
-		done:       make(chan struct{}),
-		flows:      make(map[flowKey][]Record),
-		hot:        make(map[flowKey]struct{}),
-		verdictCh:  make(chan Record, verdictQueueDepth),
-		reportDone: make(chan struct{}),
+		sockPid:      tcObjs.MapSockPid,
+		sockStep:     tcObjs.MapSockStep,
+		logger:       logger,
+		done:         make(chan struct{}),
+		flows:        make(map[flowKey][]Record),
+		hot:          make(map[flowKey]struct{}),
+		verdictCh:    make(chan Record, verdictQueueDepth),
+		reportDone:   make(chan struct{}),
+		degradedCh:   make(chan Record, degradedQueueDepth),
+		degradedDone: make(chan struct{}),
 	}
 
 	// The rule/config maps are owned by the tcbpf collection; replacing them
@@ -290,18 +313,21 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	o.reader = rd
 	go o.run()
 	go o.reportLoop()
+	go o.degradedLoop()
 
 	return o, nil
 }
 
-// Close stops the reader, stops the verdict-reporting worker, detaches the
+// Close stops the reader, stops both reporting workers, detaches the
 // observer, and releases the collection, in that order so the reader never
-// sees a closed map. The worker is stopped by ABANDONING its backlog, not
-// draining it: each queued report can cost a 500ms PTR lookup, and a full
-// queue would hold shutdown — and every teardown behind it (iptables DNAT,
-// daemon.json restore) — hostage for minutes while the hook is still
-// attached. Only the report in flight completes; abandoned reports are
-// counted and surfaced in the summary line below.
+// sees a closed map. The full-fidelity worker does not drain its backlog —
+// each queued report can cost a 500ms PTR lookup, and a full queue would
+// hold shutdown (and every teardown behind it: iptables DNAT, daemon.json
+// restore) hostage for minutes while the hook is still attached. Instead
+// the backlog is triaged: queued Blocks divert to the must-audit lane and
+// their audit records still land (counted as degraded); queued would-blocks
+// are abandoned (counted separately — TC dual-sourced them while running,
+// and at shutdown there is nothing left to compare against).
 func (o *Observer) Close() {
 	if o.reader != nil {
 		_ = o.reader.Close()
@@ -312,19 +338,28 @@ func (o *Observer) Close() {
 		close(o.verdictCh) // run() was the only sender and has exited
 		<-o.reportDone
 	}
+	if o.degradedCh != nil {
+		// Senders are run() and reportLoop, both exited above. The drain is
+		// bounded by construction: every degraded delivery is bounded work.
+		close(o.degradedCh)
+		<-o.degradedDone
+	}
 	if o.link != nil {
 		_ = o.link.Close()
 	}
 	o.objs.Close()
-	// The shutdown accounting for this hook's verdicts: how many denials it
-	// saw, and how many reports never became audit events (queue overflow
-	// during a denial storm, or backlog abandoned just now). A non-zero
-	// dropped count means audit/late-allow coverage has gaps even though
-	// enforcement and the join store were unaffected.
+	// The shutdown accounting for this hook's verdicts. The three report
+	// counters answer distinct questions: dropped — the pipeline SATURATED
+	// mid-run and reports (with their audit events) were lost; degraded —
+	// Blocks whose audit record landed via the bounded lane (no hostname,
+	// no late-allow); abandoned — would-block backlog discarded by Close's
+	// shutdown policy, not evidence of runtime saturation.
 	o.logger.Info("Origin observer closed",
 		"records", o.records.Load(),
 		"blocked", o.blocked.Load(),
-		"verdict_reports_dropped", o.verdictsDropped.Load())
+		"verdict_reports_dropped", o.verdictsDropped.Load(),
+		"verdict_reports_degraded", o.verdictsDegraded.Load(),
+		"verdict_reports_abandoned_at_close", o.verdictsAbandoned.Load())
 }
 
 // Program exposes the observer program for BPF runtime-stats logging.
@@ -356,6 +391,40 @@ func (o *Observer) SetMode(mode Mode) error {
 		return fmt.Errorf("failed to set origin mode %d: %w", mode, err)
 	}
 	o.logger.Info("Container egress hook mode set", "mode", mode.String())
+	return nil
+}
+
+// AllowLocalNetwork carves a local-only network (a docker bridge subnet)
+// out of THIS hook's adjudication, exactly as loopback is carved out. The
+// entry lands in map_local_nets, owned by the origin collection and
+// deliberately not shared with TC: subnets are discovered from container
+// config at runtime — workload-influenced input — so the write must never
+// be able to widen off-host enforcement. Carving a subnet here returns its
+// traffic to the pre-3b posture (bridge-local flows were never policed);
+// anything that actually leaves the host still meets TC's untouched
+// verdict. Callers gate on bridge-driver networks (see pkg/containers).
+func (o *Observer) AllowLocalNetwork(prefix netip.Prefix) error {
+	prefix = prefix.Masked()
+	if prefix.Addr().Is4() {
+		a4 := prefix.Addr().As4()
+		key := bpf.OriginBpfLpmKey{
+			Prefixlen: uint32(prefix.Bits()),
+			// NativeEndian: the uint32's bytes must sit in network byte
+			// order in the map key, matching the firewall's LPM writes.
+			Ip: binary.NativeEndian.Uint32(a4[:]),
+		}
+		if err := o.objs.MapLocalNets.Put(key, uint8(1)); err != nil {
+			return fmt.Errorf("failed to allow local network %s: %w", prefix, err)
+		}
+	} else {
+		key := bpf.OriginBpfLpmKeyV6{Prefixlen: uint32(prefix.Bits())}
+		a16 := prefix.Addr().As16()
+		copy(key.Ip[:], a16[:])
+		if err := o.objs.MapLocalNetsV6.Put(key, uint8(1)); err != nil {
+			return fmt.Errorf("failed to allow local network %s: %w", prefix, err)
+		}
+	}
+	o.logger.Info("Local-only network carved out of cgroup adjudication", "subnet", prefix.String())
 	return nil
 }
 
@@ -431,9 +500,11 @@ func (o *Observer) reportLoop() {
 	defer close(o.reportDone)
 	for rec := range o.verdictCh {
 		if o.closing.Load() {
-			// Shutdown: count the abandoned backlog instead of holding Close
-			// behind one slow sink call per queued record.
-			o.verdictsDropped.Add(1)
+			// Shutdown: don't hold Close behind one slow sink call per
+			// queued record — but a Block's audit record must still land,
+			// so the backlog diverts to the must-audit lane (would-blocks
+			// are abandoned and counted as such).
+			o.divertOverflow(rec, true)
 			continue
 		}
 		if fn := o.verdicts.Load(); fn != nil {
@@ -542,16 +613,59 @@ func (o *Observer) insert(ev *bpf.OriginEvent) {
 	o.mu.Unlock()
 
 	// Report AFTER the store write above — see the ordering note in the doc
-	// comment. Non-blocking: a full queue costs the report, never the reader.
+	// comment. Non-blocking on BOTH lanes: nothing here may stall the
+	// reader, whose backlog is a 128KB kernel ring. Overflow of the main
+	// queue diverts Blocks — the sole event source for what this hook
+	// dropped — to the bounded must-audit lane; would-blocks are dropped
+	// and counted (TC dual-sources them).
 	if rec.Verdict == VerdictWouldBlock || rec.Verdict == VerdictBlock {
 		o.blocked.Add(1)
 		select {
 		case o.verdictCh <- rec:
 		default:
-			if n := o.verdictsDropped.Add(1); n == 1 || n%1000 == 0 {
-				o.logger.Warn("Verdict report queue full; dropping report (enforcement and join store unaffected)",
-					"dropped_total", n)
-			}
+			o.divertOverflow(rec, false)
+		}
+	}
+}
+
+// divertOverflow handles a verdict report the worker queue couldn't take:
+// enforce-mode drops move to the must-audit lane (their audit record must
+// survive a storm; degradedLoop delivers it with bounded work), everything
+// else is counted — shadow would-blocks are dual-sourced by TC. atClose
+// separates Close's deliberate backlog policy from genuine runtime
+// saturation, so the dropped counter and its warning only ever mean "the
+// pipeline could not keep up while the run was live". Callers are the
+// ringbuf reader (queue overflow) and reportLoop (backlog triage at
+// Close); neither ever runs the sink itself.
+func (o *Observer) divertOverflow(rec Record, atClose bool) {
+	if rec.Verdict == VerdictBlock {
+		select {
+		case o.degradedCh <- rec:
+			return
+		default:
+		}
+	}
+	if atClose {
+		o.verdictsAbandoned.Add(1)
+		return
+	}
+	if n := o.verdictsDropped.Add(1); n == 1 || n%1000 == 0 {
+		o.logger.Warn("Verdict report queues full; dropping report (enforcement and join store unaffected)",
+			"dropped_total", n)
+	}
+}
+
+// degradedLoop drains the must-audit lane. Deliveries carry
+// Record.Degraded, which caps the sink at bounded work (no PTR, no
+// firewall writes, no notification) — so this lane also drains fast at
+// Close, unlike the full-fidelity worker, whose backlog gets diverted here.
+func (o *Observer) degradedLoop() {
+	defer close(o.degradedDone)
+	for rec := range o.degradedCh {
+		if fn := o.verdicts.Load(); fn != nil {
+			rec.Degraded = true
+			(*fn)(rec)
+			o.verdictsDegraded.Add(1)
 		}
 	}
 }

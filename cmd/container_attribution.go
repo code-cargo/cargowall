@@ -19,6 +19,7 @@ package cmd
 import (
 	"context"
 	"log/slog"
+	"net/netip"
 
 	"github.com/cilium/ebpf"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/code-cargo/cargowall/pkg/containers"
 	"github.com/code-cargo/cargowall/pkg/dns"
 	"github.com/code-cargo/cargowall/pkg/events"
+	"github.com/code-cargo/cargowall/pkg/network"
 	"github.com/code-cargo/cargowall/pkg/origin"
 	"github.com/code-cargo/cargowall/pkg/steps"
 )
@@ -144,6 +146,10 @@ func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificat
 			// SYN/RST). Re-deriving it as "TCP and not SYN" would re-include
 			// the kernel RST / SYN-ACK replies that guard exists to exclude.
 			MidStream: rec.Midstream,
+			// Degraded rides through: a saturated reporting pipeline delivers
+			// blocks on a bounded path (audit record only) rather than losing
+			// them — see origin.Record.Degraded.
+			Degraded: rec.Degraded,
 			Decorate: func(audit *events.AuditEvent) {
 				enricher.DecorateVerdict(audit, rec)
 			},
@@ -168,6 +174,53 @@ func (a *containerAttribution) enableMode() {
 	}
 }
 
+// allowLocalNetwork carves a local-only bridge subnet out of the cgroup
+// hook's adjudication (origin's local-nets map — never the shared policy,
+// so a workload-influenced subnet cannot widen TC's off-host enforcement).
+// Nil-safe: with no observer there is nothing adjudicating, so there is
+// nothing to carve.
+func (a *containerAttribution) allowLocalNetwork(prefix netip.Prefix) error {
+	if a == nil || a.observer == nil {
+		return nil
+	}
+	return a.observer.AllowLocalNetwork(prefix)
+}
+
+// preallowLocalNetworks carves out the local-only networks that exist
+// BEFORE the mode is raised: the default docker bridge (host config), and
+// the bridge subnets of containers that predate cargowall — docker-event
+// tracking starts only after the dockerd restart, and service containers or
+// compose stacks must not lose bridge-local traffic to enforce-mode EPERM
+// (or pollute shadow telemetry with false would-blocks) in that window.
+func (a *containerAttribution) preallowLocalNetworks(ctx context.Context) {
+	if a == nil || a.observer == nil || a.mode == origin.ModeObserve {
+		return
+	}
+	if subnet, err := network.GetDockerBridgeSubnet(); err == nil {
+		if prefix, perr := netip.ParsePrefix(subnet); perr == nil {
+			if aerr := a.allowLocalNetwork(prefix); aerr != nil {
+				a.logger.Warn("Default bridge carve-out failed", "subnet", subnet, "error", aerr)
+			}
+		}
+	} else {
+		// Warn, not Debug: under shadow/enforce this carve-out is what keeps
+		// published ports and default-bridge container traffic alive.
+		a.logger.Warn("Docker bridge subnet not discovered; default-bridge traffic stays adjudicated",
+			"error", err)
+	}
+	subnets, err := containers.DiscoverBridgeSubnets(ctx, "")
+	if err != nil {
+		a.logger.Warn("Cannot pre-scan container bridge subnets; pre-existing user-defined bridges stay adjudicated until tracking starts",
+			"error", err)
+		return
+	}
+	for _, prefix := range subnets {
+		if err := a.allowLocalNetwork(prefix); err != nil {
+			a.logger.Warn("Bridge subnet carve-out failed", "subnet", prefix.String(), "error", err)
+		}
+	}
+}
+
 // enricherArg is what ProcessBlockedEvents receives. Nil (from a nil
 // receiver) means enrichment is off; the shell itself no-ops until
 // startUserspace binds the live tracker.
@@ -187,13 +240,14 @@ func (a *containerAttribution) observerProgram() *ebpf.Program {
 	return a.observer.Program()
 }
 
-// startUserspace is the late phase: docker-events tracking, tagging, and
-// DNS client attribution (only meaningful when the bridge listener exists).
-func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dns.Server, dockerBridgeIP string, auditLogger *events.AuditLogger) {
+// startUserspace is the late phase: docker-events tracking, tagging, DNS
+// client attribution (only meaningful when the bridge listener exists), and
+// bridge-subnet discovery (allowLocalSubnet, may be nil).
+func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dns.Server, dockerBridgeIP string, auditLogger *events.AuditLogger, allowLocalSubnet func(prefix netip.Prefix) error) {
 	if a == nil {
 		return
 	}
-	ctr, err := containers.Start(ctx, containers.Options{}, a.stepTracker, a.observer, auditLogger, a.logger)
+	ctr, err := containers.Start(ctx, containers.Options{AllowLocalSubnet: allowLocalSubnet}, a.stepTracker, a.observer, auditLogger, a.logger)
 	if err != nil {
 		a.logger.Warn("Container attribution disabled", "error", err)
 		return

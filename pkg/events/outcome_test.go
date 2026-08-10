@@ -65,6 +65,47 @@ func TestReportVerdict_BlockedCarriesHostname(t *testing.T) {
 	assert.True(t, ev.Blocked)
 }
 
+// A degraded report is the saturated-pipeline path: it must stay bounded —
+// no hostname resolution, no firewall writes, no notification — while the
+// audit record still lands with kind selection identical to the full path
+// and container decoration intact. This pins the contract Record.Degraded
+// documents in pkg/origin.
+func TestReportVerdict_DegradedIsBoundedButAudited(t *testing.T) {
+	cm := config.NewConfigManager()
+	// An allow rule + DNS mapping that WOULD late-allow on the full path:
+	// the degraded path must not consult either.
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{{
+		Type:   config.RuleTypeHostname,
+		Value:  "example.com",
+		Action: config.ActionAllow,
+	}}, config.ActionDeny))
+	cm.UpdateDNSMapping("example.com", "93.184.216.34")
+
+	auditLogger, err := NewAuditLogger("", false)
+	require.NoError(t, err)
+	sink := &recordingSink{}
+	auditLogger.AddSink(sink)
+	fw := &mockFirewallUpdater{}
+
+	rec := verdictRec(true)
+	rec.Degraded = true
+	rec.Decorate = func(a *AuditEvent) {
+		a.ContainerOrigin = true
+		a.ContainerID = "abc123def456"
+	}
+	ReportVerdict(rec, cm, nil, auditLogger, fw, newTestLogger())
+
+	require.Empty(t, fw.addedIPs, "degraded reports must not write to the firewall")
+	require.Len(t, sink.events, 1)
+	ev := sink.events[0]
+	assert.Equal(t, EventConnectionBlocked, ev.EventType, "kind selection matches the full path (no late-allow)")
+	assert.Empty(t, ev.DstHostname, "no resolution: the record carries the bare IP")
+	assert.Equal(t, "93.184.216.34", ev.DstIP)
+	assert.True(t, ev.ContainerOrigin, "decoration still runs — it is bounded")
+	assert.Equal(t, "abc123def456", ev.ContainerID)
+	assert.True(t, ev.Blocked)
+}
+
 // Late-allow is the behavioral half: a denial whose destination actually
 // resolves to an allowed host must open the firewall and report as
 // late-allowed, exactly as on the TC path. Without this, enforce mode never

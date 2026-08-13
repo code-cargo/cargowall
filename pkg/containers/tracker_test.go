@@ -510,6 +510,40 @@ func TestIdentityMismatchSkipsTagging(t *testing.T) {
 	assert.Equal(t, uint32(7), ord)
 }
 
+// A container whose identity check was REFUSED at reconcile adoption must
+// never be tagged by its replayed start event: the preDaemon upgrade arm is
+// gated on identityOK, because upgradeReconciledStart tags WITHOUT
+// re-verification on the premise that adoption verified the PID.
+func TestIdentityMismatchBlocksReconcileUpgrade(t *testing.T) {
+	f := newFixture(t)
+	id := strings.Repeat("7", 64)
+	otherID := strings.Repeat("8", 64)
+	// The daemon reports pid 4242, but /proc shows that pid in another
+	// container's cgroup — identity refused at adoption.
+	writeProcEntry(t, f.procRoot, 4242, cgroupV2Line(otherID)+"\n", "app")
+	mkScopeDir(t, f.cgroupRoot, id)
+	// Present BEFORE Start — in the daemon's list, so reconcile adopts it
+	// as pre-daemon.
+	f.daemon.setContainer(makeInspect(id, 4242, "172.17.0.9", false))
+	f.daemon.setList(containerSummary{ID: id})
+	f.tagger.setOrdinal(7)
+	f.start(t)
+	f.waitAttribution(t, "reconcile", id)
+
+	// Replay the start event (real timeNano — the upgrade trigger), then a
+	// marker container whose attribution orders the assertion.
+	f.daemon.push(startEvent(id, time.Now().UnixNano()))
+	markerID := strings.Repeat("9", 64)
+	f.addContainer(t, markerID, 5555, "172.17.0.10", false)
+	f.daemon.push(startEvent(markerID, time.Now().UnixNano()))
+	f.waitAttribution(t, "start", markerID)
+
+	for _, call := range f.tagger.tagCalls() {
+		assert.NotEqual(t, 4242, call.pid,
+			"a refused identity must never be tagged, not even by the replayed start's upgrade path")
+	}
+}
+
 func TestOrdinalZeroSkipsTagging(t *testing.T) {
 	f := newFixture(t)
 	id := strings.Repeat("6", 64)
@@ -737,4 +771,85 @@ func TestEnrichLookupKeying(t *testing.T) {
 	tr.Enrich(&events.AuditEvent{}, ev6)
 	require.Len(t, fo.calls, 3)
 	assert.True(t, fo.calls[2].v6)
+}
+
+// upgradeReconciledStart is the repair path for a container reconcile
+// adopted moments before its real start event replayed: the replay's
+// timeNano carries the ordinal the sentinel adoption lacked. White-box: the
+// mechanics only, since the full reconcile→replay race needs a live gap.
+func TestUpgradeReconciledStart(t *testing.T) {
+	tagger := &fakeTagger{}
+	tagger.setOrdinal(6)
+	tr := &Tracker{
+		tagger:     tagger,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		containers: map[string]*containerInfo{},
+	}
+	info := &containerInfo{
+		id:               strings.Repeat("a", 64),
+		initPID:          4242,
+		birthOrdinal:     events.StepOrdinalPreDaemon,
+		effectiveOrdinal: events.StepOrdinalPreDaemon,
+		preDaemon:        true,
+	}
+	tr.containers[info.id] = info
+
+	tr.upgradeReconciledStart(info, info.id, time.Now().UnixNano())
+
+	require.Len(t, tagger.tagCalls(), 1, "the replayed start's ordinal must be tagged")
+	assert.Equal(t, tagCall{pid: 4242, ordinal: 6}, tagger.tagCalls()[0])
+	assert.Equal(t, uint32(6), info.birthOrdinal)
+	assert.Equal(t, uint32(6), info.effectiveOrdinal)
+	assert.False(t, info.preDaemon, "upgrade is once-only")
+
+	// A real exec re-tag must not be clobbered by a later upgrade.
+	info2 := &containerInfo{
+		id: strings.Repeat("b", 64), initPID: 5555,
+		birthOrdinal: events.StepOrdinalPreDaemon, effectiveOrdinal: 9, preDaemon: true,
+	}
+	tr.containers[info2.id] = info2
+	tr.upgradeReconciledStart(info2, info2.id, time.Now().UnixNano())
+	assert.Equal(t, uint32(6), info2.birthOrdinal)
+	assert.Equal(t, uint32(9), info2.effectiveOrdinal, "exec re-tag survives the upgrade")
+
+	// Ordinal 0 (genuinely pre-step): the sentinel was right; no tag.
+	tagger.setOrdinal(0)
+	info3 := &containerInfo{
+		id: strings.Repeat("c", 64), initPID: 7777,
+		birthOrdinal: events.StepOrdinalPreDaemon, effectiveOrdinal: events.StepOrdinalPreDaemon, preDaemon: true,
+	}
+	tr.containers[info3.id] = info3
+	before := len(tagger.tagCalls())
+	tr.upgradeReconciledStart(info3, info3.id, time.Now().UnixNano())
+	assert.Len(t, tagger.tagCalls(), before, "pre-step containers keep the sentinel untagged")
+	assert.False(t, info3.preDaemon)
+}
+
+// remove must clear the absence count unconditionally: docker ids survive
+// stop+start, so a re-adopted id carrying a stale count of 1 would be swept
+// on its FIRST absence — a two-pass-guard bypass for exactly that container
+// — and an id removed while absent would leak its entry forever (the sweep
+// loop iterates t.containers, which it just left).
+func TestRemoveClearsMissingCount(t *testing.T) {
+	tr := &Tracker{
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		containers:    map[string]*containerInfo{},
+		byIP:          map[netip.Addr]*containerInfo{},
+		byCgroup:      map[uint64]*containerInfo{},
+		seenExecs:     map[string]map[string]bool{},
+		missingCounts: map[string]int{},
+	}
+	id := strings.Repeat("d", 64)
+	tr.containers[id] = &containerInfo{id: id}
+	tr.missingCounts[id] = 1
+	tr.remove(id)
+	if _, ok := tr.missingCounts[id]; ok {
+		t.Fatal("missingCounts must be cleared on remove")
+	}
+	// And for an id that was never registered (the seenExecs race case).
+	tr.missingCounts["ghost"] = 1
+	tr.remove("ghost")
+	if _, ok := tr.missingCounts["ghost"]; ok {
+		t.Fatal("missingCounts must be cleared even for unregistered ids")
+	}
 }

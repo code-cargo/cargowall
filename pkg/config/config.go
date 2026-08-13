@@ -1679,8 +1679,8 @@ func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoA
 		// the auto-allow anyway would land a second LPM entry on the same
 		// key (allow written last, allow wins for non-host routes) and make
 		// the rendered policy contradict the operator's rule. Skip loudly.
-		if cm.cidrDenyCoversLocked(ipnet) {
-			slog.Warn("Skipping auto-allow: an explicit all-ports deny rule covers this network",
+		if cm.cidrDenyCoversLocked(ipnet, ports) {
+			slog.Warn("Skipping auto-allow: an explicit deny rule covers this network",
 				"cidr", cidr, "autoAddedType", autoAddedType)
 			continue
 		}
@@ -1729,14 +1729,18 @@ func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoA
 	}
 }
 
-// cidrDenyCoversLocked reports whether an explicit all-ports deny CIDR rule
-// covers the ENTIRE target network at an equal-or-broader prefix. Used to
-// keep infra auto-allows from silently overriding an operator's deny.
-// Must be called with cm.mu held.
-func (cm *Manager) cidrDenyCoversLocked(target *net.IPNet) bool {
+// cidrDenyCoversLocked reports whether an explicit deny CIDR rule covers
+// the ENTIRE target network at an equal-or-broader prefix, on every
+// requested port (all-ports deny covers anything; a port-limited deny
+// covers a request whose ports it all names). Used to keep infra
+// auto-allows from silently overriding an operator's deny — and to make
+// the skip log say "deny rule covers this" rather than the port-path
+// dedup's misleading "allow rule already exists". Must be called with
+// cm.mu held.
+func (cm *Manager) cidrDenyCoversLocked(target *net.IPNet, ports []Port) bool {
 	tOnes, tBits := target.Mask.Size()
 	for _, rule := range cm.config.Rules {
-		if rule.Type != RuleTypeCIDR || rule.Action != ActionDeny || len(rule.Ports) != 0 {
+		if rule.Type != RuleTypeCIDR || rule.Action != ActionDeny {
 			continue
 		}
 		_, rnet, err := net.ParseCIDR(rule.Value)
@@ -1744,7 +1748,30 @@ func (cm *Manager) cidrDenyCoversLocked(target *net.IPNet) bool {
 			continue
 		}
 		rOnes, rBits := rnet.Mask.Size()
-		if rBits == tBits && rOnes <= tOnes {
+		if rBits != tBits || rOnes > tOnes {
+			continue
+		}
+		if len(rule.Ports) == 0 {
+			return true
+		}
+		if len(ports) == 0 {
+			continue // target wants all ports; a port-limited deny can't cover that
+		}
+		covered := true
+		for _, p := range ports {
+			hit := false
+			for _, rp := range rule.Ports {
+				if rp.Port == p.Port && ProtocolsOverlap(rp.Protocol, p.Protocol) {
+					hit = true
+					break
+				}
+			}
+			if !hit {
+				covered = false
+				break
+			}
+		}
+		if covered {
 			return true
 		}
 	}

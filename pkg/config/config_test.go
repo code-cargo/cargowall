@@ -1016,6 +1016,66 @@ func TestEnsureInfraAllowed_CIDRAndIPv6(t *testing.T) {
 	}
 }
 
+// The deny-veto contract for infra auto-allows: an operator's explicit deny
+// covering the requested network (and ports) suppresses the auto-allow with
+// an honest log, never a second LPM entry that would flip the verdict.
+func TestEnsureAllowed_DenyRuleVetoesAutoAllow(t *testing.T) {
+	tests := []struct {
+		name     string
+		denyRule Rule
+		reqCIDR  string
+		reqPorts []Port
+		suppress bool
+	}{
+		{
+			"all-ports deny vs all-ports auto-allow",
+			Rule{Type: RuleTypeCIDR, Value: "127.0.0.0/8", Action: ActionDeny},
+			"127.0.0.0/8", nil, true,
+		},
+		{
+			"port-limited deny :53 vs DNS auto-allow :53",
+			Rule{Type: RuleTypeCIDR, Value: "10.0.0.0/8", Action: ActionDeny, Ports: []Port{{Port: 53, Protocol: ProtocolUDP}}},
+			"10.1.2.3",
+			[]Port{{Port: 53, Protocol: ProtocolUDP}},
+			true,
+		},
+		{
+			"port-limited deny :53 must NOT veto an all-ports allow",
+			Rule{Type: RuleTypeCIDR, Value: "127.0.0.0/8", Action: ActionDeny, Ports: []Port{{Port: 53, Protocol: ProtocolUDP}}},
+			"127.0.0.0/8", nil, false,
+		},
+		{
+			"deny on a different protocol must NOT veto",
+			Rule{Type: RuleTypeCIDR, Value: "10.0.0.0/8", Action: ActionDeny, Ports: []Port{{Port: 53, Protocol: ProtocolTCP}}},
+			"10.1.2.3",
+			[]Port{{Port: 53, Protocol: ProtocolUDP}},
+			false,
+		},
+		{
+			"narrower deny must NOT veto a broader request",
+			Rule{Type: RuleTypeCIDR, Value: "127.0.0.0/24", Action: ActionDeny},
+			"127.0.0.0/8", nil, false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := NewConfigManager()
+			if err := cm.LoadConfigFromRules([]Rule{tt.denyRule}, ActionDeny); err != nil {
+				t.Fatalf("LoadConfigFromRules() error = %v", err)
+			}
+			before := len(cm.config.Rules)
+			cm.EnsureInfraAllowed([]string{tt.reqCIDR}, tt.reqPorts, AutoAddedTypeLoopback)
+			added := len(cm.config.Rules) - before
+			if tt.suppress && added != 0 {
+				t.Fatalf("deny should have vetoed the auto-allow; %d rules added", added)
+			}
+			if !tt.suppress && added == 0 {
+				t.Fatalf("auto-allow should have been appended despite the non-covering deny")
+			}
+		})
+	}
+}
+
 // A narrower existing rule that happens to contain the prefix's BASE address
 // must not suppress the broader prefix: with a user rule for 127.0.0.0/32,
 // skipping the /8 would leave 127.1.0.0–127.255.255.255 out of the rendered

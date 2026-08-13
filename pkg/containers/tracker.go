@@ -81,8 +81,10 @@ type Options struct {
 	// local-nets map, never the shared policy: a workload-influenced subnet
 	// must not be able to widen TC's off-host enforcement). Non-bridge
 	// drivers (macvlan/ipvlan — physical-network address space) are never
-	// passed. An error means the carve-out was not applied; the tracker
-	// retries on the next container of that network. Nil disables
+	// passed. Error semantics carry the refused-vs-failed distinction:
+	// origin.ErrLocalNetworkRefused is the carve-out policy's DECISION (the
+	// tracker stamps the subnet seen and never retries); any other error is
+	// transient and retried on the network's next container. Nil disables
 	// discovery. Called without the tracker lock held.
 	AllowLocalSubnet func(prefix netip.Prefix) error
 }
@@ -327,9 +329,21 @@ func (t *Tracker) streamOnce(ctx context.Context) (healthy bool, err error) {
 			// A bridge network created mid-run must be carved BEFORE its
 			// first container's traffic, or that traffic meets enforce-mode
 			// default-deny; container-driven discovery alone misses networks
-			// whose containers are too short-lived to inspect.
-			if ev.Action == "create" {
+			// whose containers are too short-lived to inspect. A destroy
+			// evicts the driver cache — a same-name recreate with a
+			// different driver must never read the dead network's "bridge"
+			// verdict.
+			switch ev.Action {
+			case "create":
 				t.handleNetworkCreate(ctx, ev)
+			case "destroy":
+				name := ev.Actor.Attributes["name"]
+				if name == "" {
+					name = ev.Actor.ID
+				}
+				t.mu.Lock()
+				delete(t.netDrivers, name)
+				t.mu.Unlock()
 			}
 			continue
 		}

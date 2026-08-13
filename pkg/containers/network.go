@@ -25,10 +25,13 @@ package containers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
 	"time"
+
+	"github.com/code-cargo/cargowall/pkg/origin"
 )
 
 // forEachInspectAddr visits every address docker reported for a container:
@@ -96,45 +99,52 @@ func collectSubnets(insp containerInspect) []localSubnet {
 	return subnets
 }
 
-// allowSubnetOnce runs the once-per-subnet carve-out pipeline: resolve the
-// network's driver (bridge-driver networks are local-only by construction —
-// their routes are on-link; a macvlan/ipvlan subnet is physical-network
-// space and MUST stay adjudicated), then hand the subnet to the callback.
-// seenSubnets is stamped only once the decision is final — a failed driver
-// inspect or a failed carve-out write is retried by the next container on
-// the network.
-func (t *Tracker) allowSubnetOnce(ctx context.Context, s localSubnet) {
-	key := s.prefix.String()
+// carvePrefix is THE apply path for the carve-out — every discovery source
+// funnels here (network-create events and per-container discovery directly;
+// the pre-enableMode pre-scan feeds candidates through the same callback in
+// cmd, before a Tracker exists). Pipeline: seen-check → resolve the
+// network's driver (cached; network "" means the legacy top-level inspect
+// fields, resolved to the literal "bridge" network and verified like any
+// other — the macvlan protection must not rest on undocumented daemon
+// behavior) → hand the prefix to AllowLocalSubnet → stamp seenSubnets.
+//
+// Stamping carries the refused-vs-failed distinction end to end: a policy
+// refusal (origin.ErrLocalNetworkRefused, logged at the write) is a
+// DECISION and stamps seen; any transient failure — driver inspect, host
+// interface enumeration, map write — leaves the subnet unstamped so the
+// network's next container retries.
+func (t *Tracker) carvePrefix(ctx context.Context, networkName string, prefix netip.Prefix) {
+	if t.opts.AllowLocalSubnet == nil {
+		return
+	}
+	prefix = prefix.Masked()
+	key := prefix.String()
 	t.mu.Lock()
 	seen := t.seenSubnets[key]
 	t.mu.Unlock()
 	if seen {
 		return
 	}
-	// The legacy top-level inspect fields (network "") are resolved to the
-	// literal "bridge" network and driver-checked like any other: stock
-	// moby only populates them from the default bridge, but nothing
-	// guarantees that across docker-compatible daemons, and the macvlan
-	// protection must not rest on undocumented daemon behavior.
-	netName := s.network
-	if netName == "" {
-		netName = "bridge"
+
+	name := networkName
+	if name == "" {
+		name = "bridge"
 	}
 	t.mu.Lock()
-	isBridge, known := t.netDrivers[netName]
+	isBridge, known := t.netDrivers[name]
 	t.mu.Unlock()
 	if !known {
 		ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
-		nw, err := t.client.inspectNetwork(ictx, netName)
+		nw, err := t.client.inspectNetwork(ictx, name)
 		cancel()
 		if err != nil {
 			t.logger.Warn("Cannot inspect network for subnet carve-out; subnet stays adjudicated for now",
-				"network", netName, "subnet", key, "error", err)
-			return // unresolved: retried by the next container, not cached
+				"network", name, "subnet", key, "error", err)
+			return
 		}
 		isBridge = nw.Driver == "bridge"
 		t.mu.Lock()
-		t.netDrivers[netName] = isBridge
+		t.netDrivers[name] = isBridge
 		t.mu.Unlock()
 	}
 	if !isBridge {
@@ -142,10 +152,17 @@ func (t *Tracker) allowSubnetOnce(ctx context.Context, s localSubnet) {
 		t.seenSubnets[key] = true
 		t.mu.Unlock()
 		t.logger.Info("Non-bridge network subnet stays adjudicated (not local-only)",
-			"network", netName, "subnet", key)
+			"network", name, "subnet", key)
 		return
 	}
-	if err := t.opts.AllowLocalSubnet(s.prefix); err != nil {
+
+	if err := t.opts.AllowLocalSubnet(prefix); err != nil {
+		if errors.Is(err, origin.ErrLocalNetworkRefused) {
+			t.mu.Lock()
+			t.seenSubnets[key] = true
+			t.mu.Unlock()
+			return
+		}
 		t.logger.Warn("Local subnet carve-out failed; will retry on the network's next container",
 			"subnet", key, "error", err)
 		return
@@ -176,34 +193,17 @@ func (t *Tracker) handleNetworkCreate(ctx context.Context, ev dockerEvent) {
 			"network", name, "error", err)
 		return
 	}
-	isBridge := nw.Driver == "bridge"
+	// Prime the driver cache so carvePrefix below (and later per-container
+	// discovery) never re-inspects this network.
 	t.mu.Lock()
-	t.netDrivers[name] = isBridge
+	t.netDrivers[name] = nw.Driver == "bridge"
 	t.mu.Unlock()
-	if !isBridge {
-		return
-	}
 	for _, cfg := range nw.IPAM.Config {
 		prefix, perr := netip.ParsePrefix(cfg.Subnet)
 		if perr != nil {
 			continue
 		}
-		prefix = prefix.Masked()
-		key := prefix.String()
-		t.mu.Lock()
-		seen := t.seenSubnets[key]
-		t.mu.Unlock()
-		if seen {
-			continue
-		}
-		if aerr := t.opts.AllowLocalSubnet(prefix); aerr != nil {
-			t.logger.Warn("Local subnet carve-out failed; will retry via container discovery",
-				"subnet", key, "error", aerr)
-			continue
-		}
-		t.mu.Lock()
-		t.seenSubnets[key] = true
-		t.mu.Unlock()
+		t.carvePrefix(ctx, name, prefix)
 	}
 }
 

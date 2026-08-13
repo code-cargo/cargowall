@@ -442,13 +442,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// in bytecode. MUST run after the config load above — a load replaces
 	// the rendered config wholesale (and ensureAllowed no-ops with no config
 	// loaded at all) — and before UpdateAllowlistTC programs the maps below.
-	if cmd.ContainerAttribution {
-		configMgr.EnsureInfraAllowed([]string{"127.0.0.0/8", "::1/128"}, nil, config.AutoAddedTypeLoopback)
-	}
-	// (Docker bridge subnets are deliberately NOT policy: they are carved
-	// out of the cgroup hook alone via origin's local-nets map — see
-	// preallowLocalNetworks below — because their values are workload-
-	// influenced and must never widen TC's off-host enforcement.)
+	// (The loopback auto-allow and the docker bridge carve-outs are owned
+	// by the containerAttribution facade — ensureLoopbackAllowed and
+	// preallowLocalNetworks below — not threaded through boot as flag
+	// checks here.)
 
 	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
 	// load-bearing under --cgroup-enforce — the docker bridge listener that
@@ -606,6 +603,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		resolveMode(cmd.ContainerAttribution, cmd.CgroupEnforce),
 		stepTracker, &objs, logger)
 	defer attribution.Close()
+
+	// Userspace half of the loopback carve-out pair — after config load,
+	// before UpdateAllowlistTC programs the maps below.
+	attribution.ensureLoopbackAllowed(configMgr)
 
 	// BPF runtime stats (3a telemetry): global kernel accounting while
 	// enabled; the per-program numbers land in one shutdown log line each.
@@ -1198,9 +1199,8 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 	}
 
 	// DNS-infrastructure auto-allows (proxy upstream, loopback, docker
-	// bridge listener) are NOT added here: they are gated on the conditions
-	// that create the listeners, not on CI mode — see startCargoWall, after
-	// config load.
+	// bridge listener) are NOT added here: they run unconditionally in
+	// startCargoWall after config load, independent of CI mode.
 
 	return apiPolicyLoaded
 }

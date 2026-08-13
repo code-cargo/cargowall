@@ -39,6 +39,14 @@ import (
 // its stale byIP entry keeps answering DNS attribution lookups, crediting
 // whatever later occupies that bridge address to a dead container.
 func (t *Tracker) reconcile(ctx context.Context) {
+	// The network-driver cache can be stale across a stream gap (a destroy
+	// whose event was lost, then a same-name recreate with a different
+	// driver); reconcile is the recovery point for exactly that class, so
+	// the cache resets here and rebuilds on demand.
+	t.mu.Lock()
+	clear(t.netDrivers)
+	t.mu.Unlock()
+
 	list, err := t.client.listContainers(ctx)
 	if err != nil {
 		t.logger.Warn("Cannot list containers for reconciliation", "error", err)
@@ -114,17 +122,24 @@ func (t *Tracker) reconcile(ctx context.Context) {
 	// started after the list call is either absent from t.containers (its
 	// start event is still buffered in the stream — the sweep leaves it
 	// alone) or was added by a handleStart above (in the list, so live).
-	// Only genuinely dead containers are swept — unless the list came back
-	// EMPTY while we track containers, which on a just-restarted dockerd is
-	// far more plausibly an initializing daemon than a mass die-off; wiping
-	// the indexes on that evidence would permanently demote every live
-	// container (live-restore containers never re-emit a start event).
+	// An EMPTY list while containers are tracked is judged FIRST, before
+	// any absence counting: on a just-restarted dockerd it is far more
+	// plausibly an initializing daemon than a mass die-off, and it must not
+	// spend one of the two absences the sweep requires.
+	t.mu.Lock()
+	tracked := len(t.containers)
+	t.mu.Unlock()
+	if len(list) == 0 && tracked > 0 {
+		t.logger.Warn("Reconciliation list empty while containers are tracked; keeping indexes (initializing daemon?)",
+			"tracked", tracked)
+		return
+	}
+
 	// Absence must be seen on TWO consecutive passes before the sweep
 	// fires: a settling daemon can answer /containers/json with a partial
 	// list, and a single partial answer must not wipe live containers
 	// (live-restore containers never re-emit a start event, so a wrong
-	// sweep is permanent). The empty-list guard below is the degenerate
-	// case of the same distrust.
+	// sweep is permanent).
 	t.mu.Lock()
 	var stale []string
 	for id := range t.containers {
@@ -138,13 +153,7 @@ func (t *Tracker) reconcile(ctx context.Context) {
 			delete(t.missingCounts, id)
 		}
 	}
-	tracked := len(t.containers)
 	t.mu.Unlock()
-	if len(list) == 0 && tracked > 0 {
-		t.logger.Warn("Reconciliation list empty while containers are tracked; keeping indexes (initializing daemon?)",
-			"tracked", tracked)
-		return
-	}
 	for _, id := range stale {
 		t.logger.Info("Container removed during reconciliation (absent from two consecutive lists)",
 			"container", shortID(id))

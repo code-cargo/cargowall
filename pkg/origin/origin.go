@@ -127,8 +127,10 @@ type Record struct {
 	// (main queue full, or backlog diverted at Close): the sink must do
 	// only bounded work — no hostname resolution, no firewall writes, no
 	// notification — so the lane keeps up mid-storm and drains fast at
-	// shutdown. It exists so an enforce-mode drop ALWAYS produces an audit
-	// record, even when the reporting pipeline is saturated.
+	// shutdown. It exists so an enforce-mode drop produces an audit record
+	// even when the full-fidelity pipeline is saturated; only when BOTH
+	// lanes are full is a Block's record finally lost (counted in
+	// verdictsDropped, never in the shutdown-bookkeeping counter).
 	Degraded bool
 }
 
@@ -398,40 +400,6 @@ func (o *Observer) SetMode(mode Mode) error {
 	return nil
 }
 
-// AllowLocalNetwork carves a local-only network (a docker bridge subnet)
-// out of THIS hook's adjudication, exactly as loopback is carved out. The
-// entry lands in map_local_nets, owned by the origin collection and
-// deliberately not shared with TC: subnets are discovered from container
-// config at runtime — workload-influenced input — so the write must never
-// be able to widen off-host enforcement. Carving a subnet here returns its
-// traffic to the pre-3b posture (bridge-local flows were never policed);
-// anything that actually leaves the host still meets TC's untouched
-// verdict. Callers gate on bridge-driver networks (see pkg/containers).
-func (o *Observer) AllowLocalNetwork(prefix netip.Prefix) error {
-	prefix = prefix.Masked()
-	if prefix.Addr().Is4() {
-		a4 := prefix.Addr().As4()
-		key := bpf.OriginBpfLpmKey{
-			Prefixlen: uint32(prefix.Bits()),
-			// NativeEndian: the uint32's bytes must sit in network byte
-			// order in the map key, matching the firewall's LPM writes.
-			Ip: binary.NativeEndian.Uint32(a4[:]),
-		}
-		if err := o.objs.MapLocalNets.Put(key, uint8(1)); err != nil {
-			return fmt.Errorf("failed to allow local network %s: %w", prefix, err)
-		}
-	} else {
-		key := bpf.OriginBpfLpmKeyV6{Prefixlen: uint32(prefix.Bits())}
-		a16 := prefix.Addr().As16()
-		copy(key.Ip[:], a16[:])
-		if err := o.objs.MapLocalNetsV6.Put(key, uint8(1)); err != nil {
-			return fmt.Errorf("failed to allow local network %s: %w", prefix, err)
-		}
-	}
-	o.logger.Info("Local-only network carved out of cgroup adjudication", "subnet", prefix.String())
-	return nil
-}
-
 // String renders a Mode for logs.
 func (m Mode) String() string {
 	switch m {
@@ -665,6 +633,15 @@ func (o *Observer) divertOverflow(rec Record, atClose bool) {
 			return
 		default:
 		}
+		// A Block that missed BOTH lanes is a lost audit record for an
+		// enforced drop — counted as dropped whatever the caller, so
+		// "abandoned" keeps meaning only shutdown bookkeeping for
+		// would-blocks and never hides denials that went unrecorded.
+		if n := o.verdictsDropped.Add(1); n == 1 || n%1000 == 0 {
+			o.logger.Warn("Both verdict lanes full; a Block's audit record was lost",
+				"dropped_total", n)
+		}
+		return
 	}
 	if atClose {
 		o.verdictsAbandoned.Add(1)
@@ -705,13 +682,16 @@ func (o *Observer) LookupV6(dstIP [16]byte, dstPort uint16, proto uint8, srcPort
 	return o.lookup(flowKey{dst: dstIP, port: dstPort, proto: proto, ipVersion: 6}, srcPort)
 }
 
-// lookup matches on what NAT preserves. An exact source-port match is
-// authoritative (MASQUERADE keeps the source port unless it collides) and
-// returned alone; otherwise all live candidates for the destination tuple
-// are returned, newest first, so the caller can decide whether they agree —
-// disagreement must degrade to the stricter tier, and that policy belongs
-// to the caller, not the store. srcPort 0 skips the exact pass (protocol-
-// block events carry no ports).
+// lookup matches on what NAT preserves. An exact source-port match narrows
+// the candidate set (MASQUERADE keeps the source port unless it collides) —
+// but the collision that clause names is real: two netns can pick the same
+// ephemeral port to one destination, in which case the post-NAT port
+// identifies only one of the matching flows. So EVERY record with the
+// matching source port is returned, not the newest alone — a single match
+// is authoritative, several are the caller's ambiguity to file, and
+// disagreement must degrade to the stricter tier (that policy belongs to
+// the caller, not the store). srcPort 0 skips the exact pass
+// (protocol-block events carry no ports).
 func (o *Observer) lookup(key flowKey, srcPort uint16) []Record {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -720,10 +700,14 @@ func (o *Observer) lookup(key flowKey, srcPort uint16) []Record {
 		return nil
 	}
 	if srcPort != 0 {
+		var matches []Record
 		for _, r := range entries {
 			if r.SrcPort == srcPort {
-				return []Record{r}
+				matches = append(matches, r)
 			}
+		}
+		if len(matches) > 0 {
+			return matches
 		}
 	}
 	out := make([]Record, len(entries))

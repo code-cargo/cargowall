@@ -334,20 +334,12 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		out.Kind = OutcomeAllowed
 		out.Audit.AutoAllowedType = string(configMgr.GetAutoAllowedType(dstIP, event.DstPort, eventProto, out.Audit.DstHostname))
 
-	case event.IsProtocolBlock():
-		// Non-TCP/UDP protocol block — dst_port carried the protocol number.
-		out.Kind = OutcomeProtocolBlocked
-		out.SrcPort = 0
-		out.ProtocolNum = event.DstPort
-		out.Audit.Protocol = getProtocolName(uint8(event.DstPort))
-
-	case lateAllowed:
-		out.Kind = OutcomeLateAllowed
-		out.Audit.MatchedRule = matchedRule
-
 	default:
-		out.Kind = OutcomeBlocked
-		out.Audit.MidStream = event.Flags&BpfEventFlagMidstream != 0
+		// Every denial converges on the shared kind selection; dst_port
+		// carries the protocol number for the wire's protocol-block shape.
+		applyDenialOutcome(&out, lateAllowed, matchedRule,
+			event.IsProtocolBlock(), event.DstPort, getProtocolName(uint8(event.DstPort)),
+			event.Flags&BpfEventFlagMidstream != 0)
 	}
 
 	emitOutcome(out, notificationTracker, auditLogger, logger)

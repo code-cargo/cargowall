@@ -72,7 +72,7 @@ func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int
 	// network exists whatever the identity check below decides.
 	if t.opts.AllowLocalSubnet != nil {
 		for _, s := range collectSubnets(insp) {
-			t.allowSubnetOnce(ctx, s)
+			t.carvePrefix(ctx, s.network, s.prefix)
 		}
 	}
 
@@ -90,7 +90,12 @@ func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int
 	var ordinal uint32
 	if kind == "reconcile" {
 		ordinal = events.StepOrdinalPreDaemon
-		info.preDaemon = true
+		// Upgrade-on-replay is only armed when the identity check passed:
+		// upgradeReconciledStart tags WITHOUT re-verification on the premise
+		// that adoption verified the PID, and a refused container must stay
+		// at the sentinel — the stricter outcome — not get tagged later by
+		// its replayed start event.
+		info.preDaemon = identityOK
 	} else {
 		ordinal = t.tagger.OrdinalAt(time.Unix(0, timeNano))
 	}
@@ -365,6 +370,12 @@ func (t *Tracker) remove(id string) {
 	// Unconditional: exec ids may have been seen for containers the start
 	// handler never registered (inspect raced the container's death).
 	delete(t.seenExecs, id)
+	// Same reason, same shape: a lingering absence count would leak (the
+	// sweep loop iterates t.containers, which this id is leaving), and —
+	// worse — docker ids survive stop+start, so a re-adopted id carrying a
+	// stale count of 1 would be swept on its first absence, defeating the
+	// two-pass guard for exactly that container.
+	delete(t.missingCounts, id)
 	info := t.containers[id]
 	if info == nil {
 		return

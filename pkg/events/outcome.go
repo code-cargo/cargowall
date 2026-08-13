@@ -310,6 +310,34 @@ func emitOutcome(o Outcome, notificationTracker *NotificationTracker,
 	}
 }
 
+// applyDenialOutcome stamps the denial kinds both hooks share — late-
+// allowed, protocol block, blocked(+mid-stream) — onto out. The hooks
+// pre-branch only what is genuinely theirs (TC: allowed; cgroup: shadow
+// would-block); every denial converges here so the next flag lands in one
+// switch instead of two parallel ones that drift (mid-stream nearly did).
+// protocolNum/protocolName differ by wire format — TC carries the protocol
+// number in dst_port — so the caller supplies them. lateAllowed-first is
+// equivalent to TC's historical protocol-block-first: tryLateAllow is
+// TCP/UDP-only, so the two conditions are mutually exclusive.
+func applyDenialOutcome(out *Outcome, lateAllowed bool, matchedRule string,
+	protocolBlock bool, protocolNum uint16, protocolName string, midStream bool,
+) {
+	switch {
+	case lateAllowed:
+		out.Kind = OutcomeLateAllowed
+		out.Audit.MatchedRule = matchedRule
+	case protocolBlock:
+		out.Kind = OutcomeProtocolBlocked
+		out.SrcPort = 0
+		out.ProtocolNum = protocolNum
+		out.NotifyPort = protocolNum
+		out.Audit.Protocol = protocolName
+	default:
+		out.Kind = OutcomeBlocked
+		out.Audit.MidStream = midStream
+	}
+}
+
 // prepareOutcome runs the post-verdict preparation shared by both hooks:
 // destination resolution, late-allow reconciliation, and the base Outcome
 // with its audit record. Each hook then adds only what is genuinely its own
@@ -451,32 +479,20 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 		notificationTracker = nil
 	}
 
-	switch {
-	case !denial:
+	if !denial {
 		out.Kind = OutcomeWouldBlock
 		// A would-block keeps the mid-stream flag: shadow mode exists to
 		// predict what enforcement would do, and "would kill an established
 		// flow" is precisely the datum an operator weighs before flipping
 		// --cgroup-enforce. TC's audit-mode would-denies carry it too.
 		out.Audit.MidStream = rec.MidStream
-	case lateAllowed:
-		out.Kind = OutcomeLateAllowed
-		out.Audit.MatchedRule = matchedRule
-	case !isTCPOrUDP(rec.Proto):
+	} else {
 		// A denied non-TCP/UDP protocol reports in the same shape TC gives
-		// it, so flipping --cgroup-enforce never changes an event's type for
-		// consumers that branch on it. The hook emits ports 0 for these, so
-		// the protocol number is the notification/dedup key.
-		out.Kind = OutcomeProtocolBlocked
-		out.SrcPort = 0
-		out.ProtocolNum = uint16(rec.Proto)
-		out.NotifyPort = uint16(rec.Proto)
-	default:
-		out.Kind = OutcomeBlocked
-		// Mid-stream is a property of a DENIAL — real (here) or predicted
-		// (the would-block arm above) — never of a late-allow, whose whole
-		// point is that the flow is not being killed.
-		out.Audit.MidStream = rec.MidStream
+		// it (the hook emits ports 0 for these, so the protocol number is
+		// the notification/dedup key), and mid-stream marks a real denial,
+		// never a late-allow.
+		applyDenialOutcome(&out, lateAllowed, matchedRule,
+			!isTCPOrUDP(rec.Proto), uint16(rec.Proto), getProtocolName(rec.Proto), rec.MidStream)
 	}
 
 	emitOutcome(out, notificationTracker, auditLogger, logger)

@@ -73,6 +73,19 @@ func TestLookupExactSourcePortIsAuthoritative(t *testing.T) {
 	require.True(t, got[0].TCPSyn)
 }
 
+// Two netns can draw the same ephemeral source port to one destination —
+// the collision the MASQUERADE assumption names. The exact-port pass must
+// then return BOTH records so resolveJoin can degrade the disagreement,
+// never silently pick the newest as fact.
+func TestLookupExactSourcePortCollisionReturnsAllMatches(t *testing.T) {
+	o := newTestObserver()
+	o.insert(v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)) // container A
+	o.insert(v4Event(2, 0xAC110003, 0x8C527203, 40001, 443)) // container B, same src port
+
+	got := o.LookupV4(0x8C527203, 443, 6, 40001)
+	require.Len(t, got, 2, "a collided source port is the caller's ambiguity, not a coin flip")
+}
+
 func TestLookupFallbackReturnsAllCandidatesNewestFirst(t *testing.T) {
 	o := newTestObserver()
 	o.insert(v4Event(1, 0xAC110002, 0x8C527203, 40001, 443))

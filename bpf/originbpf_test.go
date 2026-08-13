@@ -420,9 +420,16 @@ func TestOriginEgressLoopbackDeviceCarveOut(t *testing.T) {
 // enforcement; the parity test's premise (shared decision) is about the
 // verdict maps, which this deliberately is not part of.
 func TestOriginEgressLocalNetworkCarveOut(t *testing.T) {
-	objs := loadOriginObjects(t)
+	// The collections MUST share the verdict maps (the production
+	// MapReplacements wiring): with two independent collections, "TC still
+	// drops it" would be true for any deny-all TC and the isolation
+	// assertion could never fail. Wired this way, moving map_local_nets
+	// into verdict.h/MapReplacements — the regression this test exists to
+	// catch — makes TC consult the carve-out and the final require fires.
+	requireBPF(t)
 	tcObjs := loadBPFObjects(t)
-	seedOriginRules(t, objs)
+	objs := loadOriginObjectsSharing(t, tcObjs)
+	seedOriginRules(t, objs) // writes the SHARED maps via origin's handles
 	setOriginMode(t, objs, originModeEnforce)
 
 	pkt4 := craftIPv4TCP(t, "10.99.7.3", 443)  // denied dst
@@ -449,11 +456,9 @@ func TestOriginEgressLocalNetworkCarveOut(t *testing.T) {
 	require.Equal(t, uint32(1), ret, "carved-out v6 subnet must pass at the cgroup hook")
 
 	// The isolation property: the same destination is still adjudicated by
-	// TC. Program TC with the same deny-all policy and confirm the carve-out
-	// did not leak — this is what makes workload-influenced subnet discovery
-	// safe to wire at all.
-	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(0)))
-	require.NoError(t, tcObjs.MapAuditMode.Put(uint32(0), uint8(0)))
+	// TC, which reads the SAME shared verdict maps but must not see
+	// map_local_nets — this is what makes workload-influenced subnet
+	// discovery safe to wire at all.
 	tcRet, _, err := tcObjs.TcEgress.Test(pkt4)
 	require.NoError(t, err)
 	require.NotEqual(t, uint32(tcActOK), tcRet,

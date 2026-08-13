@@ -18,8 +18,8 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"log/slog"
-	"net"
 	"net/netip"
 
 	"github.com/cilium/ebpf"
@@ -182,82 +182,32 @@ func (a *containerAttribution) enableMode() {
 	}
 }
 
-// allowLocalNetwork carves a local-only bridge subnet out of the cgroup
-// hook's adjudication (origin's local-nets map — never the shared policy,
-// so a workload-influenced subnet cannot widen TC's off-host enforcement).
-// Nil-safe: with no observer there is nothing adjudicating, so there is
-// nothing to carve.
-//
-// Validation, because subnet values are workload-influenced (`docker
-// network create --subnet ...` is unprivileged) and TC's single-interface
-// attachment means the "TC still polices what leaves the host" bound has
-// pre-existing blind spots on multi-interface hosts:
-//   - width cap: nothing broader than /16 (v4) or /64 (v6) is carved — a
-//     wider claim exempts address space no real docker bridge needs;
-//   - locality: the subnet must not contain any non-loopback host
-//     interface address, unless that interface's own network IS the subnet
-//     (the bridge's gateway address) — claiming space the host actually
-//     lives in (a VPC/LAN range) is refused.
-//
-// A refused subnet logs loudly and returns nil (decided, not retried): the
-// operator can still allow it explicitly in policy.
+// allowLocalNetwork is a nil-safe pass-through to the observer's
+// AllowLocalNetwork: the carve-out policy (width cap, host-address
+// locality, bridge-device exemption, fail-closed enumeration) lives ON the
+// map write in pkg/origin — a permanent workload-influenced exemption must
+// not depend on which caller reached it. With no observer there is nothing
+// adjudicating, so there is nothing to carve.
 func (a *containerAttribution) allowLocalNetwork(prefix netip.Prefix) error {
 	if a == nil || a.observer == nil {
-		return nil
-	}
-	prefix = prefix.Masked()
-	if (prefix.Addr().Is4() && prefix.Bits() < 16) || (!prefix.Addr().Is4() && prefix.Bits() < 64) {
-		a.logger.Warn("Refusing local-network carve-out: subnet wider than any real docker bridge needs",
-			"subnet", prefix.String())
-		return nil
-	}
-	if conflict := hostAddressInside(prefix); conflict != "" {
-		a.logger.Warn("Refusing local-network carve-out: subnet contains a host interface address (claims real network space)",
-			"subnet", prefix.String(), "conflict", conflict)
 		return nil
 	}
 	return a.observer.AllowLocalNetwork(prefix)
 }
 
-// hostAddressInside reports a non-loopback host interface address contained
-// in prefix whose own network is not exactly prefix — the signature of a
-// carve-out claiming address space the host genuinely lives in. The
-// bridge's own gateway address matches prefix exactly and passes.
-func hostAddressInside(prefix netip.Prefix) string {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "" // can't validate: don't block the carve-out on it
+// ensureLoopbackAllowed appends the userspace half of the loopback
+// carve-out pair (the BPF hook carves 127/8 and lo-egress directly; this
+// makes the allowance visible in the rendered policy). On the facade, not
+// in startCargoWall: the type exists so boot doesn't thread feature checks,
+// and a nil receiver — attribution off, or step attribution dead — is
+// exactly the case where the hook never adjudicates and no allowance is
+// needed. MUST run after config load (a load replaces the rendered config
+// wholesale) and before UpdateAllowlistTC programs the maps.
+func (a *containerAttribution) ensureLoopbackAllowed(configMgr *config.Manager) {
+	if a == nil {
+		return
 	}
-	for _, ifc := range ifaces {
-		if ifc.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, err := ifc.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, a := range addrs {
-			ipn, ok := a.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			addr, aok := netip.AddrFromSlice(ipn.IP)
-			if !aok {
-				continue
-			}
-			addr = addr.Unmap()
-			if !prefix.Contains(addr) {
-				continue
-			}
-			ones, _ := ipn.Mask.Size()
-			own, perr := addr.Prefix(ones)
-			if perr == nil && own == prefix {
-				continue // the subnet's own bridge interface
-			}
-			return ifc.Name + "=" + addr.String()
-		}
-	}
-	return ""
+	configMgr.EnsureInfraAllowed([]string{"127.0.0.0/8", "::1/128"}, nil, config.AutoAddedTypeLoopback)
 }
 
 // preallowLocalNetworks carves out the local-only networks that exist
@@ -272,7 +222,7 @@ func (a *containerAttribution) preallowLocalNetworks(ctx context.Context) {
 	}
 	if subnet, err := network.GetDockerBridgeSubnet(); err == nil {
 		if prefix, perr := netip.ParsePrefix(subnet); perr == nil {
-			if aerr := a.allowLocalNetwork(prefix); aerr != nil {
+			if aerr := a.allowLocalNetwork(prefix); aerr != nil && !errors.Is(aerr, origin.ErrLocalNetworkRefused) {
 				a.logger.Warn("Default bridge carve-out failed", "subnet", subnet, "error", aerr)
 			}
 		}
@@ -284,13 +234,16 @@ func (a *containerAttribution) preallowLocalNetworks(ctx context.Context) {
 	}
 	subnets, err := containers.DiscoverBridgeSubnets(ctx, "")
 	if err != nil {
-		a.logger.Warn("Cannot pre-scan container bridge subnets; pre-existing user-defined bridges stay adjudicated until tracking starts",
+		a.logger.Warn("Cannot pre-scan bridge subnets; pre-existing user-defined bridges stay adjudicated until tracking starts",
 			"error", err)
 		return
 	}
 	for _, prefix := range subnets {
-		if err := a.allowLocalNetwork(prefix); err != nil {
-			a.logger.Warn("Bridge subnet carve-out failed", "subnet", prefix.String(), "error", err)
+		// Refusals are the policy's decision and already logged by the
+		// write; transient failures are warned and left for the tracker's
+		// discovery paths to retry.
+		if err := a.allowLocalNetwork(prefix); err != nil && !errors.Is(err, origin.ErrLocalNetworkRefused) {
+			a.logger.Warn("Bridge subnet carve-out failed; tracking will retry", "subnet", prefix.String(), "error", err)
 		}
 	}
 }

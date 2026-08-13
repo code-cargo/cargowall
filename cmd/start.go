@@ -431,21 +431,11 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}
 	}
 
-	// Loopback, all ports, whenever the cgroup egress hook may adjudicate
-	// (issue #106 phase 3b). TC egress is attached to one interface and has
-	// never seen `lo`, so loopback has never been subject to the allowlist;
-	// the cgroup hook fires on it. Without this every local-only flow — the
-	// runner's own services, test listeners, the DNS proxy's DNAT'd
-	// 127.0.0.1:53 — would meet default-deny. The BPF hook also carves
-	// loopback out directly; this is the userspace half of that pair, and it
-	// makes the allowance visible in the rendered policy rather than hidden
-	// in bytecode. MUST run after the config load above — a load replaces
-	// the rendered config wholesale (and ensureAllowed no-ops with no config
-	// loaded at all) — and before UpdateAllowlistTC programs the maps below.
-	// (The loopback auto-allow and the docker bridge carve-outs are owned
-	// by the containerAttribution facade — ensureLoopbackAllowed and
-	// preallowLocalNetworks below — not threaded through boot as flag
-	// checks here.)
+	// The loopback and docker-bridge carve-outs are owned by the
+	// containerAttribution facade (ensureLoopbackAllowed and
+	// preallowLocalNetworks below). They must stay after this config load —
+	// a load replaces the rendered config wholesale — and before
+	// UpdateAllowlistTC programs the maps.
 
 	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
 	// load-bearing under --cgroup-enforce — the docker bridge listener that

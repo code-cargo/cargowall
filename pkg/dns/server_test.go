@@ -3540,7 +3540,7 @@ type recordingSink struct {
 func (r *recordingSink) Consume(ev events.AuditEvent) { r.evs = append(r.evs, ev) }
 
 // newContainerAttributionServer builds a Server via NewServer — the
-// literal-style newTestServer skips containerListenerIPs, which
+// literal-style newTestServer skips listenerModes, which
 // AddContainerListenAddr requires — with query filtering on, a
 // deny-by-default config (so blocked.example.com REFUSEs without upstream
 // I/O), and a file-less audit logger feeding the returned sink. auditMode

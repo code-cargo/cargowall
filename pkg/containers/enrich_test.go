@@ -116,7 +116,7 @@ func TestCollectIPsIncludesIPv6(t *testing.T) {
 // container→container traffic on a user-defined bridge never leaves the
 // host and TC never adjudicated it, so a missed subnet is a broken network
 // under --cgroup-enforce — and each subnet must carry its network name so
-// allowSubnetOnce can gate on the driver.
+// carvePrefix can gate on the driver.
 func TestCollectSubnetsDerivesBridgeNetworks(t *testing.T) {
 	insp := containerInspect{}
 	insp.NetworkSettings.IPAddress = "172.17.0.2"

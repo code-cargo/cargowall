@@ -73,7 +73,7 @@ type localSubnet struct {
 // collectSubnets derives the subnets docker attached the container to, v4
 // and v6, masked. Entries with no prefix length (host networking, daemons
 // that omit it) are dropped — a zero prefix would shape into a catch-all.
-// Driver gating happens later, in allowSubnetOnce: this function only
+// Driver gating happens later, in carvePrefix: this function only
 // reads the inspect payload.
 func collectSubnets(insp containerInspect) []localSubnet {
 	var subnets []localSubnet

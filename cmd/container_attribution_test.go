@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"net/netip"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -57,6 +58,10 @@ func TestContainerAttributionNilSafe(t *testing.T) {
 	var a *containerAttribution
 	assert.NotPanics(t, func() {
 		a.enableMode()
+		a.ensureLoopbackAllowed(nil)
+		a.wireVerdicts(nil, nil, nil, nil)
+		a.preallowLocalNetworks(t.Context())
+		assert.NoError(t, a.allowLocalNetwork(netip.Prefix{}))
 		a.Close()
 		assert.Nil(t, a.enricherArg())
 		assert.Nil(t, a.observerProgram())

@@ -196,9 +196,14 @@ func (a *containerAttribution) allowLocalNetwork(prefix netip.Prefix) error {
 }
 
 // ensureLoopbackAllowed appends the userspace half of the loopback
-// carve-out pair (the BPF hook carves 127/8 and lo-egress directly; this
-// makes the allowance visible in the rendered policy). On the facade, not
-// in startCargoWall: the type exists so boot doesn't thread feature checks,
+// carve-out pair. TC egress is attached to one interface and has never
+// seen `lo`, so loopback was never subject to the allowlist — but the
+// cgroup hook fires on it, and without this every local-only flow (the
+// runner's own services, test listeners, the DNS proxy's DNAT'd
+// 127.0.0.1:53) would meet default-deny. The BPF hook also carves
+// loopback out directly; this half makes the allowance visible in the
+// rendered policy rather than hidden in bytecode. On the facade, not in
+// startCargoWall: the type exists so boot doesn't thread feature checks,
 // and a nil receiver — attribution off, or step attribution dead — is
 // exactly the case where the hook never adjudicates and no allowance is
 // needed. MUST run after config load (a load replaces the rendered config

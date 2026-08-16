@@ -65,13 +65,17 @@ type joinResult struct {
 // agree on identity and ordinal, and a process claim only when they also
 // agree on PID — two processes in one container hitting the same
 // destination agree on everything else, and naming either one would be a
-// coin flip stamped into the audit stream as fact.
+// coin flip stamped into the audit stream as fact. The pre-NAT source
+// address follows the same rule as the PID: claimed only when every
+// candidate carries it (a multi-homed container's two addresses to one
+// destination must not have one of them stamped as fact).
 func resolveJoin(recs []origin.Record, classify func(origin.Record) *containerInfo) joinResult {
 	if len(recs) == 0 {
 		return joinResult{kind: joinNone}
 	}
 	first := classify(recs[0])
 	pidsAgree := true
+	srcsAgree := true
 	for _, r := range recs[1:] {
 		if classify(r) != first || r.StepOrdinal != recs[0].StepOrdinal {
 			for _, rr := range recs {
@@ -84,11 +88,17 @@ func resolveJoin(recs []origin.Record, classify func(origin.Record) *containerIn
 		if r.PID != recs[0].PID {
 			pidsAgree = false
 		}
+		if r.SrcIP != recs[0].SrcIP {
+			srcsAgree = false
+		}
 	}
 	res := joinResult{kind: joinResolved, rec: recs[0], info: first}
 	if !pidsAgree {
 		res.rec.PID = 0 // container and step stand; the process claim does not
 		res.pidDropped = true
+	}
+	if !srcsAgree {
+		res.rec.SrcIP = netip.Addr{}
 	}
 	return res
 }
@@ -172,6 +182,14 @@ func (t *Tracker) applyJoin(audit *events.AuditEvent, res joinResult) {
 	case res.info != nil:
 		audit.ContainerOrigin = true
 		audit.ContainerID = shortID(res.info.id)
+		// Under one-reporter, an enforce+audit container denial is a TC
+		// event, whose own SrcIP is the post-MASQUERADE host address —
+		// misleading next to container_id. The record knows the pre-NAT
+		// container address; claim it when the candidates agree on it
+		// (resolveJoin blanks a disagreed source like a disagreed PID).
+		if res.rec.SrcIP.IsValid() {
+			audit.SrcIP = res.rec.SrcIP.String()
+		}
 		if res.rec.StepOrdinal != 0 {
 			t.tcEnriched.Add(1)
 		} else {

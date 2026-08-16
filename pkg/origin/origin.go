@@ -344,10 +344,11 @@ func (o *Observer) Close() {
 	// records, while TC — whose teardown registered later in the defer
 	// stack — has already detached. An enforce-mode drop in that window
 	// would be invisible; a brief fail-open at shutdown beats unrecorded
-	// drops. The map write bypasses SetMode deliberately: o.mode must keep
-	// naming the posture the run operated under, because the backlog triage
-	// below (reportLoop → divertOverflow) still consults it to keep
-	// enforce-mode would-blocks on the must-audit lane.
+	// drops. The map write bypasses SetMode deliberately: the reader below
+	// is still draining the ring, and insert's one-reporter rule consults
+	// o.mode — flipping the userspace copy to observe would let in-flight
+	// enforce would-blocks queue as shadow telemetry that TC (already
+	// detached) no longer dual-sources.
 	if Mode(o.mode.Load()) != ModeObserve {
 		if err := o.objs.MapOriginConfig.Put(cfgKeyMode, uint8(ModeObserve)); err != nil {
 			o.logger.Warn("Failed to lower origin hook to observe at close", "error", err)

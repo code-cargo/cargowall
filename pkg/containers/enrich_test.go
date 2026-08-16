@@ -17,11 +17,13 @@
 package containers
 
 import (
+	"net/netip"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/origin"
 )
 
@@ -89,6 +91,52 @@ func TestResolveJoinPIDDisagreementDropsProcessClaim(t *testing.T) {
 	}, classify)
 	assert.Equal(t, joinResolved, got.kind)
 	assert.Equal(t, uint32(101), got.rec.PID, "an agreed PID is claimed")
+}
+
+// The pre-NAT source follows the same agreement discipline as the PID: one
+// address claimed only when every candidate carries it. A multi-homed
+// container's two addresses to one destination must not have one of them
+// stamped as fact.
+func TestResolveJoinSrcDisagreementDropsAddressClaim(t *testing.T) {
+	ctrA := &containerInfo{id: strings.Repeat("a", 64)}
+	byCgroup := map[uint64]*containerInfo{1: ctrA}
+	classify := func(r origin.Record) *containerInfo { return byCgroup[r.CgroupID] }
+	addrA := netip.MustParseAddr("172.17.0.2")
+	addrB := netip.MustParseAddr("172.18.0.2")
+
+	got := resolveJoin([]origin.Record{
+		{CgroupID: 1, StepOrdinal: 5, SrcIP: addrA},
+		{CgroupID: 1, StepOrdinal: 5, SrcIP: addrB},
+	}, classify)
+	assert.Equal(t, joinResolved, got.kind)
+	assert.False(t, got.rec.SrcIP.IsValid(), "a disagreed source address must never be claimed")
+
+	got = resolveJoin([]origin.Record{
+		{CgroupID: 1, StepOrdinal: 5, SrcIP: addrA},
+		{CgroupID: 1, StepOrdinal: 5, SrcIP: addrA},
+	}, classify)
+	assert.Equal(t, addrA, got.rec.SrcIP, "an agreed source address is claimed")
+}
+
+// Enrich stamps the agreed pre-NAT container address onto the audit
+// record: under one-reporter an enforce+audit container denial is a TC
+// event, whose own SrcIP is the post-MASQUERADE host address — misleading
+// next to container_id.
+func TestEnrichClaimsPreNATSource(t *testing.T) {
+	ctr := &containerInfo{id: strings.Repeat("a", 64)}
+	obs := &fakeOrigin{recs: []origin.Record{{
+		CgroupID:    1,
+		StepOrdinal: 5,
+		SrcIP:       netip.MustParseAddr("172.17.0.2"),
+	}}}
+	tr := enrichTracker(t.TempDir(), obs)
+	tr.byCgroup[1] = ctr
+
+	audit := events.AuditEvent{SrcIP: "10.1.2.3"} // post-NAT, from the TC event
+	tr.Enrich(&audit, &events.BpfBlockedEvent{IpVersion: 4, IpProto: 6, DstPort: 443})
+	assert.Equal(t, "172.17.0.2", audit.SrcIP, "the pre-NAT container address wins")
+	assert.Equal(t, shortID(ctr.id), audit.ContainerID)
+	assert.Equal(t, uint32(5), audit.StepOrdinal)
 }
 
 // IPv6 addresses must reach the DNS client index: TC enrichment can match

@@ -362,18 +362,59 @@ static __always_inline void origin_emit(struct __sk_buff *skb, __u8 ip_version,
 //   - ICMP / ICMPv6: path-MTU discovery and NDP. tc_egress treats ICMPv4 as
 //     a protocol-block candidate and always allows ICMPv6; dropping either
 //     here would break connectivity for traffic that is otherwise allowed.
+// origin_carved_v4 is THE v4 carve-out predicate — the single definition
+// of the traffic classes this hook never denies, shared by the verdict
+// path and the unparsed (parse-fail) path so the two can never drift:
+//   - 127/8 destinations, and lo-device traffic (config-gated): TC is not
+//     on lo, so denying here would break flows TC always passed.
+//   - ICMP: path-MTU discovery; tc_egress adjudicates it as a
+//     protocol-block candidate under its own rules.
+//   - bridge-local destinations (map_local_nets): container↔container
+//     traffic TC never saw.
+// Operand order keeps the config-map lookup confined to lo-device packets
+// and the LPM lookup last.
+static __always_inline __u8 origin_carved_v4(struct __sk_buff *skb, __u32 dst_ip,
+                                             __be32 daddr_nbo, __u8 ip_proto) {
+    return ((dst_ip >> 24) == 127) || (ip_proto == IPPROTO_ICMP) ||
+           (skb->ifindex == LOOPBACK_IFINDEX && origin_lo_carveout()) ||
+           local_net_v4(daddr_nbo);
+}
+
+// origin_finish_unparsed_v4 finishes a packet whose IHL or L4 header could
+// not be read. The carve-out classes must be honored even here: a
+// malformed-L4 packet to 127.0.0.1 (CAP_NET_RAW + IP_HDRINCL is enough to
+// craft one) is still loopback traffic TC never adjudicates, and failing
+// closed on it would deny a carved class — with no record anywhere, since
+// the drop happens before the TC qdisc. Outside the carve-outs it fails
+// closed exactly like tc_egress, but WITH a record (ports 0): under
+// enforce this record is the drop's only evidence. Observe passes
+// untouched and unrecorded, as the parse-fail paths always did
+// (verdict_action never drops below enforce).
+static __always_inline int origin_finish_unparsed_v4(struct __sk_buff *skb, __u8 mode,
+                                                     __u32 src_ip, __u32 dst_ip,
+                                                     __be32 daddr_nbo, __u8 ip_proto) {
+    if (mode == ORIGIN_MODE_OBSERVE)
+        return 1;
+    if (origin_carved_v4(skb, dst_ip, daddr_nbo, ip_proto))
+        return 1;
+    __u8 zero16[16] = {};
+    origin_emit(skb, 4, ip_proto, 0, verdict_label(mode, 0), src_ip, dst_ip,
+                zero16, zero16, 0, 0);
+    return verdict_action(mode, 0);
+}
+
 static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
     struct iphdr ip_hdr;
     if (bpf_skb_load_bytes(skb, 0, &ip_hdr, sizeof(ip_hdr)) < 0)
-        return verdict_action(mode, 0);  // malformed: fail-closed, as tc_egress does
-
-    __u32 ip_hlen = (ip_hdr.ihl & 0x0F) * 4;
-    if (ip_hlen < sizeof(struct iphdr) || ip_hlen > 60)
-        return verdict_action(mode, 0);  // invalid header length: fail-closed
+        return verdict_action(mode, 0);  // nothing parsed: silent fail-closed, as at tc_egress
 
     __u32 src_ip = bpf_ntohl(ip_hdr.saddr);
     __u32 dst_ip = bpf_ntohl(ip_hdr.daddr);
     __u8 ip_proto = ip_hdr.protocol;
+
+    __u32 ip_hlen = (ip_hdr.ihl & 0x0F) * 4;
+    if (ip_hlen < sizeof(struct iphdr) || ip_hlen > 60)
+        return origin_finish_unparsed_v4(skb, mode, src_ip, dst_ip, ip_hdr.daddr, ip_proto);
 
     __u16 frag_off = bpf_ntohs(ip_hdr.frag_off);
     __u8 non_first_frag = (frag_off & 0x1FFF) != 0;
@@ -399,10 +440,10 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
     } else if (ip_proto == IPPROTO_TCP) {
         struct tcphdr tcp_hdr;
         if (bpf_skb_load_bytes(skb, ip_hlen, &tcp_hdr, sizeof(tcp_hdr)) < 0)
-            return verdict_action(mode, 0);
+            return origin_finish_unparsed_v4(skb, mode, src_ip, dst_ip, ip_hdr.daddr, ip_proto);
         __u8 tcp_flags;
         if (bpf_skb_load_bytes(skb, ip_hlen + 13, &tcp_flags, 1) < 0)
-            return verdict_action(mode, 0);
+            return origin_finish_unparsed_v4(skb, mode, src_ip, dst_ip, ip_hdr.daddr, ip_proto);
         src_port = bpf_ntohs(tcp_hdr.source);
         dst_port = bpf_ntohs(tcp_hdr.dest);
         if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
@@ -418,7 +459,7 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
     } else if (ip_proto == IPPROTO_UDP) {
         struct udphdr udp_hdr;
         if (bpf_skb_load_bytes(skb, ip_hlen, &udp_hdr, sizeof(udp_hdr)) < 0)
-            return verdict_action(mode, 0);
+            return origin_finish_unparsed_v4(skb, mode, src_ip, dst_ip, ip_hdr.daddr, ip_proto);
         src_port = bpf_ntohs(udp_hdr.source);
         dst_port = bpf_ntohs(udp_hdr.dest);
     }
@@ -427,13 +468,30 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
     __u8 verdict = ORIGIN_VERDICT_NONE;
     if (mode != ORIGIN_MODE_OBSERVE) {
         // Carve-out evaluated only when a verdict would be, so observe mode
-        // never pays for it; operand order keeps the config-map lookup
-        // confined to packets actually on the loopback device.
-        __u8 carve_out = ((dst_ip >> 24) == 127) || (ip_proto == IPPROTO_ICMP) ||
-                         (skb->ifindex == LOOPBACK_IFINDEX && origin_lo_carveout()) ||
-                         local_net_v4(ip_hdr.daddr);
+        // never pays for it.
+        __u8 carve_out = origin_carved_v4(skb, dst_ip, ip_hdr.daddr, ip_proto);
+        if (carve_out && (dst_ip >> 24) != 127 && ip_proto != IPPROTO_ICMP) {
+            // A LOCAL carve (lo device / bridge-local): TC is on neither,
+            // so a record here is unjoinable — and these destinations
+            // re-emit every 10s, going hot in the join store's
+            // second-chance rotation and evicting joinable external flows.
+            // Same cost the 127/8 literal above refuses to pay. ICMP stays
+            // out: its external denials DO join at TC.
+            emit = 0;
+        }
         if (!carve_out) {
-            allowed = verdict_allowed_v4(ip_hdr.daddr, dst_port, ip_proto);
+            if (ip_proto != IPPROTO_TCP && ip_proto != IPPROTO_UDP) {
+                // tc_egress protocol-gates before any map lookup
+                // (handle_ipv4: everything not TCP/UDP/ICMP is denied
+                // outright). ICMP is a carve-out class above, so parity
+                // here is exactly "deny non-TCP/UDP". Without this the
+                // hooks disagree on GRE/ESP/SCTP: an allowed-CIDR
+                // destination would pass here and drop at TC — and flow
+                // uncontested on any path TC does not cover.
+                allowed = 0;
+            } else {
+                allowed = verdict_allowed_v4(ip_hdr.daddr, dst_port, ip_proto);
+            }
             verdict = verdict_label(mode, allowed);
             // Surface our own denials (dedup still applies), for exactly the
             // shapes tc_egress reports for the same denial: connection
@@ -474,10 +532,40 @@ static __always_inline int is_ipv6_loopback(const __u8 ip6[16]) {
     return __builtin_memcmp(ip6, loopback, 16) == 0;
 }
 
+// origin_carved_v6 is the v6 twin of origin_carved_v4 — the complete set
+// of classes this hook never denies, shared by the verdict path and the
+// unparsed path. Multicast, ::1, and ICMPv6 are included even though the
+// main path early-returns them before any verdict: a predicate that is
+// only MOSTLY the carve-out is how the two paths drift apart.
+static __always_inline __u8 origin_carved_v6(struct __sk_buff *skb,
+                                             const __u8 dst_ip6[16], __u8 proto) {
+    return dst_ip6[0] == 0xff || is_ipv6_loopback(dst_ip6) ||
+           proto == IPPROTO_ICMPV6 ||
+           (skb->ifindex == LOOPBACK_IFINDEX && origin_lo_carveout()) ||
+           local_net_v6(dst_ip6);
+}
+
+// origin_finish_unparsed_v6 is the v6 twin of origin_finish_unparsed_v4:
+// carve-outs honored, then fail-closed WITH a record (ports 0) outside
+// them. proto is the last nexthdr the extension-header walk reached — for
+// a truncated extension chain that is the extension header's own type, so
+// an ICMPv6 payload hidden behind an unreadable chain still fails closed
+// (it is unknowable), while a truncated ICMPv6 header itself is carved.
+static __always_inline int origin_finish_unparsed_v6(struct __sk_buff *skb, __u8 mode,
+                                                     const __u8 src_ip6[16],
+                                                     const __u8 dst_ip6[16], __u8 proto) {
+    if (mode == ORIGIN_MODE_OBSERVE)
+        return 1;
+    if (origin_carved_v6(skb, dst_ip6, proto))
+        return 1;
+    origin_emit(skb, 6, proto, 0, verdict_label(mode, 0), 0, 0, src_ip6, dst_ip6, 0, 0);
+    return verdict_action(mode, 0);
+}
+
 static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
     struct ipv6hdr ip6_hdr;
     if (bpf_skb_load_bytes(skb, 0, &ip6_hdr, sizeof(ip6_hdr)) < 0)
-        return verdict_action(mode, 0);  // malformed: fail-closed
+        return verdict_action(mode, 0);  // nothing parsed: silent fail-closed, as at tc_egress
 
     __u8 src_ip6[16];
     __u8 dst_ip6[16];
@@ -503,7 +591,7 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
         if (nexthdr == IPPROTO_FRAGMENT) {
             __u8 frag_hdr[8];
             if (bpf_skb_load_bytes(skb, l4_offset, frag_hdr, sizeof(frag_hdr)) < 0)
-                return verdict_action(mode, 0);
+                return origin_finish_unparsed_v6(skb, mode, src_ip6, dst_ip6, nexthdr);
             nexthdr = frag_hdr[0];
             __u16 frag_off = ((__u16)frag_hdr[2] << 8) | frag_hdr[3];
             if ((frag_off & 0xFFF8) != 0)
@@ -512,7 +600,7 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
         } else {
             __u8 ext_hdr[2];
             if (bpf_skb_load_bytes(skb, l4_offset, ext_hdr, 2) < 0)
-                return verdict_action(mode, 0);
+                return origin_finish_unparsed_v6(skb, mode, src_ip6, dst_ip6, nexthdr);
             nexthdr = ext_hdr[0];
             l4_offset += (ext_hdr[1] + 1) * 8;
         }
@@ -533,10 +621,10 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
     } else if (nexthdr == IPPROTO_TCP) {
         struct tcphdr tcp_hdr;
         if (bpf_skb_load_bytes(skb, l4_offset, &tcp_hdr, sizeof(tcp_hdr)) < 0)
-            return verdict_action(mode, 0);
+            return origin_finish_unparsed_v6(skb, mode, src_ip6, dst_ip6, nexthdr);
         __u8 tcp_flags;
         if (bpf_skb_load_bytes(skb, l4_offset + 13, &tcp_flags, 1) < 0)
-            return verdict_action(mode, 0);
+            return origin_finish_unparsed_v6(skb, mode, src_ip6, dst_ip6, nexthdr);
         src_port = bpf_ntohs(tcp_hdr.source);
         dst_port = bpf_ntohs(tcp_hdr.dest);
         if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
@@ -549,7 +637,7 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
     } else if (nexthdr == IPPROTO_UDP) {
         struct udphdr udp_hdr;
         if (bpf_skb_load_bytes(skb, l4_offset, &udp_hdr, sizeof(udp_hdr)) < 0)
-            return verdict_action(mode, 0);
+            return origin_finish_unparsed_v6(skb, mode, src_ip6, dst_ip6, nexthdr);
         src_port = bpf_ntohs(udp_hdr.source);
         dst_port = bpf_ntohs(udp_hdr.dest);
     }
@@ -557,14 +645,21 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
     __u8 allowed = 1;
     __u8 verdict = ORIGIN_VERDICT_NONE;
     if (mode != ORIGIN_MODE_OBSERVE) {
-        // Local-only traffic that used a non-loopback v6 address (the host's
-        // own global address over lo): same carve-out class and same
-        // evaluation-order rationale as the IPv4 handler; ::1 itself
-        // returned above.
-        __u8 carve_out = ((skb->ifindex == LOOPBACK_IFINDEX) && origin_lo_carveout()) ||
-                         local_net_v6(dst_ip6);
-        if (!carve_out) {
-            allowed = verdict_allowed_v6(dst_ip6, dst_port, nexthdr);
+        // Multicast, ::1, and ICMPv6 returned above, so a hit here is one
+        // of the LOCAL classes (lo device / bridge-local) — same carve-out
+        // and evaluation-order rationale as the IPv4 handler.
+        __u8 carve_out = origin_carved_v6(skb, dst_ip6, nexthdr);
+        if (carve_out) {
+            emit = 0;  // unjoinable local-only record — see the v4 handler
+        } else {
+            if (nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP) {
+                // tc_egress protocol-gate parity — see the v4 handler.
+                // ICMPv6 already returned above, matching TC's
+                // unconditional allow.
+                allowed = 0;
+            } else {
+                allowed = verdict_allowed_v6(dst_ip6, dst_port, nexthdr);
+            }
             verdict = verdict_label(mode, allowed);
             // Same denial-surfacing policy as the IPv4 branch: silent for
             // RST / SYN-ACK replies and non-first fragments, emitted for

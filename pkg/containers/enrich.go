@@ -210,15 +210,20 @@ func (t *Tracker) LookupClient(addr net.Addr) (ordinal uint32, containerID strin
 	}
 	ip = ip.Unmap()
 
+	// Copy under the lock: handleExecStart and upgradeReconciledStart
+	// mutate effectiveOrdinal from other goroutines.
 	t.mu.Lock()
 	info := t.byIP[ip]
+	if info != nil {
+		ordinal, containerID = info.effectiveOrdinal, shortID(info.id)
+	}
 	t.mu.Unlock()
 	if info == nil {
 		t.dnsMisses.Add(1)
 		return 0, "", false
 	}
 	t.dnsHits.Add(1)
-	return info.effectiveOrdinal, shortID(info.id), true
+	return ordinal, containerID, true
 }
 
 // DecorateVerdict adds container identity to a connection outcome the

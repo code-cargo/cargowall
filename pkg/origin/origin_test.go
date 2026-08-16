@@ -17,6 +17,7 @@
 package origin
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"os"
@@ -155,6 +156,60 @@ func TestReEmitKeepsOriginalTimestampForJoins(t *testing.T) {
 	require.Len(t, got, 1)
 	require.Equal(t, uint64(100), got[0].Timestamp, "replacement keeps the first-seen timestamp")
 	require.Equal(t, VerdictWouldBlock, got[0].Verdict, "everything else refreshes")
+}
+
+// ONE REPORTER PER PACKET: an enforce-mode would-block is audit posture
+// downgrading a drop on a packet that TC still sees and reports — insert
+// must keep it as a join-store record and never queue a report. Blocks (TC
+// never sees the dropped packet) and shadow would-blocks (telemetry TC does
+// not emit) still queue.
+func TestInsertEnforceWouldBlockIsJoinFodderNotAReport(t *testing.T) {
+	o := newTestObserver()
+	o.mode.Store(uint32(ModeEnforce))
+
+	wb := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	wb.Verdict = uint8(VerdictWouldBlock)
+	o.insert(wb)
+	require.Len(t, o.verdictCh, 0, "enforce would-block must not be reported — TC reports that packet")
+	require.Len(t, o.LookupV4(0x8C527203, 443, 6, 40001), 1, "but it must still be joinable")
+
+	blk := v4Event(2, 0xAC110002, 0x8C527203, 40002, 443)
+	blk.Verdict = uint8(VerdictBlock)
+	o.insert(blk)
+	require.Len(t, o.verdictCh, 1, "an enforced drop is this hook's only event source")
+
+	o2 := newTestObserver()
+	o2.mode.Store(uint32(ModeShadow))
+	swb := v4Event(3, 0xAC110002, 0x8C527203, 40003, 443)
+	swb.Verdict = uint8(VerdictWouldBlock)
+	o2.insert(swb)
+	require.Len(t, o2.verdictCh, 1, "shadow would-blocks are telemetry TC does not emit")
+}
+
+// A busy build can evict a socket's cookie from map_sock_pid/map_sock_step
+// between emits; the 10s refresh then re-resolves to zero. The refresh must
+// not erase the identity the first emit captured — a zeroed record would
+// file the rest of the flow's TC events under the unattributed tier.
+func TestReEmitKeepsResolvedIdentityAcrossEviction(t *testing.T) {
+	o := newTestObserver()
+	o.insert(v4Event(1, 0xAC110002, 0x8C527203, 40001, 443))
+	// Seed the identity the sock maps would have resolved at first emit
+	// (the test observer runs with nil maps, so insert resolved zeros).
+	key := flowKey{port: 443, proto: 6, ipVersion: 4}
+	binary.BigEndian.PutUint32(key.dst[:4], 0x8C527203)
+	o.mu.Lock()
+	o.flows[key][0].PID = 4242
+	o.flows[key][0].StepOrdinal = 7
+	o.mu.Unlock()
+
+	refresh := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	refresh.Timestamp = 999
+	o.insert(refresh) // nil maps: re-resolves to 0/0 — the eviction shape
+
+	got := o.LookupV4(0x8C527203, 443, 6, 40001)
+	require.Len(t, got, 1)
+	require.Equal(t, uint32(4242), got[0].PID, "identity survives a zero re-resolve")
+	require.Equal(t, uint32(7), got[0].StepOrdinal)
 }
 
 func TestPerKeyCapDropsOldest(t *testing.T) {

@@ -125,6 +125,9 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 // late-allow reconciliation, notifications, and an audit record. Container
 // identity is attached as decoration; it is not the owner of the outcome,
 // because most cgroup verdicts are host processes with no container at all.
+// The sink only ever sees Blocks and shadow would-blocks: enforce-mode
+// would-blocks (audit posture) are TC's to report and never leave
+// origin.insert — one reporter per packet.
 func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificationTracker *events.NotificationTracker,
 	auditLogger *events.AuditLogger, fw events.FirewallUpdater,
 ) {
@@ -132,7 +135,6 @@ func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificat
 		return
 	}
 	enricher := a.enricher
-	targetMode := a.mode
 	a.observer.SetVerdictSink(func(rec origin.Record) {
 		events.ReportVerdict(events.VerdictRecord{
 			SrcIP:       rec.SrcIP.String(),
@@ -143,12 +145,6 @@ func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificat
 			PID:         rec.PID,
 			StepOrdinal: rec.StepOrdinal,
 			Dropped:     rec.Verdict == origin.VerdictBlock,
-			// In enforce mode the ONLY source of a would-block verdict is
-			// audit posture (verdict_label downgrades the drop) — so it must
-			// report exactly like TC's audit-posture denials (a normalized
-			// connection_blocked), not like shadow telemetry that summary
-			// and OTLP discard.
-			AuditSuppressed: targetMode == origin.ModeEnforce && rec.Verdict == origin.VerdictWouldBlock,
 			// Mid-stream comes from the BPF flag, which applies the same
 			// guard as tc_egress's EVENT_FLAG_MIDSTREAM (ACK set, no
 			// SYN/RST). Re-deriving it as "TCP and not SYN" would re-include

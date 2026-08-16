@@ -310,28 +310,31 @@ func emitOutcome(o Outcome, notificationTracker *NotificationTracker,
 	}
 }
 
-// applyDenialOutcome stamps the denial kinds both hooks share — late-
-// allowed, protocol block, blocked(+mid-stream) — onto out. The hooks
+// applyDenialOutcome stamps the denial kinds both hooks share — protocol
+// block, late-allowed, blocked(+mid-stream) — onto out. The hooks
 // pre-branch only what is genuinely theirs (TC: allowed; cgroup: shadow
 // would-block); every denial converges here so the next flag lands in one
 // switch instead of two parallel ones that drift (mid-stream nearly did).
 // protocolNum/protocolName differ by wire format — TC carries the protocol
-// number in dst_port — so the caller supplies them. lateAllowed-first is
-// equivalent to TC's historical protocol-block-first: tryLateAllow is
-// TCP/UDP-only, so the two conditions are mutually exclusive.
+// number in dst_port — so the caller supplies them. protocolBlock must be
+// checked first (TC's historical order): the two conditions are NOT
+// mutually exclusive — a denied non-first UDP fragment (SrcPort=0,
+// DstPort=0, IpProto=UDP) satisfies both the protocol-block wire shape and
+// tryLateAllow's TCP/UDP gate, and it must keep reporting as a protocol
+// block.
 func applyDenialOutcome(out *Outcome, lateAllowed bool, matchedRule string,
 	protocolBlock bool, protocolNum uint16, protocolName string, midStream bool,
 ) {
 	switch {
-	case lateAllowed:
-		out.Kind = OutcomeLateAllowed
-		out.Audit.MatchedRule = matchedRule
 	case protocolBlock:
 		out.Kind = OutcomeProtocolBlocked
 		out.SrcPort = 0
 		out.ProtocolNum = protocolNum
 		out.NotifyPort = protocolNum
 		out.Audit.Protocol = protocolName
+	case lateAllowed:
+		out.Kind = OutcomeLateAllowed
+		out.Audit.MatchedRule = matchedRule
 	default:
 		out.Kind = OutcomeBlocked
 		out.Audit.MidStream = midStream
@@ -412,17 +415,10 @@ type VerdictRecord struct {
 
 	// Dropped separates an enforced drop from a shadow-mode would-block.
 	// A would-block is telemetry: nothing was blocked, so it must never be
-	// reported as a policy outcome.
+	// reported as a policy outcome. Enforce-mode would-blocks (audit
+	// posture) never reach this sink at all — the passed-through packet is
+	// TC's to report; see origin.insert's one-reporter-per-packet rule.
 	Dropped bool
-
-	// AuditSuppressed marks a denial that enforce mode would have dropped
-	// but audit posture passed. It reports exactly like a TC denial under
-	// audit — OutcomeBlocked, which the audit logger normalizes to
-	// would_deny=true/blocked=false, with late-allow still running — so the
-	// two hooks encode one run-level posture one way. Without it these
-	// records would read as shadow would-blocks, which summary and OTLP
-	// deliberately discard.
-	AuditSuppressed bool
 
 	// MidStream marks a denial of an established flow rather than a
 	// connection attempt — the hook re-adjudicates every packet, so an
@@ -454,14 +450,13 @@ type VerdictRecord struct {
 func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTracker *NotificationTracker,
 	auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger,
 ) {
-	// A denial is a drop OR an audit-suppressed would-have-dropped: both
-	// run late-allow (matching the TC path, where audit-posture denials
-	// self-heal too). Shadow would-blocks are hypothetical and must not
-	// open the firewall — nothing was denied and TC's own verdict still
-	// governs the flow. Degraded records ride the SAME pipeline with the
-	// slow work flagged off (see prepareOutcome) rather than a parallel
-	// construction that could drift from it.
-	denial := rec.Dropped || rec.AuditSuppressed
+	// Only a real drop is a denial here. Would-blocks are hypothetical and
+	// must not open the firewall — in shadow mode TC's own verdict still
+	// governs the flow, and enforce-mode would-blocks never reach this sink
+	// (TC reports them; see origin.insert). Degraded records ride the SAME
+	// pipeline with the slow work flagged off (see prepareOutcome) rather
+	// than a parallel construction that could drift from it.
+	denial := rec.Dropped
 	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, logger,
 		denial, rec.Degraded, rec.SrcIP, rec.DstIP, rec.SrcPort, rec.DstPort, rec.Proto,
 		rec.PID, rec.StepOrdinal)

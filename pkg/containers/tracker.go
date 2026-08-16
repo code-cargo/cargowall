@@ -59,11 +59,14 @@ import (
 	"github.com/code-cargo/cargowall/pkg/origin"
 )
 
-// StepTagger is the seam to pkg/steps.Tracker: tag a container subtree, and
-// resolve which step was active at a given time. Narrow on purpose — the
-// step maps stay owned by pkg/steps.
+// StepTagger is the seam to pkg/steps.Tracker: tag a container subtree
+// (Tag overwrites the leader for start/exec; Adopt is create-only for
+// reconcile adoption, so a wrongly-swept live container keeps its real
+// ordinal), and resolve which step was active at a given time. Narrow on
+// purpose — the step maps stay owned by pkg/steps.
 type StepTagger interface {
 	TagContainerProcess(pid int, ordinal uint32)
+	AdoptContainerProcess(pid int, ordinal uint32)
 	OrdinalAt(t time.Time) uint32
 }
 
@@ -344,6 +347,26 @@ func (t *Tracker) streamOnce(ctx context.Context) (healthy bool, err error) {
 				t.mu.Lock()
 				delete(t.netDrivers, name)
 				t.mu.Unlock()
+			case "connect", "disconnect":
+				// A running container gaining or releasing an address — the
+				// only address changes that arrive without a container start.
+				// Async behind the same semaphore as exec handling: the
+				// inspect can take seconds and compose-style stacks fire
+				// these in bursts, and parking the shared stream would delay
+				// start tagging — the exact window this package exists to
+				// close. The handler re-checks container identity under the
+				// lock before indexing, so ordering vs die/destroy is safe.
+				t.wg.Add(1)
+				go func() {
+					defer t.wg.Done()
+					select {
+					case t.execSem <- struct{}{}:
+						defer func() { <-t.execSem }()
+					case <-ctx.Done():
+						return
+					}
+					t.handleNetworkAddrChange(ctx, ev)
+				}()
 			}
 			continue
 		}

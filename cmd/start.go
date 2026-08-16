@@ -437,24 +437,6 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// a load replaces the rendered config wholesale — and before
 	// UpdateAllowlistTC programs the maps.
 
-	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
-	// load-bearing under --cgroup-enforce — the docker bridge listener that
-	// daemon.json points every container at. Previously this lived in the
-	// CI-only config path, so `--container-attribution --cgroup-enforce
-	// --docker-dns-interception` without a CI preset enforced against an
-	// allowlist that never contained bridgeIP:53 and container resolution
-	// died with EPERM. Unconditional: even with DNS tracking disabled (no
-	// proxy), processes still resolve against 127.0.0.1/the upstream and
-	// those port-53 flows must survive default-deny at TC.
-	dnsIPs := []string{"127.0.0.1"}
-	if dnsUpstreamHost, _, err := net.SplitHostPort(cmd.DNSUpstream); err == nil {
-		dnsIPs = append(dnsIPs, dnsUpstreamHost)
-	}
-	if dockerBridgeIP != "" {
-		dnsIPs = append(dnsIPs, dockerBridgeIP)
-	}
-	configMgr.EnsureDNSAllowed(dnsIPs)
-
 	// Late-allow reconciliation (#83): buffer recently blocked connections so
 	// the DNS enforcement path can re-report them as late-allowed once it
 	// opens the firewall for their destination IP. Registered as an audit
@@ -597,6 +579,30 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// Userspace half of the loopback carve-out pair — after config load,
 	// before UpdateAllowlistTC programs the maps below.
 	attribution.ensureLoopbackAllowed(configMgr)
+
+	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
+	// load-bearing under --cgroup-enforce — the docker bridge listener that
+	// daemon.json points every container at. Previously this lived in the
+	// CI-only config path, so `--container-attribution --cgroup-enforce
+	// --docker-dns-interception` without a CI preset enforced against an
+	// allowlist that never contained bridgeIP:53 and container resolution
+	// died with EPERM. Unconditional: even with DNS tracking disabled (no
+	// proxy), processes still resolve against 127.0.0.1/the upstream and
+	// those port-53 flows must survive default-deny at TC.
+	//
+	// MUST run after ensureLoopbackAllowed above: LPM returns only the
+	// longest match, so a 127.0.0.1/32 port-53 entry written while no
+	// broader loopback allow exists would shadow the /8 all-ports allow and
+	// deny 127.0.0.1 on every other port. With the /8 already in place, the
+	// covered-check inside ensureAllowed skips the /32 instead.
+	dnsIPs := []string{"127.0.0.1"}
+	if dnsUpstreamHost, _, err := net.SplitHostPort(cmd.DNSUpstream); err == nil {
+		dnsIPs = append(dnsIPs, dnsUpstreamHost)
+	}
+	if dockerBridgeIP != "" {
+		dnsIPs = append(dnsIPs, dockerBridgeIP)
+	}
+	configMgr.EnsureDNSAllowed(dnsIPs)
 
 	// BPF runtime stats (3a telemetry): global kernel accounting while
 	// enabled; the per-program numbers land in one shutdown log line each.

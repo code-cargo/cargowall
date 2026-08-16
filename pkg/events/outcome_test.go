@@ -65,57 +65,6 @@ func TestReportVerdict_BlockedCarriesHostname(t *testing.T) {
 	assert.True(t, ev.Blocked)
 }
 
-// Under enforce mode plus audit posture, the BPF hook labels its denials
-// would-block (the drop was suppressed) — but they are AUDIT denials, not
-// shadow telemetry: they must report exactly like TC's audit-posture
-// denials (connection_blocked, normalized by the audit logger to
-// would_deny), run late-allow, and never be discarded by the
-// would-block filters in summary/OTLP.
-func TestReportVerdict_AuditSuppressedReportsAsNormalizedBlock(t *testing.T) {
-	cm := config.NewConfigManager()
-	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{{
-		Type:   config.RuleTypeHostname,
-		Value:  "example.com",
-		Action: config.ActionAllow,
-	}}, config.ActionDeny))
-	cm.UpdateDNSMapping("example.com", "93.184.216.34")
-
-	auditLogger, err := NewAuditLogger("", true) // audit posture
-	require.NoError(t, err)
-	sink := &recordingSink{}
-	auditLogger.AddSink(sink)
-	fw := &mockFirewallUpdater{}
-
-	rec := verdictRec(false) // hook passed the packet (audit downgraded the drop)
-	rec.AuditSuppressed = true
-	ReportVerdict(rec, cm, nil, auditLogger, fw, newTestLogger())
-
-	require.NotEmpty(t, fw.addedIPs, "audit-posture denials still self-heal via late-allow, as at TC")
-	require.Len(t, sink.events, 1)
-	ev := sink.events[0]
-	assert.Equal(t, EventConnectionLateAllowed, ev.EventType,
-		"resolvable-to-allowed destination late-allows exactly like the TC path")
-
-	// And an unresolvable denial reports as a normalized block, never as
-	// shadow would-block telemetry.
-	cm2 := config.NewConfigManager()
-	require.NoError(t, cm2.LoadConfigFromRules(nil, config.ActionDeny))
-	auditLogger2, err := NewAuditLogger("", true)
-	require.NoError(t, err)
-	sink2 := &recordingSink{}
-	auditLogger2.AddSink(sink2)
-
-	rec2 := verdictRec(false)
-	rec2.AuditSuppressed = true
-	ReportVerdict(rec2, cm2, nil, auditLogger2, nil, newTestLogger())
-
-	require.Len(t, sink2.events, 1)
-	ev2 := sink2.events[0]
-	assert.Equal(t, EventConnectionBlocked, ev2.EventType)
-	assert.True(t, ev2.WouldDeny, "audit posture normalizes to would_deny")
-	assert.False(t, ev2.Blocked, "nothing was actually dropped")
-}
-
 // A degraded report is the saturated-pipeline path: it must stay bounded —
 // no hostname resolution, no firewall writes, no notification — while the
 // audit record still lands with kind selection identical to the full path
@@ -314,3 +263,20 @@ func TestReportVerdict_ProtocolBlockMatchesTC(t *testing.T) {
 type recordingSink struct{ events []AuditEvent }
 
 func (r *recordingSink) Consume(ev AuditEvent) { r.events = append(r.events, ev) }
+
+// TC's denied non-first UDP fragment (SrcPort=0, DstPort=0, IpProto=UDP)
+// satisfies BOTH the protocol-block wire shape and tryLateAllow's TCP/UDP
+// gate — the two conditions are NOT mutually exclusive, and protocol-block
+// must win (TC's historical order). A lateAllowed-first switch silently
+// re-labeled these denials as connection_late_allowed.
+func TestApplyDenialOutcome_ProtocolBlockBeatsLateAllow(t *testing.T) {
+	var out Outcome
+	applyDenialOutcome(&out, true, "some.allow.rule", true, 17, "UDP", false)
+	assert.Equal(t, OutcomeProtocolBlocked, out.Kind)
+	assert.Empty(t, out.Audit.MatchedRule, "a protocol block never claims a late-allow rule")
+
+	var out2 Outcome
+	applyDenialOutcome(&out2, true, "some.allow.rule", false, 0, "", false)
+	assert.Equal(t, OutcomeLateAllowed, out2.Kind)
+	assert.Equal(t, "some.allow.rule", out2.Audit.MatchedRule)
+}

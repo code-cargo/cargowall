@@ -210,6 +210,10 @@ type Observer struct {
 	// minutes of queued PTR lookups while the hook is still attached and
 	// teardowns wait.
 	closing atomic.Bool
+	// mode mirrors the last successful SetMode write. Two consumers:
+	// insert's one-reporter-per-packet rule (enforce-mode would-blocks are
+	// TC's to report, not this hook's) and Close's lower-to-observe guard.
+	mode atomic.Uint32
 
 	mu    sync.Mutex
 	flows map[flowKey][]Record
@@ -335,6 +339,20 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 // are abandoned (counted separately — TC dual-sourced them while running,
 // and at shutdown there is nothing left to compare against).
 func (o *Observer) Close() {
+	// Lower the hook to observe FIRST: from here until link.Close the
+	// reporting pipeline is being torn down and can no longer produce audit
+	// records, while TC — whose teardown registered later in the defer
+	// stack — has already detached. An enforce-mode drop in that window
+	// would be invisible; a brief fail-open at shutdown beats unrecorded
+	// drops. The map write bypasses SetMode deliberately: o.mode must keep
+	// naming the posture the run operated under, because the backlog triage
+	// below (reportLoop → divertOverflow) still consults it to keep
+	// enforce-mode would-blocks on the must-audit lane.
+	if Mode(o.mode.Load()) != ModeObserve {
+		if err := o.objs.MapOriginConfig.Put(cfgKeyMode, uint8(ModeObserve)); err != nil {
+			o.logger.Warn("Failed to lower origin hook to observe at close", "error", err)
+		}
+	}
 	if o.reader != nil {
 		_ = o.reader.Close()
 		<-o.done // run() exits promptly on ringbuf.ErrClosed
@@ -396,6 +414,7 @@ func (o *Observer) SetMode(mode Mode) error {
 	if err := o.objs.MapOriginConfig.Put(cfgKeyMode, uint8(mode)); err != nil {
 		return fmt.Errorf("failed to set origin mode %d: %w", mode, err)
 	}
+	o.mode.Store(uint32(mode))
 	o.logger.Info("Container egress hook mode set", "mode", mode.String())
 	return nil
 }
@@ -555,6 +574,17 @@ func (o *Observer) insert(ev *bpf.OriginEvent) {
 			if e.Timestamp < rec.Timestamp {
 				rec.Timestamp = e.Timestamp
 			}
+			// Identity survives like the timestamp: a busy build can evict
+			// the cookie from map_sock_pid/map_sock_step between emits, so a
+			// refresh re-resolving to zero must not erase the PID/step the
+			// first emit captured — that would file the rest of the flow's TC
+			// events under the unattributed tier.
+			if rec.PID == 0 {
+				rec.PID = e.PID
+			}
+			if rec.StepOrdinal == 0 {
+				rec.StepOrdinal = e.StepOrdinal
+			}
 			entries = append(entries[:i], entries[i+1:]...)
 			break
 		}
@@ -605,10 +635,21 @@ func (o *Observer) insert(ev *bpf.OriginEvent) {
 	// comment. Non-blocking on BOTH lanes: nothing here may stall the
 	// reader, whose backlog is a 128KB kernel ring. Overflow of the main
 	// queue diverts Blocks — the sole event source for what this hook
-	// dropped — to the bounded must-audit lane; would-blocks are dropped
-	// and counted (TC dual-sources them).
+	// dropped — to the bounded must-audit lane; shadow would-blocks are
+	// dropped and counted (TC dual-sources them).
 	if rec.Verdict == VerdictWouldBlock || rec.Verdict == VerdictBlock {
 		o.blocked.Add(1)
+		// ONE REPORTER PER PACKET. An enforce-mode would-block is audit
+		// posture downgrading a drop (verdict_label): the packet is PASSED
+		// and reaches TC, which adjudicates it and emits the canonical
+		// connection_blocked — with this record joined for container
+		// identity. Reporting it here too would double every denial under
+		// enforce+audit. Blocks stay this hook's to report (the packet dies
+		// at ip_finish_output; TC never sees it), and shadow would-blocks
+		// are shadow telemetry TC does not emit.
+		if rec.Verdict == VerdictWouldBlock && Mode(o.mode.Load()) == ModeEnforce {
+			return
+		}
 		select {
 		case o.verdictCh <- rec:
 		default:

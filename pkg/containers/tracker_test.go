@@ -64,6 +64,13 @@ func (f *fakeTagger) TagContainerProcess(pid int, ordinal uint32) {
 	f.calls = append(f.calls, tagCall{pid: pid, ordinal: ordinal})
 }
 
+// AdoptContainerProcess records like TagContainerProcess — the fake asserts
+// which pid/ordinal was written, not the map-update flag semantics (those
+// live in pkg/steps).
+func (f *fakeTagger) AdoptContainerProcess(pid int, ordinal uint32) {
+	f.TagContainerProcess(pid, ordinal)
+}
+
 func (f *fakeTagger) OrdinalAt(time.Time) uint32 {
 	f.mu.Lock()
 	defer f.mu.Unlock()

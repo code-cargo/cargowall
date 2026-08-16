@@ -254,3 +254,77 @@ func TestRecentBlocks_MidStreamBlockIsReconcilable(t *testing.T) {
 	require.Len(t, taken, 1)
 	assert.Equal(t, uint16(443), taken[0].DstPort)
 }
+
+// Two ORIGINS contesting one destination tuple must degrade, not
+// last-writer-win: the single late-allow re-report would otherwise state
+// the last writer's identity as fact for every attempt — the coin-flip
+// attribution resolveJoin's disagreement policy exists to prevent, on a
+// different path. The model matches joinAmbiguousContainers: two
+// containers keep ContainerOrigin (SOME container did this) with the id
+// blanked; a container/host mix drops the claim entirely. When adding an
+// identity field to RecentBlock, give it the same treatment in
+// degradeDisagreement.
+func TestRecentBlocks_ContestedDestinationDegradesIdentity(t *testing.T) {
+	now := time.Now()
+
+	// Two containers: origin survives, id does not.
+	rb := NewRecentBlocks(0)
+	a := blockedAuditEvent("20.0.0.1", 443, "TCP", now.Add(-2*time.Second))
+	a.ContainerID, a.ContainerOrigin, a.StepOrdinal = "aaa111", true, 3
+	b := blockedAuditEvent("20.0.0.1", 443, "TCP", now.Add(-1*time.Second))
+	b.ContainerID, b.ContainerOrigin, b.StepOrdinal = "bbb222", true, 5
+	b.SrcIP, b.PID = "10.0.0.2", 43
+	rb.Consume(a)
+	rb.Consume(b)
+	taken := rb.TakeMatching("20.0.0.1", nil, nil, false)
+	require.Len(t, taken, 1)
+	assert.Empty(t, taken[0].ContainerID, "naming either container would be a coin flip")
+	assert.True(t, taken[0].ContainerOrigin, "both attempts were containers; the tier claim stands")
+	assert.Zero(t, taken[0].StepOrdinal)
+	assert.Zero(t, taken[0].PID)
+	assert.Empty(t, taken[0].SrcIP)
+
+	// Container vs host: even the origin claim goes.
+	rb2 := NewRecentBlocks(0)
+	c := blockedAuditEvent("20.0.0.2", 443, "TCP", now.Add(-2*time.Second))
+	c.ContainerID, c.ContainerOrigin = "ccc333", true
+	h := blockedAuditEvent("20.0.0.2", 443, "TCP", now.Add(-1*time.Second))
+	rb2.Consume(c)
+	rb2.Consume(h)
+	taken = rb2.TakeMatching("20.0.0.2", nil, nil, false)
+	require.Len(t, taken, 1)
+	assert.False(t, taken[0].ContainerOrigin)
+	assert.Empty(t, taken[0].ContainerID)
+
+	// Same origin retrying: identity is intact — degradation is only for
+	// genuine disagreement.
+	rb3 := NewRecentBlocks(0)
+	r1 := blockedAuditEvent("20.0.0.3", 443, "TCP", now.Add(-2*time.Second))
+	r1.ContainerID, r1.ContainerOrigin = "ddd444", true
+	r2 := blockedAuditEvent("20.0.0.3", 443, "TCP", now.Add(-1*time.Second))
+	r2.ContainerID, r2.ContainerOrigin = "ddd444", true
+	rb3.Consume(r1)
+	rb3.Consume(r2)
+	taken = rb3.TakeMatching("20.0.0.3", nil, nil, false)
+	require.Len(t, taken, 1)
+	assert.Equal(t, "ddd444", taken[0].ContainerID)
+	assert.True(t, taken[0].ContainerOrigin)
+}
+
+// The supersede window must cover every recorded retry even when events
+// arrive out of timestamp order: an older contested attempt landing second
+// must not shrink At.
+func TestRecentBlocks_ContestedKeepsNewestTimestamp(t *testing.T) {
+	rb := NewRecentBlocks(0)
+	now := time.Now()
+	newer := blockedAuditEvent("20.0.0.1", 443, "TCP", now.Add(-1*time.Second))
+	newer.ContainerID, newer.ContainerOrigin = "aaa111", true
+	older := blockedAuditEvent("20.0.0.1", 443, "TCP", now.Add(-5*time.Second))
+	older.ContainerID, older.ContainerOrigin = "bbb222", true
+	rb.Consume(newer)
+	rb.Consume(older) // out of order
+
+	taken := rb.TakeMatching("20.0.0.1", nil, nil, false)
+	require.Len(t, taken, 1)
+	assert.True(t, taken[0].At.Equal(newer.Timestamp), "At is max(prev, next), not last-writer")
+}

@@ -339,6 +339,21 @@ func (t *Tracker) TagContainerProcess(pid int, ordinal uint32) {
 	}
 }
 
+// AdoptContainerProcess tags a container subtree like TagContainerProcess
+// but create-only for the leader too. It is the reconcile-adoption write:
+// adoption cannot distinguish "genuinely predates cargowall" from "live
+// container wrongly swept after a partial daemon list and re-adopted", so
+// an existing leader tag — the real ordinal from the container's original
+// start — must survive and only truly untagged tasks take the caller's
+// (sentinel) ordinal. The overwrite rationale above does not apply here:
+// adoption is not an exec re-tag, and a recycled-tid stale entry is the
+// rarer wrong to optimize for than demoting a live container.
+func (t *Tracker) AdoptContainerProcess(pid int, ordinal uint32) {
+	for _, p := range subtreePids(pid, buildChildrenMap()) {
+		t.tagTasks(p, ordinal, ebpf.UpdateNoExist)
+	}
+}
+
 // boundary records one step_child_event as observed by run(), stamped with
 // wall-clock receive time so external event streams that carry their own
 // timestamps (Docker's timeNano) can be resolved against the step that was

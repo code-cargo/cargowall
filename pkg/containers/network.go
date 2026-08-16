@@ -112,7 +112,9 @@ func collectSubnets(insp containerInspect) []localSubnet {
 // refusal (origin.ErrLocalNetworkRefused, logged at the write) is a
 // DECISION and stamps seen; any transient failure — driver inspect, host
 // interface enumeration, map write — leaves the subnet unstamped so the
-// network's next container retries.
+// network's next container retries. A non-bridge resolution is also NOT
+// stamped: it is a decision about the network, not the prefix, and lives
+// in the driver cache (see the comment at the gate below).
 func (t *Tracker) carvePrefix(ctx context.Context, networkName string, prefix netip.Prefix) {
 	if t.opts.AllowLocalSubnet == nil {
 		return
@@ -146,13 +148,20 @@ func (t *Tracker) carvePrefix(ctx context.Context, networkName string, prefix ne
 		t.mu.Lock()
 		t.netDrivers[name] = isBridge
 		t.mu.Unlock()
+		if !isBridge {
+			t.logger.Info("Non-bridge network subnet stays adjudicated (not local-only)",
+				"network", name, "subnet", key)
+		}
 	}
 	if !isBridge {
-		t.mu.Lock()
-		t.seenSubnets[key] = true
-		t.mu.Unlock()
-		t.logger.Info("Non-bridge network subnet stays adjudicated (not local-only)",
-			"network", name, "subnet", key)
+		// Deliberately NOT stamped into seenSubnets: that map records
+		// allow-path decisions for a PREFIX, but non-bridge is a property of
+		// this NETWORK. The same subnet can legitimately reappear on a later
+		// bridge network (docker releases the pool at destroy — e.g. a
+		// compose stack whose driver is edited between down and up) and must
+		// re-evaluate then. The driver cache keeps the repeat cost at a map
+		// hit, and its destroy-eviction / reconcile-clear is the recovery
+		// point a prefix-keyed stamp would not have.
 		return
 	}
 
@@ -195,9 +204,17 @@ func (t *Tracker) handleNetworkCreate(ctx context.Context, ev dockerEvent) {
 	}
 	// Prime the driver cache so carvePrefix below (and later per-container
 	// discovery) never re-inspects this network.
+	isBridge := nw.Driver == "bridge"
 	t.mu.Lock()
-	t.netDrivers[name] = nw.Driver == "bridge"
+	t.netDrivers[name] = isBridge
 	t.mu.Unlock()
+	if !isBridge {
+		// carvePrefix would refuse each subnet silently (the cache is
+		// already primed); say it once here instead.
+		t.logger.Info("Non-bridge network created; its subnets stay adjudicated (not local-only)",
+			"network", name, "driver", nw.Driver)
+		return
+	}
 	for _, cfg := range nw.IPAM.Config {
 		prefix, perr := netip.ParsePrefix(cfg.Subnet)
 		if perr != nil {
@@ -205,6 +222,94 @@ func (t *Tracker) handleNetworkCreate(ctx context.Context, ev dockerEvent) {
 		}
 		t.carvePrefix(ctx, name, prefix)
 	}
+}
+
+// handleNetworkAddrChange refreshes a tracked container's address index
+// after a `network connect`/`disconnect` on a running container — the only
+// address-changing events that arrive without a container start. Without
+// it a gained address never attributes (DNS queries from it stay
+// unattributed until the next PID-changing reconcile, i.e. typically
+// forever), and a released address keeps mapping to its old holder until
+// docker IPAM hands it to a new container — whose traffic would then be
+// stamped with the WRONG identity. Connect also feeds the subnet
+// carve-out: the container may be the first onto a bridge network
+// cargowall has not yet carved.
+func (t *Tracker) handleNetworkAddrChange(ctx context.Context, ev dockerEvent) {
+	containerID := ev.Actor.Attributes["container"]
+	if containerID == "" {
+		return
+	}
+	t.mu.Lock()
+	info := t.containers[containerID]
+	t.mu.Unlock()
+	if info == nil {
+		// Untracked: start/reconcile own first registration (docker fires a
+		// connect for the default network before "start" — that one is this
+		// no-op), and a death-racing disconnect is remove()'s job.
+		return
+	}
+
+	ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
+	insp, err := t.client.inspectContainer(ictx, containerID)
+	cancel()
+	if err != nil {
+		t.logger.Debug("Container inspect failed after network change",
+			"container", shortID(containerID), "error", err)
+		return
+	}
+
+	if t.opts.AllowLocalSubnet != nil && ev.Action == "connect" {
+		for _, s := range collectSubnets(insp) {
+			t.carvePrefix(ctx, s.network, s.prefix)
+		}
+	}
+
+	var ips []netip.Addr
+	for _, ipStr := range collectIPs(insp) {
+		if ip, perr := netip.ParseAddr(ipStr); perr == nil {
+			ips = append(ips, ip)
+		}
+	}
+	if len(ips) == 0 && ev.Action == "connect" {
+		// A connect cannot leave the container with FEWER addresses: an
+		// empty set here is a racy or incomplete inspect (teardown
+		// mid-flight), not truth — adopting it would drop addresses the
+		// container still holds. Disconnect is different: empty is a
+		// legitimate final state there, and clearing is load-bearing (a
+		// stale mapping misattributes the address's next holder).
+		t.logger.Debug("Ignoring empty inspect after network connect",
+			"container", shortID(containerID))
+		return
+	}
+
+	t.mu.Lock()
+	if t.containers[containerID] != info {
+		// Removed (die/destroy) or re-adopted while the inspect ran: this
+		// handler runs async, and indexing a dead info would resurrect
+		// entries remove() just cleaned.
+		t.mu.Unlock()
+		return
+	}
+	// Drop index entries this container no longer holds, then (re)index the
+	// current set — newest inspect wins a conflicted address, matching
+	// handleStart's semantics.
+	held := make(map[netip.Addr]bool, len(ips))
+	for _, ip := range ips {
+		held[ip] = true
+	}
+	for _, ip := range info.ips {
+		if !held[ip] && t.byIP[ip] == info {
+			delete(t.byIP, ip)
+		}
+	}
+	info.ips = ips
+	for _, ip := range ips {
+		t.byIP[ip] = info
+	}
+	t.mu.Unlock()
+
+	t.logger.Info("Container addresses refreshed after network change",
+		"container", shortID(containerID), "action", ev.Action, "addrs", len(ips))
 }
 
 // DiscoverBridgeSubnets returns every bridge-driver network's IPAM

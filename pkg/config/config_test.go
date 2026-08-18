@@ -965,6 +965,148 @@ func TestEnsureInfraAllowed_ICMP(t *testing.T) {
 	}
 }
 
+// The loopback pair ("127.0.0.0/8", "::1/128") arrives as CIDR prefixes, one
+// of them IPv6. Both shapes must land in the rendered config AND the
+// resolved rules — this is the userspace half of the cgroup hook's loopback
+// carve-out (#106 phase 3b), and it used to vanish silently because
+// ensureAllowed only understood bare IPv4 addresses.
+func TestEnsureInfraAllowed_CIDRAndIPv6(t *testing.T) {
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules(nil, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	cm.EnsureInfraAllowed([]string{"127.0.0.0/8", "::1/128"}, nil, AutoAddedTypeLoopback)
+
+	if len(cm.config.Rules) != 2 {
+		t.Fatalf("expected 2 rules, got %d: %+v", len(cm.config.Rules), cm.config.Rules)
+	}
+	if cm.config.Rules[0].Value != "127.0.0.0/8" {
+		t.Errorf("rule[0].Value = %q, want 127.0.0.0/8", cm.config.Rules[0].Value)
+	}
+	if cm.config.Rules[1].Value != "::1/128" {
+		t.Errorf("rule[1].Value = %q, want ::1/128", cm.config.Rules[1].Value)
+	}
+	for i, rr := range cm.resolvedRules {
+		if rr.IPNet == nil {
+			t.Errorf("resolvedRules[%d].IPNet is nil; the rule cannot be programmed into BPF", i)
+		}
+		if rr.AutoAddedType != AutoAddedTypeLoopback {
+			t.Errorf("resolvedRules[%d].AutoAddedType = %q, want %q", i, rr.AutoAddedType, AutoAddedTypeLoopback)
+		}
+	}
+	if len(cm.resolvedRules) != 2 {
+		t.Fatalf("expected 2 resolved rules, got %d", len(cm.resolvedRules))
+	}
+	ones, bits := cm.resolvedRules[1].IPNet.Mask.Size()
+	if ones != 128 || bits != 128 {
+		t.Errorf("v6 mask = /%d (%d bits), want /128 (128 bits)", ones, bits)
+	}
+
+	// Idempotent: a second call must not duplicate either rule.
+	cm.EnsureInfraAllowed([]string{"127.0.0.0/8", "::1/128"}, nil, AutoAddedTypeLoopback)
+	if len(cm.config.Rules) != 2 {
+		t.Errorf("second call duplicated rules: got %d", len(cm.config.Rules))
+	}
+
+	// An unparseable entry warns and is skipped, never appended half-formed.
+	cm.EnsureInfraAllowed([]string{"not-an-address"}, nil, AutoAddedTypeLoopback)
+	if len(cm.config.Rules) != 2 {
+		t.Errorf("unparseable entry changed the rule set: got %d", len(cm.config.Rules))
+	}
+}
+
+// The deny-veto contract for infra auto-allows: an operator's explicit deny
+// covering the requested network (and ports) suppresses the auto-allow with
+// an honest log, never a second LPM entry that would flip the verdict.
+func TestEnsureAllowed_DenyRuleVetoesAutoAllow(t *testing.T) {
+	tests := []struct {
+		name     string
+		denyRule Rule
+		reqCIDR  string
+		reqPorts []Port
+		suppress bool
+	}{
+		{
+			"all-ports deny vs all-ports auto-allow",
+			Rule{Type: RuleTypeCIDR, Value: "127.0.0.0/8", Action: ActionDeny},
+			"127.0.0.0/8", nil, true,
+		},
+		{
+			"port-limited deny :53 vs DNS auto-allow :53",
+			Rule{Type: RuleTypeCIDR, Value: "10.0.0.0/8", Action: ActionDeny, Ports: []Port{{Port: 53, Protocol: ProtocolUDP}}},
+			"10.1.2.3",
+			[]Port{{Port: 53, Protocol: ProtocolUDP}},
+			true,
+		},
+		{
+			"port-limited deny :53 must NOT veto an all-ports allow",
+			Rule{Type: RuleTypeCIDR, Value: "127.0.0.0/8", Action: ActionDeny, Ports: []Port{{Port: 53, Protocol: ProtocolUDP}}},
+			"127.0.0.0/8", nil, false,
+		},
+		{
+			"deny on a different protocol must NOT veto",
+			Rule{Type: RuleTypeCIDR, Value: "10.0.0.0/8", Action: ActionDeny, Ports: []Port{{Port: 53, Protocol: ProtocolTCP}}},
+			"10.1.2.3",
+			[]Port{{Port: 53, Protocol: ProtocolUDP}},
+			false,
+		},
+		{
+			"narrower deny must NOT veto a broader request",
+			Rule{Type: RuleTypeCIDR, Value: "127.0.0.0/24", Action: ActionDeny},
+			"127.0.0.0/8", nil, false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := NewConfigManager()
+			if err := cm.LoadConfigFromRules([]Rule{tt.denyRule}, ActionDeny); err != nil {
+				t.Fatalf("LoadConfigFromRules() error = %v", err)
+			}
+			before := len(cm.config.Rules)
+			cm.EnsureInfraAllowed([]string{tt.reqCIDR}, tt.reqPorts, AutoAddedTypeLoopback)
+			added := len(cm.config.Rules) - before
+			if tt.suppress && added != 0 {
+				t.Fatalf("deny should have vetoed the auto-allow; %d rules added", added)
+			}
+			if !tt.suppress && added == 0 {
+				t.Fatalf("auto-allow should have been appended despite the non-covering deny")
+			}
+		})
+	}
+}
+
+// A narrower existing rule that happens to contain the prefix's BASE address
+// must not suppress the broader prefix: with a user rule for 127.0.0.0/32,
+// skipping the /8 would leave 127.1.0.0–127.255.255.255 out of the rendered
+// policy entirely.
+func TestEnsureAllowed_NarrowRuleDoesNotSuppressBroaderPrefix(t *testing.T) {
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeCIDR, Value: "127.0.0.0/32", Action: ActionAllow},
+	}, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	cm.EnsureInfraAllowed([]string{"127.0.0.0/8"}, nil, AutoAddedTypeLoopback)
+	var found bool
+	for _, r := range cm.config.Rules {
+		if r.Value == "127.0.0.0/8" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("broader /8 was suppressed by the narrower /32: %+v", cm.config.Rules)
+	}
+
+	// And now that the /8 itself exists, a repeat call is deduplicated.
+	before := len(cm.config.Rules)
+	cm.EnsureInfraAllowed([]string{"127.0.0.0/8"}, nil, AutoAddedTypeLoopback)
+	if len(cm.config.Rules) != before {
+		t.Errorf("equal-prefix rule was not deduplicated: %d -> %d", before, len(cm.config.Rules))
+	}
+}
+
 func TestLoadConfigFromCargoWall_ICMPRule(t *testing.T) {
 	cm := NewConfigManager()
 
@@ -4045,27 +4187,32 @@ func TestResolveRules_InvalidPatternSilentlyDropped(t *testing.T) {
 	}
 }
 
-// ensureAllowed (used by EnsureDNSAllowed / EnsureInfraAllowed) silently
-// skips empty strings, malformed IPs, and IPv6 addresses. Pin this so
-// auto-allow callers don't have to defend against bad input themselves.
+// ensureAllowed (used by EnsureDNSAllowed / EnsureInfraAllowed) skips empty
+// strings and malformed values (with a warning) but accepts IPv6 — the v6
+// rule maps exist and the loopback carve-out depends on ::1/128 landing.
+// Pin this so auto-allow callers don't have to defend against bad input
+// themselves.
 func TestEnsureAllowed_SkipsInvalidIPs(t *testing.T) {
 	cm := NewConfigManager()
 	if err := cm.LoadConfigFromRules(nil, ActionDeny); err != nil {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
 	}
-	// Mix of one valid + three skipped.
+	// Two valid (one of them IPv6) + two skipped.
 	cm.EnsureDNSAllowed([]string{
 		"",
 		"not-an-ip",
-		"2001:db8::1", // IPv6 — silently skipped (BPF maps are IPv4)
+		"2001:db8::1",
 		"8.8.8.8",
 	})
 	rules := cm.GetResolvedRules()
-	if len(rules) != 1 {
-		t.Fatalf("expected 1 rule (only 8.8.8.8 valid), got %d: %+v", len(rules), rules)
+	if len(rules) != 2 {
+		t.Fatalf("expected 2 rules (v6 + v4), got %d: %+v", len(rules), rules)
 	}
-	if rules[0].Value != "8.8.8.8/32" {
-		t.Errorf("rule value = %q, want %q", rules[0].Value, "8.8.8.8/32")
+	if rules[0].Value != "2001:db8::1/128" {
+		t.Errorf("rule[0] value = %q, want %q", rules[0].Value, "2001:db8::1/128")
+	}
+	if rules[1].Value != "8.8.8.8/32" {
+		t.Errorf("rule[1] value = %q, want %q", rules[1].Value, "8.8.8.8/32")
 	}
 }
 

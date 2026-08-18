@@ -50,7 +50,18 @@ type RecentBlock struct {
 	Process     string
 	PID         uint32
 	StepOrdinal uint32
-	At          time.Time
+	// Container identity and the CNAME chain travel with the block: a
+	// reconciled late-allow is a re-report of THIS attempt, and any identity
+	// field dropped here is silently demoted in that re-report (container →
+	// unknown tier in the summary, no cargowall.container_id in OTLP, no
+	// CNAME drill-down). When adding a field to AuditEvent that a blocked
+	// event carries, mirror it here and in Consume/reconcileRecentBlocks —
+	// this struct is deliberately a subset, not the whole event, because the
+	// reconcile re-derives destination fields from the NEW resolution.
+	ContainerID     string
+	ContainerOrigin bool
+	CNAMEChain      []string
+	At              time.Time
 }
 
 type recentBlockKey struct {
@@ -89,10 +100,12 @@ func NewRecentBlocks(ttl time.Duration) *RecentBlocks {
 	}
 }
 
-// Consume records connection_blocked TCP/UDP events, keeping the latest
-// attempt per (dst_ip, dst_port, protocol). Other event types — and protocols
-// whose retries can't benefit from a late allow — are ignored, mirroring the
-// restriction on the in-band late-allow path.
+// Consume records connection_blocked TCP/UDP events, keeping one entry per
+// (dst_ip, dst_port, protocol): the latest attempt's timestamp, with
+// identity fields degraded when live attempts from different origins
+// disagree (see degradeDisagreement). Other event types — and protocols
+// whose retries can't benefit from a late allow — are ignored, mirroring
+// the restriction on the in-band late-allow path.
 func (rb *RecentBlocks) Consume(event AuditEvent) {
 	if event.EventType != EventConnectionBlocked || event.DstIP == "" {
 		return
@@ -123,16 +136,63 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 		byKey = make(map[recentBlockKey]RecentBlock)
 		rb.byIP[event.DstIP] = byKey
 	}
-	byKey[key] = RecentBlock{
-		SrcIP:       event.SrcIP,
-		DstIP:       event.DstIP,
-		DstPort:     event.DstPort,
-		Protocol:    event.Protocol,
-		Process:     event.Process,
-		PID:         event.PID,
-		StepOrdinal: event.StepOrdinal,
-		At:          event.Timestamp,
+	next := RecentBlock{
+		SrcIP:           event.SrcIP,
+		DstIP:           event.DstIP,
+		DstPort:         event.DstPort,
+		Protocol:        event.Protocol,
+		Process:         event.Process,
+		PID:             event.PID,
+		StepOrdinal:     event.StepOrdinal,
+		ContainerID:     event.ContainerID,
+		ContainerOrigin: event.ContainerOrigin,
+		CNAMEChain:      event.CNAMEChain,
+		At:              event.Timestamp,
 	}
+	// The key is destination-only, so two sources (containers A and B, or a
+	// container and a host process) blocked on the same tuple collapse into
+	// one entry. Last-writer-wins would let the single late-allow re-report
+	// state the last writer's identity as fact for every attempt — the
+	// coin-flip attribution resolveJoin's disagreement policy exists to
+	// prevent, on a different path. Keep the newest timestamp (the supersede
+	// window must cover every retry) but degrade each identity field the
+	// live entries disagree on; once contested, the entry stays degraded
+	// until taken or expired.
+	if prev, exists := byKey[key]; exists && !prev.At.Before(time.Now().Add(-rb.ttl)) {
+		next = degradeDisagreement(prev, next)
+	}
+	byKey[key] = next
+}
+
+// degradeDisagreement folds a new blocked attempt into a live entry for the
+// same destination tuple, blanking every identity field the two attempts
+// disagree on. The zero values land in the re-report as "unattributed" —
+// the honest claim when the attempt cannot be pinned to one origin. At is
+// the max of the two: the late-allow supersede window must cover every
+// recorded retry, and events can arrive out of timestamp order.
+func degradeDisagreement(prev, next RecentBlock) RecentBlock {
+	if next.At.Before(prev.At) {
+		next.At = prev.At
+	}
+	if prev.SrcIP != next.SrcIP {
+		next.SrcIP = ""
+	}
+	if prev.Process != next.Process {
+		next.Process = ""
+	}
+	if prev.PID != next.PID {
+		next.PID = 0
+	}
+	if prev.StepOrdinal != next.StepOrdinal {
+		next.StepOrdinal = 0
+	}
+	if prev.ContainerID != next.ContainerID {
+		next.ContainerID = ""
+	}
+	if prev.ContainerOrigin != next.ContainerOrigin {
+		next.ContainerOrigin = false
+	}
+	return next
 }
 
 // TakeMatching removes and returns unexpired blocks to dstIP whose port and

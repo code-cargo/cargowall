@@ -240,6 +240,38 @@ func TestLogRecordFromEvent_StepOrdinal(t *testing.T) {
 	assert.Nil(t, attrs["cargowall.step_scope"])
 }
 
+// Container attribution fields ride per-connection events (issue #106): the
+// enricher stamps them onto blocked/allowed records, and dashboards group by
+// cargowall.container_id / filter on cargowall.container_origin.
+func TestLogRecordFromEvent_ContainerAttributes(t *testing.T) {
+	base := events.AuditEvent{
+		Timestamp: time.Now(),
+		EventType: events.EventConnectionBlocked,
+		DstIP:     "1.2.3.4",
+		Protocol:  "TCP",
+		Blocked:   true,
+	}
+
+	base.ContainerID = "abc123def456"
+	base.ContainerOrigin = true
+	attrs := attrMap(t, logRecordFromEvent(base).Attributes)
+	assert.Equal(t, "abc123def456", attrs["cargowall.container_id"].GetStringValue())
+	assert.True(t, attrs["cargowall.container_origin"].GetBoolValue())
+
+	// The two fields are independent: origin can be known while the id is
+	// not (e.g. the origin record matched but the container was gone).
+	base.ContainerID = ""
+	attrs = attrMap(t, logRecordFromEvent(base).Attributes)
+	assert.NotContains(t, attrs, "cargowall.container_id")
+	assert.True(t, attrs["cargowall.container_origin"].GetBoolValue())
+
+	// Zero values emit nothing, mirroring the audit JSON's omitempty shape.
+	base.ContainerOrigin = false
+	attrs = attrMap(t, logRecordFromEvent(base).Attributes)
+	assert.NotContains(t, attrs, "cargowall.container_id")
+	assert.NotContains(t, attrs, "cargowall.container_origin")
+}
+
 func TestBuildResource(t *testing.T) {
 	res := buildResource(Config{
 		ServiceName:   "cargowall",

@@ -1,0 +1,444 @@
+//   Copyright 2026 BoxBuild Inc DBA CodeCargo
+//
+//   Licensed under the Apache License, Version 2.0 (the "License");
+//   you may not use this file except in compliance with the License.
+//   You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+//   Unless required by applicable law or agreed to in writing, software
+//   distributed under the License is distributed on an "AS IS" BASIS,
+//   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//   See the License for the specific language governing permissions and
+//   limitations under the License.
+
+//go:build linux
+
+package origin
+
+import (
+	"encoding/binary"
+	"fmt"
+	"log/slog"
+	"os"
+	"regexp"
+	"strconv"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/code-cargo/cargowall/bpf"
+)
+
+// newTestObserver builds an Observer with the join store and the verdict
+// queue live — nil pid/step maps exercise the guard insert uses when
+// resolution is unavailable (records stay usable, identities zero). The
+// reporting worker is NOT started; tests that need it run reportLoop
+// themselves.
+func newTestObserver() *Observer {
+	return &Observer{
+		flows:        make(map[flowKey][]Record),
+		hot:          make(map[flowKey]struct{}),
+		verdictCh:    make(chan Record, verdictQueueDepth),
+		reportDone:   make(chan struct{}),
+		degradedCh:   make(chan Record, degradedQueueDepth),
+		degradedDone: make(chan struct{}),
+		logger:       slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+}
+
+func v4Event(cookie uint64, srcIP, dstIP uint32, srcPort, dstPort uint16) *bpf.OriginEvent {
+	return &bpf.OriginEvent{
+		Cookie:    cookie,
+		CgroupID:  100 + cookie,
+		Timestamp: cookie, // monotonic enough for ordering assertions
+		SrcIp:     srcIP,
+		DstIp:     dstIP,
+		SrcPort:   srcPort,
+		DstPort:   dstPort,
+		IpVersion: 4,
+		IpProto:   6,
+		Flags:     bpf.OriginFlagTCPSyn,
+	}
+}
+
+func TestLookupExactSourcePortIsAuthoritative(t *testing.T) {
+	o := newTestObserver()
+	o.insert(v4Event(1, 0xAC110002, 0x8C527203, 40001, 443))
+	o.insert(v4Event(2, 0xAC110003, 0x8C527203, 40002, 443))
+
+	got := o.LookupV4(0x8C527203, 443, 6, 40001)
+	require.Len(t, got, 1)
+	require.Equal(t, uint64(1), got[0].Cookie)
+	require.Equal(t, "172.17.0.2", got[0].SrcIP.String())
+	require.True(t, got[0].TCPSyn)
+}
+
+// Two netns can draw the same ephemeral source port to one destination —
+// the collision the MASQUERADE assumption names. The exact-port pass must
+// then return BOTH records so resolveJoin can degrade the disagreement,
+// never silently pick the newest as fact.
+func TestLookupExactSourcePortCollisionReturnsAllMatches(t *testing.T) {
+	o := newTestObserver()
+	o.insert(v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)) // container A
+	o.insert(v4Event(2, 0xAC110003, 0x8C527203, 40001, 443)) // container B, same src port
+
+	got := o.LookupV4(0x8C527203, 443, 6, 40001)
+	require.Len(t, got, 2, "a collided source port is the caller's ambiguity, not a coin flip")
+}
+
+func TestLookupFallbackReturnsAllCandidatesNewestFirst(t *testing.T) {
+	o := newTestObserver()
+	o.insert(v4Event(1, 0xAC110002, 0x8C527203, 40001, 443))
+	o.insert(v4Event(2, 0xAC110003, 0x8C527203, 40002, 443))
+
+	// A rewritten source port misses the exact pass and returns everything,
+	// newest first, so the caller can decide whether the candidates agree.
+	got := o.LookupV4(0x8C527203, 443, 6, 55555)
+	require.Len(t, got, 2)
+	require.Equal(t, uint64(2), got[0].Cookie)
+	require.Equal(t, uint64(1), got[1].Cookie)
+
+	// srcPort 0 (protocol-block shape) skips the exact pass entirely.
+	got = o.LookupV4(0x8C527203, 443, 6, 0)
+	require.Len(t, got, 2)
+}
+
+func TestLookupMissesDisjointTuples(t *testing.T) {
+	o := newTestObserver()
+	o.insert(v4Event(1, 0xAC110002, 0x8C527203, 40001, 443))
+
+	require.Nil(t, o.LookupV4(0x8C527203, 80, 6, 40001), "different port")
+	require.Nil(t, o.LookupV4(0x8C527204, 443, 6, 40001), "different dst")
+	require.Nil(t, o.LookupV4(0x8C527203, 443, 17, 40001), "different proto")
+
+	var dst6 [16]byte
+	dst6[15] = 1
+	require.Nil(t, o.LookupV6(dst6, 443, 6, 40001), "different family")
+}
+
+func TestReEmitReplacesSameSocketEntry(t *testing.T) {
+	o := newTestObserver()
+	o.insert(v4Event(1, 0xAC110002, 0x8C527203, 40001, 443))
+
+	// The 10s re-emit for the same socket must refresh, not duplicate. The
+	// refreshed record's fields replace the old — EXCEPT the timestamp,
+	// which keeps first-seen so a backlogged TC event can still join (see
+	// TestReEmitKeepsOriginalTimestampForJoins).
+	refresh := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	refresh.Timestamp = 999
+	refresh.Flags = 0 // established-flow refresh: no SYN flag
+	o.insert(refresh)
+
+	got := o.LookupV4(0x8C527203, 443, 6, 0)
+	require.Len(t, got, 1, "refresh must replace, never duplicate")
+	require.False(t, got[0].TCPSyn, "the refreshed record's fields win")
+	require.Equal(t, uint64(1), got[0].Timestamp, "except the first-seen timestamp")
+}
+
+// A same-cookie refresh (the 10s re-emit, or a verdict change) must keep
+// the ORIGINAL timestamp: Enrich discards candidates newer than the TC
+// event they explain, and a refresh landing while the TC reader is
+// backlogged must not turn the flow's only record into one that postdates
+// the event.
+func TestReEmitKeepsOriginalTimestampForJoins(t *testing.T) {
+	o := newTestObserver()
+	first := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	first.Timestamp = 100
+	o.insert(first)
+
+	refresh := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	refresh.Timestamp = 999 // 10s later; a TC event from t=150 is still unprocessed
+	refresh.Verdict = uint8(VerdictWouldBlock)
+	o.insert(refresh)
+
+	got := o.LookupV4(0x8C527203, 443, 6, 40001)
+	require.Len(t, got, 1)
+	require.Equal(t, uint64(100), got[0].Timestamp, "replacement keeps the first-seen timestamp")
+	require.Equal(t, VerdictWouldBlock, got[0].Verdict, "everything else refreshes")
+}
+
+// ONE REPORTER PER PACKET: an enforce-mode would-block is audit posture
+// downgrading a drop on a packet that TC still sees and reports — insert
+// must keep it as a join-store record and never queue a report. Blocks (TC
+// never sees the dropped packet) and shadow would-blocks (telemetry TC does
+// not emit) still queue.
+func TestInsertEnforceWouldBlockIsJoinFodderNotAReport(t *testing.T) {
+	o := newTestObserver()
+	o.mode.Store(uint32(ModeEnforce))
+
+	wb := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	wb.Verdict = uint8(VerdictWouldBlock)
+	o.insert(wb)
+	require.Len(t, o.verdictCh, 0, "enforce would-block must not be reported — TC reports that packet")
+	require.Len(t, o.LookupV4(0x8C527203, 443, 6, 40001), 1, "but it must still be joinable")
+
+	blk := v4Event(2, 0xAC110002, 0x8C527203, 40002, 443)
+	blk.Verdict = uint8(VerdictBlock)
+	o.insert(blk)
+	require.Len(t, o.verdictCh, 1, "an enforced drop is this hook's only event source")
+
+	o2 := newTestObserver()
+	o2.mode.Store(uint32(ModeShadow))
+	swb := v4Event(3, 0xAC110002, 0x8C527203, 40003, 443)
+	swb.Verdict = uint8(VerdictWouldBlock)
+	o2.insert(swb)
+	require.Len(t, o2.verdictCh, 1, "shadow would-blocks are telemetry TC does not emit")
+}
+
+// A busy build can evict a socket's cookie from map_sock_pid/map_sock_step
+// between emits; the 10s refresh then re-resolves to zero. The refresh must
+// not erase the identity the first emit captured — a zeroed record would
+// file the rest of the flow's TC events under the unattributed tier.
+func TestReEmitKeepsResolvedIdentityAcrossEviction(t *testing.T) {
+	o := newTestObserver()
+	o.insert(v4Event(1, 0xAC110002, 0x8C527203, 40001, 443))
+	// Seed the identity the sock maps would have resolved at first emit
+	// (the test observer runs with nil maps, so insert resolved zeros).
+	key := flowKey{port: 443, proto: 6, ipVersion: 4}
+	binary.BigEndian.PutUint32(key.dst[:4], 0x8C527203)
+	o.mu.Lock()
+	o.flows[key][0].PID = 4242
+	o.flows[key][0].StepOrdinal = 7
+	o.mu.Unlock()
+
+	refresh := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	refresh.Timestamp = 999
+	o.insert(refresh) // nil maps: re-resolves to 0/0 — the eviction shape
+
+	got := o.LookupV4(0x8C527203, 443, 6, 40001)
+	require.Len(t, got, 1)
+	require.Equal(t, uint32(4242), got[0].PID, "identity survives a zero re-resolve")
+	require.Equal(t, uint32(7), got[0].StepOrdinal)
+}
+
+func TestPerKeyCapDropsOldest(t *testing.T) {
+	o := newTestObserver()
+	for i := range perKeyMax + 3 {
+		o.insert(v4Event(uint64(i+1), 0xAC110002, 0x8C527203, uint16(40000+i), 443))
+	}
+	got := o.LookupV4(0x8C527203, 443, 6, 0)
+	require.Len(t, got, perKeyMax)
+	require.Equal(t, uint64(perKeyMax+3), got[0].Cookie, "newest survives in front")
+	for _, r := range got {
+		require.NotEqual(t, uint16(40000), r.SrcPort, "oldest entry evicted")
+	}
+}
+
+func TestStoreKeyCapEvictsOldestKey(t *testing.T) {
+	o := newTestObserver()
+	for i := range storeMaxKeys + 10 {
+		o.insert(v4Event(uint64(i+1), 0xAC110002, uint32(0x0A000000+i), 40001, 443))
+	}
+	require.LessOrEqual(t, len(o.flows), storeMaxKeys)
+	require.Nil(t, o.LookupV4(0x0A000000, 443, 6, 0), "oldest key evicted")
+	require.NotNil(t, o.LookupV4(uint32(0x0A000000+storeMaxKeys+9), 443, 6, 0), "newest key present")
+}
+
+func TestInsertResolvesV6Source(t *testing.T) {
+	o := newTestObserver()
+	ev := &bpf.OriginEvent{
+		Cookie:    7,
+		IpVersion: 6,
+		IpProto:   6,
+		SrcPort:   40001,
+		DstPort:   443,
+	}
+	copy(ev.SrcIp6[:], []byte{0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
+	ev.DstIp6[15] = 2
+	o.insert(ev)
+
+	var dst [16]byte
+	dst[15] = 2
+	got := o.LookupV6(dst, 443, 6, 40001)
+	require.Len(t, got, 1)
+	require.Equal(t, "2606:4700::1", got[0].SrcIP.String())
+}
+
+// Guards against silent key-shape drift: two inserts differing only in a
+// field the key must include may never share a bucket.
+func TestKeyIncludesEveryDiscriminator(t *testing.T) {
+	fields := []struct {
+		name string
+		ev   *bpf.OriginEvent
+	}{
+		{"base", v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)},
+		{"port", v4Event(2, 0xAC110002, 0x8C527203, 40001, 8443)},
+		{"proto", func() *bpf.OriginEvent { e := v4Event(3, 0xAC110002, 0x8C527203, 40001, 443); e.IpProto = 17; return e }()},
+		{"dst", v4Event(4, 0xAC110002, 0x8C527204, 40001, 443)},
+	}
+	o := newTestObserver()
+	for _, f := range fields {
+		o.insert(f.ev)
+	}
+	require.Len(t, o.flows, len(fields), fmt.Sprintf("each variant must occupy its own key: %v", o.flows))
+}
+
+// The join store must be populated BEFORE the verdict sink can observe the
+// record. In shadow mode (the default under --container-attribution) a
+// would-block packet is passed and TC adjudicates it concurrently; if the
+// sink ran first — it may spend 500ms in a PTR lookup — the TC event's
+// Enrich would find no join candidate and file the flow as unattributed.
+// The sink here performs the same lookup a TC event would.
+func TestInsertStoresBeforeReporting(t *testing.T) {
+	o := newTestObserver()
+	go o.reportLoop()
+	defer func() {
+		close(o.verdictCh)
+		<-o.reportDone
+	}()
+
+	seen := make(chan []Record, 1)
+	o.SetVerdictSink(func(rec Record) {
+		seen <- o.LookupV4(0x8C527203, rec.DstPort, rec.Proto, rec.SrcPort)
+	})
+
+	ev := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	ev.Verdict = uint8(VerdictWouldBlock)
+	o.insert(ev)
+
+	got := <-seen
+	require.Len(t, got, 1, "the sink must observe the record already in the join store")
+	require.Equal(t, uint64(1), got[0].Cookie)
+	require.Equal(t, VerdictWouldBlock, got[0].Verdict)
+	require.Equal(t, uint64(1), o.blocked.Load())
+}
+
+// Slow (or absent) reporting workers must never block insert: both lanes'
+// sends are non-blocking. Overflowing the main queue diverts Blocks to the
+// must-audit lane; only overflowing BOTH finally drops a Block's report —
+// while would-blocks never enter the must-audit lane at all.
+func TestInsertNeverBlocksOnFullVerdictQueues(t *testing.T) {
+	o := newTestObserver() // neither worker started
+	total := verdictQueueDepth + degradedQueueDepth + 5
+	for i := range total {
+		ev := v4Event(uint64(i+1), 0xAC110002, 0x8C527203, uint16(40000+i%20000), 443)
+		ev.Verdict = uint8(VerdictBlock)
+		o.insert(ev) // would deadlock here without the non-blocking sends
+	}
+	require.Len(t, o.degradedCh, degradedQueueDepth, "main-queue overflow diverts Blocks to the must-audit lane")
+	require.Equal(t, uint64(5), o.verdictsDropped.Load(), "dropped only when both lanes are full")
+	require.Equal(t, uint64(total), o.blocked.Load())
+
+	// Would-blocks are dual-sourced by TC: overflow drops them directly,
+	// never displacing a Block from the must-audit lane.
+	ev := v4Event(uint64(total+1), 0xAC110002, 0x8C527203, 40001, 443)
+	ev.Verdict = uint8(VerdictWouldBlock)
+	o.insert(ev)
+	require.Equal(t, uint64(6), o.verdictsDropped.Load())
+	require.Len(t, o.degradedCh, degradedQueueDepth)
+}
+
+// The must-audit lane delivers overflowed Blocks with Record.Degraded set,
+// on its own worker — the ringbuf reader (insert's caller) never runs the
+// sink even when the main queue is saturated.
+func TestDegradedLaneDeliversOverflowedBlocks(t *testing.T) {
+	o := newTestObserver()
+	go o.degradedLoop() // main reportLoop deliberately not started
+
+	delivered := make(chan Record, 8)
+	o.SetVerdictSink(func(rec Record) { delivered <- rec })
+
+	// Fill the main queue so the next Block overflows into the lane.
+	for i := range verdictQueueDepth {
+		ev := v4Event(uint64(i+1), 0xAC110002, 0x8C527203, uint16(40000+i%20000), 443)
+		ev.Verdict = uint8(VerdictBlock)
+		o.insert(ev)
+	}
+	ev := v4Event(99999, 0xAC110002, 0x0A000063, 40001, 443)
+	ev.Verdict = uint8(VerdictBlock)
+	o.insert(ev)
+
+	got := <-delivered
+	require.True(t, got.Degraded, "overflow deliveries must be marked degraded")
+	require.Equal(t, uint64(99999), got.Cookie)
+	require.Equal(t, VerdictBlock, got.Verdict)
+
+	// Drain the worker BEFORE reading counters: the sink send happens-before
+	// the test's receive, but the counter increment follows the sink call
+	// with no such edge — degradedDone is the synchronization point.
+	close(o.degradedCh)
+	<-o.degradedDone
+	require.Equal(t, uint64(1), o.verdictsDegraded.Load())
+	require.Zero(t, o.verdictsDropped.Load(), "diverted, not dropped")
+}
+
+// Eviction is second-chance, not pure FIFO: a key re-emitted since eviction
+// last considered it survives one rotation, so the hot destinations a build
+// hammers are not the first casualties of a wide fan-out of one-shot keys.
+func TestStoreEvictionGivesRefreshedKeysASecondChance(t *testing.T) {
+	o := newTestObserver()
+	for i := range storeMaxKeys {
+		o.insert(v4Event(uint64(i+1), 0xAC110002, uint32(0x0A000000+i), 40001, 443))
+	}
+	// Refresh the OLDEST key (the 10s re-emit for a long-lived hot flow).
+	o.insert(v4Event(1, 0xAC110002, 0x0A000000, 40001, 443))
+
+	// The next new key must evict the idle second key, not the hot first.
+	o.insert(v4Event(9999, 0xAC110002, 0x0B000000, 40001, 443))
+	require.NotNil(t, o.LookupV4(0x0A000000, 443, 6, 0), "refreshed key must survive eviction")
+	require.Nil(t, o.LookupV4(0x0A000001, 443, 6, 0), "idle key is the victim")
+	require.LessOrEqual(t, len(o.flows), storeMaxKeys)
+}
+
+// When every existing key is hot, a full rotation clears every hot bit —
+// and must then evict an old cold key, never the key this insert came to
+// store (which would discard the record before any TC event could join it).
+func TestStoreEvictionAllHotKeepsNewKey(t *testing.T) {
+	o := newTestObserver()
+	for i := range storeMaxKeys {
+		o.insert(v4Event(uint64(i+1), 0xAC110002, uint32(0x0A000000+i), 40001, 443))
+	}
+	for i := range storeMaxKeys { // refresh every key: the whole store is hot
+		o.insert(v4Event(uint64(i+1), 0xAC110002, uint32(0x0A000000+i), 40001, 443))
+	}
+	o.insert(v4Event(9999, 0xAC110002, 0x0B000000, 40001, 443))
+	require.NotNil(t, o.LookupV4(0x0B000000, 443, 6, 0),
+		"the just-inserted key must never be its own eviction victim")
+	require.LessOrEqual(t, len(o.flows), storeMaxKeys)
+}
+
+// SetVerdictSink(nil) uninstalls the sink; storing a pointer to a nil func
+// would pass reportLoop's nil check and panic on the first block record.
+func TestSetVerdictSinkNilUninstalls(t *testing.T) {
+	o := newTestObserver()
+	go o.reportLoop()
+	o.SetVerdictSink(nil)
+	ev := v4Event(1, 0xAC110002, 0x8C527203, 40001, 443)
+	ev.Verdict = uint8(VerdictBlock)
+	o.insert(ev) // must not panic the report worker
+	close(o.verdictCh)
+	<-o.reportDone
+}
+
+// TestOriginConstantsMatchBpfSource pins the Go constants to the C source
+// the way TestDNSProxyFWMarkMatchesGoConstant pins the firewall mark: the
+// ORIGIN_MODE_*, ORIGIN_VERDICT_* and ORIGIN_FLAG_* values are mirrored in
+// three places (originbpf.c, this package, bpf/origin_event.go), and a
+// drift would mislabel every verdict userspace reports.
+func TestOriginConstantsMatchBpfSource(t *testing.T) {
+	src, err := os.ReadFile("../../bpf/originbpf.c")
+	require.NoError(t, err)
+
+	defines := map[string]uint64{
+		"ORIGIN_MODE_OBSERVE":        uint64(ModeObserve),
+		"ORIGIN_MODE_SHADOW":         uint64(ModeShadow),
+		"ORIGIN_MODE_ENFORCE":        uint64(ModeEnforce),
+		"ORIGIN_VERDICT_NONE":        uint64(VerdictNone),
+		"ORIGIN_VERDICT_ALLOW":       uint64(VerdictAllow),
+		"ORIGIN_VERDICT_WOULD_BLOCK": uint64(VerdictWouldBlock),
+		"ORIGIN_VERDICT_BLOCK":       uint64(VerdictBlock),
+		"ORIGIN_FLAG_TCP_SYN":        uint64(bpf.OriginFlagTCPSyn),
+		"ORIGIN_FLAG_TCP_MIDSTREAM":  uint64(bpf.OriginFlagTCPMidstream),
+		"ORIGIN_CFG_KEY_MODE":        uint64(cfgKeyMode),
+		"ORIGIN_CFG_KEY_LO_CARVEOUT": uint64(cfgKeyLoCarveout),
+	}
+	for name, want := range defines {
+		re := regexp.MustCompile(`(?m)^#define ` + name + `\s+(0x[0-9A-Fa-f]+|\d+)\b`)
+		m := re.FindStringSubmatch(string(src))
+		require.NotNil(t, m, "originbpf.c must #define %s", name)
+		got, err := strconv.ParseUint(m[1], 0, 64)
+		require.NoError(t, err)
+		require.Equal(t, want, got, "%s drifted between originbpf.c and the Go mirror", name)
+	}
+}

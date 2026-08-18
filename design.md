@@ -396,6 +396,9 @@ sequenceDiagram
 | `cg_connect6` | cgroup/connect6 | Maps IPv6 TCP socket cookie → PID |
 | `cg_sendmsg4` | cgroup/sendmsg4 | Maps IPv4 UDP socket cookie → PID |
 | `cg_sendmsg6` | cgroup/sendmsg6 | Maps IPv6 UDP socket cookie → PID |
+| `step_fork` / `step_exit` | tp_btf tracepoints (stepbpf.c, separate collection; needs kernel BTF) | Step attribution: mint/inherit per-step process tags, drop at exit |
+| `cg_sock_create` | cgroup/sock_create (stepbpf.c) | Copies the creating thread's step tag onto each socket cookie |
+| `cg_origin_egress` | cgroup_skb/egress (originbpf.c, separate collection) | Flow-origin recorder and — in enforce mode — the primary egress verdict (issue #106). Runs in socket context, pre-NAT, inside the originating netns, so it can both attribute and enforce container traffic. Behavior is set by a runtime mode: observe (pass, record only), shadow (compute the verdict, report would-blocks, pass), enforce (drop denied traffic). Shares the rule maps with `tc_egress` via `bpf/verdict.h` |
 
 ## Audit Mode
 
@@ -449,6 +452,208 @@ The DNS proxy handles Kubernetes service discovery by:
 - `ConfigureDockerDNS(bridgeIP)` writes `{"dns": ["<bridgeIP>"]}` to `/etc/docker/daemon.json` (with backup)
 - Docker daemon requires a full restart (`systemctl restart docker`) for DNS changes — SIGHUP is not sufficient
 - `RestoreDockerDNS()` restores the original daemon.json from backup on shutdown
+
+### Container Attribution (issue #106, phase 3a — audit-only)
+
+Bridge-networked container packets cross a netns and NAT before `tc_egress`
+sees them, so the socket-cookie join yields nothing there (pid 0, ordinal 0).
+Phase 3a closes the attribution gap without touching enforcement:
+
+- `pkg/containers` subscribes to Docker events over `/var/run/docker.sock`
+  (stdlib HTTP client, no docker dependency), resolves each container/exec
+  workload's host PID, confirms identity via `/proc/<pid>/cgroup`, and tags
+  the process subtree with the step ordinal active at the event's `timeNano`
+  (`steps.Tracker.OrdinalAt` / `TagContainerProcess`). From there the
+  existing `cg_sock_create` hook tags container sockets and kernel fork
+  inheritance covers descendants.
+- `pkg/origin` owns the `cg_origin_egress` observer: pre-NAT flow-origin
+  records (socket cookie, cgroup id, container source IP) resolved against
+  the pid/step maps at read time and kept in a bounded join store. TC events
+  arriving with no socket identity are enriched from it (`Enrich`), keyed on
+  what MASQUERADE preserves (dst tuple, usually the source port). Only the
+  record's socket-tag ordinal is ever copied — never "current step" — so
+  traffic from the start→tag window lands in the container tier, not a step.
+- Container DNS: queries arriving on the bridge listener are attributed by
+  container IP (`SetContainerLookup`); the host-netns sockdiag path is never
+  consulted for them. **Known approximation:** the DNS path attributes a
+  whole container to its *effective* ordinal — birth step, overwritten by
+  each later `docker exec` (last-writer-wins) — because a DNS query carries
+  only the client IP, not a socket tag. TC enrichment does not share this
+  limit (it reads each socket's own tag from the origin record). No phase
+  may treat DNS-path ordinals as per-socket causal attribution or as an
+  enforcement input — the decided split lives in "DNS and per-step policy"
+  below, next to the phase-3b invariants it interacts with.
+- Unattributable container traffic gets its own summary tier ("Container
+  traffic (unattributed…)"), checked before every looser bucket.
+- Scope boundaries: docker-in-docker attribution stops at the outer
+  container; `--privileged` containers are flagged in the audit stream.
+
+### Egress enforcement hooks (issue #106, phase 3b)
+
+Phase 3b makes the root-cgroup hook the *primary* egress verdict, with TC
+egress kept attached as a fail-closed backstop. Both hooks compute the same
+decision from the same maps: `bpf/verdict.h` owns the rule/config maps and
+the `verdict_allowed_v4`/`_v6` helpers, and both collections include it —
+a divergence between the primary hook and its backstop would be a security
+bug, so the decision exists once and `TestVerdictParityWithTcEgress` proves
+the two programs agree. `pkg/origin` wires the origin collection to the
+tcbpf collection's map fds with `MapReplacements`, so there is one set of
+kernel maps. (This deliberately reverses phase 3a's standalone-collection
+isolation, whose purpose was to keep a verifier failure from touching
+enforcement; the blast radius is now bounded by the mode gate and the TC
+backstop instead.)
+
+**Mode ladder** (`map_origin_config`, set by userspace, never at attach):
+
+| Mode | Behavior | How it's selected |
+|------|----------|-------------------|
+| observe | Phase-3a behavior: always pass, record flow origins | container attribution off |
+| shadow | Compute the verdict, emit `cgroup_would_block`, still pass | default with `--container-attribution` |
+| enforce | Drop denied traffic here; a drop reports as `connection_blocked` | `--cgroup-enforce` |
+
+Shadow is the default because this hook adjudicates surfaces TC never saw;
+it measures that blast radius in production before anyone relies on
+enforcement. Audit mode (`map_audit_mode`) still overrides everything — it
+never drops, at either hook.
+
+**Ordering.** The program is attached early (the join store needs it) but is
+inert in observe until `enableMode` runs *after* the allowlist, auto-allows,
+and existing-connection gating are programmed — the same
+attach-before-program guard that makes TC attach last.
+
+**What TC still enforces.** Traffic with no local socket in our cgroup root:
+`AF_PACKET`/raw sends, non-IP frames, genuinely forwarded packets, TCP
+minisockets — plus everything, if the cgroup hook fails to load or attach
+(warn-only by design, because TC remains).
+
+**One post-verdict pipeline.** Both hooks feed the same steps in
+`pkg/events` (`outcome.go`): hostname/CNAME resolution, late-allow
+reconciliation, the audit record, and the block notification. `processEvent`
+supplies TC packets; `ReportVerdict` supplies cgroup verdict records. This
+matters because a cgroup drop is the *only* event source for the traffic it
+kills — the packet dies at `ip_finish_output`, before the TC qdisc — so if
+that path were thinner, denials under `--cgroup-enforce` would silently lose
+late-allow self-healing and hostname attribution. Container identity is
+attached as decoration by `pkg/containers`; it never owns the outcome, since
+most cgroup verdicts are host processes with no container at all.
+
+**Shadow mode is intentionally dual-sourced.** In shadow, the cgroup hook
+emits `cgroup_would_block` for a flow *and* TC still enforces it, possibly
+emitting `connection_blocked` for the same flow. Both lines appear in the
+audit log by design — that is how the two hooks' opinions are compared. The
+summary and OTLP exporter exclude would-blocks so counts stay honest, and
+any other consumer must do the same: **never sum `cgroup_would_block` with
+`connection_blocked`**, and never treat a would-block as a policy outcome.
+
+**Behavior changes to know about:**
+- A cgroup drop surfaces at the socket layer rather than TC's silent
+  blackhole — but the UX differs by protocol. UDP `sendto()`/`sendmsg()`
+  fail fast with `EPERM`. TCP does NOT fail fast: the SYN is dropped in
+  `ip_finish_output` and `tcp_connect()` short-circuits only on
+  `ECONNREFUSED`, so the SYN retransmits from the timer and `connect()`
+  eventually returns `ETIMEDOUT` — which is why originbpf.c's emit dedup
+  expects blocked-flow SYN retransmits.
+- The hook sees traffic TC never did — loopback (including the DNS proxy's
+  own DNAT'd `127.0.0.1:53`) and the docker bridge. Loopback is carved out
+  both in BPF and as a userspace `127.0.0.0/8` + `::1/128` allow rule;
+  ICMP/ICMPv6 and IPv6 multicast are passed for PMTU and NDP. Docker bridge
+  subnets are the same local-only class but are carved out via a map this
+  collection OWNS (`map_local_nets`, never shared with TC) rather than the
+  policy: subnet values are discovered from container config — i.e.
+  workload-influenced — so they must not be able to widen off-host
+  enforcement. A carved subnet exempts traffic only at this hook (returning
+  it to its pre-3b unpoliced-locally posture); traffic leaving via the
+  TC-attached interface still meets TC's untouched verdict, and a test pins
+  that isolation. Because TC attaches to one interface (multi-interface
+  hosts have pre-existing TC blind spots), entries are also validated
+  before writing: only bridge-driver networks (their routes are on-link by
+  construction; macvlan/ipvlan subnets are physical-network space and stay
+  adjudicated), width-capped at /16 (v4) / /64 (v6), and refused when the
+  subnet contains a real host interface address — claiming VPC/LAN space
+  the host lives in is a bypass attempt, not a bridge. Coverage: networks
+  are enumerated directly (GET /networks — no dependency on live
+  containers), before the mode is raised (`preallowLocalNetworks`) and on
+  network-create events thereafter, with per-container discovery as the
+  backstop. Consequence, by design: container↔container and host↔container
+  traffic on docker bridges is open under `--cgroup-enforce` — the policy
+  governs what leaves the machine, exactly the scope TC enforced;
+  inter-container isolation is docker network segmentation's job, not this
+  firewall's.
+- The DNS proxy's upstream queries carry `SO_MARK 0xCA12` and are exempted
+  before any verdict, so a policy race can never let the proxy self-block
+  the lookups that populate the allowlist.
+- Container traffic denied by policy is dropped pre-NAT, so TC never sees
+  it: the cgroup hook is the sole event source for those blocks, and its
+  events carry native pid/step/container attribution with no join needed.
+
+### DNS and per-step policy (decided 2026-08-08)
+
+**Rule: DNS-path attribution is audit-only. No phase — current or future —
+may use a DNS-derived ordinal as an enforcement input.**
+
+Binding on today's code, not just the future: `Tracker.LookupClient`'s
+ordinal reaches no enforcement path. It DOES fan out as an audit
+approximation (the `dns_blocked` event, and from there the summary's
+per-step grouping, the SaaS push, and OTLP's `cargowall.step_ordinal`), so
+consumers see a per-step-looking label that is really per-container
+last-writer-wins. `DecorateVerdict` is the site one line away from
+regressing this rule: it holds a `*containerInfo` and must keep stamping
+only `ContainerOrigin`/`ContainerID` — never `effectiveOrdinal` — onto
+connection outcomes.
+
+**Why the signal is unfit for policy** (scoped precisely — container
+identity is NOT the problem): a DNS query identifies the *container* (its
+IP is unique per bridge network), but not the *process or step* within it.
+One container spans steps (`effectiveOrdinal` is birth step overwritten by
+each `docker exec`), and for embedded-resolver forwards on user-defined
+networks the querying process's identity is laundered by the proxying
+itself — the forwarding socket lives in the container's netns but is
+created by dockerd, so socket-based lookups don't return "unknown", they
+confidently return dockerd. Per-step granularity from this signal is not
+achievable by any hook placement; per-container granularity is too coarse
+to select policy with.
+
+**The split** (what the per-step phase builds instead):
+- *Query filtering stays run-wide and step-agnostic.* All of today's allow
+  paths — rules, CNAME-derived allowances, search-domain suffixes, the
+  default action — remain without a step dimension. Residual risk, stated
+  honestly: this concedes cross-step DNS exfiltration. A compromised step
+  may query any domain the run allows for anyone, and the connection
+  verdict cannot see that channel (the query rides the proxy, whose
+  upstream socket is mark-exempt). Accepted because the alternative rests
+  on the unfit signal above; revisit only with a genuinely causal
+  mechanism, none of which is currently known.
+- *Per-step tightness is planned at the connection verdict* — future work,
+  none of it exists yet. `verdict.h`'s maps and key structs have no step
+  dimension, and the enforcing hook does not read `map_sock_step`.
+  Constraints that phase must resolve, recorded now so they aren't
+  rediscovered in review: (a) step-keyed rules mean re-keying the rule maps
+  and every writer; (b) the "one decision, parity-tested" invariant above
+  must be renegotiated, because a socket-keyed verdict is computable only
+  at the cgroup hook — post-NAT TC has no socket — so parity would scope to
+  the run-wide baseline with TC remaining the run-wide backstop (the
+  existing degradation posture); (c) selection semantics follow the tagging
+  model: sockets and container processes keep their *creating* step's tag,
+  so a service container started in step 2 is governed by step 2's policy
+  for its lifetime unless re-tagged by exec — per-step policy means "the
+  policy of the step that created it", not "the step active now"; (d) the
+  denial UX above applies — UDP fails fast with `EPERM`, TCP times out.
+
+**Follow-ups deliberately NOT adopted as written** (each has a verified
+flaw; redesign before building):
+- Join-store lookup for direct-bridge DNS clients: the store keys by
+  destination tuple only, and container→gateway traffic is not MASQUERADEd,
+  so distinct netns port spaces can collide on `(bridgeIP, 53, UDP,
+  srcPort)` and name the wrong container with no ambiguity signal; all
+  container DNS shares one key under `perKeyMax`; the ringbuf reader races
+  the query handler; and embedded-resolver forwards resolve to dockerd (see
+  above). Usable only as a hint gated on source-IP agreement with the byIP
+  index, never as a replacement for it.
+- Active-ordinal set per container: requires handling the `exec_die` event
+  (the tracker currently drops it unmatched) plus exec-id→ordinal
+  bookkeeping, or the set only grows. "Strictest member" is undefined over
+  opaque ordinals — on disagreement, degrade to the container-unattributed
+  tier, the codebase's one existing ambiguity vocabulary.
 
 ## GitHub Actions Integration
 

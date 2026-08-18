@@ -163,6 +163,29 @@ func TestExporter_StepBoundaryNotExported(t *testing.T) {
 		"only the connection event may reach the collector")
 }
 
+// Container attribution markers describe a tagging action, not a
+// connection — mirroring step boundaries, they must be dropped at the sink
+// so they can't inflate allow-counting dashboards.
+func TestExporter_ContainerAttributionNotExported(t *testing.T) {
+	c := newCollector(t)
+	e := New(testConfig(c.server.URL), "test", discardLogger())
+
+	e.Consume(events.AuditEvent{
+		Timestamp:       time.Now(),
+		EventType:       events.EventContainerAttribution,
+		StepOrdinal:     3,
+		ContainerID:     "abc123def456",
+		AttributionKind: "start",
+	})
+	e.Consume(testEvent())
+	require.NoError(t, e.Shutdown(context.Background()))
+
+	reqs := c.recorded()
+	require.Len(t, reqs, 1)
+	assert.Len(t, reqs[0].ResourceLogs[0].ScopeLogs[0].LogRecords, 1,
+		"only the connection event may reach the collector")
+}
+
 func TestExporter_BatchesBySize(t *testing.T) {
 	c := newCollector(t)
 	e := New(testConfig(c.server.URL), "test", discardLogger())

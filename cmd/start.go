@@ -39,6 +39,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/code-cargo/cargowall/bpf"
@@ -55,6 +56,27 @@ import (
 	"github.com/code-cargo/cargowall/pkg/steps"
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
+
+// logProgStats logs one BPF program's kernel runtime counters (meaningful
+// only while --bpf-stats had accounting enabled). The avg-ns-per-run figure
+// is the 3a per-packet-overhead deliverable; tc_egress is logged alongside
+// the observer as the in-house baseline.
+func logProgStats(logger *slog.Logger, name string, prog *ebpf.Program) {
+	stats, err := prog.Stats()
+	if err != nil {
+		logger.Debug("BPF program stats unavailable", "program", name, "error", err)
+		return
+	}
+	var avgNs int64
+	if stats.RunCount > 0 {
+		avgNs = stats.Runtime.Nanoseconds() / int64(stats.RunCount)
+	}
+	logger.Info("BPF program stats",
+		"program", name,
+		"run_count", stats.RunCount,
+		"runtime_ns", stats.Runtime.Nanoseconds(),
+		"avg_ns", avgNs)
+}
 
 // StartCargoWall brings the firewall up and blocks until shutdown. Any fatal
 // error publishes the failure sentinel BEFORE the teardown unwind begins —
@@ -258,8 +280,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			if err != nil {
 				logger.Debug("Docker bridge not found, container DNS filtering unavailable", "error", err)
 			} else {
-				// Add docker bridge IP as additional listen address
-				dnsServer.AddListenAddr(dockerBridgeIP + ":53")
+				// Add docker bridge IP as additional listen address, marked
+				// container-serving so queries arriving there attribute via
+				// the container-IP lookup, never the host-netns sockdiag path.
+				dnsServer.AddContainerListenAddr(dockerBridgeIP + ":53")
 				logger.Info("Docker DNS interception enabled", "docker_bridge", dockerBridgeIP)
 
 				// Configure Docker to use our DNS proxy. Restore is deferred
@@ -373,7 +397,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
 	var apiPolicyLoaded bool
 	if cmd.CIMode() != CIModeNone {
-		apiPolicyLoaded = loadCIConfig(ctx, cmd, configMgr, auditLogger, dockerBridgeIP, logger)
+		apiPolicyLoaded = loadCIConfig(ctx, cmd, configMgr, auditLogger, logger)
 	} else if hooks != nil && hooks.LoadPolicy != nil {
 		// Extension hook: load policy from external source (e.g., NATS state machine)
 		policy, hookSmClient, cleanup, err := hooks.LoadPolicy(ctx, cmd)
@@ -406,6 +430,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			// Continue with default deny-all policy
 		}
 	}
+
+	// The loopback and docker-bridge carve-outs are owned by the
+	// containerAttribution facade (ensureLoopbackAllowed and
+	// preallowLocalNetworks below). They must stay after this config load —
+	// a load replaces the rendered config wholesale — and before
+	// UpdateAllowlistTC programs the maps.
 
 	// Late-allow reconciliation (#83): buffer recently blocked connections so
 	// the DNS enforcement path can re-report them as late-allowed once it
@@ -515,6 +545,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// created them so audit events carry a causal step ordinal. Optional by
 	// design — it needs kernel BTF and a Runner.Worker process, and a failure
 	// here must never degrade enforcement, so it only warns.
+	var stepTracker *steps.Tracker
 	if cmd.StepAttribution {
 		tracker, err := steps.Start(&objs, steps.Options{
 			WorkerPID:   cmd.RunnerWorkerPID,
@@ -523,6 +554,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		if err != nil {
 			logger.Warn("Step attribution disabled", "error", err)
 		} else {
+			stepTracker = tracker
 			defer tracker.Close()
 			logger.Info("Step attribution enabled",
 				"worker_pid", tracker.WorkerPID(),
@@ -532,6 +564,62 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			if dnsServer != nil {
 				dnsServer.SetStepLookup(tracker.StepForClient)
 			}
+		}
+	}
+
+	// Container attribution (issue #106, phase 3a), kernel half. The
+	// two-phase boot order — observer before the event reader, docker
+	// tracking after the dockerd restart — lives in containerAttribution;
+	// a nil value is the disabled feature and every call below no-ops.
+	attribution := newContainerAttribution(cmd.ContainerAttribution,
+		resolveMode(cmd.ContainerAttribution, cmd.CgroupEnforce),
+		stepTracker, &objs, logger)
+	defer attribution.Close()
+
+	// Userspace half of the loopback carve-out pair — after config load,
+	// before UpdateAllowlistTC programs the maps below.
+	attribution.ensureLoopbackAllowed(configMgr)
+
+	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
+	// load-bearing under --cgroup-enforce — the docker bridge listener that
+	// daemon.json points every container at. Previously this lived in the
+	// CI-only config path, so `--container-attribution --cgroup-enforce
+	// --docker-dns-interception` without a CI preset enforced against an
+	// allowlist that never contained bridgeIP:53 and container resolution
+	// died with EPERM. Unconditional: even with DNS tracking disabled (no
+	// proxy), processes still resolve against 127.0.0.1/the upstream and
+	// those port-53 flows must survive default-deny at TC.
+	//
+	// MUST run after ensureLoopbackAllowed above: LPM returns only the
+	// longest match, so a 127.0.0.1/32 port-53 entry written while no
+	// broader loopback allow exists would shadow the /8 all-ports allow and
+	// deny 127.0.0.1 on every other port. With the /8 already in place, the
+	// covered-check inside ensureAllowed skips the /32 instead.
+	dnsIPs := []string{"127.0.0.1"}
+	if dnsUpstreamHost, _, err := net.SplitHostPort(cmd.DNSUpstream); err == nil {
+		dnsIPs = append(dnsIPs, dnsUpstreamHost)
+	}
+	if dockerBridgeIP != "" {
+		dnsIPs = append(dnsIPs, dockerBridgeIP)
+	}
+	configMgr.EnsureDNSAllowed(dnsIPs)
+
+	// BPF runtime stats (3a telemetry): global kernel accounting while
+	// enabled; the per-program numbers land in one shutdown log line each.
+	// Registered after attribution's Close defer so the stats read runs
+	// while the programs are still alive.
+	if cmd.BPFStats {
+		statsCloser, err := ebpf.EnableStats(unix.BPF_STATS_RUN_TIME)
+		if err != nil {
+			logger.Warn("BPF runtime stats unavailable", "error", err)
+		} else {
+			defer statsCloser.Close()
+			defer func() {
+				logProgStats(logger, "tc_egress", objs.TcEgress)
+				if p := attribution.observerProgram(); p != nil {
+					logProgStats(logger, "cg_origin_egress", p)
+				}
+			}()
 		}
 	}
 
@@ -546,7 +634,13 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	defer rd.Close()
 
 	// Start the event reader before the firewall is enforcing so no events are missed.
-	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, logger)
+	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, logger, attribution.enricherArg())
+
+	// Route the cgroup hook's verdicts into that same pipeline. Wired here,
+	// once the firewall exists, because late-allow needs it — and before the
+	// hook can leave observe mode, so no verdict is ever reported by a
+	// thinner path than a TC event would take.
+	attribution.wireVerdicts(configMgr, notificationTracker, auditLogger, fw)
 
 	// Set default action through firewall
 	defaultAction := configMgr.GetDefaultAction()
@@ -659,6 +753,17 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	if err != nil {
 		return fmt.Errorf("failed to attach TC egress: %w", err)
 	}
+
+	// Same ordering contract, applied to the cgroup egress hook: it has been
+	// attached since early startup (the join store needs it) but inert in
+	// observe mode. Raising it to shadow/enforce only now — after every rule
+	// above is programmed — is what keeps it clear of the same
+	// attach-before-program race. Local-only networks (default docker
+	// bridge, bridges of pre-existing containers) are carved out first, for
+	// the same reason the allowlist is: the hook must be correct from its
+	// first adjudicated packet.
+	attribution.preallowLocalNetworks(ctx)
+	attribution.enableMode()
 	// Registered with teardowns, not a bare defer: on TCX kernels the link
 	// dies with the process fd anyway, but the legacy clsact fallback
 	// (kernels <6.6) installs a netlink cls_bpf filter that OUTLIVES the
@@ -730,6 +835,14 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			logger.Warn("Failed to restart Docker daemon for DNS config", "error", err)
 		}
 	}
+
+	// Container attribution, userspace half — after the dockerd restart
+	// above, for the ordering reasons containerAttribution documents.
+	// User-defined bridge subnets discovered per container are carved out
+	// of the cgroup hook only (one LPM write — cheap enough for the event
+	// stream goroutine), never added to the shared policy: TC's off-host
+	// enforcement must be un-widenable by workload-influenced input.
+	attribution.startUserspace(ctx, dnsServer, dockerBridgeIP, auditLogger, attribution.allowLocalNetwork)
 
 	if startupInterrupted(ctx, logger, "pre-ready") {
 		return nil
@@ -1003,11 +1116,11 @@ func writeModeFile(auditMode bool, logger *slog.Logger) {
 
 // loadCIConfig handles CI config priority:
 // (1) SaaS API fetch + bootstrap + mode override + state file,
-// (2) env vars, (3) config file. Calls EnsureDNSAllowed at end.
+// (2) env vars, (3) config file.
 // Returns true if SaaS API policy was loaded. Posture changes land on
 // configMgr (the single source of truth); under --api-failure-mode=fail
 // cmd.policyLockdown is set in place.
-func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, dockerBridgeIP string, logger *slog.Logger) bool {
+func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, logger *slog.Logger) bool {
 	logger.Info("Running in CI mode", "mode", string(cmd.CIMode()))
 
 	var apiPolicyLoaded bool
@@ -1081,16 +1194,9 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 		}
 	}
 
-	// Auto-allow DNS infrastructure IPs on port 53 so the DNS proxy
-	// can reach the upstream and local processes/containers can resolve.
-	dnsIPs := []string{"127.0.0.1"}
-	if dnsUpstreamHost, _, err := net.SplitHostPort(cmd.DNSUpstream); err == nil {
-		dnsIPs = append(dnsIPs, dnsUpstreamHost)
-	}
-	if dockerBridgeIP != "" {
-		dnsIPs = append(dnsIPs, dockerBridgeIP)
-	}
-	configMgr.EnsureDNSAllowed(dnsIPs)
+	// DNS-infrastructure auto-allows (proxy upstream, loopback, docker
+	// bridge listener) are NOT added here: they run unconditionally in
+	// startCargoWall after config load, independent of CI mode.
 
 	return apiPolicyLoaded
 }

@@ -18,6 +18,11 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+// The allow/deny decision, its rule/config maps, and their key/value structs
+// are shared with cg_origin_egress (bpf/originbpf.c) so the enforcing hook
+// and its backstop can never diverge. See bpf/verdict.h.
+#include "verdict.h"
+
 // TC action return codes
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
@@ -55,51 +60,8 @@
 #define TCP_FLAG_ACK 0x10
 #define TCP_FLAG_URG 0x20
 
-// ---- IPv4 structs ----
-
-// LPM trie key for CIDR matching
-struct lpm_key {
-    __u32 prefixlen;  // Must be first member for LPM trie
-    __u32 ip;
-} __attribute__((packed));
-
-// Value for LPM trie - action with optional port restrictions
-struct lpm_val {
-    __u8 action;      // 0 = deny, 1 = allow
-    __u8 port_specific; // 0 = all ports, 1 = check port map
-    __u16 pad;
-} __attribute__((packed));
-
-// Key for port-specific rules. For ICMP (proto=1) the port field is always 0;
-// ICMP has no L4 port, so the protocol byte alone discriminates the rule.
-struct port_key {
-    __u32 ip;
-    __u16 port;
-    __u8 proto;           // IPPROTO_TCP (6), IPPROTO_UDP (17), or IPPROTO_ICMP (1)
-    __u8 pad;
-} __attribute__((packed));
-
-// Value for port rules - just allow/deny
-struct port_val {
-    __u8 action;      // 0 = deny, 1 = allow
-    __u8 pad[3];
-} __attribute__((packed));
-
-// ---- IPv6 structs ----
-
-// IPv6 LPM trie key (128-bit IP)
-struct lpm_key_v6 {
-    __u32 prefixlen;
-    __u8 ip[16];
-} __attribute__((packed));
-
-// IPv6 port key
-struct port_key_v6 {
-    __u8 ip[16];
-    __u16 port;
-    __u8 proto;           // IPPROTO_TCP (6) or IPPROTO_UDP (17)
-    __u8 pad;
-} __attribute__((packed));
+// The rule/config structs (lpm_key, lpm_val, port_key, port_val, and the v6
+// variants) now live in verdict.h, shared with cg_origin_egress.
 
 // ---- Event struct with version discriminator ----
 
@@ -129,62 +91,15 @@ struct blocked_event {
 const struct blocked_event *btf_anchor_blocked_event __attribute__((unused));
 
 
-// Default action map (0 = deny, 1 = allow)
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, __u32);
-    __type(value, __u8);
-    __uint(max_entries, 1);
-} map_default_action SEC(".maps");
-
-// LPM trie map for IPv4 CIDR-based allow/deny rules
-struct {
-    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
-    __type(key, struct lpm_key);
-    __type(value, struct lpm_val);
-    __uint(max_entries, 4096);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
-} map_cidrs SEC(".maps");
-
-// Hash map for IPv4 port-specific rules
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct port_key);
-    __type(value, struct port_val);
-    __uint(max_entries, 4096);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
-} map_ports SEC(".maps");
-
-// LPM trie map for IPv6 CIDR-based allow/deny rules
-struct {
-    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
-    __type(key, struct lpm_key_v6);
-    __type(value, struct lpm_val);
-    __uint(max_entries, 4096);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
-} map_cidrs_v6 SEC(".maps");
-
-// Hash map for IPv6 port-specific rules
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct port_key_v6);
-    __type(value, struct port_val);
-    __uint(max_entries, 4096);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
-} map_ports_v6 SEC(".maps");
+// The rule/config maps (map_default_action, map_cidrs, map_ports,
+// map_cidrs_v6, map_ports_v6, map_audit_mode) now live in verdict.h, shared
+// with cg_origin_egress. map_events and map_sock_pid below stay owned here:
+// tc_egress emission is TC-specific and unchanged.
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
 } map_events SEC(".maps");
-
-// Audit mode map (0 = enforce/block, 1 = audit/log only)
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, __u32);
-    __type(value, __u8);
-    __uint(max_entries, 1);
-} map_audit_mode SEC(".maps");
 
 // LRU hash map: socket cookie → PID (populated by cgroup programs, read by TC)
 struct {
@@ -283,14 +198,11 @@ static __always_inline void step_tag_socket(__u64 cookie) {
 }
 
 
-// Helper: check audit mode and return appropriate action
+// Helper: check audit mode and return appropriate action. audit_mode_active
+// (map_audit_mode) lives in verdict.h, shared with the cgroup hook; only the
+// TC action constants are TC-specific.
 static __always_inline int check_audit_or_block(void) {
-    __u32 audit_key = 0;
-    __u8 *audit_mode = bpf_map_lookup_elem(&map_audit_mode, &audit_key);
-    if (audit_mode && *audit_mode == 1) {
-        return TC_ACT_OK;  // Audit mode: log but don't block
-    }
-    return TC_ACT_SHOT;  // Enforce mode: block
+    return audit_mode_active() ? TC_ACT_OK : TC_ACT_SHOT;
 }
 
 // Helper: rate-limit mid-stream drop events per IPv4 destination tuple.
@@ -466,76 +378,9 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
         }
     }
 
-    // Check firewall rules using LPM trie (network byte order key)
-    struct lpm_key key = {
-        .prefixlen = 32,
-        .ip = dst_ip_nbo
-    };
-
-    struct lpm_val *rule = bpf_map_lookup_elem(&map_cidrs, &key);
-    __u8 decision_made = 0;
-    __u8 allowed = 0;
-
-    if (rule) {
-        // We have a matching rule
-        if (rule->port_specific == 0) {
-            // Rule applies to all ports
-            decision_made = 1;
-            if (rule->action == 1) {
-                allowed = 1;
-            }
-        } else {
-            // Rule has specific ports - check port map
-            struct port_key pkey = {
-                .ip = dst_ip_nbo,
-                .port = dst_port,
-                .proto = ip_proto,
-                .pad = 0
-            };
-            struct port_val *pval = bpf_map_lookup_elem(&map_ports, &pkey);
-            if (pval) {
-                // Specific rule for this IP:port
-                decision_made = 1;
-                if (pval->action == 1) {
-                    allowed = 1;
-                }
-            } else {
-                // Check for wildcard 0.0.0.0:port entries
-                pkey.ip = 0;  // 0.0.0.0
-                pval = bpf_map_lookup_elem(&map_ports, &pkey);
-                if (pval) {
-                    decision_made = 1;
-                    if (pval->action == 1) {
-                        allowed = 1;
-                    }
-                }
-            }
-        }
-    } else {
-        // No LPM match - check for wildcard port rules
-        struct port_key pkey = {
-            .ip = 0,  // 0.0.0.0 wildcard
-            .port = dst_port,
-            .proto = ip_proto,
-            .pad = 0
-        };
-        struct port_val *pval = bpf_map_lookup_elem(&map_ports, &pkey);
-        if (pval) {
-            decision_made = 1;
-            if (pval->action == 1) {
-                allowed = 1;
-            }
-        }
-    }
-
-    // If no specific rule made a decision, use default action
-    if (!decision_made) {
-        __u32 def_key = 0;
-        __u8 *default_action = bpf_map_lookup_elem(&map_default_action, &def_key);
-        if (default_action && *default_action == 1) {
-            allowed = 1;
-        }
-    }
+    // The allow/deny decision (map_cidrs → map_ports → wildcard → default)
+    // is shared with cg_origin_egress via verdict.h.
+    __u8 allowed = verdict_allowed_v4(dst_ip_nbo, dst_port, ip_proto);
 
     if (!allowed) {
         if (is_tcp_syn || ip_proto == IPPROTO_UDP) {
@@ -671,72 +516,9 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
         }
     }
 
-    // Check firewall rules using IPv6 LPM trie
-    struct lpm_key_v6 key;
-    __builtin_memset(&key, 0, sizeof(key));
-    key.prefixlen = 128;
-    __builtin_memcpy(key.ip, dst_ip6, 16);
-
-    struct lpm_val *rule = bpf_map_lookup_elem(&map_cidrs_v6, &key);
-    __u8 decision_made = 0;
-    __u8 allowed = 0;
-
-    if (rule) {
-        if (rule->port_specific == 0) {
-            decision_made = 1;
-            if (rule->action == 1) {
-                allowed = 1;
-            }
-        } else {
-            // Check IPv6 port map
-            struct port_key_v6 pkey;
-            __builtin_memset(&pkey, 0, sizeof(pkey));
-            __builtin_memcpy(pkey.ip, dst_ip6, 16);
-            pkey.port = dst_port;
-            pkey.proto = nexthdr;
-
-            struct port_val *pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
-            if (pval) {
-                decision_made = 1;
-                if (pval->action == 1) {
-                    allowed = 1;
-                }
-            } else {
-                // Check for wildcard [::]:port entries
-                __builtin_memset(pkey.ip, 0, 16);
-                pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
-                if (pval) {
-                    decision_made = 1;
-                    if (pval->action == 1) {
-                        allowed = 1;
-                    }
-                }
-            }
-        }
-    } else {
-        // No LPM match - check for wildcard port rules
-        struct port_key_v6 pkey;
-        __builtin_memset(&pkey, 0, sizeof(pkey));
-        pkey.port = dst_port;
-        pkey.proto = nexthdr;
-
-        struct port_val *pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
-        if (pval) {
-            decision_made = 1;
-            if (pval->action == 1) {
-                allowed = 1;
-            }
-        }
-    }
-
-    // If no specific rule made a decision, use default action
-    if (!decision_made) {
-        __u32 def_key = 0;
-        __u8 *default_action = bpf_map_lookup_elem(&map_default_action, &def_key);
-        if (default_action && *default_action == 1) {
-            allowed = 1;
-        }
-    }
+    // The allow/deny decision (map_cidrs_v6 → map_ports_v6 → wildcard →
+    // default) is shared with cg_origin_egress via verdict.h.
+    __u8 allowed = verdict_allowed_v6(dst_ip6, dst_port, nexthdr);
 
     if (!allowed) {
         if (is_tcp_syn || nexthdr == IPPROTO_UDP) {

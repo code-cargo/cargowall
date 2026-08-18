@@ -140,24 +140,18 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
+      # Step bodies live in scripts/ci/enforce.sh; the YAML is wiring.
       - name: Warm systemd-resolved cache before attach (reproduce #89)
-        run: |
-          # GitHub's Azure runners resolve via systemd-resolved (127.0.0.53).
-          # Populate its stub cache with a wildcard-matched name BEFORE cargowall
-          # attaches. The concrete name can't be pre-tracked, so only the
-          # attach-time cache flush makes the later getaddrinfo miss the stub and
-          # re-resolve through the proxy — where **.githubusercontent.com matches
-          # and the IP is allowed with attribution. Without the flush the warm
-          # entry is served invisibly and the "hostname pattern" curl below is
-          # blocked as a bare IP. Best-effort so runners without systemd-resolved
-          # simply fall back to the cold-cache path.
-          resolvectl query raw.githubusercontent.com 2>/dev/null \
-            || getent ahosts raw.githubusercontent.com \
-            || true
-          echo "Warmed resolver cache for raw.githubusercontent.com"
+        run: bash scripts/ci/enforce.sh warm-resolver
 
       - name: Start CargoWall via Action
         uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        env:
+          # 3a telemetry: per-program overhead numbers (cg_origin_egress vs
+          # the tc_egress baseline) land in the daemon's shutdown log during
+          # the action's post step. Informational — shared-runner variance
+          # makes ns thresholds flaky, so nothing asserts on them.
+          CARGOWALL_BPF_STATS: 'true'
         with:
           mode: enforce
           offline: 'true'
@@ -169,160 +163,88 @@ jobs:
           debug: true
 
       - name: Test allowed connection via hostname pattern
-        run: |
-          # Runs FIRST among the connection tests: it doubles as the #89
-          # regression check for raw.githubusercontent.com, which was warmed
-          # into the systemd-resolved stub cache before attach (step above).
-          # Keeping it first minimizes the warm→request window so a short record
-          # TTL can't expire the entry and silently degrade this to the ordinary
-          # cold-cache path. If the attach-time cache flush regresses, this
-          # getaddrinfo is served invisibly from the warm stub, the proxy never
-          # sees the name, and the connection is blocked as a bare IP — failing
-          # here.
-          curl -sf --connect-timeout 10 --max-time 30 https://raw.githubusercontent.com/github/gitignore/main/README.md > /dev/null
-          echo "✅ raw.githubusercontent.com allowed via **.githubusercontent.com pattern (warm-cache re-resolved through proxy)"
+        run: bash scripts/ci/enforce.sh allowed-pattern
 
       - name: Test allowed connection
-        run: |
-          curl -sf --connect-timeout 10 --max-time 30 https://github.com > /dev/null
-          echo "✅ github.com allowed"
+        run: bash scripts/ci/enforce.sh allowed
 
       - name: Test blocked connection
-        run: |
-          if curl -sf --connect-timeout 5 --max-time 10 https://example.com > /dev/null 2>&1; then
-            echo "❌ example.com should be blocked"
-            exit 1
-          fi
-          echo "✅ example.com blocked"
+        run: bash scripts/ci/enforce.sh blocked
 
       - name: Test blocked direct IP connection
-        run: |
-          echo "Testing direct IP connection (bypassing DNS): 93.184.216.34 (example.com)"
-          if curl -s --connect-timeout 5 --max-time 10 -o /dev/null http://93.184.216.34 2>&1; then
-            echo "❌ Direct IP connection succeeded (should have been blocked)"
-            exit 1
-          fi
-          echo "✅ Direct IP connection blocked"
+        run: bash scripts/ci/enforce.sh blocked-ip
 
       - name: Test Docker pull through cargowall
-        run: |
-          docker pull alpine:latest
-          echo "✅ Docker pull succeeded through cargowall"
+        run: bash scripts/ci/enforce.sh docker-pull
 
       - name: Test Docker container filtering
-        run: |
-          # Test container can reach allowed host
-          docker run --rm alpine:latest sh -c "
-            wget -q --spider --timeout=15 https://github.com && echo 'CONNECTION_SUCCESS' || echo 'CONNECTION_FAILED'
-          " 2>&1 | grep -q "CONNECTION_SUCCESS"
-          echo "✅ Docker container reached github.com"
+        run: bash scripts/ci/enforce.sh docker-filter
 
-          # Test container is blocked from non-allowed host
-          RESULT=$(docker run --rm alpine:latest sh -c "
-            wget -q --spider --timeout=5 https://example.com && echo 'CONNECTION_SUCCESS' || echo 'CONNECTION_BLOCKED'
-          " 2>&1) || true
-          if echo "$RESULT" | grep -q "CONNECTION_SUCCESS"; then
-            echo "❌ Docker container should not reach example.com"
-            exit 1
-          fi
-          echo "✅ Docker container blocked from example.com"
+      # The four steps below are backed by scripts/ci/container-attribution.sh;
+      # the YAML is wiring. One workflow step per subcommand is load-bearing:
+      # step ordinals come from step boundaries, and the validate assertions
+      # test relations between them (exec ordinal > start ordinal; the three
+      # concurrent containers share one).
+      - name: Container attribution scenarios (issue #106)
+        run: bash scripts/ci/container-attribution.sh scenarios
+
+      - name: Container exec attribution (separate step on purpose)
+        run: bash scripts/ci/container-attribution.sh exec
+
+      - name: Bridge-local traffic (host→published port, container→container)
+        run: bash scripts/ci/container-attribution.sh bridge
 
       - name: Validate audit log events
-        run: |
-          AUDIT_LOG=/tmp/cargowall-audit.json
-
-          if [ ! -f "$AUDIT_LOG" ] || [ ! -s "$AUDIT_LOG" ]; then
-            echo "❌ Audit log file not found or empty"
-            exit 1
-          fi
-          echo "✅ Audit log exists ($(wc -l < "$AUDIT_LOG") lines)"
-
-          EVENTS_VALID=true
-
-          BLOCKED_COUNT=$(jq -s '[.[] | select(.event_type == "connection_blocked" and .blocked == true)] | length' "$AUDIT_LOG")
-          echo "connection_blocked events (blocked=true): $BLOCKED_COUNT"
-          if [ "$BLOCKED_COUNT" -eq 0 ]; then
-            echo "❌ No connection_blocked events found"
-            EVENTS_VALID=false
-          fi
-
-          DNS_BLOCKED_COUNT=$(jq -s '[.[] | select(.event_type == "dns_blocked")] | length' "$AUDIT_LOG")
-          echo "dns_blocked events: $DNS_BLOCKED_COUNT"
-          if [ "$DNS_BLOCKED_COUNT" -eq 0 ]; then
-            echo "❌ No dns_blocked events found"
-            EVENTS_VALID=false
-          fi
-
-          # Step attribution runs against the real Runner.Worker on this job
-          # (the action passes --github-action, which implies it). The daemon
-          # deliberately degrades to a warning when attribution can't start,
-          # so these are the only assertions that catch a silent degrade on
-          # the environment that matters.
-          STEP_BOUNDARY_COUNT=$(jq -s '[.[] | select(.event_type == "step_boundary")] | length' "$AUDIT_LOG")
-          echo "step_boundary events: $STEP_BOUNDARY_COUNT"
-          if [ "$STEP_BOUNDARY_COUNT" -eq 0 ]; then
-            echo "❌ No step_boundary events found (step attribution silently degraded?)"
-            EVENTS_VALID=false
-          fi
-
-          # Every curl above ran in a post-attach `run:` step, so its
-          # connection events must carry a real (small) step ordinal — not 0
-          # (untagged) and not the runner/pre-daemon sentinels. The upper
-          # bound is pkg/steps maxOrdinalBase (0xFFFFFFFE minus the 2^16
-          # sentinel margin = 4294901758): no real ordinal can start there.
-          STEP_TAGGED_COUNT=$(jq -s '[.[] | select(.event_type | test("^connection_")) | select((.step_ordinal // 0) > 0 and (.step_ordinal // 0) < 4294901758)] | length' "$AUDIT_LOG")
-          echo "connection events with a real step_ordinal: $STEP_TAGGED_COUNT"
-          if [ "$STEP_TAGGED_COUNT" -eq 0 ]; then
-            echo "❌ No connection events carry a step ordinal"
-            EVENTS_VALID=false
-          fi
-
-          # Evidence dump: the raw attribution rows, so a passing run shows
-          # first-hand what was tagged (and a failing one shows what wasn't).
-          echo "--- step_boundary events ---"
-          jq -c 'select(.event_type == "step_boundary") | {step_ordinal, pid, process}' "$AUDIT_LOG"
-          echo "--- attributed connection events ---"
-          jq -c 'select(.event_type | test("^connection_")) | {step_ordinal: (.step_ordinal // 0), event_type, dst_hostname, dst_ip, dst_port, process}' "$AUDIT_LOG"
-
-          if [ "$EVENTS_VALID" = true ]; then
-            echo "✅ Audit log contains expected event types"
-          else
-            echo "❌ Audit log missing expected event types"
-            echo "Sample entries:"
-            head -5 "$AUDIT_LOG" | jq .
-            exit 1
-          fi
+        run: bash scripts/ci/container-attribution.sh validate
 
       - name: Test summary command
-        run: |
-          SUMMARY_OUTPUT=$(./bin/cargowall summary --audit-log /tmp/cargowall-audit.json --steps '[]' 2>&1)
+        run: bash scripts/ci/enforce.sh summary
 
-          echo "Summary output:"
-          echo "$SUMMARY_OUTPUT"
+  test-cargowall-cgroup-enforce:
+    name: Integration Test (Cgroup Enforce)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-          SUMMARY_VALID=true
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
 
-          if ! echo "$SUMMARY_OUTPUT" | grep -q "Enforce Mode"; then
-            echo "❌ Missing 'Enforce Mode' header"
-            SUMMARY_VALID=false
-          fi
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
 
-          if ! echo "$SUMMARY_OUTPUT" | grep -q "### Summary"; then
-            echo "❌ Missing '### Summary' section"
-            SUMMARY_VALID=false
-          fi
+      # The job body lives in scripts/ci/cgroup-enforce.sh; this YAML is
+      # wiring only. `pre` runs before cargowall starts (pre-enableMode
+      # pre-scan shape), `verify` holds every post-start assertion.
+      - name: Pre-create a user-defined bridge (service-container shape)
+        run: bash scripts/ci/cgroup-enforce.sh pre
 
-          if ! echo "$SUMMARY_OUTPUT" | grep -q "Connections blocked"; then
-            echo "❌ Missing 'Connections blocked' metric"
-            SUMMARY_VALID=false
-          fi
+      - name: Start CargoWall with cgroup enforcement (issue #106 phase 3b)
+        uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        env:
+          # The whole point of this job: the root-cgroup hook is
+          # authoritative for traffic with a local socket (pre-NAT, socket
+          # context), with TC egress still attached as the fail-closed
+          # backstop for everything else.
+          CARGOWALL_CGROUP_ENFORCE: 'true'
+        with:
+          mode: enforce
+          offline: 'true'
+          allowed-hosts: |
+             docker.io
+             docker.com
+             **.githubusercontent.com
+          binary-path: ./bin/cargowall
+          debug: true
 
-          if [ "$SUMMARY_VALID" = true ]; then
-            echo "✅ Summary command produces valid markdown"
-          else
-            echo "❌ Summary command output missing expected content"
-            exit 1
-          fi
+      - name: Verify cgroup enforcement
+        run: bash scripts/ci/cgroup-enforce.sh verify
 
   test-cargowall-audit:
     name: Integration Test (Audit Mode)
@@ -375,193 +297,38 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
+      # Step bodies live in scripts/ci/sudo-lockdown.sh (shared with the
+      # full-block job below); the YAML is wiring.
       - name: Snapshot pre-lockdown sudo state
-        run: |
-          echo "--- Runner user info ---"
-          id runner
-          echo "--- Groups ---"
-          groups runner
-          echo "--- sudoers.d contents ---"
-          sudo ls -la /etc/sudoers.d/
-          echo "--- Verify runner has full sudo ---"
-          sudo whoami
-          echo "--- Save sudoers.d file list for later comparison ---"
-          sudo ls /etc/sudoers.d/ | sort > /tmp/sudoers-before.txt
+        run: bash scripts/ci/sudo-lockdown.sh snapshot
 
       - name: Start CargoWall with sudo lockdown
-        run: |
-          # Start cargowall inside a root wrapper that watches for a stop
-          # trigger. Once lockdown is active the runner user cannot sudo kill,
-          # so we need an already-root process that can send SIGTERM.
-          sudo bash -c '
-            ./bin/cargowall start \
-              --github-action \
-              --audit-mode \
-              --sudo-lockdown \
-              --sudo-allow-commands "/usr/sbin/iptables,/usr/sbin/ip6tables" \
-              --dns-upstream "8.8.8.8:53" &
-            CW_PID=$!
-            echo $CW_PID > /tmp/cargowall-pid
-            # Wait for stop trigger (created by a later step — no sudo needed)
-            while [ ! -f /tmp/cargowall-stop ]; do sleep 1; done
-            kill -TERM $CW_PID
-            wait $CW_PID 2>/dev/null
-          ' &
-
-          # Wait for cargowall to be ready
-          for i in $(seq 1 30); do
-            if [ -f /tmp/cargowall-ready ]; then
-              echo "CargoWall ready after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-          if [ ! -f /tmp/cargowall-ready ]; then
-            echo "CargoWall did not become ready"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh start "/usr/sbin/iptables,/usr/sbin/ip6tables"
 
       - name: Test allowed sudo command works
-        run: |
-          if sudo /usr/sbin/iptables -L -n > /dev/null 2>&1; then
-            echo "✅ Allowed command (iptables) works via sudo"
-          else
-            echo "❌ Allowed command (iptables) failed via sudo"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh expect-allowed iptables /usr/sbin/iptables -L -n
 
       - name: Test blocked sudo command is denied
-        run: |
-          OUTPUT=$(sudo -n /usr/bin/apt-get --version 2>&1) && {
-            echo "❌ apt-get should be blocked by sudo lockdown"
-            exit 1
-          }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
-            echo "✅ Blocked command (apt-get) denied by sudo"
-          else
-            echo "❌ apt-get failed but not due to sudoers denial: $OUTPUT"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh expect-denied apt-get /usr/bin/apt-get --version
 
       - name: Test sudo bash is denied
-        run: |
-          OUTPUT=$(sudo -n /bin/bash -c "echo pwned" 2>&1) && {
-            echo "❌ sudo bash should be blocked"
-            exit 1
-          }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
-            echo "✅ sudo bash denied"
-          else
-            echo "❌ bash failed but not due to sudoers denial: $OUTPUT"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh expect-denied "sudo bash" /bin/bash -c "echo pwned"
 
       - name: Test sudo kill is denied
-        run: |
-          OUTPUT=$(sudo -n /usr/bin/kill -0 1 2>&1) && {
-            echo "❌ sudo kill should be blocked (not in allow list)"
-            exit 1
-          }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
-            echo "✅ sudo kill denied"
-          else
-            echo "❌ kill failed but not due to sudoers denial: $OUTPUT"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh expect-denied "sudo kill" /usr/bin/kill -0 1
 
       - name: Stop CargoWall and verify cleanup
-        run: |
-          CW_PID=$(cat /tmp/cargowall-pid)
-
-          # Signal the root wrapper to send SIGTERM — no sudo needed
-          touch /tmp/cargowall-stop
-
-          # Wait for cargowall to exit. Use /proc to check since kill -0
-          # requires permission on a root-owned process.
-          for i in $(seq 1 15); do
-            if [ ! -d "/proc/$CW_PID" ]; then
-              echo "CargoWall stopped after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-          if [ -d "/proc/$CW_PID" ]; then
-            echo "❌ CargoWall did not stop within 15s"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh stop-verify
 
       - name: Verify sudo access restored
-        run: |
-          echo "--- sudoers.d after cleanup ---"
-          sudo ls -la /etc/sudoers.d/
-
-          # Lockdown file should be removed
-          if sudo test -f /etc/sudoers.d/zz-cargowall-lockdown; then
-            echo "❌ Lockdown sudoers file still exists after cleanup"
-            exit 1
-          fi
-          echo "✅ Lockdown sudoers file removed"
-
-          # State file should be removed
-          if sudo test -f /etc/sudoers.d/.cargowall-lockdown-state; then
-            echo "❌ State file still exists after cleanup"
-            exit 1
-          fi
-          echo "✅ State file removed"
-
-          # Disabled files should be restored
-          STILL_DISABLED=$(sudo ls /etc/sudoers.d/ | grep -c '\.cargowall-disabled$' || true)
-          if [ "$STILL_DISABLED" -gt 0 ]; then
-            echo "❌ $STILL_DISABLED sudoers files still disabled after cleanup"
-            sudo ls -la /etc/sudoers.d/
-            exit 1
-          fi
-          echo "✅ All disabled sudoers files restored"
-
-          # sudoers.d should be back to original state
-          sudo ls /etc/sudoers.d/ | sort > /tmp/sudoers-after.txt
-          if ! diff /tmp/sudoers-before.txt /tmp/sudoers-after.txt; then
-            echo "❌ sudoers.d contents differ from pre-lockdown state"
-            exit 1
-          fi
-          echo "✅ sudoers.d contents match pre-lockdown state"
+        run: bash scripts/ci/sudo-lockdown.sh verify-restored
 
       - name: Verify runner has full sudo again
-        run: |
-          if sudo whoami > /dev/null 2>&1; then
-            echo "✅ Full sudo access restored"
-          else
-            echo "❌ sudo access not restored after cleanup"
-            exit 1
-          fi
-
-          # Verify unrestricted commands work again
-          if sudo apt-get --version > /dev/null 2>&1; then
-            echo "✅ Previously blocked commands now work"
-          else
-            echo "❌ apt-get still blocked after cleanup"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh verify-full-sudo
 
       - name: Emergency cleanup
         if: always()
-        run: |
-          # Signal the root wrapper to stop cargowall gracefully
-          touch /tmp/cargowall-stop
-          sleep 5
-          # If we still have sudo, clean up any remnants
-          if sudo -n true 2>/dev/null; then
-            sudo rm -f /etc/sudoers.d/zz-cargowall-lockdown
-            sudo rm -f /etc/sudoers.d/.cargowall-lockdown-state
-            for f in /etc/sudoers.d/*.cargowall-disabled; do
-              [ -f "$f" ] || continue
-              sudo mv "$f" "${f%.cargowall-disabled}"
-            done
-            for group in sudo admin wheel; do
-              sudo gpasswd -a runner "$group" 2>/dev/null || true
-            done
-          fi
-          echo "Emergency cleanup complete"
+        run: bash scripts/ci/sudo-lockdown.sh emergency
 
   test-sudo-lockdown-full-block:
     name: Integration Test (Sudo Lockdown - Full Block)
@@ -582,146 +349,34 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
+      # Step bodies live in scripts/ci/sudo-lockdown.sh; the YAML is wiring.
       - name: Snapshot pre-lockdown sudo state
-        run: |
-          sudo ls /etc/sudoers.d/ | sort > /tmp/sudoers-before.txt
+        run: bash scripts/ci/sudo-lockdown.sh snapshot
 
       - name: Start CargoWall with sudo lockdown (no allowed commands)
-        run: |
-          sudo bash -c '
-            ./bin/cargowall start \
-              --github-action \
-              --audit-mode \
-              --sudo-lockdown \
-              --dns-upstream "8.8.8.8:53" &
-            CW_PID=$!
-            echo $CW_PID > /tmp/cargowall-pid
-            while [ ! -f /tmp/cargowall-stop ]; do sleep 1; done
-            kill -TERM $CW_PID
-            wait $CW_PID 2>/dev/null
-          ' &
-
-          for i in $(seq 1 30); do
-            if [ -f /tmp/cargowall-ready ]; then
-              echo "CargoWall ready after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-          if [ ! -f /tmp/cargowall-ready ]; then
-            echo "CargoWall did not become ready"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh start
 
       - name: Test iptables is denied (no commands allowed)
-        run: |
-          OUTPUT=$(sudo -n /usr/sbin/iptables -L -n 2>&1) && {
-            echo "❌ iptables should be blocked with no allowed commands"
-            exit 1
-          }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
-            echo "✅ iptables denied (full block mode)"
-          else
-            echo "❌ iptables failed but not due to sudoers denial: $OUTPUT"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh expect-denied iptables /usr/sbin/iptables -L -n
 
       - name: Test apt-get is denied
-        run: |
-          OUTPUT=$(sudo -n /usr/bin/apt-get --version 2>&1) && {
-            echo "❌ apt-get should be blocked"
-            exit 1
-          }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
-            echo "✅ apt-get denied (full block mode)"
-          else
-            echo "❌ apt-get failed but not due to sudoers denial: $OUTPUT"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh expect-denied apt-get /usr/bin/apt-get --version
 
       - name: Test sudo bash is denied
-        run: |
-          OUTPUT=$(sudo -n /bin/bash -c "echo pwned" 2>&1) && {
-            echo "❌ sudo bash should be blocked"
-            exit 1
-          }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
-            echo "✅ sudo bash denied (full block mode)"
-          else
-            echo "❌ bash failed but not due to sudoers denial: $OUTPUT"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh expect-denied "sudo bash" /bin/bash -c "echo pwned"
 
       - name: Stop CargoWall and verify cleanup
-        run: |
-          CW_PID=$(cat /tmp/cargowall-pid)
-          touch /tmp/cargowall-stop
-          for i in $(seq 1 15); do
-            if [ ! -d "/proc/$CW_PID" ]; then
-              echo "CargoWall stopped after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-          if [ -d "/proc/$CW_PID" ]; then
-            echo "❌ CargoWall did not stop within 15s"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh stop-verify
 
       - name: Verify sudo access restored
-        run: |
-          if sudo test -f /etc/sudoers.d/zz-cargowall-lockdown; then
-            echo "❌ Lockdown sudoers file still exists after cleanup"
-            exit 1
-          fi
-          echo "✅ Lockdown sudoers file removed"
-
-          if sudo test -f /etc/sudoers.d/.cargowall-lockdown-state; then
-            echo "❌ State file still exists after cleanup"
-            exit 1
-          fi
-          echo "✅ State file removed"
-
-          STILL_DISABLED=$(sudo ls /etc/sudoers.d/ | grep -c '\.cargowall-disabled$' || true)
-          if [ "$STILL_DISABLED" -gt 0 ]; then
-            echo "❌ $STILL_DISABLED sudoers files still disabled after cleanup"
-            exit 1
-          fi
-          echo "✅ All disabled sudoers files restored"
-
-          sudo ls /etc/sudoers.d/ | sort > /tmp/sudoers-after.txt
-          if ! diff /tmp/sudoers-before.txt /tmp/sudoers-after.txt; then
-            echo "❌ sudoers.d contents differ from pre-lockdown state"
-            exit 1
-          fi
-          echo "✅ sudoers.d contents match pre-lockdown state"
+        run: bash scripts/ci/sudo-lockdown.sh verify-restored
 
       - name: Verify runner has full sudo again
-        run: |
-          if sudo whoami > /dev/null 2>&1; then
-            echo "✅ Full sudo access restored"
-          else
-            echo "❌ sudo access not restored after cleanup"
-            exit 1
-          fi
+        run: bash scripts/ci/sudo-lockdown.sh verify-full-sudo
 
       - name: Emergency cleanup
         if: always()
-        run: |
-          touch /tmp/cargowall-stop
-          sleep 5
-          if sudo -n true 2>/dev/null; then
-            sudo rm -f /etc/sudoers.d/zz-cargowall-lockdown
-            sudo rm -f /etc/sudoers.d/.cargowall-lockdown-state
-            for f in /etc/sudoers.d/*.cargowall-disabled; do
-              [ -f "$f" ] || continue
-              sudo mv "$f" "${f%.cargowall-disabled}"
-            done
-            for group in sudo admin wheel; do
-              sudo gpasswd -a runner "$group" 2>/dev/null || true
-            done
-          fi
-          echo "Emergency cleanup complete"
+        run: bash scripts/ci/sudo-lockdown.sh emergency
 
   test-cargowall-gitlab-ci:
     name: Integration Test (GitLab CI mode)
@@ -742,45 +397,12 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
+      # Step bodies live in scripts/ci/gitlab-ci.sh; the YAML is wiring.
       - name: Write minimal policy
-        run: |
-          sudo mkdir -p /etc/cargowall
-          sudo tee /etc/cargowall/config.json > /dev/null <<'JSON'
-          {
-            "defaultAction": "deny",
-            "rules": [
-              {
-                "type": "hostname",
-                "value": "github.com",
-                "ports": [{"port": 443, "protocol": "tcp"}],
-                "action": "allow"
-              },
-              {
-                "type": "cidr",
-                "value": "8.8.8.8/32",
-                "ports": [{"port": 53, "protocol": "udp"}],
-                "action": "allow"
-              }
-            ],
-            "searchDomains": [".compute.internal"]
-          }
-          JSON
+        run: bash scripts/ci/gitlab-ci.sh policy
 
       - name: Start CargoWall with --gitlab-ci preset
-        run: |
-          # nohup + & + disown lets cargowall outlive this step's shell.
-          # The privileged-Docker stand-in for GitLab SaaS doesn't exist on
-          # GitHub Actions runners, so we exercise the same code path on the
-          # Azure-backed Linux runner — eBPF + sudo + iptables work the same.
-          sudo nohup ./bin/cargowall start \
-            --gitlab-ci \
-            --audit-mode \
-            --audit-log /tmp/cargowall-audit.json \
-            --pidfile /tmp/cargowall.pid \
-            --dns-upstream "8.8.8.8:53" \
-            --debug \
-            > /tmp/cargowall.log 2>&1 &
-          disown
+        run: bash scripts/ci/gitlab-ci.sh start
 
       - name: Wait for ready via wait-ready subcommand
         run: ./bin/cargowall wait-ready --timeout 30s
@@ -790,144 +412,41 @@ jobs:
         run: sudo cat /tmp/cargowall.log || true
 
       - name: Verify systemd-resolved cache flush ran at attach (#89)
-        run: |
-          # On the Azure runner the client resolver is systemd-resolved, whose
-          # warm stub cache used to serve pre-attach answers invisibly (#89).
-          # With the DNS redirect active (--gitlab-ci preset), cargowall flushes
-          # that cache at attach so future lookups traverse the proxy. Assert the
-          # FlushResolvedCache path executed — the flush itself on a resolved
-          # host, or the documented best-effort skip elsewhere.
-          if sudo grep -q "Flushed systemd-resolved DNS cache" /tmp/cargowall.log; then
-            echo "✅ resolved cache flushed at attach"
-          elif sudo grep -qE "systemd-resolved not running|resolvectl not found" /tmp/cargowall.log; then
-            echo "ℹ️ systemd-resolved not in use on this runner; flush correctly skipped"
-          else
-            echo "❌ neither flush nor skip logged — FlushResolvedCache path not reached"
-            sudo grep -iE "resolv|flush|dns redirect" /tmp/cargowall.log || true
-            exit 1
-          fi
+        run: bash scripts/ci/gitlab-ci.sh verify-flush
 
       - name: Verify pidfile written
-        run: |
-          if ! sudo test -s /tmp/cargowall.pid; then
-            echo "❌ pidfile /tmp/cargowall.pid was not written"
-            exit 1
-          fi
-          echo "✅ pidfile present, pid=$(sudo cat /tmp/cargowall.pid)"
+        run: bash scripts/ci/gitlab-ci.sh verify-pidfile
 
       - name: Allowed call reaches github.com
-        run: |
-          curl -sf --connect-timeout 10 --max-time 30 https://github.com > /dev/null
-          echo "✅ github.com reachable"
+        run: bash scripts/ci/gitlab-ci.sh allowed
 
       - name: Disallowed call still goes through (audit mode logs only)
-        run: |
-          curl -sf --connect-timeout 5 --max-time 10 https://example.com > /dev/null || true
-          echo "✅ example.com fetch attempted (audit mode does not block)"
+        run: bash scripts/ci/gitlab-ci.sh disallowed
 
       - name: DNS query under search-domain suffix is NOT logged as blocked
-        run: |
-          # `.compute.internal` is configured as a search domain (see policy
-          # above). A query for a name under that suffix with no matching
-          # hostname rule should pass cargowall's filter via the bypass.
-          # In audit mode this means: no dns_blocked event is logged for it.
-          # The upstream will return NXDOMAIN for an ephemeral name like
-          # this, which is fine — we only care about cargowall's verdict.
-          dig +time=5 +tries=1 @127.0.0.1 ip-10-0-0-5.us-west-2.compute.internal A > /tmp/bypass-query.log 2>&1 || true
-          cat /tmp/bypass-query.log
-          echo "✅ search-domain query issued"
+        run: bash scripts/ci/gitlab-ci.sh dns-bypass
 
       - name: DNS query NOT covered by rule or search-domain IS logged
-        run: |
-          # No hostname rule, no search-domain match — cargowall should log
-          # this as dns_blocked-would (audit mode lets the query through
-          # but records the would-be-deny).
-          dig +time=5 +tries=1 @127.0.0.1 nonexistent.example.org A > /tmp/blocked-query.log 2>&1 || true
-          cat /tmp/blocked-query.log
-          echo "✅ control query issued"
+        run: bash scripts/ci/gitlab-ci.sh dns-control
 
       - name: Verify search-domain bypass distinguished from would-deny
-        run: |
-          AUDIT_LOG=/tmp/cargowall-audit.json
-          if ! sudo test -s "$AUDIT_LOG"; then
-            echo "❌ Audit log not written"
-            exit 1
-          fi
-
-          # The bypassed query must NOT appear in dns_blocked events.
-          BYPASSED_LOGGED=$(sudo jq -s '[
-            .[] | select(.event_type == "dns_blocked")
-                | select((.dst_hostname // "") | contains("compute.internal"))
-          ] | length' "$AUDIT_LOG")
-          if [ "$BYPASSED_LOGGED" -ne 0 ]; then
-            echo "❌ search-domain query incorrectly logged as dns_blocked ($BYPASSED_LOGGED entries)"
-            sudo jq -s '.[] | select(.event_type == "dns_blocked")' "$AUDIT_LOG"
-            exit 1
-          fi
-          echo "✅ search-domain query not in dns_blocked log"
-
-          # The control query MUST appear in dns_blocked.
-          BLOCKED_LOGGED=$(sudo jq -s '[
-            .[] | select(.event_type == "dns_blocked")
-                | select((.dst_hostname // "") | contains("nonexistent.example.org"))
-          ] | length' "$AUDIT_LOG")
-          if [ "$BLOCKED_LOGGED" -eq 0 ]; then
-            echo "❌ control query missing from dns_blocked log"
-            sudo jq -s '.[] | select(.event_type == "dns_blocked")' "$AUDIT_LOG"
-            exit 1
-          fi
-          echo "✅ control query correctly in dns_blocked log"
+        run: bash scripts/ci/gitlab-ci.sh verify-dns-verdicts
 
       - name: Verify cloud-provider detection ran
-        run: |
-          # --gitlab-ci enables --auto-allow-cloud-metadata, which triggers
-          # the new detectCloudProvider path. GitHub-hosted runners are on
-          # Azure VMs, so detection should resolve to "azure" via the
-          # chassis_asset_tag or wireserver-upstream fallback.
-          if ! sudo grep -q "Cloud provider detection" /tmp/cargowall.log; then
-            echo "❌ 'Cloud provider detection' log line missing"
-            sudo grep -i "cloud\|detect" /tmp/cargowall.log || true
-            exit 1
-          fi
-          DETECTED=$(sudo grep "Cloud provider detection" /tmp/cargowall.log | head -1)
-          echo "✅ Cloud provider detection ran: $DETECTED"
+        run: bash scripts/ci/gitlab-ci.sh verify-cloud-detect
 
       - name: Validate audit log contains would-deny events
-        run: |
-          AUDIT_LOG=/tmp/cargowall-audit.json
-          if ! sudo test -s "$AUDIT_LOG"; then
-            echo "❌ Audit log not written"
-            exit 1
-          fi
-          BLOCKED=$(sudo jq -s '[.[] | select(.event_type == "connection_blocked" or .event_type == "dns_blocked")] | length' "$AUDIT_LOG")
-          echo "would-deny events: $BLOCKED"
-          if [ "$BLOCKED" -eq 0 ]; then
-            echo "❌ Expected at least one would-deny event in audit log"
-            sudo head -5 "$AUDIT_LOG" | jq .
-            exit 1
-          fi
-          echo "✅ Audit log contains $BLOCKED would-deny events"
+        run: bash scripts/ci/gitlab-ci.sh verify-audit
 
       - name: Stop CargoWall via stop subcommand
-        run: |
-          sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid --timeout 15s
-          echo "✅ stop subcommand returned cleanly"
+        run: bash scripts/ci/gitlab-ci.sh stop
 
       - name: Verify pidfile removed
-        run: |
-          if sudo test -f /tmp/cargowall.pid; then
-            echo "❌ pidfile still present after stop"
-            sudo ls -la /tmp/cargowall.pid
-            exit 1
-          fi
-          echo "✅ pidfile cleaned up"
+        run: bash scripts/ci/gitlab-ci.sh verify-pidfile-removed
 
       - name: Emergency cleanup
         if: always()
-        run: |
-          if sudo test -f /tmp/cargowall.pid; then
-            sudo kill -TERM $(sudo cat /tmp/cargowall.pid) 2>/dev/null || true
-          fi
+        run: bash scripts/ci/gitlab-ci.sh emergency
 
   test-cargowall-saas:
     name: Integration Test (SaaS)

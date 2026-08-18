@@ -33,6 +33,18 @@ const (
 	EventDNSBlocked            AuditEventType = "dns_blocked"
 	EventExistingConnection    AuditEventType = "existing_connection"
 	EventStepBoundary          AuditEventType = "step_boundary"
+	// EventContainerAttribution marks one container/exec workload being tagged
+	// with a step ordinal (issue #106): a telemetry marker like step_boundary,
+	// describing no connection. TagLatencyMS/Privileged/AttributionKind are
+	// only meaningful on this type.
+	EventContainerAttribution AuditEventType = "container_attribution"
+	// EventCgroupWouldBlock is a connection the cgroup egress hook WOULD have
+	// dropped, reported while that hook is in shadow mode (issue #106 phase
+	// 3b). Nothing was blocked — TC's verdict still governed the packet.
+	// These measure the blast radius of the surfaces the cgroup hook newly
+	// adjudicates (loopback, docker bridge, container netns) before
+	// enforcement is turned on, so they are telemetry, not policy outcomes.
+	EventCgroupWouldBlock AuditEventType = "cgroup_would_block"
 )
 
 // Step-ordinal sentinels, mirroring STEP_ORD_* in tcbpf.c. Real workflow
@@ -70,6 +82,15 @@ type AuditEvent struct {
 	WouldDeny       bool           `json:"would_deny"`             // true in audit mode (would have been denied)
 	Blocked         bool           `json:"blocked"`                // true in enforce mode (actually blocked)
 	StepOrdinal     uint32         `json:"step_ordinal,omitempty"` // workflow step that (transitively) created the socket — causal, not temporal; see StepOrdinal* sentinels
+
+	// Container attribution (issue #106). All additive and omitempty: the
+	// summary reader tolerates their absence, so old daemons and new
+	// summaries (and vice versa) interoperate.
+	ContainerID     string  `json:"container_id,omitempty"`     // 12-char Docker container id the traffic/tag belongs to
+	ContainerOrigin bool    `json:"container_origin,omitempty"` // traffic classified as container-originated (with or without a step ordinal)
+	AttributionKind string  `json:"attribution_kind,omitempty"` // container_attribution only: "start" | "exec" | "reconcile"
+	TagLatencyMS    float64 `json:"tag_latency_ms,omitempty"`   // container_attribution only: docker event → tag-complete latency
+	Privileged      bool    `json:"privileged,omitempty"`       // container_attribution only: container runs --privileged (host-root equivalent)
 }
 
 // EventSink receives every audit event after the audit/enforce mode flags
@@ -134,11 +155,17 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 	// Skip for events that set their own flags (allowed, existing connection,
 	// late-allowed — where the connection was initially dropped by BPF but a
 	// subsequent rule match opened the firewall, so the policy outcome is allow)
-	// and for step boundaries, which describe no connection at all.
+	// and for step boundaries and container attributions, which describe no
+	// connection at all.
+	// cgroup_would_block also sets its own flags: nothing was blocked (the
+	// packet passed in shadow mode), so normalization must not stamp
+	// Blocked=true from the run's enforce posture.
 	if event.EventType != EventConnectionAllowed &&
 		event.EventType != EventConnectionLateAllowed &&
 		event.EventType != EventExistingConnection &&
-		event.EventType != EventStepBoundary {
+		event.EventType != EventStepBoundary &&
+		event.EventType != EventContainerAttribution &&
+		event.EventType != EventCgroupWouldBlock {
 		if a.auditMode {
 			event.WouldDeny = true
 			event.Blocked = false

@@ -54,9 +54,12 @@ var dnsRedirectRules = []dnsRedirectRule{
 	// Reverse-direction guard: an inbound sport-53 packet must not CREATE a
 	// flow — a reply racing the conntrack flush would re-create it reversed,
 	// with a null NAT binding no later flush can see (design.md, "DNS
-	// redirect"). Replies on ESTABLISHED entries never match.
-	{"INPUT", []string{"-p", "udp", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
-	{"INPUT", []string{"-p", "tcp", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
+	// redirect"). Replies on ESTABLISHED entries never match. Loopback is
+	// exempt: nothing on lo is DNAT'd, a reversed 127.x entry can never
+	// capture a later external-resolver query, and dropping a stub reply
+	// mid-transaction would cost the client its full resolver timeout.
+	{"INPUT", []string{"-p", "udp", "!", "-i", "lo", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
+	{"INPUT", []string{"-p", "tcp", "!", "-i", "lo", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
 }
 
 // SetupDNSRedirect adds iptables DNAT rules to redirect all outbound DNS

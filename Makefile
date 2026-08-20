@@ -67,7 +67,7 @@ test:
 
 test-bpf:
 	@printf "${GREEN}Running BPF tests (requires root)...${RESET}\n"
-	sudo go test -v -count=1 ./bpf/ ./pkg/tc/
+	sudo go test -v -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/
 
 test-ci:
 	@printf "${GREEN}Running CI tests...${RESET}\n"

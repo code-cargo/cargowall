@@ -32,7 +32,7 @@ import (
 // exercised against the marshaller.
 func tupleOrigPayload(t *testing.T, ct ctTuple) []byte {
 	t.Helper()
-	attrs, err := marshalTupleOrig(ct)
+	attrs, err := marshalDeleteAttrs(ct)
 	if err != nil {
 		t.Fatalf("marshal tuple: %v", err)
 	}
@@ -59,6 +59,14 @@ func TestParseConntrackTupleOrig_RoundTrip(t *testing.T) {
 	}
 	if !got.isDNS() {
 		t.Fatal("udp/53 tuple not classified as DNS")
+	}
+
+	// Non-default conntrack zone survives the round trip — a delete that
+	// drops the zone addresses zone 0 and ENOENTs on the real entry.
+	want.zone = 7
+	got, ok = parseConntrackTupleOrig(tupleOrigPayload(t, want))
+	if !ok || got != want {
+		t.Fatalf("zoned round-trip mismatch: ok=%v got %+v want %+v", ok, got, want)
 	}
 }
 
@@ -147,8 +155,9 @@ func sendUDP(t *testing.T, addr string) uint16 {
 	return uint16(conn.LocalAddr().(*net.UDPAddr).Port)
 }
 
-// listenTCP starts a TCP listener on addr (root can bind :53) that accepts
-// and holds connections, so established flows persist for the test window.
+// listenTCP starts a TCP listener on addr (root can bind :53). No Accept
+// needed: the kernel completes handshakes into the listen backlog, which is
+// enough to hold dialed flows ESTABLISHED for the test window.
 func listenTCP(t *testing.T, addr string) {
 	t.Helper()
 	ln, err := net.Listen("tcp4", addr)
@@ -156,15 +165,6 @@ func listenTCP(t *testing.T, addr string) {
 		t.Fatalf("listen %s: %v", addr, err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			defer c.Close()
-		}
-	}()
 }
 
 // dialTCP establishes a connection to addr and holds it open for the rest
@@ -231,20 +231,25 @@ func TestFlushDNSConntrack_Live(t *testing.T) {
 	tcpDNSPort := dialTCP(t, "127.0.0.2:53")
 	tcpOtherPort := dialTCP(t, "127.0.0.2:5353")
 
-	if !hasTuple(t, unix.IPPROTO_UDP, udpDNSPort, 53) {
-		t.Skip("conntrack not tracking loopback flows on this kernel/config")
+	// Skip ONLY when the table is empty (conntrack not observing loopback
+	// or not active). A non-empty table missing the just-planted flow is a
+	// wire-format regression in the parser under test — the exact failure
+	// this lane exists to catch — and must fail, not skip.
+	if len(dumpAll(t)) == 0 {
+		t.Skip("conntrack table empty — tracking not active on this kernel/config")
 	}
 	for _, pre := range []struct {
 		name         string
 		proto        uint8
 		sport, dport uint16
 	}{
+		{"udp:53", unix.IPPROTO_UDP, udpDNSPort, 53},
 		{"udp:5353", unix.IPPROTO_UDP, udpOtherPort, 5353},
 		{"tcp:53", unix.IPPROTO_TCP, tcpDNSPort, 53},
 		{"tcp:5353", unix.IPPROTO_TCP, tcpOtherPort, 5353},
 	} {
 		if !hasTuple(t, pre.proto, pre.sport, pre.dport) {
-			t.Fatalf("%s flow not tracked despite udp:53 being tracked", pre.name)
+			t.Fatalf("%s planted flow missing from a non-empty dump — parser or marshal regression", pre.name)
 		}
 	}
 

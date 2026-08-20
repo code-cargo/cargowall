@@ -33,33 +33,50 @@ const DNSProxyFWMark = 0xCA12
 // dnsProxyFWMarkStr is the hex string representation used in iptables rules.
 var dnsProxyFWMarkStr = fmt.Sprintf("0x%X", DNSProxyFWMark)
 
+// dnsRedirectRule is one iptables rule of the redirect: the chain it lives
+// in plus its match/target arguments.
+type dnsRedirectRule struct {
+	chain string
+	args  []string
+}
+
 // dnsRedirectRules defines the iptables rules for DNS redirection.
-// Each rule is a slice of arguments to pass to iptables.
-// Order matters: RETURN rules for marked packets must come before DNAT rules.
-var dnsRedirectRules = [][]string{
+// Order matters: RETURN rules for marked packets must come before DNAT
+// rules, and teardown deletes in REVERSE so the exemptions outlive the
+// DNAT they exempt from.
+var dnsRedirectRules = []dnsRedirectRule{
 	// Exempt the CargoWall DNS proxy's upstream queries (marked with DNSProxyFWMark)
-	{"-t", "nat", "-p", "udp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"},
-	{"-t", "nat", "-p", "tcp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"},
+	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"}},
+	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"}},
 	// Redirect all other outbound DNS to the local proxy
-	{"-t", "nat", "-p", "udp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"},
-	{"-t", "nat", "-p", "tcp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"},
+	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
+	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
+	// Reverse-direction guard: an inbound sport-53 packet must not CREATE a
+	// flow — a reply racing the conntrack flush would re-create it reversed,
+	// with a null NAT binding no later flush can see (design.md, "DNS
+	// redirect"). Replies on ESTABLISHED entries never match.
+	{"INPUT", []string{"-p", "udp", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
+	{"INPUT", []string{"-p", "tcp", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
 }
 
 // SetupDNSRedirect adds iptables DNAT rules to redirect all outbound DNS
-// (UDP+TCP port 53) to the local proxy at 127.0.0.1:53.
+// (UDP+TCP port 53) to the local proxy at 127.0.0.1:53, plus the INPUT
+// guard that keeps flushed flows from being re-picked-up in reverse.
 // Packets marked with DNSProxyFWMark (the DNS proxy's upstream queries) are exempted.
 func SetupDNSRedirect(logger *slog.Logger) error {
 	for _, rule := range dnsRedirectRules {
-		args := append([]string{"-A", "OUTPUT"}, rule...)
+		args := append([]string{"-A", rule.chain}, rule.args...)
 		cmd := exec.Command("iptables", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("iptables -A OUTPUT %v failed: %w (output: %s)", rule, err, out)
+			return fmt.Errorf("iptables -A %s %v failed: %w (output: %s)", rule.chain, rule.args, err, out)
 		}
 	}
 	logger.Info("DNS redirect iptables rules installed")
 
 	// Purge DNS flow state predating the rules — nat verdicts are per-flow,
 	// so those flows would keep bypassing the proxy (see FlushDNSConntrack).
+	// The INPUT guard above is already in place, so a reply in flight
+	// across this flush cannot resurrect a deleted flow in reverse.
 	if err := FlushDNSConntrack(logger); err != nil {
 		logger.Warn("Failed to flush DNS conntrack entries; pre-existing DNS flows may bypass the proxy until they expire",
 			"error", err)
@@ -138,23 +155,38 @@ func FlushResolvedCache(ctx context.Context, logger *slog.Logger) error {
 	return nil
 }
 
-// TeardownDNSRedirect removes the iptables DNAT rules added by SetupDNSRedirect.
+// TeardownDNSRedirect removes the iptables rules added by SetupDNSRedirect,
+// in reverse install order so the mark RETURN exemptions outlive the DNAT
+// rules they exempt the proxy's own upstream queries from — deleting in
+// install order would leave a two-exec window where the proxy's queries
+// DNAT back onto itself.
 func TeardownDNSRedirect(logger *slog.Logger) error {
 	var lastErr error
-	for _, rule := range dnsRedirectRules {
-		args := append([]string{"-D", "OUTPUT"}, rule...)
+	removed := 0
+	for i := len(dnsRedirectRules) - 1; i >= 0; i-- {
+		rule := dnsRedirectRules[i]
+		args := append([]string{"-D", rule.chain}, rule.args...)
 		cmd := exec.Command("iptables", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			lastErr = fmt.Errorf("iptables -D OUTPUT %v failed: %w (output: %s)", rule, err, out)
-			logger.Warn("Failed to remove DNS redirect rule", "rule", rule, "error", err)
+			lastErr = fmt.Errorf("iptables -D %s %v failed: %w (output: %s)", rule.chain, rule.args, err, out)
+			logger.Warn("Failed to remove DNS redirect rule", "chain", rule.chain, "rule", rule.args, "error", err)
+		} else {
+			removed++
 		}
+	}
+	if removed == 0 {
+		// Every -D failed: nothing was ever installed (teardown registers
+		// before a setup that may fail or never run). No redirect means no
+		// flow state of ours to flush — leave the host's DNS state alone.
+		return lastErr
 	}
 	if lastErr == nil {
 		logger.Info("DNS redirect iptables rules removed")
 	}
 
-	// Purge flows still DNAT'd to the now-dead proxy so client DNS recovers
-	// immediately instead of at conntrack expiry (see FlushDNSConntrack).
+	// Rules were installed (even if some -D calls failed), so purge flows
+	// still DNAT'd to the now-dead proxy — client DNS recovers immediately
+	// instead of at conntrack expiry (see FlushDNSConntrack).
 	if err := FlushDNSConntrack(logger); err != nil {
 		logger.Warn("Failed to flush DNS conntrack entries on teardown; client DNS may stall until entries expire",
 			"error", err)

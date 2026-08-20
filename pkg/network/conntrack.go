@@ -43,7 +43,12 @@ const (
 	ipctnlMsgCtGet    = 1 // IPCTNL_MSG_CT_GET
 	ipctnlMsgCtDelete = 2 // IPCTNL_MSG_CT_DELETE
 
-	ctaTupleOrig = 1 // CTA_TUPLE_ORIG (enum ctattr_type)
+	// Top-level attributes (enum ctattr_type). CTA_ZONE is a big-endian
+	// u16; a conntrack zone (`-j CT --zone`, used by OVS) namespaces the
+	// tuple, and a delete that fails to echo it addresses zone 0 instead —
+	// ENOENT for an entry that plainly exists.
+	ctaTupleOrig = 1  // CTA_TUPLE_ORIG
+	ctaZone      = 18 // CTA_ZONE
 
 	// Nested under CTA_TUPLE_ORIG (enum ctattr_tuple).
 	ctaTupleIP    = 1 // CTA_TUPLE_IP
@@ -68,11 +73,13 @@ const (
 // cannot stall startup or shutdown.
 const ctFlushTimeout = 2 * time.Second
 
-// ctDumpAttempts bounds the dump retry: a dump is all-or-nothing (mdlayher
-// aggregates the whole multipart reply or fails), so retrying on a fresh
-// socket is what keeps one transient failure from leaving every stale DNS
-// flow in place.
-const ctDumpAttempts = 3
+// ctFlushAttempts bounds the whole-attempt retry in FlushDNSConntrack: each
+// attempt is a complete dial→dump→delete pass on a fresh socket, so one
+// transient failure anywhere — the all-or-nothing dump (mdlayher aggregates
+// the full multipart reply or fails) or a mid-delete deadline — cannot
+// leave stale DNS flows in place. Permanent refusals (EPERM, EOPNOTSUPP)
+// short-circuit instead of retrying.
+const ctFlushAttempts = 3
 
 // ctMsgType composes an nfnetlink header type from the conntrack subsystem
 // and a message subtype.
@@ -87,14 +94,16 @@ func nfgenmsgV4() []byte {
 	return []byte{unix.AF_INET, unix.NFNETLINK_V0, 0, 0}
 }
 
-// ctTuple is one flow's original-direction identity — exactly the fields
-// ctnetlink needs to address the entry for deletion. Ports are host order.
+// ctTuple is one flow's original-direction identity plus its conntrack
+// zone — exactly the fields ctnetlink needs to address the entry for
+// deletion. Ports and zone are host order.
 type ctTuple struct {
 	srcIP   [4]byte
 	dstIP   [4]byte
 	proto   uint8
 	srcPort uint16
 	dstPort uint16
+	zone    uint16
 }
 
 // isDNS reports whether the flow is one the DNS redirect claims: TCP or UDP
@@ -104,16 +113,20 @@ func (t ctTuple) isDNS() bool {
 	return t.dstPort == 53 && (t.proto == unix.IPPROTO_TCP || t.proto == unix.IPPROTO_UDP)
 }
 
-func bePort(p uint16) []byte {
+func be16(p uint16) []byte {
 	b := make([]byte, 2)
 	binary.BigEndian.PutUint16(b, p)
 	return b
 }
 
-// marshalTupleOrig encodes a CTA_TUPLE_ORIG attribute tree addressing one
-// conntrack entry.
-func marshalTupleOrig(t ctTuple) ([]byte, error) {
+// marshalDeleteAttrs encodes the attribute tree addressing one conntrack
+// entry for deletion: CTA_TUPLE_ORIG, plus CTA_ZONE when the entry lives in
+// a non-default zone.
+func marshalDeleteAttrs(t ctTuple) ([]byte, error) {
 	ae := netlink.NewAttributeEncoder()
+	if t.zone != 0 {
+		ae.Bytes(ctaZone, be16(t.zone))
+	}
 	ae.Nested(ctaTupleOrig, func(nae *netlink.AttributeEncoder) error {
 		nae.Nested(ctaTupleIP, func(iae *netlink.AttributeEncoder) error {
 			iae.Bytes(ctaIPv4Src, t.srcIP[:])
@@ -122,8 +135,8 @@ func marshalTupleOrig(t ctTuple) ([]byte, error) {
 		})
 		nae.Nested(ctaTupleProto, func(pae *netlink.AttributeEncoder) error {
 			pae.Uint8(ctaProtoNum, t.proto)
-			pae.Bytes(ctaProtoSrcPort, bePort(t.srcPort))
-			pae.Bytes(ctaProtoDstPort, bePort(t.dstPort))
+			pae.Bytes(ctaProtoSrcPort, be16(t.srcPort))
+			pae.Bytes(ctaProtoDstPort, be16(t.dstPort))
 			return nil
 		})
 		return nil
@@ -147,6 +160,12 @@ func parseConntrackTupleOrig(data []byte) (ctTuple, bool) {
 	}
 	var haveSrc, haveDst, haveNum, haveSport, haveDport bool
 	for ad.Next() {
+		if ad.Type() == ctaZone {
+			if b := ad.Bytes(); len(b) >= 2 {
+				t.zone = binary.BigEndian.Uint16(b)
+			}
+			continue
+		}
 		if ad.Type() != ctaTupleOrig {
 			continue
 		}
@@ -239,12 +258,14 @@ func dumpTuples(conn *netlink.Conn, keep func(ctTuple) bool) ([]ctTuple, error) 
 }
 
 // deleteTuple removes one conntrack entry, addressed by its original-
-// direction tuple. ENOENT is success: the entry expired or was replaced
-// between dump and delete, which is the outcome the delete wanted anyway.
-func deleteTuple(conn *netlink.Conn, t ctTuple) error {
-	attrs, err := marshalTupleOrig(t)
+// direction tuple (and zone). ENOENT is not an error — the entry expired or
+// was replaced between dump and delete — but it is reported distinctly
+// (deleted=false) so the caller can tell a benign race from a systematic
+// failure to address entries.
+func deleteTuple(conn *netlink.Conn, t ctTuple) (bool, error) {
+	attrs, err := marshalDeleteAttrs(t)
 	if err != nil {
-		return fmt.Errorf("marshal conntrack tuple: %w", err)
+		return false, fmt.Errorf("marshal conntrack tuple: %w", err)
 	}
 	_, err = conn.Execute(netlink.Message{
 		Header: netlink.Header{
@@ -253,8 +274,65 @@ func deleteTuple(conn *netlink.Conn, t ctTuple) error {
 		},
 		Data: append(nfgenmsgV4(), attrs...),
 	})
-	if err != nil && !errors.Is(err, unix.ENOENT) {
-		return fmt.Errorf("conntrack delete: %w", err)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, unix.ENOENT):
+		return false, nil
+	default:
+		return false, fmt.Errorf("conntrack delete: %w", err)
+	}
+}
+
+// flushAttempt is one complete dial→dump→delete pass over the dport-53
+// entries. Re-running it is convergent: a re-dump no longer contains what a
+// prior pass already deleted. A delete-phase error returns partial progress
+// as "flushed N of M" so the eventual error names how far the flush got.
+func flushAttempt(logger *slog.Logger) error {
+	conn, err := dialCt()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	tuples, err := dumpTuples(conn, ctTuple.isDNS)
+	if err != nil {
+		return err
+	}
+
+	// Fresh deadline for the deletes: a slow dump would otherwise leave
+	// them only the attempt's remainder.
+	if err := conn.SetDeadline(time.Now().Add(ctFlushTimeout)); err != nil {
+		return fmt.Errorf("set netlink deadline: %w", err)
+	}
+	deleted, gone := 0, 0
+	var lastErr error
+	for _, t := range tuples {
+		ok, err := deleteTuple(conn, t)
+		if err != nil {
+			lastErr = err
+			// The deadline covers the whole delete loop; once it expires
+			// every remaining delete fails the same way, so stop instead
+			// of burning through the tail.
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				break
+			}
+			continue
+		}
+		if ok {
+			deleted++
+		} else {
+			gone++
+		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("flushed %d of %d DNS conntrack entries: %w", deleted, len(tuples), lastErr)
+	}
+	if deleted > 0 || gone > 0 {
+		// already_gone counts ENOENT acks. A handful is the benign
+		// dump→delete race; already_gone dominating deleted is the
+		// signal that deletes are failing to address entries.
+		logger.Info("Flushed pre-existing DNS conntrack entries", "count", deleted, "already_gone", gone)
 	}
 	return nil
 }
@@ -265,55 +343,24 @@ func deleteTuple(conn *netlink.Conn, t ctTuple) error {
 // DNS flow state predating the redirect bypasses the proxy — and state
 // surviving teardown keeps DNAT'ing to the dead proxy — until deleted.
 // Scoped to port 53 (a full flush would churn unrelated NAT state) and
-// best-effort at both call sites: the iptables rules stand either way, but
-// an actively-used stale flow can bypass indefinitely, hence the Warn.
-// Mechanics, collateral analysis, and measurements: design.md.
+// best-effort: the iptables rules stand regardless, and a returned error
+// names how far the flush got. Mechanics, collateral analysis, and
+// measurements: design.md.
 func FlushDNSConntrack(logger *slog.Logger) error {
 	var lastErr error
-	for range ctDumpAttempts {
-		conn, err := dialCt()
-		if err != nil {
-			return err // not transient — no point retrying the dial
+	for range ctFlushAttempts {
+		err := flushAttempt(logger)
+		if err == nil {
+			return nil
 		}
-		tuples, err := dumpTuples(conn, ctTuple.isDNS)
-		if err != nil {
-			// Fresh socket per retry: it also discards any stale queued
-			// replies a timed-out attempt left behind. Permanent refusals
-			// are not retried: EPERM (no CAP_NET_ADMIN) and EOPNOTSUPP
-			// (no nf_conntrack_netlink) won't change on a fresh socket.
-			conn.Close()
-			lastErr = err
-			if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EOPNOTSUPP) {
-				return lastErr
-			}
-			continue
+		lastErr = err
+		// A fresh attempt gets a fresh socket (discarding any stale queued
+		// replies a timed-out one left behind), but permanent refusals are
+		// not retried: EPERM (no CAP_NET_ADMIN) and EOPNOTSUPP (no
+		// nf_conntrack_netlink) won't change on a new socket.
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EOPNOTSUPP) {
+			return lastErr
 		}
-		deleted := 0
-		lastErr = nil
-		for _, t := range tuples {
-			if err := deleteTuple(conn, t); err != nil {
-				lastErr = err
-				// The attempt's deadline covers the whole delete loop;
-				// once it expires every remaining delete fails the same
-				// way, so stop instead of burning through the tail.
-				if errors.Is(err, os.ErrDeadlineExceeded) {
-					break
-				}
-				continue
-			}
-			deleted++
-		}
-		conn.Close()
-		if lastErr != nil {
-			// Name how far the flush got: a partial flush leaves real
-			// bypass windows, and the callers' Warn is the only place
-			// that surfaces it.
-			return fmt.Errorf("flushed %d of %d DNS conntrack entries: %w", deleted, len(tuples), lastErr)
-		}
-		if deleted > 0 {
-			logger.Info("Flushed pre-existing DNS conntrack entries", "count", deleted)
-		}
-		return nil
 	}
 	return lastErr
 }

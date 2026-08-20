@@ -362,6 +362,9 @@ jobs:
           if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
             echo "::error::DNS DNAT rules leaked after stop"; exit 1
           fi
+          if sudo iptables -S INPUT | grep -q -- '--sport 53'; then
+            echo "::error::DNS INPUT guard rules leaked after stop"; exit 1
+          fi
           getent hosts example.com > /dev/null \
             || { echo "::error::DNS broken after teardown"; exit 1; }
 
@@ -548,6 +551,9 @@ jobs:
           if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
             echo "::error::DNAT rules leaked — startup SIGTERM did not run teardown"; exit 1
           fi
+          if sudo iptables -S INPUT | grep -q -- '--sport 53'; then
+            echo "::error::DNS INPUT guard rules leaked — startup SIGTERM did not run teardown"; exit 1
+          fi
           # The cancelled fetch must not be misreported as an outage: even
           # with api-failure-mode=fail, no failure sentinel may be written.
           test ! -f /tmp/cargowall-failed \
@@ -667,6 +673,9 @@ jobs:
             || { echo "::error::sudo still restricted after forced teardown"; exit 1; }
           if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
             echo "::error::DNAT rules leaked through the forced teardown"; exit 1
+          fi
+          if sudo iptables -S INPUT | grep -q -- '--sport 53'; then
+            echo "::error::DNS INPUT guard rules leaked through the forced teardown"; exit 1
           fi
           if sudo test -f /etc/docker/daemon.json.cargowall.bak; then
             echo "::error::daemon.json backup left behind — Docker DNS not restored"; exit 1

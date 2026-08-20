@@ -61,6 +61,32 @@ type TcBpfStepState struct {
 	NextOrdinal uint64
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	TcBpfMapMapAuditMode          = "map_audit_mode"
+	TcBpfMapMapCidrs              = "map_cidrs"
+	TcBpfMapMapCidrsV6            = "map_cidrs_v6"
+	TcBpfMapMapDefaultAction      = "map_default_action"
+	TcBpfMapMapEvents             = "map_events"
+	TcBpfMapMapMidstreamSeen      = "map_midstream_seen"
+	TcBpfMapMapMidstreamSeenV6    = "map_midstream_seen_v6"
+	TcBpfMapMapPorts              = "map_ports"
+	TcBpfMapMapPortsV6            = "map_ports_v6"
+	TcBpfMapMapSockPid            = "map_sock_pid"
+	TcBpfMapMapSockStep           = "map_sock_step"
+	TcBpfMapMapStepState          = "map_step_state"
+	TcBpfMapMapTaskStep           = "map_task_step"
+	TcBpfProgCgConnect4           = "cg_connect4"
+	TcBpfProgCgConnect6           = "cg_connect6"
+	TcBpfProgCgSendmsg4           = "cg_sendmsg4"
+	TcBpfProgCgSendmsg6           = "cg_sendmsg6"
+	TcBpfProgTcEgress             = "tc_egress"
+	TcBpfProgTcIngress            = "tc_ingress"
+	TcBpfVarBtfAnchorBlockedEvent = "btf_anchor_blocked_event"
+)
+
 // LoadTcBpf returns the embedded CollectionSpec for TcBpf.
 func LoadTcBpf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_TcBpfBytes)
@@ -81,7 +107,7 @@ func LoadTcBpf() (*ebpf.CollectionSpec, error) {
 //	*TcBpfMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadTcBpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func LoadTcBpfObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := LoadTcBpf()
 	if err != nil {
 		return err

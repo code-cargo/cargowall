@@ -25,15 +25,10 @@ This file lists the dependencies used in this repository.
 
 ## Indirect
 
-| Dependency                    | License          | Copyright Owner               |
-|-------------------------------|------------------|-------------------------------|
-| github.com/davecgh/go-spew    | ISC              | Dave Collins                  |
-| github.com/google/go-cmp      | BSD-3-Clause     | The Go Authors                |
-| github.com/josharian/native   | MIT              | Josh Bleecher Snyder          |
-| github.com/mdlayher/socket    | MIT              | Matt Layher                   |
-| github.com/pmezard/go-difflib | BSD-3-Clause     | Patrick Mezard                |
-| github.com/stretchr/objx      | MIT              | Stretchr, Inc.                |
-| golang.org/x/mod              | BSD-3-Clause     | The Go Authors                |
-| golang.org/x/sync             | BSD-3-Clause     | The Go Authors                |
-| golang.org/x/tools            | BSD-3-Clause     | The Go Authors                |
-| gopkg.in/yaml.v3              | MIT / Apache-2.0 | Kirill Simonov, Canonical Ltd |
+| Dependency                 | License          | Copyright Owner               |
+|----------------------------|------------------|-------------------------------|
+| github.com/google/go-cmp   | BSD-3-Clause     | The Go Authors                |
+| github.com/mdlayher/socket | MIT              | Matt Layher                   |
+| github.com/stretchr/objx   | MIT              | Stretchr, Inc.                |
+| go.yaml.in/yaml/v3         | MIT / Apache-2.0 | Kirill Simonov, Canonical Ltd |
+| golang.org/x/sync          | BSD-3-Clause     | The Go Authors                |

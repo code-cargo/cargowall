@@ -20,6 +20,20 @@ type StepBpfStepState struct {
 	NextOrdinal uint64
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	StepBpfMapMapSockStep             = "map_sock_step"
+	StepBpfMapMapStepEvents           = "map_step_events"
+	StepBpfMapMapStepState            = "map_step_state"
+	StepBpfMapMapTaskStep             = "map_task_step"
+	StepBpfProgCgSockCreate           = "cg_sock_create"
+	StepBpfProgStepExit               = "step_exit"
+	StepBpfProgStepFork               = "step_fork"
+	StepBpfVarBtfAnchorStepChildEvent = "btf_anchor_step_child_event"
+)
+
 // LoadStepBpf returns the embedded CollectionSpec for StepBpf.
 func LoadStepBpf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_StepBpfBytes)
@@ -40,7 +54,7 @@ func LoadStepBpf() (*ebpf.CollectionSpec, error) {
 //	*StepBpfMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadStepBpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func LoadStepBpfObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := LoadStepBpf()
 	if err != nil {
 		return err

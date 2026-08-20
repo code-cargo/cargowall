@@ -8,6 +8,10 @@ on:
       - "bpf/originbpf.c"
       - "bpf/verdict.h"
       - "bpf/vmlinux.h"
+      # A toolchain or dependency bump regenerates the bpf2go loaders and can
+      # recompile the objects — re-verify them from the pinned CI environment
+      # rather than trusting whatever local clang produced the commit.
+      - "go.mod"
       - ".github/workflows/bpf-generate.yml"
 
 

@@ -57,6 +57,13 @@ func SetupDNSRedirect(logger *slog.Logger) error {
 		}
 	}
 	logger.Info("DNS redirect iptables rules installed")
+
+	// Purge DNS flow state predating the rules — nat verdicts are per-flow,
+	// so those flows would keep bypassing the proxy (see FlushDNSConntrack).
+	if err := FlushDNSConntrack(logger); err != nil {
+		logger.Warn("Failed to flush DNS conntrack entries; pre-existing DNS flows may bypass the proxy until they expire",
+			"error", err)
+	}
 	return nil
 }
 
@@ -144,6 +151,13 @@ func TeardownDNSRedirect(logger *slog.Logger) error {
 	}
 	if lastErr == nil {
 		logger.Info("DNS redirect iptables rules removed")
+	}
+
+	// Purge flows still DNAT'd to the now-dead proxy so client DNS recovers
+	// immediately instead of at conntrack expiry (see FlushDNSConntrack).
+	if err := FlushDNSConntrack(logger); err != nil {
+		logger.Warn("Failed to flush DNS conntrack entries on teardown; client DNS may stall until entries expire",
+			"error", err)
 	}
 	return lastErr
 }

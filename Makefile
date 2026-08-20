@@ -73,7 +73,7 @@ test-ci:
 	@printf "${GREEN}Running CI tests...${RESET}\n"
 	go run gotest.tools/gotestsum@latest --junitfile test-results.xml --format testdox -- ./...
 	@printf "${GREEN}Running BPF tests with sudo...${RESET}\n"
-	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/ ./pkg/tc/
+	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/
 
 vet:
 	$(call check_tool,staticcheck)

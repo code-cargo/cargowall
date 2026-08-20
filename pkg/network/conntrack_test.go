@@ -147,41 +147,105 @@ func sendUDP(t *testing.T, addr string) uint16 {
 	return uint16(conn.LocalAddr().(*net.UDPAddr).Port)
 }
 
-// hasTuple reports whether the live conntrack table holds a v4 UDP entry
-// matching (srcPort, dstPort).
-func hasTuple(t *testing.T, srcPort, dstPort uint16) bool {
+// listenTCP starts a TCP listener on addr (root can bind :53) that accepts
+// and holds connections, so established flows persist for the test window.
+func listenTCP(t *testing.T, addr string) {
 	t.Helper()
-	conn, tuples, err := dumpConntrackTuples()
+	ln, err := net.Listen("tcp4", addr)
+	if err != nil {
+		t.Fatalf("listen %s: %v", addr, err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+}
+
+// dialTCP establishes a connection to addr and holds it open for the rest
+// of the test, returning the local port.
+func dialTCP(t *testing.T, addr string) uint16 {
+	t.Helper()
+	conn, err := net.Dial("tcp4", addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	return uint16(conn.LocalAddr().(*net.TCPAddr).Port)
+}
+
+// dumpAll dials its own socket, dumps every v4 tuple, and closes.
+func dumpAll(t *testing.T) []ctTuple {
+	t.Helper()
+	conn, err := dialCt()
+	if err != nil {
+		t.Fatalf("dial conntrack: %v", err)
+	}
+	defer conn.Close()
+	tuples, err := dumpTuples(conn, nil)
 	if err != nil {
 		t.Fatalf("dump conntrack: %v", err)
 	}
-	conn.Close()
-	return slices.ContainsFunc(tuples, func(ct ctTuple) bool {
-		return ct.proto == unix.IPPROTO_UDP && ct.srcPort == srcPort && ct.dstPort == dstPort
+	return tuples
+}
+
+// hasTuple reports whether the live conntrack table holds a v4 entry
+// matching (proto, srcPort, dstPort).
+func hasTuple(t *testing.T, proto uint8, srcPort, dstPort uint16) bool {
+	t.Helper()
+	return slices.ContainsFunc(dumpAll(t), func(ct ctTuple) bool {
+		return ct.proto == proto && ct.srcPort == srcPort && ct.dstPort == dstPort
 	})
 }
 
 // TestFlushDNSConntrack_Live exercises the full dump→filter→delete path
-// against the running kernel: a UDP flow to :53 must be deleted, a UDP flow
-// to another port must survive. Root-gated (ctnetlink deletes need
-// CAP_NET_ADMIN) and skipped when conntrack isn't observing loopback (no
-// tracking hooks registered — nothing to flush, nothing to test).
+// against the running kernel: UDP and TCP flows to :53 must be deleted —
+// the TCP one an ESTABLISHED connection, the long-lived DNS-over-TCP shape
+// the flush exists for — while flows to another port survive. Root-gated
+// (ctnetlink deletes and binding :53 need privileges) and skipped when
+// conntrack isn't observing loopback (no tracking hooks registered —
+// nothing to flush, nothing to test).
+//
+// Deliberate side effect under CI's sudo pass: this flushes the runner's
+// own dport-53 conntrack entries. Harmless for the same reason production's
+// flush is — a runner carries no DNS DNAT rules, so recreated entries
+// behave identically and an in-flight lookup costs at most one retry.
 func TestFlushDNSConntrack_Live(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root (CAP_NET_ADMIN for conntrack delete)")
 	}
 
-	// 127.0.0.2: loopback-net, no listener needed — the ICMP port
-	// unreachable that answers doesn't remove the conntrack entry within
-	// the test window.
-	dnsPort := sendUDP(t, "127.0.0.2:53")
-	otherPort := sendUDP(t, "127.0.0.2:5353")
+	// 127.0.0.2: loopback-net, free of the resolved stub on 127.0.0.53. UDP
+	// needs no listener — the ICMP port unreachable that answers doesn't
+	// remove the conntrack entry within the test window. TCP uses real
+	// listeners so the :53 flow is ESTABLISHED, not a refused SYN.
+	udpDNSPort := sendUDP(t, "127.0.0.2:53")
+	udpOtherPort := sendUDP(t, "127.0.0.2:5353")
+	listenTCP(t, "127.0.0.2:53")
+	listenTCP(t, "127.0.0.2:5353")
+	tcpDNSPort := dialTCP(t, "127.0.0.2:53")
+	tcpOtherPort := dialTCP(t, "127.0.0.2:5353")
 
-	if !hasTuple(t, dnsPort, 53) {
+	if !hasTuple(t, unix.IPPROTO_UDP, udpDNSPort, 53) {
 		t.Skip("conntrack not tracking loopback flows on this kernel/config")
 	}
-	if !hasTuple(t, otherPort, 5353) {
-		t.Fatal("control flow (:5353) not tracked despite :53 being tracked")
+	for _, pre := range []struct {
+		name         string
+		proto        uint8
+		sport, dport uint16
+	}{
+		{"udp:5353", unix.IPPROTO_UDP, udpOtherPort, 5353},
+		{"tcp:53", unix.IPPROTO_TCP, tcpDNSPort, 53},
+		{"tcp:5353", unix.IPPROTO_TCP, tcpOtherPort, 5353},
+	} {
+		if !hasTuple(t, pre.proto, pre.sport, pre.dport) {
+			t.Fatalf("%s flow not tracked despite udp:53 being tracked", pre.name)
+		}
 	}
 
 	if err := FlushDNSConntrack(discardLogger()); err != nil {
@@ -191,13 +255,16 @@ func TestFlushDNSConntrack_Live(t *testing.T) {
 	// The delete is synchronous (ACKed per entry), but give the table a
 	// beat on slow CI before declaring a leak.
 	deadline := time.Now().Add(2 * time.Second)
-	for hasTuple(t, dnsPort, 53) {
+	for hasTuple(t, unix.IPPROTO_UDP, udpDNSPort, 53) || hasTuple(t, unix.IPPROTO_TCP, tcpDNSPort, 53) {
 		if time.Now().After(deadline) {
 			t.Fatal("dport-53 conntrack entry survived FlushDNSConntrack")
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if !hasTuple(t, otherPort, 5353) {
-		t.Fatal("non-DNS conntrack entry (:5353) was deleted — flush overshot its scope")
+	if !hasTuple(t, unix.IPPROTO_UDP, udpOtherPort, 5353) {
+		t.Fatal("non-DNS UDP entry (:5353) was deleted — flush overshot its scope")
+	}
+	if !hasTuple(t, unix.IPPROTO_TCP, tcpOtherPort, 5353) {
+		t.Fatal("non-DNS TCP entry (:5353) was deleted — flush overshot its scope")
 	}
 }

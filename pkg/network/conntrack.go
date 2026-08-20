@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/mdlayher/netlink"
@@ -28,17 +29,12 @@ import (
 )
 
 // Conntrack flush for the DNS redirect, via ctnetlink (NETLINK_NETFILTER).
-// Attribute constants are from include/uapi/linux/netfilter/
-// nfnetlink_conntrack.h — x/sys/unix carries the nfnetlink subsystem and
-// version constants but not the CTA_* space.
-//
-// Dump-then-delete-per-entry is the only mechanism the kernel offers for a
-// port-scoped flush: IPCTNL_MSG_CT_DELETE takes either a full tuple or a
-// whole-table flush, and the flush path rejects CTA_FILTER with EOPNOTSUPP
-// (filters are dump-only; verified on 6.8) — the same reason
-// conntrack-tools' `conntrack -D --dport` iterates in userspace. Dumps are
-// flow-controlled (the kernel produces one batch per recv), so the default
-// rcvbuf handles arbitrarily large tables; a 5k-entry table dumps in ~5ms.
+// CTA_* constants are from include/uapi/linux/netfilter/nfnetlink_conntrack.h
+// (x/sys/unix carries the nfnetlink subsystem/version constants but not the
+// CTA_* space). Dump-then-delete-per-entry is deliberate: the kernel's flush
+// path rejects CTA_FILTER with EOPNOTSUPP (filters are dump-only), so a
+// port-scoped flush has no single-call form. Full rationale and
+// measurements: design.md, "DNS redirect".
 
 const (
 	// nfnetlink message subtypes (enum ctnl_msg_types); dump replies
@@ -72,10 +68,10 @@ const (
 // cannot stall startup or shutdown.
 const ctFlushTimeout = 2 * time.Second
 
-// ctDumpAttempts bounds the dump retry. mdlayher's Receive is
-// all-or-nothing across a multipart dump — a mid-dump failure yields no
-// partial results to act on — so retrying on a fresh socket is what keeps a
-// transient hiccup from leaving every stale DNS flow in place.
+// ctDumpAttempts bounds the dump retry: a dump is all-or-nothing (mdlayher
+// aggregates the whole multipart reply or fails), so retrying on a fresh
+// socket is what keeps one transient failure from leaving every stale DNS
+// flow in place.
 const ctDumpAttempts = 3
 
 // ctMsgType composes an nfnetlink header type from the conntrack subsystem
@@ -198,56 +194,54 @@ func parseConntrackTupleOrig(data []byte) (ctTuple, bool) {
 	return t, ad.Err() == nil && haveSrc && haveDst && haveNum && haveSport && haveDport
 }
 
-// dumpConntrackTuples dumps the IPv4 conntrack table, retrying on a fresh
-// socket per attempt (see ctDumpAttempts; a fresh dial also discards any
-// stale queued replies from a timed-out attempt). Unparseable entries are
-// skipped, not fatal — an entry we cannot address for deletion is one the
-// caller could not act on anyway. Table churn during the dump can set
-// NLM_F_DUMP_INTR, which mdlayher ignores; an entry missed that way is a
-// post-redirect flow that already carries the right NAT verdict. Returns
-// the successful attempt's conn for the caller's follow-up deletes; the
-// caller closes it.
-func dumpConntrackTuples() (*netlink.Conn, []ctTuple, error) {
-	var lastErr error
-	for range ctDumpAttempts {
-		conn, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
-		if err != nil {
-			return nil, nil, fmt.Errorf("dial netfilter netlink: %w", err)
-		}
-		if err := conn.SetDeadline(time.Now().Add(ctFlushTimeout)); err != nil {
-			conn.Close()
-			return nil, nil, fmt.Errorf("set netlink deadline: %w", err)
-		}
-		msgs, err := conn.Execute(netlink.Message{
-			Header: netlink.Header{
-				Type:  ctMsgType(ipctnlMsgCtGet),
-				Flags: netlink.Request | netlink.Dump,
-			},
-			Data: nfgenmsgV4(),
-		})
-		if err != nil {
-			conn.Close()
-			lastErr = fmt.Errorf("conntrack dump: %w", err)
-			continue
-		}
-		var tuples []ctTuple
-		for _, m := range msgs {
-			if m.Header.Type != ctMsgType(ipctnlMsgCtNew) {
-				continue
-			}
-			if t, ok := parseConntrackTupleOrig(m.Data); ok {
-				tuples = append(tuples, t)
-			}
-		}
-		return conn, tuples, nil
+// dialCt opens a NETLINK_NETFILTER socket with a bounded deadline so a lost
+// reply cannot stall startup or shutdown.
+func dialCt() (*netlink.Conn, error) {
+	conn, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
+	if err != nil {
+		return nil, fmt.Errorf("dial netfilter netlink: %w", err)
 	}
-	return nil, nil, lastErr
+	if err := conn.SetDeadline(time.Now().Add(ctFlushTimeout)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("set netlink deadline: %w", err)
+	}
+	return conn, nil
 }
 
-// deleteConntrackEntry removes one entry, addressed by its original-
+// dumpTuples dumps the IPv4 conntrack table over conn, keeping the tuples
+// keep() accepts (nil keeps all). Best-effort by design: ctnetlink dumps
+// carry no consistency signal (the conntrack dump path never stamps
+// NLM_F_DUMP_INTR), so an entry that moves during the walk can be missed —
+// the flush makes no completeness claim. Unparseable entries are skipped,
+// not fatal: an entry we cannot address for deletion is one we could not
+// act on anyway.
+func dumpTuples(conn *netlink.Conn, keep func(ctTuple) bool) ([]ctTuple, error) {
+	msgs, err := conn.Execute(netlink.Message{
+		Header: netlink.Header{
+			Type:  ctMsgType(ipctnlMsgCtGet),
+			Flags: netlink.Request | netlink.Dump,
+		},
+		Data: nfgenmsgV4(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("conntrack dump: %w", err)
+	}
+	var tuples []ctTuple
+	for _, m := range msgs {
+		if m.Header.Type != ctMsgType(ipctnlMsgCtNew) {
+			continue
+		}
+		if t, ok := parseConntrackTupleOrig(m.Data); ok && (keep == nil || keep(t)) {
+			tuples = append(tuples, t)
+		}
+	}
+	return tuples, nil
+}
+
+// deleteTuple removes one conntrack entry, addressed by its original-
 // direction tuple. ENOENT is success: the entry expired or was replaced
 // between dump and delete, which is the outcome the delete wanted anyway.
-func deleteConntrackEntry(conn *netlink.Conn, t ctTuple) error {
+func deleteTuple(conn *netlink.Conn, t ctTuple) error {
 	attrs, err := marshalTupleOrig(t)
 	if err != nil {
 		return fmt.Errorf("marshal conntrack tuple: %w", err)
@@ -266,51 +260,60 @@ func deleteConntrackEntry(conn *netlink.Conn, t ctTuple) error {
 }
 
 // FlushDNSConntrack deletes every IPv4 conntrack entry whose original-
-// direction destination port is 53 (TCP or UDP). The nat table is evaluated
-// only on a flow's first packet — the verdict is stamped into its conntrack
-// entry and replayed for every later packet — so DNS flow state predating
-// the redirect keeps steering queries straight to the (allow-listed)
-// upstream resolver, silently bypassing the proxy's rule matching and IP
-// allowlisting; state surviving teardown keeps DNAT'ing queries to the
-// now-dead proxy. Deleting the entries makes the next packet of every DNS
-// flow re-traverse the nat OUTPUT chain and land on the current rules.
-//
-// Scoped to port 53 rather than a full table flush, which would churn
-// unrelated NAT state (Docker MASQUERADE bindings, established flows). The
-// scoped delete is collateral-free: loopback stub traffic (127.0.0.53) is
-// outside the DNAT anyway, the proxy's own marked upstream flows re-match
-// the mark RETURN rules, and an in-flight transaction costs at most one
-// retry. Callers treat failure as best-effort — the iptables rules stand
-// either way, and idle entries age out on their own in 30-120s — but an
-// actively-used flow (e.g. an open DNS-over-TCP stream) keeps refreshing
-// its entry and can bypass indefinitely, hence the Warn at both call sites.
+// direction destination port is 53 (TCP or UDP). nat is evaluated only on a
+// flow's first packet and the verdict replayed from its conntrack entry, so
+// DNS flow state predating the redirect bypasses the proxy — and state
+// surviving teardown keeps DNAT'ing to the dead proxy — until deleted.
+// Scoped to port 53 (a full flush would churn unrelated NAT state) and
+// best-effort at both call sites: the iptables rules stand either way, but
+// an actively-used stale flow can bypass indefinitely, hence the Warn.
+// Mechanics, collateral analysis, and measurements: design.md.
 func FlushDNSConntrack(logger *slog.Logger) error {
-	conn, tuples, err := dumpConntrackTuples()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	// Fresh deadline for the deletes: the dump may have consumed most of
-	// its attempt's budget.
-	if err := conn.SetDeadline(time.Now().Add(ctFlushTimeout)); err != nil {
-		return fmt.Errorf("set netlink deadline: %w", err)
-	}
-
-	deleted := 0
 	var lastErr error
-	for _, t := range tuples {
-		if !t.isDNS() {
-			continue
+	for range ctDumpAttempts {
+		conn, err := dialCt()
+		if err != nil {
+			return err // not transient — no point retrying the dial
 		}
-		if err := deleteConntrackEntry(conn, t); err != nil {
+		tuples, err := dumpTuples(conn, ctTuple.isDNS)
+		if err != nil {
+			// Fresh socket per retry: it also discards any stale queued
+			// replies a timed-out attempt left behind. Permanent refusals
+			// are not retried: EPERM (no CAP_NET_ADMIN) and EOPNOTSUPP
+			// (no nf_conntrack_netlink) won't change on a fresh socket.
+			conn.Close()
 			lastErr = err
+			if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EOPNOTSUPP) {
+				return lastErr
+			}
 			continue
 		}
-		deleted++
-	}
-	if deleted > 0 {
-		logger.Info("Flushed pre-existing DNS conntrack entries", "count", deleted)
+		deleted := 0
+		lastErr = nil
+		for _, t := range tuples {
+			if err := deleteTuple(conn, t); err != nil {
+				lastErr = err
+				// The attempt's deadline covers the whole delete loop;
+				// once it expires every remaining delete fails the same
+				// way, so stop instead of burning through the tail.
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					break
+				}
+				continue
+			}
+			deleted++
+		}
+		conn.Close()
+		if lastErr != nil {
+			// Name how far the flush got: a partial flush leaves real
+			// bypass windows, and the callers' Warn is the only place
+			// that surfaces it.
+			return fmt.Errorf("flushed %d of %d DNS conntrack entries: %w", deleted, len(tuples), lastErr)
+		}
+		if deleted > 0 {
+			logger.Info("Flushed pre-existing DNS conntrack entries", "count", deleted)
+		}
+		return nil
 	}
 	return lastErr
 }

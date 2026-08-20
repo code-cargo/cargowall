@@ -70,6 +70,25 @@ type OriginBpfPortVal struct {
 	Pad    [3]uint8
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	OriginBpfMapMapAuditMode         = "map_audit_mode"
+	OriginBpfMapMapCidrs             = "map_cidrs"
+	OriginBpfMapMapCidrsV6           = "map_cidrs_v6"
+	OriginBpfMapMapDefaultAction     = "map_default_action"
+	OriginBpfMapMapLocalNets         = "map_local_nets"
+	OriginBpfMapMapLocalNetsV6       = "map_local_nets_v6"
+	OriginBpfMapMapOriginConfig      = "map_origin_config"
+	OriginBpfMapMapOriginEvents      = "map_origin_events"
+	OriginBpfMapMapOriginSeen        = "map_origin_seen"
+	OriginBpfMapMapPorts             = "map_ports"
+	OriginBpfMapMapPortsV6           = "map_ports_v6"
+	OriginBpfProgCgOriginEgress      = "cg_origin_egress"
+	OriginBpfVarBtfAnchorOriginEvent = "btf_anchor_origin_event"
+)
+
 // LoadOriginBpf returns the embedded CollectionSpec for OriginBpf.
 func LoadOriginBpf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_OriginBpfBytes)
@@ -90,7 +109,7 @@ func LoadOriginBpf() (*ebpf.CollectionSpec, error) {
 //	*OriginBpfMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadOriginBpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func LoadOriginBpfObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := LoadOriginBpf()
 	if err != nil {
 		return err

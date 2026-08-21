@@ -154,18 +154,36 @@ func ordinalStepName(steps []GitHubStep, ordinalSteps map[uint32]int, ord uint32
 
 // Bucket labels for traffic that doesn't resolve to a real GitHub step,
 // shared by the rendered summary and the SaaS push so both group identically.
+// Kept terse — they render as summary headings and dashboard cells; the
+// fuller story lives on untaggedBucketLabel and in design.md:
+//   - bucketRunner: Runner.Worker's own threads plus cargowall's subtree
+//     (the StepOrdinalRunner sentinel).
+//   - bucketPreDaemon: worker child subtrees started before cargowall
+//     attached (the StepOrdinalPreDaemon sentinel).
+//   - bucketDocker: the daemon's own host-side sockets (image pulls,
+//     docker-proxy port forwarding), distinct from container workloads.
+//   - bucketHostServices: sockdiag found the socket, its owner is outside
+//     the Runner.Worker subtree (step_attr_outcome=untagged) — systemd
+//     units and daemons.
+//   - bucketContainerUnattr: container-origin socket that predates tagging,
+//     or an unknown container.
+//   - bucketAutoInfra: auto-allowed platform endpoints (IMDS, GitHub API…).
+//   - bucketUnknown: no socket tag — pre-attach socket, a failed lookup
+//     (not_found/ambiguous_wildcard/dump_error/shed), or an unrecognized
+//     origin.
 const (
-	bucketRunner          = "CI infrastructure (Runner.Worker)"
-	bucketPreDaemon       = "Started before cargowall attached"
-	bucketDocker          = "Docker daemon (host-side sockets: image pulls, port proxy)"
-	bucketContainerUnattr = "Container traffic (unattributed: socket predates tagging or unknown container)"
-	bucketAutoInfra       = "Auto-allowed platform endpoints (untagged)"
-	bucketUnknown         = "Unattributed (no socket tag: pre-attach socket or unrecognized origin)"
+	bucketRunner          = "Runner infrastructure"
+	bucketPreDaemon       = "Pre-attach"
+	bucketDocker          = "Docker daemon"
+	bucketHostServices    = "Host services"
+	bucketContainerUnattr = "Container (unattributed)"
+	bucketAutoInfra       = "Auto-allowed infra"
+	bucketUnknown         = "Unattributed"
 )
 
 // bucketOrder is the fixed display order for non-step buckets in the rendered
 // summary (the push path preserves the GitHub timeline scaffold instead).
-var bucketOrder = []string{bucketRunner, bucketPreDaemon, bucketDocker, bucketContainerUnattr, bucketAutoInfra, bucketUnknown}
+var bucketOrder = []string{bucketRunner, bucketPreDaemon, bucketDocker, bucketHostServices, bucketContainerUnattr, bucketAutoInfra, bucketUnknown}
 
 // causalClass is how a causally-tagged event maps to a group.
 type causalClass int
@@ -210,15 +228,24 @@ func assignCausal(ev events.AuditEvent, ordinalSteps map[uint32]int) causalAssig
 // as container-originated but without a step tag must land in the container
 // tier and may never fall through to a looser bucket — that ordering is the
 // summary-side form of the "unattributable container traffic gets its own
-// tier" requirement (issue #106). Then Docker-daemon host sockets, then
-// auto-allowed platform endpoints, and only the remainder is genuinely
-// unexplained.
+// tier" requirement (issue #106). Then Docker-daemon host sockets (more
+// specific than the host-services tier: dockerd is also outside the
+// workflow), then identified host system services — DNS events whose
+// sockdiag lookup FOUND the client socket but its owner carries no step tag
+// (StepAttrUntagged), i.e. systemd units and daemons outside Runner.Worker,
+// correctly unattributed rather than unexplained (issue #114) — then
+// auto-allowed platform endpoints; only the remainder is genuinely
+// unexplained. Other lookup outcomes (not_found, ambiguous, dump_error,
+// shed) stay in the unknown bucket: those are lookup limitations, not an
+// identified outside owner.
 func untaggedBucketLabel(ev events.AuditEvent) string {
 	switch {
 	case ev.ContainerOrigin:
 		return bucketContainerUnattr
 	case dockerProcesses[ev.Process]:
 		return bucketDocker
+	case ev.StepAttrOutcome == events.StepAttrUntagged:
+		return bucketHostServices
 	case ev.AutoAllowedType != "":
 		return bucketAutoInfra
 	default:

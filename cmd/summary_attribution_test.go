@@ -109,8 +109,8 @@ func TestSummary_Run_CausalGroupingAndCounts(t *testing.T) {
 	assert.Contains(t, out, "| Connections blocked | 1 | 3 |")
 	// Untagged dockerd traffic lands in the labeled docker bucket, not a
 	// generic unattributed dump and not a step it raced into.
-	assert.Contains(t, out, "Docker daemon (host-side sockets")
-	assert.NotContains(t, out, "Unattributed (no socket tag")
+	assert.Contains(t, out, "Docker daemon")
+	assert.NotContains(t, out, `#### Step: "`+bucketUnknown)
 }
 
 // Step names and process strings are user-controlled; a pipe or newline
@@ -164,6 +164,11 @@ func TestSummary_RenderAndPushGroupingsAgree(t *testing.T) {
 		// Untagged container-origin traffic; the dockerd process name proves
 		// ContainerOrigin outranks the docker bucket in both presenters.
 		{Timestamp: base.Add(7 * time.Second), EventType: events.EventConnectionBlocked, DstIP: "8.8.8.8", DstPort: 443, Protocol: "TCP", Process: "dockerd", ContainerOrigin: true},
+		// Untagged-outcome DNS block (issue #114): the render side only emits
+		// buckets listed in bucketOrder, so this is the event that fails if
+		// bucketHostServices ever goes missing there while the push side
+		// keeps shipping it.
+		{Timestamp: base.Add(8 * time.Second), EventType: events.EventDNSBlocked, DstIP: "9.9.9.9", DstHostname: "esm.example", Protocol: "UDP", Process: "https", StepAttrOutcome: events.StepAttrUntagged},
 	}
 
 	// destination(group label) per event IP, for each presenter. Render
@@ -201,6 +206,7 @@ func TestSummary_RenderAndPushGroupingsAgree(t *testing.T) {
 	assert.Equal(t, bucketPreDaemon, renderDest["6.6.6.6"])
 	assert.Equal(t, "#99", renderDest["7.7.7.7"])
 	assert.Equal(t, bucketContainerUnattr, renderDest["8.8.8.8"])
+	assert.Equal(t, bucketHostServices, renderDest["9.9.9.9"])
 }
 
 func TestSummary_BuildCausalPushGroups(t *testing.T) {
@@ -480,9 +486,12 @@ func TestSummary_UntaggedBucketLabel(t *testing.T) {
 		want string
 	}{
 		{
-			// Precedence: ContainerOrigin beats BOTH later arms at once.
-			name: "container origin outranks dockerd process and auto-allow",
-			ev:   events.AuditEvent{ContainerOrigin: true, Process: "dockerd", AutoAllowedType: "cloud_metadata"},
+			// Precedence: ContainerOrigin beats EVERY later arm at once.
+			name: "container origin outranks dockerd process, untagged outcome, and auto-allow",
+			ev: events.AuditEvent{
+				ContainerOrigin: true, Process: "dockerd",
+				StepAttrOutcome: events.StepAttrUntagged, AutoAllowedType: "cloud_metadata",
+			},
 			want: bucketContainerUnattr,
 		},
 		{
@@ -494,6 +503,62 @@ func TestSummary_UntaggedBucketLabel(t *testing.T) {
 			name: "auto-allowed platform endpoint",
 			ev:   events.AuditEvent{Process: "python3", AutoAllowedType: "cloud_metadata"},
 			want: bucketAutoInfra,
+		},
+		{
+			// Issue #114: the sockdiag lookup found the socket and its owner
+			// is outside the workflow — an identified host service, not an
+			// unexplained event.
+			name: "untagged-outcome DNS event is a host system service",
+			ev: events.AuditEvent{
+				EventType:       events.EventDNSBlocked,
+				Process:         "https",
+				StepAttrOutcome: events.StepAttrUntagged,
+			},
+			want: bucketHostServices,
+		},
+		{
+			// Docker stays the more specific tier: dockerd's own sockets are
+			// also untagged, and must not migrate into host-services.
+			name: "dockerd with untagged outcome stays daemon traffic",
+			ev: events.AuditEvent{
+				EventType:       events.EventDNSBlocked,
+				Process:         "dockerd",
+				StepAttrOutcome: events.StepAttrUntagged,
+			},
+			want: bucketDocker,
+		},
+		{
+			// Not a shape today's producers emit (AutoAllowedType rides
+			// allowed connection events, the outcome rides dns_blocked), but
+			// the arm order is intentional and pinned: an identified outside
+			// OWNER outranks a destination classification.
+			name: "untagged outcome outranks auto-allow",
+			ev: events.AuditEvent{
+				Process:         "https",
+				StepAttrOutcome: events.StepAttrUntagged,
+				AutoAllowedType: "cloud_metadata",
+			},
+			want: bucketHostServices,
+		},
+		{
+			// Lookup limitations are not identified outsiders: everything
+			// short of untagged stays honestly unexplained.
+			name: "not_found outcome stays unexplained",
+			ev: events.AuditEvent{
+				EventType:       events.EventDNSBlocked,
+				Process:         "curl",
+				StepAttrOutcome: events.StepAttrNotFound,
+			},
+			want: bucketUnknown,
+		},
+		{
+			name: "dump_error outcome stays unexplained",
+			ev: events.AuditEvent{
+				EventType:       events.EventDNSBlocked,
+				Process:         "curl",
+				StepAttrOutcome: events.StepAttrDumpError,
+			},
+			want: bucketUnknown,
 		},
 		{
 			name: "plain untagged traffic is genuinely unexplained",
@@ -517,13 +582,29 @@ func TestSummary_Run_ContainerOriginUntaggedLandsInContainerBucket(t *testing.T)
 		{Timestamp: base, EventType: events.EventStepBoundary, PID: 10, StepOrdinal: 1, Process: "bash -e /tmp/a.sh"},
 		{Timestamp: base.Add(time.Second), EventType: events.EventConnectionBlocked, DstIP: "203.0.113.9", DstPort: 443, Protocol: "TCP", Process: "dockerd", Blocked: true, ContainerOrigin: true},
 	})
-	assert.Contains(t, out, `#### Step: "Container traffic (unattributed`,
+	assert.Contains(t, out, `#### Step: "`+bucketContainerUnattr,
 		"container-origin traffic gets its own tier")
 	assert.Contains(t, out, "203.0.113.9")
-	assert.NotContains(t, out, "Unattributed (no socket tag",
+	assert.NotContains(t, out, `#### Step: "`+bucketUnknown,
 		"must not fall through to the generic unattributed bucket")
-	assert.NotContains(t, out, "Docker daemon (host-side sockets",
+	assert.NotContains(t, out, `#### Step: "`+bucketDocker,
 		"container origin outranks the dockerd process name end to end")
+}
+
+// End to end: an ordinal-0 DNS block whose sockdiag lookup identified an
+// owner outside the workflow renders under the host-services heading — not
+// the generic unattributed bucket (issue #114).
+func TestSummary_Run_UntaggedOutcomeLandsInHostServicesBucket(t *testing.T) {
+	base := time.Now()
+	out := runSummary(t, []events.AuditEvent{
+		{Timestamp: base, EventType: events.EventStepBoundary, PID: 10, StepOrdinal: 1, Process: "bash -e /tmp/a.sh"},
+		{Timestamp: base.Add(time.Second), EventType: events.EventDNSBlocked, DstHostname: "esm.ubuntu.com", Process: "https", PID: 2398, StepAttrOutcome: events.StepAttrUntagged, Blocked: true},
+	})
+	assert.Contains(t, out, `#### Step: "`+bucketHostServices,
+		"identified outside owners get their own tier")
+	assert.Contains(t, out, "esm.ubuntu.com")
+	assert.NotContains(t, out, `#### Step: "`+bucketUnknown,
+		"must not fall through to the generic unattributed bucket")
 }
 
 // A container-origin event WITH a resolved ordinal is a fully attributed
@@ -552,7 +633,7 @@ func TestSummary_Run_ContainerOriginWithOrdinalLandsInStepGroup(t *testing.T) {
 
 	assert.Contains(t, out, `#### Step: "#1 - build"`, "step-tagged container traffic groups under its step")
 	assert.Contains(t, out, "203.0.113.7")
-	assert.NotContains(t, out, "Container traffic (unattributed",
+	assert.NotContains(t, out, `#### Step: "`+bucketContainerUnattr,
 		"a resolved ordinal keeps the event out of the container bucket")
 }
 

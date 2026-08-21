@@ -21,10 +21,14 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // installFakeResolvectl drops an executable `resolvectl` running the given
@@ -91,6 +95,70 @@ func TestFlushResolvedCache_Success(t *testing.T) {
 
 	if err := FlushResolvedCache(context.Background(), discardLogger()); err != nil {
 		t.Fatalf("expected nil on successful flush, got %v", err)
+	}
+}
+
+// TestDNSRedirectRules_Shape pins the rule slice: mark RETURN exemptions
+// first (the proxy's upstream client and startup stub peeks), then the
+// systemd-resolved stub DNAT (makes the querying process's own
+// socket visible to the proxy instead of resolved's), then the generic
+// DNAT that still excludes the rest of 127.0.0.0/8 (the proxy listen must
+// never be DNAT'd), then the INPUT anti-resurrection guards. Order is
+// load-bearing: install order is slice order and teardown reverses it, so
+// the exemptions outlive every DNAT they exempt from.
+func TestDNSRedirectRules_Shape(t *testing.T) {
+	want := []string{
+		"OUTPUT -t nat -p udp --dport 53 -m mark --mark 0xCA12 -j RETURN",
+		"OUTPUT -t nat -p tcp --dport 53 -m mark --mark 0xCA12 -j RETURN",
+		"OUTPUT -t nat -p udp -d 127.0.0.53 --dport 53 -j DNAT --to-destination 127.0.0.1:53",
+		"OUTPUT -t nat -p tcp -d 127.0.0.53 --dport 53 -j DNAT --to-destination 127.0.0.1:53",
+		"OUTPUT -t nat -p udp --dport 53 ! -d 127.0.0.0/8 -j DNAT --to-destination 127.0.0.1:53",
+		"OUTPUT -t nat -p tcp --dport 53 ! -d 127.0.0.0/8 -j DNAT --to-destination 127.0.0.1:53",
+		"INPUT -p udp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP",
+		"INPUT -p tcp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP",
+	}
+	if len(dnsRedirectRules) != len(want) {
+		t.Fatalf("dnsRedirectRules has %d rules, want %d", len(dnsRedirectRules), len(want))
+	}
+	for i, r := range dnsRedirectRules {
+		got := r.chain + " " + strings.Join(r.args, " ")
+		if got != want[i] {
+			t.Errorf("rule %d:\n  got  %q\n  want %q", i, got, want[i])
+		}
+	}
+}
+
+// TestMarkDNSProxySocket_SetsMark: a dialer using MarkDNSProxySocket must
+// carry DNSProxyFWMark, or the stub DNAT would loop cargowall's own stub
+// peeks (cacheResolver) back into the proxy. Root-only: SO_MARK needs
+// CAP_NET_ADMIN, and the sudo'd pkg/network test pass in CI provides it.
+func TestMarkDNSProxySocket_SetsMark(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("SO_MARK requires CAP_NET_ADMIN; covered by the sudo test pass")
+	}
+	d := &net.Dialer{Control: MarkDNSProxySocket}
+	conn, err := d.Dial("udp", "127.0.0.1:53535")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	raw, err := conn.(*net.UDPConn).SyscallConn()
+	if err != nil {
+		t.Fatalf("syscall conn: %v", err)
+	}
+	var mark int
+	var sockErr error
+	if err := raw.Control(func(fd uintptr) {
+		mark, sockErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK)
+	}); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	if sockErr != nil {
+		t.Fatalf("getsockopt SO_MARK: %v", sockErr)
+	}
+	if mark != DNSProxyFWMark {
+		t.Fatalf("SO_MARK = %#x, want %#x", mark, DNSProxyFWMark)
 	}
 }
 

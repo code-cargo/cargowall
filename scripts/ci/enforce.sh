@@ -96,6 +96,65 @@ docker_filter() {
   echo "✅ Docker container blocked from example.com"
 }
 
+# Attribution gate: the blocked() curl above ran in its own post-attach
+# workflow step, so EVERY refused example.com query came from a step-tagged
+# process and its dns_blocked event must carry that step's ordinal — the
+# assertion is all-of-subset, not at-least-one, so a partially laundered or
+# shed path cannot pass. Other domains (systemd units, background services)
+# are printed as evidence but not asserted: unattributed is correct for
+# clients outside the Runner.Worker subtree. On failure the per-event
+# outcome taxonomy (step_attr_outcome says WHY: untagged / not_found /
+# ambiguous_wildcard / dump_error / shed) and a socket-table snapshot make
+# the run diagnosable from its log alone.
+dns_attribution() {
+  AUDIT_LOG=/tmp/cargowall-audit.json
+
+  # Fail with a clear diagnostic before any jq substitution: under
+  # `set -euo pipefail` an unreadable/invalid log would otherwise kill the
+  # script with a bare jq parse error.
+  if [ ! -r "$AUDIT_LOG" ]; then
+    echo "❌ Audit log $AUDIT_LOG is missing or unreadable"
+    exit 1
+  fi
+  if ! jq -s empty "$AUDIT_LOG" 2>/dev/null; then
+    echo "❌ Audit log $AUDIT_LOG is not valid JSON"
+    exit 1
+  fi
+
+  echo "Host-path dns_blocked events (domain / step_ordinal / outcome / process / pid):"
+  jq -r -s '.[] | select(.event_type == "dns_blocked" and (.container_origin != true))
+    | [.dst_hostname, (.step_ordinal // 0), (.step_attr_outcome // "-"), (.process // "-"), (.pid // 0)]
+    | @tsv' "$AUDIT_LOG" || true
+
+  # The blocked() probe's domain, restricted to host-path events. Real
+  # ordinal: >0 and below events.MaxRealStepOrdinal — the same
+  # StepOrdinalPreDaemon (0xFFFFFFFE) minus 2^16 arithmetic, derived here
+  # from the named sentinel value rather than a pasted decimal.
+  # step_attr_outcome must ALSO say "ok": an ordinal that did not come
+  # through the sockdiag taxonomy must not pass the gate.
+  MAX_REAL_ORDINAL=$((0xFFFFFFFE - 65536))
+  TOTAL=$(jq -s '[.[] | select(.event_type == "dns_blocked" and (.container_origin != true))
+    | select(.dst_hostname == "example.com")] | length' "$AUDIT_LOG")
+  ATTRIBUTED=$(jq -s --argjson max "$MAX_REAL_ORDINAL" '[.[]
+    | select(.event_type == "dns_blocked" and (.container_origin != true))
+    | select(.dst_hostname == "example.com")
+    | select(.step_attr_outcome == "ok")
+    | select((.step_ordinal // 0) > 0 and (.step_ordinal // 0) < $max)] | length' "$AUDIT_LOG")
+  echo "example.com dns_blocked events: $TOTAL, with real step ordinal: $ATTRIBUTED"
+
+  if [ "$TOTAL" -eq 0 ]; then
+    echo "❌ No example.com dns_blocked events — the blocked-connection step should have produced them"
+    exit 1
+  fi
+  if [ "$ATTRIBUTED" -ne "$TOTAL" ]; then
+    echo "❌ $((TOTAL - ATTRIBUTED))/$TOTAL example.com dns_blocked events lost their step ordinal"
+    echo "UDP socket table at check time (diagnosis aid):"
+    sudo ss -uapn | head -60 || true
+    exit 1
+  fi
+  echo "✅ all $TOTAL example.com dns_blocked events carry a real step ordinal"
+}
+
 summary() {
   SUMMARY_OUTPUT=$(./bin/cargowall summary --audit-log /tmp/cargowall-audit.json --steps '[]' 2>&1)
 
@@ -135,6 +194,7 @@ case "${1:-}" in
   blocked-ip) blocked_ip ;;
   docker-pull) docker_pull ;;
   docker-filter) docker_filter ;;
+  dns-attribution) dns_attribution ;;
   summary) summary ;;
-  *) echo "usage: $0 warm-resolver|allowed-pattern|allowed|blocked|blocked-ip|docker-pull|docker-filter|summary" >&2; exit 2 ;;
+  *) echo "usage: $0 warm-resolver|allowed-pattern|allowed|blocked|blocked-ip|docker-pull|docker-filter|dns-attribution|summary" >&2; exit 2 ;;
 esac

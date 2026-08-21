@@ -171,6 +171,9 @@ jobs:
       - name: Test blocked connection
         run: bash scripts/ci/enforce.sh blocked
 
+      - name: DNS step attribution evidence (issue 110)
+        run: bash scripts/ci/enforce.sh dns-attribution
+
       - name: Test blocked direct IP connection
         run: bash scripts/ci/enforce.sh blocked-ip
 

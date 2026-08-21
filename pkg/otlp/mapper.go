@@ -139,6 +139,9 @@ func logRecordFromEvent(ev events.AuditEvent) *logspb.LogRecord {
 	if ev.ContainerOrigin {
 		attrs = append(attrs, boolAttr("cargowall.container_origin", true))
 	}
+	if ev.StepAttrOutcome != "" {
+		attrs = append(attrs, stringAttr("cargowall.step_attr_outcome", string(ev.StepAttrOutcome)))
+	}
 	// Real step ordinals export as an int for per-step grouping; the two
 	// reserved sentinels export as a scope label instead of a meaningless
 	// 4294967294/4294967295 that dashboards would treat as a step id.

@@ -240,6 +240,23 @@ func TestLogRecordFromEvent_StepOrdinal(t *testing.T) {
 	assert.Nil(t, attrs["cargowall.step_scope"])
 }
 
+// The sockdiag outcome taxonomy (issue #110) must survive past the JSON
+// file: dns_blocked records export it, everything else omits it.
+func TestLogRecordFromEvent_StepAttrOutcome(t *testing.T) {
+	ev := events.AuditEvent{
+		Timestamp:       time.Now(),
+		EventType:       events.EventDNSBlocked,
+		DstHostname:     "blocked.example.com",
+		StepAttrOutcome: events.StepAttrUntagged,
+	}
+	attrs := attrMap(t, logRecordFromEvent(ev).Attributes)
+	assert.Equal(t, "untagged", attrs["cargowall.step_attr_outcome"].GetStringValue())
+
+	ev.StepAttrOutcome = ""
+	attrs = attrMap(t, logRecordFromEvent(ev).Attributes)
+	assert.Nil(t, attrs["cargowall.step_attr_outcome"], "empty outcome is omitted")
+}
+
 // Container attribution fields ride per-connection events (issue #106): the
 // enricher stamps them onto blocked/allowed records, and dashboards group by
 // cargowall.container_id / filter on cargowall.container_origin.

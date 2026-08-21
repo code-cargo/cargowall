@@ -71,9 +71,9 @@ type Options struct {
 // maxOrdinalBase bounds --step-ordinal-base away from the reserved
 // StepOrdinal* sentinels: the kernel increments a u64 counter but truncates
 // each assignment to u32, so a base near the top would collide real steps
-// with StepOrdinalPreDaemon/Runner (or wrap to 0 = untagged). The 2^16
-// margin leaves room for any realistic number of steps.
-const maxOrdinalBase = uint64(events.StepOrdinalPreDaemon) - 1<<16
+// with StepOrdinalPreDaemon/Runner (or wrap to 0 = no ordinal). The margin
+// inside MaxRealStepOrdinal leaves room for any realistic number of steps.
+const maxOrdinalBase = uint64(events.MaxRealStepOrdinal)
 
 // Tracker owns the step-attribution BPF programs and the reconciler
 // goroutine that turns new-step ringbuf notifications into audit events.
@@ -85,7 +85,6 @@ type Tracker struct {
 	reader        *ringbuf.Reader
 	stateMap      *ebpf.Map
 	taskMap       *ebpf.Map
-	sockMap       *ebpf.Map
 	auditLogger   *events.AuditLogger
 	logger        *slog.Logger
 	done          chan struct{}
@@ -94,12 +93,9 @@ type Tracker struct {
 	boundaryMu sync.Mutex
 	boundaries []boundary
 
-	// DNS-path lookup guards — see StepForClient.
-	stepCacheMu  sync.Mutex
-	stepCache    map[stepCacheKey]stepCacheEntry
-	diagSem      chan struct{}
-	diagWarnMu   sync.Mutex
-	diagLastWarn string
+	// DNS-path client attribution (sock_diag lookups, caching, map joins) —
+	// see clientResolver. Constructed in Start, closed in Close.
+	resolver *clientResolver
 }
 
 // Start loads the step-attribution collection against tcObjs' shared maps,
@@ -145,12 +141,10 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		workerCmdline: readCmdline(workerPID),
 		stateMap:      tcObjs.MapStepState,
 		taskMap:       tcObjs.MapTaskStep,
-		sockMap:       tcObjs.MapSockStep,
 		auditLogger:   auditLogger,
 		logger:        logger,
 		done:          make(chan struct{}),
-		stepCache:     make(map[stepCacheKey]stepCacheEntry),
-		diagSem:       make(chan struct{}, diagConcurrency),
+		resolver:      newClientResolver(tcObjs.MapSockStep, tcObjs.MapSockPid, logger),
 	}
 
 	// The three shared maps are owned by the tcbpf collection; replacing them
@@ -213,6 +207,9 @@ func (t *Tracker) Close() {
 		_ = t.reader.Close()
 		<-t.done // run() exits promptly on ringbuf.ErrClosed
 	}
+	// Stop new sock_diag work (later StepForClient calls shed) and join the
+	// per-table drainers, so no dump goroutine outlives the tracker.
+	t.resolver.close()
 	for _, l := range t.links {
 		_ = l.Close()
 	}

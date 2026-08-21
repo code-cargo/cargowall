@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/events"
@@ -57,7 +56,7 @@ type Server struct {
 	// Atomic because it is installed via SetStepLookup after the server is
 	// already answering queries (step attribution starts later in startup),
 	// so handler goroutines read it concurrently with the write. Holds a
-	// func(net.Addr) uint32.
+	// StepLookup.
 	stepLookup atomic.Value
 
 	// Per-listener attribution modes (issue #106): every listen address is
@@ -120,15 +119,9 @@ func NewServer(cfg *config.Manager, fw firewall.Firewall, upstream, listenAddr s
 		listenAddr: listenAddr,
 		client: &dns.Client{
 			Timeout: 5 * time.Second,
-			Dialer: &net.Dialer{
-				Control: func(network, address string, c syscall.RawConn) error {
-					var sErr error
-					c.Control(func(fd uintptr) {
-						sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_MARK, cargowallNet.DNSProxyFWMark)
-					})
-					return sErr
-				},
-			},
+			// Marked so the redirect's RETURN exemptions pass the proxy's own
+			// upstream queries through instead of DNAT-looping them back.
+			Dialer: &net.Dialer{Control: cargowallNet.MarkDNSProxySocket},
 		},
 		hostnameIPs:   make(map[string]map[string]bool),
 		dnsCache:      newLRUCache[string, *dnsCacheEntry](10000),
@@ -149,17 +142,6 @@ func (s *Server) SetAuditLogger(auditLogger *events.AuditLogger) {
 	s.auditLogger = auditLogger
 }
 
-// SetStepLookup installs a resolver from a DNS client address to the step
-// ordinal of the process that owns the client socket (steps.Tracker's
-// sock_diag path). Used to attribute dns_blocked events causally; nil or a
-// failed lookup leaves the event untagged.
-func (s *Server) SetStepLookup(lookup func(net.Addr) uint32) {
-	if lookup == nil {
-		return // atomic.Value cannot store nil; absent means untagged anyway
-	}
-	s.stepLookup.Store(lookup)
-}
-
 // SetRecentBlocks attaches the buffer of recently blocked connections that
 // the enforcement path reconciles as late-allowed when it opens the firewall
 // for their destination IP (#83). Requires an audit logger to emit the
@@ -168,75 +150,10 @@ func (s *Server) SetRecentBlocks(rb *events.RecentBlocks) {
 	s.recentBlocks = rb
 }
 
-// listenerAttribution is how a listener's blocked queries are attributed —
-// a property of the listen ADDRESS, fixed at creation, so the query path
-// asks the listener instead of re-deriving feature state per query.
-type listenerAttribution int
-
-const (
-	// attributeHostSockdiag resolves the querying step from the client
-	// socket via sock_diag — correct only for host-netns clients.
-	attributeHostSockdiag listenerAttribution = iota
-	// attributeContainerIP marks queries container-origin and resolves
-	// attribution by client IP via the container lookup. The sockdiag path
-	// NEVER runs for these listeners: it cannot see a container-netns
-	// socket, and its single-wildcard fallback can hand a container query
-	// an unrelated HOST process's ordinal — a wrong attribution rather
-	// than a coarse one. When the lookup is absent (installed late, after
-	// the dockerd restart — or never, when --docker-dns-interception runs
-	// without --container-attribution), queries file as container-origin
-	// with no ordinal: the unattributed container tier. That residual is
-	// accepted and pinned by test.
-	attributeContainerIP
-)
-
 // AddListenAddr adds an additional address for the DNS server to listen on,
 // attributed via the host sockdiag path.
 func (s *Server) AddListenAddr(addr string) {
 	s.additionalAddrs = append(s.additionalAddrs, addr)
-}
-
-// ContainerLookup resolves a container-origin DNS client address (the
-// container's veth IP — the source of both direct bridge queries and the
-// embedded resolver's external forwards) to its step attribution.
-type ContainerLookup func(addr net.Addr) (stepOrdinal uint32, containerID string, ok bool)
-
-// SetContainerLookup installs the container-client resolver
-// (containers.Tracker.LookupClient). Same late-install contract as
-// SetStepLookup.
-func (s *Server) SetContainerLookup(lookup ContainerLookup) {
-	if lookup == nil {
-		return // atomic.Value cannot store nil; absent means unattributed anyway
-	}
-	s.containerLookup.Store(lookup)
-}
-
-// AddContainerListenAddr adds a listen address AND marks it as
-// container-serving, so queries arriving there are attributed via the
-// container lookup instead of the host-netns sockdiag path (which cannot see
-// a container's client socket, and whose wildcard fallback could even
-// mis-hit an unrelated host socket on the same ephemeral port). Explicit
-// marking rather than inference: a future non-container extra listener must
-// not silently classify its clients as containers. Call before Start.
-func (s *Server) AddContainerListenAddr(addr string) {
-	s.AddListenAddr(addr)
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		s.listenerModes[host] = attributeContainerIP
-	}
-}
-
-// attributionMode returns the listener's attribution mode for a query —
-// attributeHostSockdiag unless the listen address was created
-// container-serving.
-func (s *Server) attributionMode(w dns.ResponseWriter) listenerAttribution {
-	if len(s.listenerModes) == 0 || w.LocalAddr() == nil {
-		return attributeHostSockdiag
-	}
-	host, _, err := net.SplitHostPort(w.LocalAddr().String())
-	if err != nil {
-		return attributeHostSockdiag
-	}
-	return s.listenerModes[host]
 }
 
 // EnableQueryFiltering enables DNS query filtering.
@@ -407,16 +324,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// but an unprivileged run must still be able to bind — so a failed mark
 	// warns rather than refusing to serve DNS at all.
 	lc := net.ListenConfig{
-		Control: func(_, address string, c syscall.RawConn) error {
-			var sErr error
-			if err := c.Control(func(fd uintptr) {
-				sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_MARK, cargowallNet.DNSProxyFWMark)
-			}); err != nil {
-				return err
-			}
-			if sErr != nil {
+		Control: func(network, address string, c syscall.RawConn) error {
+			if err := cargowallNet.MarkDNSProxySocket(network, address, c); err != nil {
 				s.logger.Warn("Could not mark DNS listener socket; replies may be blocked under cgroup enforcement",
-					"addr", address, "error", sErr)
+					"addr", address, "error", err)
 			}
 			return nil
 		},
@@ -547,42 +458,21 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 			// manager) - in audit mode, log but don't block
 			isAuditMode := s.config.IsAuditMode()
 
+			attr := s.attributeClient(w)
+			ev := events.AuditEvent{
+				EventType:   events.EventDNSBlocked,
+				DstHostname: domain,
+			}
+			attr.apply(&ev)
+
+			logAttrs := attr.logAttrs("domain", domain, "from", w.RemoteAddr().String())
 			if isAuditMode {
-				s.logger.Info("DNS query would be blocked (audit mode)",
-					"domain", domain,
-					"from", w.RemoteAddr().String())
+				s.logger.Info("DNS query would be blocked (audit mode)", logAttrs...)
 			} else {
-				s.logger.Info("DNS query blocked (domain not allowed)",
-					"domain", domain,
-					"from", w.RemoteAddr().String())
+				s.logger.Info("DNS query blocked (domain not allowed)", logAttrs...)
 			}
 
-			// Log to audit file if configured. A host client's step is
-			// resolved from its socket while it is still blocked in its recv,
-			// so the sock_diag lookup sees a live socket. A container client
-			// has no visible socket in the host netns — its query is keyed on
-			// the container IP instead, and never touches the sockdiag path.
 			if s.auditLogger != nil {
-				ev := events.AuditEvent{
-					EventType:   events.EventDNSBlocked,
-					DstHostname: domain,
-				}
-				// Attribution is the listener's constructor-time property —
-				// see listenerAttribution for the semantics of each mode.
-				switch s.attributionMode(w) {
-				case attributeContainerIP:
-					ev.ContainerOrigin = true
-					if lookup, ok := s.containerLookup.Load().(ContainerLookup); ok {
-						if ordinal, containerID, found := lookup(w.RemoteAddr()); found {
-							ev.StepOrdinal = ordinal
-							ev.ContainerID = containerID
-						}
-					}
-				case attributeHostSockdiag:
-					if lookup, ok := s.stepLookup.Load().(func(net.Addr) uint32); ok {
-						ev.StepOrdinal = lookup(w.RemoteAddr())
-					}
-				}
 				if err := s.auditLogger.LogEvent(ev); err != nil {
 					s.logger.Error("Failed to write DNS audit log", "error", err)
 				}

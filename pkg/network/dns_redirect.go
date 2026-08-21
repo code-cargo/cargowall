@@ -23,12 +23,31 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // DNSProxyFWMark is the firewall mark applied to the DNS proxy's own upstream
 // queries so that iptables RETURN rules can exempt them from redirection.
 const DNSProxyFWMark = 0xCA12
+
+// MarkDNSProxySocket is a net Control function (Dialer.Control or
+// ListenConfig.Control) that stamps DNSProxyFWMark on the socket, so its
+// traffic matches the RETURN exemptions in dnsRedirectRules instead of
+// being DNAT'd back into the proxy. Every socket cargowall itself uses on
+// the port-53 path — the proxy's upstream client, its listeners, and the
+// startup stub peek — must carry the mark.
+func MarkDNSProxySocket(_, _ string, c syscall.RawConn) error {
+	var sErr error
+	if err := c.Control(func(fd uintptr) {
+		sErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, DNSProxyFWMark)
+	}); err != nil {
+		return err
+	}
+	return sErr
+}
 
 // dnsProxyFWMarkStr is the hex string representation used in iptables rules.
 var dnsProxyFWMarkStr = fmt.Sprintf("0x%X", DNSProxyFWMark)
@@ -48,6 +67,13 @@ var dnsRedirectRules = []dnsRedirectRule{
 	// Exempt the CargoWall DNS proxy's upstream queries (marked with DNSProxyFWMark)
 	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"}},
 	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"}},
+	// DNAT the systemd-resolved stub too: a stub-following client otherwise
+	// reaches resolved, which re-queries upstream from its OWN socket —
+	// laundering the querying process away from the sockdiag join and
+	// serving warm cache hits the proxy never sees. Marked stub peeks are
+	// exempted above; 127.0.0.1 (the proxy listen) stays un-DNATed.
+	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "-d", "127.0.0.53", "--dport", "53", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
+	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "-d", "127.0.0.53", "--dport", "53", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
 	// Redirect all other outbound DNS to the local proxy
 	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
 	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
@@ -55,9 +81,11 @@ var dnsRedirectRules = []dnsRedirectRule{
 	// flow — a reply racing the conntrack flush would re-create it reversed,
 	// with a null NAT binding no later flush can see (design.md, "DNS
 	// redirect"). Replies on ESTABLISHED entries never match. Loopback is
-	// exempt: nothing on lo is DNAT'd, a reversed 127.x entry can never
-	// capture a later external-resolver query, and dropping a stub reply
-	// mid-transaction would cost the client its full resolver timeout.
+	// exempt: a reversed 127.x entry has loopback addresses on both sides,
+	// so it can only ever match loopback tuples — it can never capture a
+	// later external-resolver query, even now that stub-destined lo traffic
+	// IS DNAT'd — and dropping a stub or proxy reply mid-transaction would
+	// cost the client its full resolver timeout.
 	{"INPUT", []string{"-p", "udp", "!", "-i", "lo", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
 	{"INPUT", []string{"-p", "tcp", "!", "-i", "lo", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
 }
@@ -99,14 +127,13 @@ var resolvedRuntimeDir = "/run/systemd/resolve"
 var flushResolvedTimeout = 5 * time.Second
 
 // FlushResolvedCache clears systemd-resolved's DNS cache via
-// `resolvectl flush-caches`. Once the DNS redirect is installed, flushing
-// forces every subsequent lookup — including from processes that warmed the
-// 127.0.0.53 stub cache before cargowall attached — to miss the stub and go
-// upstream, where the redirect routes it through the proxy. That is where
-// suffix/wildcard rules match, resolved IPs get firewall-allowed, and
-// hostname attribution is retained; a warm stub cache hit never travels
-// upstream, so the proxy never sees the name and the connection lands as an
-// unattributed bare IP (deny-by-default).
+// `resolvectl flush-caches`. Client packets to the stub are DNAT'd to the
+// proxy by dnsRedirectRules, so the residual warm-cache exposure is lookups
+// that reach resolved WITHOUT a client DNS packet — nss-resolve's
+// D-Bus/varlink path — plus resolved's own upstream re-queries: a warm
+// cache hit there is served invisibly, the proxy never sees the name, and
+// the connection lands as an unallowed bare IP. Flushing forces those
+// lookups upstream, through the redirect.
 //
 // Best-effort with two quiet skips (return nil, log at Debug): resolvectl not
 // installed, or systemd-resolved not running — in both cases there is no stub

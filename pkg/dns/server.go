@@ -57,7 +57,7 @@ type Server struct {
 	// Atomic because it is installed via SetStepLookup after the server is
 	// already answering queries (step attribution starts later in startup),
 	// so handler goroutines read it concurrently with the write. Holds a
-	// func(net.Addr) uint32.
+	// func(net.Addr, *events.AuditEvent).
 	stepLookup atomic.Value
 
 	// Per-listener attribution modes (issue #106): every listen address is
@@ -120,15 +120,9 @@ func NewServer(cfg *config.Manager, fw firewall.Firewall, upstream, listenAddr s
 		listenAddr: listenAddr,
 		client: &dns.Client{
 			Timeout: 5 * time.Second,
-			Dialer: &net.Dialer{
-				Control: func(network, address string, c syscall.RawConn) error {
-					var sErr error
-					c.Control(func(fd uintptr) {
-						sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_MARK, cargowallNet.DNSProxyFWMark)
-					})
-					return sErr
-				},
-			},
+			// Marked so the redirect's RETURN exemptions pass the proxy's own
+			// upstream queries through instead of DNAT-looping them back.
+			Dialer: &net.Dialer{Control: cargowallNet.MarkedDialControl},
 		},
 		hostnameIPs:   make(map[string]map[string]bool),
 		dnsCache:      newLRUCache[string, *dnsCacheEntry](10000),
@@ -149,13 +143,15 @@ func (s *Server) SetAuditLogger(auditLogger *events.AuditLogger) {
 	s.auditLogger = auditLogger
 }
 
-// SetStepLookup installs a resolver from a DNS client address to the step
-// ordinal of the process that owns the client socket (steps.Tracker's
-// sock_diag path). Used to attribute dns_blocked events causally; nil or a
-// failed lookup leaves the event untagged.
-func (s *Server) SetStepLookup(lookup func(net.Addr) uint32) {
+// SetStepLookup installs the resolver that writes a host DNS client's step
+// attribution (ordinal, outcome, owner pid/process — fields AuditEvent
+// already owns) onto a dns_blocked event, keyed by the client address
+// (steps.Tracker.AttributeClient's sock_diag path). An installed resolver
+// always stamps the outcome, even when the lookup fails; only an absent
+// (never-installed) resolver leaves the event untouched.
+func (s *Server) SetStepLookup(lookup func(addr net.Addr, ev *events.AuditEvent)) {
 	if lookup == nil {
-		return // atomic.Value cannot store nil; absent means untagged anyway
+		return // atomic.Value cannot store nil; absent leaves events untouched anyway
 	}
 	s.stepLookup.Store(lookup)
 }
@@ -579,8 +575,8 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 						}
 					}
 				case attributeHostSockdiag:
-					if lookup, ok := s.stepLookup.Load().(func(net.Addr) uint32); ok {
-						ev.StepOrdinal = lookup(w.RemoteAddr())
+					if lookup, ok := s.stepLookup.Load().(func(net.Addr, *events.AuditEvent)); ok {
+						lookup(w.RemoteAddr(), &ev)
 					}
 				}
 				if err := s.auditLogger.LogEvent(ev); err != nil {

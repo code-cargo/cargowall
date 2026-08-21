@@ -562,7 +562,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			// DNS events have no TC packet to carry a tag; the proxy
 			// resolves the querying step from the client socket instead.
 			if dnsServer != nil {
-				dnsServer.SetStepLookup(tracker.StepForClient)
+				dnsServer.SetStepLookup(tracker.AttributeClient)
 			}
 		}
 	}
@@ -696,11 +696,14 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 		// Shared resolver that uses the systemd-resolved stub listener for
 		// looking up cached DNS entries. Used for existing-connection reverse
-		// DNS and Phase 1 cache population.
+		// DNS and Phase 1 cache population. Marked so the stub DNAT rule in
+		// dnsRedirectRules (installed before this runs) passes these peeks
+		// through to the real stub instead of looping them into the proxy.
 		cacheResolver := &net.Resolver{
 			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "udp", "127.0.0.53:53")
+			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				d := &net.Dialer{Control: network.MarkedDialControl}
+				return d.DialContext(ctx, "udp", "127.0.0.53:53")
 			},
 		}
 
@@ -713,9 +716,11 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 		// Flush systemd-resolved's cache now that the redirect is installed
 		// and every warm-cache read above (existing-connection reverse DNS +
-		// Phase 1 snapshot) has run against it. Flushing forces all future
-		// lookups — from any process, including ones that populated the stub
-		// cache before cargowall attached — to miss 127.0.0.53 and go
+		// Phase 1 snapshot) has run against it. Client packets to the stub
+		// are DNAT'd to the proxy by dnsRedirectRules, so the residual
+		// warm-cache exposure is lookups that reach resolved WITHOUT a
+		// client DNS packet — nss-resolve's D-Bus/varlink path — plus
+		// resolved's own upstream re-queries. Flushing forces those to go
 		// upstream, where the redirect routes them through the proxy for
 		// suffix-rule matching, IP allowlisting, and hostname attribution.
 		// Without this, a warm stub cache hit is served invisibly and the

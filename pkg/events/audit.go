@@ -57,6 +57,14 @@ const (
 	StepOrdinalRunner    uint32 = 0xFFFFFFFF // Runner.Worker itself / cargowall infra
 )
 
+// MaxRealStepOrdinal is the exclusive upper bound of real (non-sentinel)
+// step ordinals: StepOrdinalPreDaemon minus a 2^16 margin, leaving room for
+// any realistic number of steps above the configured ordinal base. Owned
+// here next to the sentinels; pkg/steps bounds --step-ordinal-base with it,
+// and the CI gates (scripts/ci/*.sh) mirror the same 0xFFFFFFFE - 65536
+// arithmetic when selecting real-ordinal events.
+const MaxRealStepOrdinal = StepOrdinalPreDaemon - 1<<16
+
 // IsConnectionAllowed reports whether the event type represents an allow
 // outcome for a TCP/UDP connection — either a regular allow or a late-allowed
 // retry after the BPF map missed.
@@ -64,24 +72,52 @@ func (et AuditEventType) IsConnectionAllowed() bool {
 	return et == EventConnectionAllowed || et == EventConnectionLateAllowed
 }
 
+// StepAttrOutcome says how the sockdiag step lookup behind a dns_blocked
+// event resolved (pkg/steps StepForClient). Defined next to AuditEvent —
+// the one place the vocabulary lives — so the JSON field, OTLP export, and
+// CI assertions cannot drift from the producer.
+type StepAttrOutcome string
+
+const (
+	// StepAttrOK: client socket found and tagged; StepOrdinal is real (or a
+	// sentinel).
+	StepAttrOK StepAttrOutcome = "ok"
+	// StepAttrUntagged: socket found but its cookie has no map_sock_step
+	// entry — the owner is outside the tagged subtree (e.g. a systemd
+	// service, systemd-resolved) or predates attach.
+	StepAttrUntagged StepAttrOutcome = "untagged"
+	// StepAttrNotFound: clean dump, no socket matched the client address.
+	StepAttrNotFound StepAttrOutcome = "not_found"
+	// StepAttrAmbiguous: only wildcard-bound candidates matched and there
+	// were two or more — declined rather than guessed.
+	StepAttrAmbiguous StepAttrOutcome = "ambiguous_wildcard"
+	// StepAttrDumpError: the netlink dump itself failed.
+	StepAttrDumpError StepAttrOutcome = "dump_error"
+	// StepAttrShed: dropped under flood back-pressure without resolving.
+	StepAttrShed StepAttrOutcome = "shed"
+	// StepAttrUnsupported: the client address was not UDP/TCP.
+	StepAttrUnsupported StepAttrOutcome = "unsupported_addr"
+)
+
 // AuditEvent represents a network event for audit logging
 type AuditEvent struct {
-	Timestamp       time.Time      `json:"timestamp"`
-	EventType       AuditEventType `json:"event_type"`
-	SrcIP           string         `json:"src_ip,omitempty"`
-	DstIP           string         `json:"dst_ip,omitempty"`
-	DstHostname     string         `json:"dst_hostname,omitempty"`
-	DstPort         uint16         `json:"dst_port,omitempty"`
-	Protocol        string         `json:"protocol,omitempty"` // L4 protocol name ("TCP"/"UDP", see getProtocolName; the blocked protocol itself for protocol_blocked) — shipped to the summary backend and part of the dedup key, so a real value beats a hardcoded literal
-	Process         string         `json:"process,omitempty"`
-	PID             uint32         `json:"pid,omitempty"`
-	MatchedRule     string         `json:"matched_rule,omitempty"` // the matching rule's Value (pattern string for glob rules), which can differ from the resolved DstHostname (e.g. rule `*.compute-1.amazonaws.com` matching `ec2-1-2-3-4.compute-1...`)
-	AutoAllowedType string         `json:"auto_allowed_type,omitempty"`
-	CNAMEChain      []string       `json:"cname_chain,omitempty"`  // CNAME chain origin..target when DstHostname was reached via a CNAME of an allowed host
-	MidStream       bool           `json:"mid_stream,omitempty"`   // set on connection_blocked when the drop was a non-SYN TCP segment (established connection killed mid-stream, e.g. a pre-existing socket whose dst was never seeded)
-	WouldDeny       bool           `json:"would_deny"`             // true in audit mode (would have been denied)
-	Blocked         bool           `json:"blocked"`                // true in enforce mode (actually blocked)
-	StepOrdinal     uint32         `json:"step_ordinal,omitempty"` // workflow step that (transitively) created the socket — causal, not temporal; see StepOrdinal* sentinels
+	Timestamp       time.Time       `json:"timestamp"`
+	EventType       AuditEventType  `json:"event_type"`
+	SrcIP           string          `json:"src_ip,omitempty"`
+	DstIP           string          `json:"dst_ip,omitempty"`
+	DstHostname     string          `json:"dst_hostname,omitempty"`
+	DstPort         uint16          `json:"dst_port,omitempty"`
+	Protocol        string          `json:"protocol,omitempty"` // L4 protocol name ("TCP"/"UDP", see getProtocolName; the blocked protocol itself for protocol_blocked) — shipped to the summary backend and part of the dedup key, so a real value beats a hardcoded literal
+	Process         string          `json:"process,omitempty"`
+	PID             uint32          `json:"pid,omitempty"`
+	MatchedRule     string          `json:"matched_rule,omitempty"` // the matching rule's Value (pattern string for glob rules), which can differ from the resolved DstHostname (e.g. rule `*.compute-1.amazonaws.com` matching `ec2-1-2-3-4.compute-1...`)
+	AutoAllowedType string          `json:"auto_allowed_type,omitempty"`
+	CNAMEChain      []string        `json:"cname_chain,omitempty"`       // CNAME chain origin..target when DstHostname was reached via a CNAME of an allowed host
+	MidStream       bool            `json:"mid_stream,omitempty"`        // set on connection_blocked when the drop was a non-SYN TCP segment (established connection killed mid-stream, e.g. a pre-existing socket whose dst was never seeded)
+	WouldDeny       bool            `json:"would_deny"`                  // true in audit mode (would have been denied)
+	Blocked         bool            `json:"blocked"`                     // true in enforce mode (actually blocked)
+	StepOrdinal     uint32          `json:"step_ordinal,omitempty"`      // workflow step that (transitively) created the socket — causal, not temporal; see StepOrdinal* sentinels
+	StepAttrOutcome StepAttrOutcome `json:"step_attr_outcome,omitempty"` // dns_blocked only: how the sockdiag step lookup resolved — additive/omitempty like the container fields below
 
 	// Container attribution (issue #106). All additive and omitempty: the
 	// summary reader tolerates their absence, so old daemons and new

@@ -71,9 +71,9 @@ type Options struct {
 // maxOrdinalBase bounds --step-ordinal-base away from the reserved
 // StepOrdinal* sentinels: the kernel increments a u64 counter but truncates
 // each assignment to u32, so a base near the top would collide real steps
-// with StepOrdinalPreDaemon/Runner (or wrap to 0 = untagged). The 2^16
-// margin leaves room for any realistic number of steps.
-const maxOrdinalBase = uint64(events.StepOrdinalPreDaemon) - 1<<16
+// with StepOrdinalPreDaemon/Runner (or wrap to 0 = no ordinal). The margin
+// inside MaxRealStepOrdinal leaves room for any realistic number of steps.
+const maxOrdinalBase = uint64(events.MaxRealStepOrdinal)
 
 // Tracker owns the step-attribution BPF programs and the reconciler
 // goroutine that turns new-step ringbuf notifications into audit events.
@@ -94,10 +94,13 @@ type Tracker struct {
 	boundaryMu sync.Mutex
 	boundaries []boundary
 
-	// DNS-path lookup guards — see StepForClient.
+	// DNS-path lookup state — see StepForClient. pidMap (map_sock_pid,
+	// written by the connect/sendmsg hooks) names the socket owner behind a
+	// resolved cookie; diag coalesces the sock_diag dumps.
+	pidMap       *ebpf.Map
 	stepCacheMu  sync.Mutex
 	stepCache    map[stepCacheKey]stepCacheEntry
-	diagSem      chan struct{}
+	diag         *diagBatcher
 	diagWarnMu   sync.Mutex
 	diagLastWarn string
 }
@@ -146,11 +149,12 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		stateMap:      tcObjs.MapStepState,
 		taskMap:       tcObjs.MapTaskStep,
 		sockMap:       tcObjs.MapSockStep,
+		pidMap:        tcObjs.MapSockPid,
 		auditLogger:   auditLogger,
 		logger:        logger,
 		done:          make(chan struct{}),
 		stepCache:     make(map[stepCacheKey]stepCacheEntry),
-		diagSem:       make(chan struct{}, diagConcurrency),
+		diag:          newDiagBatcher(),
 	}
 
 	// The three shared maps are owned by the tcbpf collection; replacing them
@@ -213,6 +217,9 @@ func (t *Tracker) Close() {
 		_ = t.reader.Close()
 		<-t.done // run() exits promptly on ringbuf.ErrClosed
 	}
+	// Stop new sock_diag work (later StepForClient calls shed) and join the
+	// per-table drainers, so no dump goroutine outlives the tracker.
+	t.diag.close()
 	for _, l := range t.links {
 		_ = l.Close()
 	}

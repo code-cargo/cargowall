@@ -3588,7 +3588,7 @@ func TestHandleDNSQuery_ContainerListenerUsesContainerLookup(t *testing.T) {
 	server.AddContainerListenAddr("172.17.0.1:53")
 
 	stepLookupCalls := 0
-	server.SetStepLookup(func(net.Addr) uint32 { stepLookupCalls++; return 7 })
+	server.SetStepLookup(func(_ net.Addr, ev *events.AuditEvent) { stepLookupCalls++; ev.StepOrdinal = 7 })
 	var lookupAddr net.Addr
 	server.SetContainerLookup(func(addr net.Addr) (uint32, string, bool) {
 		lookupAddr = addr
@@ -3623,7 +3623,7 @@ func TestHandleDNSQuery_ContainerListenerUsesContainerLookup(t *testing.T) {
 func TestHandleDNSQuery_InterceptionWithoutAttributionFilesAsUnattributedContainer(t *testing.T) {
 	server, sink := newContainerAttributionServer(t, false)
 	server.AddContainerListenAddr("172.17.0.1:53")
-	server.SetStepLookup(func(net.Addr) uint32 { return 7 })
+	server.SetStepLookup(func(_ net.Addr, ev *events.AuditEvent) { ev.StepOrdinal = 7 })
 	// No SetContainerLookup: the attribution feature is off in this config.
 
 	w := newAddrResponseWriter("172.17.0.1", "172.17.0.3", 42345)
@@ -3655,7 +3655,7 @@ func TestHandleDNSQuery_ContainerListenerLookupMissStaysContainerOrigin(t *testi
 			server.AddContainerListenAddr("172.17.0.1:53")
 
 			stepLookupCalls := 0
-			server.SetStepLookup(func(net.Addr) uint32 { stepLookupCalls++; return 7 })
+			server.SetStepLookup(func(_ net.Addr, ev *events.AuditEvent) { stepLookupCalls++; ev.StepOrdinal = 7 })
 			if tc.install {
 				server.SetContainerLookup(func(net.Addr) (uint32, string, bool) { return 0, "", false })
 			}
@@ -3680,7 +3680,12 @@ func TestHandleDNSQuery_HostListenerKeepsSockdiagPath(t *testing.T) {
 	server, sink := newContainerAttributionServer(t, false)
 	server.AddContainerListenAddr("172.17.0.1:53")
 
-	server.SetStepLookup(func(net.Addr) uint32 { return 5 })
+	server.SetStepLookup(func(_ net.Addr, ev *events.AuditEvent) {
+		ev.StepOrdinal = 5
+		ev.StepAttrOutcome = events.StepAttrOK
+		ev.PID = 4242
+		ev.Process = "curl"
+	})
 	containerLookupCalls := 0
 	server.SetContainerLookup(func(net.Addr) (uint32, string, bool) {
 		containerLookupCalls++
@@ -3693,6 +3698,9 @@ func TestHandleDNSQuery_HostListenerKeepsSockdiagPath(t *testing.T) {
 	assert.Equal(t, dns.RcodeRefused, w.msg.Rcode)
 	assert.False(t, ev.ContainerOrigin, "host-listener queries are not container-origin")
 	assert.Equal(t, uint32(5), ev.StepOrdinal, "host path unchanged: sockdiag lookup attributes the query")
+	assert.Equal(t, events.StepAttrOK, ev.StepAttrOutcome, "the lookup outcome is carried on the event")
+	assert.Equal(t, uint32(4242), ev.PID, "the client socket owner's pid is carried on the event")
+	assert.Equal(t, "curl", ev.Process, "the client socket owner's name is carried on the event")
 	assert.Empty(t, ev.ContainerID)
 	assert.Zero(t, containerLookupCalls, "container lookup must not run for host-listener queries")
 }
@@ -3704,7 +3712,7 @@ func TestHandleDNSQuery_PlainAddListenAddrStaysHostPath(t *testing.T) {
 	server, sink := newContainerAttributionServer(t, false)
 	server.AddListenAddr("172.17.0.1:53") // plain, not AddContainerListenAddr
 
-	server.SetStepLookup(func(net.Addr) uint32 { return 5 })
+	server.SetStepLookup(func(_ net.Addr, ev *events.AuditEvent) { ev.StepOrdinal = 5 })
 	containerLookupCalls := 0
 	server.SetContainerLookup(func(net.Addr) (uint32, string, bool) {
 		containerLookupCalls++

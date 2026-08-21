@@ -128,15 +128,15 @@ func TestDNSRedirectRules_Shape(t *testing.T) {
 	}
 }
 
-// TestMarkedDialControl_SetsMark: a dialer using MarkedDialControl must
+// TestMarkDNSProxySocket_SetsMark: a dialer using MarkDNSProxySocket must
 // carry DNSProxyFWMark, or the stub DNAT would loop cargowall's own stub
 // peeks (cacheResolver) back into the proxy. Root-only: SO_MARK needs
 // CAP_NET_ADMIN, and the sudo'd pkg/network test pass in CI provides it.
-func TestMarkedDialControl_SetsMark(t *testing.T) {
+func TestMarkDNSProxySocket_SetsMark(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("SO_MARK requires CAP_NET_ADMIN; covered by the sudo test pass")
 	}
-	d := &net.Dialer{Control: MarkedDialControl}
+	d := &net.Dialer{Control: MarkDNSProxySocket}
 	conn, err := d.Dial("udp", "127.0.0.1:53535")
 	if err != nil {
 		t.Fatalf("dial: %v", err)

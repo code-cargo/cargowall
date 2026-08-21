@@ -17,6 +17,7 @@
 package steps
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -356,9 +357,83 @@ func TestLookupCookie_ExactBeatsCrossTableWildcard(t *testing.T) {
 		"the v6-table exact match must win; the v4 wildcard is a different socket")
 }
 
+// The full cross-table ranking on synthetic rows via the batcher's dump
+// seam: exact in any table beats wildcard anywhere; an earlier table's
+// wildcard beats a later one's; a unique wildcard beats ambiguity.
+func TestLookupCookie_RankingSynthetic(t *testing.T) {
+	exact4 := wantBytes(unix.AF_INET, net.IPv4(127, 0, 0, 1))
+	exact6 := wantBytes(unix.AF_INET6, net.IPv4(127, 0, 0, 1))
+	const port = 40000
+	cases := []struct {
+		name       string
+		v4, v6     []sockRow
+		wantCookie uint64
+		wantStatus cookieStatus
+	}{
+		{"v4 exact wins", []sockRow{{sport: port, src: exact4, cookie: 1}}, nil, 1, cookieHit},
+		{
+			"v6 exact beats v4 wildcard",
+			[]sockRow{{sport: port, cookie: 2}},
+			[]sockRow{{sport: port, src: exact6, cookie: 3}},
+			3, cookieHit,
+		},
+		{
+			"v4 wildcard beats v6 wildcard",
+			[]sockRow{{sport: port, cookie: 4}},
+			[]sockRow{{sport: port, cookie: 5}},
+			4, cookieHit,
+		},
+		{"v6 wildcard when v4 empty", nil, []sockRow{{sport: port, cookie: 6}}, 6, cookieHit},
+		{
+			"unique wildcard beats ambiguity in the other table",
+			[]sockRow{{sport: port, cookie: 7}, {sport: port, cookie: 8}},
+			[]sockRow{{sport: port, cookie: 9}},
+			9, cookieHit,
+		},
+		{
+			"ambiguous only",
+			[]sockRow{{sport: port, cookie: 7}, {sport: port, cookie: 8}},
+			nil, 0, cookieAmbiguous,
+		},
+		{"not found", nil, nil, 0, cookieNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTestResolver()
+			defer r.close()
+			r.diag.dump = func(table diagTable) ([]sockRow, error) {
+				if table.family == unix.AF_INET {
+					return tc.v4, nil
+				}
+				return tc.v6, nil
+			}
+			cookie, status, err := r.lookupCookie(unix.AF_INET, unix.IPPROTO_UDP, net.IPv4(127, 0, 0, 1), port)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantStatus, status)
+			assert.Equal(t, tc.wantCookie, cookie)
+		})
+	}
+}
+
 // stepForClient outcome taxonomy: each distinct failure mode must be
 // tellable apart on the result — none may collapse into a silent 0.
 func TestStepForClient_Outcomes(t *testing.T) {
+	t.Run("dump error", func(t *testing.T) {
+		r := newTestResolver()
+		defer r.close()
+		boom := errors.New("boom")
+		r.diag.dump = func(diagTable) ([]sockRow, error) { return nil, boom }
+		attr := r.stepForClient(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001})
+		assert.Equal(t, events.StepAttrDumpError, attr.Outcome)
+
+		// Cached with the TTL: the repeat query must not dump again.
+		calls := 0
+		r.diag.dump = func(diagTable) ([]sockRow, error) { calls++; return nil, boom }
+		attr = r.stepForClient(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001})
+		assert.Equal(t, events.StepAttrDumpError, attr.Outcome)
+		assert.Zero(t, calls, "dump errors are cached, not retried per query")
+	})
+
 	t.Run("unsupported addr", func(t *testing.T) {
 		r := newTestResolver()
 		attr := r.stepForClient(&net.UnixAddr{Name: "/tmp/x", Net: "unix"})

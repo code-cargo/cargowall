@@ -702,7 +702,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		cacheResolver := &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				d := &net.Dialer{Control: network.MarkedDialControl}
+				d := &net.Dialer{Control: network.MarkDNSProxySocket}
 				return d.DialContext(ctx, "udp", "127.0.0.53:53")
 			},
 		}

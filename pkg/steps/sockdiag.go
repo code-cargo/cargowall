@@ -244,6 +244,10 @@ type diagQueue struct {
 // in flight is served by the NEXT round — its socket may not have existed
 // when the running dump started.
 type diagBatcher struct {
+	// dump is the table-dump seam: dumpSocketTable in production, synthetic
+	// rows or forced errors in tests.
+	dump func(table diagTable) ([]sockRow, error)
+
 	mu     sync.Mutex
 	queues map[diagTable]*diagQueue
 	closed bool
@@ -251,7 +255,10 @@ type diagBatcher struct {
 }
 
 func newDiagBatcher() *diagBatcher {
-	return &diagBatcher{queues: make(map[diagTable]*diagQueue)}
+	return &diagBatcher{
+		dump:   func(t diagTable) ([]sockRow, error) { return dumpSocketTable(t.family, t.proto) },
+		queues: make(map[diagTable]*diagQueue),
+	}
 }
 
 // rows returns a snapshot of one socket table. The first arrival starts a
@@ -296,7 +303,7 @@ func (b *diagBatcher) drain(table diagTable, q *diagQueue) {
 		q.pending = nil
 		b.mu.Unlock()
 
-		rows, err := dumpSocketTable(table.family, table.proto)
+		rows, err := b.dump(table)
 		for _, c := range calls {
 			c.rows, c.err = rows, err
 			close(c.done)
@@ -358,19 +365,19 @@ func newClientResolver(sockMap, pidMap *ebpf.Map, logger *slog.Logger) *clientRe
 
 func (r *clientResolver) close() { r.diag.close() }
 
-// lookupCookie finds the client's socket cookie, ranking an exact source
-// match in ANY table above a wildcard match: for an IPv4 client the exact
-// socket may be a dual-stack one living only in the v6 table (source
-// ::ffff:a.b.c.d), while an unrelated wildcard shares the port in the v4
-// table — so the order is v4 exact, v6 exact, v4 unique wildcard, v6
-// unique wildcard, then ambiguous/not-found.
+// lookupCookie finds the client's socket cookie. An exact source match in
+// ANY table must beat a unique wildcard in another: an IPv4 client's exact
+// socket can be a dual-stack one living only in the v6 table (v4-mapped
+// source), while a wildcard sharing the port is some unrelated socket.
 func (r *clientResolver) lookupCookie(family, proto uint8, ip net.IP, port uint16) (uint64, cookieStatus, error) {
 	families := []uint8{family}
 	if family == unix.AF_INET {
 		families = append(families, unix.AF_INET6)
 	}
-	var wildCookie uint64
-	haveWild, haveAmbiguous := false, false
+	// Best non-exact candidate across tables; a wildcard from an earlier
+	// table outranks anything a later table adds short of an exact match.
+	var bestCookie uint64
+	best := matchNone
 	for _, fam := range families {
 		rows, shed, err := r.diag.rows(diagTable{family: fam, proto: proto})
 		if shed {
@@ -384,17 +391,19 @@ func (r *clientResolver) lookupCookie(family, proto uint8, ip net.IP, port uint1
 		case matchExact:
 			return cookie, cookieHit, nil
 		case matchWildcard:
-			if !haveWild {
-				wildCookie, haveWild = cookie, true
+			if best != matchWildcard {
+				bestCookie, best = cookie, matchWildcard
 			}
 		case matchAmbiguous:
-			haveAmbiguous = true
+			if best == matchNone {
+				best = matchAmbiguous
+			}
 		}
 	}
-	switch {
-	case haveWild:
-		return wildCookie, cookieHit, nil
-	case haveAmbiguous:
+	switch best {
+	case matchWildcard:
+		return bestCookie, cookieHit, nil
+	case matchAmbiguous:
 		return 0, cookieAmbiguous, nil
 	default:
 		return 0, cookieNotFound, nil
@@ -485,6 +494,13 @@ func (r *clientResolver) stepForClient(addr net.Addr) events.StepAttribution {
 			attr.PID = pid
 			attr.Process = readComm(int(pid))
 		}
+	default:
+		// A status this switch does not know is a programming error: log it
+		// loudly and return unresolved WITHOUT caching — neither a silent
+		// empty outcome for the TTL nor an operational code (dump_error)
+		// blaming netlink for a bug.
+		r.logger.Error("Step attribution: unhandled cookie status", "status", status)
+		return events.StepAttribution{}
 	}
 
 	// Cache every resolved outcome, dump errors and negatives included —

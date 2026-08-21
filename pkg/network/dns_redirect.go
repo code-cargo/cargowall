@@ -33,12 +33,13 @@ import (
 // queries so that iptables RETURN rules can exempt them from redirection.
 const DNSProxyFWMark = 0xCA12
 
-// MarkedDialControl is a net.Dialer Control that stamps DNSProxyFWMark on the
-// socket, so the connection matches the RETURN exemptions in
-// dnsRedirectRules instead of being DNAT'd back into the proxy. Every dialer
-// cargowall itself points at a port-53 endpoint — the proxy's upstream
-// client and the startup stub peek (cacheResolver) — must use it.
-func MarkedDialControl(_, _ string, c syscall.RawConn) error {
+// MarkDNSProxySocket is a net Control function (Dialer.Control or
+// ListenConfig.Control) that stamps DNSProxyFWMark on the socket, so its
+// traffic matches the RETURN exemptions in dnsRedirectRules instead of
+// being DNAT'd back into the proxy. Every socket cargowall itself uses on
+// the port-53 path — the proxy's upstream client, its listeners, and the
+// startup stub peek — must carry the mark.
+func MarkDNSProxySocket(_, _ string, c syscall.RawConn) error {
 	var sErr error
 	if err := c.Control(func(fd uintptr) {
 		sErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, DNSProxyFWMark)
@@ -66,14 +67,11 @@ var dnsRedirectRules = []dnsRedirectRule{
 	// Exempt the CargoWall DNS proxy's upstream queries (marked with DNSProxyFWMark)
 	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"}},
 	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"}},
-	// Intercept the systemd-resolved stub listener too: a client following a
-	// stub resolv.conf (CLI installs, hardcoded 127.0.0.53) otherwise reaches
-	// resolved, which re-queries upstream from its OWN socket — laundering
-	// the querying process away from the sockdiag step join and serving warm
-	// cache hits the proxy never sees. The proxy's startup stub peeks carry
-	// DNSProxyFWMark (MarkedDialControl) and are exempted above; 127.0.0.1
-	// itself — the proxy listen — stays un-DNATed. nss-resolve D-Bus lookups
-	// never emit a client DNS packet and remain out of reach.
+	// DNAT the systemd-resolved stub too: a stub-following client otherwise
+	// reaches resolved, which re-queries upstream from its OWN socket —
+	// laundering the querying process away from the sockdiag join and
+	// serving warm cache hits the proxy never sees. Marked stub peeks are
+	// exempted above; 127.0.0.1 (the proxy listen) stays un-DNATed.
 	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "-d", "127.0.0.53", "--dport", "53", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
 	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "-d", "127.0.0.53", "--dport", "53", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
 	// Redirect all other outbound DNS to the local proxy

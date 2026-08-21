@@ -591,6 +591,22 @@ any other consumer must do the same: **never sum `cgroup_would_block` with
 **Rule: DNS-path attribution is audit-only. No phase — current or future —
 may use a DNS-derived ordinal as an enforcement input.**
 
+**Host-path outcome taxonomy:** every host `dns_blocked` event
+carries `step_attr_outcome` — how the sock_diag lookup (client source
+address → cookie → `map_sock_step`) resolved: `ok`, `untagged` (socket
+found but its cookie has no `map_sock_step` entry — the owner is outside
+the tagged subtree, or the socket predates attach), `not_found`,
+`ambiguous_wildcard` (≥2 wildcard-bound candidates — declined, since
+misattribution is worse than none), `dump_error`, `shed` (flood
+back-pressure). Owned by `events.StepAttrOutcome` next to `AuditEvent` so
+JSON, OTLP (`cargowall.step_attr_outcome`), the summary bucketing, and the
+CI gate (`enforce.sh dns-attribution`, all-of-subset on `ok` + real
+ordinal) share one vocabulary; events also carry the owner's pid/comm from
+`map_sock_pid`. The summary routes `untagged` into its own "Host services"
+tier — the found-but-untagged residue, in practice systemd units and
+daemons — distinct from the unknown bucket that keeps the genuine lookup
+limitations.
+
 Binding on today's code, not just the future: `Tracker.LookupClient`'s
 ordinal reaches no enforcement path. It DOES fan out as an audit
 approximation (the `dns_blocked` event, and from there the summary's
@@ -657,7 +673,7 @@ flaw; redesign before building):
 
 ## GitHub Actions Integration
 
-- **DNS redirect:** iptables DNAT rules redirect all outbound DNS (port 53) to `127.0.0.1:53`, exempting sockets marked via `network.MarkDNSProxySocket` (`SO_MARK` `0xCA12`: the proxy's upstream client, its listeners, and the startup stub peeks). The systemd-resolved stub (`127.0.0.53`) is DNAT'd explicitly (#110) so a stub-following client's own socket reaches the proxy — attribution intact, no invisible warm-cache serving; `127.0.0.1` itself (the proxy listen) stays un-DNATed, and nss-resolve's D-Bus lookups remain covered by the attach-time cache flush. Install and teardown both flush dport-53 conntrack entries (ctnetlink): nat verdicts are stamped per flow at its first packet, so pre-install DNS flow state would otherwise keep bypassing the proxy (and post-teardown state would keep DNAT'ing to the dead proxy) until natural expiry
+- **DNS redirect:** iptables DNAT rules redirect all outbound DNS (port 53) to `127.0.0.1:53`, exempting sockets marked via `network.MarkDNSProxySocket` (`SO_MARK` `0xCA12`: the proxy's upstream client, its listeners, and the startup stub peeks). The systemd-resolved stub (`127.0.0.53`) is DNAT'd explicitly so a stub-following client's own socket reaches the proxy — attribution intact, no invisible warm-cache serving; `127.0.0.1` itself (the proxy listen) stays un-DNATed, and nss-resolve's D-Bus lookups remain covered by the attach-time cache flush. Install and teardown both flush dport-53 conntrack entries (ctnetlink): nat verdicts are stamped per flow at its first packet, so pre-install DNS flow state would otherwise keep bypassing the proxy (and post-teardown state would keep DNAT'ing to the dead proxy) until natural expiry
   - Flush mechanics (`pkg/network/conntrack.go`): dump + per-entry delete over `NETLINK_NETFILTER` — the kernel's flush path rejects `CTA_FILTER` with `EOPNOTSUPP` (filters are dump-only; verified on 6.8), the same reason `conntrack -D --dport` iterates in userspace. Netlink dumps are flow-controlled, so the default rcvbuf handles arbitrary table sizes (a 5k-entry table dumps in ~5ms, well inside the 2s deadline)
   - Scoped to dport 53: a full table flush would churn unrelated NAT state (Docker MASQUERADE bindings, established flows). Collateral within scope is deliberate: an in-flight UDP transaction costs one retry, while an established DNAT'd DNS-over-TCP stream is reset — its later packets miss the NAT verdict — which is the point at both call sites, since such a stream is either bypassing the proxy or aimed at a dead one. Loopback-destination entries (the DNAT'd `127.0.0.53` stub flows, direct `127.0.0.1` proxy flows) cost at most the same one-retry/reset when deleted: an in-flight reply recreates the entry — possibly reversed, which on `lo` matters not at all, since a reversed 127.x entry has loopback addresses on both sides and can never match a later external-resolver query. They stay in scope to keep the predicate simple, and the live test targets loopback for exactly that harmlessness. The proxy's own marked upstream flows re-match the mark RETURN rules on recreation
   - Reverse-direction guard: those costs only hold if the client speaks first. If the first packet after a delete comes from upstream (a reply in flight across the flush, a server-side segment on a DNS-over-TCP stream), conntrack re-creates the flow with upstream as ORIGINAL, stamps a null NAT binding (no nat rules face inbound), and every later client packet rides the reply direction — which never traverses nat OUTPUT — with an original tuple (dport = client's ephemeral port) no dport-53 flush can select. For a socket-reusing resolver (c-ares/Node holds one UDP socket per server) that is a persistent, invisible bypass. The redirect therefore installs `INPUT -p udp/tcp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP` alongside the DNAT: dropping the packet destroys its unconfirmed entry, so the client's next packet is NEW forward and takes the DNAT — the already-budgeted retry/reset, now guaranteed regardless of which side speaks first. Legitimate replies ride ESTABLISHED entries and never match. Loopback is exempt (`! -i lo`): a reversed 127.x entry has loopback addresses on both sides, so it can only ever match loopback tuples — it can never capture a later external query, even though stub-destined `lo` traffic is now DNAT'd — and without the exemption a stub or proxy lookup in flight across the install flush would lose its reply and sit out the resolver timeout (5s for glibc)

@@ -85,7 +85,6 @@ type Tracker struct {
 	reader        *ringbuf.Reader
 	stateMap      *ebpf.Map
 	taskMap       *ebpf.Map
-	sockMap       *ebpf.Map
 	auditLogger   *events.AuditLogger
 	logger        *slog.Logger
 	done          chan struct{}
@@ -94,15 +93,9 @@ type Tracker struct {
 	boundaryMu sync.Mutex
 	boundaries []boundary
 
-	// DNS-path lookup state — see StepForClient. pidMap (map_sock_pid,
-	// written by the connect/sendmsg hooks) names the socket owner behind a
-	// resolved cookie; diag coalesces the sock_diag dumps.
-	pidMap       *ebpf.Map
-	stepCacheMu  sync.Mutex
-	stepCache    map[stepCacheKey]stepCacheEntry
-	diag         *diagBatcher
-	diagWarnMu   sync.Mutex
-	diagLastWarn string
+	// DNS-path client attribution (sock_diag lookups, caching, map joins) —
+	// see clientResolver. Constructed in Start, closed in Close.
+	resolver *clientResolver
 }
 
 // Start loads the step-attribution collection against tcObjs' shared maps,
@@ -148,13 +141,10 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		workerCmdline: readCmdline(workerPID),
 		stateMap:      tcObjs.MapStepState,
 		taskMap:       tcObjs.MapTaskStep,
-		sockMap:       tcObjs.MapSockStep,
-		pidMap:        tcObjs.MapSockPid,
 		auditLogger:   auditLogger,
 		logger:        logger,
 		done:          make(chan struct{}),
-		stepCache:     make(map[stepCacheKey]stepCacheEntry),
-		diag:          newDiagBatcher(),
+		resolver:      newClientResolver(tcObjs.MapSockStep, tcObjs.MapSockPid, logger),
 	}
 
 	// The three shared maps are owned by the tcbpf collection; replacing them
@@ -219,7 +209,7 @@ func (t *Tracker) Close() {
 	}
 	// Stop new sock_diag work (later StepForClient calls shed) and join the
 	// per-table drainers, so no dump goroutine outlives the tracker.
-	t.diag.close()
+	t.resolver.close()
 	for _, l := range t.links {
 		_ = l.Close()
 	}

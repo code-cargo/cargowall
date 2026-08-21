@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/events"
@@ -57,7 +56,7 @@ type Server struct {
 	// Atomic because it is installed via SetStepLookup after the server is
 	// already answering queries (step attribution starts later in startup),
 	// so handler goroutines read it concurrently with the write. Holds a
-	// func(net.Addr, *events.AuditEvent).
+	// StepLookup.
 	stepLookup atomic.Value
 
 	// Per-listener attribution modes (issue #106): every listen address is
@@ -143,13 +142,15 @@ func (s *Server) SetAuditLogger(auditLogger *events.AuditLogger) {
 	s.auditLogger = auditLogger
 }
 
-// SetStepLookup installs the resolver that writes a host DNS client's step
-// attribution (ordinal, outcome, owner pid/process — fields AuditEvent
-// already owns) onto a dns_blocked event, keyed by the client address
-// (steps.Tracker.AttributeClient's sock_diag path). An installed resolver
-// always stamps the outcome, even when the lookup fails; only an absent
-// (never-installed) resolver leaves the event untouched.
-func (s *Server) SetStepLookup(lookup func(addr net.Addr, ev *events.AuditEvent)) {
+// StepLookup resolves a host DNS client address to its step attribution
+// (steps.Tracker.StepForClient's sock_diag path) — the host-listener
+// counterpart of ContainerLookup. An installed lookup always yields an
+// Outcome, even on failure; only an absent lookup leaves events untouched.
+type StepLookup func(addr net.Addr) events.StepAttribution
+
+// SetStepLookup installs the host-client step resolver used to attribute
+// dns_blocked events.
+func (s *Server) SetStepLookup(lookup StepLookup) {
 	if lookup == nil {
 		return // atomic.Value cannot store nil; absent leaves events untouched anyway
 	}
@@ -403,16 +404,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// but an unprivileged run must still be able to bind — so a failed mark
 	// warns rather than refusing to serve DNS at all.
 	lc := net.ListenConfig{
-		Control: func(_, address string, c syscall.RawConn) error {
-			var sErr error
-			if err := c.Control(func(fd uintptr) {
-				sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_MARK, cargowallNet.DNSProxyFWMark)
-			}); err != nil {
-				return err
-			}
-			if sErr != nil {
+		Control: func(network, address string, c syscall.RawConn) error {
+			if err := cargowallNet.MarkedDialControl(network, address, c); err != nil {
 				s.logger.Warn("Could not mark DNS listener socket; replies may be blocked under cgroup enforcement",
-					"addr", address, "error", sErr)
+					"addr", address, "error", err)
 			}
 			return nil
 		},
@@ -543,42 +538,62 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 			// manager) - in audit mode, log but don't block
 			isAuditMode := s.config.IsAuditMode()
 
-			if isAuditMode {
-				s.logger.Info("DNS query would be blocked (audit mode)",
-					"domain", domain,
-					"from", w.RemoteAddr().String())
-			} else {
-				s.logger.Info("DNS query blocked (domain not allowed)",
-					"domain", domain,
-					"from", w.RemoteAddr().String())
-			}
-
-			// Log to audit file if configured. A host client's step is
+			// Attribute BEFORE logging anything: a host client's step is
 			// resolved from its socket while it is still blocked in its recv,
 			// so the sock_diag lookup sees a live socket. A container client
 			// has no visible socket in the host netns — its query is keyed on
 			// the container IP instead, and never touches the sockdiag path.
+			// Attribution is the listener's constructor-time property — see
+			// listenerAttribution for the semantics of each mode.
+			ev := events.AuditEvent{
+				EventType:   events.EventDNSBlocked,
+				DstHostname: domain,
+			}
+			switch s.attributionMode(w) {
+			case attributeContainerIP:
+				ev.ContainerOrigin = true
+				if lookup, ok := s.containerLookup.Load().(ContainerLookup); ok {
+					if ordinal, containerID, found := lookup(w.RemoteAddr()); found {
+						ev.StepOrdinal = ordinal
+						ev.ContainerID = containerID
+					}
+				}
+			case attributeHostSockdiag:
+				if lookup, ok := s.stepLookup.Load().(StepLookup); ok {
+					attr := lookup(w.RemoteAddr())
+					ev.StepOrdinal = attr.Ordinal
+					ev.StepAttrOutcome = attr.Outcome
+					ev.PID = attr.PID
+					ev.Process = attr.Process
+				}
+			}
+
+			// The ops-log line carries the attribution too: a bare
+			// domain+from line beside the summary's buckets reads as an
+			// unattributed event.
+			logAttrs := []any{"domain", domain, "from", w.RemoteAddr().String()}
+			if ev.StepOrdinal != 0 {
+				logAttrs = append(logAttrs, "step_ordinal", ev.StepOrdinal)
+			}
+			if ev.StepAttrOutcome != "" {
+				logAttrs = append(logAttrs, "step_attr_outcome", ev.StepAttrOutcome)
+			}
+			if ev.Process != "" {
+				logAttrs = append(logAttrs, "process", ev.Process)
+			}
+			if ev.PID != 0 {
+				logAttrs = append(logAttrs, "pid", ev.PID)
+			}
+			if ev.ContainerID != "" {
+				logAttrs = append(logAttrs, "container_id", ev.ContainerID)
+			}
+			if isAuditMode {
+				s.logger.Info("DNS query would be blocked (audit mode)", logAttrs...)
+			} else {
+				s.logger.Info("DNS query blocked (domain not allowed)", logAttrs...)
+			}
+
 			if s.auditLogger != nil {
-				ev := events.AuditEvent{
-					EventType:   events.EventDNSBlocked,
-					DstHostname: domain,
-				}
-				// Attribution is the listener's constructor-time property —
-				// see listenerAttribution for the semantics of each mode.
-				switch s.attributionMode(w) {
-				case attributeContainerIP:
-					ev.ContainerOrigin = true
-					if lookup, ok := s.containerLookup.Load().(ContainerLookup); ok {
-						if ordinal, containerID, found := lookup(w.RemoteAddr()); found {
-							ev.StepOrdinal = ordinal
-							ev.ContainerID = containerID
-						}
-					}
-				case attributeHostSockdiag:
-					if lookup, ok := s.stepLookup.Load().(func(net.Addr, *events.AuditEvent)); ok {
-						lookup(w.RemoteAddr(), &ev)
-					}
-				}
 				if err := s.auditLogger.LogEvent(ev); err != nil {
 					s.logger.Error("Failed to write DNS audit log", "error", err)
 				}

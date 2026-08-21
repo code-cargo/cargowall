@@ -19,10 +19,12 @@ package steps
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 
@@ -30,19 +32,13 @@ import (
 )
 
 // sockdiag resolves a local socket's kernel cookie from its source address,
-// via NETLINK_SOCK_DIAG. The DNS proxy uses this to attribute a query to
-// the step whose process sent it: source address → cookie → map_sock_step.
+// via NETLINK_SOCK_DIAG: source address → cookie → map_sock_step.
 //
 // A dump (matched client-side by source) is used instead of an exact
 // 4-tuple lookup deliberately: the iptables DNAT that steers DNS to the
 // proxy rewrites the packet, not the client socket, so the client's socket
 // still names the ORIGINAL resolver as its peer — the proxy-side 4-tuple
 // doesn't exist in the client's socket table.
-//
-// The pipeline is split in three: dumpSocketTable walks one (family, proto)
-// table into rows, matchCookie is a pure source-address match over those
-// rows, and diagBatcher coalesces concurrent lookups so a burst of clients
-// costs one dump, not one each.
 
 // inetDiagReqV2 documents struct inet_diag_req_v2 — the dump request body
 // serialized in dumpSocketTable. The embedded sock id (ports/addrs
@@ -146,17 +142,27 @@ func dumpSocketTable(family, proto uint8) ([]sockRow, error) {
 	return rows, nil
 }
 
+// matchKind classifies one table match, so callers can rank an exact source
+// hit above a wildcard fallback — including across tables.
+type matchKind int
+
+const (
+	matchNone      matchKind = iota
+	matchExact               // source bytes equal the want
+	matchWildcard            // exactly one wildcard-bound candidate on the port
+	matchAmbiguous           // two or more wildcard candidates — declined
+)
+
 // matchCookie resolves a source address against dumped rows. An exact
 // source match wins immediately (ephemeral ports make it unique in
 // practice). An unconnected client (bare sendto, e.g. dig or dnspython —
 // glibc/musl/Go resolvers all connect) is auto-bound to the wildcard
 // address, so the table shows 0.0.0.0/:: where the wire carried the routed
-// source; such a socket is accepted by port alone, but only with exactly
-// one wildcard candidate — misattribution is worse than none, so two or
-// more report ambiguous instead. (A bound-then-connected socket gets a
-// concrete source from the route, so an all-zero source reliably means
-// unconnected.)
-func matchCookie(rows []sockRow, port uint16, want [16]byte) (cookie uint64, found, ambiguous bool) {
+// source; such a socket is matchable by port alone, but only with exactly
+// one wildcard candidate — misattribution is worse than none. (A
+// bound-then-connected socket gets a concrete source from the route, so an
+// all-zero source reliably means unconnected.)
+func matchCookie(rows []sockRow, port uint16, want [16]byte) (uint64, matchKind) {
 	var wildCookie uint64
 	wildCount := 0
 	for _, r := range rows {
@@ -164,7 +170,7 @@ func matchCookie(rows []sockRow, port uint16, want [16]byte) (cookie uint64, fou
 			continue
 		}
 		if r.src == want {
-			return r.cookie, true, false
+			return r.cookie, matchExact
 		}
 		if r.src == [16]byte{} {
 			wildCookie = r.cookie
@@ -172,21 +178,13 @@ func matchCookie(rows []sockRow, port uint16, want [16]byte) (cookie uint64, fou
 		}
 	}
 	switch wildCount {
-	case 1:
-		return wildCookie, true, false
 	case 0:
-		return 0, false, false
+		return 0, matchNone
+	case 1:
+		return wildCookie, matchWildcard
 	default:
-		return 0, false, true
+		return 0, matchAmbiguous
 	}
-}
-
-// ClientStep is the resolved attribution of one DNS client address.
-type ClientStep struct {
-	Ordinal uint32                 // step ordinal, 0 unless Outcome is StepAttrOK
-	Outcome events.StepAttrOutcome // why the lookup resolved the way it did
-	PID     uint32                 // socket owner's pid from map_sock_pid, 0 if unknown
-	Process string                 // owner's /proc comm, "" if unknown
 }
 
 // stepCacheTTL bounds reuse of a client-address resolution. A cookie is
@@ -216,7 +214,7 @@ type stepCacheKey struct {
 }
 
 type stepCacheEntry struct {
-	step    ClientStep
+	step    events.StepAttribution
 	expires time.Time
 }
 
@@ -315,57 +313,105 @@ func (b *diagBatcher) close() {
 	b.wg.Wait()
 }
 
-// resolveCookie resolves one client source address against its socket
-// table — one shared snapshot, one pure match — folding the whole
-// dump/match state into the outcome taxonomy the event carries: an empty
-// outcome means cookie is a unique hit; otherwise shed / dump_error (with
-// the underlying error) / ambiguous_wildcard / not_found. A clean AF_INET
-// miss retries the AF_INET6 table before concluding not_found: a
-// dual-stack [::]:port socket sending v4-mapped traffic lives there.
-func (t *Tracker) resolveCookie(family, proto uint8, ip net.IP, port uint16) (uint64, events.StepAttrOutcome, error) {
-	rows, shed, err := t.diag.rows(diagTable{family: family, proto: proto})
-	if shed {
-		return 0, events.StepAttrShed, nil
+// cookieStatus is the dump/match layer's own result vocabulary; it maps
+// onto events.StepAttrOutcome only after the BPF join in stepForClient.
+type cookieStatus int
+
+const (
+	cookieHit cookieStatus = iota
+	cookieAmbiguous
+	cookieNotFound
+	cookieShed
+	cookieDumpError
+)
+
+// clientResolver owns the DNS-path lookup state: the dump batcher, the
+// short-TTL result cache, and the cookie → (step, pid) map joins. It is a
+// subsystem of Tracker but deliberately not part of its struct surface —
+// the tracker's BPF/ringbuf lifecycle and this load-shedding machinery only
+// meet at construction and close.
+type clientResolver struct {
+	sockMap *ebpf.Map // map_sock_step: cookie → step ordinal
+	pidMap  *ebpf.Map // map_sock_pid: cookie → owning pid
+	logger  *slog.Logger
+
+	diag *diagBatcher
+
+	cacheMu sync.Mutex
+	cache   map[stepCacheKey]stepCacheEntry
+
+	warnMu   sync.Mutex
+	lastWarn string
+}
+
+// newClientResolver wires the resolver against the shared BPF maps; nil
+// maps are the unit-test configuration (found sockets resolve as untagged).
+func newClientResolver(sockMap, pidMap *ebpf.Map, logger *slog.Logger) *clientResolver {
+	return &clientResolver{
+		sockMap: sockMap,
+		pidMap:  pidMap,
+		logger:  logger,
+		diag:    newDiagBatcher(),
+		cache:   make(map[stepCacheKey]stepCacheEntry),
 	}
-	if err != nil {
-		return 0, events.StepAttrDumpError, err
+}
+
+func (r *clientResolver) close() { r.diag.close() }
+
+// lookupCookie finds the client's socket cookie, ranking an exact source
+// match in ANY table above a wildcard match: for an IPv4 client the exact
+// socket may be a dual-stack one living only in the v6 table (source
+// ::ffff:a.b.c.d), while an unrelated wildcard shares the port in the v4
+// table — so the order is v4 exact, v6 exact, v4 unique wildcard, v6
+// unique wildcard, then ambiguous/not-found.
+func (r *clientResolver) lookupCookie(family, proto uint8, ip net.IP, port uint16) (uint64, cookieStatus, error) {
+	families := []uint8{family}
+	if family == unix.AF_INET {
+		families = append(families, unix.AF_INET6)
 	}
-	cookie, found, ambiguous := matchCookie(rows, port, wantBytes(family, ip))
+	var wildCookie uint64
+	haveWild, haveAmbiguous := false, false
+	for _, fam := range families {
+		rows, shed, err := r.diag.rows(diagTable{family: fam, proto: proto})
+		if shed {
+			return 0, cookieShed, nil
+		}
+		if err != nil {
+			return 0, cookieDumpError, err
+		}
+		cookie, kind := matchCookie(rows, port, wantBytes(fam, ip))
+		switch kind {
+		case matchExact:
+			return cookie, cookieHit, nil
+		case matchWildcard:
+			if !haveWild {
+				wildCookie, haveWild = cookie, true
+			}
+		case matchAmbiguous:
+			haveAmbiguous = true
+		}
+	}
 	switch {
-	case found:
-		return cookie, "", nil
-	case ambiguous:
-		return 0, events.StepAttrAmbiguous, nil
-	case family == unix.AF_INET:
-		return t.resolveCookie(unix.AF_INET6, proto, ip, port)
+	case haveWild:
+		return wildCookie, cookieHit, nil
+	case haveAmbiguous:
+		return 0, cookieAmbiguous, nil
 	default:
-		return 0, events.StepAttrNotFound, nil
+		return 0, cookieNotFound, nil
 	}
 }
 
-// AttributeClient resolves the step attribution of the process owning the
-// local socket behind addr and writes it onto the audit event — the DNS
-// proxy's dns_blocked path installs this as its step lookup, so a new
-// attribution field means a new line here, not a re-threaded callback type.
-func (t *Tracker) AttributeClient(addr net.Addr, ev *events.AuditEvent) {
-	cs := t.StepForClient(addr)
-	ev.StepOrdinal = cs.Ordinal
-	ev.StepAttrOutcome = cs.Outcome
-	ev.PID = cs.PID
-	ev.Process = cs.Process
-}
-
-// StepForClient resolves the attribution of the process owning the local
+// stepForClient resolves the attribution of the process owning the local
 // socket behind addr (a DNS client seen by the proxy). Ordinal 0 with a
 // non-ok Outcome means no ordinal was resolved — the Outcome says why, and
 // PID/Process name the owner when the socket was found at all.
 //
 // The blocked-query path is adversarial by definition (query floods are
-// what filtering exists for), so the dump is guarded twice: a short-TTL
+// what filtering exists for), so the dump is guarded twice: the short-TTL
 // cache absorbs repeat queries from the same client socket, and lookups
-// beyond a batch cap shed to StepAttrShed (uncached) rather than growing
+// beyond the batch cap shed to StepAttrShed (uncached) rather than growing
 // the pending set without bound.
-func (t *Tracker) StepForClient(addr net.Addr) ClientStep {
+func (r *clientResolver) stepForClient(addr net.Addr) events.StepAttribution {
 	var ip net.IP
 	var port int
 	var proto uint8
@@ -375,7 +421,7 @@ func (t *Tracker) StepForClient(addr net.Addr) ClientStep {
 	case *net.TCPAddr:
 		ip, port, proto = a.IP, a.Port, unix.IPPROTO_TCP
 	default:
-		return ClientStep{Outcome: events.StepAttrUnsupported}
+		return events.StepAttribution{Outcome: events.StepAttrUnsupported}
 	}
 	family := uint8(unix.AF_INET6)
 	if ip.To4() != nil {
@@ -388,45 +434,46 @@ func (t *Tracker) StepForClient(addr net.Addr) ClientStep {
 	key.proto = proto
 
 	now := time.Now()
-	t.stepCacheMu.Lock()
-	if e, ok := t.stepCache[key]; ok && now.Before(e.expires) {
-		t.stepCacheMu.Unlock()
+	r.cacheMu.Lock()
+	if e, ok := r.cache[key]; ok && now.Before(e.expires) {
+		r.cacheMu.Unlock()
 		return e.step
 	}
-	t.stepCacheMu.Unlock()
+	r.cacheMu.Unlock()
 
-	cookie, outcome, err := t.resolveCookie(family, proto, ip, uint16(port))
-	if outcome == events.StepAttrShed {
-		return ClientStep{Outcome: outcome} // uncached: a quieter moment can still resolve this client
-	}
+	cookie, status, err := r.lookupCookie(family, proto, ip, uint16(port))
 
-	var cs ClientStep
-	switch {
-	case outcome == events.StepAttrDumpError:
+	var attr events.StepAttribution
+	switch status {
+	case cookieShed:
+		return events.StepAttribution{Outcome: events.StepAttrShed} // uncached: a quieter moment can still resolve this client
+	case cookieDumpError:
 		// Warn once per DISTINCT failure, not once ever: a transient
 		// first error (one recv timeout) must not permanently mask a
 		// later systemic one (EOPNOTSUPP on a CONFIG_INET_DIAG-less
 		// kernel), while identical repeats stay suppressed.
 		msg := err.Error()
-		t.diagWarnMu.Lock()
-		changed := msg != t.diagLastWarn
-		t.diagLastWarn = msg
-		t.diagWarnMu.Unlock()
+		r.warnMu.Lock()
+		changed := msg != r.lastWarn
+		r.lastWarn = msg
+		r.warnMu.Unlock()
 		if changed {
-			t.logger.Warn("Step attribution: socket-cookie lookup failed; DNS events will carry step_attr_outcome=dump_error",
+			r.logger.Warn("Step attribution: socket-cookie lookup failed; DNS events will carry step_attr_outcome=dump_error",
 				"error", err)
 		}
-		cs.Outcome = outcome
-	case outcome != "":
-		cs.Outcome = outcome
-	default:
+		attr.Outcome = events.StepAttrDumpError
+	case cookieAmbiguous:
+		attr.Outcome = events.StepAttrAmbiguous
+	case cookieNotFound:
+		attr.Outcome = events.StepAttrNotFound
+	case cookieHit:
 		// nil sockMap only in unit tests (no loaded BPF); a lookup error on
 		// the real map means the cookie was never tagged.
 		var ordinal uint32
-		if t.sockMap == nil || t.sockMap.Lookup(cookie, &ordinal) != nil {
-			cs.Outcome = events.StepAttrUntagged
+		if r.sockMap == nil || r.sockMap.Lookup(cookie, &ordinal) != nil {
+			attr.Outcome = events.StepAttrUntagged
 		} else {
-			cs.Ordinal, cs.Outcome = ordinal, events.StepAttrOK
+			attr.Ordinal, attr.Outcome = ordinal, events.StepAttrOK
 		}
 		// Name the socket's owner either way — untagged is exactly where a
 		// name (systemd-resolved, apt-news, ...) tells the reader who the
@@ -434,25 +481,31 @@ func (t *Tracker) StepForClient(addr net.Addr) ClientStep {
 		// hooks may not have seen a pre-attach socket, and the pid can be
 		// gone by the time /proc is read.
 		var pid uint32
-		if t.pidMap != nil && t.pidMap.Lookup(cookie, &pid) == nil && pid != 0 {
-			cs.PID = pid
-			cs.Process = readComm(int(pid))
+		if r.pidMap != nil && r.pidMap.Lookup(cookie, &pid) == nil && pid != 0 {
+			attr.PID = pid
+			attr.Process = readComm(int(pid))
 		}
 	}
 
 	// Cache every resolved outcome, dump errors and negatives included —
 	// unattributable floods are the hot case, and a systemic dump failure
-	// (EOPNOTSUPP, persistent timeouts) must not turn every blocked query
-	// into a fresh dump; the TTL keeps transient errors recoverable. Only
-	// shed stays uncached (nothing was resolved). Expiry from a fresh
-	// clock, not the pre-dump `now`: the dump itself can take a large
-	// fraction of the TTL, and stamping from before it would shorten — or
-	// entirely consume — the shed window exactly where dumps are slowest.
-	t.stepCacheMu.Lock()
-	if len(t.stepCache) >= stepCacheCap {
-		clear(t.stepCache)
+	// must not turn every blocked query into a fresh dump; the TTL keeps
+	// transient errors recoverable. Only shed stays uncached (nothing was
+	// resolved). Expiry from a fresh clock, not the pre-dump `now`: the
+	// dump itself can take a large fraction of the TTL, and stamping from
+	// before it would shorten — or entirely consume — the shed window
+	// exactly where dumps are slowest.
+	r.cacheMu.Lock()
+	if len(r.cache) >= stepCacheCap {
+		clear(r.cache)
 	}
-	t.stepCache[key] = stepCacheEntry{step: cs, expires: time.Now().Add(stepCacheTTL)}
-	t.stepCacheMu.Unlock()
-	return cs
+	r.cache[key] = stepCacheEntry{step: attr, expires: time.Now().Add(stepCacheTTL)}
+	r.cacheMu.Unlock()
+	return attr
+}
+
+// StepForClient resolves a DNS client address to its step attribution —
+// installed on the DNS proxy as its host-path step lookup.
+func (t *Tracker) StepForClient(addr net.Addr) events.StepAttribution {
+	return t.resolver.stepForClient(addr)
 }

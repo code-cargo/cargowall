@@ -3588,7 +3588,10 @@ func TestHandleDNSQuery_ContainerListenerUsesContainerLookup(t *testing.T) {
 	server.AddContainerListenAddr("172.17.0.1:53")
 
 	stepLookupCalls := 0
-	server.SetStepLookup(func(_ net.Addr, ev *events.AuditEvent) { stepLookupCalls++; ev.StepOrdinal = 7 })
+	server.SetStepLookup(func(net.Addr) events.StepAttribution {
+		stepLookupCalls++
+		return events.StepAttribution{Ordinal: 7, Outcome: events.StepAttrOK}
+	})
 	var lookupAddr net.Addr
 	server.SetContainerLookup(func(addr net.Addr) (uint32, string, bool) {
 		lookupAddr = addr
@@ -3623,7 +3626,9 @@ func TestHandleDNSQuery_ContainerListenerUsesContainerLookup(t *testing.T) {
 func TestHandleDNSQuery_InterceptionWithoutAttributionFilesAsUnattributedContainer(t *testing.T) {
 	server, sink := newContainerAttributionServer(t, false)
 	server.AddContainerListenAddr("172.17.0.1:53")
-	server.SetStepLookup(func(_ net.Addr, ev *events.AuditEvent) { ev.StepOrdinal = 7 })
+	server.SetStepLookup(func(net.Addr) events.StepAttribution {
+		return events.StepAttribution{Ordinal: 7, Outcome: events.StepAttrOK}
+	})
 	// No SetContainerLookup: the attribution feature is off in this config.
 
 	w := newAddrResponseWriter("172.17.0.1", "172.17.0.3", 42345)
@@ -3655,7 +3660,10 @@ func TestHandleDNSQuery_ContainerListenerLookupMissStaysContainerOrigin(t *testi
 			server.AddContainerListenAddr("172.17.0.1:53")
 
 			stepLookupCalls := 0
-			server.SetStepLookup(func(_ net.Addr, ev *events.AuditEvent) { stepLookupCalls++; ev.StepOrdinal = 7 })
+			server.SetStepLookup(func(net.Addr) events.StepAttribution {
+				stepLookupCalls++
+				return events.StepAttribution{Ordinal: 7, Outcome: events.StepAttrOK}
+			})
 			if tc.install {
 				server.SetContainerLookup(func(net.Addr) (uint32, string, bool) { return 0, "", false })
 			}
@@ -3680,11 +3688,8 @@ func TestHandleDNSQuery_HostListenerKeepsSockdiagPath(t *testing.T) {
 	server, sink := newContainerAttributionServer(t, false)
 	server.AddContainerListenAddr("172.17.0.1:53")
 
-	server.SetStepLookup(func(_ net.Addr, ev *events.AuditEvent) {
-		ev.StepOrdinal = 5
-		ev.StepAttrOutcome = events.StepAttrOK
-		ev.PID = 4242
-		ev.Process = "curl"
+	server.SetStepLookup(func(net.Addr) events.StepAttribution {
+		return events.StepAttribution{Ordinal: 5, Outcome: events.StepAttrOK, PID: 4242, Process: "curl"}
 	})
 	containerLookupCalls := 0
 	server.SetContainerLookup(func(net.Addr) (uint32, string, bool) {
@@ -3712,7 +3717,9 @@ func TestHandleDNSQuery_PlainAddListenAddrStaysHostPath(t *testing.T) {
 	server, sink := newContainerAttributionServer(t, false)
 	server.AddListenAddr("172.17.0.1:53") // plain, not AddContainerListenAddr
 
-	server.SetStepLookup(func(_ net.Addr, ev *events.AuditEvent) { ev.StepOrdinal = 5 })
+	server.SetStepLookup(func(net.Addr) events.StepAttribution {
+		return events.StepAttribution{Ordinal: 5, Outcome: events.StepAttrOK}
+	})
 	containerLookupCalls := 0
 	server.SetContainerLookup(func(net.Addr) (uint32, string, bool) {
 		containerLookupCalls++

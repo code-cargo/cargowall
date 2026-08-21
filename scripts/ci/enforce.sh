@@ -96,7 +96,7 @@ docker_filter() {
   echo "✅ Docker container blocked from example.com"
 }
 
-# Gate for issue #110: the blocked() curl above ran in its own post-attach
+# Attribution gate: the blocked() curl above ran in its own post-attach
 # workflow step, so EVERY refused example.com query came from a step-tagged
 # process and its dns_blocked event must carry that step's ordinal — the
 # assertion is all-of-subset, not at-least-one, so a partially laundered or
@@ -108,6 +108,18 @@ docker_filter() {
 # the run diagnosable from its log alone.
 dns_attribution() {
   AUDIT_LOG=/tmp/cargowall-audit.json
+
+  # Fail with a clear diagnostic before any jq substitution: under
+  # `set -euo pipefail` an unreadable/invalid log would otherwise kill the
+  # script with a bare jq parse error.
+  if [ ! -r "$AUDIT_LOG" ]; then
+    echo "❌ Audit log $AUDIT_LOG is missing or unreadable"
+    exit 1
+  fi
+  if ! jq -s empty "$AUDIT_LOG" 2>/dev/null; then
+    echo "❌ Audit log $AUDIT_LOG is not valid JSON"
+    exit 1
+  fi
 
   echo "Host-path dns_blocked events (domain / step_ordinal / outcome / process / pid):"
   jq -r -s '.[] | select(.event_type == "dns_blocked" and (.container_origin != true))
@@ -135,7 +147,7 @@ dns_attribution() {
     exit 1
   fi
   if [ "$ATTRIBUTED" -ne "$TOTAL" ]; then
-    echo "❌ $((TOTAL - ATTRIBUTED))/$TOTAL example.com dns_blocked events lost their step ordinal (#110)"
+    echo "❌ $((TOTAL - ATTRIBUTED))/$TOTAL example.com dns_blocked events lost their step ordinal"
     echo "UDP socket table at check time (diagnosis aid):"
     sudo ss -uapn | head -60 || true
     exit 1

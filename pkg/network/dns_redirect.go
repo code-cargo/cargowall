@@ -70,10 +70,10 @@ var dnsRedirectRules = []dnsRedirectRule{
 	// stub resolv.conf (CLI installs, hardcoded 127.0.0.53) otherwise reaches
 	// resolved, which re-queries upstream from its OWN socket — laundering
 	// the querying process away from the sockdiag step join and serving warm
-	// cache hits the proxy never sees (#110). The proxy's startup stub peeks
-	// carry DNSProxyFWMark (MarkedDialControl) and are exempted above;
-	// 127.0.0.1 itself — the proxy listen — stays un-DNATed. nss-resolve
-	// D-Bus lookups never emit a client DNS packet and remain out of reach.
+	// cache hits the proxy never sees. The proxy's startup stub peeks carry
+	// DNSProxyFWMark (MarkedDialControl) and are exempted above; 127.0.0.1
+	// itself — the proxy listen — stays un-DNATed. nss-resolve D-Bus lookups
+	// never emit a client DNS packet and remain out of reach.
 	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "-d", "127.0.0.53", "--dport", "53", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
 	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "-d", "127.0.0.53", "--dport", "53", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
 	// Redirect all other outbound DNS to the local proxy
@@ -132,12 +132,10 @@ var flushResolvedTimeout = 5 * time.Second
 // `resolvectl flush-caches`. Client packets to the stub are DNAT'd to the
 // proxy by dnsRedirectRules, so the residual warm-cache exposure is lookups
 // that reach resolved WITHOUT a client DNS packet — nss-resolve's
-// D-Bus/varlink path — plus resolved's own upstream re-queries. Flushing
-// forces those to go upstream, where the redirect routes them through the
-// proxy: that is where suffix/wildcard rules match, resolved IPs get
-// firewall-allowed, and hostname attribution is retained; a warm stub cache
-// hit never travels upstream, so the proxy never sees the name and the
-// connection lands as an unattributed bare IP (deny-by-default).
+// D-Bus/varlink path — plus resolved's own upstream re-queries: a warm
+// cache hit there is served invisibly, the proxy never sees the name, and
+// the connection lands as an unallowed bare IP. Flushing forces those
+// lookups upstream, through the redirect.
 //
 // Best-effort with two quiet skips (return nil, log at Debug): resolvectl not
 // installed, or systemd-resolved not running — in both cases there is no stub

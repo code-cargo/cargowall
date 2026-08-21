@@ -99,6 +99,17 @@ const (
 	StepAttrUnsupported StepAttrOutcome = "unsupported_addr"
 )
 
+// StepAttribution is one resolved DNS-client attribution — the step
+// lookup's result, copied field-for-field onto dns_blocked events. Owned
+// here next to the outcome vocabulary so the producer (pkg/steps) and the
+// consumer (pkg/dns) share one type without depending on each other.
+type StepAttribution struct {
+	Ordinal uint32          // step ordinal, 0 unless Outcome is StepAttrOK
+	Outcome StepAttrOutcome // why the lookup resolved the way it did
+	PID     uint32          // client socket owner's pid, 0 if unknown
+	Process string          // owner's process name, "" if unknown
+}
+
 // AuditEvent represents a network event for audit logging
 type AuditEvent struct {
 	Timestamp       time.Time       `json:"timestamp"`

@@ -100,7 +100,7 @@ func TestFlushResolvedCache_Success(t *testing.T) {
 
 // TestDNSRedirectRules_Shape pins the rule slice: mark RETURN exemptions
 // first (the proxy's upstream client and startup stub peeks), then the
-// systemd-resolved stub DNAT (#110 — makes the querying process's own
+// systemd-resolved stub DNAT (makes the querying process's own
 // socket visible to the proxy instead of resolved's), then the generic
 // DNAT that still excludes the rest of 127.0.0.0/8 (the proxy listen must
 // never be DNAT'd), then the INPUT anti-resurrection guards. Order is

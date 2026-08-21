@@ -562,7 +562,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			// DNS events have no TC packet to carry a tag; the proxy
 			// resolves the querying step from the client socket instead.
 			if dnsServer != nil {
-				dnsServer.SetStepLookup(tracker.AttributeClient)
+				dnsServer.SetStepLookup(tracker.StepForClient)
 			}
 		}
 	}
@@ -716,18 +716,11 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 		// Flush systemd-resolved's cache now that the redirect is installed
 		// and every warm-cache read above (existing-connection reverse DNS +
-		// Phase 1 snapshot) has run against it. Client packets to the stub
-		// are DNAT'd to the proxy by dnsRedirectRules, so the residual
-		// warm-cache exposure is lookups that reach resolved WITHOUT a
-		// client DNS packet — nss-resolve's D-Bus/varlink path — plus
-		// resolved's own upstream re-queries. Flushing forces those to go
-		// upstream, where the redirect routes them through the proxy for
-		// suffix-rule matching, IP allowlisting, and hostname attribution.
-		// Without this, a warm stub cache hit is served invisibly and the
-		// connection arrives as an unattributed bare IP (deny-by-default).
-		// Gated on the redirect being live: with no proxy in the upstream
-		// path, flushing would only churn the cache for no benefit.
-		// Non-fatal — hosts without systemd-resolved work via the redirect.
+		// Phase 1 snapshot) has run against it — what the flush still covers
+		// is documented on FlushResolvedCache. Gated on the redirect being
+		// live: with no proxy in the upstream path, flushing would only
+		// churn the cache for no benefit. Non-fatal — hosts without
+		// systemd-resolved work via the redirect.
 		if dnsRedirectActive {
 			if err := network.FlushResolvedCache(ctx, logger); err != nil {
 				logger.Warn("Failed to flush systemd-resolved cache (non-fatal)", "error", err)

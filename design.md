@@ -594,7 +594,8 @@ may use a DNS-derived ordinal as an enforcement input.**
 **Host-path outcome taxonomy:** every host `dns_blocked` event
 carries `step_attr_outcome` — how the sock_diag lookup (client source
 address → cookie → `map_sock_step`) resolved: `ok`, `untagged` (socket
-found, owner outside the Runner.Worker subtree), `not_found`,
+found but its cookie has no `map_sock_step` entry — the owner is outside
+the tagged subtree, or the socket predates attach), `not_found`,
 `ambiguous_wildcard` (≥2 wildcard-bound candidates — declined, since
 misattribution is worse than none), `dump_error`, `shed` (flood
 back-pressure). Owned by `events.StepAttrOutcome` next to `AuditEvent` so
@@ -602,8 +603,8 @@ JSON, OTLP (`cargowall.step_attr_outcome`), the summary bucketing, and the
 CI gate (`enforce.sh dns-attribution`, all-of-subset on `ok` + real
 ordinal) share one vocabulary; events also carry the owner's pid/comm from
 `map_sock_pid`. The summary routes `untagged` into its own "Host services"
-tier — an identified outside owner (systemd units, daemons),
-distinct from the unknown bucket that keeps the genuine lookup
+tier — the found-but-untagged residue, in practice systemd units and
+daemons — distinct from the unknown bucket that keeps the genuine lookup
 limitations.
 
 Binding on today's code, not just the future: `Tracker.LookupClient`'s

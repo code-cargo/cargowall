@@ -154,23 +154,6 @@ func ordinalStepName(steps []GitHubStep, ordinalSteps map[uint32]int, ord uint32
 
 // Bucket labels for traffic that doesn't resolve to a real GitHub step,
 // shared by the rendered summary and the SaaS push so both group identically.
-// Kept terse — they render as summary headings and dashboard cells; the
-// fuller story lives on untaggedBucketLabel and in design.md:
-//   - bucketRunner: Runner.Worker's own threads plus cargowall's subtree
-//     (the StepOrdinalRunner sentinel).
-//   - bucketPreDaemon: worker child subtrees started before cargowall
-//     attached (the StepOrdinalPreDaemon sentinel).
-//   - bucketDocker: the daemon's own host-side sockets (image pulls,
-//     docker-proxy port forwarding), distinct from container workloads.
-//   - bucketHostServices: sockdiag found the socket, its owner is outside
-//     the Runner.Worker subtree (step_attr_outcome=untagged) — systemd
-//     units and daemons.
-//   - bucketContainerUnattr: container-origin socket that predates tagging,
-//     or an unknown container.
-//   - bucketAutoInfra: auto-allowed platform endpoints (IMDS, GitHub API…).
-//   - bucketUnknown: no socket tag — pre-attach socket, a failed lookup
-//     (not_found/ambiguous_wildcard/dump_error/shed), or an unrecognized
-//     origin.
 const (
 	bucketRunner          = "Runner infrastructure"
 	bucketPreDaemon       = "Pre-attach"
@@ -183,6 +166,9 @@ const (
 
 // bucketOrder is the fixed display order for non-step buckets in the rendered
 // summary (the push path preserves the GitHub timeline scaffold instead).
+// Every label assignCausal can emit MUST appear here: causalGroups renders
+// only bucketOrder entries while the push ships any label first-seen, so a
+// missing entry silently drops those events from the markdown.
 var bucketOrder = []string{bucketRunner, bucketPreDaemon, bucketDocker, bucketHostServices, bucketContainerUnattr, bucketAutoInfra, bucketUnknown}
 
 // causalClass is how a causally-tagged event maps to a group.
@@ -228,16 +214,11 @@ func assignCausal(ev events.AuditEvent, ordinalSteps map[uint32]int) causalAssig
 // as container-originated but without a step tag must land in the container
 // tier and may never fall through to a looser bucket — that ordering is the
 // summary-side form of the "unattributable container traffic gets its own
-// tier" requirement (issue #106). Then Docker-daemon host sockets (more
-// specific than the host-services tier: dockerd is also outside the
-// workflow), then identified host system services — DNS events whose
-// sockdiag lookup FOUND the client socket but its owner carries no step tag
-// (StepAttrUntagged), i.e. systemd units and daemons outside Runner.Worker,
-// correctly unattributed rather than unexplained (issue #114) — then
-// auto-allowed platform endpoints; only the remainder is genuinely
-// unexplained. Other lookup outcomes (not_found, ambiguous, dump_error,
-// shed) stay in the unknown bucket: those are lookup limitations, not an
-// identified outside owner.
+// tier" requirement (issue #106). Docker stays ahead of the untagged arm
+// because the process name is the more specific daemon signal (dockerd's
+// sockets are untagged too). StepAttrUntagged is a FOUND socket whose owner
+// carries no step tag — an owner without a tag, not a lookup failure; every
+// other outcome stays in the unknown remainder.
 func untaggedBucketLabel(ev events.AuditEvent) string {
 	switch {
 	case ev.ContainerOrigin:

@@ -256,6 +256,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// proxy for future upstream lookups to traverse.
 	var dnsRedirectActive bool
 	if !cmd.DisableDNSTracking {
+		// Infrastructure auto-allows must be installed before the proxy below
+		// arms query filtering (issue #119).
+		populateAutoAllowRules(cmd, configMgr, logger)
+
 		// Get upstream DNS server (defaults to Kubernetes DNS)
 		upstream := cmd.DNSUpstream
 
@@ -576,8 +580,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		stepTracker, &objs, logger)
 	defer attribution.Close()
 
-	// Userspace half of the loopback carve-out pair — after config load,
-	// before UpdateAllowlistTC programs the maps below.
+	// Userspace half of the loopback carve-out pair — must run before
+	// UpdateAllowlistTC programs the maps below. (Placement relative to the
+	// config load no longer matters: auto-allows are journalled across
+	// loads, issue #119.)
 	attribution.ensureLoopbackAllowed(configMgr)
 
 	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
@@ -677,19 +683,20 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			logger.Debug("Updated DNS server with audit logger")
 		}
 
-		applyAutoAllowHelpers(cmd, configMgr, fw, logger)
-
 		// Apply firewall rules to any hostnames tracked before they were
 		// matchable. Two overlapping scenarios funnel here, both fixed by
-		// one pass after auto-allow finishes:
+		// one pass after the config load:
 		//
 		//  1. DNS proxy starts before config load (hooks / prepopulate
 		//     paths) — a hostname like NATS gets resolved while no rule
 		//     exists; the rule arrives later via LoadConfigFromCargoWall.
-		//  2. Auto-allow adds search domains (e.g. `.compute.internal`)
-		//     AFTER the proxy may have seen `bastion.compute.internal`
-		//     as an unmatched full name — stripping now makes the
-		//     short-name `bastion` rule fire.
+		//  2. A policy's own search domains (e.g. `.compute.internal`)
+		//     arrive with that load, AFTER the proxy may have seen
+		//     `bastion.compute.internal` as an unmatched full name —
+		//     stripping now makes the short-name `bastion` rule fire.
+		//     (Auto-allow's suffixes no longer land here: they are
+		//     installed before the proxy starts, and replayed across
+		//     every load — issue #119.)
 		//
 		// Cheap when no tracking has happened yet; idempotent in any case.
 		dnsServer.ApplyRulesToTrackedHostnames()
@@ -1125,16 +1132,12 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 
 	// Priority 1: SaaS API (when api-url + token are set)
 	if cmd.ApiUrl != "" && cmd.Token != "" {
-		// Bootstrap an empty config so EnsureHostnameAllowed can add rules
-		// before the real policy is loaded. Unconditional: every
-		// Ensure*Allowed helper no-ops while cm.config is nil, so skipping
-		// this for a hostname-less api-url would leave lockdown (which also
-		// skips the env/file fallback) with a nil config — a total
-		// blackhole with no DNS or infra allows, contradicting the
-		// documented "CI infrastructure auto-allows remain active".
-		configMgr.LoadConfigFromRules(nil, config.ActionDeny)
 		// The API hostname must be allowed through DNS filtering for the
-		// policy fetch to succeed.
+		// policy fetch to succeed. No bootstrap load ahead of it: the helper
+		// seeds a deny-default config when none exists (issue #119), so
+		// lockdown — which skips the env/file fallback — still ends up with
+		// the documented "CI infrastructure auto-allows remain active"
+		// posture rather than a nil-config blackhole.
 		if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
 			configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
 		}
@@ -1289,31 +1292,28 @@ func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLog
 	}
 }
 
-// applyAutoAllowHelpers invokes each enabled auto-allow helper and updates
-// the BPF allowlist once at the end. The CodeCargo API allow runs whenever
-// --api-url is set (independent of CI mode) so the SaaS summary push works.
-func applyAutoAllowHelpers(cmd *StartCmd, configMgr *config.Manager, fw firewall.Firewall, logger *slog.Logger) {
-	ran := false
+// populateAutoAllowRules invokes each enabled auto-allow helper, installing
+// the infrastructure allows on the config manager. The CodeCargo API allow
+// runs whenever --api-url is set (independent of CI mode) so the SaaS
+// summary push works.
+//
+// Runs before the DNS proxy arms query filtering, and therefore before any
+// policy source has been read: the helpers seed a deny-default config when
+// none is loaded and are journalled onto every later load (issue #119). No
+// firewall sync here either — the rules ride the UpdateAllowlistTC that runs
+// once the firewall exists.
+func populateAutoAllowRules(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger) {
 	if cmd.AutoAllowCloudMetadata {
 		autoAllowCloudMetadata(configMgr, logger)
-		ran = true
 	}
 	if cmd.AutoAllowGitHubHosts {
 		autoAllowGitHubHosts(configMgr, logger)
-		ran = true
 	}
 	if cmd.AutoAllowGitlabHosts {
 		autoAllowGitlabHosts(configMgr, logger)
-		ran = true
 	}
 	if cmd.ApiUrl != "" {
 		autoAllowCodeCargoAPI(cmd.ApiUrl, configMgr, logger)
-		ran = true
-	}
-	if ran {
-		if err := fw.UpdateAllowlistTC(configMgr); err != nil {
-			logger.Warn("Failed to update allowlist with auto-allow rules", "error", err)
-		}
 	}
 }
 

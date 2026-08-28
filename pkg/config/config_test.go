@@ -1653,12 +1653,11 @@ func TestConsecutiveDoubleStarRejected(t *testing.T) {
 
 // Mirrors the GitHub Actions startup flow: the SaaS API hostname is added to
 // an empty bootstrap config so the policy fetch can resolve, then
-// LoadConfigFromCargoWall replaces the ruleset with the fetched policy (which
-// does not contain the API hostname), then autoAllowInfraHosts re-adds it.
-// Before the fix, the third step's EnsureHostnameAllowed call no-op'd on a
-// stale trackedHostnames entry, leaving the hostname unmatched at DNS-filter
-// time.
-func TestEnsureHostnameAllowed_ReAddedAfterCargoWallReload(t *testing.T) {
+// LoadConfigFromCargoWall replaces the ruleset with the fetched policy, which
+// does not contain the API hostname. The replay layer re-applies it (issue
+// #119); a re-add afterwards must still be idempotent rather than no-op on a
+// stale trackedHostnames entry or stack a duplicate rule.
+func TestEnsureHostnameAllowed_SurvivesCargoWallReload(t *testing.T) {
 	cm := NewConfigManager()
 
 	// Bootstrap with an empty deny-all config and add the API hostname.
@@ -1689,14 +1688,21 @@ func TestEnsureHostnameAllowed_ReAddedAfterCargoWallReload(t *testing.T) {
 		t.Fatalf("LoadConfigFromCargoWall() error = %v", err)
 	}
 
-	// After the reload, the API hostname is no longer in the ruleset.
-	if v := cm.MatchHostnameRule("app.codecargo.com"); v.Matched() {
-		t.Fatalf("after reload, MatchHostnameRule(app.codecargo.com) = %+v, want empty", v)
+	// The reload replaces cm.config wholesale, but the auto-allow replay
+	// layer re-applies the API hostname onto the new ruleset (issue #119) —
+	// the fetch that policy came from must keep working, and so must the DNS
+	// proxy's gate for it.
+	if v := cm.MatchHostnameRule("app.codecargo.com"); !v.HasAllow() {
+		t.Fatalf("after reload, MatchHostnameRule(app.codecargo.com) = %+v, want allow", v)
 	}
 
-	// autoAllowInfraHosts re-adds the API hostname. This must actually install
-	// a rule, not no-op on a stale trackedHostnames entry from the bootstrap.
+	// Re-adding is still idempotent: call sites that predate the replay layer
+	// name the hostname again after the load, and that must neither no-op on
+	// a stale trackedHostnames entry nor stack a duplicate rule.
 	cm.EnsureHostnameAllowed("app.codecargo.com", []Port{PortHTTPS}, AutoAddedTypeCodeCargoService)
+	if got := countRules(cm, AutoAddedTypeCodeCargoService); got != 1 {
+		t.Errorf("codecargo_service rules after re-add = %d, want 1", got)
+	}
 	v := cm.MatchHostnameRule("app.codecargo.com")
 	if !v.HasAllow() {
 		t.Errorf("after re-add, MatchHostnameRule(app.codecargo.com) verdict = %+v, want allow", v)
@@ -1918,21 +1924,19 @@ func TestAddSearchDomains_KeepsValidSkipsInvalid(t *testing.T) {
 	}
 }
 
-// AddSearchDomains must no-op on a nil config, matching the behavior of the
-// other auto-allow helpers (EnsureDNSAllowed / EnsureInfraAllowed /
-// EnsureHostnameAllowed). Otherwise the no-config fallback path would
-// partially succeed with only the search-domain set populated.
-func TestAddSearchDomains_NoConfigIsNoOp(t *testing.T) {
+// AddSearchDomains on a fresh manager seeds a deny-default config and
+// installs, so an auto-allow pass running before the policy fetch takes
+// effect (issue #119). It used to no-op, which is why the pass had to run
+// after the load.
+func TestAddSearchDomains_SeedsConfigWhenNoneLoaded(t *testing.T) {
 	cm := NewConfigManager()
-	// cm.config is intentionally nil — simulate the fallback path where
-	// LoadConfig / LoadFromEnv / LoadConfigFromCargoWall all failed.
 	cm.AddSearchDomains([]string{".compute.internal"}, slog.Default())
 
-	if got := cm.GetSearchDomains(); got != nil {
-		t.Errorf("GetSearchDomains() = %v, want nil (no-op on nil config)", got)
+	if got := cm.GetSearchDomains(); len(got) != 1 || got[0] != ".compute.internal" {
+		t.Errorf("GetSearchDomains() = %v, want [.compute.internal]", got)
 	}
-	if cm.config != nil {
-		t.Errorf("cm.config should remain nil; got %+v", cm.config)
+	if !cm.HasSearchDomainSuffix("bastion.compute.internal") {
+		t.Errorf("HasSearchDomainSuffix() = false, want true on the seeded config")
 	}
 }
 
@@ -4086,28 +4090,35 @@ func TestNilConfigSafety(t *testing.T) {
 				t.Errorf("GetAutoAllowedType() = %q, want None", got)
 			}
 		}},
-		{"EnsureHostnameAllowed no-ops", func(t *testing.T, cm *Manager) {
+		// The Ensure* helpers no longer no-op on a nil config: they seed a
+		// deny-default one and install, so an auto-allow pass can run before
+		// any policy source has been read (issue #119). Still listed here —
+		// a fresh manager is exactly where that seeding must not panic.
+		{"EnsureHostnameAllowed seeds and installs", func(t *testing.T, cm *Manager) {
 			cm.EnsureHostnameAllowed("github.com", []Port{PortHTTPS}, AutoAddedTypeGitHubService)
-			if len(cm.GetResolvedRules()) != 0 {
-				t.Errorf("expected no rule added on nil config, got %d", len(cm.GetResolvedRules()))
+			if !cm.MatchHostnameRule("github.com").HasAllow() {
+				t.Errorf("expected the rule to land on the seeded config, got %+v", cm.GetResolvedRules())
+			}
+			if got := cm.GetDefaultAction(); got != ActionDeny {
+				t.Errorf("seeded default action = %q, want %q", got, ActionDeny)
 			}
 		}},
-		{"EnsureDNSAllowed no-ops", func(t *testing.T, cm *Manager) {
+		{"EnsureDNSAllowed seeds and installs", func(t *testing.T, cm *Manager) {
 			cm.EnsureDNSAllowed([]string{"8.8.8.8"})
-			if len(cm.GetResolvedRules()) != 0 {
-				t.Errorf("expected no rule added on nil config, got %d", len(cm.GetResolvedRules()))
+			if len(cm.GetResolvedRules()) != 1 {
+				t.Errorf("expected 1 rule on the seeded config, got %d", len(cm.GetResolvedRules()))
 			}
 		}},
-		{"EnsureInfraAllowed no-ops", func(t *testing.T, cm *Manager) {
+		{"EnsureInfraAllowed seeds and installs", func(t *testing.T, cm *Manager) {
 			cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{PortHTTP}, AutoAddedTypeCloudMetadata)
-			if len(cm.GetResolvedRules()) != 0 {
-				t.Errorf("expected no rule added on nil config, got %d", len(cm.GetResolvedRules()))
+			if len(cm.GetResolvedRules()) != 1 {
+				t.Errorf("expected 1 rule on the seeded config, got %d", len(cm.GetResolvedRules()))
 			}
 		}},
-		{"AddSearchDomains no-ops", func(t *testing.T, cm *Manager) {
+		{"AddSearchDomains seeds and installs", func(t *testing.T, cm *Manager) {
 			cm.AddSearchDomains([]string{".compute.internal"}, slog.Default())
-			if got := cm.GetSearchDomains(); got != nil {
-				t.Errorf("expected no search domains added on nil config, got %v", got)
+			if got := cm.GetSearchDomains(); len(got) != 1 || got[0] != ".compute.internal" {
+				t.Errorf("GetSearchDomains() = %v, want [.compute.internal]", got)
 			}
 		}},
 	}

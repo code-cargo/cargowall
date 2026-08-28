@@ -202,8 +202,9 @@ func (a *containerAttribution) allowLocalNetwork(prefix netip.Prefix) error {
 // startCargoWall: the type exists so boot doesn't thread feature checks,
 // and a nil receiver — attribution off, or step attribution dead — is
 // exactly the case where the hook never adjudicates and no allowance is
-// needed. MUST run after config load (a load replaces the rendered config
-// wholesale) and before UpdateAllowlistTC programs the maps.
+// needed. MUST run before UpdateAllowlistTC programs the maps. (It no longer
+// has to follow the config load: auto-allows are journalled and re-applied
+// across loads, issue #119.)
 func (a *containerAttribution) ensureLoopbackAllowed(configMgr *config.Manager) {
 	if a == nil {
 		return

@@ -1177,6 +1177,37 @@ func TestIsQueryAllowed(t *testing.T) {
 	}
 }
 
+// The query gate must already know the infrastructure auto-allows when the
+// proxy arms filtering, and must keep knowing them once the fetched policy
+// replaces the ruleset. Before issue #119 the auto-allow pass ran behind the
+// policy fetch, so a hostname like productionresultssa16.blob.core.windows.net
+// — allowed only by the Azure infrastructure auto-allow — was REFUSED for the
+// length of that fetch, and the load itself would have wiped an earlier pass.
+func TestIsQueryAllowed_InfraAutoAllowsSpanThePolicyFetch(t *testing.T) {
+	const domain = "productionresultssa16.blob.core.windows.net"
+
+	cfg := config.NewConfigManager()
+	cfg.EnsureHostnameAllowed("blob.core.windows.net",
+		[]config.Port{config.PortHTTPS}, config.AutoAddedTypeAzureInfrastructure)
+
+	server := &Server{
+		config:        cfg,
+		filterQueries: true,
+		logger:        slog.Default(),
+	}
+	assert.True(t, server.isQueryAllowed(domain, dns.TypeA),
+		"infra hostname must be allowed before any policy has loaded")
+
+	// The fetched policy names neither the hostname nor its CNAME target —
+	// exactly the policy from the run in issue #119.
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "*.*.store.core.windows.net", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	assert.True(t, server.isQueryAllowed(domain, dns.TypeA),
+		"infra hostname must survive the policy load that replaces the ruleset")
+}
+
 func TestIsQueryAllowed_SearchDomainBypass(t *testing.T) {
 	tests := []struct {
 		name          string

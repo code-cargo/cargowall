@@ -438,6 +438,9 @@ jobs:
       - name: Verify cloud-provider detection ran
         run: bash scripts/ci/gitlab-ci.sh verify-cloud-detect
 
+      - name: Verify auto-allows precede DNS query filtering
+        run: bash scripts/ci/gitlab-ci.sh verify-startup-order
+
       - name: Validate audit log contains would-deny events
         run: bash scripts/ci/gitlab-ci.sh verify-audit
 

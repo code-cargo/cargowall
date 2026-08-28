@@ -164,6 +164,33 @@ verify_cloud_detect() {
   echo "✅ Cloud provider detection ran: $DETECTED"
 }
 
+# Issue #119: the infrastructure auto-allows must be installed BEFORE the DNS
+# proxy arms query filtering. When they landed after — behind the policy fetch
+# — every infrastructure hostname queried inside that window was REFUSED under
+# the pre-policy default-deny. One process writing one stream, so line order
+# is decision order.
+verify_startup_order() {
+  LOG=/tmp/cargowall.log
+  FILTER_LINE=$(sudo grep -n "DNS query filtering enabled" "$LOG" | head -1 | cut -d: -f1) || true
+  INFRA_LINE=$(sudo grep -n "Auto-added infrastructure hostname allow rule" "$LOG" | tail -1 | cut -d: -f1) || true
+
+  if [ -z "${FILTER_LINE:-}" ]; then
+    echo "❌ 'DNS query filtering enabled' missing — the --gitlab-ci preset arms it"
+    exit 1
+  fi
+  if [ -z "${INFRA_LINE:-}" ]; then
+    echo "❌ no infrastructure hostname auto-allows logged — the auto-allow pass never ran"
+    sudo grep -i "auto-a" "$LOG" || true
+    exit 1
+  fi
+  if [ "$INFRA_LINE" -gt "$FILTER_LINE" ]; then
+    echo "❌ auto-allow ran AFTER query filtering armed (line $INFRA_LINE > $FILTER_LINE) — #119 regression"
+    sudo grep -nE "Auto-added infrastructure hostname allow rule|DNS query filtering enabled" "$LOG" || true
+    exit 1
+  fi
+  echo "✅ infrastructure auto-allows installed before query filtering armed (line $INFRA_LINE < $FILTER_LINE)"
+}
+
 verify_audit() {
   AUDIT_LOG=/tmp/cargowall-audit.json
   if ! sudo test -s "$AUDIT_LOG"; then
@@ -211,6 +238,7 @@ case "${1:-}" in
   dns-control) dns_control ;;
   verify-dns-verdicts) verify_dns_verdicts ;;
   verify-cloud-detect) verify_cloud_detect ;;
+  verify-startup-order) verify_startup_order ;;
   verify-audit) verify_audit ;;
   stop) stop ;;
   verify-pidfile-removed) verify_pidfile_removed ;;

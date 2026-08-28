@@ -31,7 +31,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/encoding/protojson"
 
@@ -495,53 +494,70 @@ func TestAutoAllowGitlabHosts_ServiceHostsEnvOverridesDefaults(t *testing.T) {
 	require.NotContains(t, got, "gitlab.com", "default hosts should be replaced when env override is set")
 }
 
-// applyAutoAllowHelpers must NOT touch the firewall when no helper would
-// run — otherwise it'd push an unchanged allowlist on every call and waste
-// BPF map work for standalone users with no auto-allow flags set.
-func TestApplyAutoAllowHelpers_NoFlagsNoUpdate(t *testing.T) {
+// populateAutoAllowRules runs before any policy source has been read, so it
+// must seed the deny-default base config itself — every Ensure*Allowed
+// helper no-ops on a nil config, and without the seed the DNS proxy would
+// arm query filtering against a manager that cannot hold a rule (#119).
+func TestPopulateAutoAllowRules_NoFlagsSeedsBaseConfig(t *testing.T) {
 	cm := config.NewConfigManager()
-	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
-
-	// NewMockFirewall(t) fails the test on any unexpected call, so the
-	// absence of an EXPECT() asserts UpdateAllowlistTC is never invoked.
-	fw := firewall.NewMockFirewall(t)
 
 	cmd := &StartCmd{} // every flag false, no ApiUrl
-	applyAutoAllowHelpers(cmd, cm, fw, quietLogger())
+	populateAutoAllowRules(cmd, cm, quietLogger())
+
+	require.Equal(t, config.ActionDeny, cm.GetDefaultAction())
+	require.Empty(t, cm.GetResolvedRules(), "no helper enabled means no rules")
+
+	// The seeded config is writable — the property the seed exists for.
+	cm.EnsureHostnameAllowed("example.com", []config.Port{config.PortHTTPS}, config.AutoAddedTypeGitHubService)
+	require.True(t, cm.MatchHostnameRule("example.com").HasAllow())
 }
 
-// When at least one helper runs, the dispatcher must call UpdateAllowlistTC
-// exactly once at the end (not once per helper).
-func TestApplyAutoAllowHelpers_AnyFlagTriggersSingleUpdate(t *testing.T) {
+// The infrastructure allows must be queryable on a manager that has never
+// loaded a policy — that is the whole point of running this pass before the
+// DNS proxy arms filtering (#119).
+func TestPopulateAutoAllowRules_MatchableBeforeAnyPolicyLoad(t *testing.T) {
+	cm := config.NewConfigManager()
+
+	cmd := &StartCmd{ApiUrl: "https://app.codecargo.com"}
+	populateAutoAllowRules(cmd, cm, quietLogger())
+
+	require.True(t, cm.MatchHostnameRule("app.codecargo.com").HasAllow(),
+		"the SaaS API hostname must be allowed before the policy fetch it carries")
+}
+
+// ApiUrl alone (no CI flags) is enough, because the CodeCargo API allow runs
+// whenever an api-url is set.
+func TestPopulateAutoAllowRules_ApiUrlAloneAddsHostname(t *testing.T) {
+	cm := config.NewConfigManager()
+
+	cmd := &StartCmd{ApiUrl: "https://api.codecargo.com"}
+	populateAutoAllowRules(cmd, cm, quietLogger())
+
+	got := hostnameRulesFor(t, cm, config.AutoAddedTypeCodeCargoService)
+	require.Contains(t, got, "api.codecargo.com")
+}
+
+// The pass runs before the policy fetch, so the policy that lands afterwards
+// must not wipe what it installed — the failure this whole reordering exists
+// to prevent (#119).
+func TestPopulateAutoAllowRules_SurvivesLaterPolicyLoad(t *testing.T) {
 	t.Setenv("CI_SERVER_URL", "")
 	t.Setenv("CI_REGISTRY", "")
 	t.Setenv("CI_API_V4_URL", "")
 
 	cm := config.NewConfigManager()
-	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+	cmd := &StartCmd{AutoAllowGitlabHosts: true, ApiUrl: "https://app.codecargo.com"}
+	populateAutoAllowRules(cmd, cm, quietLogger())
 
-	fw := firewall.NewMockFirewall(t)
-	fw.EXPECT().UpdateAllowlistTC(mock.Anything).Return(nil).Once()
+	// A policy naming none of the auto-allowed hostnames.
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "github.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
 
-	cmd := &StartCmd{AutoAllowGitlabHosts: true}
-	applyAutoAllowHelpers(cmd, cm, fw, quietLogger())
-}
-
-// ApiUrl alone (no CI flags) is enough to trigger the dispatcher because the
-// CodeCargo API allow runs whenever an api-url is set.
-func TestApplyAutoAllowHelpers_ApiUrlAloneTriggersUpdate(t *testing.T) {
-	cm := config.NewConfigManager()
-	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
-
-	fw := firewall.NewMockFirewall(t)
-	fw.EXPECT().UpdateAllowlistTC(mock.Anything).Return(nil).Once()
-
-	cmd := &StartCmd{ApiUrl: "https://api.codecargo.com"}
-	applyAutoAllowHelpers(cmd, cm, fw, quietLogger())
-
-	// And the API hostname should be in the resolved rules.
-	got := hostnameRulesFor(t, cm, config.AutoAddedTypeCodeCargoService)
-	require.Contains(t, got, "api.codecargo.com")
+	require.True(t, cm.MatchHostnameRule("app.codecargo.com").HasAllow(),
+		"the SaaS API hostname must survive the policy load")
+	require.Contains(t, hostnameRulesFor(t, cm, config.AutoAddedTypeGitLabService), "gitlab.com")
+	require.True(t, cm.MatchHostnameRule("github.com").HasAllow(), "policy rules still load")
 }
 
 // emptyDMI / dmiWithVendor / dmiWithChassisTag isolate cloud-detection tests

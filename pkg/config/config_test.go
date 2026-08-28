@@ -1653,12 +1653,11 @@ func TestConsecutiveDoubleStarRejected(t *testing.T) {
 
 // Mirrors the GitHub Actions startup flow: the SaaS API hostname is added to
 // an empty bootstrap config so the policy fetch can resolve, then
-// LoadConfigFromCargoWall replaces the ruleset with the fetched policy (which
-// does not contain the API hostname), then autoAllowInfraHosts re-adds it.
-// Before the fix, the third step's EnsureHostnameAllowed call no-op'd on a
-// stale trackedHostnames entry, leaving the hostname unmatched at DNS-filter
-// time.
-func TestEnsureHostnameAllowed_ReAddedAfterCargoWallReload(t *testing.T) {
+// LoadConfigFromCargoWall replaces the ruleset with the fetched policy, which
+// does not contain the API hostname. The replay layer re-applies it (issue
+// #119); a re-add afterwards must still be idempotent rather than no-op on a
+// stale trackedHostnames entry or stack a duplicate rule.
+func TestEnsureHostnameAllowed_SurvivesCargoWallReload(t *testing.T) {
 	cm := NewConfigManager()
 
 	// Bootstrap with an empty deny-all config and add the API hostname.
@@ -1689,14 +1688,21 @@ func TestEnsureHostnameAllowed_ReAddedAfterCargoWallReload(t *testing.T) {
 		t.Fatalf("LoadConfigFromCargoWall() error = %v", err)
 	}
 
-	// After the reload, the API hostname is no longer in the ruleset.
-	if v := cm.MatchHostnameRule("app.codecargo.com"); v.Matched() {
-		t.Fatalf("after reload, MatchHostnameRule(app.codecargo.com) = %+v, want empty", v)
+	// The reload replaces cm.config wholesale, but the auto-allow replay
+	// layer re-applies the API hostname onto the new ruleset (issue #119) —
+	// the fetch that policy came from must keep working, and so must the DNS
+	// proxy's gate for it.
+	if v := cm.MatchHostnameRule("app.codecargo.com"); !v.HasAllow() {
+		t.Fatalf("after reload, MatchHostnameRule(app.codecargo.com) = %+v, want allow", v)
 	}
 
-	// autoAllowInfraHosts re-adds the API hostname. This must actually install
-	// a rule, not no-op on a stale trackedHostnames entry from the bootstrap.
+	// Re-adding is still idempotent: call sites that predate the replay layer
+	// name the hostname again after the load, and that must neither no-op on
+	// a stale trackedHostnames entry nor stack a duplicate rule.
 	cm.EnsureHostnameAllowed("app.codecargo.com", []Port{PortHTTPS}, AutoAddedTypeCodeCargoService)
+	if got := countRules(cm, AutoAddedTypeCodeCargoService); got != 1 {
+		t.Errorf("codecargo_service rules after re-add = %d, want 1", got)
+	}
 	v := cm.MatchHostnameRule("app.codecargo.com")
 	if !v.HasAllow() {
 		t.Errorf("after re-add, MatchHostnameRule(app.codecargo.com) verdict = %+v, want allow", v)

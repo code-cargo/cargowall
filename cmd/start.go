@@ -256,16 +256,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// proxy for future upstream lookups to traverse.
 	var dnsRedirectActive bool
 	if !cmd.DisableDNSTracking {
-		// Install the infrastructure auto-allows BEFORE the proxy below arms
-		// query filtering. Every rule here is derived from local state (CLI
-		// flags, ACTIONS_*/CI_* env, /run/systemd/resolve/resolv.conf, DMI),
-		// so none of it has to wait on the policy fetch — and waiting is what
-		// made the proxy refuse infrastructure hostnames for the length of an
-		// API round trip (issue #119). The config manager replays these onto
-		// whatever policy lands later, so they survive the load that used to
-		// wipe them. Gated on the DNS listeners exactly as the single late
-		// pass was, since that is where the auto-allow set has always been
-		// wired; the rules reach the BPF maps at the UpdateAllowlistTC below.
+		// Infrastructure auto-allows must be installed before the proxy below
+		// arms query filtering (issue #119).
 		populateAutoAllowRules(cmd, configMgr, logger)
 
 		// Get upstream DNS server (defaults to Kubernetes DNS)
@@ -588,8 +580,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		stepTracker, &objs, logger)
 	defer attribution.Close()
 
-	// Userspace half of the loopback carve-out pair — after config load,
-	// before UpdateAllowlistTC programs the maps below.
+	// Userspace half of the loopback carve-out pair — must run before
+	// UpdateAllowlistTC programs the maps below. (Placement relative to the
+	// config load no longer matters: auto-allows are journalled across
+	// loads, issue #119.)
 	attribution.ensureLoopbackAllowed(configMgr)
 
 	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
@@ -1138,18 +1132,12 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 
 	// Priority 1: SaaS API (when api-url + token are set)
 	if cmd.ApiUrl != "" && cmd.Token != "" {
-		// Bootstrap an empty config so EnsureHostnameAllowed can add rules
-		// before the real policy is loaded. Unconditional: every
-		// Ensure*Allowed helper no-ops while cm.config is nil, so skipping
-		// this for a hostname-less api-url would leave lockdown (which also
-		// skips the env/file fallback) with a nil config — a total
-		// blackhole with no DNS or infra allows, contradicting the
-		// documented "CI infrastructure auto-allows remain active".
-		// Non-destructive when populateAutoAllowRules already seeded a base
-		// config: the load replays the recorded auto-allows onto this one.
-		configMgr.LoadConfigFromRules(nil, config.ActionDeny)
 		// The API hostname must be allowed through DNS filtering for the
-		// policy fetch to succeed.
+		// policy fetch to succeed. No bootstrap load ahead of it: the helper
+		// seeds a deny-default config when none exists (issue #119), so
+		// lockdown — which skips the env/file fallback — still ends up with
+		// the documented "CI infrastructure auto-allows remain active"
+		// posture rather than a nil-config blackhole.
 		if u, err := url.Parse(cmd.ApiUrl); err == nil && u.Hostname() != "" {
 			configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
 		}
@@ -1309,16 +1297,12 @@ func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLog
 // runs whenever --api-url is set (independent of CI mode) so the SaaS
 // summary push works.
 //
-// Runs before the DNS proxy arms query filtering (issue #119) and therefore
-// before any policy source has been read, so it seeds the empty deny-default
-// config the Ensure*Allowed helpers need — they no-op on a nil config, and
-// the first loader would otherwise be the only thing that could make them
-// stick. No firewall sync here: the rules ride the UpdateAllowlistTC that
-// already runs once the firewall exists, and the manager replays them onto
-// every config loaded in between.
+// Runs before the DNS proxy arms query filtering, and therefore before any
+// policy source has been read: the helpers seed a deny-default config when
+// none is loaded and are journalled onto every later load (issue #119). No
+// firewall sync here either — the rules ride the UpdateAllowlistTC that runs
+// once the firewall exists.
 func populateAutoAllowRules(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger) {
-	configMgr.EnsureBaseConfig()
-
 	if cmd.AutoAllowCloudMetadata {
 		autoAllowCloudMetadata(configMgr, logger)
 	}

@@ -19,6 +19,7 @@ package config
 import (
 	"log/slog"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -41,7 +42,6 @@ func countRules(cm *Manager, autoType AutoAddedType) int {
 // infrastructure hostnames for the length of that fetch (issue #119).
 func TestAutoAllowReplay_SurvivesConfigLoad(t *testing.T) {
 	cm := NewConfigManager()
-	cm.EnsureBaseConfig()
 
 	cm.EnsureHostnameAllowed("blob.core.windows.net", []Port{PortHTTPS}, AutoAddedTypeAzureInfrastructure)
 	cm.EnsureInfraAllowed([]string{"168.63.129.16"}, []Port{PortHTTP}, AutoAddedTypeAzureInfrastructure)
@@ -78,7 +78,6 @@ func TestAutoAllowReplay_SurvivesConfigLoad(t *testing.T) {
 // runs last" ordering gave for free.
 func TestAutoAllowReplay_LoadedDenyVetoesInfraAllow(t *testing.T) {
 	cm := NewConfigManager()
-	cm.EnsureBaseConfig()
 	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{PortHTTP}, AutoAddedTypeCloudMetadata)
 
 	if err := cm.LoadConfigFromRules([]Rule{
@@ -92,22 +91,59 @@ func TestAutoAllowReplay_LoadedDenyVetoesInfraAllow(t *testing.T) {
 	}
 }
 
-// Helpers called before any loader has run record their input even though
-// the application no-ops on a nil config, so the first load installs them.
-// This is what lets the auto-allow pass precede the policy fetch.
-func TestAutoAllowReplay_RecordedBeforeAnyConfigExists(t *testing.T) {
+// Hostname auto-allows have no deny-veto: an allow for a name the policy
+// denies is appended anyway and wins on exact-match-last. That asymmetry
+// with the CIDR path predates the replay layer, and this pins the property
+// that matters here — the reorder must not CHANGE the verdict. Both
+// orderings (helpers after the load, as before #119; helpers before it,
+// replayed) must agree, whatever that verdict is.
+func TestAutoAllowReplay_HostnamePrecedenceUnchangedByOrdering(t *testing.T) {
+	const host = "blob.core.windows.net"
+	policy := []Rule{{Type: RuleTypeHostname, Value: host, Action: ActionDeny}}
+
+	// Pre-#119 ordering: policy first, auto-allow after.
+	afterLoad := NewConfigManager()
+	if err := afterLoad.LoadConfigFromRules(policy, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+	afterLoad.EnsureHostnameAllowed(host, []Port{PortHTTPS}, AutoAddedTypeAzureInfrastructure)
+
+	// Post-#119 ordering: auto-allow first, replayed by the load.
+	beforeLoad := NewConfigManager()
+	beforeLoad.EnsureHostnameAllowed(host, []Port{PortHTTPS}, AutoAddedTypeAzureInfrastructure)
+	if err := beforeLoad.LoadConfigFromRules(policy, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	got, want := beforeLoad.MatchHostnameRule(host), afterLoad.MatchHostnameRule(host)
+	if got.HasAllow() != want.HasAllow() || got.HasDeny() != want.HasDeny() ||
+		got.AllowRule != want.AllowRule || got.DenyRule != want.DenyRule {
+		t.Errorf("verdict differs by ordering:\n  replayed    = %+v\n  after-load  = %+v", got, want)
+	}
+	// Documenting the shared verdict rather than asserting it is right: the
+	// auto-allow wins. Whether it should is issue #121.
+	if !got.HasAllow() {
+		t.Errorf("expected the documented (allow-wins) verdict, got %+v", got)
+	}
+}
+
+// A helper called before any loader has run is matchable immediately — the
+// property the whole reorder rests on, since the DNS proxy arms query
+// filtering before the first policy source is read.
+func TestAutoAllowReplay_MatchableOnAFreshManager(t *testing.T) {
 	cm := NewConfigManager()
 
 	cm.EnsureHostnameAllowed("github.com", []Port{PortHTTPS}, AutoAddedTypeGitHubService)
-	if len(cm.GetResolvedRules()) != 0 {
-		t.Fatalf("nil config must stay ruleless, got %d rules", len(cm.GetResolvedRules()))
+	if !cm.MatchHostnameRule("api.github.com").HasAllow() {
+		t.Fatalf("auto-allow must be matchable with no config loaded, got %d rules", len(cm.GetResolvedRules()))
 	}
 
+	// And it survives the load that arrives later.
 	if err := cm.LoadConfigFromRules(nil, ActionDeny); err != nil {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
 	}
-	if !cm.MatchHostnameRule("github.com").HasAllow() {
-		t.Errorf("the recorded allow must land on the first loaded config")
+	if !cm.MatchHostnameRule("api.github.com").HasAllow() {
+		t.Errorf("the journalled allow must survive the first loaded config")
 	}
 }
 
@@ -116,7 +152,6 @@ func TestAutoAllowReplay_RecordedBeforeAnyConfigExists(t *testing.T) {
 // re-apply on every load.
 func TestAutoAllowReplay_DedupsIdenticalCalls(t *testing.T) {
 	cm := NewConfigManager()
-	cm.EnsureBaseConfig()
 
 	for range 3 {
 		cm.EnsureHostnameAllowed("app.codecargo.com", []Port{PortHTTPS}, AutoAddedTypeCodeCargoService)
@@ -133,9 +168,60 @@ func TestAutoAllowReplay_DedupsIdenticalCalls(t *testing.T) {
 	}
 }
 
-// EnsureBaseConfig only fills a vacuum: an already-loaded policy must not be
-// replaced by the deny-default stub.
-func TestEnsureBaseConfig_LeavesLoadedConfigAlone(t *testing.T) {
+// The ops log announces an auto-allow once, where it is installed. A replay
+// must stay silent: re-announcing the same rules on every load misdates the
+// install, and the #119 CI gate — which asserts the last announcement
+// precedes the DNS proxy arming — cannot tell a replay from a late install.
+func TestAutoAllowReplay_DoesNotReAnnounce(t *testing.T) {
+	var captured []string
+	orig := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	slog.SetDefault(slog.New(slog.NewTextHandler(&captureWriter{out: &captured},
+		&slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	cm := NewConfigManager()
+	cm.EnsureHostnameAllowed("gitlab.com", []Port{PortHTTPS}, AutoAddedTypeGitLabService)
+	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, []Port{PortHTTP}, AutoAddedTypeCloudMetadata)
+
+	if got := countLines(captured, "Auto-added infrastructure hostname allow rule"); got != 1 {
+		t.Fatalf("hostname install announcements = %d, want 1", got)
+	}
+	if got := countLines(captured, "Auto-added allow rule"); got != 1 {
+		t.Fatalf("CIDR install announcements = %d, want 1", got)
+	}
+
+	captured = nil
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "github.com", Action: ActionAllow},
+	}, ActionDeny); err != nil {
+		t.Fatalf("LoadConfigFromRules() error = %v", err)
+	}
+
+	if got := countLines(captured, "Auto-added"); got != 0 {
+		t.Errorf("replay re-announced %d install lines, want 0: %v", got, captured)
+	}
+	// Silent, but not absent from the log entirely — and the rules landed.
+	if got := countLines(captured, "Re-applied journalled auto-allows"); got != 1 {
+		t.Errorf("replay summary lines = %d, want 1", got)
+	}
+	if !cm.MatchHostnameRule("gitlab.com").HasAllow() {
+		t.Errorf("a silent replay must still install the rules")
+	}
+}
+
+func countLines(lines []string, substr string) int {
+	n := 0
+	for _, line := range lines {
+		if strings.Contains(line, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// Seeding only fills a vacuum: an auto-allow arriving after a policy load
+// must not replace that policy with the deny-default stub.
+func TestAutoAllowSeed_LeavesLoadedConfigAlone(t *testing.T) {
 	cm := NewConfigManager()
 	if err := cm.LoadConfigFromRules([]Rule{
 		{Type: RuleTypeHostname, Value: "github.com", Action: ActionAllow},
@@ -143,27 +229,27 @@ func TestEnsureBaseConfig_LeavesLoadedConfigAlone(t *testing.T) {
 		t.Fatalf("LoadConfigFromRules() error = %v", err)
 	}
 
-	cm.EnsureBaseConfig()
+	cm.EnsureHostnameAllowed("app.codecargo.com", []Port{PortHTTPS}, AutoAddedTypeCodeCargoService)
 
 	if got := cm.GetDefaultAction(); got != ActionAllow {
 		t.Errorf("GetDefaultAction() = %q, want %q (loaded config untouched)", got, ActionAllow)
 	}
 	if !cm.MatchHostnameRule("github.com").HasAllow() {
-		t.Errorf("the loaded rule must survive EnsureBaseConfig")
+		t.Errorf("the loaded rule must survive an auto-allow")
 	}
 }
 
-// A fresh manager has no config at all, so the base config must both exist
-// and be deny-default — the same posture GetDefaultAction reports for nil.
-func TestEnsureBaseConfig_SeedsDenyDefault(t *testing.T) {
+// The seeded config is deny-default — the same posture GetDefaultAction
+// already reports for a nil config, so seeding widens what is allowed before
+// a policy lands, never what is denied.
+func TestAutoAllowSeed_IsDenyDefault(t *testing.T) {
 	cm := NewConfigManager()
-	cm.EnsureBaseConfig()
+	cm.EnsureHostnameAllowed("github.com", []Port{PortHTTPS}, AutoAddedTypeGitHubService)
 
 	if got := cm.GetDefaultAction(); got != ActionDeny {
 		t.Errorf("GetDefaultAction() = %q, want %q", got, ActionDeny)
 	}
-	cm.EnsureHostnameAllowed("github.com", []Port{PortHTTPS}, AutoAddedTypeGitHubService)
-	if !cm.MatchHostnameRule("github.com").HasAllow() {
-		t.Errorf("the seeded config must accept auto-allow rules")
+	if cm.MatchHostnameRule("evil.example.com").Matched() {
+		t.Errorf("seeding must not allow anything but the auto-allows themselves")
 	}
 }

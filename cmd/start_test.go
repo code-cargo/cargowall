@@ -494,11 +494,9 @@ func TestAutoAllowGitlabHosts_ServiceHostsEnvOverridesDefaults(t *testing.T) {
 	require.NotContains(t, got, "gitlab.com", "default hosts should be replaced when env override is set")
 }
 
-// populateAutoAllowRules runs before any policy source has been read, so it
-// must seed the deny-default base config itself — every Ensure*Allowed
-// helper no-ops on a nil config, and without the seed the DNS proxy would
-// arm query filtering against a manager that cannot hold a rule (#119).
-func TestPopulateAutoAllowRules_NoFlagsSeedsBaseConfig(t *testing.T) {
+// No flags means no helpers, and therefore no rules and no config — a
+// standalone run must not acquire a policy it never asked for.
+func TestPopulateAutoAllowRules_NoFlagsInstallsNothing(t *testing.T) {
 	cm := config.NewConfigManager()
 
 	cmd := &StartCmd{} // every flag false, no ApiUrl
@@ -506,10 +504,6 @@ func TestPopulateAutoAllowRules_NoFlagsSeedsBaseConfig(t *testing.T) {
 
 	require.Equal(t, config.ActionDeny, cm.GetDefaultAction())
 	require.Empty(t, cm.GetResolvedRules(), "no helper enabled means no rules")
-
-	// The seeded config is writable — the property the seed exists for.
-	cm.EnsureHostnameAllowed("example.com", []config.Port{config.PortHTTPS}, config.AutoAddedTypeGitHubService)
-	require.True(t, cm.MatchHostnameRule("example.com").HasAllow())
 }
 
 // The infrastructure allows must be queryable on a manager that has never
@@ -1139,11 +1133,11 @@ func TestStartCargoWall_FatalErrorWritesFailureSentinel(t *testing.T) {
 	assert.Contains(t, string(data), "cargowall startup failed")
 }
 
-// A hostname-less --api-url must still bootstrap the deny-all config:
-// lockdown skips the env/file fallback, so without the bootstrap the manager
-// would hold a nil config where every Ensure*Allowed no-ops — a blackhole
-// with no DNS or CI-infra allows, contradicting the lockdown contract.
-func TestLoadCIConfig_LockdownBootstrapsWithHostnamelessApiUrl(t *testing.T) {
+// Lockdown skips the env/file fallback, so a hostname-less --api-url leaves
+// the manager with no config at all — and the CI infrastructure auto-allows
+// that run afterwards must still stick, or lockdown is a blackhole with no
+// DNS or infra allows rather than the documented deny-all posture.
+func TestLoadCIConfig_LockdownKeepsInfraAllowsWithHostnamelessApiUrl(t *testing.T) {
 	setFastPolicyRetries(t)
 	redirectStateFiles(t)
 
@@ -1160,12 +1154,13 @@ func TestLoadCIConfig_LockdownBootstrapsWithHostnamelessApiUrl(t *testing.T) {
 
 	require.True(t, cmd.policyLockdown, "an unsupported scheme is a transport failure")
 	assert.Equal(t, config.ActionDeny, cm.GetDefaultAction())
-	// The DNS/infra auto-allows now run in startCargoWall AFTER config load
-	// (gated on the listeners, not CI mode), so probe the property directly:
-	// Ensure*Allowed no-ops on a nil config, and a rule landing proves the
-	// lockdown bootstrap left the manager writable for those later calls.
+	// The DNS/infra auto-allows are wired to the listeners, not to CI mode,
+	// so probe the property directly: a rule landing proves lockdown left the
+	// manager writable for them (the helpers seed a deny-default config when
+	// the fetch never produced one — issue #119).
 	cm.EnsureDNSAllowed([]string{"127.0.0.1"})
-	assert.NotEmpty(t, cm.GetResolvedRules(), "lockdown must still accept the DNS/infra allows added after load")
+	assert.NotEmpty(t, cm.GetResolvedRules(), "lockdown must still accept the DNS/infra allows")
+	assert.Equal(t, config.ActionDeny, cm.GetDefaultAction(), "seeding must not soften the lockdown posture")
 }
 
 // The pid stamped into a sentinel identifies its run exactly — a leftover

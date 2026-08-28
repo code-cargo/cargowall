@@ -169,10 +169,15 @@ verify_cloud_detect() {
 # — every infrastructure hostname queried inside that window was REFUSED under
 # the pre-policy default-deny. One process writing one stream, so line order
 # is decision order.
+#
+# Both patterns anchor at the JSON logger's "msg" field (this job runs the
+# default JSON handler; --github-action swaps in the Actions handler). A bare
+# substring match would widen to any future line that merely quotes the
+# message — a replay or reconciliation log, say.
 verify_startup_order() {
   LOG=/tmp/cargowall.log
-  FILTER_LINE=$(sudo grep -n "DNS query filtering enabled" "$LOG" | head -1 | cut -d: -f1) || true
-  INFRA_LINE=$(sudo grep -n "Auto-added infrastructure hostname allow rule" "$LOG" | tail -1 | cut -d: -f1) || true
+  FILTER_LINE=$(sudo grep -n '"msg":"DNS query filtering enabled' "$LOG" | head -1 | cut -d: -f1) || true
+  INFRA_LINE=$(sudo grep -n '"msg":"Auto-added infrastructure hostname allow rule"' "$LOG" | tail -1 | cut -d: -f1) || true
 
   if [ -z "${FILTER_LINE:-}" ]; then
     echo "❌ 'DNS query filtering enabled' missing — the --gitlab-ci preset arms it"
@@ -185,7 +190,7 @@ verify_startup_order() {
   fi
   if [ "$INFRA_LINE" -gt "$FILTER_LINE" ]; then
     echo "❌ auto-allow ran AFTER query filtering armed (line $INFRA_LINE > $FILTER_LINE) — #119 regression"
-    sudo grep -nE "Auto-added infrastructure hostname allow rule|DNS query filtering enabled" "$LOG" || true
+    sudo grep -nE '"msg":"(Auto-added infrastructure hostname allow rule|DNS query filtering enabled)' "$LOG" || true
     exit 1
   fi
   echo "✅ infrastructure auto-allows installed before query filtering armed (line $INFRA_LINE < $FILTER_LINE)"

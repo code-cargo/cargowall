@@ -261,11 +261,8 @@ func (cm *Manager) applyLoadedConfig(cfg *FirewallConfig) error {
 	if err := cm.resolveRulesLocked(); err != nil {
 		return err
 	}
-	// The loaded ruleset replaced cm.config wholesale, taking the
-	// infrastructure auto-allows with it. Re-apply them here — against the
-	// new rules, so a policy deny still vetoes an infra allow — rather than
-	// making every caller re-run the auto-allow helpers after each load
-	// (issue #119, autoallow.go).
+	// The load replaced cm.config wholesale, taking the infrastructure
+	// auto-allows with it; the journal puts them back (autoallow.go).
 	cm.replayAutoAllowsLocked()
 	return nil
 }
@@ -1661,14 +1658,12 @@ func (cm *Manager) EnsureInfraAllowed(ips []string, ports []Port, autoAddedType 
 // ("127.0.0.0/8", "::1/128") depends on all four shapes working, so an
 // unparseable entry warns instead of vanishing silently.
 //
-// The call is recorded and re-applied after every subsequent config load
-// (issue #119, autoallow.go).
+// Journalled: re-applied after every subsequent config load (issue #119,
+// autoallow.go).
 func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoAddedType) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Recorded before the nil-config guard below: a helper called before any
-	// loader has run still takes effect, replayed by the first load.
 	cm.recordAutoAllowLocked(autoAllowEntry{
 		kind:     autoAllowCIDR,
 		values:   ips,
@@ -1678,15 +1673,14 @@ func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoA
 	cm.ensureAllowedLocked(ips, ports, autoAddedType, false)
 }
 
-// ensureAllowedLocked is the lock-held core of ensureAllowed, shared with
-// the replay path. `replay` only picks the log level: the first application
-// is the ops log's record of what the run auto-allowed, while a replay
-// repeats those same rules on every subsequent load and would drown it.
-// Caller must hold cm.mu.Lock.
+// ensureAllowedLocked is the lock-held core of ensureAllowed, shared with the
+// replay path. `replay` suppresses the per-rule announcement below: the ops
+// log records an auto-allow once, when it is installed, and re-announcing
+// the same rules on every load would both drown that record and misdate it.
+// replayAutoAllowsLocked logs one summary line instead. Caller must hold
+// cm.mu.Lock.
 func (cm *Manager) ensureAllowedLocked(ips []string, ports []Port, autoAddedType AutoAddedType, replay bool) {
-	if cm.config == nil {
-		return
-	}
+	cm.seedBaseConfigLocked()
 
 	for _, entry := range ips {
 		if entry == "" {
@@ -1759,10 +1753,7 @@ func (cm *Manager) ensureAllowedLocked(ips []string, ports []Port, autoAddedType
 			IPNet:         ipnet,
 		})
 
-		if replay {
-			slog.Debug("Re-applied auto-added allow rule after config load",
-				"cidr", cidr, "ports", ports, "autoAddedType", autoAddedType)
-		} else {
+		if !replay {
 			slog.Info("Auto-added allow rule", "cidr", cidr, "ports", ports, "autoAddedType", autoAddedType)
 		}
 	}
@@ -1859,9 +1850,8 @@ func (cm *Manager) cidrCoveredLocked(target *net.IPNet, port *Port) bool {
 // its subdomains) are permitted through the firewall. This is used in
 // GitHub Actions mode to auto-allow infrastructure like the Actions service.
 //
-// The call is recorded and re-applied after every subsequent config load
-// (issue #119, autoallow.go), so callers may run before any policy source
-// has been read and need not re-invoke this once one lands.
+// Journalled: callers may run before any policy source has been read, and
+// need not re-invoke this once one lands (issue #119, autoallow.go).
 func (cm *Manager) EnsureHostnameAllowed(hostname string, ports []Port, autoAddedType AutoAddedType) {
 	// DNS names are case-insensitive — store canonical lowercase so
 	// MatchHostnameRule's case-insensitive lookup finds these entries.
@@ -1870,8 +1860,6 @@ func (cm *Manager) EnsureHostnameAllowed(hostname string, ports []Port, autoAdde
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Recorded before the nil-config guard below: a helper called before any
-	// loader has run still takes effect, replayed by the first load.
 	cm.recordAutoAllowLocked(autoAllowEntry{
 		kind:     autoAllowHostname,
 		values:   []string{hostname},
@@ -1881,14 +1869,16 @@ func (cm *Manager) EnsureHostnameAllowed(hostname string, ports []Port, autoAdde
 	cm.ensureHostnameAllowedLocked(hostname, ports, autoAddedType, false)
 }
 
-// ensureHostnameAllowedLocked is the lock-held core of
-// EnsureHostnameAllowed, shared with the replay path. `hostname` is already
-// lower-cased; `replay` only picks the log level (see ensureAllowedLocked).
-// Caller must hold cm.mu.Lock.
+// ensureHostnameAllowedLocked is the lock-held core of EnsureHostnameAllowed,
+// shared with the replay path; `hostname` is already lower-cased and `replay`
+// suppresses the announcement (see ensureAllowedLocked). Caller must hold
+// cm.mu.Lock.
+//
+// Unlike the CIDR path this has no deny-veto: a hostname the loaded policy
+// denies is appended as an allow anyway and wins on exact-match-last. That
+// asymmetry predates the journal and is unchanged by it (issue #121).
 func (cm *Manager) ensureHostnameAllowedLocked(hostname string, ports []Port, autoAddedType AutoAddedType, replay bool) {
-	if cm.config == nil {
-		return
-	}
+	cm.seedBaseConfigLocked()
 
 	// Skip if already tracked as allowed
 	if action, ok := cm.trackedHostnames[hostname]; ok && action == ActionAllow {
@@ -1915,10 +1905,7 @@ func (cm *Manager) ensureHostnameAllowedLocked(hostname string, ports []Port, au
 		AutoAddedType: autoAddedType,
 	})
 
-	if replay {
-		slog.Debug("Re-applied auto-added infrastructure hostname allow rule after config load",
-			"hostname", hostname, "ports", ports, "autoAddedType", autoAddedType)
-	} else {
+	if !replay {
 		slog.Info("Auto-added infrastructure hostname allow rule", "hostname", hostname, "ports", ports, "autoAddedType", autoAddedType)
 	}
 }
@@ -2100,10 +2087,9 @@ func (cm *Manager) HasSearchDomainSuffix(hostname string) bool {
 // flags a programming error worth surfacing without losing the good entries
 // that ride alongside it.
 //
-// Like EnsureDNSAllowed / EnsureInfraAllowed / EnsureHostnameAllowed, the
-// merge itself no-ops when no config has been loaded — but the call is
-// recorded either way and replayed onto the first config that loads, so an
-// auto-allow pass running ahead of the policy fetch still takes effect
+// Like EnsureDNSAllowed / EnsureInfraAllowed / EnsureHostnameAllowed, this
+// may run before any policy source has been read: it seeds a deny-default
+// config when none is loaded, and is journalled so later loads re-apply it
 // (issue #119, autoallow.go).
 func (cm *Manager) AddSearchDomains(domains []string, logger *slog.Logger) {
 	// Iterate the caller's slice (not the post-merge normalized form) so the
@@ -2129,19 +2115,15 @@ func (cm *Manager) AddSearchDomains(domains []string, logger *slog.Logger) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Recorded before the nil-config guard below: a helper called before any
-	// loader has run still takes effect, replayed by the first load.
 	cm.recordAutoAllowLocked(autoAllowEntry{kind: autoAllowSearchDomain, values: valid})
 	cm.addSearchDomainsLocked(valid)
 }
 
 // addSearchDomainsLocked merges already-validated, already-normalized
-// suffixes into the loaded config, shared with the replay path. Caller must
-// hold cm.mu.Lock.
+// suffixes into the config, shared with the replay path. Caller must hold
+// cm.mu.Lock.
 func (cm *Manager) addSearchDomainsLocked(valid []string) {
-	if cm.config == nil {
-		return
-	}
+	cm.seedBaseConfigLocked()
 	cm.config.SearchDomains = mergeNormalizedSearchDomains(cm.config.SearchDomains, valid)
 }
 

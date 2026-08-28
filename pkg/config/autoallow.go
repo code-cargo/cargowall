@@ -21,23 +21,23 @@ import (
 	"slices"
 )
 
-// The auto-allow replay layer (issue #119).
+// The auto-allow journal (issue #119).
 //
 // Rules added by the Ensure*Allowed helpers and AddSearchDomains are not
-// policy — they are the infrastructure a run needs to function at all: the
-// cloud metadata endpoint, the Azure wireserver, the CI control plane, the
-// SaaS API, loopback. Every loader replaces cm.config wholesale, so those
-// rules used to survive only by being installed AFTER the last load. That
-// is why the auto-allow helpers ran behind the policy fetch — and why the
-// DNS proxy armed query filtering against an empty ruleset for the length
-// of an API round trip, refusing infrastructure hostnames (issue #119).
+// policy — they are the infrastructure a run needs to function at all: cloud
+// metadata, the Azure wireserver, the CI control plane, the SaaS API,
+// loopback. Every loader replaces cm.config wholesale, so before this layer
+// they survived only by being installed after the last load, which is why
+// they ran behind the policy fetch — leaving the DNS proxy filtering against
+// an empty ruleset for the length of an API round trip.
 //
-// Recording each call and replaying it after every load inverts that: the
-// helpers can run before the proxy starts, and a later policy load
-// re-applies them instead of wiping them. Replay drives the same locked
-// cores as the original call, in the original order, so a loaded policy
-// that denies an auto-allowed network still vetoes it exactly as it did
-// when the helpers ran last.
+// The contract: record each call's INPUT, re-run the same locked cores after
+// every load. Re-running the cores (rather than re-appending the rules they
+// produced) is what keeps the verdict identical to the old auto-allow-runs-
+// last ordering — a CIDR auto-allow is still vetoed by a loaded deny that
+// covers it, and a hostname auto-allow still wins over a policy deny for the
+// same exact name (#121). This layer moves WHEN rules are installed, never
+// WHICH rule wins.
 
 // autoAllowKind distinguishes the three shapes of auto-add the helpers
 // record. Kept internal: nothing outside this package needs to enumerate
@@ -51,10 +51,6 @@ const (
 )
 
 // autoAllowEntry is one recorded Ensure*Allowed / AddSearchDomains call.
-// It stores the helper's INPUT rather than the rule it produced, so a
-// replay re-runs the deny-veto and dedup checks against whatever ruleset is
-// loaded at that moment instead of resurrecting a decision made against an
-// older one.
 type autoAllowEntry struct {
 	kind     autoAllowKind
 	values   []string // CIDRs/IPs, one hostname, or normalized search domains
@@ -69,12 +65,10 @@ func (e autoAllowEntry) equal(other autoAllowEntry) bool {
 		slices.Equal(e.ports, other.ports)
 }
 
-// recordAutoAllowLocked appends an entry to the replay layer, ignoring an
-// exact repeat: call sites that predate this layer still invoke the helpers
-// more than once (loadCIConfig allows the API hostname so its own fetch can
-// resolve, and the auto-allow pass names it again), and each repeat would
-// otherwise grow the replay list and re-log on every load. Clones the
-// caller's slices — the layer outlives the call. Caller holds cm.mu.
+// recordAutoAllowLocked journals an entry, ignoring an exact repeat — some
+// call sites name the same hostname twice, and each repeat would otherwise
+// grow the list replayed on every load. Clones the caller's slices: the
+// journal outlives the call. Caller holds cm.mu.
 func (cm *Manager) recordAutoAllowLocked(entry autoAllowEntry) {
 	entry.values = slices.Clone(entry.values)
 	entry.ports = slices.Clone(entry.ports)
@@ -86,13 +80,20 @@ func (cm *Manager) recordAutoAllowLocked(entry autoAllowEntry) {
 	cm.autoAllows = append(cm.autoAllows, entry)
 }
 
-// replayAutoAllowsLocked re-applies every recorded auto-add onto the config
+// replayAutoAllowsLocked re-applies every journalled auto-add onto the config
 // a loader just installed. applyLoadedConfig calls it after
-// resolveRulesLocked so the cores see the new resolvedRules — their dedup
-// and deny-veto checks then run against the freshly loaded policy, which is
-// the same precedence the helpers had when they ran after the load.
-// Caller holds cm.mu.
+// resolveRulesLocked, so the cores' dedup and deny-veto checks see the new
+// ruleset. Caller holds cm.mu.
+//
+// The cores run in replay mode: an auto-allow is announced in the ops log
+// once, where it is installed. Re-announcing every rule on every load would
+// misdate the install and — since the CI gate for #119 keys on that
+// announcement preceding the DNS proxy arming — would also make a replay
+// indistinguishable from a late install. One summary line covers the pass.
 func (cm *Manager) replayAutoAllowsLocked() {
+	if len(cm.autoAllows) == 0 {
+		return
+	}
 	for _, entry := range cm.autoAllows {
 		switch entry.kind {
 		case autoAllowCIDR:
@@ -107,30 +108,15 @@ func (cm *Manager) replayAutoAllowsLocked() {
 			cm.addSearchDomainsLocked(entry.values)
 		}
 	}
+	slog.Debug("Re-applied journalled auto-allows onto the loaded config", "count", len(cm.autoAllows))
 }
 
-// EnsureBaseConfig installs an empty deny-default config when no loader has
-// run yet, so the Ensure*Allowed helpers — which no-op on a nil config —
-// can install the infrastructure allows before the first policy source is
-// read (issue #119). Idempotent: a config from any loader is left alone.
-//
-// Deny-default matches every other pre-policy posture in the daemon
-// (GetDefaultAction already reports deny for a nil config), so this changes
-// what is ALLOWED during startup, never what is denied.
-func (cm *Manager) EnsureBaseConfig() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if cm.config != nil {
-		return
+// seedBaseConfigLocked gives an auto-allow somewhere to land when no loader
+// has run yet. Deny-default is already what GetDefaultAction reports for a
+// nil config, so seeding changes what is ALLOWED before a policy arrives,
+// never what is denied. Caller holds cm.mu.
+func (cm *Manager) seedBaseConfigLocked() {
+	if cm.config == nil {
+		cm.config = &FirewallConfig{DefaultAction: ActionDeny}
 	}
-	cm.config = &FirewallConfig{DefaultAction: ActionDeny}
-	// An empty ruleset resolves to an empty resolvedRules; the replay below
-	// is what actually populates it when helpers already recorded entries
-	// against the nil config.
-	if err := cm.resolveRulesLocked(); err != nil {
-		slog.Error("Failed to resolve base config", "error", err)
-		return
-	}
-	cm.replayAutoAllowsLocked()
 }

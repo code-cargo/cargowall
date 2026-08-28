@@ -1187,7 +1187,6 @@ func TestIsQueryAllowed_InfraAutoAllowsSpanThePolicyFetch(t *testing.T) {
 	const domain = "productionresultssa16.blob.core.windows.net"
 
 	cfg := config.NewConfigManager()
-	cfg.EnsureBaseConfig()
 	cfg.EnsureHostnameAllowed("blob.core.windows.net",
 		[]config.Port{config.PortHTTPS}, config.AutoAddedTypeAzureInfrastructure)
 

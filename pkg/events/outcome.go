@@ -197,9 +197,13 @@ func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegist
 	return allowMatches && !denyMatches, matchedRule
 }
 
-// OutcomeKind is what happened to a connection. It is the ONLY thing a hook
-// decides about presentation: which event type is stamped, how the line
-// reads, and whether a notification fires all follow from it in emitOutcome.
+// OutcomeKind is the POLICY outcome: what the ruleset decided about a
+// connection. It alone fixes the event type, because that is what consumers
+// key off (RecentBlocks, the summary pipeline, OTLP) — but it does not fix
+// presentation. The same denial is a drop under enforcement and a
+// would-block under audit, so how the line reads and whether a notification
+// fires follow from kind AND Outcome.Enforced, and from nothing else a hook
+// decides.
 type OutcomeKind uint8
 
 const (
@@ -221,6 +225,15 @@ const (
 type Outcome struct {
 	Kind  OutcomeKind
 	Audit AuditEvent
+	// Enforced is whether this outcome is a drop that actually happened —
+	// the second presentation axis, mirroring L7Record.Enforced, and the
+	// gate on both the wording and the notification. False for allows, for
+	// shadow would-blocks, for late-allows (the policy outcome is allow;
+	// Kind carries that the first packet died), and false for EVERY denial
+	// in audit mode, the run's log-only posture where both hooks pass the
+	// packet and report the denial anyway. A denial that dropped nothing
+	// must not read as one that did, and must not notify.
+	Enforced bool
 	// SrcPort renders the log's src as ip:port. Zero omits the port (a
 	// protocol block has none).
 	SrcPort uint16
@@ -234,12 +247,39 @@ type Outcome struct {
 	ProtocolNum uint16
 }
 
+// deniedMsg renders a denial's log line from the two axes that describe one:
+// whether the datapath enforced it, and whether it took out an established
+// flow. Both denial kinds share it — they differ only in the subject — so
+// the wording cannot drift between a connection and a protocol denial the
+// way it would if each kind inlined its own conditionals.
+func deniedMsg(subject string, enforced, midStream bool) string {
+	verb := "blocked"
+	var qualifiers []string
+	if !enforced {
+		verb = "would be blocked"
+		qualifiers = append(qualifiers, "audit mode")
+	}
+	if midStream {
+		qualifiers = append(qualifiers, "mid-stream")
+	}
+	msg := subject + " " + verb
+	if len(qualifiers) > 0 {
+		msg += " (" + strings.Join(qualifiers, ", ") + ")"
+	}
+	return msg
+}
+
 // emitOutcome is the single place a connection outcome becomes observable:
 // it stamps the event type, writes the log line, records the audit event,
 // and fires the notification. Both enforcement hooks funnel through it, so
 // TC and the cgroup hook cannot drift in how they report the same outcome —
 // which they had begun to do (mid-stream, protocol-block typing, log src
 // formatting) when each owned its own fan-out.
+//
+// It is a function of the Outcome it is handed and nothing else: the two
+// facts presentation needs — the policy outcome and whether the datapath
+// enforced it — are both resolved by then (see prepareOutcome), so the
+// emitter never reaches back out for live run state.
 func emitOutcome(o Outcome, notificationTracker *NotificationTracker,
 	auditLogger *AuditLogger, logger *slog.Logger,
 ) {
@@ -250,8 +290,15 @@ func emitOutcome(o Outcome, notificationTracker *NotificationTracker,
 	}
 	attrs := []any{"src", src, "dst", o.DisplayHostname, "dst_ip", audit.DstIP}
 
+	// Only a REAL drop notifies — the notification client reaches the SaaS
+	// state machine, which has no audit posture and would raise a block that
+	// never happened. Would-blocks (audit mode, cgroup shadow) and
+	// late-allows are telemetry and stop at the audit record, the same
+	// policy ReportL7 states. One gate for every kind: Enforced is already
+	// false for each of them.
+	notify := o.Enforced
+
 	var msg string
-	var notify bool
 
 	switch o.Kind {
 	case OutcomeAllowed:
@@ -260,10 +307,10 @@ func emitOutcome(o Outcome, notificationTracker *NotificationTracker,
 		attrs = append(attrs, "dst_port", audit.DstPort)
 
 	case OutcomeLateAllowed:
-		// Policy outcome is allow (the retry will succeed), so no block
-		// notification. MatchedRule is the rule's Value (pattern string for
-		// glob rules) — distinct from DisplayHostname, which is the reported
-		// destination.
+		// The policy outcome is allow (the retry will succeed), which is why
+		// applyDenialOutcome cleared Enforced: no block notification.
+		// MatchedRule is the rule's Value (pattern string for glob rules) —
+		// distinct from DisplayHostname, which is the reported destination.
 		audit.EventType = EventConnectionLateAllowed
 		msg = "Connection late-allowed"
 		attrs = append(attrs, "dst_port", audit.DstPort, "matched_rule", audit.MatchedRule)
@@ -271,9 +318,8 @@ func emitOutcome(o Outcome, notificationTracker *NotificationTracker,
 	case OutcomeProtocolBlocked:
 		audit.EventType = EventProtocolBlocked
 		audit.DstPort = 0 // the wire field carried a protocol number, not a port
-		msg = "Protocol blocked"
+		msg = deniedMsg("Protocol", o.Enforced, false)
 		attrs = append(attrs, "protocol", audit.Protocol, "protocol_num", o.ProtocolNum)
-		notify = true
 
 	case OutcomeWouldBlock:
 		// Explicit flags: LogEvent skips normalization for this type, so no
@@ -292,12 +338,8 @@ func emitOutcome(o Outcome, notificationTracker *NotificationTracker,
 		// reconciler, summary pipeline, and OTLP mapping treat it like any
 		// other block.
 		audit.EventType = EventConnectionBlocked
-		msg = "Connection blocked"
-		if audit.MidStream {
-			msg = "Connection blocked (mid-stream)"
-		}
+		msg = deniedMsg("Connection", o.Enforced, audit.MidStream)
 		attrs = append(attrs, "dst_port", audit.DstPort)
-		notify = true
 	}
 
 	logConnEvent(logger, msg, &audit, attrs...)
@@ -337,6 +379,12 @@ func applyDenialOutcome(out *Outcome, lateAllowed bool, matchedRule string,
 	case lateAllowed:
 		out.Kind = OutcomeLateAllowed
 		out.Audit.MatchedRule = matchedRule
+		// The packet did die under enforcement, but the policy outcome is
+		// allow and the retry will succeed — Kind already carries that, so
+		// nothing here should present as a drop or notify. Clearing the
+		// presentation bit here is what lets the emitter gate the
+		// notification once, above its switch, instead of per denial kind.
+		out.Enforced = false
 	default:
 		out.Kind = OutcomeBlocked
 		out.Audit.MidStream = midStream
@@ -355,6 +403,17 @@ func applyDenialOutcome(out *Outcome, lateAllowed bool, matchedRule string,
 // saturated reporting pipeline: no DNS-cache/PTR resolution and no firewall
 // writes — the audit record goes out with the bare IP, because it is the
 // one artifact an enforced drop must never lose.
+//
+// denial is also where Outcome.Enforced comes from, and the only place the
+// run's posture is read: in audit mode both datapaths pass the packet and
+// report the denial anyway (tcbpf.c's check_audit_or_block, originbpf.c's
+// verdict_action), so a denial there enforced nothing. config.Manager is
+// that posture's single authority — the same value seeds the BPF audit map
+// at startup and on every reload, and the DNS proxy reads it for its own
+// would-block wording. The cgroup hook's denial is already the datapath
+// fact (verdict_label only labels a Block under enforce && !audit, and
+// origin.insert drops the would-blocks so TC is the single reporter), so
+// the posture term is redundant there and wrong nowhere.
 //
 // One audit record underlies every outcome branch and every observable
 // channel: the caller stamps its event type and type-specific fields onto
@@ -397,6 +456,7 @@ func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegi
 		SrcPort:         srcPort,
 		DisplayHostname: displayHostname,
 		NotifyPort:      dstPort,
+		Enforced:        denial && !configMgr.IsAuditMode(),
 	}
 	return out, lateAllowed, matchedRule
 }

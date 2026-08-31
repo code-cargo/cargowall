@@ -17,6 +17,8 @@
 package events
 
 import (
+	"bytes"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -124,13 +126,21 @@ func TestReportVerdict_LateAllowOpensFirewall(t *testing.T) {
 	sink := &recordingSink{}
 	auditLogger.AddSink(sink)
 	fw := &mockFirewallUpdater{}
+	sm := &mockStateMachineClient{}
 
-	ReportVerdict(verdictRec(true), cm, nil, auditLogger, fw, nil, newTestLogger())
+	ReportVerdict(verdictRec(true), cm, NewNotificationTracker(sm, newTestLogger()),
+		auditLogger, fw, nil, newTestLogger())
 
 	require.NotEmpty(t, fw.addedIPs, "late-allow must open the firewall for the resolved host")
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, EventConnectionLateAllowed, sink.events[0].EventType)
 	assert.Equal(t, "example.com", sink.events[0].MatchedRule)
+	// The packet died under enforcement, but the policy outcome is allow and
+	// the retry will succeed: a late-allow must never page the SaaS for a
+	// drop policy already healed. This is what makes emitOutcome's single
+	// notify = o.Enforced gate safe — applyDenialOutcome clears Enforced for
+	// this kind, so hoisting the gate out of the switch cannot regress it.
+	assert.Empty(t, sm.calls, "a late-allow is not a block notification")
 }
 
 // Shadow mode is hypothetical: nothing was blocked, so it must not open the
@@ -279,4 +289,149 @@ func TestApplyDenialOutcome_ProtocolBlockBeatsLateAllow(t *testing.T) {
 	applyDenialOutcome(&out2, true, "some.allow.rule", false, 0, "", false)
 	assert.Equal(t, OutcomeLateAllowed, out2.Kind)
 	assert.Equal(t, "some.allow.rule", out2.Audit.MatchedRule)
+}
+
+// reportDenial drives one hook's entry point with the same denied TCP flow,
+// so a case can assert that both produce the identical line.
+func reportDenial(t *testing.T, hook string, midStream bool, cm *config.Manager,
+	nt *NotificationTracker, al *AuditLogger, logger *slog.Logger,
+) {
+	t.Helper()
+	switch hook {
+	case "tc":
+		ev := orphanEvent()
+		if midStream {
+			ev.Flags |= BpfEventFlagMidstream
+		}
+		processEvent(makeBpfEvent(ev), cm, nt, al, nil, nil, logger, nil)
+	case "cgroup":
+		rec := verdictRec(true)
+		rec.MidStream = midStream
+		ReportVerdict(rec, cm, nt, al, nil, nil, logger)
+	default:
+		t.Fatalf("unknown hook %q", hook)
+	}
+}
+
+// Audit mode is the run's "log, never block" posture: both datapaths pass
+// the packet and report the denial anyway (tcbpf.c's check_audit_or_block,
+// originbpf.c's verdict_action), so a denial reported under it enforced
+// nothing. Two things follow, and #122 is what happens when they don't: the
+// line must not read as a drop that happened, and it must not raise a
+// notification for one. Every other consumer — the audit record, the
+// summary's posture inference, OTLP's would_deny, the DNS proxy's own
+// wording, ReportL7 — was already posture-aware; emitOutcome was the last
+// emitter asserting an enforcement it had not performed.
+func TestEmitOutcome_AuditModeReportsWouldBlock(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		auditMode  bool
+		midStream  bool
+		wantMsg    string
+		wantNotify bool
+		// The hooks that actually produce this row. Under enforcement both
+		// do, and the wording is emitOutcome's job precisely so they cannot
+		// drift. An audit-mode denial is TC's alone: verdict_label makes it
+		// a would-block at the cgroup hook, and origin.insert drops those in
+		// enforce mode so exactly one reporter emits the packet's denial
+		// (shadow mode keeps them, as OutcomeWouldBlock — see
+		// TestReportVerdict_ShadowIsTelemetryOnly).
+		hooks []string
+	}{
+		{"enforce", false, false, "Connection blocked", true, []string{"tc", "cgroup"}},
+		{"enforce, established flow killed", false, true, "Connection blocked (mid-stream)", true, []string{"tc", "cgroup"}},
+		{"audit", true, false, "Connection would be blocked (audit mode)", false, []string{"tc"}},
+		{"audit, established flow would be killed", true, true, "Connection would be blocked (audit mode, mid-stream)", false, []string{"tc"}},
+	} {
+		for _, hook := range tt.hooks {
+			t.Run(tt.name+"/"+hook, func(t *testing.T) {
+				cm := config.NewConfigManager()
+				require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+				cm.SetAuditMode(tt.auditMode)
+				// Resolve the destination from the cache so no PTR lookup runs.
+				cm.UpdateDNSMapping("example.com", "93.184.216.34")
+
+				// The daemon holds the two postures in sync (cmd/start.go),
+				// so the record's normalization and the log line must agree
+				// about the same run.
+				auditLogger, err := NewAuditLogger("", tt.auditMode)
+				require.NoError(t, err)
+				sink := &recordingSink{}
+				auditLogger.AddSink(sink)
+
+				sm := &mockStateMachineClient{}
+				var logBuf bytes.Buffer
+				logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+				reportDenial(t, hook, tt.midStream, cm, NewNotificationTracker(sm, logger), auditLogger, logger)
+
+				assert.Contains(t, logBuf.String(), `msg="`+tt.wantMsg+`"`)
+
+				require.Len(t, sink.events, 1)
+				ev := sink.events[0]
+				// The event type is deliberately unchanged: RecentBlocks,
+				// the summary pipeline and the OTLP mapping key off it, and
+				// would_deny is what carries the posture to them.
+				assert.Equal(t, EventConnectionBlocked, ev.EventType)
+				assert.Equal(t, tt.auditMode, ev.WouldDeny)
+				assert.Equal(t, !tt.auditMode, ev.Blocked)
+				assert.Equal(t, tt.midStream, ev.MidStream)
+
+				if tt.wantNotify {
+					require.Len(t, sm.calls, 1, "a real drop notifies")
+					assert.Equal(t, "example.com", sm.calls[0].hostname)
+				} else {
+					assert.Empty(t, sm.calls, "a would-block is telemetry: the SaaS has no audit posture and would surface a block that never happened")
+				}
+			})
+		}
+	}
+}
+
+// A denied non-TCP/UDP protocol is the same claim in a different shape — it
+// carries a protocol number instead of a port, so it takes its own branch
+// out of emitOutcome's switch and drifted the same way. TC is the reporter
+// for both postures here (see the hooks note above); that the cgroup hook
+// agrees under enforcement is TestReportVerdict_ProtocolBlockMatchesTC.
+func TestEmitOutcome_AuditModeProtocolBlock(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		auditMode  bool
+		wantMsg    string
+		wantNotify bool
+	}{
+		{"enforce", false, "Protocol blocked", true},
+		{"audit", true, "Protocol would be blocked (audit mode)", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := config.NewConfigManager()
+			require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+			cm.SetAuditMode(tt.auditMode)
+			cm.UpdateDNSMapping("example.com", "93.184.216.34")
+
+			auditLogger, err := NewAuditLogger("", tt.auditMode)
+			require.NoError(t, err)
+			sink := &recordingSink{}
+			auditLogger.AddSink(sink)
+
+			sm := &mockStateMachineClient{}
+			var logBuf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+			// TC's protocol-block wire shape: ports zeroed, the protocol
+			// number riding dst_port (BpfBlockedEvent.IsProtocolBlock).
+			ev := orphanEvent()
+			ev.IpProto = 47 // GRE
+			ev.SrcPort = 0
+			ev.DstPort = 47
+			processEvent(makeBpfEvent(ev), cm, NewNotificationTracker(sm, logger), auditLogger, nil, nil, logger, nil)
+
+			assert.Contains(t, logBuf.String(), `msg="`+tt.wantMsg+`"`)
+			require.Len(t, sink.events, 1)
+			assert.Equal(t, EventProtocolBlocked, sink.events[0].EventType)
+			assert.Equal(t, tt.auditMode, sink.events[0].WouldDeny)
+			assert.Equal(t, !tt.auditMode, sink.events[0].Blocked)
+			assert.Equal(t, tt.wantNotify, len(sm.calls) == 1)
+		})
+	}
 }

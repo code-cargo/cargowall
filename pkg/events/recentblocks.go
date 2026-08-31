@@ -221,12 +221,12 @@ func (rb *RecentBlocks) TakeMatching(dstIP string, allowPorts, denyPorts []confi
 			continue
 		}
 		proto, _ := protocolTypeForAuditName(b.Protocol) // recorded entries always map
-		if !rulePortCovered(allowPorts, b.DstPort, proto) {
+		if !config.PortsCover(allowPorts, b.DstPort, proto) {
 			continue
 		}
 		delete(byKey, key)
 		rb.size--
-		if hasDeny && rulePortCovered(denyPorts, b.DstPort, proto) {
+		if hasDeny && config.PortsCover(denyPorts, b.DstPort, proto) {
 			continue
 		}
 		taken = append(taken, b)

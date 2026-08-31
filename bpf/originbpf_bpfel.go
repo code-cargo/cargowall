@@ -13,6 +13,26 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type OriginBpfL7FlowKey struct {
+	_         structs.HostLayout
+	Cookie    uint64
+	Dst       [16]uint8
+	DstPort   uint16
+	IpProto   uint8
+	IpVersion uint8
+}
+
+type OriginBpfL7FlowVal struct {
+	_           structs.HostLayout
+	State       uint8
+	Punts       uint8
+	LastPuntLen uint16
+	LastPuntSeq uint32
+	Ts          uint64
+	DcidLen     uint8
+	Dcid        [20]uint8
+}
+
 type OriginBpfLpmKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
@@ -78,6 +98,11 @@ const (
 	OriginBpfMapMapCidrs             = "map_cidrs"
 	OriginBpfMapMapCidrsV6           = "map_cidrs_v6"
 	OriginBpfMapMapDefaultAction     = "map_default_action"
+	OriginBpfMapMapL7Events          = "map_l7_events"
+	OriginBpfMapMapL7Flow            = "map_l7_flow"
+	OriginBpfMapMapL7Scope           = "map_l7_scope"
+	OriginBpfMapMapL7ScopeV6         = "map_l7_scope_v6"
+	OriginBpfMapMapL7Stats           = "map_l7_stats"
 	OriginBpfMapMapLocalNets         = "map_local_nets"
 	OriginBpfMapMapLocalNetsV6       = "map_local_nets_v6"
 	OriginBpfMapMapOriginConfig      = "map_origin_config"
@@ -86,6 +111,7 @@ const (
 	OriginBpfMapMapPorts             = "map_ports"
 	OriginBpfMapMapPortsV6           = "map_ports_v6"
 	OriginBpfProgCgOriginEgress      = "cg_origin_egress"
+	OriginBpfVarBtfAnchorL7Event     = "btf_anchor_l7_event"
 	OriginBpfVarBtfAnchorOriginEvent = "btf_anchor_origin_event"
 )
 
@@ -142,6 +168,11 @@ type OriginBpfMapSpecs struct {
 	MapCidrs         *ebpf.MapSpec `ebpf:"map_cidrs"`
 	MapCidrsV6       *ebpf.MapSpec `ebpf:"map_cidrs_v6"`
 	MapDefaultAction *ebpf.MapSpec `ebpf:"map_default_action"`
+	MapL7Events      *ebpf.MapSpec `ebpf:"map_l7_events"`
+	MapL7Flow        *ebpf.MapSpec `ebpf:"map_l7_flow"`
+	MapL7Scope       *ebpf.MapSpec `ebpf:"map_l7_scope"`
+	MapL7ScopeV6     *ebpf.MapSpec `ebpf:"map_l7_scope_v6"`
+	MapL7Stats       *ebpf.MapSpec `ebpf:"map_l7_stats"`
 	MapLocalNets     *ebpf.MapSpec `ebpf:"map_local_nets"`
 	MapLocalNetsV6   *ebpf.MapSpec `ebpf:"map_local_nets_v6"`
 	MapOriginConfig  *ebpf.MapSpec `ebpf:"map_origin_config"`
@@ -155,6 +186,7 @@ type OriginBpfMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type OriginBpfVariableSpecs struct {
+	BtfAnchorL7Event     *ebpf.VariableSpec `ebpf:"btf_anchor_l7_event"`
 	BtfAnchorOriginEvent *ebpf.VariableSpec `ebpf:"btf_anchor_origin_event"`
 }
 
@@ -182,6 +214,11 @@ type OriginBpfMaps struct {
 	MapCidrs         *ebpf.Map `ebpf:"map_cidrs"`
 	MapCidrsV6       *ebpf.Map `ebpf:"map_cidrs_v6"`
 	MapDefaultAction *ebpf.Map `ebpf:"map_default_action"`
+	MapL7Events      *ebpf.Map `ebpf:"map_l7_events"`
+	MapL7Flow        *ebpf.Map `ebpf:"map_l7_flow"`
+	MapL7Scope       *ebpf.Map `ebpf:"map_l7_scope"`
+	MapL7ScopeV6     *ebpf.Map `ebpf:"map_l7_scope_v6"`
+	MapL7Stats       *ebpf.Map `ebpf:"map_l7_stats"`
 	MapLocalNets     *ebpf.Map `ebpf:"map_local_nets"`
 	MapLocalNetsV6   *ebpf.Map `ebpf:"map_local_nets_v6"`
 	MapOriginConfig  *ebpf.Map `ebpf:"map_origin_config"`
@@ -197,6 +234,11 @@ func (m *OriginBpfMaps) Close() error {
 		m.MapCidrs,
 		m.MapCidrsV6,
 		m.MapDefaultAction,
+		m.MapL7Events,
+		m.MapL7Flow,
+		m.MapL7Scope,
+		m.MapL7ScopeV6,
+		m.MapL7Stats,
 		m.MapLocalNets,
 		m.MapLocalNetsV6,
 		m.MapOriginConfig,
@@ -211,6 +253,7 @@ func (m *OriginBpfMaps) Close() error {
 //
 // It can be passed to LoadOriginBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type OriginBpfVariables struct {
+	BtfAnchorL7Event     *ebpf.Variable `ebpf:"btf_anchor_l7_event"`
 	BtfAnchorOriginEvent *ebpf.Variable `ebpf:"btf_anchor_origin_event"`
 }
 

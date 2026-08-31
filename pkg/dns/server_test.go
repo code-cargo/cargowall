@@ -3647,7 +3647,7 @@ func TestHandleDNSQuery_ContainerListenerUsesContainerLookup(t *testing.T) {
 }
 
 // The ACCEPTED residual of per-listener attribution: running
-// --docker-dns-interception without --container-attribution files every
+// --docker-dns-interception without --container-egress files every
 // blocked bridge-listener query — including one from a HOST process that
 // chose to resolve via the bridge address — as unattributed container
 // traffic. Chosen deliberately over the alternative (sockdiag for bridge
@@ -3788,4 +3788,110 @@ func TestHandleDNSQuery_ContainerListenerAuditModeStillTagsAndForwards(t *testin
 	assert.Equal(t, "cafe12345678", ev.ContainerID)
 	assert.True(t, ev.WouldDeny, "audit-mode logger marks would-deny")
 	assert.False(t, ev.Blocked)
+}
+
+// A rule-allowed host that reaches its addresses THROUGH CNAME hops must
+// record the per-IP origin chain, exactly as the derived path does. Without
+// it, a shared edge IP attributes only via ipToHostname (last-write-wins
+// across every host that resolved to it) and connection events carry no
+// drill-down chain.
+func TestHandleDNSQuery_RuleAllowedRecordsCNAMEChain(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "builds.dotnet.microsoft.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const origin = "builds.dotnet.microsoft.com."
+	const edgeIP = "23.56.109.139"
+	seedCachedResponse(server, origin, makeCNAMEResponse(origin,
+		[]string{"dotnetcli.trafficmanager.net", "a441.dscd.akamai.net"}, edgeIP))
+	mockFw.On("AddIP", net.ParseIP(edgeIP), config.ActionAllow, []config.Port(nil)).Return(true, nil).Once()
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	query.Id = 7201
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	chain := cfg.LookupCNAMEChain(edgeIP)
+	require.NotEmpty(t, chain, "a rule-allowed host with CNAME hops must record its chain")
+	assert.Equal(t, "builds.dotnet.microsoft.com", chain[0],
+		"the origin is the name the user allowed")
+	assert.Equal(t, []string{
+		"builds.dotnet.microsoft.com",
+		"dotnetcli.trafficmanager.net",
+		"a441.dscd.akamai.net",
+	}, chain, "the full origin..target chain is the drill-down")
+}
+
+// The converse: a plain A answer has no chain, so recording a synthetic
+// one-element "chain" would put a meaningless drill-down on every event.
+func TestHandleDNSQuery_PlainAResponseRecordsNoCNAMEChain(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "plain.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const origin = "plain.example.com."
+	const ip = "93.184.216.34"
+	seedCachedResponse(server, origin, makeCNAMEResponse(origin, nil, ip)) // no hops
+	mockFw.On("AddIP", net.ParseIP(ip), config.ActionAllow, []config.Port(nil)).Return(true, nil).Once()
+
+	query := new(dns.Msg)
+	query.SetQuestion(origin, dns.TypeA)
+	query.Id = 7202
+	w := &MockResponseWriter{}
+	w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+	server.handleDNSQuery(w, query)
+	w.AssertExpectations(t)
+
+	assert.Empty(t, cfg.LookupCNAMEChain(ip),
+		"a chainless answer must not record a synthetic chain")
+}
+
+// Two rule-allowed origins on ONE shared edge IP: the per-IP record keeps both
+// and attribution is recency-ranked, rather than the last-write-wins single
+// name ipToHostname would give.
+func TestHandleDNSQuery_SharedEdgeKeepsBothOrigins(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "first.example.com", Action: config.ActionAllow},
+		{Type: config.RuleTypeHostname, Value: "second.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	mockFw := firewall.NewMockFirewall(t)
+	server := newTestServer(t, cfg, mockFw)
+	server.filterQueries = true
+
+	const edgeIP = "104.16.1.1"
+	mockFw.On("AddIP", net.ParseIP(edgeIP), config.ActionAllow, []config.Port(nil)).Return(true, nil).Twice()
+
+	for i, origin := range []string{"first.example.com.", "second.example.com."} {
+		seedCachedResponse(server, origin, makeCNAMEResponse(origin, []string{"shared.edge.example.net"}, edgeIP))
+		query := new(dns.Msg)
+		query.SetQuestion(origin, dns.TypeA)
+		query.Id = uint16(7300 + i)
+		w := &MockResponseWriter{}
+		w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+		server.handleDNSQuery(w, query)
+		w.AssertExpectations(t)
+	}
+
+	// The most recently resolved origin wins the display attribution...
+	chain := cfg.LookupCNAMEChain(edgeIP)
+	require.NotEmpty(t, chain)
+	assert.Equal(t, "second.example.com", chain[0], "most recent origin wins attribution")
+	// ...and the earlier origin is retained, not overwritten — proven by the
+	// per-IP record surviving as a set (see maxCNAMEOriginsPerIP).
+	assert.Equal(t, []string{"second.example.com", "shared.edge.example.net"}, chain)
 }

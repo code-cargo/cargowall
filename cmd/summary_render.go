@@ -66,7 +66,11 @@ type summaryData struct {
 func tallyEvents(evts []events.AuditEvent) (blocked, allowed, dnsBlocked, protoBlocked, autoAllowed int) {
 	for _, event := range evts {
 		switch event.EventType {
-		case events.EventConnectionBlocked:
+		// l7_blocked is a real enforce-mode drop (SNI/Host mismatch on a
+		// scoped IP) and counts as a blocked connection; l7_would_block never
+		// reaches this tally — the classifier files it with the telemetry
+		// markers.
+		case events.EventConnectionBlocked, events.EventL7Blocked:
 			blocked++
 		case events.EventConnectionAllowed, events.EventConnectionLateAllowed:
 			allowed++
@@ -197,7 +201,7 @@ func (c *SummaryCmd) generateSummary(d summaryData) {
 				e := &summaryEntry{
 					dest:        dest,
 					typeLabel:   c.eventTypeLabel(event.EventType),
-					blocked:     !event.EventType.IsConnectionAllowed(),
+					blocked:     !event.EventType.IsAllowedOutcome(),
 					autoAllowed: event.AutoAllowedType != "",
 					process:     event.Process,
 					stepLabel:   stepOrdinalLabel(event.StepOrdinal),
@@ -255,16 +259,12 @@ func (c *SummaryCmd) generateSummary(d summaryData) {
 func (c *SummaryCmd) eventDestination(event events.AuditEvent) string {
 	// Protocol blocks (ICMP, GRE, etc.) show as "hostname (PROTOCOL)" or "IP (PROTOCOL)"
 	if event.EventType == events.EventProtocolBlocked {
-		dest := event.DstHostname
-		if dest == "" {
-			dest = event.DstIP
-		}
-		return fmt.Sprintf("%s (%s)", dest, event.Protocol)
+		return fmt.Sprintf("%s (%s)", event.ReportedDestName(), event.Protocol)
 	}
-	dest := event.DstHostname
-	if dest == "" {
-		dest = event.DstIP
-	}
+	// ReportedDestName: an L7 denial renders under the SNI/Host the flow
+	// presented — attributing it to the allowed origin the edge IP resolves
+	// to would tell the operator the wrong name was blocked.
+	dest := event.ReportedDestName()
 	if event.DstPort > 0 {
 		dest = fmt.Sprintf("%s:%d", dest, event.DstPort)
 	}
@@ -277,7 +277,7 @@ func (c *SummaryCmd) eventTypeLabel(eventType events.AuditEventType) string {
 		return "Connection"
 	case events.EventProtocolBlocked:
 		return "Protocol"
-	case events.EventDNSBlocked:
+	case events.EventDNSBlocked, events.EventDNSQueryLateAllowed:
 		return "DNS"
 	default:
 		return string(eventType)
@@ -289,12 +289,14 @@ func (c *SummaryCmd) generateAllowlistSuggestions(stepEvents []StepEvents) {
 	destCounts := make(map[string]int)
 	for _, se := range stepEvents {
 		for _, event := range se.Events {
-			if event.EventType == events.EventConnectionBlocked || event.EventType == events.EventDNSBlocked {
-				dest := event.DstHostname
-				if dest == "" {
-					dest = event.DstIP
-				}
-				destCounts[dest]++
+			// l7_blocked included: an SNI/Host denial is a destination the run
+			// needed and did not have, which is exactly what this section
+			// exists to surface. ReportedDestName (not DstHostname) so the
+			// suggestion names the SNI that was actually rejected rather than
+			// the already-allowed origin its edge IP resolves to.
+			switch event.EventType {
+			case events.EventConnectionBlocked, events.EventDNSBlocked, events.EventL7Blocked:
+				destCounts[event.ReportedDestName()]++
 			}
 		}
 	}

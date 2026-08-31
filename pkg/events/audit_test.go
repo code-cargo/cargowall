@@ -457,3 +457,36 @@ func TestAuditLogger_FileLess(t *testing.T) {
 	require.NoError(t, logger.Close())
 	require.NoError(t, logger.Close())
 }
+
+// TestIsAllowedOutcome pins the classification the markdown summary renders
+// each event's Blocked column from. dns_query_late_allowed is the one that has
+// to be argued: nothing was allowed at the instant it was written, but it
+// SUPERSEDES the dns_blocked row it re-reports and reconcileLateAllowedBlocks
+// has already deleted that row by the time the renderer asks — so classifying
+// it as a block prints the name as denied with nothing left to correct it,
+// while its connection-side twin prints Allowed. That is the two halves of
+// #119 disagreeing on the primary human-facing surface.
+func TestIsAllowedOutcome(t *testing.T) {
+	allowed := []AuditEventType{
+		EventConnectionAllowed,
+		EventConnectionLateAllowed,
+		EventDNSQueryLateAllowed,
+	}
+	for _, et := range allowed {
+		if !et.IsAllowedOutcome() {
+			t.Errorf("%s must classify as an allow outcome", et)
+		}
+	}
+
+	blocked := []AuditEventType{
+		EventConnectionBlocked,
+		EventDNSBlocked,
+		EventProtocolBlocked,
+		EventL7Blocked,
+	}
+	for _, et := range blocked {
+		if et.IsAllowedOutcome() {
+			t.Errorf("%s must not classify as an allow outcome", et)
+		}
+	}
+}

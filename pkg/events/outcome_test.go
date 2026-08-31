@@ -53,7 +53,7 @@ func TestReportVerdict_BlockedCarriesHostname(t *testing.T) {
 	sink := &recordingSink{}
 	auditLogger.AddSink(sink)
 
-	ReportVerdict(verdictRec(true), cm, nil, auditLogger, nil, newTestLogger())
+	ReportVerdict(verdictRec(true), cm, nil, auditLogger, nil, nil, newTestLogger())
 
 	require.Len(t, sink.events, 1)
 	ev := sink.events[0]
@@ -93,7 +93,7 @@ func TestReportVerdict_DegradedIsBoundedButAudited(t *testing.T) {
 		a.ContainerOrigin = true
 		a.ContainerID = "abc123def456"
 	}
-	ReportVerdict(rec, cm, nil, auditLogger, fw, newTestLogger())
+	ReportVerdict(rec, cm, nil, auditLogger, fw, nil, newTestLogger())
 
 	require.Empty(t, fw.addedIPs, "degraded reports must not write to the firewall")
 	require.Len(t, sink.events, 1)
@@ -125,7 +125,7 @@ func TestReportVerdict_LateAllowOpensFirewall(t *testing.T) {
 	auditLogger.AddSink(sink)
 	fw := &mockFirewallUpdater{}
 
-	ReportVerdict(verdictRec(true), cm, nil, auditLogger, fw, newTestLogger())
+	ReportVerdict(verdictRec(true), cm, nil, auditLogger, fw, nil, newTestLogger())
 
 	require.NotEmpty(t, fw.addedIPs, "late-allow must open the firewall for the resolved host")
 	require.Len(t, sink.events, 1)
@@ -150,7 +150,7 @@ func TestReportVerdict_ShadowIsTelemetryOnly(t *testing.T) {
 	auditLogger.AddSink(sink)
 	fw := &mockFirewallUpdater{}
 
-	ReportVerdict(verdictRec(false), cm, nil, auditLogger, fw, newTestLogger())
+	ReportVerdict(verdictRec(false), cm, nil, auditLogger, fw, nil, newTestLogger())
 
 	assert.Empty(t, fw.addedIPs, "a would-block must never mutate the firewall")
 	require.Len(t, sink.events, 1)
@@ -187,7 +187,7 @@ func TestReportVerdict_DecoratorIsOptional(t *testing.T) {
 
 			rec := verdictRec(true)
 			rec.Decorate = tt.decorate
-			ReportVerdict(rec, cm, nil, auditLogger, nil, newTestLogger())
+			ReportVerdict(rec, cm, nil, auditLogger, nil, nil, newTestLogger())
 
 			require.Len(t, sink.events, 1)
 			assert.Equal(t, tt.wantID, sink.events[0].ContainerID)
@@ -221,7 +221,7 @@ func TestReportVerdict_MidStreamMatchesTC(t *testing.T) {
 
 			rec := verdictRec(true)
 			rec.MidStream = tt.midStream
-			ReportVerdict(rec, cm, nil, auditLogger, nil, newTestLogger())
+			ReportVerdict(rec, cm, nil, auditLogger, nil, nil, newTestLogger())
 
 			require.Len(t, sink.events, 1)
 			// Same event type either way — MidStream is a flag, not a
@@ -249,7 +249,7 @@ func TestReportVerdict_ProtocolBlockMatchesTC(t *testing.T) {
 	rec.Proto = 47 // GRE
 	rec.DstPort = 0
 	rec.SrcPort = 0
-	ReportVerdict(rec, cm, nil, auditLogger, nil, newTestLogger())
+	ReportVerdict(rec, cm, nil, auditLogger, nil, nil, newTestLogger())
 
 	require.Len(t, sink.events, 1)
 	ev := sink.events[0]

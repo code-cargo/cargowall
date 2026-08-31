@@ -29,7 +29,6 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf/ringbuf"
-	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/config"
 )
@@ -209,58 +208,6 @@ func reverseDNSAttempted(ip string) bool {
 // reverseDNSResolver uses the system default resolver for PTR lookups.
 var reverseDNSResolver = net.DefaultResolver
 
-// ipProtoToConfigProtocol maps the L4 protocol byte from a BpfBlockedEvent to
-// the corresponding config.ProtocolType. The bool reports whether the proto
-// is one we recognize; unknown protocols fail closed in dstPortAllowedByRule
-// rather than mapping to ProtocolAll, so a future guard-loosening upstream
-// can't silently widen the match.
-func ipProtoToConfigProtocol(proto uint8) (config.ProtocolType, bool) {
-	switch proto {
-	case unix.IPPROTO_TCP:
-		return config.ProtocolTCP, true
-	case unix.IPPROTO_UDP:
-		return config.ProtocolUDP, true
-	case unix.IPPROTO_ICMP:
-		return config.ProtocolICMP, true
-	default:
-		return "", false
-	}
-}
-
-// dstPortAllowedByRule reports whether a (dstPort, proto) tuple would be
-// permitted by an allow rule whose port restrictions are `ports`. An empty
-// `ports` means the rule allows all ports. An unknown L4 proto fails closed
-// (no overlap, even with ProtocolAll rules) — see ipProtoToConfigProtocol.
-//
-// Shares rulePortCovered with the late-allow reconciliation path, which
-// reaches the same question from an audit-log protocol name rather than an L4
-// byte: both decide "does this rule side cover the connection?", and the
-// reconciler's mixed-verdict handling is only correct if it matches this one.
-func dstPortAllowedByRule(dstPort uint16, proto uint8, ports []config.Port) bool {
-	if len(ports) == 0 {
-		return true
-	}
-	eventProto, ok := ipProtoToConfigProtocol(proto)
-	if !ok {
-		return false
-	}
-	return rulePortCovered(ports, dstPort, eventProto)
-}
-
-// rulePortCovered reports whether a rule-side port list covers (port, proto).
-// An empty list means the side applies to all ports, matching rule semantics.
-func rulePortCovered(ports []config.Port, port uint16, proto config.ProtocolType) bool {
-	if len(ports) == 0 {
-		return true
-	}
-	for _, p := range ports {
-		if p.Port == port && config.ProtocolsOverlap(p.Protocol, proto) {
-			return true
-		}
-	}
-	return false
-}
-
 // IsProtocolBlock reports whether a raw event is the non-TCP/UDP protocol
 // block shape, where dst_port carries the protocol number rather than a port.
 // Single source of truth for that encoding: processEvent branches on it and
@@ -281,7 +228,8 @@ type ContainerEnricher interface {
 
 // processEvent handles a single blocked/allowed event from the ring buffer.
 func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *NotificationTracker,
-	auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger, enricher ContainerEnricher,
+	auditLogger *AuditLogger, fw FirewallUpdater, l7 L7LateRegistrar, logger *slog.Logger,
+	enricher ContainerEnricher,
 ) {
 	if len(raw) < int(unsafe.Sizeof(BpfBlockedEvent{})) {
 		return
@@ -308,7 +256,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	// cgroup hook's ReportVerdict — see prepareOutcome in outcome.go. TC
 	// events are never degraded: this reader already owns the full
 	// preparation cost by design.
-	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, logger,
+	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, l7, logger,
 		event.Allowed == 0, false, srcIP, dstIP, event.SrcPort, event.DstPort, event.IpProto,
 		event.Pid, event.StepOrdinal)
 
@@ -327,7 +275,7 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 		// fall back to ProtocolAll so the attribution doesn't regress for
 		// non-TCP/UDP/ICMP traffic — the firewall already gated the
 		// connection by the time we get here, this is just audit tagging.
-		eventProto, ok := ipProtoToConfigProtocol(event.IpProto)
+		eventProto, ok := config.ProtocolFromIPProto(event.IpProto)
 		if !ok {
 			eventProto = config.ProtocolAll
 		}
@@ -375,7 +323,7 @@ func logConnEvent(logger *slog.Logger, msg string, audit *AuditEvent, attrs ...a
 
 // ProcessBlockedEvents processes blocked connection events. enricher is
 // optional (nil-safe) container attribution — see ContainerEnricher.
-func ProcessBlockedEvents(rd *ringbuf.Reader, configMgr *config.Manager, notificationTracker *NotificationTracker, auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger, enricher ContainerEnricher) {
+func ProcessBlockedEvents(rd *ringbuf.Reader, configMgr *config.Manager, notificationTracker *NotificationTracker, auditLogger *AuditLogger, fw FirewallUpdater, l7 L7LateRegistrar, logger *slog.Logger, enricher ContainerEnricher) {
 	for {
 		record, err := rd.Read()
 		if err != nil {
@@ -386,6 +334,6 @@ func ProcessBlockedEvents(rd *ringbuf.Reader, configMgr *config.Manager, notific
 			continue
 		}
 
-		processEvent(record.RawSample, configMgr, notificationTracker, auditLogger, fw, logger, enricher)
+		processEvent(record.RawSample, configMgr, notificationTracker, auditLogger, fw, l7, logger, enricher)
 	}
 }

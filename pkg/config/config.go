@@ -176,6 +176,12 @@ type Manager struct {
 	// See autoallow.go.
 	autoAllows []autoAllowEntry
 
+	// nameToIPs is the L7 per-IP binding evidence, populated only by the
+	// forward-resolution paths. Guarded by bindMu, NOT mu — its lookups sit on
+	// the DNS answer and L7 punt hot paths. See binding.go.
+	nameToIPs map[string]*nameBinding
+	bindMu    sync.Mutex
+
 	// auditMode is the run's enforcement posture and lives here — next to
 	// DefaultAction — as the single source of truth both datapaths consult:
 	// the DNS proxy reads it per query, and user space writes it into the
@@ -195,6 +201,7 @@ func NewConfigManager() *Manager {
 		ipToCNAMEOrigins: make(map[string][]cnameOriginRecord),
 		ipLastSeen:       make(map[string]time.Time),
 		trackedHostnames: make(map[string]Action),
+		nameToIPs:        make(map[string]*nameBinding),
 		maxCacheSize:     10000, // Default max cache size
 	}
 }
@@ -956,6 +963,13 @@ func (cm *Manager) UpdateDNSMapping(hostname string, ip string) {
 	if ip != "" {
 		cm.ipToHostname[ip] = hostname
 		cm.ipLastSeen[ip] = time.Now()
+		// NOTE: this does NOT seed the L7 binding evidence (nameToIPs). This
+		// method is called with names from reverse-DNS PTR lookups and
+		// ForwardMatchIP (pkg/events/outcome.go, cmd/start.go), which an
+		// attacker who controls the destination IP can forge — a self-set
+		// PTR(theirIP)=allowed.example would otherwise mint a binding that
+		// defeats --tls-sni=enforce-pinned. Only genuine forward resolution through
+		// the proxy may record binding evidence; see RecordForwardResolution.
 	}
 
 	// Also update the forward cache if this hostname is being tracked
@@ -1058,6 +1072,17 @@ func (cm *Manager) RecordCNAMEChain(ip string, chain []string, ttl time.Duration
 	}
 	cm.ipToCNAMEOrigins[ip] = records
 	cm.ipLastSeen[ip] = now
+
+	// Every hop (origin..target) is a name a client may present as SNI/Host
+	// when dialing this IP, so each is binding evidence with the same
+	// count-bounded, refresh-on-use lifecycle as a direct forward resolution —
+	// NOT the chain's response-TTL. This is what keeps a ttl==0 CDN answer
+	// from expiring a target-hop binding out from under a live connection.
+	cm.bindMu.Lock()
+	for _, hop := range stored {
+		cm.recordBindingLocked(hop, ip, now)
+	}
+	cm.bindMu.Unlock()
 }
 
 // LookupCNAMEChain returns the CNAME chain (origin..target) for a derived-allow
@@ -1121,6 +1146,11 @@ func (cm *Manager) cleanupOldEntries() {
 	for _, ip := range toDelete {
 		cm.forgetIP(ip)
 	}
+
+	// nameToIPs (the L7 binding evidence) is deliberately NOT swept here: its
+	// lifecycle is count-bounded LRU with refresh-on-use (see
+	// NameResolvedToIP), because a TTL expiry would deadlock cached-IP
+	// clients while the never-expiring L4/scope entries keep them eligible.
 
 	if len(toDelete) > 0 {
 		slog.Info("Cleaned up old DNS cache entries", "count", len(toDelete))
@@ -1982,7 +2012,7 @@ func (cm *Manager) GetAutoAllowedType(ip string, port uint16, proto ProtocolType
 		if rule.AutoAddedType == AutoAddedTypeNone || rule.Action != ActionAllow {
 			continue
 		}
-		if !autoAllowedPortMatch(rule.Ports, port, proto) {
+		if !PortsCover(rule.Ports, port, proto) {
 			continue
 		}
 		if rule.MatchesHostname(hostname) {
@@ -1997,7 +2027,7 @@ func (cm *Manager) GetAutoAllowedType(ip string, port uint16, proto ProtocolType
 		if rule.AutoAddedType == AutoAddedTypeNone || rule.Action != ActionAllow {
 			continue
 		}
-		if !autoAllowedPortMatch(rule.Ports, port, proto) {
+		if !PortsCover(rule.Ports, port, proto) {
 			continue
 		}
 		if parsedIP != nil && rule.IPNet != nil && rule.IPNet.Contains(parsedIP) {
@@ -2005,22 +2035,6 @@ func (cm *Manager) GetAutoAllowedType(ip string, port uint16, proto ProtocolType
 		}
 	}
 	return AutoAddedTypeNone
-}
-
-// autoAllowedPortMatch reports whether (port, proto) is covered by the
-// rule's Ports list. Empty Ports means "all ports" — no restriction.
-// Otherwise both the port number AND protocol must match
-// (ProtocolsOverlap handles ProtocolAll on either side).
-func autoAllowedPortMatch(rulePorts []Port, port uint16, proto ProtocolType) bool {
-	if len(rulePorts) == 0 {
-		return true
-	}
-	for _, p := range rulePorts {
-		if p.Port == port && ProtocolsOverlap(p.Protocol, proto) {
-			return true
-		}
-	}
-	return false
 }
 
 // GetSudoLockdown returns the policy-sourced sudo lockdown settings, or nil

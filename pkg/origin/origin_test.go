@@ -275,7 +275,7 @@ func TestKeyIncludesEveryDiscriminator(t *testing.T) {
 }
 
 // The join store must be populated BEFORE the verdict sink can observe the
-// record. In shadow mode (the default under --container-attribution) a
+// record. In shadow mode (what --container-egress=observe selects) a
 // would-block packet is passed and TC adjudicates it concurrently; if the
 // sink ran first — it may spend 500ms in a PTR lookup — the TC event's
 // Enrich would find no join candidate and file the flow as unattributed.

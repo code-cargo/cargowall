@@ -33,6 +33,15 @@ const (
 	EventDNSBlocked            AuditEventType = "dns_blocked"
 	EventExistingConnection    AuditEventType = "existing_connection"
 	EventStepBoundary          AuditEventType = "step_boundary"
+	// EventDNSQueryLateAllowed re-reports a refused query whose name a rule
+	// covered moments later — the auto-allow set and the fetched policy both
+	// land after the proxy arms query filtering, so a name that was allowed
+	// for the rest of the run was still REFUSED during that window (issue
+	// #119). Dated at the original refusal so it supersedes the dns_blocked
+	// records it re-reports, exactly as connection_late_allowed does for the
+	// connection path (#83). Nothing was blocked at the time this event is
+	// written; the refusal it describes already happened.
+	EventDNSQueryLateAllowed AuditEventType = "dns_query_late_allowed"
 	// EventContainerAttribution marks one container/exec workload being tagged
 	// with a step ordinal (issue #106): a telemetry marker like step_boundary,
 	// describing no connection. TagLatencyMS/Privileged/AttributionKind are
@@ -45,6 +54,15 @@ const (
 	// adjudicates (loopback, docker bridge, container netns) before
 	// enforcement is turned on, so they are telemetry, not policy outcomes.
 	EventCgroupWouldBlock AuditEventType = "cgroup_would_block"
+	// EventL7Blocked is a flow dropped by L7 (SNI/Host/QUIC) enforcement: the
+	// destination IP was allowed at L4, but the TLS SNI / HTTP Host / QUIC name
+	// the flow presented is not an allowed hostname on that IP. This is the
+	// shared-edge tenant swap being stopped.
+	EventL7Blocked AuditEventType = "l7_blocked"
+	// EventL7WouldBlock is the observe-mode counterpart: L7 enforcement WOULD
+	// have dropped the flow, but the packet was passed. Phase-A telemetry that
+	// gates turning enforcement on — the L7 analogue of cgroup_would_block.
+	EventL7WouldBlock AuditEventType = "l7_would_block"
 )
 
 // Step-ordinal sentinels, mirroring STEP_ORD_* in tcbpf.c. Real workflow
@@ -65,11 +83,47 @@ const (
 // arithmetic when selecting real-ordinal events.
 const MaxRealStepOrdinal = StepOrdinalPreDaemon - 1<<16
 
-// IsConnectionAllowed reports whether the event type represents an allow
-// outcome for a TCP/UDP connection — either a regular allow or a late-allowed
-// retry after the BPF map missed.
-func (et AuditEventType) IsConnectionAllowed() bool {
-	return et == EventConnectionAllowed || et == EventConnectionLateAllowed
+// IsAllowedOutcome reports whether the event type represents an ALLOW outcome
+// — the connection allows (regular and the late-allowed retry after the BPF
+// map missed) plus the DNS query late-allow.
+//
+// dns_query_late_allowed belongs here even though nothing was allowed at the
+// instant it was written: it supersedes the dns_blocked row it re-reports, and
+// reconcileLateAllowedBlocks has already deleted that row by the time a
+// renderer asks. Classifying it as a block would print the name as denied with
+// nothing left to correct it, while its connection-side twin printed Allowed —
+// the two halves of #119 disagreeing on the primary human-facing surface.
+func (et AuditEventType) IsAllowedOutcome() bool {
+	return et == EventConnectionAllowed || et == EventConnectionLateAllowed ||
+		et == EventDNSQueryLateAllowed
+}
+
+// ReportedDestName is the destination identity a human- or SaaS-facing
+// surface should print for this event. For an L7 denial the rejected identity
+// is the SNI/Host the flow PRESENTED (L7Name) — DstHostname there is the
+// allowed origin the shared edge IP happens to resolve to, which is exactly
+// the name that must NOT be recorded as denied. Every export surface (summary
+// tables, dedup keys, unique-hostname counts, SaaS push, OTLP) goes through
+// this one helper so they cannot disagree.
+//
+// An L7 denial that recovered NO name (ECH, no SNI, no Host, a parse error)
+// falls through to the bare IP, deliberately NOT to DstHostname: that is the
+// allowed origin the shared edge resolves to, so reporting it would blame the
+// allowed name for the denial — and, because these surfaces drive the
+// allowlist suggestions, would tell the operator to allow a hostname their
+// config already allows. The IP is the only identity such a flow actually
+// established.
+func (e *AuditEvent) ReportedDestName() string {
+	if e.EventType == EventL7Blocked || e.EventType == EventL7WouldBlock {
+		if e.L7Name != "" {
+			return e.L7Name
+		}
+		return e.DstIP
+	}
+	if e.DstHostname != "" {
+		return e.DstHostname
+	}
+	return e.DstIP
 }
 
 // StepAttrOutcome says how the sockdiag step lookup behind a dns_blocked
@@ -129,6 +183,14 @@ type AuditEvent struct {
 	Blocked         bool            `json:"blocked"`                     // true in enforce mode (actually blocked)
 	StepOrdinal     uint32          `json:"step_ordinal,omitempty"`      // workflow step that (transitively) created the socket — causal, not temporal; see StepOrdinal* sentinels
 	StepAttrOutcome StepAttrOutcome `json:"step_attr_outcome,omitempty"` // dns_blocked only: how the sockdiag step lookup resolved — additive/omitempty like the container fields below
+
+	// L7 (TLS SNI / HTTP Host / QUIC) enforcement. All additive/omitempty. On
+	// l7_blocked/l7_would_block: L7Name is the SNI/Host the flow presented (may
+	// be attacker-chosen — distinct from the DNS-resolved DstHostname),
+	// L7Protocol is tls|http|quic, and L7Reason is why it was denied.
+	L7Name     string `json:"l7_name,omitempty"`
+	L7Protocol string `json:"l7_protocol,omitempty"`
+	L7Reason   string `json:"l7_reason,omitempty"`
 
 	// Container attribution (issue #106). All additive and omitempty: the
 	// summary reader tolerates their absence, so old daemons and new
@@ -200,19 +262,26 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 
 	// Set the block status based on audit mode.
 	// Skip for events that set their own flags (allowed, existing connection,
-	// late-allowed — where the connection was initially dropped by BPF but a
-	// subsequent rule match opened the firewall, so the policy outcome is allow)
+	// late-allowed — where the connection was initially dropped by BPF, or the
+	// query refused by the proxy, but a subsequent rule match opened the
+	// firewall, so the policy outcome is allow)
 	// and for step boundaries and container attributions, which describe no
 	// connection at all.
 	// cgroup_would_block also sets its own flags: nothing was blocked (the
 	// packet passed in shadow mode), so normalization must not stamp
 	// Blocked=true from the run's enforce posture.
+	// l7_would_block, like cgroup_would_block, is telemetry: the packet passed
+	// (observe mode, or enforce under audit posture), so it sets its own flags
+	// and must not be stamped Blocked from the run's enforce posture. l7_blocked
+	// is a real drop and is normalized like any other block.
 	if event.EventType != EventConnectionAllowed &&
 		event.EventType != EventConnectionLateAllowed &&
+		event.EventType != EventDNSQueryLateAllowed &&
 		event.EventType != EventExistingConnection &&
 		event.EventType != EventStepBoundary &&
 		event.EventType != EventContainerAttribution &&
-		event.EventType != EventCgroupWouldBlock {
+		event.EventType != EventCgroupWouldBlock &&
+		event.EventType != EventL7WouldBlock {
 		if a.auditMode {
 			event.WouldDeny = true
 			event.Blocked = false

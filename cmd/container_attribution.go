@@ -50,7 +50,7 @@ import (
 // Every method is nil-receiver safe: a nil *containerAttribution IS the
 // disabled feature, so startCargoWall wires the subsystem unconditionally
 // instead of threading flag checks through the boot sequence. All failures
-// are warn-only, which stays correct under --cgroup-enforce only because TC
+// are warn-only, which stays correct under --container-egress=enforce only because TC
 // egress remains attached: losing this subsystem degrades enforcement to
 // TC-only, it never leaves traffic unpoliced.
 type containerAttribution struct {
@@ -67,14 +67,20 @@ type containerAttribution struct {
 // (compute verdicts, report would-blocks, block nothing) so the blast radius
 // of the surfaces this hook newly sees is measured before anyone relies on
 // it. Enforcement is opt-in.
-func resolveMode(containerAttribution, cgroupEnforce bool) origin.Mode {
-	switch {
-	case !containerAttribution:
-		return origin.ModeObserve
-	case cgroupEnforce:
+func resolveMode(containerEgress string) origin.Mode {
+	switch containerEgress {
+	case ContainerEgressEnforce:
 		return origin.ModeEnforce
-	default:
+	case ContainerEgressObserve:
+		// The flag's "observe" is the kernel's SHADOW rung, deliberately: the
+		// operator-facing question is "does it drop anything", and shadow is
+		// the rung that answers no while still computing the verdict and
+		// reporting cgroup_would_block. ORIGIN_MODE_OBSERVE — pass everything,
+		// compute nothing — is the hook's inert boot posture, not a
+		// destination anything raises it to.
 		return origin.ModeShadow
+	default:
+		return origin.ModeObserve // off: the hook is never raised
 	}
 }
 
@@ -90,7 +96,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		if mode == origin.ModeEnforce {
 			// Never drop a requested enforcement posture silently: the
 			// operator believes pre-NAT/loopback/bridge egress is policed.
-			logger.Warn("Container attribution disabled and --cgroup-enforce DROPPED " +
+			logger.Warn("Container attribution disabled and --container-egress=enforce DROPPED " +
 				"(requires active step attribution) — egress policing falls back to post-NAT TC only")
 		} else {
 			logger.Warn("Container attribution disabled (requires active step attribution)")
@@ -109,7 +115,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		// attached and enforcing, so losing this hook degrades enforcement
 		// to TC-only (plus the loss of container attribution) rather than
 		// leaving traffic unpoliced. That is precisely why TC stays.
-		// target_mode makes a dropped --cgroup-enforce request visible.
+		// target_mode makes a dropped --container-egress=enforce request visible.
 		logger.Warn("Container egress hook disabled — enforcement falls back to TC egress only",
 			"target_mode", mode.String(), "error", err)
 	} else {
@@ -129,7 +135,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 // would-blocks (audit posture) are TC's to report and never leave
 // origin.insert — one reporter per packet.
 func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificationTracker *events.NotificationTracker,
-	auditLogger *events.AuditLogger, fw events.FirewallUpdater,
+	auditLogger *events.AuditLogger, fw events.FirewallUpdater, l7 events.L7LateRegistrar,
 ) {
 	if a == nil || a.observer == nil {
 		return
@@ -157,25 +163,46 @@ func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificat
 			Decorate: func(audit *events.AuditEvent) {
 				enricher.DecorateVerdict(audit, rec)
 			},
-		}, configMgr, notificationTracker, auditLogger, fw, a.logger)
+		}, configMgr, notificationTracker, auditLogger, fw, l7, a.logger)
 	})
 }
 
-// enableMode raises the cgroup hook to its configured posture. MUST be
-// called only after the allowlist, DNS/infra auto-allows, and
-// existing-connection gating are programmed — the same attach-before-program
-// guard that makes cmd/start.go attach TC last.
-func (a *containerAttribution) enableMode() {
+// enableMode raises the cgroup hook to its configured posture, returning
+// whether it reached it. MUST be called only after the allowlist, DNS/infra
+// auto-allows, and existing-connection gating are programmed — the same
+// attach-before-program guard that makes cmd/start.go attach TC last.
+//
+// A failure leaves the hook in observe: no enforcement from it, TC still
+// enforcing. Degraded, never fail-open.
+func (a *containerAttribution) enableMode() error {
 	if a == nil || a.observer == nil || a.mode == origin.ModeObserve {
-		return
+		return nil // nothing to raise
 	}
 	if err := a.observer.SetMode(a.mode); err != nil {
-		// Failure leaves the hook in observe: no enforcement from it, TC
-		// still enforcing. Degraded, never fail-open — and the dropped
-		// target posture is named so a lost --cgroup-enforce is visible.
+		// The dropped target posture is named so a lost --container-egress=enforce is
+		// visible in the log, not just in the returned error.
 		a.logger.Warn("Container egress hook stays in observe mode",
 			"target_mode", a.mode.String(), "error", err)
+		return err
 	}
+	return nil
+}
+
+// originObserver exposes the cgroup hook's observer for features that ride it
+// (today L7). Nil when the hook is not running.
+func (a *containerAttribution) originObserver() *origin.Observer {
+	if a == nil {
+		return nil
+	}
+	return a.observer
+}
+
+// containerEnricher exposes the identity decorator for those same features.
+func (a *containerAttribution) containerEnricher() *containers.Enricher {
+	if a == nil {
+		return nil
+	}
+	return a.enricher
 }
 
 // allowLocalNetwork is a nil-safe pass-through to the observer's

@@ -1107,6 +1107,73 @@ func TestReconcileLateAllowedBlocks(t *testing.T) {
 }
 
 // With no late-allowed events the audit stream passes through untouched.
+// The DNS half (#119): refusals of a name are superseded by the
+// dns_query_late_allowed dated at the last of them, so a query the rules
+// covered moments later is not shipped to the SaaS as a denial.
+func TestReconcileLateAllowedBlocks_DNSQueries(t *testing.T) {
+	base := time.Date(2026, 8, 28, 17, 56, 18, 0, time.UTC)
+	q := func(eventType events.AuditEventType, host string, ts time.Time) events.AuditEvent {
+		return events.AuditEvent{
+			Timestamp:   ts,
+			EventType:   eventType,
+			DstHostname: host,
+			Process:     "Runner.Worker",
+		}
+	}
+	const blob = "productionresultssa16.blob.core.windows.net"
+
+	input := []events.AuditEvent{
+		// The A and AAAA halves plus their retries, all refused while the
+		// auto-allow was still loading — superseded by the late-allow dated
+		// at the last of them.
+		q(events.EventDNSBlocked, blob, base),
+		q(events.EventDNSBlocked, blob, base.Add(time.Millisecond)),
+		q(events.EventDNSBlocked, blob, base.Add(752*time.Millisecond)),
+		q(events.EventDNSQueryLateAllowed, blob, base.Add(752*time.Millisecond)),
+		// Casing must not strand a refusal: DNS is case-insensitive.
+		q(events.EventDNSBlocked, "ProductionResultsSA16.Blob.Core.Windows.NET", base.Add(500*time.Millisecond)),
+		// Refused AFTER the late-allow — the name being refused again, kept.
+		q(events.EventDNSBlocked, blob, base.Add(30*time.Second)),
+		// A different name with no late-allow — kept.
+		q(events.EventDNSBlocked, "evil.example.com", base),
+	}
+
+	got := reconcileLateAllowedBlocks(input)
+
+	var refused []string
+	lateAllowed := 0
+	for _, e := range got {
+		switch e.EventType {
+		case events.EventDNSBlocked:
+			refused = append(refused, e.DstHostname)
+		case events.EventDNSQueryLateAllowed:
+			lateAllowed++
+		}
+	}
+	assert.Equal(t, 1, lateAllowed, "the late-allowed record itself is kept")
+	require.Len(t, refused, 2)
+	assert.ElementsMatch(t, []string{blob, "evil.example.com"}, refused)
+}
+
+// A DNS late-allow must not touch connection blocks, and vice versa: the two
+// halves key on different fields and share one pass.
+func TestReconcileLateAllowedBlocks_HalvesDoNotCross(t *testing.T) {
+	base := time.Date(2026, 8, 28, 17, 56, 18, 0, time.UTC)
+	input := []events.AuditEvent{
+		{Timestamp: base, EventType: events.EventConnectionBlocked, DstIP: "20.150.82.228", DstPort: 443, Protocol: "TCP"},
+		{Timestamp: base, EventType: events.EventDNSQueryLateAllowed, DstHostname: "blob.core.windows.net"},
+		{Timestamp: base, EventType: events.EventDNSBlocked, DstHostname: "other.example.com"},
+		{Timestamp: base, EventType: events.EventConnectionLateAllowed, DstIP: "20.150.82.228", DstPort: 443, Protocol: "TCP"},
+	}
+
+	got := reconcileLateAllowedBlocks(input)
+
+	assert.Len(t, got, 3, "only the connection block is superseded")
+	for _, e := range got {
+		assert.NotEqual(t, events.EventConnectionBlocked, e.EventType)
+	}
+}
+
 func TestReconcileLateAllowedBlocks_NoLateAllows(t *testing.T) {
 	input := []events.AuditEvent{
 		makeEvent(t, events.EventConnectionBlocked, "", "203.0.113.9", "curl", 443, time.Now()),

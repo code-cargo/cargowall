@@ -941,3 +941,52 @@ func TestOriginRealSocket(t *testing.T) {
 		break
 	}
 }
+
+// TestL7EventLayoutMatchesBTF pins the L7 punt-sample layout the same way
+// TestOriginEventLayoutMatchesBTF pins origin_event: the hand-written L7Event
+// mirror must match struct l7_event's compiled BTF field-for-field, so the
+// reader the test validates is the reader pkg/origin will run.
+func TestL7EventLayoutMatchesBTF(t *testing.T) {
+	spec, err := LoadOriginBpf()
+	require.NoError(t, err)
+
+	typ, err := spec.Types.AnyTypeByName("l7_event")
+	require.NoError(t, err)
+	st, ok := typ.(*btf.Struct)
+	require.True(t, ok, "l7_event must be a struct, got %T", typ)
+
+	var evt L7Event
+	require.Equal(t, uint32(unsafe.Sizeof(evt)), st.Size, "struct size")
+
+	goOffsets := map[string]uintptr{
+		"cookie":      unsafe.Offsetof(evt.Cookie),
+		"cgroup_id":   unsafe.Offsetof(evt.CgroupID),
+		"timestamp":   unsafe.Offsetof(evt.Timestamp),
+		"src_ip":      unsafe.Offsetof(evt.SrcIp),
+		"dst_ip":      unsafe.Offsetof(evt.DstIp),
+		"src_ip6":     unsafe.Offsetof(evt.SrcIp6),
+		"dst_ip6":     unsafe.Offsetof(evt.DstIp6),
+		"src_port":    unsafe.Offsetof(evt.SrcPort),
+		"dst_port":    unsafe.Offsetof(evt.DstPort),
+		"ip_version":  unsafe.Offsetof(evt.IpVersion),
+		"ip_proto":    unsafe.Offsetof(evt.IpProto),
+		"flags":       unsafe.Offsetof(evt.Flags),
+		"scope":       unsafe.Offsetof(evt.Scope),
+		"seq":         unsafe.Offsetof(evt.Seq),
+		"payload_len": unsafe.Offsetof(evt.PayloadLen),
+		"pad":         unsafe.Offsetof(evt.Pad),
+		"dcid_len":    unsafe.Offsetof(evt.DcidLen),
+		"dcid":        unsafe.Offsetof(evt.Dcid),
+		"pad2":        unsafe.Offsetof(evt.Pad2),
+		"payload":     unsafe.Offsetof(evt.Payload),
+	}
+
+	seen := make(map[string]bool)
+	for _, m := range st.Members {
+		want, known := goOffsets[m.Name]
+		require.True(t, known, "C member %q has no Go mirror field", m.Name)
+		require.Equal(t, want, uintptr(m.Offset.Bytes()), "offset of %q", m.Name)
+		seen[m.Name] = true
+	}
+	require.Len(t, seen, len(goOffsets), "Go mirror has fields the C struct lacks")
+}

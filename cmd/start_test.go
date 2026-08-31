@@ -406,7 +406,7 @@ func TestGateExistingConnections_InheritsRulePorts(t *testing.T) {
 	fw := firewall.NewMockFirewall(t)
 	fw.EXPECT().AddIP(net.ParseIP("1.2.3.4"), config.ActionAllow, wantPorts).Return(true, nil).Once()
 
-	gateExistingConnections(existingConns{"1.2.3.4": {{Port: 443, Protocol: config.ProtocolTCP}}}, cm, fw, nil, quietLogger())
+	gateExistingConnections(existingConns{"1.2.3.4": {{Port: 443, Protocol: config.ProtocolTCP}}}, cm, fw, nil, nil, quietLogger())
 }
 
 // Pre-existing connections to IPs we can't identify are kept alive, but only
@@ -423,7 +423,7 @@ func TestGateExistingConnections_UnresolvableAllowsObservedPortsOnly(t *testing.
 	fw := firewall.NewMockFirewall(t)
 	fw.EXPECT().AddIP(net.ParseIP("203.0.113.5"), config.ActionAllow, observed).Return(true, nil).Once()
 
-	gateExistingConnections(existingConns{"203.0.113.5": observed}, cm, fw, nil, quietLogger())
+	gateExistingConnections(existingConns{"203.0.113.5": observed}, cm, fw, nil, nil, quietLogger())
 }
 
 // Denied pre-existing connections must not be added to the allowlist —
@@ -437,7 +437,7 @@ func TestGateExistingConnections_DeniedHostnameNotAdded(t *testing.T) {
 
 	fw := firewall.NewMockFirewall(t)
 
-	gateExistingConnections(existingConns{"10.20.30.40": {{Port: 443, Protocol: config.ProtocolTCP}}}, cm, fw, nil, quietLogger())
+	gateExistingConnections(existingConns{"10.20.30.40": {{Port: 443, Protocol: config.ProtocolTCP}}}, cm, fw, nil, nil, quietLogger())
 }
 
 // hostnameRulesFor returns the allow-rule hostname strings tagged with the
@@ -1023,7 +1023,7 @@ func TestGateExistingStartupConnections_GatesAndRecords(t *testing.T) {
 	fw.EXPECT().AddIP(net.ParseIP("198.51.100.7"), config.ActionAllow, []config.Port{tcpTuple(443)}).Return(true, nil).Once()
 
 	cmd := &StartCmd{AllowExistingConnections: true}
-	gated := gateExistingStartupConnections(cmd, existingConns{"198.51.100.7": {tcpTuple(443)}}, cm, fw, nil, quietLogger())
+	gated := gateExistingStartupConnections(cmd, existingConns{"198.51.100.7": {tcpTuple(443)}}, cm, fw, nil, nil, quietLogger())
 	require.True(t, gated[tupleKey("198.51.100.7", tcpTuple(443))],
 		"gated tuples must be recorded for the delta re-scan")
 }
@@ -1035,7 +1035,7 @@ func TestGateExistingStartupConnections_FlagOffDoesNotGate(t *testing.T) {
 	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
 
 	fw := firewall.NewMockFirewall(t)
-	require.Nil(t, gateExistingStartupConnections(&StartCmd{}, existingConns{"198.51.100.7": {tcpTuple(443)}}, cm, fw, nil, quietLogger()))
+	require.Nil(t, gateExistingStartupConnections(&StartCmd{}, existingConns{"198.51.100.7": {tcpTuple(443)}}, cm, fw, nil, nil, quietLogger()))
 }
 
 // The pre-attach re-scan must gate only tuples that appeared after the
@@ -1052,14 +1052,14 @@ func TestRescanAndGateDelta_GatesOnlyNewConnections(t *testing.T) {
 	fw.EXPECT().AddIP(net.ParseIP("203.0.113.9"), config.ActionAllow, []config.Port{tcpTuple(443)}).Return(true, nil).Once()
 
 	cmd := &StartCmd{AllowExistingConnections: true}
-	rescanAndGateDelta(cmd, map[string]bool{tupleKey("198.51.100.7", tcpTuple(443)): true}, cm, fw, nil, quietLogger())
+	rescanAndGateDelta(cmd, map[string]bool{tupleKey("198.51.100.7", tcpTuple(443)): true}, cm, fw, nil, nil, quietLogger())
 }
 
 func TestRescanAndGateDelta_FlagOffDoesNotScan(t *testing.T) {
 	withProcNetFixture(t, "198.51.100.7:443")
 
 	fw := firewall.NewMockFirewall(t)
-	rescanAndGateDelta(&StartCmd{}, nil, config.NewConfigManager(), fw, nil, quietLogger())
+	rescanAndGateDelta(&StartCmd{}, nil, config.NewConfigManager(), fw, nil, nil, quietLogger())
 }
 
 // TestTeardownList_OnceAcrossPaths: each registered undo runs at most once

@@ -366,29 +366,73 @@ func TestStartCmd_AfterApply_OrthogonalFlagsPreservedWhenSetExplicitly(t *testin
 	assert.Equal(t, CIModeNone, cmd.CIMode())
 }
 
-// --cgroup-enforce must never be silently discarded: without container
-// attribution (and the step attribution it rides on) there is no cgroup
-// hook to enforce at, and a startup that quietly dropped the request is
-// indistinguishable from one that honored it. AfterApply refuses instead.
-func TestStartCmd_AfterApply_CgroupEnforceRequiresAttributionFlags(t *testing.T) {
-	cmd := &StartCmd{CgroupEnforce: true}
-	require.ErrorContains(t, cmd.AfterApply(), "--cgroup-enforce requires --container-attribution")
+// An enforcement posture must never be silently discarded: without the step
+// attribution the hook rides on there is nothing to enforce at, and a startup
+// that quietly dropped the request is indistinguishable from one that honored
+// it. AfterApply refuses instead.
+func TestStartCmd_AfterApply_ContainerEgressRequiresStepAttribution(t *testing.T) {
+	cmd := &StartCmd{ContainerEgress: ContainerEgressEnforce}
+	require.ErrorContains(t, cmd.AfterApply(), "requires --step-attribution")
 
-	// Container attribution alone is not enough: without step attribution,
-	// newContainerAttribution statically returns nil and enforcement would
-	// evaporate at runtime with only a warning.
-	cmd = &StartCmd{CgroupEnforce: true, ContainerAttribution: true}
-	require.ErrorContains(t, cmd.AfterApply(), "--cgroup-enforce requires --step-attribution")
+	// Observe is not exempt: newContainerAttribution statically returns nil
+	// without step attribution, so the posture would evaporate at runtime with
+	// only a warning either way.
+	cmd = &StartCmd{ContainerEgress: ContainerEgressObserve}
+	require.ErrorContains(t, cmd.AfterApply(), "requires --step-attribution")
 
-	cmd = &StartCmd{CgroupEnforce: true, ContainerAttribution: true, StepAttribution: true}
+	cmd = &StartCmd{ContainerEgress: ContainerEgressEnforce, StepAttribution: true}
 	require.NoError(t, cmd.AfterApply())
 
-	// The GitHub preset implies both prerequisites; the GitLab preset
-	// implies neither and must still refuse.
-	cmd = &StartCmd{GithubAction: true, CgroupEnforce: true}
+	// The GitHub preset implies step attribution; the GitLab preset implies
+	// neither and must still refuse.
+	cmd = &StartCmd{GithubAction: true, ContainerEgress: ContainerEgressEnforce}
 	require.NoError(t, cmd.AfterApply())
-	cmd = &StartCmd{GitlabCI: true, CgroupEnforce: true}
+	cmd = &StartCmd{GitlabCI: true, ContainerEgress: ContainerEgressEnforce}
 	require.Error(t, cmd.AfterApply())
+}
+
+// The preset implies a posture but must never LOWER one the operator asked
+// for: --github-action alone means observe, and an explicit enforce survives
+// preset expansion (the CI job that proves phase 3b sets it through the
+// CARGOWALL_CONTAINER_EGRESS env var, with the preset applied on top).
+func TestStartCmd_AfterApply_GithubPresetDoesNotLowerEgressPosture(t *testing.T) {
+	cmd := &StartCmd{GithubAction: true}
+	require.NoError(t, cmd.AfterApply())
+	require.Equal(t, ContainerEgressObserve, cmd.ContainerEgress)
+
+	cmd = &StartCmd{GithubAction: true, ContainerEgress: ContainerEgressEnforce}
+	require.NoError(t, cmd.AfterApply())
+	require.Equal(t, ContainerEgressEnforce, cmd.ContainerEgress)
+}
+
+// The two ladders are enums, so every rung above off states its prerequisite
+// once and the illegal rungs are unspellable rather than rejected by hand.
+func TestStartCmd_AfterApply_TLSSNILadder(t *testing.T) {
+	base := func(sni, egress string) *StartCmd {
+		return &StartCmd{TLSSNI: sni, ContainerEgress: egress, StepAttribution: true}
+	}
+
+	// L7 rides the cgroup hook's program: it cannot adjudicate a packet that
+	// hook never sees.
+	require.ErrorContains(t, base(TLSSNIObserve, ContainerEgressOff).AfterApply(),
+		"requires --container-egress")
+
+	// Observe rides an observing hook happily — nothing drops at either layer.
+	require.NoError(t, base(TLSSNIObserve, ContainerEgressObserve).AfterApply())
+
+	// L7 only ever narrows a pass into a drop, so dropping on the L7 identity
+	// means nothing while the hook it rides still passes what it would block.
+	for _, sni := range []string{TLSSNIEnforce, TLSSNIEnforcePinned} {
+		require.ErrorContains(t, base(sni, ContainerEgressObserve).AfterApply(),
+			"requires --container-egress=enforce", "sni=%s", sni)
+		require.NoError(t, base(sni, ContainerEgressEnforce).AfterApply(), "sni=%s", sni)
+	}
+
+	// A typo is a startup failure, not a silently-off feature.
+	require.ErrorContains(t, base("enforced", ContainerEgressEnforce).AfterApply(),
+		"--tls-sni must be one of")
+	require.ErrorContains(t, base(TLSSNIObserve, "shadow").AfterApply(),
+		"--container-egress must be one of")
 }
 
 func TestStartCmd_CIMode_GithubBeatsGitlabWhenBothSet(t *testing.T) {

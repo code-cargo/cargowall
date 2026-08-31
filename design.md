@@ -1,6 +1,6 @@
 # Design
 
-Dual-stack (IPv4/IPv6) L4 firewall using TC eBPF egress filtering, cgroup socket hooks for PID tracking, an integrated DNS proxy for JIT hostname resolution, and an audit mode for log-only operation.
+Dual-stack (IPv4/IPv6) egress firewall using TC eBPF filtering and a cgroup_skb hook for the L3/L4 verdict, an optional L7 layer that pins the TLS SNI / HTTP Host / QUIC name of flows to shared edge IPs (see "L7 destination-identity enforcement"), cgroup socket hooks for PID tracking, an integrated DNS proxy for JIT hostname resolution, and an audit mode for log-only operation.
 
 ## Key Features
 
@@ -352,7 +352,8 @@ sequenceDiagram
 - Configurable upstream DNS (e.g., `10.96.0.10:53` for Kubernetes)
 - LRU cache (10,000 entries) with per-entry TTL from DNS response minimum TTL
 - DNS query filtering (`EnableQueryFiltering`) — blocks queries for non-allowed domains; always allows reverse DNS (`in-addr.arpa`, `ip6.arpa`). CNAME targets seen in an allowed response are learned (TTL-bounded, 10,000-entry LRU), each carrying the origin rule's allow ports (UNIONed across origins via `config.UnionPorts`). A learned target is both permitted for later direct queries and, when one resolves, has its IPs written to the allow map on the inherited ports — so a chain split across query round-trips (CDN-fronted PKI that returns a different Akamai/Cloudflare variant per query, dynamic edge labels) is enforced, not just un-refused. Learning is transitive (a derived-allowed response extends the chain) but bounded: `cnameChainTargets` follows only records connected to the query name, so injected/unrelated records are ignored; depth and lifetime are bounded by the LRU and per-hop TTL. Explicit deny rules still win. The trust model is unchanged in spirit — "allowing host H allows H's CNAME chain on H's ports"; the new behavior is reassembling that chain when it spans multiple responses
-- `ApplyRulesToTrackedHostnames()` — re-evaluates all accumulated IPs against current config after rule changes
+- `ApplyRulesToTrackedHostnames()` — re-evaluates all accumulated IPs against current config after rule changes, and reconciles refused queries (below)
+- **Late-allowed queries (`dns_query_late_allowed`, issue #119).** Query filtering arms when the proxy starts listening, but the rules it filters against arrive later — the infrastructure auto-allow set, then the fetched policy. A query for a name the run allows for its entire remaining life can therefore be REFUSED inside that window, leaving a `dns_blocked` record that reaches the SaaS as a denial the policy never intended. `pkg/events.RecentDNSBlocks` buffers refusals by name (short TTL, count-bounded — the flood it bounds is the tunneling traffic filtering exists to refuse), and `reconcileRefusedQueries` re-reports the ones a rule turns out to cover, **dated at the original refusal** so the summary supersedes every `dns_blocked` row at or before it. This is the query-side twin of the connection path's `connection_late_allowed` (#83): same shape, keyed by name instead of destination IP, triggered by the ruleset changing instead of by an address record arriving. Names still refused stay buffered until their TTL expires — a later load may yet cover them. Identity fields are degraded when two clients' refusals of the same name disagree, so a re-report never states one client's attribution as fact for another's
 - Rule conflict detection: checks CIDR vs hostname action conflicts via `CheckIPRuleConflict()`; deny wins
 - Kubernetes search domain stripping (`.default.svc.cluster.local`, `.svc.cluster.local`, `.cluster.local`)
 - Accumulates IPs per hostname across responses for round-robin DNS support
@@ -421,7 +422,8 @@ Audit mode allows CargoWall to run in a log-only configuration — all traffic d
 **Audit log:**
 - NDJSON format, one JSON object per line
 - Each event includes `would_deny` (true in audit mode) and `blocked` (true in enforce mode) flags
-- Event types: `connection_blocked`, `connection_allowed`, `protocol_blocked`, `dns_blocked`, `existing_connection`
+- Event types: `connection_blocked`, `connection_allowed`, `connection_late_allowed`, `dns_query_late_allowed`, `protocol_blocked`, `dns_blocked`, `existing_connection`
+- The two late-allow types carry the timestamp of the attempt they re-report, not of the reconciliation, and the summary drops the blocked rows they supersede (`reconcileLateAllowedBlocks`). Any other consumer must do the same, or it will double-count an attempt as both a denial and an allow
 
 ## Kubernetes Integration
 
@@ -507,9 +509,9 @@ backstop instead.)
 
 | Mode | Behavior | How it's selected |
 |------|----------|-------------------|
-| observe | Phase-3a behavior: always pass, record flow origins | container attribution off |
-| shadow | Compute the verdict, emit `cgroup_would_block`, still pass | default with `--container-attribution` |
-| enforce | Drop denied traffic here; a drop reports as `connection_blocked` | `--cgroup-enforce` |
+| observe | Phase-3a behavior: always pass, record flow origins | not selectable — the inert posture the hook attaches in |
+| shadow | Compute the verdict, emit `cgroup_would_block`, still pass | `--container-egress=observe` |
+| enforce | Drop denied traffic here; a drop reports as `connection_blocked` | `--container-egress=enforce` |
 
 Shadow is the default because this hook adjudicates surfaces TC never saw;
 it measures that blast radius in production before anyone relies on
@@ -532,7 +534,7 @@ reconciliation, the audit record, and the block notification. `processEvent`
 supplies TC packets; `ReportVerdict` supplies cgroup verdict records. This
 matters because a cgroup drop is the *only* event source for the traffic it
 kills — the packet dies at `ip_finish_output`, before the TC qdisc — so if
-that path were thinner, denials under `--cgroup-enforce` would silently lose
+that path were thinner, denials under `--container-egress=enforce` would silently lose
 late-allow self-healing and hostname attribution. Container identity is
 attached as decoration by `pkg/containers`; it never owns the outcome, since
 most cgroup verdicts are host processes with no container at all.
@@ -575,7 +577,7 @@ any other consumer must do the same: **never sum `cgroup_would_block` with
   containers), before the mode is raised (`preallowLocalNetworks`) and on
   network-create events thereafter, with per-container discovery as the
   backstop. Consequence, by design: container↔container and host↔container
-  traffic on docker bridges is open under `--cgroup-enforce` — the policy
+  traffic on docker bridges is open under `--container-egress=enforce` — the policy
   governs what leaves the machine, exactly the scope TC enforced;
   inter-container isolation is docker network segmentation's job, not this
   firewall's.
@@ -670,6 +672,23 @@ flaw; redesign before building):
   bookkeeping, or the set only grows. "Strictest member" is undefined over
   opaque ordinals — on disagreement, degrade to the container-unattributed
   tier, the codebase's one existing ambiguity vocabulary.
+
+### L7 destination-identity enforcement (TLS SNI / HTTP Host / QUIC)
+
+The L3/L4 verdict allows a destination IP. A hostname rule resolving to a
+shared CDN/edge IP (Cloudflare, Akamai, Fastly) therefore opens that `/32` for
+**every** tenant behind it, and the L4 verdict cannot tell two tenants apart.
+This layer pins *which* hostname a flow to a DNS-derived IP may reach: the
+kernel decides whether a segment needs adjudication and punts it, a userspace
+oracle is the only name matcher, and the verdict is written back so the
+client's retransmit is admitted or dropped in the kernel. It can only turn an
+L4-allowed flow into a deny, never widen one. Off by default; `--tls-sni`
+walks it up an observe → enforce → enforce-pinned ladder.
+
+**See [design-l7.md](design-l7.md)** for the full rationale: the punt/oracle
+split, the identity gate, QUIC connection-attempt identity and the coalesced
+walk, the per-IP binding, the verifier budget that shapes all of it, and the
+documented residuals.
 
 ## GitHub Actions Integration
 

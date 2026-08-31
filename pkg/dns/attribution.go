@@ -75,7 +75,7 @@ const (
 	// an unrelated HOST process's ordinal — a wrong attribution rather
 	// than a coarse one. When the lookup is absent (installed late, after
 	// the dockerd restart — or never, when --docker-dns-interception runs
-	// without --container-attribution), queries file as container-origin
+	// without --container-egress), queries file as container-origin
 	// with no ordinal: the unattributed container tier. That residual is
 	// accepted and pinned by test.
 	attributeContainerIP

@@ -103,8 +103,21 @@ func logRecordFromEvent(ev events.AuditEvent) *logspb.LogRecord {
 	if ev.DstPort != 0 {
 		attrs = append(attrs, intAttr("destination.port", int64(ev.DstPort)))
 	}
-	if ev.DstHostname != "" {
-		attrs = append(attrs, stringAttr("server.address", ev.DstHostname))
+	// server.address is the connection's reported name — ReportedDestName, so
+	// an L7 block carries the rejected SNI/Host rather than the allowed
+	// origin the shared edge IP resolves to. The IP fallback is excluded:
+	// destination.address already carries it.
+	if serverName := ev.ReportedDestName(); serverName != "" && serverName != ev.DstIP {
+		attrs = append(attrs, stringAttr("server.address", serverName))
+	}
+	if ev.L7Name != "" {
+		attrs = append(attrs, stringAttr("cargowall.l7_name", ev.L7Name))
+	}
+	if ev.L7Protocol != "" {
+		attrs = append(attrs, stringAttr("cargowall.l7_protocol", ev.L7Protocol))
+	}
+	if ev.L7Reason != "" {
+		attrs = append(attrs, stringAttr("cargowall.l7_reason", ev.L7Reason))
 	}
 	switch strings.ToLower(ev.Protocol) {
 	case "tcp":
@@ -171,16 +184,17 @@ func eventBody(ev events.AuditEvent) string {
 		// Keep the body consistent with the cargowall.verdict attribute.
 		action = "existing connection " + strings.ReplaceAll(verdict(ev), "_", " ")
 	}
-	target := ev.DstHostname
-	if target == "" {
-		target = ev.DstIP
-	}
+	// ReportedDestName: the body of an l7_blocked log line must name the
+	// rejected SNI, not the allowed origin the edge resolves to.
+	target := ev.ReportedDestName()
 	if ev.DstPort != 0 {
 		target = fmt.Sprintf("%s:%d", target, ev.DstPort)
 	}
 	switch ev.EventType {
 	case events.EventDNSBlocked:
 		return "dns blocked " + target
+	case events.EventDNSQueryLateAllowed:
+		return "dns query late-allowed " + target
 	case events.EventProtocolBlocked:
 		return fmt.Sprintf("protocol %s blocked %s", ev.Protocol, target)
 	case events.EventExistingConnection:

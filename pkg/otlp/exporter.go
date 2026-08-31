@@ -109,10 +109,13 @@ func (e *Exporter) Consume(ev events.AuditEvent) {
 	// step/container. Per-connection events already carry
 	// cargowall.step_ordinal and cargowall.container_id, which are the
 	// correlation keys that matter; a proper marker schema can come with
-	// the SaaS step tier.
+	// the SaaS step tier. The cgroup/L7 would-blocks are shadow/observe
+	// telemetry for traffic that was NOT blocked — exporting them as
+	// connection outcomes would make observe mode look like enforcement.
 	if ev.EventType == events.EventStepBoundary ||
 		ev.EventType == events.EventContainerAttribution ||
-		ev.EventType == events.EventCgroupWouldBlock {
+		ev.EventType == events.EventCgroupWouldBlock ||
+		ev.EventType == events.EventL7WouldBlock {
 		return
 	}
 	e.mu.Lock()

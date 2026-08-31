@@ -59,6 +59,12 @@ type Server struct {
 	// StepLookup.
 	stepLookup atomic.Value
 
+	// l7 registrar (issue: L7 SNI enforcement), installed via SetL7Registrar
+	// after the server is answering. Atomic for the same late-install,
+	// concurrent-read reason as stepLookup. Holds an L7Registrar. nil-load
+	// means L7 is off, and every registration call is skipped.
+	l7 atomic.Value
+
 	// Per-listener attribution modes (issue #106): every listen address is
 	// created with a listenerAttribution deciding how its blocked queries
 	// are attributed, so the choice is a constructor-time property of the
@@ -102,6 +108,10 @@ type Server struct {
 	// their destination IP is added to the firewall (#83). Nil disables
 	// reconciliation.
 	recentBlocks *events.RecentBlocks
+
+	// recentDNSBlocks buffers refused QUERIES for the same reconciliation on
+	// the DNS side (#119); see reconcileRefusedQueries.
+	recentDNSBlocks *events.RecentDNSBlocks
 }
 
 // dnsCacheEntry holds a cached DNS response
@@ -237,6 +247,50 @@ func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 // ApplyRulesToTrackedHostnames applies newly loaded firewall rules to any hostnames we've already tracked
 // This is called after loading config to handle hostnames that were resolved before rules were loaded
 func (s *Server) ApplyRulesToTrackedHostnames() {
+	// Ahead of the firewall gate below: re-reporting refusals the newly
+	// loaded rules cover is pure reporting (#119), and a nil firewall — the
+	// one thing that gate exists to catch — has no bearing on whether those
+	// refusals were superseded.
+	s.reconcileRefusedQueries()
+
+	// Without an installed firewall every iteration of the replay below is a
+	// no-op, so the L7 scope flush would run with NOTHING re-warming the maps
+	// — every previously scoped destination silently unscoped (SNI
+	// enforcement off for those IPs) for the rest of the run while the daemon
+	// still reports L7 active. Both real callers run after SetFirewall; this
+	// gate enforces that ordering in code instead of leaving it a caller
+	// convention a future reload path could break.
+	if s.firewall == nil {
+		s.logger.Warn("ApplyRulesToTrackedHostnames called before SetFirewall — " +
+			"skipping (no re-warm is possible, so nothing is flushed)")
+		return
+	}
+
+	// The L7 scope maps are registrar-written state with no expiry and no
+	// per-name reverse index, so a dropped hostname rule's IPs would stay
+	// L7-governed forever, and — the maps being fixed-size with no eviction —
+	// dead entries would eventually fill them and silently FAIL-OPEN every
+	// newly resolved destination. Flush and re-warm are therefore ONE step:
+	// the loop below rebuilds both allow tiers (rule hostnames and derived
+	// CNAME targets) under the new rules, from s.hostnameIPs unioned with the
+	// config manager's IP->hostname map. The unscoped window between the two
+	// fails toward the pre-L7 posture.
+	//
+	// Residual for a future reload caller: an IP scoped by a late-allow
+	// (events.ScopeAllowedIP) is rebuilt only if its name is in one of those
+	// two sources. One whose name reached the late-allow but never the DNS
+	// mapping is flushed and not restored, and nothing re-fires it — its /32
+	// is already open, so no further BLOCKED event occurs. Startup callers are
+	// unaffected (they run before any late-allow); a genuine reload path
+	// should re-scope from the late-allow evidence rather than assume this
+	// loop covers it.
+	if r := s.l7Registrar(); r != nil {
+		if err := r.FlushScopes(); err != nil {
+			s.logger.Warn("L7: flushing scope maps on reload "+
+				"(stale destinations may stay L7-governed)", "error", err)
+		}
+	}
+
 	// Process all tracked hostnames we've seen (stored in hostnameIPs map)
 	s.hostnameIPsMutex.Lock()
 	trackedHostnames := make(map[string]map[string]bool)
@@ -263,10 +317,40 @@ func (s *Server) ApplyRulesToTrackedHostnames() {
 		trackedHostnames[fullHostname][ip] = true
 	}
 
-	// Now re-process each tracked hostname with the newly loaded rules
+	// Now re-process each tracked hostname with the newly loaded rules. (Names
+	// the reload no longer allows need no per-name revocation here — the
+	// wholesale flush above already dropped them, along with the late-allow
+	// entries no enumeration could find.)
 	for hostname, ipSet := range trackedHostnames {
+		if len(ipSet) == 0 {
+			continue
+		}
 		verdict := s.config.MatchHostnameRule(hostname)
-		if !verdict.Matched() || len(ipSet) == 0 || s.firewall == nil {
+		if !verdict.Matched() {
+			// The DERIVED tier — the same two-tier selection the live path
+			// applies. A CNAME target a client resolved directly (or that the
+			// pre-resolve chased) is tracked here but matches no rule; while
+			// the firewall was still nil, enforceDNSResponse's derived arm
+			// was skipped exactly like its rule arm, and a cached edge label
+			// may never be re-queried. This replay is the ONE
+			// maps-are-writable repair for that window, so skipping unmatched
+			// names left those destinations L4-reachable (default-allow, a
+			// covering CIDR) but L7-unscoped for the run. applyVerdictSide
+			// opens the IP and scopes it on the ports it actually
+			// inherited; the matcher decides names per flow. An expired
+			// derived TTL misses here and stays skipped; an explicit deny
+			// never reaches this arm (Matched is true for it).
+			derivedPorts, ok := s.DerivedAllowPorts(hostname)
+			if !ok {
+				continue
+			}
+			s.logger.Debug("Applying derived allow to tracked CNAME target",
+				"hostname", hostname, "ip_count", len(ipSet), "allow_ports", derivedPorts)
+			for ipStr := range ipSet {
+				if ip := net.ParseIP(ipStr); ip != nil {
+					s.applyVerdictSide(ip, hostname, config.ActionAllow, derivedPorts, true)
+				}
+			}
 			continue
 		}
 		s.logger.Info("Applying rules to tracked hostname",
@@ -738,6 +822,11 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 		} else {
 			for _, ip := range ips {
 				s.config.UpdateDNSMapping(canonicalHostname, ip.String())
+				// This is THE forward-resolution path — a real DNS answer
+				// traversing the proxy — so it (and RecordCNAMEChain below)
+				// are the only seeds of the L7 per-IP binding evidence.
+				// Reverse-DNS paths must never record it (PTR forgery).
+				s.config.RecordForwardResolution(canonicalHostname, ip.String())
 			}
 
 			// Track the IPs we've seen for this hostname. Accumulate
@@ -763,14 +852,42 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 					"allow_rule", verdict.AllowRule,
 					"allow_ports", verdict.AllowPorts)
 
+				// A rule-allowed name that reaches its addresses THROUGH CNAME
+				// hops lands on the same shared edges the derived path records,
+				// so it needs the same per-IP origin record. Without it, such an
+				// IP attributes only via ipToHostname, which is last-write-wins
+				// across every host that resolved to it: two allowed origins on
+				// one edge and the reported name is whichever resolved most
+				// recently, with no recency/TTL ranking and no drill-down chain.
+				// Recorded ONLY when the response actually carried hops — a
+				// plain A answer has no chain, and a synthetic one-element
+				// "chain" would put a meaningless drill-down on every event.
+				// chain[0] is the queried name here, so this changes which
+				// origin is reported only where the IP is genuinely shared.
+				var ruleChain []string
+				if len(links) > 0 && verdict.HasAllow() {
+					ruleChain = make([]string, 0, len(links)+1)
+					ruleChain = append(ruleChain, canonicalHostname)
+					for _, link := range links {
+						ruleChain = append(ruleChain, link.target)
+					}
+				}
+
 				for _, ip := range ips {
 					if verdict.HasDeny() {
 						s.applyVerdictSide(ip, canonicalHostname, config.ActionDeny, verdict.DenyPorts, false)
 					}
 					if verdict.HasAllow() {
-						if s.applyVerdictSide(ip, canonicalHostname, config.ActionAllow, verdict.AllowPorts, false) {
+						allowed := s.applyVerdictSide(ip, canonicalHostname, config.ActionAllow, verdict.AllowPorts, false)
+						if len(ruleChain) > 0 {
+							// Same TTL semantics as the derived path: a later
+							// request chasing a different allowed origin to this
+							// shared edge wins attribution once this one goes stale.
+							s.config.RecordCNAMEChain(ip.String(), ruleChain, time.Duration(ttl)*time.Second)
+						}
+						if allowed {
 							s.reconcileRecentBlocks(ip, canonicalHostname, verdict.AllowRule,
-								verdict.AllowPorts, verdict.DenyPorts, verdict.HasDeny(), nil)
+								verdict.AllowPorts, verdict.DenyPorts, verdict.HasDeny(), ruleChain)
 						}
 					}
 				}
@@ -1037,8 +1154,19 @@ func (s *Server) applyVerdictSide(ip net.IP, hostname string, action config.Acti
 			"conflicting_rule", conflictingRule,
 			"final_action", finalAction)
 	}
+	if finalAction == config.ActionAllow {
+		// Pin the L7 identity ONCE, ahead of every return below. The fact being
+		// recorded — this name is allowed at this IP, so future flows there must
+		// present it as SNI/Host — does not depend on whether an L4 write was
+		// needed: under default-ALLOW the short-circuit takes every allow
+		// verdict, so scoping only on the write path left map_l7_scope empty for
+		// the whole run. Scoping an IP whose L4 write then fails is inert, since
+		// L7 only ever narrows a flow the L4 verdict already passed. A no-op when
+		// L7 is off.
+		s.registerL7(hostname, ip, ports)
+	}
 	if finalAction == s.config.GetDefaultAction() {
-		return false
+		return false // the default already covers this IP; no L4 write needed
 	}
 	if err := s.addIPToBPFMaps(ip, hostname, finalAction, ports); err != nil {
 		s.logger.Error(maybeReprocessMsg("Failed to add IP to BPF maps", isReprocess),

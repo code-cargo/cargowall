@@ -146,7 +146,10 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
     __type(value, __u8);
-    __uint(max_entries, 2);
+    // Keys 0 (mode) and 1 (lo carveout) here, plus 2 (L7 mode) owned by
+    // sni.h; key 3 is reserved. The map stays sized at 4 so a future keyed
+    // toggle needs no resize.
+    __uint(max_entries, 4);
 } map_origin_config SEC(".maps");
 
 static __always_inline __u8 origin_mode(void) {
@@ -362,6 +365,11 @@ static __always_inline void origin_emit(struct __sk_buff *skb, __u8 ip_version,
 //   - ICMP / ICMPv6: path-MTU discovery and NDP. tc_egress treats ICMPv4 as
 //     a protocol-block candidate and always allows ICMPv6; dropping either
 //     here would break connectivity for traffic that is otherwise allowed.
+// L7 (TLS SNI / HTTP Host / QUIC) narrowing layer. Included here, after
+// map_origin_config, verdict_action, and audit_mode_active are all in scope,
+// because sni.h reuses that mode/audit ladder rather than a parallel one.
+#include "sni.h"
+
 // origin_carved_v4 is THE v4 carve-out predicate — the single definition
 // of the traffic classes this hook never denies, shared by the verdict
 // path and the unparsed (parse-fail) path so the two can never drift:
@@ -422,6 +430,11 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
     __u16 src_port = 0;
     __u16 dst_port = 0;
     __u8 flags = 0;
+    // TCP data offset (32-bit words) and host-order sequence, captured from
+    // the header parsed below for the L7 tail — so the hook never re-reads
+    // (and can never fail-open on) bytes this function already validated.
+    __u8 tcp_doff = 0;
+    __u32 tcp_seq = 0;
     // Loopback destinations never emit: TC never sees lo, so nothing can
     // join the record — and with the DNS redirect DNATing port 53 to
     // 127.0.0.1 before this hook, every host DNS query is a fresh socket
@@ -446,6 +459,10 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
             return origin_finish_unparsed_v4(skb, mode, src_ip, dst_ip, ip_hdr.daddr, ip_proto);
         src_port = bpf_ntohs(tcp_hdr.source);
         dst_port = bpf_ntohs(tcp_hdr.dest);
+        // Byte 12's high nibble, read from the struct as raw bytes so the
+        // value is bitfield-layout- and endian-independent.
+        tcp_doff = ((__u8 *)&tcp_hdr)[12] >> 4;
+        tcp_seq = bpf_ntohl(tcp_hdr.seq);
         if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
             flags = ORIGIN_FLAG_TCP_SYN;
         } else {
@@ -511,7 +528,19 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
         origin_emit(skb, 4, ip_proto, flags, verdict, src_ip, dst_ip, zero16, zero16,
                     src_port, dst_port);
     }
-    return verdict_action(mode, allowed);
+
+    // L7 narrowing. l7_gate_open holds the rules; the carve-out is checked
+    // here, LAST, so an unscoped packet never pays that lookup, and re-derived
+    // rather than reused because the verdict block only computes carve_out
+    // above observe mode. L7 can turn this pass into a drop, never the reverse.
+    int pass = verdict_action(mode, allowed);
+    __u8 l7m = l7_mode();
+    if (l7_gate_open(l7m, allowed, non_first_frag, ip_proto) &&
+        !origin_carved_v4(skb, dst_ip, ip_hdr.daddr, ip_proto))
+        pass = l7_hook_v4(skb, l7m, ip_hlen, ip_hdr.daddr, src_ip, dst_ip,
+                          ip_proto, src_port, dst_port, flags == ORIGIN_FLAG_TCP_SYN,
+                          tcp_doff, tcp_seq);
+    return pass;
 }
 
 static __always_inline int is_ipv6_ext_hdr(__u8 nexthdr) {
@@ -615,6 +644,9 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
     __u16 dst_port = 0;
     __u8 flags = 0;
     __u8 emit = 1;
+    // Captured for the L7 tail — see the v4 handler.
+    __u8 tcp_doff = 0;
+    __u32 tcp_seq = 0;
 
     if (non_first_frag) {
         emit = 0;
@@ -627,6 +659,8 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
             return origin_finish_unparsed_v6(skb, mode, src_ip6, dst_ip6, nexthdr);
         src_port = bpf_ntohs(tcp_hdr.source);
         dst_port = bpf_ntohs(tcp_hdr.dest);
+        tcp_doff = ((__u8 *)&tcp_hdr)[12] >> 4;
+        tcp_seq = bpf_ntohl(tcp_hdr.seq);
         if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
             flags = ORIGIN_FLAG_TCP_SYN;
         } else {
@@ -673,7 +707,17 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
         origin_emit(skb, 6, nexthdr, flags, verdict, 0, 0, src_ip6, dst_ip6,
                     src_port, dst_port);
     }
-    return verdict_action(mode, allowed);
+
+    // L7 narrowing — the v6 twin, same gate. l4_offset already points past the
+    // extension-header chain.
+    int pass = verdict_action(mode, allowed);
+    __u8 l7m = l7_mode();
+    if (l7_gate_open(l7m, allowed, non_first_frag, nexthdr) &&
+        !origin_carved_v6(skb, dst_ip6, nexthdr))
+        pass = l7_hook_v6(skb, l7m, l4_offset, dst_ip6, src_ip6,
+                          nexthdr, src_port, dst_port, flags == ORIGIN_FLAG_TCP_SYN,
+                          tcp_doff, tcp_seq);
+    return pass;
 }
 
 SEC("cgroup_skb/egress")

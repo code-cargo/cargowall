@@ -119,8 +119,8 @@ func isTCPOrUDP(proto uint8) bool {
 // which is why both hooks must run it, not just TC.
 //
 // Restricted to TCP/UDP — see isTCPOrUDP.
-func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, hostname, dstIP string,
-	dstPort uint16, proto uint8, logger *slog.Logger,
+func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegistrar,
+	hostname, dstIP string, dstPort uint16, proto uint8, logger *slog.Logger,
 ) (lateAllowed bool, matchedRule string) {
 	if hostname == "" || fw == nil || !isTCPOrUDP(proto) {
 		return false, ""
@@ -158,6 +158,8 @@ func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, hostname, dstIP
 			"ip", dstIP, "hostname", hostname, "error", err)
 		return false, matchedRule
 	}
+
+	ScopeAllowedIP(l7, hostname, ip, verdict.AllowPorts)
 	if changed {
 		// `changed` covers both "IP was new" and "IP was present but new
 		// per-port entries were written" (shared-IP-different-ports case) —
@@ -189,9 +191,9 @@ func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, hostname, dstIP
 	// late-allow/blocked label can diverge from the actual BPF verdict for
 	// that edge. Enforcement is unaffected — this only governs the
 	// audit/notification.
-	allowMatches := dstPortAllowedByRule(dstPort, proto, verdict.AllowPorts)
+	allowMatches := config.DstPortAllowedByRule(dstPort, proto, verdict.AllowPorts)
 	denyMatches := verdict.HasDeny() &&
-		dstPortAllowedByRule(dstPort, proto, verdict.DenyPorts)
+		config.DstPortAllowedByRule(dstPort, proto, verdict.DenyPorts)
 	return allowMatches && !denyMatches, matchedRule
 }
 
@@ -361,7 +363,7 @@ func applyDenialOutcome(out *Outcome, lateAllowed bool, matchedRule string,
 // can never produce a log line that disagrees with the audit stream. (The
 // process name is looked up from /proc since bpf_get_current_comm is
 // unavailable in TC programs.)
-func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, logger *slog.Logger,
+func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegistrar, logger *slog.Logger,
 	denial, degraded bool, srcIP, dstIP string, srcPort, dstPort uint16, proto uint8,
 	pid, ordinal uint32,
 ) (out Outcome, lateAllowed bool, matchedRule string) {
@@ -370,7 +372,7 @@ func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, logger *slog.
 	if !degraded {
 		hostname, cnameChain = resolveDestination(configMgr, dstIP, logger)
 		if denial {
-			lateAllowed, matchedRule = tryLateAllow(configMgr, fw, hostname, dstIP,
+			lateAllowed, matchedRule = tryLateAllow(configMgr, fw, l7, hostname, dstIP,
 				dstPort, proto, logger)
 		}
 	}
@@ -448,7 +450,7 @@ type VerdictRecord struct {
 // not be a thinner path: a denial reported here has to self-heal via
 // late-allow and carry a hostname just like any other.
 func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTracker *NotificationTracker,
-	auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger,
+	auditLogger *AuditLogger, fw FirewallUpdater, l7 L7LateRegistrar, logger *slog.Logger,
 ) {
 	// Only a real drop is a denial here. Would-blocks are hypothetical and
 	// must not open the firewall — in shadow mode TC's own verdict still
@@ -457,7 +459,7 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 	// pipeline with the slow work flagged off (see prepareOutcome) rather
 	// than a parallel construction that could drift from it.
 	denial := rec.Dropped
-	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, logger,
+	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, l7, logger,
 		denial, rec.Degraded, rec.SrcIP, rec.DstIP, rec.SrcPort, rec.DstPort, rec.Proto,
 		rec.PID, rec.StepOrdinal)
 
@@ -479,7 +481,7 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 		// A would-block keeps the mid-stream flag: shadow mode exists to
 		// predict what enforcement would do, and "would kill an established
 		// flow" is precisely the datum an operator weighs before flipping
-		// --cgroup-enforce. TC's audit-mode would-denies carry it too.
+		// --container-egress=enforce. TC's audit-mode would-denies carry it too.
 		out.Audit.MidStream = rec.MidStream
 	} else {
 		// A denied non-TCP/UDP protocol reports in the same shape TC gives

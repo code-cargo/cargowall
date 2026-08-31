@@ -109,13 +109,18 @@ func (c *SummaryCmd) Run() error {
 			existingConnEvents = append(existingConnEvents, event)
 		case events.EventStepBoundary:
 			stepBoundaries = append(stepBoundaries, event)
-		case events.EventContainerAttribution, events.EventCgroupWouldBlock:
+		case events.EventContainerAttribution, events.EventCgroupWouldBlock,
+			events.EventL7WouldBlock:
 			// Telemetry markers, not connection outcomes. Container/exec
-			// tagging describes no connection at all; a cgroup would-block
-			// describes traffic that was NOT blocked (shadow mode), so
-			// counting it as a block would overstate what the firewall did.
-			// The audit log carries both for CI assertions and blast-radius
+			// tagging describes no connection at all; a cgroup or L7
+			// would-block describes traffic that was NOT blocked (shadow or
+			// observe mode), so counting it as a block would overstate what
+			// the firewall did — and for l7_would_block would poison the very
+			// observe-mode measurement that gates --tls-sni=enforce. The
+			// audit log carries all three for CI assertions and blast-radius
 			// measurement; the summary renders nothing from them yet.
+			// (l7_blocked is a REAL enforce-mode drop and stays a regular
+			// connection outcome.)
 		default:
 			regularEvents = append(regularEvents, event)
 		}
@@ -248,9 +253,11 @@ func (c *SummaryCmd) readAuditLog() ([]events.AuditEvent, error) {
 	return allEvents, scanner.Err()
 }
 
-// reconcileLateAllowedBlocks drops connection_blocked events superseded by a
-// connection_late_allowed event for the same (dst_ip, dst_port, protocol) at
-// the same time or later. The daemon emits such events when the firewall
+// reconcileLateAllowedBlocks drops blocked events superseded by a late-allow
+// for the same destination at the same time or later: connection_blocked
+// against connection_late_allowed keyed on (dst_ip, dst_port, protocol), and
+// dns_blocked against dns_query_late_allowed keyed on the queried name
+// (#119 — a query refused while the rule covering it was still loading). The daemon emits such events when the firewall
 // opens for an IP after it was blocked — either in-band (the blocked event's
 // hostname matched an allow rule) or via late-allow reconciliation when the
 // address records finally traverse the DNS proxy (#83). The policy outcome
@@ -266,23 +273,41 @@ func reconcileLateAllowedBlocks(auditEvents []events.AuditEvent) []events.AuditE
 		protocol string
 	}
 	latestLateAllow := make(map[connKey]time.Time)
+	// Queried names are matched case-insensitively: DNS is, and the refusal
+	// and the reconciliation can reach the log with different casing.
+	latestDNSLateAllow := make(map[string]time.Time)
 	for _, e := range auditEvents {
-		if e.EventType != events.EventConnectionLateAllowed || e.DstIP == "" {
-			continue
-		}
-		k := connKey{ip: e.DstIP, port: e.DstPort, protocol: e.Protocol}
-		if e.Timestamp.After(latestLateAllow[k]) {
-			latestLateAllow[k] = e.Timestamp
+		switch {
+		case e.EventType == events.EventConnectionLateAllowed && e.DstIP != "":
+			k := connKey{ip: e.DstIP, port: e.DstPort, protocol: e.Protocol}
+			if e.Timestamp.After(latestLateAllow[k]) {
+				latestLateAllow[k] = e.Timestamp
+			}
+		case e.EventType == events.EventDNSQueryLateAllowed && e.DstHostname != "":
+			k := strings.ToLower(e.DstHostname)
+			if e.Timestamp.After(latestDNSLateAllow[k]) {
+				latestDNSLateAllow[k] = e.Timestamp
+			}
 		}
 	}
-	if len(latestLateAllow) == 0 {
+	if len(latestLateAllow) == 0 && len(latestDNSLateAllow) == 0 {
 		return auditEvents
 	}
 
 	kept := make([]events.AuditEvent, 0, len(auditEvents))
 	for _, e := range auditEvents {
-		if e.EventType == events.EventConnectionBlocked {
+		switch e.EventType {
+		case events.EventConnectionBlocked:
 			ts, ok := latestLateAllow[connKey{ip: e.DstIP, port: e.DstPort, protocol: e.Protocol}]
+			if ok && !e.Timestamp.After(ts) {
+				continue
+			}
+		case events.EventDNSBlocked:
+			// No port/protocol in the key: a refused query names a domain,
+			// and the reconciliation that supersedes it allowed that same
+			// name. Refusals AFTER the late-allow are kept, same as the
+			// connection side — those are the name being refused again.
+			ts, ok := latestDNSLateAllow[strings.ToLower(e.DstHostname)]
 			if ok && !e.Timestamp.After(ts) {
 				continue
 			}
@@ -413,11 +438,9 @@ func deduplicateStepEvents(stepEvents []StepEvents) {
 		seen := make(map[dedupKey]int) // key -> index into deduped
 		var deduped []events.AuditEvent
 		for _, event := range stepEvents[i].Events {
-			dest := event.DstHostname
-			if dest == "" {
-				dest = event.DstIP
-			}
-			key := dedupKey{process: event.Process, dest: dest, port: event.DstPort, protocol: event.Protocol, eventType: event.EventType}
+			// ReportedDestName so distinct presented SNIs denied on one shared
+			// edge IP stay distinct rows instead of collapsing into one.
+			key := dedupKey{process: event.Process, dest: event.ReportedDestName(), port: event.DstPort, protocol: event.Protocol, eventType: event.EventType}
 			if idx, exists := seen[key]; exists {
 				backfillDistinguishingFields(&deduped[idx], &event)
 				continue
@@ -439,11 +462,16 @@ func computeSummary(allEvents []events.AuditEvent, mode data.CargoWallMode) *car
 			if e.AutoAllowedType != "" {
 				autoAllowed++
 			}
-		case events.EventConnectionBlocked, events.EventDNSBlocked, events.EventProtocolBlocked:
+		// l7_blocked is a real enforce-mode drop and must count as denied in
+		// the SaaS summary exactly as it does in the markdown tally.
+		case events.EventConnectionBlocked, events.EventDNSBlocked, events.EventProtocolBlocked,
+			events.EventL7Blocked:
 			blocked++
 		}
-		if e.DstHostname != "" {
-			hostnames[e.DstHostname] = struct{}{}
+		// ReportedDestName: an L7 denial's identity is the presented SNI, not
+		// the allowed origin the edge IP resolves to.
+		if name := e.ReportedDestName(); name != e.DstIP && name != "" {
+			hostnames[name] = struct{}{}
 		}
 	}
 
@@ -678,15 +706,21 @@ func readDowngrade() *cargowallv1.CargoWallDowngrade {
 func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {
 	actionType := data.CargoWallActionType_CARGO_WALL_ACTION_TYPE_ALLOW
 	switch e.EventType {
-	case events.EventConnectionBlocked, events.EventDNSBlocked, events.EventProtocolBlocked:
+	// l7_blocked is an enforce-mode drop — the SNI-mismatch denial the L7
+	// layer exists to produce — and must reach the SaaS as a DENY, not fall
+	// through to the ALLOW default. (l7_would_block never reaches this
+	// function: the classifier above files it with the telemetry markers.)
+	case events.EventConnectionBlocked, events.EventDNSBlocked, events.EventProtocolBlocked,
+		events.EventL7Blocked:
 		actionType = data.CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY
 	}
 
 	category := data.CargoWallEventCategory_CARGO_WALL_EVENT_CATEGORY_UNSPECIFIED
 	switch e.EventType {
-	case events.EventDNSBlocked:
+	case events.EventDNSBlocked, events.EventDNSQueryLateAllowed:
 		category = data.CargoWallEventCategory_CARGO_WALL_EVENT_CATEGORY_DNS
-	case events.EventConnectionBlocked, events.EventConnectionAllowed, events.EventConnectionLateAllowed, events.EventExistingConnection:
+	case events.EventConnectionBlocked, events.EventConnectionAllowed, events.EventConnectionLateAllowed,
+		events.EventExistingConnection, events.EventL7Blocked:
 		category = data.CargoWallEventCategory_CARGO_WALL_EVENT_CATEGORY_CONNECTION
 	case events.EventProtocolBlocked:
 		category = data.CargoWallEventCategory_CARGO_WALL_EVENT_CATEGORY_PROTOCOL
@@ -697,8 +731,12 @@ func auditEventToProto(e events.AuditEvent) *cargowallv1.CargoWallActionEvent {
 		Action:    actionType,
 		Category:  category,
 	}
-	if e.DstHostname != "" {
-		event.Hostname = &e.DstHostname
+	// The connection's reported name — ReportedDestName, so an L7 block ships
+	// the rejected SNI/Host rather than the allowed origin the edge resolves
+	// to (see the helper). The IP fallback is excluded: the proto carries the
+	// IP in its own field.
+	if hostname := e.ReportedDestName(); hostname != "" && hostname != e.DstIP {
+		event.Hostname = &hostname
 	}
 	if e.DstIP != "" {
 		event.Ip = &e.DstIP

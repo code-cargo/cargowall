@@ -227,6 +227,35 @@ type Observer struct {
 	verdictsDropped   atomic.Uint64 // runtime overflow of BOTH lanes: reports lost mid-run
 	verdictsDegraded  atomic.Uint64 // Blocks delivered via the must-audit lane
 	verdictsAbandoned atomic.Uint64 // would-block reports discarded by Close's backlog policy
+
+	// l7 is the optional SNI/Host/QUIC oracle, enabled by EnableL7 when the
+	// --tls-sni flag is set. nil means L7 is off (its kernel maps are still
+	// loaded but the mode gate leaves the program's L7 branch inert).
+	l7 *L7
+}
+
+// EnableL7 constructs the SNI/Host/QUIC oracle over this collection's L7 maps
+// and starts its punt reader. Everything the reader goroutines read arrives in
+// opts, so a half-configured oracle is unrepresentable.
+//
+// It does NOT raise the L7 mode gate — the caller does that (SetMode) only
+// after the scope maps have had a chance to warm, mirroring how origin
+// enforcement is raised after the allowlist is programmed. The returned *L7 is
+// also the registrar the DNS path calls (ScopeIP) as names resolve. Safe to
+// call once, after Start.
+func (o *Observer) EnableL7(opts L7Options) (*L7, error) {
+	if o.l7 != nil {
+		return o.l7, nil
+	}
+	if opts.Matcher == nil {
+		return nil, errors.New("l7: no name matcher")
+	}
+	l := newL7(&o.objs, opts, o.logger)
+	if err := l.start(); err != nil {
+		return nil, err
+	}
+	o.l7 = l
+	return l, nil
 }
 
 // Start loads the origin collection, attaches the observer at the root
@@ -354,6 +383,15 @@ func (o *Observer) Close() {
 			o.logger.Warn("Failed to lower origin hook to observe at close", "error", err)
 		}
 	}
+	// Tear down the L7 oracle before the collection: lower its mode gate to
+	// OFF (mirroring the origin lowering above) and stop its punt reader, which
+	// reads map_l7_events — a map o.objs.Close() below is about to release.
+	if o.l7 != nil {
+		if err := o.l7.SetMode(L7ModeOff); err != nil {
+			o.logger.Warn("Failed to lower L7 mode to off at close", "error", err)
+		}
+		o.l7.close()
+	}
 	if o.reader != nil {
 		_ = o.reader.Close()
 		<-o.done // run() exits promptly on ringbuf.ErrClosed
@@ -389,6 +427,21 @@ func (o *Observer) Close() {
 
 // Program exposes the observer program for BPF runtime-stats logging.
 func (o *Observer) Program() *ebpf.Program { return o.objs.CgOriginEgress }
+
+// ResolveCookie resolves a socket cookie against the tcbpf pid/step identity
+// maps — the same join insert applies to every origin record, exposed so the
+// L7 punt path's audit records carry identical attribution (l7_event mirrors
+// origin_event's leading fields for exactly this join). A zero result means
+// the socket was untagged when asked.
+func (o *Observer) ResolveCookie(cookie uint64) (pid, ordinal uint32) {
+	if o.sockPid != nil {
+		_ = o.sockPid.Lookup(cookie, &pid)
+	}
+	if o.sockStep != nil {
+		_ = o.sockStep.Lookup(cookie, &ordinal)
+	}
+	return pid, ordinal
+}
 
 // SetVerdictSink installs the callback that receives would-block/block
 // records. Must be called before the mode is raised above observe. The sink
@@ -518,13 +571,7 @@ func (o *Observer) reportLoop() {
 // event against its own join candidate and file container flows into the
 // unattributed tier under the default posture.
 func (o *Observer) insert(ev *bpf.OriginEvent) {
-	var pid, ordinal uint32
-	if o.sockPid != nil {
-		_ = o.sockPid.Lookup(ev.Cookie, &pid)
-	}
-	if o.sockStep != nil {
-		_ = o.sockStep.Lookup(ev.Cookie, &ordinal)
-	}
+	pid, ordinal := o.ResolveCookie(ev.Cookie)
 
 	var srcIP, dstIP netip.Addr
 	if ev.IpVersion == 4 {

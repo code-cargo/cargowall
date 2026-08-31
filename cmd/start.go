@@ -369,6 +369,21 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		defer auditLogger.Close()
 	}
 
+	// The query-side late-allow buffer (#119) is wired HERE, not with its
+	// connection-side twin below, because the window it exists to cover opens
+	// before that point: the proxy is already listening and filtering, and the
+	// policy fetch is still ahead of us. A refusal is only buffered if it was
+	// audited, and the DNS server has no audit logger until one is handed to
+	// it — so both go on as early as the logger exists. Refusals between the
+	// proxy starting and this line remain outside the feature's reach; the
+	// policy-load window, which is what #119 is about, is inside it.
+	if dnsServer != nil && auditLogger != nil {
+		dnsServer.SetAuditLogger(auditLogger)
+		recentDNSBlocks := events.NewRecentDNSBlocks(0)
+		auditLogger.AddSink(recentDNSBlocks)
+		dnsServer.SetRecentDNSBlocks(recentDNSBlocks)
+	}
+
 	// OpenTelemetry export: enabled iff the standard OTLP env vars are set.
 	// The exporter subscribes to the audit event stream, so without
 	// --audit-log a file-less audit logger acts as the event hub.
@@ -450,6 +465,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		recentBlocks := events.NewRecentBlocks(0)
 		auditLogger.AddSink(recentBlocks)
 		dnsServer.SetRecentBlocks(recentBlocks)
+
 	}
 
 	// Log the effective posture now that config load has settled it on the
@@ -575,9 +591,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// two-phase boot order — observer before the event reader, docker
 	// tracking after the dockerd restart — lives in containerAttribution;
 	// a nil value is the disabled feature and every call below no-ops.
-	attribution := newContainerAttribution(cmd.ContainerAttribution,
-		resolveMode(cmd.ContainerAttribution, cmd.CgroupEnforce),
-		stepTracker, &objs, logger)
+	attribution := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
+		resolveMode(cmd.ContainerEgress), stepTracker, &objs, logger)
 	defer attribution.Close()
 
 	// Userspace half of the loopback carve-out pair — must run before
@@ -586,10 +601,17 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// loads, issue #119.)
 	attribution.ensureLoopbackAllowed(configMgr)
 
+	// Start L7 (SNI/Host/QUIC) enforcement early — before the startup
+	// resolutions below — so destinations resolved at boot are L7-scoped. The
+	// mode gate stays off until l7f.raise() below, so nothing is adjudicated
+	// against cold scope maps. nil means the feature is off.
+	l7f := startL7(cmd, attribution.originObserver(), attribution.containerEnricher(),
+		configMgr, dnsServer, auditLogger, notificationTracker, logger)
+
 	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
-	// load-bearing under --cgroup-enforce — the docker bridge listener that
-	// daemon.json points every container at. Previously this lived in the
-	// CI-only config path, so `--container-attribution --cgroup-enforce
+	// load-bearing under --container-egress=enforce — the docker bridge
+	// listener that daemon.json points every container at. Previously this
+	// lived in the CI-only config path, so `--container-egress=enforce
 	// --docker-dns-interception` without a CI preset enforced against an
 	// allowlist that never contained bridgeIP:53 and container resolution
 	// died with EPERM. Unconditional: even with DNS tracking disabled (no
@@ -639,14 +661,21 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	}
 	defer rd.Close()
 
+	// The L7 registrar both event pipelines scope through when they late-allow
+	// a /32. nil when --tls-sni is off; the firewall stays purely L4.
+	var l7Reg events.L7LateRegistrar
+	if l7f != nil {
+		l7Reg = l7f.registrar()
+	}
+
 	// Start the event reader before the firewall is enforcing so no events are missed.
-	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, logger, attribution.enricherArg())
+	go events.ProcessBlockedEvents(rd, configMgr, notificationTracker, auditLogger, fw, l7Reg, logger, attribution.enricherArg())
 
 	// Route the cgroup hook's verdicts into that same pipeline. Wired here,
 	// once the firewall exists, because late-allow needs it — and before the
 	// hook can leave observe mode, so no verdict is ever reported by a
 	// thinner path than a TC event would take.
-	attribution.wireVerdicts(configMgr, notificationTracker, auditLogger, fw)
+	attribution.wireVerdicts(configMgr, notificationTracker, auditLogger, fw, l7Reg)
 
 	// Set default action through firewall
 	defaultAction := configMgr.GetDefaultAction()
@@ -735,12 +764,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}
 
 		// Gate AFTER pre-population so reverse-DNS attribution is available.
-		gatedExisting = gateExistingStartupConnections(cmd, existing, configMgr, fw, auditLogger, logger)
+		gatedExisting = gateExistingStartupConnections(cmd, existing, configMgr, fw, l7Reg, auditLogger, logger)
 	}
 
 	// Re-scan just before attach so connections established during the DNS
 	// pre-population window survive.
-	rescanAndGateDelta(cmd, gatedExisting, configMgr, fw, auditLogger, logger)
+	rescanAndGateDelta(cmd, gatedExisting, configMgr, fw, l7Reg, auditLogger, logger)
 
 	if startupInterrupted(ctx, logger, "pre-attach") {
 		return nil
@@ -768,7 +797,17 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// the same reason the allowlist is: the hook must be correct from its
 	// first adjudicated packet.
 	attribution.preallowLocalNetworks(ctx)
-	attribution.enableMode()
+	// L7 rides the same hook but its gate is its own map key, and the kernel's
+	// L7 drop keys off the L7 mode and audit_mode_active() — never ORIGIN_MODE
+	// — so a failed origin SetMode says nothing about whether L7 can
+	// adjudicate. Gating the raise on it meant one map-write failure left L7 in
+	// OFF, including --tls-sni's observe mode, whose measurement is the only
+	// data the enforce rollout is decided on. enableMode logs its own failure
+	// and each posture's log line now states its own truth.
+	_ = attribution.enableMode()
+	if l7f != nil {
+		l7f.raise()
+	}
 	// Registered with teardowns, not a bare defer: on TCX kernels the link
 	// dies with the process fd anyway, but the legacy clsact fallback
 	// (kernels <6.6) installs a netlink cls_bpf filter that OUTLIVES the
@@ -1580,6 +1619,13 @@ func prePopulateDNSCache(ctx context.Context, configMgr *config.Manager, dnsServ
 		if ips, err := cacheResolver.LookupHost(lookupCtx, hostname); err == nil {
 			for _, ip := range ips {
 				configMgr.UpdateDNSMapping(hostname, ip)
+				// A FORWARD lookup of a rule hostname — the same evidence
+				// class as the proxy's own answers, not a PTR — and these are
+				// the IPs live processes are already using. Recording it is
+				// what lets those IPs be L7-scoped at all (RegisterL7Identity
+				// scopes iff bound); without it the first flight to a
+				// systemd-resolved cached IP is name_not_at_ip under pin-ip.
+				configMgr.RecordForwardResolution(hostname, ip)
 			}
 		} else {
 			logger.Debug("System DNS cache miss", "hostname", hostname, "error", err)
@@ -1616,8 +1662,13 @@ func prePopulateDNSCache(ctx context.Context, configMgr *config.Manager, dnsServ
 // gateExistingConnections iterates pre-existing connections, blocks those
 // that resolve to a denied tracked hostname, and allows everything else —
 // allowed hostnames on their rule's ports, unresolvable/unmatched IPs on the
-// observed remote ports only.
-func gateExistingConnections(conns existingConns, configMgr *config.Manager, fw firewall.Firewall, auditLogger *events.AuditLogger, logger *slog.Logger) {
+// observed remote ports only. fw is the (possibly L7-upgraded) firewall seam:
+// when it carries the late-allow registrar, hostname-allowed IPs opened here
+// are also L7-scoped, so a new TLS flow to a pre-existing connection's edge
+// IP still has its SNI pinned instead of bypassing L7 entirely. (The
+// pre-existing flows themselves are untouched: their mid-stream segments
+// carry no handshake and pass the identity gate.)
+func gateExistingConnections(conns existingConns, configMgr *config.Manager, fw events.FirewallUpdater, l7 events.L7LateRegistrar, auditLogger *events.AuditLogger, logger *slog.Logger) {
 	for ipStr, observedPorts := range conns {
 		ip := net.ParseIP(ipStr)
 		if ip == nil {
@@ -1662,10 +1713,18 @@ func gateExistingConnections(conns existingConns, configMgr *config.Manager, fw 
 		}
 		if wasAdded, err := fw.AddIP(ip, config.ActionAllow, allowPorts); err != nil {
 			logger.Debug("Failed to allow existing connection IP", "ip", ipStr, "error", err)
-		} else if wasAdded {
-			logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname, "ports", allowPorts)
-			if auditLogger != nil {
-				auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, true, autoAllowedType)
+		} else {
+			// Only a real hostname allow: an unmatched IP allowed on the
+			// observed ports has no name to pin, and scoping it would
+			// fail-close its flows. See events.ScopeAllowedIP.
+			if verdict.HasAllow() {
+				events.ScopeAllowedIP(l7, hostname, ip, verdict.AllowPorts)
+			}
+			if wasAdded {
+				logger.Info("Auto-allowed pre-existing connection", "ip", ipStr, "hostname", hostname, "ports", allowPorts)
+				if auditLogger != nil {
+					auditLogger.LogExistingConnection(ipStr, hostname, trackedHost, true, autoAllowedType)
+				}
 			}
 		}
 	}
@@ -1838,11 +1897,11 @@ func scanExistingForStartup(cmd *StartCmd, logger *slog.Logger) existingConns {
 // --allow-existing-connections is set, returning the set of gated tuple keys
 // so the pre-attach re-scan gates only the delta (including a new port on an
 // already-seen peer).
-func gateExistingStartupConnections(cmd *StartCmd, conns existingConns, configMgr *config.Manager, fw firewall.Firewall, auditLogger *events.AuditLogger, logger *slog.Logger) map[string]bool {
+func gateExistingStartupConnections(cmd *StartCmd, conns existingConns, configMgr *config.Manager, fw events.FirewallUpdater, l7 events.L7LateRegistrar, auditLogger *events.AuditLogger, logger *slog.Logger) map[string]bool {
 	if !cmd.AllowExistingConnections || fw == nil || len(conns) == 0 {
 		return nil
 	}
-	gateExistingConnections(conns, configMgr, fw, auditLogger, logger)
+	gateExistingConnections(conns, configMgr, fw, l7, auditLogger, logger)
 	gated := make(map[string]bool, len(conns))
 	for ip, ports := range conns {
 		for _, p := range ports {
@@ -1857,14 +1916,14 @@ func gateExistingStartupConnections(cmd *StartCmd, conns existingConns, configMg
 // pre-population between the initial scan and attach can take tens of
 // seconds of sequential lookups, and connections established in that window
 // would otherwise be killed mid-stream the moment the program attaches.
-func rescanAndGateDelta(cmd *StartCmd, gated map[string]bool, configMgr *config.Manager, fw firewall.Firewall, auditLogger *events.AuditLogger, logger *slog.Logger) {
+func rescanAndGateDelta(cmd *StartCmd, gated map[string]bool, configMgr *config.Manager, fw events.FirewallUpdater, l7 events.L7LateRegistrar, auditLogger *events.AuditLogger, logger *slog.Logger) {
 	if !cmd.AllowExistingConnections || fw == nil {
 		return
 	}
 	if delta, err := scanExistingConnections(gated); err != nil {
 		logger.Debug("Pre-attach connection re-scan failed", "error", err)
 	} else if len(delta) > 0 {
-		gateExistingConnections(delta, configMgr, fw, auditLogger, logger)
+		gateExistingConnections(delta, configMgr, fw, l7, auditLogger, logger)
 	}
 }
 

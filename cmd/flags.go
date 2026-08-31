@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -124,17 +125,25 @@ type StartCmd struct {
 	StepOrdinalBase uint32 `help:"Base for step ordinal numbering; ordinals are opaque per-step-subtree IDs correlated to plan steps via step_boundary cmdlines, not by position" default:"1" env:"CARGOWALL_STEP_ORDINAL_BASE"`
 	RunnerWorkerPID int    `help:"PID of the Runner.Worker process (0 = auto-discover by process name)" default:"0" env:"CARGOWALL_RUNNER_WORKER_PID"`
 
-	// Container attribution (issue #106). On its own this is audit-only:
-	// the root-cgroup hook reports what it would block (shadow mode) and
-	// blocks nothing. --cgroup-enforce below is what makes it authoritative.
-	ContainerAttribution bool `help:"Correlate Docker containers and execs to workflow steps via a root-cgroup egress hook, and report what that hook would block (does not block anything by itself — see --cgroup-enforce; requires --step-attribution; implied by --github-action)" default:"false" env:"CARGOWALL_CONTAINER_ATTRIBUTION"`
-	BPFStats             bool `help:"Collect kernel BPF runtime statistics and log per-program overhead at shutdown (small global cost while enabled)" name:"bpf-stats" default:"false" env:"CARGOWALL_BPF_STATS"`
-	// Container enforcement (issue #106, phase 3b). Off by default: with
-	// container attribution on, the cgroup hook runs in SHADOW mode, which
-	// reports what it would block without blocking anything. Turning this on
-	// makes that hook authoritative for traffic with a local socket, with TC
-	// egress remaining attached as the fail-closed backstop.
-	CgroupEnforce bool `help:"Enforce egress policy at the root-cgroup hook (pre-NAT, socket context) instead of only reporting what it would block; TC egress remains a backstop (requires --container-attribution)" default:"false" env:"CARGOWALL_CGROUP_ENFORCE"`
+	// The root-cgroup egress hook (issue #106) and the L7 identity layer that
+	// rides it are each ONE flag naming a posture, not a pile of booleans
+	// implying one. Both are ladders — every rung strictly contains the one
+	// below — and a boolean per rung makes the illegal rungs (enforce without
+	// the feature, pinning without enforcement) representable, so they have to
+	// be rejected by hand in Validate. An enum makes them unspellable.
+	ContainerEgress string `help:"Root-cgroup egress hook posture: off, observe (correlate Docker containers/execs to workflow steps and report what the hook would block, blocking nothing), enforce (authoritative for traffic with a local socket, pre-NAT and in socket context; TC egress remains the backstop). Requires --step-attribution; --github-action implies observe" name:"container-egress" default:"off" env:"CARGOWALL_CONTAINER_EGRESS"`
+	BPFStats        bool   `help:"Collect kernel BPF runtime statistics and log per-program overhead at shutdown (small global cost while enabled)" name:"bpf-stats" default:"false" env:"CARGOWALL_BPF_STATS"`
+
+	// L7 (TLS SNI / HTTP Host / QUIC): pins WHICH hostname a flow to a shared
+	// CDN/edge IP may reach, closing the hole where allowing one hostname's
+	// edge IP allows every tenant behind it.
+	//
+	// enforce-pinned is a rung rather than a modifier because pinning below
+	// enforcement means nothing: the per-IP binding's would-deny rate is
+	// ALREADY measured at every rung (reported as l7_would_block with reason
+	// name_not_at_ip), so the only thing the top rung adds is turning those
+	// measurements into drops.
+	TLSSNI string `help:"L7 destination-identity posture: off, observe (parse the SNI/Host/QUIC name and report it, never dropping), enforce (drop flows whose name no rule allows on that IP), enforce-pinned (also drop when the name never resolved to THIS destination). Requires --container-egress, and enforce rungs require --container-egress=enforce" name:"tls-sni" default:"off" env:"CARGOWALL_TLS_SNI"`
 
 	// Sudo lockdown (CI security hardening)
 	SudoLockdown      bool   `help:"Enable sudo lockdown to prevent firewall bypass" default:"false" env:"CARGOWALL_SUDO_LOCKDOWN"`
@@ -228,13 +237,84 @@ func (c *StartCmd) AfterApply() error {
 	// requirement.) Step attribution can still fail at RUNTIME (no kernel
 	// BTF, no Runner.Worker); that residual downgrade is warned loudly in
 	// newContainerAttribution.
-	if c.CgroupEnforce && !c.ContainerAttribution {
-		return fmt.Errorf("--cgroup-enforce requires --container-attribution")
+	// A zero value is the unset flag, not a bad one: Kong fills the default
+	// when it parses, but a StartCmd built in code (tests, embedders) reaches
+	// here with "" and must mean off rather than fail validation.
+	if c.ContainerEgress == "" {
+		c.ContainerEgress = ContainerEgressOff
 	}
-	if c.CgroupEnforce && !c.StepAttribution {
-		return fmt.Errorf("--cgroup-enforce requires --step-attribution (container attribution rides on step attribution)")
+	if c.TLSSNI == "" {
+		c.TLSSNI = TLSSNIOff
+	}
+	egress := rung(containerEgressRungs, c.ContainerEgress)
+	if egress < 0 {
+		return fmt.Errorf("--container-egress must be one of %s, got %q",
+			strings.Join(containerEgressRungs, ", "), c.ContainerEgress)
+	}
+	sni := rung(tlsSNIRungs, c.TLSSNI)
+	if sni < 0 {
+		return fmt.Errorf("--tls-sni must be one of %s, got %q",
+			strings.Join(tlsSNIRungs, ", "), c.TLSSNI)
+	}
+	// What remains are genuine CROSS-feature dependencies — one subsystem
+	// needing another to be live — not rungs of the same ladder. Each is
+	// load-bearing: without step tags the observer's ordinals would always be
+	// zero (newContainerAttribution returns nil), and L7 rides the cgroup
+	// hook's program, so it cannot adjudicate a packet that hook never sees.
+	// (Runs after preset expansion, so --github-action satisfies the step
+	// requirement.) Step attribution can still fail at RUNTIME (no kernel BTF,
+	// no Runner.Worker); that residual downgrade is warned loudly in
+	// newContainerAttribution.
+	if egress > 0 && !c.StepAttribution {
+		return fmt.Errorf("--container-egress=%s requires --step-attribution "+
+			"(container attribution rides on step attribution)", c.ContainerEgress)
+	}
+	if sni > 0 && egress == 0 {
+		return fmt.Errorf("--tls-sni=%s requires --container-egress "+
+			"(L7 rides the cgroup egress hook)", c.TLSSNI)
+	}
+	// L7 can only ever narrow a pass into a drop, so dropping on the L7
+	// identity means nothing while the hook it rides is still passing
+	// everything it would have blocked.
+	if sni >= rung(tlsSNIRungs, TLSSNIEnforce) && c.ContainerEgress != ContainerEgressEnforce {
+		return fmt.Errorf("--tls-sni=%s requires --container-egress=enforce", c.TLSSNI)
 	}
 	return nil
+}
+
+// --container-egress values, in ascending strictness. The root-cgroup hook has
+// a third kernel rung below these (ORIGIN_MODE_OBSERVE: record origins, compute
+// no verdict) which is the boot-time inert posture only — nothing raises the
+// hook TO it, so it is deliberately not spellable here.
+const (
+	ContainerEgressOff     = "off"
+	ContainerEgressObserve = "observe"
+	ContainerEgressEnforce = "enforce"
+)
+
+// --tls-sni values, in ascending strictness.
+const (
+	TLSSNIOff           = "off"
+	TLSSNIObserve       = "observe"
+	TLSSNIEnforce       = "enforce"
+	TLSSNIEnforcePinned = "enforce-pinned"
+)
+
+// containerEgressRungs and tlsSNIRungs order each ladder so validation can ask
+// "at least this strict" instead of enumerating combinations. An unknown value
+// is rung -1 and never satisfies a floor.
+var (
+	containerEgressRungs = []string{ContainerEgressOff, ContainerEgressObserve, ContainerEgressEnforce}
+	tlsSNIRungs          = []string{TLSSNIOff, TLSSNIObserve, TLSSNIEnforce, TLSSNIEnforcePinned}
+)
+
+func rung(ladder []string, v string) int {
+	for i, s := range ladder {
+		if s == v {
+			return i
+		}
+	}
+	return -1
 }
 
 // --api-failure-mode values.
@@ -262,10 +342,13 @@ func (c *StartCmd) applyCIPreset(mode CIMode) {
 		// process. Degrades to a warning when the worker or kernel BTF is
 		// missing, so it is safe to imply here.
 		c.StepAttribution = true
-		// Container attribution rides on step attribution and degrades the
+		// The cgroup egress hook rides on step attribution and degrades the
 		// same way (audit-only observer + docker-events tagging, warn-only on
-		// any failure), so it is equally safe to imply.
-		c.ContainerAttribution = true
+		// any failure), so observe is equally safe to imply. Never lowers a
+		// posture the operator asked for explicitly.
+		if rung(containerEgressRungs, c.ContainerEgress) < rung(containerEgressRungs, ContainerEgressObserve) {
+			c.ContainerEgress = ContainerEgressObserve
+		}
 	case CIModeGitlabCI:
 		c.AutoAllowGitlabHosts = true
 	}

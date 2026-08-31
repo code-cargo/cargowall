@@ -235,7 +235,7 @@ jobs:
           # authoritative for traffic with a local socket (pre-NAT, socket
           # context), with TC egress still attached as the fail-closed
           # backstop for everything else.
-          CARGOWALL_CGROUP_ENFORCE: 'true'
+          CARGOWALL_CONTAINER_EGRESS: 'enforce'
         with:
           mode: enforce
           offline: 'true'

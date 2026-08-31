@@ -2838,10 +2838,10 @@ func TestChosenAttributionName(t *testing.T) {
 	}
 }
 
-// autoAllowedPortMatch: empty rulePorts means "all ports"; otherwise both
-// port number AND protocol must match (ProtocolsOverlap handles ProtocolAll
-// on either side).
-func TestAutoAllowedPortMatch(t *testing.T) {
+// PortsCover: empty rulePorts means "all ports"; otherwise both port number
+// AND protocol must match (ProtocolsOverlap handles ProtocolAll on either
+// side).
+func TestPortsCover(t *testing.T) {
 	tests := []struct {
 		name       string
 		rulePorts  []Port
@@ -2859,8 +2859,8 @@ func TestAutoAllowedPortMatch(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := autoAllowedPortMatch(tc.rulePorts, tc.queryPort, tc.queryProto); got != tc.want {
-				t.Errorf("autoAllowedPortMatch(%v, %d, %s) = %v, want %v",
+			if got := PortsCover(tc.rulePorts, tc.queryPort, tc.queryProto); got != tc.want {
+				t.Errorf("PortsCover(%v, %d, %s) = %v, want %v",
 					tc.rulePorts, tc.queryPort, tc.queryProto, got, tc.want)
 			}
 		})

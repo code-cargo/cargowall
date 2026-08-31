@@ -26,28 +26,29 @@ import (
 )
 
 // The mode ladder is the safety gate for phase 3b: enforcement must be
-// opt-in, and merely turning container attribution on must never start
-// dropping traffic.
+// opt-in, and merely turning the hook on must never start dropping traffic.
+// The flag's "observe" is the kernel's SHADOW rung — the operator-facing
+// question is whether anything drops, and shadow is the rung that answers no
+// while still computing the verdict.
 func TestResolveMode(t *testing.T) {
 	tests := []struct {
-		name        string
-		attribution bool
-		enforce     bool
-		want        origin.Mode
+		name   string
+		egress string
+		want   origin.Mode
 	}{
-		{"attribution off", false, false, origin.ModeObserve},
-		{"attribution on defaults to shadow", true, false, origin.ModeShadow},
-		{"enforce opt-in", true, true, origin.ModeEnforce},
+		{"off", ContainerEgressOff, origin.ModeObserve},
+		{"observe selects shadow, never enforce", ContainerEgressObserve, origin.ModeShadow},
+		{"enforce opt-in", ContainerEgressEnforce, origin.ModeEnforce},
 		{
-			// --cgroup-enforce without container attribution leaves the hook
-			// unloaded entirely, so it cannot enforce. Fail-safe direction:
-			// TC keeps enforcing, nothing silently half-enables.
-			"enforce without attribution stays observe", false, true, origin.ModeObserve,
+			// Unspellable through the flag (AfterApply rejects it), so this
+			// pins the fail-safe direction of the fallthrough itself: an
+			// unrecognized posture must never resolve to enforcement.
+			"unknown posture stays inert", "wat", origin.ModeObserve,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, resolveMode(tt.attribution, tt.enforce))
+			assert.Equal(t, tt.want, resolveMode(tt.egress))
 		})
 	}
 }
@@ -59,7 +60,7 @@ func TestContainerAttributionNilSafe(t *testing.T) {
 	assert.NotPanics(t, func() {
 		a.enableMode()
 		a.ensureLoopbackAllowed(nil)
-		a.wireVerdicts(nil, nil, nil, nil)
+		a.wireVerdicts(nil, nil, nil, nil, nil)
 		a.preallowLocalNetworks(t.Context())
 		assert.NoError(t, a.allowLocalNetwork(netip.Prefix{}))
 		a.Close()

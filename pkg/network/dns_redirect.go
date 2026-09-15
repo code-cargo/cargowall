@@ -121,6 +121,22 @@ func SetupDNSRedirect(logger *slog.Logger) error {
 // caller). A var so tests can point it at a controllable path.
 var resolvedRuntimeDir = "/run/systemd/resolve"
 
+// SystemdResolvedRunning reports whether systemd-resolved is running, by the
+// presence of its runtime directory. A genuine "not there" is a clean false;
+// any other stat failure (EACCES, EIO) is surfaced rather than folded into
+// false, so a host where resolved IS running is never misreported as one
+// where it is not. Shared by the cache flush and the DNS proxy's synthetic
+// answers (#126) so both read the same signal.
+func SystemdResolvedRunning() (bool, error) {
+	if _, err := os.Stat(resolvedRuntimeDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("probing %s failed: %w", resolvedRuntimeDir, err)
+	}
+	return true, nil
+}
+
 // flushResolvedTimeout bounds the resolvectl call so a wedged systemd-resolved
 // (or its D-Bus endpoint) cannot stall startup before the eBPF program
 // attaches and the firewall begins enforcing. A var so tests can shorten it.
@@ -155,15 +171,15 @@ func FlushResolvedCache(ctx context.Context, logger *slog.Logger) error {
 	// resolvectl can be installed on hosts that don't actually run
 	// systemd-resolved (a different resolver is in use); its runtime dir is
 	// absent there, so skip quietly rather than warn on every startup. Only a
-	// genuine "not there" is benign — a stat failure such as EACCES/EIO is real
-	// and surfaced, mirroring the LookPath classification above (otherwise a
-	// host where resolved *is* running would be misreported as a correct skip).
-	if _, err := os.Stat(resolvedRuntimeDir); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			logger.Debug("systemd-resolved not running; skipping cache flush", "probe", resolvedRuntimeDir)
-			return nil
-		}
-		return fmt.Errorf("probing %s failed: %w", resolvedRuntimeDir, err)
+	// genuine "not there" is benign — SystemdResolvedRunning surfaces every
+	// other stat failure, mirroring the LookPath classification above.
+	running, err := SystemdResolvedRunning()
+	if err != nil {
+		return err
+	}
+	if !running {
+		logger.Debug("systemd-resolved not running; skipping cache flush", "probe", resolvedRuntimeDir)
+		return nil
 	}
 
 	flushCtx, cancel := context.WithTimeout(ctx, flushResolvedTimeout)

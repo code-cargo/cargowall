@@ -57,6 +57,49 @@ func withResolvedRunning(t *testing.T) {
 	t.Cleanup(func() { resolvedRuntimeDir = prev })
 }
 
+// TestSystemdResolvedRunning: the runtime dir present → true; a genuine
+// "not there" → false with no error. Both are clean outcomes; only a
+// non-ENOENT stat failure is surfaced (see the permission case below).
+func TestSystemdResolvedRunning(t *testing.T) {
+	withResolvedRunning(t)
+	running, err := SystemdResolvedRunning()
+	if err != nil || !running {
+		t.Fatalf("runtime dir present: want (true, nil), got (%v, %v)", running, err)
+	}
+
+	prev := resolvedRuntimeDir
+	resolvedRuntimeDir = filepath.Join(t.TempDir(), "absent")
+	t.Cleanup(func() { resolvedRuntimeDir = prev })
+	running, err = SystemdResolvedRunning()
+	if err != nil || running {
+		t.Fatalf("runtime dir absent: want (false, nil), got (%v, %v)", running, err)
+	}
+}
+
+// TestSystemdResolvedRunning_StatFailureSurfaced: a probe that fails for any
+// reason other than ENOENT must not read as "not running" — otherwise a host
+// where resolved IS running would be misreported. Root bypasses directory
+// permissions, so the case is only testable unprivileged.
+func TestSystemdResolvedRunning_StatFailureSurfaced(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions; EACCES cannot be provoked")
+	}
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+
+	prev := resolvedRuntimeDir
+	resolvedRuntimeDir = filepath.Join(parent, "resolve")
+	t.Cleanup(func() { resolvedRuntimeDir = prev })
+
+	running, err := SystemdResolvedRunning()
+	if err == nil || running {
+		t.Fatalf("EACCES probe: want (false, error), got (%v, %v)", running, err)
+	}
+}
+
 // TestFlushResolvedCache_NotInstalled: resolvectl absent from PATH → quiet skip.
 func TestFlushResolvedCache_NotInstalled(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // empty dir, no resolvectl

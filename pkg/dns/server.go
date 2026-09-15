@@ -112,6 +112,11 @@ type Server struct {
 	// recentDNSBlocks buffers refused QUERIES for the same reconciliation on
 	// the DNS side (#119); see reconcileRefusedQueries.
 	recentDNSBlocks *events.RecentDNSBlocks
+
+	// synthetic answers systemd-resolved's synthetic names locally (#126).
+	// Decided once in Start, before any listener serves, so handlers read
+	// it without synchronization. See synthetic.go.
+	synthetic bool
 }
 
 // dnsCacheEntry holds a cached DNS response
@@ -385,6 +390,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// No TTL cleanup needed - IPs persist until updated by new DNS responses
 	// DNS cache uses lazy expiration - no cleanup goroutine needed
 
+	// Decide ahead of the listeners whether to answer resolved's synthetic
+	// names (#126); written here and never again.
+	s.synthetic = s.probeSynthetic()
+
 	// Collect all addresses to listen on
 	allAddrs := []string{s.listenAddr}
 	allAddrs = append(allAddrs, s.additionalAddrs...)
@@ -528,6 +537,21 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		"query", queryName,
 		"type", queryType,
 		"upstream", s.upstream)
+
+	// systemd-resolved's synthetic names (#126) are answered locally, ahead
+	// of the filter gate and the cache — resolved's own precedence — and only
+	// on host listeners. The search-expanded form a resolver tries first is
+	// NXDOMAIN, as it is natively. See synthetic.go.
+	if s.synthetic && len(r.Question) > 0 {
+		if name, expanded, ok := syntheticQuery(r.Question[0].Name); ok && s.attributionMode(w) != attributeContainerIP {
+			if expanded {
+				s.answerSyntheticNXDomain(w, r, name)
+			} else {
+				s.answerSynthetic(w, r, name)
+			}
+			return
+		}
+	}
 
 	// DNS Query Filtering: Block queries for non-allowed domains (prevents
 	// DNS tunneling). isQueryAllowed handles both the full and the

@@ -253,8 +253,10 @@ func TestServeSynthetic_StubUnreachableIsOrdinary(t *testing.T) {
 	assert.Equal(t, dns.RcodeRefused, m.Rcode)
 }
 
-// The localhost family resolved synthesizes beyond what /etc/hosts carries.
-func TestServeSynthetic_RelaysLocalhostFamily(t *testing.T) {
+// The localhost family resolved synthesizes beyond what /etc/hosts carries —
+// relayed, but not tracked: any label under .localhost is accepted, and
+// retaining each alias would grow hostnameIPs without bound.
+func TestServeSynthetic_RelaysLocalhostFamilyUntracked(t *testing.T) {
 	s, seen, _ := syntheticServer(t)
 	for _, q := range []string{"api.localhost.", "localhost.localdomain.", "foo.localhost.localdomain."} {
 		m := askName(t, s, q, dns.TypeA)
@@ -263,6 +265,10 @@ func TestServeSynthetic_RelaysLocalhostFamily(t *testing.T) {
 		assert.Equal(t, "127.0.0.1", m.Answer[0].(*dns.A).A.String(), q)
 	}
 	assert.Len(t, seen(), 3)
+	assert.Empty(t, s.config.LookupHostnameByIP("127.0.0.1"))
+	s.hostnameIPsMutex.RLock()
+	defer s.hostnameIPsMutex.RUnlock()
+	assert.Empty(t, s.hostnameIPs)
 }
 
 // The search-expanded form is the first query a resolver sends for the

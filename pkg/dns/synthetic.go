@@ -26,10 +26,12 @@ import (
 // Names systemd-resolved synthesizes locally (#126): the underscore set, and
 // the RFC 6761 localhost family (localhost, localhost.localdomain, anything
 // beneath either). The proxy relays them to the stub on its marked client
-// and writes resolved's answer back, uncached but enforced like any upstream
-// answer (#129): a rule naming "_gateway" opens the gateway's address on
-// its ports, a deny closes it, and with no rule the connection is
-// attributed to the name rather than a bare IP.
+// and writes resolved's answer back, uncached. The underscore set is
+// enforced like any upstream answer (#129): a rule naming "_gateway" opens
+// the gateway's address on its ports, a deny closes it, and with no rule
+// the connection is attributed to the name rather than a bare IP. The
+// localhost family is relayed only: loopback is auto-allowed, and tracking
+// arbitrary "*.localhost" aliases would grow hostnameIPs without bound.
 var (
 	syntheticNames = []string{"_gateway", "_outbound", "_localdnsstub", "_localdnsproxy"}
 	localhostRoots = []string{"localhost", "localhost.localdomain"}
@@ -70,7 +72,7 @@ func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
 		return false
 	}
 	resp.Id = r.Id
-	if resp.Rcode == dns.RcodeSuccess {
+	if resp.Rcode == dns.RcodeSuccess && slices.Contains(syntheticNames, name) {
 		s.enforceDNSResponse(name, resp, 0)
 	}
 	w.WriteMsg(resp)

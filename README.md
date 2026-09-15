@@ -104,7 +104,7 @@ allowed-hosts: |
   **.storage.azure.com
 ```
 
-Underscore labels are valid rule values. `_gateway` names whatever systemd-resolved resolves it to — the runner's default gateway — so a host-side agent reached at the gateway (Firecracker/gvproxy runners such as Blacksmith put theirs at `192.168.127.1`) can be allowed by name rather than by a provider-specific CIDR. Such a rule trusts the routing table the way any hostname rule trusts DNS: scope it to the repository or workflow that needs it, not the organization.
+Underscore labels are valid rule values. `_gateway` names whatever systemd-resolved resolves it to — the runner's default gateway — so a host-side agent reached at the gateway (Firecracker/gvproxy runners such as Blacksmith put theirs at `192.168.127.1`) can be allowed by name rather than by a provider-specific CIDR. Two things to know: such a rule trusts the routing table the way any hostname rule trusts DNS, so scope it to the repository or workflow that needs it, not the organization; and `_gateway` is an address alias, never a name the peer presents, so the rule is L4-only — it opens the address on its ports like a CIDR allow and pins no L7 identity, so with `--tls-sni` on, HTTP to the agent carrying `Host: 192.168.127.1` is not an L7 miss.
 
 **Search domains** whitelist whole DNS suffixes for resolution without per-hostname tracking. Typical use case: you've allowed a VPC CIDR for internal traffic and want DNS resolution to work for any name under that VPC's internal suffix.
 

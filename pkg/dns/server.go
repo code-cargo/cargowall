@@ -112,6 +112,10 @@ type Server struct {
 	// recentDNSBlocks buffers refused QUERIES for the same reconciliation on
 	// the DNS side (#119); see reconcileRefusedQueries.
 	recentDNSBlocks *events.RecentDNSBlocks
+
+	// machineNames are the forms of the machine's own hostname that resolved
+	// synthesizes, seeded at Start; see synthetic.go.
+	machineNames []string
 }
 
 // dnsCacheEntry holds a cached DNS response
@@ -386,6 +390,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// DNS cache uses lazy expiration - no cleanup goroutine needed
 
 	s.seedHostSearchDomains()
+	s.seedMachineNames()
 
 	// Collect all addresses to listen on
 	allAddrs := []string{s.listenAddr}
@@ -833,8 +838,12 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 				// This is THE forward-resolution path — a real DNS answer
 				// traversing the proxy — so it (and RecordCNAMEChain below)
 				// are the only seeds of the L7 per-IP binding evidence.
-				// Reverse-DNS paths must never record it (PTR forgery).
-				s.config.RecordForwardResolution(canonicalHostname, ip.String())
+				// Reverse-DNS paths must never record it (PTR forgery), and
+				// neither does a name the proxy answered from resolved's
+				// local state (localAlias): it is never a wire identity.
+				if !s.localAlias(canonicalHostname) {
+					s.config.RecordForwardResolution(canonicalHostname, ip.String())
+				}
 			}
 
 			// Track the IPs we've seen for this hostname. Accumulate

@@ -30,10 +30,12 @@ var resolvConfPath = "/etc/resolv.conf"
 // config manager as a strip-only suffix source (#127). Read once at Start:
 // the list is boot-time DHCP state and a job is short-lived.
 func (s *Server) seedHostSearchDomains() {
-	domains := hostSearchDomains(resolvConfPath)
-	s.config.SetHostSearchDomains(domains, s.logger)
-	if len(domains) > 0 {
-		s.logger.Info("Host search domains active for rule matching", "domains", domains)
+	s.config.SetHostSearchDomains(hostSearchDomains(resolvConfPath), s.logger)
+	// Report what the manager kept, not what the file said: public suffixes
+	// are dropped on the way in, and this is the line operators read to see
+	// whether stripping is on.
+	if active := s.config.HostSearchDomains(); len(active) > 0 {
+		s.logger.Info("Host search domains active for rule matching", "domains", active)
 	}
 }
 

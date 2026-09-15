@@ -1248,21 +1248,27 @@ func (v HostnameVerdict) Matched() bool { return v.HasDeny() || v.HasAllow() }
 // lowercase at construction time (resolveRules / EnsureHostnameAllowed) and
 // the lookup hostname is lowercased here.
 //
-// Search-domain composition. The full hostname and its search-domain-stripped
-// form are each evaluated against the rule set independently, then folded
-// into one verdict:
+// Search-domain composition. Up to three forms of the name are evaluated
+// against the rule set independently (matchFormsLocked), in precedence
+// order: the name as asked; its policy strip — Kubernetes defaults plus the
+// operator's search-domains, longest suffix wins; and its host strip — the
+// runner's own resolv.conf search list (hostsearch.go), longest wins. The
+// two strips are separate candidates: a host suffix longer than a policy
+// suffix adds a form and never replaces the one existing rules were written
+// against. The forms then fold into one verdict (foldForms):
 //
-//   - Both deny: union the port lists (UnionPorts); attribute the
-//     deny rule via pickDenyForm (narrower-exact-wins, broader-port-wins).
-//   - Both allow: pick the allow rule via pickAllowForm (narrower-exact-wins).
-//   - Mixed (one deny, one allow): both sides are recorded on the verdict
-//     so callers can write per-port BPF entries faithfully.
-//   - One match, one no-match: the matched side is recorded.
+//   - Denies union their port lists (UnionPorts) and attribute via
+//     pickDenyForm (exact-name wins, then broader port coverage).
+//   - Allows attribute via pickAllowForm (a strictly narrower exact rule
+//     wins) and carry the chosen form's ports — no union.
+//   - A deny and an allow among the forms is a mixed verdict: both sides
+//     are recorded so callers can write per-port BPF entries faithfully.
+//   - Ties keep the earlier form, so the name as asked outranks its strips.
 //   - No matches: zero verdict (Matched() == false).
 //
 // This contract means a deny rule for "blocked" still rejects
 // "blocked.compute.internal" even when a broader allow for
-// "compute.internal" also matches the full form, and a `bastion: allow 22`
+// "compute.internal" also matches the name as asked, and a `bastion: allow 22`
 // rule still allows port 22 on `bastion.compute.internal` even when
 // `*.compute.internal: deny 80` denies port 80 on the same name.
 func (cm *Manager) MatchHostnameRule(hostname string) HostnameVerdict {
@@ -1316,11 +1322,11 @@ func foldForms(forms []formMatch) (deny *formMatch, denyPorts []Port, allow *for
 				continue
 			}
 			denyPorts = UnionPorts(denyPorts, f.ports)
-			if pickDenyForm(deny.value, deny.name, deny.ports, f.value, f.name, f.ports) {
+			if pickDenyForm(deny, f) {
 				deny = f
 			}
 		case ActionAllow:
-			if allow == nil || pickAllowForm(allow.value, allow.name, f.value, f.name) {
+			if allow == nil || pickAllowForm(allow, f) {
 				allow = f
 			}
 		}
@@ -1338,46 +1344,39 @@ func matchedExactly(ruleValue, hostname string) bool {
 	return ruleValue == hostname
 }
 
-// pickDenyForm encodes the both-deny attribution tiebreak shared by
-// MatchHostnameRule and FindTrackedHostname: when search-domain stripping
-// produces two matching deny rules (one on the full hostname, one on the
-// stripped form), which form should the result attribute to?
+// pickDenyForm is the both-deny attribution tiebreak shared by
+// MatchHostnameRule and FindTrackedHostname, applied pairwise as foldForms
+// walks the forms in precedence order: does next displace current?
 //
-// Precedence:
-//  1. Exact-name match wins over parent/pattern (more specific by name scope).
-//  2. Within same name-specificity, broader port coverage wins
-//     (all-ports — empty Ports — absorbs any port-scoped rule).
-//  3. Otherwise full form wins (stable default).
+//  1. An exact-name match wins over parent/pattern (more specific by name).
+//  2. At equal name-specificity, broader port coverage wins (all-ports —
+//     empty Ports — absorbs any port-scoped rule).
+//  3. Otherwise current stays: the earlier form wins ties.
 //
-// Port UNION across both rules is the caller's job (see UnionPorts);
-// this helper only decides which form's value/name supplies attribution.
-func pickDenyForm(
-	valueFull, name string, portsFull []Port,
-	valueStripped, stripped string, portsStripped []Port,
-) (strippedWins bool) {
-	fullExact := matchedExactly(valueFull, name)
-	strippedExact := matchedExactly(valueStripped, stripped)
+// Port UNION across the denies is the caller's job (UnionPorts); this only
+// decides which form's value/name supplies attribution.
+func pickDenyForm(current, next *formMatch) (nextWins bool) {
+	currentExact := matchedExactly(current.value, current.name)
+	nextExact := matchedExactly(next.value, next.name)
 	switch {
-	case strippedExact && !fullExact:
+	case nextExact && !currentExact:
 		return true
-	case fullExact && !strippedExact:
+	case currentExact && !nextExact:
 		return false
-	case len(portsStripped) == 0 && len(portsFull) > 0:
+	case len(next.ports) == 0 && len(current.ports) > 0:
 		return true
-	case len(portsFull) == 0 && len(portsStripped) > 0:
+	case len(current.ports) == 0 && len(next.ports) > 0:
 		return false
 	default:
 		return false
 	}
 }
 
-// pickAllowForm encodes the both-allow narrower-exact-wins tiebreak shared
-// by MatchHostnameRule and FindTrackedHostname: prefer the stripped form
-// only when its rule matched exactly AND the full form's rule didn't
-// (i.e. the stripped exact rule is strictly narrower than a full-form
-// parent-suffix or pattern).
-func pickAllowForm(valueFull, name, valueStripped, stripped string) (strippedWins bool) {
-	return matchedExactly(valueStripped, stripped) && !matchedExactly(valueFull, name)
+// pickAllowForm is the both-allow tiebreak, applied the same way: next
+// displaces current only when next's rule matched exactly and current's did
+// not — a strictly narrower exact rule beats a parent-suffix or pattern.
+func pickAllowForm(current, next *formMatch) (nextWins bool) {
+	return matchedExactly(next.value, next.name) && !matchedExactly(current.value, current.name)
 }
 
 // matchHostnameRuleLocked is the lock-free / single-form core of
@@ -1591,14 +1590,12 @@ func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameActio
 // "github.com" allow vs. "internal.github.com" deny for an
 // "api.internal.github.com" lookup).
 //
-// Search-domain stripping is applied as a fallback: both the full name and
-// the stripped form are consulted, with deny-anywhere precedence
-// (mirrors MatchHostnameRule). Critically, BOTH forms' actions are
-// checked before attributing to an allow — otherwise a full-form deny
-// pattern (e.g. `*.compute.internal`) combined with a stripped-form
-// allow (e.g. `bastion`) would attribute to the stripped allow, and a
-// downstream re-lookup would late-allow traffic that should have been
-// blocked.
+// Search-domain stripping: the same forms and fold as MatchHostnameRule
+// (matchFormsLocked / foldForms), so attribution names the rule the verdict
+// fired on. A deny among the forms outranks an allow — otherwise a
+// full-form deny pattern (`*.compute.internal`) beside a stripped-form
+// allow (`bastion`) would attribute to the allow, and a downstream
+// re-lookup would late-allow traffic that should have been blocked.
 func (cm *Manager) FindTrackedHostname(name string) string {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()

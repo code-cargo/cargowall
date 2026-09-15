@@ -20,6 +20,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -31,13 +32,6 @@ import (
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/firewall"
 )
-
-func withResolvedRunning(t *testing.T, running bool) {
-	t.Helper()
-	prev := resolvedRunning
-	resolvedRunning = func() (bool, error) { return running, nil }
-	t.Cleanup(func() { resolvedRunning = prev })
-}
 
 // withResolvConf points the client resolver config at a fixture; an empty
 // string leaves it absent.
@@ -52,9 +46,11 @@ func withResolvConf(t *testing.T, content string) {
 }
 
 // withFakeStub runs a stand-in for the resolved stub that answers the way
-// resolved does — "_gateway" and "_outbound" A with AA and TTL 0, AAAA as
-// NODATA, anything it does not know as NXDOMAIN — and returns a snapshot
-// function for the questions it was asked.
+// resolved does — "_gateway" and "_outbound" A with AA and TTL 0, the
+// localhost family as 127.0.0.1, AAAA as NODATA, anything else as NXDOMAIN —
+// and returns a snapshot function for the questions it was asked. Returns
+// only once the server is serving: Shutdown before ActivateAndServe is a
+// "server not started" no-op that leaves the conn open.
 func withFakeStub(t *testing.T) func() []dns.Question {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -64,8 +60,10 @@ func withFakeStub(t *testing.T) func() []dns.Question {
 		seen []dns.Question
 	)
 	answers := map[string]string{"_gateway.": "192.168.5.2", "_outbound.": "192.168.5.15"}
+	started := make(chan struct{})
 	stub := &dns.Server{
-		PacketConn: pc,
+		PacketConn:        pc,
+		NotifyStartedFunc: func() { close(started) },
 		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 			q := r.Question[0]
 			mu.Lock()
@@ -74,7 +72,11 @@ func withFakeStub(t *testing.T) func() []dns.Question {
 			m := new(dns.Msg)
 			m.SetReply(r)
 			m.Authoritative = true
-			switch ip, known := answers[q.Name]; {
+			ip, known := answers[q.Name]
+			if strings.HasSuffix(q.Name, "localhost.") || strings.HasSuffix(q.Name, "localhost.localdomain.") {
+				ip, known = "127.0.0.1", true
+			}
+			switch {
 			case !known:
 				m.Rcode = dns.RcodeNameError
 			case q.Qtype == dns.TypeA:
@@ -87,7 +89,11 @@ func withFakeStub(t *testing.T) func() []dns.Question {
 		}),
 	}
 	go func() { _ = stub.ActivateAndServe() }()
-	t.Cleanup(func() { _ = stub.Shutdown() })
+	<-started
+	t.Cleanup(func() {
+		_ = stub.Shutdown()
+		_ = pc.Close()
+	})
 	prev := resolvedStubAddr
 	resolvedStubAddr = pc.LocalAddr().String()
 	t.Cleanup(func() { resolvedStubAddr = prev })
@@ -100,12 +106,11 @@ func withFakeStub(t *testing.T) func() []dns.Question {
 
 // syntheticServer is a filtering, default-deny server — the configuration
 // under which these names would otherwise be REFUSED, so every answer below
-// also proves precedence over the gate — with resolved "running", a fake
-// stub, and a resolver config without a search list. The mock firewall
-// carries no expectations: any enforcement side effect fails the test.
+// also proves precedence over the gate — with a fake stub and a resolver
+// config without a search list. The mock firewall carries no expectations:
+// any enforcement side effect fails the test.
 func syntheticServer(t *testing.T) (*Server, func() []dns.Question) {
 	t.Helper()
-	withResolvedRunning(t, true)
 	withResolvConf(t, "nameserver 127.0.0.53\n")
 	seen := withFakeStub(t)
 	cfg := config.NewConfigManager()
@@ -163,6 +168,12 @@ func TestSyntheticQuery(t *testing.T) {
 		{"_gateway.blacksmith.sh.", "", false, false}, // partial suffix is not the suffix
 		{"gateway.lan.", "", false, false},
 		{"example.com.", "", false, false},
+		{"localhost.", "localhost", false, true},
+		{"API.localhost.", "api.localhost", false, true},
+		{"localhost.localdomain.", "localhost.localdomain", false, true},
+		{"foo.localhost.localdomain.", "foo.localhost.localdomain", false, true},
+		{"localhost.example.com.", "", false, false},
+		{"notlocalhost.", "", false, false},
 	} {
 		got, expanded, ok := syntheticQuery(tc.qname)
 		assert.Equal(t, tc.ok, ok, tc.qname)
@@ -214,11 +225,26 @@ func TestServeSynthetic_RelaysStubVerdictVerbatim(t *testing.T) {
 	assert.Equal(t, dns.RcodeNameError, m.Rcode)
 }
 
-func TestServeSynthetic_StubUnreachableIsServfail(t *testing.T) {
+// A stub that does not answer — resolved stopped, or never installed — sends
+// the name down the ordinary path, REFUSED here, rather than SERVFAIL: the
+// runtime directory outlives a stopped resolved, so this is the only probe.
+func TestServeSynthetic_StubUnreachableIsOrdinary(t *testing.T) {
 	s, _ := syntheticServer(t)
 	resolvedStubAddr = "127.0.0.1:1" // nothing listens; UDP gets ECONNREFUSED at once
 	m := askName(t, s, "_gateway.", dns.TypeA)
-	assert.Equal(t, dns.RcodeServerFailure, m.Rcode)
+	assert.Equal(t, dns.RcodeRefused, m.Rcode)
+}
+
+// The localhost family resolved synthesizes beyond what /etc/hosts carries.
+func TestServeSynthetic_RelaysLocalhostFamily(t *testing.T) {
+	s, seen := syntheticServer(t)
+	for _, q := range []string{"api.localhost.", "localhost.localdomain.", "foo.localhost.localdomain."} {
+		m := askName(t, s, q, dns.TypeA)
+		assert.Equal(t, dns.RcodeSuccess, m.Rcode, q)
+		require.Len(t, m.Answer, 1, q)
+		assert.Equal(t, "127.0.0.1", m.Answer[0].(*dns.A).A.String(), q)
+	}
+	assert.Len(t, seen(), 3)
 }
 
 // The search-expanded form is the first query a resolver sends for the
@@ -249,18 +275,6 @@ func TestServeSynthetic_ExpandedOtherwiseOrdinary(t *testing.T) {
 	withResolvConf(t, "search lan\n")
 	m = askName(t, s, "_gateway.example.com.", dns.TypeA)
 	assert.Equal(t, dns.RcodeRefused, m.Rcode, "suffix not on the search list")
-}
-
-// With resolved not running the name takes the ordinary path — and under
-// filtering with default deny that is REFUSED, the enforce symptom in #126.
-// Pins that the relay, not something else, answers the name above, and that
-// the stub is not consulted on a host that has none.
-func TestServeSynthetic_ResolvedNotRunningIsOrdinary(t *testing.T) {
-	s, seen := syntheticServer(t)
-	withResolvedRunning(t, false)
-	m := askName(t, s, "_gateway.", dns.TypeA)
-	assert.Equal(t, dns.RcodeRefused, m.Rcode)
-	assert.Empty(t, seen())
 }
 
 func TestServeSynthetic_NonINClassIsOrdinary(t *testing.T) {

@@ -23,38 +23,35 @@ import (
 	"strings"
 
 	"github.com/miekg/dns"
-
-	cargowallNet "github.com/code-cargo/cargowall/pkg/network"
 )
 
-// syntheticNames are the names systemd-resolved synthesizes locally (#126).
-// The proxy relays them to the stub on its marked client and writes
-// resolved's answer back uncached and unenforced: it never feeds
+// Names systemd-resolved synthesizes locally (#126): the underscore set, and
+// the RFC 6761 localhost family (localhost, localhost.localdomain, anything
+// beneath either). The proxy relays them to the stub on its marked client
+// and writes resolved's answer back uncached and unenforced: it never feeds
 // hostnameIPs or the firewall.
-var syntheticNames = []string{"_gateway", "_outbound", "_localdnsstub", "_localdnsproxy"}
+var (
+	syntheticNames = []string{"_gateway", "_outbound", "_localdnsstub", "_localdnsproxy"}
+	localhostRoots = []string{"localhost", "localhost.localdomain"}
+)
 
 // Injection points for tests.
 var (
 	resolvedStubAddr = "127.0.0.53:53"
 	resolvConfPath   = "/etc/resolv.conf"
-	resolvedRunning  = cargowallNet.SystemdResolvedRunning
 )
 
-// serveSynthetic answers a synthetic-name query — host listeners, IN class,
-// resolved running (probed per hit) — reporting whether it wrote a response.
+// serveSynthetic answers a synthetic-name query — host listeners, IN class —
+// reporting whether it wrote a response. A stub that does not answer sends
+// the query down the ordinary path: /run/systemd/resolve outlives a stopped
+// resolved (RuntimeDirectoryPreserve=yes), so presence proves nothing, and
+// the connection-refused round trip on loopback is the cheapest true probe.
 func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
 	if len(r.Question) == 0 || r.Question[0].Qclass != dns.ClassINET || !s.hostListener(w) {
 		return false
 	}
 	name, expanded, ok := syntheticQuery(r.Question[0].Name)
 	if !ok {
-		return false
-	}
-	if running, err := resolvedRunning(); err != nil || !running {
-		if err != nil {
-			s.logger.Debug("systemd-resolved probe failed; synthetic name takes the ordinary path",
-				"name", name, "error", err)
-		}
 		return false
 	}
 
@@ -71,10 +68,9 @@ func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
 
 	resp, _, err := s.client.Exchange(r, resolvedStubAddr)
 	if err != nil {
-		s.logger.Warn("systemd-resolved stub query failed", "name", name, "error", err)
-		m.SetRcode(r, dns.RcodeServerFailure)
-		w.WriteMsg(m)
-		return true
+		s.logger.Debug("systemd-resolved stub unreachable; synthetic name takes the ordinary path",
+			"name", name, "error", err)
+		return false
 	}
 	resp.Id = r.Id
 	w.WriteMsg(resp)
@@ -87,12 +83,17 @@ func (s *Server) hostListener(w dns.ResponseWriter) bool {
 	return s.attributionMode(w) == attributeHostSockdiag
 }
 
-// syntheticQuery classifies a wire-form query name: a bare synthetic name,
-// its search-expanded form (first label synthetic, remainder a suffix on the
-// host's resolv.conf search list), or neither. resolv.conf is read only
-// after the first label matches.
+// syntheticQuery classifies a wire-form query name: a localhost-family name,
+// a bare underscore name, its search-expanded form (first label synthetic,
+// remainder a suffix on the host's resolv.conf search list), or neither.
+// resolv.conf is read only after the first label matches.
 func syntheticQuery(qname string) (name string, expanded, ok bool) {
 	full := strings.ToLower(strings.TrimSuffix(qname, "."))
+	for _, root := range localhostRoots {
+		if full == root || strings.HasSuffix(full, "."+root) {
+			return full, false, true
+		}
+	}
 	first, rest, hasRest := strings.Cut(full, ".")
 	if !slices.Contains(syntheticNames, first) {
 		return "", false, false

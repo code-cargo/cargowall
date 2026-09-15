@@ -106,12 +106,11 @@ func withFakeStub(t *testing.T) func() []dns.Question {
 
 // syntheticServer is a filtering, default-deny server — the configuration
 // under which these names would otherwise be REFUSED, so every answer below
-// also proves precedence over the gate — with a fake stub and a resolver
-// config without a search list. The mock firewall carries no expectations:
-// any enforcement side effect fails the test.
+// also proves precedence over the gate — with a fake stub and no host
+// search list. The mock firewall carries no expectations: any enforcement
+// side effect fails the test.
 func syntheticServer(t *testing.T) (*Server, func() []dns.Question) {
 	t.Helper()
-	withResolvConf(t, "nameserver 127.0.0.53\n")
 	seen := withFakeStub(t)
 	cfg := config.NewConfigManager()
 	require.NoError(t, cfg.LoadConfigFromRules(nil, config.ActionDeny))
@@ -139,7 +138,7 @@ func askName(t *testing.T, s *Server, name string, qtype uint16) *dns.Msg {
 }
 
 func TestSyntheticQuery(t *testing.T) {
-	search := []string{"lan", "vm.blacksmith.sh"}
+	isHostSuffix := func(rest string) bool { return rest == "lan" || rest == "vm.blacksmith.sh" }
 	for _, tc := range []struct {
 		qname    string
 		want     string
@@ -165,13 +164,13 @@ func TestSyntheticQuery(t *testing.T) {
 		{"localhost.example.com.", "", false, false},
 		{"notlocalhost.", "", false, false},
 	} {
-		got, expanded, ok := syntheticQuery(tc.qname, search)
+		got, expanded, ok := syntheticQuery(tc.qname, isHostSuffix)
 		assert.Equal(t, tc.ok, ok, tc.qname)
 		assert.Equal(t, tc.expanded, expanded, tc.qname)
 		assert.Equal(t, tc.want, got, tc.qname)
 	}
 
-	_, _, ok := syntheticQuery("_gateway.lan.", nil)
+	_, _, ok := syntheticQuery("_gateway.lan.", func(string) bool { return false })
 	assert.False(t, ok, "with no search list the expanded form is an ordinary query")
 }
 
@@ -241,7 +240,7 @@ func TestServeSynthetic_RelaysLocalhostFamily(t *testing.T) {
 // included, treats as "try the next form" — and never relayed to the stub.
 func TestServeSynthetic_ExpandedIsNXDomain(t *testing.T) {
 	s, seen := syntheticServer(t)
-	withResolvConf(t, "search lan vm.blacksmith.sh\n")
+	s.config.SetHostSearchDomains([]string{"lan", "vm.blacksmith.sh"}, s.logger)
 
 	for _, q := range []string{"_gateway.lan.", "_gateway.vm.blacksmith.sh.", "_outbound.lan."} {
 		m := askName(t, s, q, dns.TypeA)
@@ -261,7 +260,7 @@ func TestServeSynthetic_ExpandedOtherwiseOrdinary(t *testing.T) {
 	m := askName(t, s, "_gateway.lan.", dns.TypeA)
 	assert.Equal(t, dns.RcodeRefused, m.Rcode, "no search list")
 
-	withResolvConf(t, "search lan\n")
+	s.config.SetHostSearchDomains([]string{"lan"}, s.logger)
 	m = askName(t, s, "_gateway.example.com.", dns.TypeA)
 	assert.Equal(t, dns.RcodeRefused, m.Rcode, "suffix not on the search list")
 }

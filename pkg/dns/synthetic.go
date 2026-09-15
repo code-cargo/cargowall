@@ -41,11 +41,11 @@ var resolvedStubAddr = "127.0.0.53:53"
 // the query down the ordinary path: /run/systemd/resolve outlives a stopped
 // resolved (RuntimeDirectoryPreserve=yes), so presence proves nothing, and
 // the connection-refused round trip on loopback is the cheapest true probe.
-func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg, search []string) bool {
+func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
 	if len(r.Question) == 0 || r.Question[0].Qclass != dns.ClassINET || !s.hostListener(w) {
 		return false
 	}
-	name, expanded, ok := syntheticQuery(r.Question[0].Name, search)
+	name, expanded, ok := syntheticQuery(r.Question[0].Name, s.config.IsHostSearchSuffix)
 	if !ok {
 		return false
 	}
@@ -80,8 +80,8 @@ func (s *Server) hostListener(w dns.ResponseWriter) bool {
 
 // syntheticQuery classifies a wire-form query name: a localhost-family name,
 // a bare underscore name, its search-expanded form (first label synthetic,
-// remainder one of the host's search suffixes), or neither.
-func syntheticQuery(qname string, search []string) (name string, expanded, ok bool) {
+// remainder a host search suffix per isHostSuffix), or neither.
+func syntheticQuery(qname string, isHostSuffix func(string) bool) (name string, expanded, ok bool) {
 	full := strings.ToLower(strings.TrimSuffix(qname, "."))
 	for _, root := range localhostRoots {
 		if full == root || strings.HasSuffix(full, "."+root) {
@@ -95,7 +95,7 @@ func syntheticQuery(qname string, search []string) (name string, expanded, ok bo
 	if !hasRest {
 		return first, false, true
 	}
-	if slices.Contains(search, rest) {
+	if isHostSuffix(rest) {
 		return first, true, true
 	}
 	return "", false, false

@@ -112,10 +112,6 @@ type Server struct {
 	// recentDNSBlocks buffers refused QUERIES for the same reconciliation on
 	// the DNS side (#119); see reconcileRefusedQueries.
 	recentDNSBlocks *events.RecentDNSBlocks
-
-	// hostSearch feeds the host's resolv.conf search list to the config
-	// manager as a strip-only suffix source (#127); see hostsearch.go.
-	hostSearch hostSearchSource
 }
 
 // dnsCacheEntry holds a cached DNS response
@@ -389,9 +385,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// No TTL cleanup needed - IPs persist until updated by new DNS responses
 	// DNS cache uses lazy expiration - no cleanup goroutine needed
 
-	// Seed the host search list before any listener answers, so the first
-	// query is judged with it (#127).
-	s.hostSearch.refresh(s.config, s.logger)
+	s.seedHostSearchDomains()
 
 	// Collect all addresses to listen on
 	allAddrs := []string{s.listenAddr}
@@ -537,13 +531,9 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		"type", queryType,
 		"upstream", s.upstream)
 
-	// The host search list is what a stub resolver expands single-label
-	// names with; keep the manager's strip-only copy current (#127).
-	search := s.hostSearch.refresh(s.config, s.logger)
-
 	// systemd-resolved's synthetic names are relayed to the stub, ahead of
 	// the filter gate and the cache.
-	if s.serveSynthetic(w, r, search) {
+	if s.serveSynthetic(w, r) {
 		return
 	}
 

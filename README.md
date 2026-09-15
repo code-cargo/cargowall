@@ -123,7 +123,7 @@ Matching is case-insensitive; when configured suffixes overlap, the longest matc
 
 Suffixes must have at least two labels **and** must not themselves be public suffixes per [Mozilla's PSL](https://publicsuffix.org/); `.com`, `.co.uk`, `.com.au`, `.github.io`, and similar TLD-equivalents are rejected at config load.
 
-The runner's own `resolv.conf` search list is honoured automatically, for **stripping only**: a stub resolver asks `myservice.corp.lan` before `myservice` on a host with `search corp.lan`, so that expanded form is judged as `myservice`. It never grants the bypass — `resolv.conf` is written by DHCP, not by you — and public suffixes on it are ignored. The file is re-read whenever it changes.
+The runner's own `resolv.conf` search list is honoured automatically, for **stripping only**: a stub resolver asks `myservice.corp.lan` before `myservice` on a host with `search corp.lan`, so that expanded form is judged as `myservice`. It never grants the bypass — `resolv.conf` is written by DHCP, not by you — and public suffixes on it are ignored. It is read when the proxy starts.
 
 See the [cargowall-action README](https://github.com/code-cargo/cargowall-action) for full usage, inputs, outputs, and examples.
 

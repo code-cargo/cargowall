@@ -18,53 +18,23 @@ package dns
 
 import (
 	"bufio"
-	"log/slog"
 	"os"
 	"strings"
-	"sync"
-	"time"
-
-	"github.com/code-cargo/cargowall/pkg/config"
 )
 
 // resolvConfPath is the client resolver config whose search list is
 // honoured; a var so tests can point it at a fixture.
 var resolvConfPath = "/etc/resolv.conf"
 
-// hostSearchSource keeps the config manager's host search list (#127) in
-// step with resolv.conf: a stat per query, a re-read and
-// SetHostSearchDomains only when the file changes. DHCP rewrites it mid-run.
-type hostSearchSource struct {
-	mu      sync.Mutex
-	loaded  bool
-	modTime time.Time
-	size    int64
-	domains []string
-}
-
-// refresh returns the current search list, re-reading resolv.conf and
-// pushing it to the manager when the file has changed. An absent file
-// yields an empty list, and clears the manager's copy if one was pushed.
-func (h *hostSearchSource) refresh(cm *config.Manager, logger *slog.Logger) []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	st, err := os.Stat(resolvConfPath)
-	if err != nil {
-		if h.loaded && h.domains != nil {
-			cm.SetHostSearchDomains(nil, logger)
-		}
-		h.loaded, h.domains = true, nil
-		return nil
+// seedHostSearchDomains publishes the host's resolv.conf search list to the
+// config manager as a strip-only suffix source (#127). Read once at Start:
+// the list is boot-time DHCP state and a job is short-lived.
+func (s *Server) seedHostSearchDomains() {
+	domains := hostSearchDomains(resolvConfPath)
+	s.config.SetHostSearchDomains(domains, s.logger)
+	if len(domains) > 0 {
+		s.logger.Info("Host search domains active for rule matching", "domains", domains)
 	}
-	if h.loaded && st.ModTime().Equal(h.modTime) && st.Size() == h.size {
-		return h.domains
-	}
-	h.loaded, h.modTime, h.size = true, st.ModTime(), st.Size()
-	h.domains = hostSearchDomains(resolvConfPath)
-	cm.SetHostSearchDomains(h.domains, logger)
-	logger.Debug("Host search domains loaded", "domains", h.domains, "path", resolvConfPath)
-	return h.domains
 }
 
 // hostSearchDomains reads resolv.conf's search list: the last "search" or

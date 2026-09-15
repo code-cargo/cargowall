@@ -20,8 +20,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
@@ -32,25 +32,12 @@ import (
 	"github.com/code-cargo/cargowall/pkg/firewall"
 )
 
-func TestHostSearchSource_TracksResolvConf(t *testing.T) {
-	withResolvConf(t, "search lan\n")
-	cm := config.NewConfigManager()
-	var src hostSearchSource
-
-	assert.Equal(t, []string{"lan"}, src.refresh(cm, slog.Default()))
-	assert.Equal(t, []string{".lan"}, cm.HostSearchDomains())
-
-	// Rewritten (DHCP renew): the manager follows once the file changes.
-	require.NoError(t, os.WriteFile(resolvConfPath, []byte("search corp.example lan\n"), 0o644))
-	later := time.Now().Add(2 * time.Second)
-	require.NoError(t, os.Chtimes(resolvConfPath, later, later))
-	assert.Equal(t, []string{"corp.example", "lan"}, src.refresh(cm, slog.Default()))
-	assert.ElementsMatch(t, []string{".corp.example", ".lan"}, cm.HostSearchDomains())
-
-	// Gone: cleared, not stale.
-	require.NoError(t, os.Remove(resolvConfPath))
-	assert.Nil(t, src.refresh(cm, slog.Default()))
-	assert.Empty(t, cm.HostSearchDomains())
+// No test may inherit the machine's own search list: point the resolver
+// config at a path that does not exist, so Start seeds nothing unless a test
+// opts in through withResolvConf.
+func TestMain(m *testing.M) {
+	resolvConfPath = filepath.Join(os.TempDir(), "cargowall-dns-test-absent-resolv.conf")
+	os.Exit(m.Run())
 }
 
 func TestHostSearchDomains_Parse(t *testing.T) {
@@ -63,30 +50,40 @@ func TestHostSearchDomains_Parse(t *testing.T) {
 	assert.Nil(t, hostSearchDomains(resolvConfPath), "unreadable file: no search list")
 }
 
+func TestSeedHostSearchDomains(t *testing.T) {
+	withResolvConf(t, "search corp.lan com\n")
+	cfg := config.NewConfigManager()
+	s := newTestServer(t, cfg, firewall.NewMockFirewall(t))
+	s.logger = slog.Default()
+	s.seedHostSearchDomains()
+	assert.Equal(t, []string{".corp.lan"}, cfg.HostSearchDomains(), "published through the manager's normalization: public suffix dropped")
+
+	withResolvConf(t, "")
+	s.seedHostSearchDomains()
+	assert.Empty(t, cfg.HostSearchDomains())
+}
+
 // The expanded form of an allowed single-label name passes the gate; the
 // expanded form of an unknown one does not — stripping is not a bypass.
 func TestIsQueryAllowed_HostSearchExpandedForm(t *testing.T) {
-	withResolvConf(t, "search corp.lan\n")
 	cfg := config.NewConfigManager()
 	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
 		{Type: config.RuleTypeHostname, Value: "myservice", Action: config.ActionAllow},
 	}, config.ActionDeny))
+	cfg.SetHostSearchDomains([]string{"corp.lan"}, slog.Default())
 	s := newTestServer(t, cfg, firewall.NewMockFirewall(t))
 	s.filterQueries = true
-	s.hostSearch.refresh(cfg, s.logger)
 
 	assert.True(t, s.isQueryAllowed("myservice.corp.lan", dns.TypeA))
 	assert.True(t, s.isQueryAllowed("myservice", dns.TypeA))
 	assert.False(t, s.isQueryAllowed("other.corp.lan", dns.TypeA))
 }
 
-// End to end, the c-ares shape: the FIRST query on the wire for "myservice"
-// on a host with "search corp.lan" is "myservice.corp.lan". It must be
-// forwarded, answered, and its address opened under rule "myservice" — not
-// REFUSED, which ends c-ares' search before the bare name.
+// End to end, the shape every stub resolver produces: the FIRST query on the
+// wire for "myservice" on a host with "search corp.lan" is
+// "myservice.corp.lan" — and for a real host that is the record. It must be
+// forwarded, answered, and its address opened under rule "myservice".
 func TestHandleDNSQuery_HostSearchExpandedFormResolvesAndEnforces(t *testing.T) {
-	withResolvConf(t, "search corp.lan\n")
-
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	started := make(chan struct{})
@@ -115,6 +112,7 @@ func TestHandleDNSQuery_HostSearchExpandedFormResolvesAndEnforces(t *testing.T) 
 	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
 		{Type: config.RuleTypeHostname, Value: "myservice", Action: config.ActionAllow},
 	}, config.ActionDeny))
+	cfg.SetHostSearchDomains([]string{"corp.lan"}, slog.Default())
 	mockFw := firewall.NewMockFirewall(t)
 	mockFw.On("AddIP",
 		mock.MatchedBy(func(ip net.IP) bool { return ip.Equal(net.ParseIP("192.0.2.10")) }),

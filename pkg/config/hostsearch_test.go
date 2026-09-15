@@ -12,6 +12,8 @@
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 
+//go:build linux
+
 package config
 
 import (
@@ -76,6 +78,19 @@ func TestSetHostSearchDomains_SurvivesPolicyLoadAndClears(t *testing.T) {
 	cm.SetHostSearchDomains(nil, slog.Default())
 	if cm.MatchHostnameRule("svc.lan").HasAllow() {
 		t.Error("a cleared host search list must stop stripping")
+	}
+}
+
+func TestIsHostSearchSuffix(t *testing.T) {
+	cm := NewConfigManager()
+	cm.SetHostSearchDomains([]string{"corp.lan", "lan"}, slog.Default())
+	for suffix, want := range map[string]bool{
+		"corp.lan": true, "CORP.LAN": true, ".corp.lan": true, "corp.lan.": true, "lan": true,
+		"blacksmith.sh": false, "orp.lan": false, "": false,
+	} {
+		if got := cm.IsHostSearchSuffix(suffix); got != want {
+			t.Errorf("IsHostSearchSuffix(%q) = %v, want %v", suffix, got, want)
+		}
 	}
 }
 

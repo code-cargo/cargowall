@@ -176,9 +176,8 @@ type Manager struct {
 	// See autoallow.go.
 	autoAllows []autoAllowEntry
 
-	// hostSearchDomains is the host's own resolv.conf search list: a
-	// strip-only suffix source, never bypass, kept outside config so a
-	// policy load leaves it alone. See hostsearch.go.
+	// hostSearchDomains is the host's resolv.conf search list, strip-only;
+	// see hostsearch.go.
 	hostSearchDomains []string
 
 	// nameToIPs is the L7 per-IP binding evidence, populated only by the
@@ -400,28 +399,26 @@ func (cm *Manager) StripSearchDomains(hostname string) string {
 // helpers consume the lowercase form directly, so case preservation lives
 // only on the public StripSearchDomains path.
 func (cm *Manager) stripSearchDomainsLocked(name string) string {
-	longest := 0
-	for _, suffix := range kubernetesSearchDomains {
-		if len(suffix) > longest && strings.HasSuffix(name, suffix) {
-			longest = len(suffix)
-		}
-	}
+	longest := longestSuffix(name, kubernetesSearchDomains, 0)
 	if cm.config != nil {
-		for _, suffix := range cm.config.SearchDomains {
-			if len(suffix) > longest && strings.HasSuffix(name, suffix) {
-				longest = len(suffix)
-			}
-		}
+		longest = longestSuffix(name, cm.config.SearchDomains, longest)
 	}
-	for _, suffix := range cm.hostSearchDomains {
-		if len(suffix) > longest && strings.HasSuffix(name, suffix) {
-			longest = len(suffix)
-		}
-	}
+	longest = longestSuffix(name, cm.hostSearchDomains, longest)
 	if longest == 0 {
 		return name
 	}
 	return name[:len(name)-longest]
+}
+
+// longestSuffix returns the length of the longest suffix in suffixes that
+// name ends with, if longer than the running best.
+func longestSuffix(name string, suffixes []string, longest int) int {
+	for _, suffix := range suffixes {
+		if len(suffix) > longest && strings.HasSuffix(name, suffix) {
+			longest = len(suffix)
+		}
+	}
+	return longest
 }
 
 // mergeNormalizedSearchDomains returns the dedup'd union of two

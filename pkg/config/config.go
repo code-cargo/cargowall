@@ -403,11 +403,29 @@ func (cm *Manager) stripSearchDomainsLocked(name string) string {
 	if cm.config != nil {
 		longest = longestSuffix(name, cm.config.SearchDomains, longest)
 	}
-	longest = longestSuffix(name, cm.hostSearchDomains, longest)
 	if longest == 0 {
 		return name
 	}
 	return name[:len(name)-longest]
+}
+
+// stripCandidatesLocked returns the distinct stripped forms of a lowercase
+// name, in precedence order: the policy strip (Kubernetes defaults and the
+// operator's search-domains — the form every existing rule was written
+// against), then the host strip (resolv.conf list, hostsearch.go). Separate
+// candidates, not one longest pick: a host suffix longer than a policy
+// suffix must add a form, never displace the one rules already match.
+func (cm *Manager) stripCandidatesLocked(name string) []string {
+	var out []string
+	if s := cm.stripSearchDomainsLocked(name); s != name {
+		out = append(out, s)
+	}
+	if n := longestSuffix(name, cm.hostSearchDomains, 0); n > 0 {
+		if s := name[:len(name)-n]; s != name && !slices.Contains(out, s) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // longestSuffix returns the length of the longest suffix in suffixes that
@@ -1251,64 +1269,63 @@ func (cm *Manager) MatchHostnameRule(hostname string) HostnameVerdict {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	hostname = strings.ToLower(hostname)
-
-	actionFull, portsFull, valueFull := cm.matchHostnameRuleLocked(hostname)
-	stripped := cm.stripSearchDomainsLocked(hostname)
-	if stripped == hostname {
-		return singleFormVerdict(actionFull, portsFull, valueFull)
-	}
-
-	actionStripped, portsStripped, valueStripped := cm.matchHostnameRuleLocked(stripped)
-
-	// Same-action: collapse into one side of the verdict.
-	if actionFull == ActionDeny && actionStripped == ActionDeny {
-		mergedPorts := UnionPorts(portsFull, portsStripped)
-		denyRule := valueFull
-		if pickDenyForm(valueFull, hostname, portsFull, valueStripped, stripped, portsStripped) {
-			denyRule = valueStripped
-		}
-		return HostnameVerdict{DenyPorts: mergedPorts, DenyRule: denyRule}
-	}
-	if actionFull == ActionAllow && actionStripped == ActionAllow {
-		if pickAllowForm(valueFull, hostname, valueStripped, stripped) {
-			return HostnameVerdict{AllowPorts: portsStripped, AllowRule: valueStripped}
-		}
-		return HostnameVerdict{AllowPorts: portsFull, AllowRule: valueFull}
-	}
-
-	// One form matched, the other didn't.
-	if actionStripped == "" {
-		return singleFormVerdict(actionFull, portsFull, valueFull)
-	}
-	if actionFull == "" {
-		return singleFormVerdict(actionStripped, portsStripped, valueStripped)
-	}
-
-	// Mixed: one deny, one allow. Record both sides so port-aware callers
-	// (firewall writes) can emit faithful BPF entries.
+	deny, denyPorts, allow := foldForms(cm.matchFormsLocked(strings.ToLower(hostname)))
 	var v HostnameVerdict
-	if actionFull == ActionDeny {
-		v.DenyPorts, v.DenyRule = portsFull, valueFull
-		v.AllowPorts, v.AllowRule = portsStripped, valueStripped
-	} else {
-		v.AllowPorts, v.AllowRule = portsFull, valueFull
-		v.DenyPorts, v.DenyRule = portsStripped, valueStripped
+	if deny != nil {
+		v.DenyPorts, v.DenyRule = denyPorts, deny.value
+	}
+	if allow != nil {
+		v.AllowPorts, v.AllowRule = allow.ports, allow.value
 	}
 	return v
 }
 
-// singleFormVerdict packages a single (action, ports, value) tuple from
-// matchHostnameRuleLocked into the corresponding HostnameVerdict side.
-func singleFormVerdict(action Action, ports []Port, value string) HostnameVerdict {
-	switch action {
-	case ActionDeny:
-		return HostnameVerdict{DenyPorts: ports, DenyRule: value}
-	case ActionAllow:
-		return HostnameVerdict{AllowPorts: ports, AllowRule: value}
-	default:
-		return HostnameVerdict{}
+// formMatch is one evaluated form of a lookup name: the name as asked, or
+// one of its stripped forms.
+type formMatch struct {
+	name   string
+	action Action
+	ports  []Port
+	value  string
+}
+
+// matchFormsLocked evaluates the full name and each stripped candidate, in
+// precedence order. Caller must hold cm.mu.RLock and pass lowercase.
+func (cm *Manager) matchFormsLocked(hostname string) []formMatch {
+	names := append([]string{hostname}, cm.stripCandidatesLocked(hostname)...)
+	forms := make([]formMatch, 0, len(names))
+	for _, n := range names {
+		action, ports, value := cm.matchHostnameRuleLocked(n)
+		forms = append(forms, formMatch{name: n, action: action, ports: ports, value: value})
 	}
+	return forms
+}
+
+// foldForms reduces the forms to the deny and allow rule that fire, each
+// nil when none did. Denies union their ports and attribute by pickDenyForm;
+// allows attribute by pickAllowForm and carry the chosen form's ports. Ties
+// keep the earlier form, so the name as asked outranks its stripped forms.
+// One of each is a mixed verdict, recorded on both sides.
+func foldForms(forms []formMatch) (deny *formMatch, denyPorts []Port, allow *formMatch) {
+	for i := range forms {
+		f := &forms[i]
+		switch f.action {
+		case ActionDeny:
+			if deny == nil {
+				deny, denyPorts = f, copyPorts(f.ports)
+				continue
+			}
+			denyPorts = UnionPorts(denyPorts, f.ports)
+			if pickDenyForm(deny.value, deny.name, deny.ports, f.value, f.name, f.ports) {
+				deny = f
+			}
+		case ActionAllow:
+			if allow == nil || pickAllowForm(allow.value, allow.name, f.value, f.name) {
+				allow = f
+			}
+		}
+	}
+	return deny, denyPorts, allow
 }
 
 // matchedExactly reports whether the rule whose Value-field is `ruleValue`
@@ -1583,54 +1600,19 @@ func (cm *Manager) CheckIPRuleConflict(ip net.IP, hostname string, hostnameActio
 // downstream re-lookup would late-allow traffic that should have been
 // blocked.
 func (cm *Manager) FindTrackedHostname(name string) string {
-	name = strings.ToLower(name)
-
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	actionFull, portsFull, valueFull := cm.matchHostnameRuleLocked(name)
-	stripped := cm.stripSearchDomainsLocked(name)
-	if stripped == name {
-		if actionFull == "" {
-			return ""
-		}
-		return chosenAttributionName(name, valueFull)
-	}
-
-	actionStripped, portsStripped, valueStripped := cm.matchHostnameRuleLocked(stripped)
-
+	// The same fold as MatchHostnameRule, so audit attribution names the
+	// rule the verdict fired on; a deny outranks an allow, as it does there.
+	deny, _, allow := foldForms(cm.matchFormsLocked(strings.ToLower(name)))
 	switch {
-	case actionFull == ActionDeny && actionStripped == ActionDeny:
-		// Both denies — pickDenyForm picks the same rule MatchHostnameRule
-		// would attribute, so audit attribution matches the verdict.
-		if pickDenyForm(valueFull, name, portsFull, valueStripped, stripped, portsStripped) {
-			return chosenAttributionName(stripped, valueStripped)
-		}
-		return chosenAttributionName(name, valueFull)
-	case actionFull == ActionDeny:
-		// Full form denies (typically a parent or pattern rule covering
-		// the suffixed name). Attribute to the full form so downstream
-		// MatchHostnameRule re-lookups preserve the deny.
-		return chosenAttributionName(name, valueFull)
-	case actionStripped == ActionDeny:
-		return chosenAttributionName(stripped, valueStripped)
+	case deny != nil:
+		return chosenAttributionName(deny.name, deny.value)
+	case allow != nil:
+		return chosenAttributionName(allow.name, allow.value)
 	}
-
-	// Allow case — attribution flows through chosenAttributionName so
-	// overlapping allow parents resolve to the same longest-suffix winner
-	// MatchHostnameRule picks.
-	switch {
-	case actionFull == "" && actionStripped == "":
-		return ""
-	case actionFull == "":
-		return chosenAttributionName(stripped, valueStripped)
-	case actionStripped == "":
-		return chosenAttributionName(name, valueFull)
-	}
-	if pickAllowForm(valueFull, name, valueStripped, stripped) {
-		return chosenAttributionName(stripped, valueStripped)
-	}
-	return chosenAttributionName(name, valueFull)
+	return ""
 }
 
 // chosenAttributionName returns the hostname that corresponds to the rule

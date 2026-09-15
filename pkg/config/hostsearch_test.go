@@ -42,25 +42,97 @@ func TestSetHostSearchDomains_StripOnly(t *testing.T) {
 	if cm.HasSearchDomainSuffix("other.corp.lan") {
 		t.Error("host search domains must never grant the search-domain bypass")
 	}
-	if got := cm.StripSearchDomains("myservice.corp.lan"); got != "myservice" {
-		t.Errorf("StripSearchDomains = %q, want myservice", got)
+	if got := cm.StripSearchDomains("myservice.corp.lan"); got != "myservice.corp.lan" {
+		t.Errorf("StripSearchDomains = %q, want the name unchanged: the host list is a matching candidate, not the canonical strip", got)
+	}
+	if got := cm.FindTrackedHostname("myservice.corp.lan"); got != "myservice" {
+		t.Errorf("FindTrackedHostname = %q, want myservice (attribution names the rule that fired)", got)
 	}
 }
 
+// A host suffix longer than a policy suffix must not displace the stripped
+// form existing rules were written against (#130 review). Runner pod in
+// namespace "runners": the Kubernetes strip yields db.runners, the host strip
+// yields db; rules against either must keep matching.
+func TestHostSearch_DoesNotDisplacePolicyStrip(t *testing.T) {
+	const fqdn = "db.runners.svc.cluster.local"
+	hostList := []string{"runners.svc.cluster.local", "svc.cluster.local", "cluster.local"}
+
+	cm := newCMWithSearchDomains(t, []Rule{{Type: RuleTypeHostname, Value: "db.runners", Action: ActionAllow}})
+	cm.SetHostSearchDomains(hostList, slog.Default())
+	if v := cm.MatchHostnameRule(fqdn); !v.HasAllow() || v.AllowRule != "db.runners" {
+		t.Errorf("allow db.runners: verdict %+v, want allow via db.runners", v)
+	}
+	if got := cm.FindTrackedHostname(fqdn); got != "db.runners" {
+		t.Errorf("FindTrackedHostname = %q, want db.runners", got)
+	}
+
+	// Deny variant under default allow: the deny must keep applying.
+	cm = NewConfigManager()
+	if err := cm.LoadConfigFromRules([]Rule{{Type: RuleTypeHostname, Value: "db.runners", Action: ActionDeny}}, ActionAllow); err != nil {
+		t.Fatal(err)
+	}
+	cm.SetHostSearchDomains(hostList, slog.Default())
+	if v := cm.MatchHostnameRule(fqdn); !v.HasDeny() || v.DenyRule != "db.runners" {
+		t.Errorf("deny db.runners: verdict %+v, want deny via db.runners", v)
+	}
+
+	// The host strip is an additional form: a rule against it matches too.
+	cm = newCMWithSearchDomains(t, []Rule{{Type: RuleTypeHostname, Value: "db", Action: ActionAllow}})
+	cm.SetHostSearchDomains(hostList, slog.Default())
+	if v := cm.MatchHostnameRule(fqdn); !v.HasAllow() || v.AllowRule != "db" {
+		t.Errorf("allow db: verdict %+v, want allow via db (host strip)", v)
+	}
+
+	// Operator suffix plus a longer DHCP suffix, no Kubernetes involved.
+	cm = newCMWithSearchDomains(t, []Rule{{Type: RuleTypeHostname, Value: "db.team", Action: ActionAllow}}, ".corp.example")
+	cm.SetHostSearchDomains([]string{"team.corp.example"}, slog.Default())
+	if v := cm.MatchHostnameRule("db.team.corp.example"); !v.HasAllow() || v.AllowRule != "db.team" {
+		t.Errorf("operator strip: verdict %+v, want allow via db.team", v)
+	}
+}
+
+// Policy strip and host strip matching opposite rules is a mixed verdict,
+// and attribution follows the deny — the same precedence the two-form
+// verdict always had.
+func TestHostSearch_PolicyAndHostFormsDisagree(t *testing.T) {
+	cm := newCMWithSearchDomains(t, []Rule{
+		{Type: RuleTypeHostname, Value: "db.runners", Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "db", Action: ActionDeny},
+	})
+	cm.SetHostSearchDomains([]string{"runners.svc.cluster.local"}, slog.Default())
+	v := cm.MatchHostnameRule("db.runners.svc.cluster.local")
+	if !v.HasAllow() || v.AllowRule != "db.runners" || !v.HasDeny() || v.DenyRule != "db" {
+		t.Errorf("verdict %+v, want mixed: allow db.runners, deny db", v)
+	}
+	if got := cm.FindTrackedHostname("db.runners.svc.cluster.local"); got != "db" {
+		t.Errorf("FindTrackedHostname = %q, want db (deny outranks allow)", got)
+	}
+}
+
+// Within the host list the longest suffix wins, as within the policy list:
+// with "search corp.lan lan" a resolver expands "a" to "a.corp.lan", whose
+// host form is "a" — not "a.corp".
 func TestSetHostSearchDomains_LongestSuffixWins(t *testing.T) {
 	cm := newCMWithSearchDomains(t, []Rule{{Type: RuleTypeHostname, Value: "a", Action: ActionAllow}})
 	cm.SetHostSearchDomains([]string{"lan", "corp.lan"}, slog.Default())
-	if got := cm.StripSearchDomains("a.corp.lan"); got != "a" {
-		t.Errorf("StripSearchDomains = %q, want a (longest suffix)", got)
+	if v := cm.MatchHostnameRule("a.corp.lan"); !v.HasAllow() || v.AllowRule != "a" {
+		t.Errorf("verdict %+v, want allow via rule a", v)
+	}
+
+	cm = newCMWithSearchDomains(t, []Rule{{Type: RuleTypeHostname, Value: "a.corp", Action: ActionAllow}})
+	cm.SetHostSearchDomains([]string{"lan", "corp.lan"}, slog.Default())
+	if v := cm.MatchHostnameRule("a.corp.lan"); v.Matched() {
+		t.Errorf("verdict %+v, want no match: only the longest host suffix is a candidate", v)
 	}
 }
 
 func TestSetHostSearchDomains_NormalizesAndSkipsPublicSuffixes(t *testing.T) {
 	cm := NewConfigManager()
-	cm.SetHostSearchDomains([]string{" Corp.LAN. ", "lan", "internal", "com", "co.uk", "github.io", "", "lan"}, slog.Default())
+	cm.SetHostSearchDomains([]string{" Corp.LAN. ", "lan", "internal", "home.arpa", "com", "co.uk", "github.io", "", "lan"}, slog.Default())
 	got := cm.HostSearchDomains()
 	slices.Sort(got)
-	want := []string{".corp.lan", ".internal", ".lan"}
+	want := []string{".corp.lan", ".home.arpa", ".internal", ".lan"}
 	if !slices.Equal(got, want) {
 		t.Errorf("HostSearchDomains = %v, want %v (public suffixes skipped, single private labels kept, deduped)", got, want)
 	}
@@ -99,8 +171,9 @@ func TestIsPublicSuffix(t *testing.T) {
 		in   string
 		want bool
 	}{
-		{"lan", false},      // unknown single label: the PSL default rule, not a real suffix
-		{"internal", false}, // private-use entry, single label
+		{"lan", false},       // unknown single label: the PSL default rule, not a real suffix
+		{"internal", false},  // private-use entry, single label
+		{"home.arpa", false}, // ICANN PSL entry, but RFC 8375 special-use: unregistrable, safe to strip
 		{"corp.lan", false},
 		{"compute.internal", false},
 		{"com", true},

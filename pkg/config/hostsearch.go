@@ -67,12 +67,19 @@ func (cm *Manager) IsHostSearchSuffix(suffix string) bool {
 	return slices.Contains(cm.hostSearchDomains, "."+strings.ToLower(strings.Trim(suffix, ".")))
 }
 
+// specialUseSuffixes are on the PSL but can never be registered, so
+// stripping them is safe: home.arpa (RFC 8375; pfSense's default domain).
+var specialUseSuffixes = map[string]bool{"home.arpa": true}
+
 // isPublicSuffix reports whether a bare suffix is a public suffix. Stripping
 // one would let rule "foo" match "foo.com". The PSL's default rule makes
 // every unknown single label its own suffix — which is what a private search
 // domain like "lan" looks like — so a single label counts only when the PSL
 // knows it as an ICANN suffix.
 func isPublicSuffix(bare string) bool {
+	if specialUseSuffixes[bare] {
+		return false
+	}
 	ps, icann := publicsuffix.PublicSuffix(bare)
 	if ps != bare {
 		return false

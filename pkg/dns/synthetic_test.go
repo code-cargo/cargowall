@@ -138,18 +138,8 @@ func askName(t *testing.T, s *Server, name string, qtype uint16) *dns.Msg {
 	return ask(t, s, &MockResponseWriter{}, q)
 }
 
-func TestHostSearchDomains(t *testing.T) {
-	withResolvConf(t, "# generated\nnameserver 127.0.0.53\noptions edns0 trust-ad\n"+
-		"domain old.example\n"+ // superseded: last directive wins
-		"search LAN corp.example. # trailing comment\n")
-	assert.Equal(t, []string{"lan", "corp.example"}, hostSearchDomains(resolvConfPath))
-
-	withResolvConf(t, "")
-	assert.Nil(t, hostSearchDomains(resolvConfPath), "unreadable file: no expansion recognised")
-}
-
 func TestSyntheticQuery(t *testing.T) {
-	withResolvConf(t, "search lan vm.blacksmith.sh\n")
+	search := []string{"lan", "vm.blacksmith.sh"}
 	for _, tc := range []struct {
 		qname    string
 		want     string
@@ -175,14 +165,13 @@ func TestSyntheticQuery(t *testing.T) {
 		{"localhost.example.com.", "", false, false},
 		{"notlocalhost.", "", false, false},
 	} {
-		got, expanded, ok := syntheticQuery(tc.qname)
+		got, expanded, ok := syntheticQuery(tc.qname, search)
 		assert.Equal(t, tc.ok, ok, tc.qname)
 		assert.Equal(t, tc.expanded, expanded, tc.qname)
 		assert.Equal(t, tc.want, got, tc.qname)
 	}
 
-	withResolvConf(t, "")
-	_, _, ok := syntheticQuery("_gateway.lan.")
+	_, _, ok := syntheticQuery("_gateway.lan.", nil)
 	assert.False(t, ok, "with no search list the expanded form is an ordinary query")
 }
 

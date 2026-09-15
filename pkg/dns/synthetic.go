@@ -17,8 +17,6 @@
 package dns
 
 import (
-	"bufio"
-	"os"
 	"slices"
 	"strings"
 
@@ -35,22 +33,19 @@ var (
 	localhostRoots = []string{"localhost", "localhost.localdomain"}
 )
 
-// Injection points for tests.
-var (
-	resolvedStubAddr = "127.0.0.53:53"
-	resolvConfPath   = "/etc/resolv.conf"
-)
+// resolvedStubAddr is a var so tests can point the relay at a fake stub.
+var resolvedStubAddr = "127.0.0.53:53"
 
 // serveSynthetic answers a synthetic-name query — host listeners, IN class —
 // reporting whether it wrote a response. A stub that does not answer sends
 // the query down the ordinary path: /run/systemd/resolve outlives a stopped
 // resolved (RuntimeDirectoryPreserve=yes), so presence proves nothing, and
 // the connection-refused round trip on loopback is the cheapest true probe.
-func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
+func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg, search []string) bool {
 	if len(r.Question) == 0 || r.Question[0].Qclass != dns.ClassINET || !s.hostListener(w) {
 		return false
 	}
-	name, expanded, ok := syntheticQuery(r.Question[0].Name)
+	name, expanded, ok := syntheticQuery(r.Question[0].Name, search)
 	if !ok {
 		return false
 	}
@@ -85,9 +80,8 @@ func (s *Server) hostListener(w dns.ResponseWriter) bool {
 
 // syntheticQuery classifies a wire-form query name: a localhost-family name,
 // a bare underscore name, its search-expanded form (first label synthetic,
-// remainder a suffix on the host's resolv.conf search list), or neither.
-// resolv.conf is read only after the first label matches.
-func syntheticQuery(qname string) (name string, expanded, ok bool) {
+// remainder one of the host's search suffixes), or neither.
+func syntheticQuery(qname string, search []string) (name string, expanded, ok bool) {
 	full := strings.ToLower(strings.TrimSuffix(qname, "."))
 	for _, root := range localhostRoots {
 		if full == root || strings.HasSuffix(full, "."+root) {
@@ -101,34 +95,8 @@ func syntheticQuery(qname string) (name string, expanded, ok bool) {
 	if !hasRest {
 		return first, false, true
 	}
-	if slices.Contains(hostSearchDomains(resolvConfPath), rest) {
+	if slices.Contains(search, rest) {
 		return first, true, true
 	}
 	return "", false, false
-}
-
-// hostSearchDomains reads resolv.conf's search list: the last "search" or
-// "domain" directive wins, as glibc reads it; unreadable yields nil.
-func hostSearchDomains(path string) []string {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	var domains []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) < 2 || (fields[0] != "search" && fields[0] != "domain") {
-			continue
-		}
-		domains = domains[:0]
-		for _, d := range fields[1:] {
-			if strings.HasPrefix(d, "#") || strings.HasPrefix(d, ";") {
-				break
-			}
-			domains = append(domains, strings.ToLower(strings.TrimSuffix(d, ".")))
-		}
-	}
-	return domains
 }

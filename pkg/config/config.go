@@ -176,6 +176,11 @@ type Manager struct {
 	// See autoallow.go.
 	autoAllows []autoAllowEntry
 
+	// hostSearchDomains is the host's own resolv.conf search list: a
+	// strip-only suffix source, never bypass, kept outside config so a
+	// policy load leaves it alone. See hostsearch.go.
+	hostSearchDomains []string
+
 	// nameToIPs is the L7 per-IP binding evidence, populated only by the
 	// forward-resolution paths. Guarded by bindMu, NOT mu — its lookups sit on
 	// the DNS answer and L7 punt hot paths. See binding.go.
@@ -406,6 +411,11 @@ func (cm *Manager) stripSearchDomainsLocked(name string) string {
 			if len(suffix) > longest && strings.HasSuffix(name, suffix) {
 				longest = len(suffix)
 			}
+		}
+	}
+	for _, suffix := range cm.hostSearchDomains {
+		if len(suffix) > longest && strings.HasSuffix(name, suffix) {
+			longest = len(suffix)
 		}
 	}
 	if longest == 0 {

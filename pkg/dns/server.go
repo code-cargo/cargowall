@@ -529,8 +529,8 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		"type", queryType,
 		"upstream", s.upstream)
 
-	// systemd-resolved's synthetic names (#126): relayed to the stub, ahead
-	// of the filter gate and the cache. See synthetic.go.
+	// systemd-resolved's synthetic names are relayed to the stub, ahead of
+	// the filter gate and the cache.
 	if s.serveSynthetic(w, r) {
 		return
 	}

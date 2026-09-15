@@ -27,30 +27,21 @@ import (
 	cargowallNet "github.com/code-cargo/cargowall/pkg/network"
 )
 
-// syntheticNames are the names systemd-resolved synthesizes from local state
-// and never sends upstream. The redirect DNATs the stub to this proxy and the
-// proxy's upstream is the resolver behind resolved, so without special
-// handling they NXDOMAIN for the whole run — REFUSED under enforce, silently
-// under audit (#126). The proxy relays the bare names to the stub on its
-// marked client socket, which the redirect's RETURN rules pass through the
-// stub DNAT (as they do the startup cache peek), and writes resolved's own
-// answer back: uncached, unenforced, never fed to hostnameIPs or the
-// firewall. Reaching the gateway remains an explicit CIDR decision.
+// syntheticNames are the names systemd-resolved synthesizes locally (#126).
+// The proxy relays them to the stub on its marked client and writes
+// resolved's answer back uncached and unenforced: it never feeds
+// hostnameIPs or the firewall.
 var syntheticNames = []string{"_gateway", "_outbound", "_localdnsstub", "_localdnsproxy"}
 
-// Injection points for tests: the stub address, the client resolver config
-// whose search list is honoured, and the resolved-running probe.
+// Injection points for tests.
 var (
 	resolvedStubAddr = "127.0.0.53:53"
 	resolvConfPath   = "/etc/resolv.conf"
 	resolvedRunning  = cargowallNet.SystemdResolvedRunning
 )
 
-// serveSynthetic answers a synthetic-name query, reporting whether it wrote
-// a response. Host listeners and IN class only, ahead of the filter gate and
-// the cache — resolved's own precedence. The probe runs per hit rather than
-// once at Start so a resolved restart mid-run is honoured; a probe error
-// reads as not running and the query takes the ordinary path.
+// serveSynthetic answers a synthetic-name query — host listeners, IN class,
+// resolved running (probed per hit) — reporting whether it wrote a response.
 func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
 	if len(r.Question) == 0 || r.Question[0].Qclass != dns.ClassINET || !s.hostListener(w) {
 		return false
@@ -69,12 +60,9 @@ func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
 
 	m := new(dns.Msg)
 	if expanded {
-		// The search-expanded form a stub resolver tries before the bare
-		// name. NXDOMAIN — what the upstream says natively — rather than the
-		// gate's REFUSED, which c-ares treats as terminal on a multi-label
-		// attempt and so never went on to ask "_gateway". Never relayed to
-		// the stub: resolved would send it upstream unmarked, and the DNAT
-		// would bring it straight back here.
+		// NXDOMAIN, not REFUSED: REFUSED on a multi-label attempt aborts
+		// c-ares' search before the bare name. Not relayed: the stub would
+		// query upstream unmarked and the DNAT would bring it back here.
 		m.SetRcode(r, dns.RcodeNameError)
 		m.Authoritative = true
 		w.WriteMsg(m)
@@ -94,19 +82,15 @@ func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
 }
 
 // hostListener reports whether the query arrived on a listener created for
-// host-netns clients rather than via AddContainerListenAddr. A container's
-// native resolver path never answered these names, and the host's gateway is
-// the wrong answer inside a container netns.
+// host-netns clients rather than via AddContainerListenAddr.
 func (s *Server) hostListener(w dns.ResponseWriter) bool {
 	return s.attributionMode(w) == attributeHostSockdiag
 }
 
 // syntheticQuery classifies a wire-form query name: a bare synthetic name,
 // its search-expanded form (first label synthetic, remainder a suffix on the
-// host's own search list), or neither. Only expansions a resolver on this
-// host generates count — "_gateway.example.com" is an ordinary query.
-// resolv.conf is read only once the first label has matched, per hit, so a
-// DHCP-rewritten search list stays current.
+// host's resolv.conf search list), or neither. resolv.conf is read only
+// after the first label matches.
 func syntheticQuery(qname string) (name string, expanded, ok bool) {
 	full := strings.ToLower(strings.TrimSuffix(qname, "."))
 	first, rest, hasRest := strings.Cut(full, ".")
@@ -122,10 +106,8 @@ func syntheticQuery(qname string) (name string, expanded, ok bool) {
 	return "", false, false
 }
 
-// hostSearchDomains reads the search list clients expand single-label names
-// with: the last "search" or "domain" directive wins, as glibc and Go read
-// it. Lowercased, trailing dots trimmed. An unreadable file yields nil, so
-// no expansion is recognised.
+// hostSearchDomains reads resolv.conf's search list: the last "search" or
+// "domain" directive wins, as glibc reads it; unreadable yields nil.
 func hostSearchDomains(path string) []string {
 	f, err := os.Open(path)
 	if err != nil {

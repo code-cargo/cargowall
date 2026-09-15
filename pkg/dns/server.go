@@ -529,6 +529,12 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 		"type", queryType,
 		"upstream", s.upstream)
 
+	// systemd-resolved's synthetic names are relayed to the stub, ahead of
+	// the filter gate and the cache.
+	if s.serveSynthetic(w, r) {
+		return
+	}
+
 	// DNS Query Filtering: Block queries for non-allowed domains (prevents
 	// DNS tunneling). isQueryAllowed handles both the full and the
 	// search-domain-stripped form internally with the right precedence.

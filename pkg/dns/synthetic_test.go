@@ -106,17 +106,24 @@ func withFakeStub(t *testing.T) func() []dns.Question {
 
 // syntheticServer is a filtering, default-deny server — the configuration
 // under which these names would otherwise be REFUSED, so every answer below
-// also proves precedence over the gate — with a fake stub and no host
-// search list. The mock firewall carries no expectations: any enforcement
-// side effect fails the test.
-func syntheticServer(t *testing.T) (*Server, func() []dns.Question) {
+// also proves precedence over the gate — with a fake stub, no host search
+// list, and the given rules. The mock firewall carries no expectations
+// unless a test adds them: with no rule naming a synthetic name, any
+// firewall call fails the test.
+func syntheticServer(t *testing.T, rules ...config.Rule) (*Server, func() []dns.Question, *firewall.MockFirewall) {
+	t.Helper()
+	return syntheticServerWithDefault(t, config.ActionDeny, rules...)
+}
+
+func syntheticServerWithDefault(t *testing.T, defaultAction config.Action, rules ...config.Rule) (*Server, func() []dns.Question, *firewall.MockFirewall) {
 	t.Helper()
 	seen := withFakeStub(t)
 	cfg := config.NewConfigManager()
-	require.NoError(t, cfg.LoadConfigFromRules(nil, config.ActionDeny))
-	s := newTestServer(t, cfg, firewall.NewMockFirewall(t))
+	require.NoError(t, cfg.LoadConfigFromRules(rules, defaultAction))
+	mockFw := firewall.NewMockFirewall(t)
+	s := newTestServer(t, cfg, mockFw)
 	s.filterQueries = true
-	return s, seen
+	return s, seen, mockFw
 }
 
 func ask(t *testing.T, s *Server, w *MockResponseWriter, q *dns.Msg) *dns.Msg {
@@ -175,10 +182,11 @@ func TestSyntheticQuery(t *testing.T) {
 }
 
 // The bare name is relayed to the stub and resolved's answer written back
-// as-is, ahead of a gate that would otherwise REFUSE it — and nothing is
-// cached, tracked or enforced.
+// as-is, ahead of a gate that would otherwise REFUSE it. Nothing is cached;
+// the answer IS tracked, so a later connection to the address is attributed
+// to the name — and with no rule naming it, the firewall is not touched.
 func TestServeSynthetic_RelaysBareNameToStub(t *testing.T) {
-	s, seen := syntheticServer(t)
+	s, seen, _ := syntheticServer(t)
 
 	m := askName(t, s, "_gateway.", dns.TypeA)
 	assert.Equal(t, dns.RcodeSuccess, m.Rcode)
@@ -194,16 +202,38 @@ func TestServeSynthetic_RelaysBareNameToStub(t *testing.T) {
 
 	_, cached := s.dnsCache.Get(s.generateCacheKey(&dns.Msg{Question: []dns.Question{{Name: "_gateway.", Qtype: dns.TypeA, Qclass: dns.ClassINET}}}))
 	assert.False(t, cached, "stub answers are not cached")
+	assert.Equal(t, "_gateway", s.config.LookupHostnameByIP("192.168.5.2"), "the address is attributed to the name")
 	s.hostnameIPsMutex.RLock()
 	defer s.hostnameIPsMutex.RUnlock()
-	assert.Empty(t, s.hostnameIPs, "stub answers are not tracked")
+	assert.Contains(t, s.hostnameIPs, "_gateway")
+}
+
+// A rule can name a synthetic name (#129): allow opens the gateway's address
+// on the rule's ports, deny closes it — the same enforcement any upstream
+// answer gets, so "_gateway" is a portable rule where a provider CIDR was.
+func TestServeSynthetic_RuleNamesTheGateway(t *testing.T) {
+	ports := []config.Port{{Port: 1041, Protocol: config.ProtocolTCP}}
+	s, _, mockFw := syntheticServer(t, config.Rule{Type: config.RuleTypeHostname, Value: "_gateway", Ports: ports, Action: config.ActionAllow})
+	mockFw.On("AddIP", mock.MatchedBy(func(ip net.IP) bool { return ip.Equal(net.ParseIP("192.168.5.2")) }), config.ActionAllow, ports).
+		Return(true, nil).Once()
+	m := askName(t, s, "_gateway.", dns.TypeA)
+	assert.Equal(t, dns.RcodeSuccess, m.Rcode)
+	mockFw.AssertExpectations(t)
+
+	// A deny only needs a BPF entry when the default would otherwise allow.
+	s, _, mockFw = syntheticServerWithDefault(t, config.ActionAllow, config.Rule{Type: config.RuleTypeHostname, Value: "_gateway", Action: config.ActionDeny})
+	mockFw.On("AddIP", mock.MatchedBy(func(ip net.IP) bool { return ip.Equal(net.ParseIP("192.168.5.2")) }), config.ActionDeny, []config.Port(nil)).
+		Return(true, nil).Once()
+	m = askName(t, s, "_gateway.", dns.TypeA)
+	assert.Equal(t, dns.RcodeSuccess, m.Rcode, "a deny rule still resolves the name; it closes the address")
+	mockFw.AssertExpectations(t)
 }
 
 // Whatever resolved says is what the client gets: NODATA for a family it
 // has no address for, NXDOMAIN for a name it does not synthesize. The proxy
 // shapes nothing itself.
 func TestServeSynthetic_RelaysStubVerdictVerbatim(t *testing.T) {
-	s, _ := syntheticServer(t)
+	s, _, _ := syntheticServer(t)
 
 	m := askName(t, s, "_gateway.", dns.TypeAAAA)
 	assert.Equal(t, dns.RcodeSuccess, m.Rcode)
@@ -217,7 +247,7 @@ func TestServeSynthetic_RelaysStubVerdictVerbatim(t *testing.T) {
 // the name down the ordinary path, REFUSED here, rather than SERVFAIL: the
 // runtime directory outlives a stopped resolved, so this is the only probe.
 func TestServeSynthetic_StubUnreachableIsOrdinary(t *testing.T) {
-	s, _ := syntheticServer(t)
+	s, _, _ := syntheticServer(t)
 	resolvedStubAddr = "127.0.0.1:1" // nothing listens; UDP gets ECONNREFUSED at once
 	m := askName(t, s, "_gateway.", dns.TypeA)
 	assert.Equal(t, dns.RcodeRefused, m.Rcode)
@@ -225,7 +255,7 @@ func TestServeSynthetic_StubUnreachableIsOrdinary(t *testing.T) {
 
 // The localhost family resolved synthesizes beyond what /etc/hosts carries.
 func TestServeSynthetic_RelaysLocalhostFamily(t *testing.T) {
-	s, seen := syntheticServer(t)
+	s, seen, _ := syntheticServer(t)
 	for _, q := range []string{"api.localhost.", "localhost.localdomain.", "foo.localhost.localdomain."} {
 		m := askName(t, s, q, dns.TypeA)
 		assert.Equal(t, dns.RcodeSuccess, m.Rcode, q)
@@ -239,7 +269,7 @@ func TestServeSynthetic_RelaysLocalhostFamily(t *testing.T) {
 // bare name: NXDOMAIN, not REFUSED — the rcode every client, c-ares
 // included, treats as "try the next form" — and never relayed to the stub.
 func TestServeSynthetic_ExpandedIsNXDomain(t *testing.T) {
-	s, seen := syntheticServer(t)
+	s, seen, _ := syntheticServer(t)
 	s.config.SetHostSearchDomains([]string{"lan", "vm.blacksmith.sh"}, s.logger)
 
 	for _, q := range []string{"_gateway.lan.", "_gateway.vm.blacksmith.sh.", "_outbound.lan."} {
@@ -255,7 +285,7 @@ func TestServeSynthetic_ExpandedIsNXDomain(t *testing.T) {
 // search list, or no search list at all, leaves the query on the ordinary
 // path — REFUSED here — rather than the proxy inventing a negative answer.
 func TestServeSynthetic_ExpandedOtherwiseOrdinary(t *testing.T) {
-	s, _ := syntheticServer(t)
+	s, _, _ := syntheticServer(t)
 
 	m := askName(t, s, "_gateway.lan.", dns.TypeA)
 	assert.Equal(t, dns.RcodeRefused, m.Rcode, "no search list")
@@ -266,7 +296,7 @@ func TestServeSynthetic_ExpandedOtherwiseOrdinary(t *testing.T) {
 }
 
 func TestServeSynthetic_NonINClassIsOrdinary(t *testing.T) {
-	s, seen := syntheticServer(t)
+	s, seen, _ := syntheticServer(t)
 	q := new(dns.Msg)
 	q.SetQuestion("_gateway.", dns.TypeA)
 	q.Question[0].Qclass = dns.ClassCHAOS
@@ -286,7 +316,7 @@ func (c *containerListenerWriter) LocalAddr() net.Addr {
 // gateway is the wrong answer in a container netns: container listeners
 // fall through to the ordinary path.
 func TestServeSynthetic_ContainerListenerIsOrdinary(t *testing.T) {
-	s, seen := syntheticServer(t)
+	s, seen, _ := syntheticServer(t)
 	s.listenerModes = map[string]listenerAttribution{"172.17.0.1": attributeContainerIP}
 
 	q := new(dns.Msg)

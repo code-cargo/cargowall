@@ -17,6 +17,7 @@
 package dns
 
 import (
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -144,40 +145,49 @@ func askName(t *testing.T, s *Server, name string, qtype uint16) *dns.Msg {
 	return ask(t, s, &MockResponseWriter{}, q)
 }
 
-func TestSyntheticQuery(t *testing.T) {
-	isHostSuffix := func(rest string) bool { return rest == "lan" || rest == "vm.blacksmith.sh" }
+func TestLookupSynthetic(t *testing.T) {
+	cfg := config.NewConfigManager()
+	cfg.SetHostSearchDomains([]string{"lan", "vm.blacksmith.sh"}, slog.Default())
+	s := newTestServer(t, cfg, firewall.NewMockFirewall(t))
+	s.machineNames = []string{"runner-abc.corp.example", "runner-abc", "runner-abc.local"}
 	for _, tc := range []struct {
-		qname    string
-		want     string
-		expanded bool
-		ok       bool
+		qname                 string
+		want                  string
+		expanded, enforce, ok bool
 	}{
-		{"_gateway.", "_gateway", false, true},
-		{"_GATEWAY.", "_gateway", false, true},
-		{"_outbound.", "_outbound", false, true},
-		{"_localdnsstub.", "_localdnsstub", false, true},
-		{"_localdnsproxy.", "_localdnsproxy", false, true},
-		{"_gateway.lan.", "_gateway", true, true},
-		{"_GATEWAY.LAN.", "_gateway", true, true},
-		{"_outbound.vm.blacksmith.sh.", "_outbound", true, true},
-		{"_gateway.example.com.", "", false, false},   // not a host search suffix
-		{"_gateway.blacksmith.sh.", "", false, false}, // partial suffix is not the suffix
-		{"gateway.lan.", "", false, false},
-		{"example.com.", "", false, false},
-		{"localhost.", "localhost", false, true},
-		{"API.localhost.", "api.localhost", false, true},
-		{"localhost.localdomain.", "localhost.localdomain", false, true},
-		{"foo.localhost.localdomain.", "foo.localhost.localdomain", false, true},
-		{"localhost.example.com.", "", false, false},
-		{"notlocalhost.", "", false, false},
+		{"_gateway.", "_gateway", false, true, true},
+		{"_GATEWAY.", "_gateway", false, true, true},
+		{"_outbound.", "_outbound", false, true, true},
+		{"_localdnsstub.", "_localdnsstub", false, true, true},
+		{"_localdnsproxy.", "_localdnsproxy", false, true, true},
+		{"_gateway.lan.", "_gateway", true, false, true},
+		{"_GATEWAY.LAN.", "_gateway", true, false, true},
+		{"_outbound.vm.blacksmith.sh.", "_outbound", true, false, true},
+		{"_gateway.example.com.", "", false, false, false},   // not a host search suffix
+		{"_gateway.blacksmith.sh.", "", false, false, false}, // partial suffix is not the suffix
+		{"gateway.lan.", "", false, false, false},
+		{"example.com.", "", false, false, false},
+		{"localhost.", "localhost", false, false, true},
+		{"API.localhost.", "api.localhost", false, false, true},
+		{"localhost.localdomain.", "localhost.localdomain", false, false, true},
+		{"foo.localhost.localdomain.", "foo.localhost.localdomain", false, false, true},
+		{"localhost.example.com.", "", false, false, false},
+		{"notlocalhost.", "", false, false, false},
+		{"Runner-ABC.", "runner-abc", false, true, true},
+		{"runner-abc.local.", "runner-abc.local", false, true, true},
+		{"runner-abc.corp.example.", "runner-abc.corp.example", false, true, true},
+		{"runner-abc.lan.", "", false, false, false}, // a real host: no search expansion, ordinary path
+		{"other-host.", "", false, false, false},
 	} {
-		got, expanded, ok := syntheticQuery(tc.qname, isHostSuffix)
+		got, expanded, enforce, ok := s.lookupSynthetic(tc.qname)
 		assert.Equal(t, tc.ok, ok, tc.qname)
 		assert.Equal(t, tc.expanded, expanded, tc.qname)
+		assert.Equal(t, tc.enforce, enforce, tc.qname)
 		assert.Equal(t, tc.want, got, tc.qname)
 	}
 
-	_, _, ok := syntheticQuery("_gateway.lan.", func(string) bool { return false })
+	cfg.SetHostSearchDomains(nil, slog.Default())
+	_, _, _, ok := s.lookupSynthetic("_gateway.lan.")
 	assert.False(t, ok, "with no search list the expanded form is an ordinary query")
 }
 
@@ -347,6 +357,7 @@ func TestSeedMachineNames(t *testing.T) {
 	}{
 		{"Runner-ABC.corp.example.", nil, []string{"runner-abc.corp.example", "runner-abc", "runner-abc.local"}},
 		{"runner-abc", nil, []string{"runner-abc", "runner-abc.local"}},
+		{"runner-abc.local", nil, []string{"runner-abc.local", "runner-abc"}}, // already the mDNS form: no duplicate
 		{"", nil, nil},
 		{"runner-abc", os.ErrNotExist, nil},
 	} {
@@ -374,6 +385,12 @@ func TestServeSynthetic_MachineHostnameRelayedAndTracked(t *testing.T) {
 
 	m = askName(t, s, "other-host.", dns.TypeA)
 	assert.Equal(t, dns.RcodeRefused, m.Rcode, "only the machine's own names are relayed")
+
+	// A real host takes no search expansion: its expanded form is the
+	// ordinary path (REFUSED here), never a synthetic NXDOMAIN.
+	s.config.SetHostSearchDomains([]string{"lan"}, s.logger)
+	m = askName(t, s, "runner-abc.lan.", dns.TypeA)
+	assert.Equal(t, dns.RcodeRefused, m.Rcode)
 }
 
 // containerListenerWriter answers on the docker-bridge listener.

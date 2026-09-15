@@ -385,6 +385,8 @@ func (s *Server) Start(ctx context.Context) error {
 	// No TTL cleanup needed - IPs persist until updated by new DNS responses
 	// DNS cache uses lazy expiration - no cleanup goroutine needed
 
+	s.seedHostSearchDomains()
+
 	// Collect all addresses to listen on
 	allAddrs := []string{s.listenAddr}
 	allAddrs = append(allAddrs, s.additionalAddrs...)

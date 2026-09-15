@@ -2188,7 +2188,10 @@ func TestPickDenyForm(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := pickDenyForm(tc.valueFull, tc.hostname, tc.portsFull, tc.valueStripped, tc.stripped, tc.portsStripped)
+			got := pickDenyForm(
+				&formMatch{name: tc.hostname, value: tc.valueFull, ports: tc.portsFull},
+				&formMatch{name: tc.stripped, value: tc.valueStripped, ports: tc.portsStripped},
+			)
 			if got != tc.wantStripped {
 				t.Errorf("pickDenyForm = %v, want %v", got, tc.wantStripped)
 			}
@@ -2233,7 +2236,10 @@ func TestPickAllowForm(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := pickAllowForm(tc.valueFull, tc.hostname, tc.valueStripped, tc.stripped)
+			got := pickAllowForm(
+				&formMatch{name: tc.hostname, value: tc.valueFull},
+				&formMatch{name: tc.stripped, value: tc.valueStripped},
+			)
 			if got != tc.wantStripped {
 				t.Errorf("pickAllowForm = %v, want %v", got, tc.wantStripped)
 			}

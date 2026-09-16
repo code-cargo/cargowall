@@ -183,6 +183,57 @@ func TestHostnamePatternMatches(t *testing.T) {
 			"other.foo.internal.cloudapp.net",
 			false,
 		},
+		// Empty hostname / empty labels. "" splits to one empty label, which
+		// no segment may consume: an IP with no reverse name must not take a
+		// wildcard rule's verdict (#125).
+		{
+			"doublestar rejects empty hostname",
+			"**",
+			"",
+			false,
+		},
+		{
+			"star rejects empty hostname",
+			"*",
+			"",
+			false,
+		},
+		{
+			"doublestar suffix rejects empty hostname",
+			"**.github.com",
+			"",
+			false,
+		},
+		{
+			"star suffix rejects empty hostname",
+			"*.github.com",
+			"",
+			false,
+		},
+		{
+			"literal rejects empty hostname",
+			"github.com",
+			"",
+			false,
+		},
+		{
+			"doublestar rejects empty label",
+			"**",
+			"a..b",
+			false,
+		},
+		{
+			"doublestar rejects trailing empty label",
+			"**",
+			"github.com.",
+			false,
+		},
+		{
+			"star rejects empty label",
+			"*.github.com",
+			".github.com",
+			false,
+		},
 	}
 
 	for _, tt := range tests {

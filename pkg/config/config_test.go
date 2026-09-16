@@ -4400,3 +4400,30 @@ func TestLoadConfigFromCargoWall_RejectedPolicyKeepsPosture(t *testing.T) {
 		t.Fatal("rejected policy must not change posture")
 	}
 }
+
+// An IP with no reverse name reaches the matcher as "". A `*` or `**` rule
+// must not fire on it: gateExistingConnections would open the IP on the
+// wildcard's ports instead of its observed ports and pin L7 scope to an
+// empty name (#125). Every pattern shape, and the attribution lookup, must
+// agree that "" matches nothing.
+func TestMatchHostnameRule_EmptyHostnameMatchesNothing(t *testing.T) {
+	for _, pattern := range []string{"*", "**", "*.example.com", "**.example.com"} {
+		t.Run(pattern, func(t *testing.T) {
+			cm := NewConfigManager()
+			if err := cm.LoadConfigFromRules([]Rule{
+				{Type: RuleTypeHostname, Value: pattern, Ports: []Port{{Port: 123, Protocol: ProtocolUDP}}, Action: ActionAllow},
+			}, ActionDeny); err != nil {
+				t.Fatal(err)
+			}
+			if v := cm.MatchHostnameRule(""); v.Matched() {
+				t.Errorf("MatchHostnameRule(\"\") = %+v, want no match", v)
+			}
+			if got := cm.FindTrackedHostname(""); got != "" {
+				t.Errorf("FindTrackedHostname(\"\") = %q, want \"\"", got)
+			}
+			if got := cm.GetAutoAllowedTypeForHostname(""); got != AutoAddedTypeNone {
+				t.Errorf("GetAutoAllowedTypeForHostname(\"\") = %q, want none", got)
+			}
+		})
+	}
+}

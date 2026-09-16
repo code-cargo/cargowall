@@ -1617,16 +1617,7 @@ func prePopulateDNSCache(ctx context.Context, configMgr *config.Manager, dnsServ
 	for hostname := range configMgr.GetTrackedHostnames() {
 		lookupCtx, lookupCancel := context.WithTimeout(cacheCtx, 2*time.Second)
 		if ips, err := cacheResolver.LookupHost(lookupCtx, hostname); err == nil {
-			for _, ip := range ips {
-				configMgr.UpdateDNSMapping(hostname, ip)
-				// A FORWARD lookup of a rule hostname — the same evidence
-				// class as the proxy's own answers, not a PTR — and these are
-				// the IPs live processes are already using. Recording it is
-				// what lets those IPs be L7-scoped at all (RegisterL7Identity
-				// scopes iff bound); without it the first flight to a
-				// systemd-resolved cached IP is name_not_at_ip under pin-ip.
-				configMgr.RecordForwardResolution(hostname, ip)
-			}
+			recordSystemCacheAnswer(configMgr, dnsServer, hostname, ips)
 		} else {
 			logger.Debug("System DNS cache miss", "hostname", hostname, "error", err)
 		}

@@ -112,10 +112,6 @@ type Server struct {
 	// recentDNSBlocks buffers refused QUERIES for the same reconciliation on
 	// the DNS side (#119); see reconcileRefusedQueries.
 	recentDNSBlocks *events.RecentDNSBlocks
-
-	// machineNames are the forms of the machine's own hostname that resolved
-	// synthesizes, seeded at Start; see synthetic.go.
-	machineNames []string
 }
 
 // dnsCacheEntry holds a cached DNS response
@@ -390,7 +386,6 @@ func (s *Server) Start(ctx context.Context) error {
 	// DNS cache uses lazy expiration - no cleanup goroutine needed
 
 	s.seedHostSearchDomains()
-	s.seedMachineNames()
 
 	// Collect all addresses to listen on
 	allAddrs := []string{s.listenAddr}
@@ -650,7 +645,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	// DNS-path output consistent with the connection-event path, which logs
 	// the lowercase hostname from the IP->hostname mapping (#65).
 	if len(r.Question) > 0 && resp.Rcode == dns.RcodeSuccess {
-		s.enforceDNSResponse(strings.ToLower(strings.TrimSuffix(r.Question[0].Name, ".")), resp, 0, true)
+		s.enforceDNSResponse(strings.ToLower(strings.TrimSuffix(r.Question[0].Name, ".")), resp, 0, wireAnswer)
 	}
 
 	// Return response to client
@@ -665,12 +660,12 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 // connections, and pre-resolution of allowed CNAME-only responses.
 // canonicalHostname is the queried name, lowercased with the trailing dot
 // trimmed. depth bounds pre-resolve recursion (see preResolveCNAMETarget);
-// handleDNSQuery passes 0. wireIdentity reports whether the answer came off
-// the wire — an upstream or pre-resolve answer for a name a peer can
-// present — and so may mint L7 forward-resolution evidence; an answer the
-// proxy produced from resolved's local state (serveSynthetic) is an address
-// alias no peer presents and mints none, so SCOPE IFF BOUND scopes nothing.
-func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, depth int, wireIdentity bool) {
+// handleDNSQuery passes 0. source says whether the answer came off the wire
+// (wireAnswer: upstream or pre-resolve, for a name a peer can present) and
+// so may mint L7 forward-resolution evidence, or from resolved's local state
+// (localAnswer: an address alias no peer presents) and mints none, so SCOPE
+// IFF BOUND scopes nothing.
+func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, depth int, source answerSource) {
 	// Extract IPs and TTLs from response
 	ips, ttl := s.extractIPsFromResponse(resp)
 
@@ -844,7 +839,7 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 				// are the only seeds of the L7 per-IP binding evidence.
 				// Reverse-DNS paths must never record it (PTR forgery), and
 				// an answer that did not come off the wire mints none.
-				if wireIdentity {
+				if source == wireAnswer {
 					s.config.RecordForwardResolution(canonicalHostname, ip.String())
 				}
 			}
@@ -1306,7 +1301,7 @@ func (s *Server) preResolveCNAMETarget(target string, depth int) {
 			if resp.Rcode != dns.RcodeSuccess {
 				continue
 			}
-			s.enforceDNSResponse(target, resp, depth, true)
+			s.enforceDNSResponse(target, resp, depth, wireAnswer)
 		}
 	}()
 }

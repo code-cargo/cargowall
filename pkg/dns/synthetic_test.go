@@ -61,7 +61,10 @@ func withFakeStub(t *testing.T) func() []dns.Question {
 		seen []dns.Question
 	)
 	// runner-abc stands in for the machine's own hostname.
-	answers := map[string]string{"_gateway.": "192.168.5.2", "_outbound.": "192.168.5.15", "runner-abc.": "10.0.0.5"}
+	answers := map[string]string{
+		"_gateway.": "192.168.5.2", "_outbound.": "192.168.5.15", "_localdnsstub.": "127.0.0.53",
+		"runner-abc.": "10.0.0.5", "renamed.": "10.0.0.6",
+	}
 	started := make(chan struct{})
 	stub := &dns.Server{
 		PacketConn:        pc,
@@ -119,6 +122,7 @@ func syntheticServer(t *testing.T, rules ...config.Rule) (*Server, func() []dns.
 
 func syntheticServerWithDefault(t *testing.T, defaultAction config.Action, rules ...config.Rule) (*Server, func() []dns.Question) {
 	t.Helper()
+	withMachineHostname(t, "", os.ErrNotExist) // no machine name unless a test sets one
 	seen := withFakeStub(t)
 	cfg := config.NewConfigManager()
 	require.NoError(t, cfg.LoadConfigFromRules(rules, defaultAction))
@@ -149,7 +153,7 @@ func TestLookupSynthetic(t *testing.T) {
 	cfg := config.NewConfigManager()
 	cfg.SetHostSearchDomains([]string{"lan", "vm.blacksmith.sh"}, slog.Default())
 	s := newTestServer(t, cfg, firewall.NewMockFirewall(t))
-	s.machineNames = []string{"runner-abc.corp.example", "runner-abc", "runner-abc.local"}
+	withMachineHostname(t, "Runner-ABC.corp.example", nil)
 	for _, tc := range []struct {
 		qname                 string
 		want                  string
@@ -158,11 +162,12 @@ func TestLookupSynthetic(t *testing.T) {
 		{"_gateway.", "_gateway", false, true, true},
 		{"_GATEWAY.", "_gateway", false, true, true},
 		{"_outbound.", "_outbound", false, true, true},
-		{"_localdnsstub.", "_localdnsstub", false, true, true},
-		{"_localdnsproxy.", "_localdnsproxy", false, true, true},
+		{"_localdnsstub.", "_localdnsstub", false, false, true},   // loopback listener: relay only
+		{"_localdnsproxy.", "_localdnsproxy", false, false, true}, // loopback listener: relay only
 		{"_gateway.lan.", "_gateway", true, false, true},
 		{"_GATEWAY.LAN.", "_gateway", true, false, true},
 		{"_outbound.vm.blacksmith.sh.", "_outbound", true, false, true},
+		{"_localdnsstub.lan.", "_localdnsstub", true, false, true},
 		{"_gateway.example.com.", "", false, false, false},   // not a host search suffix
 		{"_gateway.blacksmith.sh.", "", false, false, false}, // partial suffix is not the suffix
 		{"gateway.lan.", "", false, false, false},
@@ -174,9 +179,9 @@ func TestLookupSynthetic(t *testing.T) {
 		{"localhost.example.com.", "", false, false, false},
 		{"notlocalhost.", "", false, false, false},
 		{"Runner-ABC.", "runner-abc", false, true, true},
-		{"runner-abc.local.", "runner-abc.local", false, true, true},
 		{"runner-abc.corp.example.", "runner-abc.corp.example", false, true, true},
-		{"runner-abc.lan.", "", false, false, false}, // a real host: no search expansion, ordinary path
+		{"runner-abc.lan.", "runner-abc", true, false, true}, // the machine's expanded form: NXDOMAIN, like _gateway's
+		{"runner-abc.local.", "", false, false, false},       // the mDNS form is not local state
 		{"other-host.", "", false, false, false},
 	} {
 		got, expanded, enforce, ok := s.lookupSynthetic(tc.qname)
@@ -189,6 +194,10 @@ func TestLookupSynthetic(t *testing.T) {
 	cfg.SetHostSearchDomains(nil, slog.Default())
 	_, _, _, ok := s.lookupSynthetic("_gateway.lan.")
 	assert.False(t, ok, "with no search list the expanded form is an ordinary query")
+
+	assert.True(t, s.LocalAlias("_gateway"))
+	assert.True(t, s.LocalAlias("runner-abc"))
+	assert.False(t, s.LocalAlias("registry.example"))
 }
 
 // The bare name is relayed to the stub and resolved's answer written back
@@ -349,22 +358,21 @@ func withMachineHostname(t *testing.T, name string, err error) {
 	t.Cleanup(func() { machineHostname = prev })
 }
 
-func TestSeedMachineNames(t *testing.T) {
+func TestMachineNames(t *testing.T) {
 	for _, tc := range []struct {
 		hostname string
 		err      error
 		want     []string
 	}{
-		{"Runner-ABC.corp.example.", nil, []string{"runner-abc.corp.example", "runner-abc", "runner-abc.local"}},
-		{"runner-abc", nil, []string{"runner-abc", "runner-abc.local"}},
-		{"runner-abc.local", nil, []string{"runner-abc.local", "runner-abc"}}, // already the mDNS form: no duplicate
+		{"Runner-ABC.corp.example.", nil, []string{"runner-abc.corp.example", "runner-abc"}},
+		{"runner-abc", nil, []string{"runner-abc"}},
+		{"localhost", nil, nil},       // the localhost family is handled on its own terms
+		{"build.localhost", nil, nil}, // and must not leak in through the machine name
 		{"", nil, nil},
 		{"runner-abc", os.ErrNotExist, nil},
 	} {
 		withMachineHostname(t, tc.hostname, tc.err)
-		s := newTestServer(t, config.NewConfigManager(), firewall.NewMockFirewall(t))
-		s.seedMachineNames()
-		assert.Equal(t, tc.want, s.machineNames, tc.hostname)
+		assert.Equal(t, tc.want, machineNames(), tc.hostname)
 	}
 }
 
@@ -373,7 +381,7 @@ func TestSeedMachineNames(t *testing.T) {
 // tracked like the underscore set, a fixed handful of names.
 func TestServeSynthetic_MachineHostnameRelayedAndTracked(t *testing.T) {
 	s, seen := syntheticServer(t)
-	s.machineNames = []string{"runner-abc", "runner-abc.local"}
+	withMachineHostname(t, "runner-abc", nil)
 
 	m := askName(t, s, "runner-abc.", dns.TypeA)
 	assert.Equal(t, dns.RcodeSuccess, m.Rcode)
@@ -386,11 +394,33 @@ func TestServeSynthetic_MachineHostnameRelayedAndTracked(t *testing.T) {
 	m = askName(t, s, "other-host.", dns.TypeA)
 	assert.Equal(t, dns.RcodeRefused, m.Rcode, "only the machine's own names are relayed")
 
-	// A real host takes no search expansion: its expanded form is the
-	// ordinary path (REFUSED here), never a synthetic NXDOMAIN.
+	// The search-expanded form a stub resolver tries first is NXDOMAIN, as
+	// for _gateway — REFUSED would end a c-ares search before the bare name.
 	s.config.SetHostSearchDomains([]string{"lan"}, s.logger)
 	m = askName(t, s, "runner-abc.lan.", dns.TypeA)
+	assert.Equal(t, dns.RcodeNameError, m.Rcode)
+
+	// hostnamectl set-hostname mid-run: the new name is served, the old one
+	// takes the ordinary path.
+	withMachineHostname(t, "renamed", nil)
+	m = askName(t, s, "renamed.", dns.TypeA)
+	assert.Equal(t, "10.0.0.6", m.Answer[0].(*dns.A).A.String())
+	m = askName(t, s, "runner-abc.", dns.TypeA)
 	assert.Equal(t, dns.RcodeRefused, m.Rcode)
+}
+
+// The stub's own loopback listeners are relayed but never tracked or
+// written: a rule naming _localdnsstub must not put 127.0.0.53 — the
+// address the relay itself depends on — into the maps.
+func TestServeSynthetic_StubListenersUntracked(t *testing.T) {
+	s, _ := syntheticServer(t, config.Rule{Type: config.RuleTypeHostname, Value: "_localdnsstub", Action: config.ActionAllow})
+	m := askName(t, s, "_localdnsstub.", dns.TypeA)
+	assert.Equal(t, dns.RcodeSuccess, m.Rcode)
+	assert.Equal(t, "127.0.0.53", m.Answer[0].(*dns.A).A.String())
+	assert.Empty(t, s.config.LookupHostnameByIP("127.0.0.53"))
+	s.hostnameIPsMutex.RLock()
+	defer s.hostnameIPsMutex.RUnlock()
+	assert.Empty(t, s.hostnameIPs)
 }
 
 // containerListenerWriter answers on the docker-bridge listener.

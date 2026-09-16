@@ -37,6 +37,7 @@ import (
 // opts in through withResolvConf.
 func TestMain(m *testing.M) {
 	resolvConfPath = filepath.Join(os.TempDir(), "cargowall-dns-test-absent-resolv.conf")
+	machineHostname = func() (string, error) { return "", os.ErrNotExist }
 	os.Exit(m.Run())
 }
 

@@ -288,7 +288,10 @@ destination we cannot bind stays L4-governed.** Startup pre-population
 therefore records its Phase-1 answers as forward resolutions — they are forward
 lookups of rule names through the system resolver, the same evidence class as
 the proxy's own answers — rather than leaving IPs live processes already use
-un-scopeable.
+un-scopeable. The one exception is a name the proxy itself answers from
+resolved's local state (`dns.Server.LocalAlias`: `_gateway`, the machine's own
+name): an address alias no peer presents, so it is mapped for attribution but
+mints no evidence and its address stays L4-governed (`cmd/prepopulate.go`).
 
 **Lifecycle.** The store is count-bounded LRU with refresh-on-use, deliberately
 not TTL-swept: the L4 and `map_l7_scope` entries it gates never expire, so an

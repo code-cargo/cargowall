@@ -195,9 +195,11 @@ func TestLookupSynthetic(t *testing.T) {
 	_, _, _, ok := s.lookupSynthetic("_gateway.lan.")
 	assert.False(t, ok, "with no search list the expanded form is an ordinary query")
 
-	assert.True(t, s.LocalAlias("_gateway"))
-	assert.True(t, s.LocalAlias("runner-abc"))
-	assert.False(t, s.LocalAlias("registry.example"))
+	assert.Equal(t, TrackedAlias, s.ClassifyAlias("_gateway"))
+	assert.Equal(t, TrackedAlias, s.ClassifyAlias("runner-abc"))
+	assert.Equal(t, UntrackedAlias, s.ClassifyAlias("_localdnsstub"))
+	assert.Equal(t, UntrackedAlias, s.ClassifyAlias("api.localhost"))
+	assert.Equal(t, NotAlias, s.ClassifyAlias("registry.example"))
 }
 
 // The bare name is relayed to the stub and resolved's answer written back

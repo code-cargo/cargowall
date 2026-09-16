@@ -24,12 +24,19 @@ import (
 	"github.com/code-cargo/cargowall/pkg/dns"
 )
 
-// Pre-population must not turn a synthetic name into an L7 identity: the
-// mapping is recorded for attribution, the evidence that would let
-// RegisterL7Identity scope the address is not. A real rule name gets both.
+// Pre-population must not turn a synthetic name into an L7 identity: an
+// enforced alias is mapped for attribution but the evidence that would let
+// RegisterL7Identity scope the address is not minted; a loopback listener is
+// recorded nowhere, so the replay can never write the stub's own address. A
+// real rule name gets both mapping and evidence.
 func TestRecordSystemCacheAnswer_WithholdsEvidenceForLocalAliases(t *testing.T) {
 	cfg := config.NewConfigManager()
 	srv := dns.NewServer(cfg, nil, "192.0.2.53:53", "127.0.0.1:0", slog.Default())
+
+	recordSystemCacheAnswer(cfg, srv, "_localdnsstub", []string{"127.0.0.53"})
+	if got := cfg.LookupHostnameByIP("127.0.0.53"); got != "" {
+		t.Errorf("a loopback listener must not be mapped, got %q", got)
+	}
 
 	recordSystemCacheAnswer(cfg, srv, "_gateway", []string{"192.168.127.1"})
 	if got := cfg.LookupHostnameByIP("192.168.127.1"); got != "_gateway" {

@@ -116,13 +116,33 @@ func (s *Server) lookupSynthetic(qname string) (name string, expanded, enforce, 
 	return "", false, false, false
 }
 
-// LocalAlias reports whether the proxy answers name from resolved's local
-// state rather than the wire. Callers that resolve rule names outside the
-// proxy — startup pre-population through the system resolver — use it to
-// withhold L7 forward-resolution evidence for such names.
-func (s *Server) LocalAlias(name string) bool {
-	_, _, _, ok := s.lookupSynthetic(name)
-	return ok
+// AliasClass is how a caller that resolves rule names outside the proxy —
+// startup pre-population through the system resolver — must treat a name
+// the proxy answers from resolved's local state.
+type AliasClass int
+
+const (
+	// NotAlias is a wire name: map it and mint forward-resolution evidence.
+	NotAlias AliasClass = iota
+	// TrackedAlias is an enforced synthetic name (_gateway, _outbound, the
+	// machine's own names): map it for attribution, mint no evidence.
+	TrackedAlias
+	// UntrackedAlias is a loopback listener or a localhost-family name:
+	// never tracked, never written — nothing to record at all.
+	UntrackedAlias
+)
+
+// ClassifyAlias classifies name for a caller outside the proxy's own relay.
+func (s *Server) ClassifyAlias(name string) AliasClass {
+	_, expanded, enforce, ok := s.lookupSynthetic(name)
+	switch {
+	case !ok:
+		return NotAlias
+	case enforce && !expanded:
+		return TrackedAlias
+	default:
+		return UntrackedAlias
+	}
 }
 
 // serveSynthetic answers a synthetic-name query — host listeners, IN class —

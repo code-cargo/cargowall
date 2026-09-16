@@ -1617,7 +1617,7 @@ func prePopulateDNSCache(ctx context.Context, configMgr *config.Manager, dnsServ
 	for hostname := range configMgr.GetTrackedHostnames() {
 		lookupCtx, lookupCancel := context.WithTimeout(cacheCtx, 2*time.Second)
 		if ips, err := cacheResolver.LookupHost(lookupCtx, hostname); err == nil {
-			recordSystemCacheAnswer(configMgr, dnsServer, hostname, ips)
+			dnsServer.RecordSystemCacheAnswer(hostname, ips)
 		} else {
 			logger.Debug("System DNS cache miss", "hostname", hostname, "error", err)
 		}

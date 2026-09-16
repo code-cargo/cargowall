@@ -155,51 +155,64 @@ func TestLookupSynthetic(t *testing.T) {
 	s := newTestServer(t, cfg, firewall.NewMockFirewall(t))
 	withMachineHostname(t, "Runner-ABC.corp.example", nil)
 	for _, tc := range []struct {
-		qname                 string
-		want                  string
-		expanded, enforce, ok bool
+		qname string
+		want  string
+		class aliasClass
 	}{
-		{"_gateway.", "_gateway", false, true, true},
-		{"_GATEWAY.", "_gateway", false, true, true},
-		{"_outbound.", "_outbound", false, true, true},
-		{"_localdnsstub.", "_localdnsstub", false, false, true},   // loopback listener: relay only
-		{"_localdnsproxy.", "_localdnsproxy", false, false, true}, // loopback listener: relay only
-		{"_gateway.lan.", "_gateway", true, false, true},
-		{"_GATEWAY.LAN.", "_gateway", true, false, true},
-		{"_outbound.vm.blacksmith.sh.", "_outbound", true, false, true},
-		{"_localdnsstub.lan.", "_localdnsstub", true, false, true},
-		{"_gateway.example.com.", "", false, false, false},   // not a host search suffix
-		{"_gateway.blacksmith.sh.", "", false, false, false}, // partial suffix is not the suffix
-		{"gateway.lan.", "", false, false, false},
-		{"example.com.", "", false, false, false},
-		{"localhost.", "localhost", false, false, true},
-		{"API.localhost.", "api.localhost", false, false, true},
-		{"localhost.localdomain.", "localhost.localdomain", false, false, true},
-		{"foo.localhost.localdomain.", "foo.localhost.localdomain", false, false, true},
-		{"localhost.example.com.", "", false, false, false},
-		{"notlocalhost.", "", false, false, false},
-		{"Runner-ABC.", "runner-abc", false, true, true},
-		{"runner-abc.corp.example.", "runner-abc.corp.example", false, true, true},
-		{"runner-abc.lan.", "runner-abc", true, false, true}, // the machine's expanded form: NXDOMAIN, like _gateway's
-		{"runner-abc.local.", "", false, false, false},       // the mDNS form is not local state
-		{"other-host.", "", false, false, false},
+		{"_gateway.", "_gateway", trackedAlias},
+		{"_GATEWAY.", "_gateway", trackedAlias},
+		{"_outbound.", "_outbound", trackedAlias},
+		{"_localdnsstub.", "_localdnsstub", untrackedAlias},   // loopback listener
+		{"_localdnsproxy.", "_localdnsproxy", untrackedAlias}, // loopback listener
+		{"_gateway.lan.", "_gateway", expandedAlias},
+		{"_GATEWAY.LAN.", "_gateway", expandedAlias},
+		{"_outbound.vm.blacksmith.sh.", "_outbound", expandedAlias},
+		{"_localdnsstub.lan.", "_localdnsstub", expandedAlias},
+		{"_gateway.example.com.", "", notAlias},   // not a host search suffix
+		{"_gateway.blacksmith.sh.", "", notAlias}, // partial suffix is not the suffix
+		{"gateway.lan.", "", notAlias},
+		{"example.com.", "", notAlias},
+		{"localhost.", "localhost", untrackedAlias},
+		{"API.localhost.", "api.localhost", untrackedAlias},
+		{"localhost.localdomain.", "localhost.localdomain", untrackedAlias},
+		{"foo.localhost.localdomain.", "foo.localhost.localdomain", untrackedAlias},
+		{"localhost.example.com.", "", notAlias},
+		{"notlocalhost.", "", notAlias},
+		{"Runner-ABC.", "runner-abc", trackedAlias},
+		{"runner-abc.corp.example.", "runner-abc.corp.example", trackedAlias},
+		{"runner-abc.lan.", "runner-abc", expandedAlias},                           // the machine's expanded form, like _gateway's
+		{"runner-abc.corp.example.lan.", "runner-abc.corp.example", expandedAlias}, // the FQDN's too
+		{"runner-abc.local.", "", notAlias},                                        // the mDNS form is not local state
+		{"other-host.", "", notAlias},
 	} {
-		got, expanded, enforce, ok := s.lookupSynthetic(tc.qname)
-		assert.Equal(t, tc.ok, ok, tc.qname)
-		assert.Equal(t, tc.expanded, expanded, tc.qname)
-		assert.Equal(t, tc.enforce, enforce, tc.qname)
+		got, class := s.lookupSynthetic(tc.qname)
+		assert.Equal(t, tc.class, class, tc.qname)
 		assert.Equal(t, tc.want, got, tc.qname)
 	}
 
 	cfg.SetHostSearchDomains(nil, slog.Default())
-	_, _, _, ok := s.lookupSynthetic("_gateway.lan.")
-	assert.False(t, ok, "with no search list the expanded form is an ordinary query")
+	_, class := s.lookupSynthetic("_gateway.lan.")
+	assert.Equal(t, notAlias, class, "with no search list the expanded form is an ordinary query")
+}
 
-	assert.Equal(t, TrackedAlias, s.ClassifyAlias("_gateway"))
-	assert.Equal(t, TrackedAlias, s.ClassifyAlias("runner-abc"))
-	assert.Equal(t, UntrackedAlias, s.ClassifyAlias("_localdnsstub"))
-	assert.Equal(t, UntrackedAlias, s.ClassifyAlias("api.localhost"))
-	assert.Equal(t, NotAlias, s.ClassifyAlias("registry.example"))
+// Startup pre-population resolves rule names outside the proxy and must
+// record them under the proxy's own policy: a wire name is mapped and mints
+// L7 evidence; a tracked alias is mapped without evidence; a loopback
+// listener is recorded nowhere, so the tracked-hostname replay can never
+// write the stub's own address.
+func TestRecordSystemCacheAnswer(t *testing.T) {
+	s := newTestServer(t, config.NewConfigManager(), firewall.NewMockFirewall(t))
+
+	s.RecordSystemCacheAnswer("_localdnsstub", []string{"127.0.0.53"})
+	assert.Empty(t, s.config.LookupHostnameByIP("127.0.0.53"), "a loopback listener must not be mapped")
+
+	s.RecordSystemCacheAnswer("_gateway", []string{"192.168.127.1"})
+	assert.Equal(t, "_gateway", s.config.LookupHostnameByIP("192.168.127.1"))
+	assert.False(t, s.config.NameResolvedToIP("_gateway", "192.168.127.1"), "_gateway must not mint forward-resolution evidence")
+
+	s.RecordSystemCacheAnswer("registry.example", []string{"192.0.2.10"})
+	assert.Equal(t, "registry.example", s.config.LookupHostnameByIP("192.0.2.10"))
+	assert.True(t, s.config.NameResolvedToIP("registry.example", "192.0.2.10"), "a wire name must mint forward-resolution evidence")
 }
 
 // The bare name is relayed to the stub and resolved's answer written back
@@ -360,21 +373,23 @@ func withMachineHostname(t *testing.T, name string, err error) {
 	t.Cleanup(func() { machineHostname = prev })
 }
 
-func TestMachineNames(t *testing.T) {
+func TestMachineHostnames(t *testing.T) {
 	for _, tc := range []struct {
-		hostname string
-		err      error
-		want     []string
+		hostname    string
+		err         error
+		full, label string
 	}{
-		{"Runner-ABC.corp.example.", nil, []string{"runner-abc.corp.example", "runner-abc"}},
-		{"runner-abc", nil, []string{"runner-abc"}},
-		{"localhost", nil, nil},       // the localhost family is handled on its own terms
-		{"build.localhost", nil, nil}, // and must not leak in through the machine name
-		{"", nil, nil},
-		{"runner-abc", os.ErrNotExist, nil},
+		{"Runner-ABC.corp.example.", nil, "runner-abc.corp.example", "runner-abc"},
+		{"runner-abc", nil, "runner-abc", ""},
+		{"localhost", nil, "", ""},       // the localhost family is handled on its own terms
+		{"build.localhost", nil, "", ""}, // and must not leak in through the machine name
+		{"", nil, "", ""},
+		{"runner-abc", os.ErrNotExist, "", ""},
 	} {
 		withMachineHostname(t, tc.hostname, tc.err)
-		assert.Equal(t, tc.want, machineNames(), tc.hostname)
+		full, label := machineHostnames()
+		assert.Equal(t, tc.full, full, tc.hostname)
+		assert.Equal(t, tc.label, label, tc.hostname)
 	}
 }
 

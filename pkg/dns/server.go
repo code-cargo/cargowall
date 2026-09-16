@@ -654,6 +654,20 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	}
 }
 
+// answerSource says where a DNS answer came from, for enforceDNSResponse's
+// L7 evidence: only an answer that came off the wire, for a name a peer can
+// present, may mint forward-resolution evidence.
+type answerSource int
+
+const (
+	// wireAnswer: an upstream answer, or a CNAME pre-resolve of one.
+	wireAnswer answerSource = iota
+	// localAnswer: relayed from resolved's own state — an address alias, not
+	// an identity. Scoping its address against it would make every flow
+	// there an L7 miss.
+	localAnswer
+)
+
 // enforceDNSResponse applies one successful DNS response to enforcement
 // state: rule/derived verdict matching, CNAME-chain learning, BPF map updates
 // for resolved IPs, late-allow reconciliation of previously blocked

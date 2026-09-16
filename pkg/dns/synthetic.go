@@ -24,29 +24,30 @@ import (
 	"github.com/miekg/dns"
 )
 
-// answerSource says where a DNS answer came from, for enforceDNSResponse's
-// L7 evidence: only an answer that came off the wire, for a name a peer can
-// present, may mint forward-resolution evidence.
-type answerSource int
+// aliasClass is what kind of name the proxy has in hand: an ordinary one, or
+// one of the kinds it answers from resolved's local state (#126, #129).
+type aliasClass int
 
 const (
-	// wireAnswer: an upstream answer, or a CNAME pre-resolve of one.
-	wireAnswer answerSource = iota
-	// localAnswer: relayed from resolved's own state — an address alias, not
-	// an identity. Scoping its address against it would make every flow
-	// there an L7 miss.
-	localAnswer
+	// notAlias: the ordinary path.
+	notAlias aliasClass = iota
+	// trackedAlias: _gateway, _outbound and the machine's own names —
+	// relayed, L4-enforced and attributed like an upstream answer, minting
+	// no L7 evidence. A real routed address a rule may name.
+	trackedAlias
+	// untrackedAlias: the stub's loopback listeners and the localhost
+	// family — relayed, recorded nowhere. Loopback the relay itself depends
+	// on, and any label under .localhost is accepted, so tracking would
+	// grow hostnameIPs without bound.
+	untrackedAlias
+	// expandedAlias: <alias>.<search>, the form a stub resolver tries before
+	// the name itself — NXDOMAIN, recorded nowhere. Never relayed: the stub
+	// would query upstream unmarked and the DNAT would bring it back here.
+	expandedAlias
 )
 
-// Names systemd-resolved synthesizes locally (#126), relayed to the stub on
-// the marked client and written back uncached. Which of them are enforced
-// is decided in lookupSynthetic.
 var (
-	// enforcedNames are real routed addresses a rule may name (#129): the
-	// default gateway and the machine's outbound address.
-	enforcedNames = []string{"_gateway", "_outbound"}
-	// relayOnlyNames resolve to the loopback listeners the proxy's own relay
-	// and startup cache peek depend on: relayed, never tracked, never written.
+	enforcedNames  = []string{"_gateway", "_outbound"}
 	relayOnlyNames = []string{"_localdnsstub", "_localdnsproxy"}
 	localhostRoots = []string{"localhost", "localhost.localdomain"}
 )
@@ -57,28 +58,28 @@ var (
 	machineHostname  = os.Hostname
 )
 
-// machineNames returns the forms resolved synthesizes for the machine's own
-// hostname: the configured name and, when it carries a domain, its first
-// label. Read per lookup — gethostname is a trivial syscall — so a
-// hostnamectl set-hostname mid-run is honoured. The mDNS "<label>.local"
-// form is deliberately absent: resolved renames it on conflict, and a
-// .local query it does not synthesize is multicast to the LAN, whose answer
-// is not local state. A hostname in the localhost family yields nothing;
-// that family is handled on its own terms.
-func machineNames() []string {
+// machineHostnames returns the forms resolved synthesizes for the machine's
+// own hostname: the configured name and, when it carries a domain, its
+// first label (else ""). Read per lookup — gethostname is a trivial syscall
+// — so a hostnamectl set-hostname mid-run is honoured. The mDNS
+// "<label>.local" form is deliberately absent: resolved renames it on
+// conflict, and a .local query it does not synthesize is multicast to the
+// LAN, whose answer is not local state. A hostname in the localhost family
+// yields nothing; that family is handled on its own terms.
+func machineHostnames() (full, label string) {
 	h, err := machineHostname()
 	if err != nil {
-		return nil
+		return "", ""
 	}
 	h = strings.ToLower(strings.TrimSuffix(h, "."))
 	first, _, cut := strings.Cut(h, ".")
 	if first == "" || isLocalhostName(h) {
-		return nil
+		return "", ""
 	}
 	if cut {
-		return []string{h, first}
+		return h, first
 	}
-	return []string{h}
+	return h, ""
 }
 
 // isLocalhostName reports an RFC 6761 localhost-family name.
@@ -91,58 +92,43 @@ func isLocalhostName(name string) bool {
 	return false
 }
 
-// lookupSynthetic classifies a wire-form query name (trailing dot). ok:
-// the proxy answers this name itself. expanded: the search-expanded form a
-// stub resolver tries before the name itself, answered NXDOMAIN — never
-// relayed, never enforced. enforce: the answer gets L4 enforcement and
-// attribution like an upstream one (#129) — enforcedNames and the machine's
-// own names, a fixed handful. The localhost family and relayOnlyNames are
-// relayed only: they are loopback, and any label under .localhost is
-// accepted, so tracking them would grow hostnameIPs without bound.
-func (s *Server) lookupSynthetic(qname string) (name string, expanded, enforce, ok bool) {
+// lookupSynthetic classifies a wire-form query name (trailing dot),
+// returning the alias it names — for expandedAlias, the bare alias — and
+// its class. Checked in place against the fixed sets; nothing is built per
+// query.
+func (s *Server) lookupSynthetic(qname string) (string, aliasClass) {
 	full := strings.ToLower(strings.TrimSuffix(qname, "."))
 	if isLocalhostName(full) || slices.Contains(relayOnlyNames, full) {
-		return full, false, false, true
+		return full, untrackedAlias
 	}
-	enforced := append(machineNames(), enforcedNames...)
-	if slices.Contains(enforced, full) {
-		return full, false, true, true
+	host, label := machineHostnames()
+	if slices.Contains(enforcedNames, full) || full == host || full == label {
+		return full, trackedAlias
 	}
-	for _, n := range append(enforced, relayOnlyNames...) {
-		if rest, found := strings.CutPrefix(full, n+"."); found && s.config.IsHostSearchSuffix(rest) {
-			return n, true, false, true
+	for _, n := range enforcedNames {
+		if s.expandedFrom(full, n) {
+			return n, expandedAlias
 		}
 	}
-	return "", false, false, false
+	for _, n := range relayOnlyNames {
+		if s.expandedFrom(full, n) {
+			return n, expandedAlias
+		}
+	}
+	if host != "" && s.expandedFrom(full, host) {
+		return host, expandedAlias
+	}
+	if label != "" && s.expandedFrom(full, label) {
+		return label, expandedAlias
+	}
+	return "", notAlias
 }
 
-// AliasClass is how a caller that resolves rule names outside the proxy —
-// startup pre-population through the system resolver — must treat a name
-// the proxy answers from resolved's local state.
-type AliasClass int
-
-const (
-	// NotAlias is a wire name: map it and mint forward-resolution evidence.
-	NotAlias AliasClass = iota
-	// TrackedAlias is an enforced synthetic name (_gateway, _outbound, the
-	// machine's own names): map it for attribution, mint no evidence.
-	TrackedAlias
-	// UntrackedAlias is a loopback listener or a localhost-family name:
-	// never tracked, never written — nothing to record at all.
-	UntrackedAlias
-)
-
-// ClassifyAlias classifies name for a caller outside the proxy's own relay.
-func (s *Server) ClassifyAlias(name string) AliasClass {
-	_, expanded, enforce, ok := s.lookupSynthetic(name)
-	switch {
-	case !ok:
-		return NotAlias
-	case enforce && !expanded:
-		return TrackedAlias
-	default:
-		return UntrackedAlias
-	}
+// expandedFrom reports whether full is base plus one of the host's own
+// search suffixes.
+func (s *Server) expandedFrom(full, base string) bool {
+	rest, ok := strings.CutPrefix(full, base)
+	return ok && len(rest) > 1 && rest[0] == '.' && s.config.IsHostSearchSuffix(rest[1:])
 }
 
 // serveSynthetic answers a synthetic-name query — host listeners, IN class —
@@ -154,15 +140,13 @@ func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
 	if len(r.Question) == 0 || r.Question[0].Qclass != dns.ClassINET || !s.hostListener(w) {
 		return false
 	}
-	name, expanded, enforce, ok := s.lookupSynthetic(r.Question[0].Name)
-	if !ok {
+	name, class := s.lookupSynthetic(r.Question[0].Name)
+	switch class {
+	case notAlias:
 		return false
-	}
-
-	if expanded {
+	case expandedAlias:
 		// NXDOMAIN, not REFUSED: REFUSED on a multi-label attempt aborts
-		// c-ares' search before the bare name. Not relayed: the stub would
-		// query upstream unmarked and the DNAT would bring it back here.
+		// c-ares' search before the bare name.
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeNameError)
 		m.Authoritative = true
@@ -177,11 +161,33 @@ func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
 		return false
 	}
 	resp.Id = r.Id
-	if enforce && resp.Rcode == dns.RcodeSuccess {
+	if class == trackedAlias && resp.Rcode == dns.RcodeSuccess {
 		s.enforceDNSResponse(name, resp, 0, localAnswer)
 	}
 	w.WriteMsg(resp)
 	return true
+}
+
+// RecordSystemCacheAnswer applies one startup pre-population answer — the
+// IPs a rule hostname currently resolves to through the system resolver, the
+// IPs live processes are already using — under the same policy as the
+// proxy's own answers. A wire name is mapped for attribution and mints
+// forward-resolution evidence: a FORWARD lookup of a rule name, the same
+// evidence class as the proxy's answers, and what lets an IP be L7-scoped at
+// all (RegisterL7Identity scopes iff bound). A tracked alias is mapped
+// without evidence. Anything else is recorded nowhere, so the
+// tracked-hostname replay can never write a loopback listener.
+func (s *Server) RecordSystemCacheAnswer(hostname string, ips []string) {
+	_, class := s.lookupSynthetic(hostname)
+	if class != notAlias && class != trackedAlias {
+		return
+	}
+	for _, ip := range ips {
+		s.config.UpdateDNSMapping(hostname, ip)
+		if class == notAlias {
+			s.config.RecordForwardResolution(hostname, ip)
+		}
+	}
 }
 
 // hostListener reports whether the query arrived on a listener created for

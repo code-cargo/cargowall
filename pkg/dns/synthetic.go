@@ -101,8 +101,11 @@ func (s *Server) lookupSynthetic(qname string) (string, aliasClass) {
 	if isLocalhostName(full) || slices.Contains(relayOnlyNames, full) {
 		return full, untrackedAlias
 	}
+	// "" means absent for both host (gethostname failed) and label (a
+	// single-label hostname); neither may match the root query, which
+	// trims to "".
 	host, label := machineHostnames()
-	if slices.Contains(enforcedNames, full) || full == host || full == label {
+	if slices.Contains(enforcedNames, full) || (host != "" && full == host) || (label != "" && full == label) {
 		return full, trackedAlias
 	}
 	for _, n := range enforcedNames {

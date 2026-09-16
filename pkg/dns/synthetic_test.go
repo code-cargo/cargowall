@@ -195,6 +195,28 @@ func TestLookupSynthetic(t *testing.T) {
 	assert.Equal(t, notAlias, class, "with no search list the expanded form is an ordinary query")
 }
 
+// A missing label is not a name. With a single-label hostname (the common
+// runner case) or a failed gethostname, machineHostnames reports "" for the
+// absent form; the root query "." trims to "" and must not match it.
+func TestLookupSynthetic_RootQueryIsNotTheMissingLabel(t *testing.T) {
+	s := newTestServer(t, config.NewConfigManager(), firewall.NewMockFirewall(t))
+	for _, tc := range []struct {
+		hostname string
+		err      error
+	}{
+		{"fv-az123-456", nil},
+		{"", os.ErrNotExist},
+	} {
+		withMachineHostname(t, tc.hostname, tc.err)
+		_, class := s.lookupSynthetic(".")
+		assert.Equal(t, notAlias, class, "hostname=%q err=%v", tc.hostname, tc.err)
+		if tc.hostname != "" {
+			_, class = s.lookupSynthetic(tc.hostname + ".")
+			assert.Equal(t, trackedAlias, class, "the real single-label name still matches")
+		}
+	}
+}
+
 // Startup pre-population resolves rule names outside the proxy and must
 // record them under the proxy's own policy: a wire name is mapped and mints
 // L7 evidence; a tracked alias is mapped without evidence; a loopback

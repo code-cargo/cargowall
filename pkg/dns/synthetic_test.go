@@ -17,6 +17,7 @@
 package dns
 
 import (
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -59,7 +60,11 @@ func withFakeStub(t *testing.T) func() []dns.Question {
 		mu   sync.Mutex
 		seen []dns.Question
 	)
-	answers := map[string]string{"_gateway.": "192.168.5.2", "_outbound.": "192.168.5.15"}
+	// runner-abc stands in for the machine's own hostname.
+	answers := map[string]string{
+		"_gateway.": "192.168.5.2", "_outbound.": "192.168.5.15", "_localdnsstub.": "127.0.0.53",
+		"runner-abc.": "10.0.0.5", "renamed.": "10.0.0.6",
+	}
 	started := make(chan struct{})
 	stub := &dns.Server{
 		PacketConn:        pc,
@@ -106,14 +111,21 @@ func withFakeStub(t *testing.T) func() []dns.Question {
 
 // syntheticServer is a filtering, default-deny server — the configuration
 // under which these names would otherwise be REFUSED, so every answer below
-// also proves precedence over the gate — with a fake stub and no host
-// search list. The mock firewall carries no expectations: any enforcement
-// side effect fails the test.
-func syntheticServer(t *testing.T) (*Server, func() []dns.Question) {
+// also proves precedence over the gate — with a fake stub, no host search
+// list, and the given rules. The mock firewall carries no expectations
+// unless a test adds them: with no rule naming a synthetic name, any
+// firewall call fails the test.
+func syntheticServer(t *testing.T, rules ...config.Rule) (*Server, func() []dns.Question) {
 	t.Helper()
+	return syntheticServerWithDefault(t, config.ActionDeny, rules...)
+}
+
+func syntheticServerWithDefault(t *testing.T, defaultAction config.Action, rules ...config.Rule) (*Server, func() []dns.Question) {
+	t.Helper()
+	withMachineHostname(t, "", os.ErrNotExist) // no machine name unless a test sets one
 	seen := withFakeStub(t)
 	cfg := config.NewConfigManager()
-	require.NoError(t, cfg.LoadConfigFromRules(nil, config.ActionDeny))
+	require.NoError(t, cfg.LoadConfigFromRules(rules, defaultAction))
 	s := newTestServer(t, cfg, firewall.NewMockFirewall(t))
 	s.filterQueries = true
 	return s, seen
@@ -137,46 +149,98 @@ func askName(t *testing.T, s *Server, name string, qtype uint16) *dns.Msg {
 	return ask(t, s, &MockResponseWriter{}, q)
 }
 
-func TestSyntheticQuery(t *testing.T) {
-	isHostSuffix := func(rest string) bool { return rest == "lan" || rest == "vm.blacksmith.sh" }
+func TestLookupSynthetic(t *testing.T) {
+	cfg := config.NewConfigManager()
+	cfg.SetHostSearchDomains([]string{"lan", "vm.blacksmith.sh"}, slog.Default())
+	s := newTestServer(t, cfg, firewall.NewMockFirewall(t))
+	withMachineHostname(t, "Runner-ABC.corp.example", nil)
 	for _, tc := range []struct {
-		qname    string
-		want     string
-		expanded bool
-		ok       bool
+		qname string
+		want  string
+		class aliasClass
 	}{
-		{"_gateway.", "_gateway", false, true},
-		{"_GATEWAY.", "_gateway", false, true},
-		{"_outbound.", "_outbound", false, true},
-		{"_localdnsstub.", "_localdnsstub", false, true},
-		{"_localdnsproxy.", "_localdnsproxy", false, true},
-		{"_gateway.lan.", "_gateway", true, true},
-		{"_GATEWAY.LAN.", "_gateway", true, true},
-		{"_outbound.vm.blacksmith.sh.", "_outbound", true, true},
-		{"_gateway.example.com.", "", false, false},   // not a host search suffix
-		{"_gateway.blacksmith.sh.", "", false, false}, // partial suffix is not the suffix
-		{"gateway.lan.", "", false, false},
-		{"example.com.", "", false, false},
-		{"localhost.", "localhost", false, true},
-		{"API.localhost.", "api.localhost", false, true},
-		{"localhost.localdomain.", "localhost.localdomain", false, true},
-		{"foo.localhost.localdomain.", "foo.localhost.localdomain", false, true},
-		{"localhost.example.com.", "", false, false},
-		{"notlocalhost.", "", false, false},
+		{"_gateway.", "_gateway", trackedAlias},
+		{"_GATEWAY.", "_gateway", trackedAlias},
+		{"_outbound.", "_outbound", trackedAlias},
+		{"_localdnsstub.", "_localdnsstub", untrackedAlias},   // loopback listener
+		{"_localdnsproxy.", "_localdnsproxy", untrackedAlias}, // loopback listener
+		{"_gateway.lan.", "_gateway", expandedAlias},
+		{"_GATEWAY.LAN.", "_gateway", expandedAlias},
+		{"_outbound.vm.blacksmith.sh.", "_outbound", expandedAlias},
+		{"_localdnsstub.lan.", "_localdnsstub", expandedAlias},
+		{"_gateway.example.com.", "", notAlias},   // not a host search suffix
+		{"_gateway.blacksmith.sh.", "", notAlias}, // partial suffix is not the suffix
+		{"gateway.lan.", "", notAlias},
+		{"example.com.", "", notAlias},
+		{"localhost.", "localhost", untrackedAlias},
+		{"API.localhost.", "api.localhost", untrackedAlias},
+		{"localhost.localdomain.", "localhost.localdomain", untrackedAlias},
+		{"foo.localhost.localdomain.", "foo.localhost.localdomain", untrackedAlias},
+		{"localhost.example.com.", "", notAlias},
+		{"notlocalhost.", "", notAlias},
+		{"Runner-ABC.", "runner-abc", trackedAlias},
+		{"runner-abc.corp.example.", "runner-abc.corp.example", trackedAlias},
+		{"runner-abc.lan.", "runner-abc", expandedAlias},                           // the machine's expanded form, like _gateway's
+		{"runner-abc.corp.example.lan.", "runner-abc.corp.example", expandedAlias}, // the FQDN's too
+		{"runner-abc.local.", "", notAlias},                                        // the mDNS form is not local state
+		{"other-host.", "", notAlias},
 	} {
-		got, expanded, ok := syntheticQuery(tc.qname, isHostSuffix)
-		assert.Equal(t, tc.ok, ok, tc.qname)
-		assert.Equal(t, tc.expanded, expanded, tc.qname)
+		got, class := s.lookupSynthetic(tc.qname)
+		assert.Equal(t, tc.class, class, tc.qname)
 		assert.Equal(t, tc.want, got, tc.qname)
 	}
 
-	_, _, ok := syntheticQuery("_gateway.lan.", func(string) bool { return false })
-	assert.False(t, ok, "with no search list the expanded form is an ordinary query")
+	cfg.SetHostSearchDomains(nil, slog.Default())
+	_, class := s.lookupSynthetic("_gateway.lan.")
+	assert.Equal(t, notAlias, class, "with no search list the expanded form is an ordinary query")
+}
+
+// A missing label is not a name. With a single-label hostname (the common
+// runner case) or a failed gethostname, machineHostnames reports "" for the
+// absent form; the root query "." trims to "" and must not match it.
+func TestLookupSynthetic_RootQueryIsNotTheMissingLabel(t *testing.T) {
+	s := newTestServer(t, config.NewConfigManager(), firewall.NewMockFirewall(t))
+	for _, tc := range []struct {
+		hostname string
+		err      error
+	}{
+		{"fv-az123-456", nil},
+		{"", os.ErrNotExist},
+	} {
+		withMachineHostname(t, tc.hostname, tc.err)
+		_, class := s.lookupSynthetic(".")
+		assert.Equal(t, notAlias, class, "hostname=%q err=%v", tc.hostname, tc.err)
+		if tc.hostname != "" {
+			_, class = s.lookupSynthetic(tc.hostname + ".")
+			assert.Equal(t, trackedAlias, class, "the real single-label name still matches")
+		}
+	}
+}
+
+// Startup pre-population resolves rule names outside the proxy and must
+// record them under the proxy's own policy: a wire name is mapped and mints
+// L7 evidence; a tracked alias is mapped without evidence; a loopback
+// listener is recorded nowhere, so the tracked-hostname replay can never
+// write the stub's own address.
+func TestRecordSystemCacheAnswer(t *testing.T) {
+	s := newTestServer(t, config.NewConfigManager(), firewall.NewMockFirewall(t))
+
+	s.RecordSystemCacheAnswer("_localdnsstub", []string{"127.0.0.53"})
+	assert.Empty(t, s.config.LookupHostnameByIP("127.0.0.53"), "a loopback listener must not be mapped")
+
+	s.RecordSystemCacheAnswer("_gateway", []string{"192.168.127.1"})
+	assert.Equal(t, "_gateway", s.config.LookupHostnameByIP("192.168.127.1"))
+	assert.False(t, s.config.NameResolvedToIP("_gateway", "192.168.127.1"), "_gateway must not mint forward-resolution evidence")
+
+	s.RecordSystemCacheAnswer("registry.example", []string{"192.0.2.10"})
+	assert.Equal(t, "registry.example", s.config.LookupHostnameByIP("192.0.2.10"))
+	assert.True(t, s.config.NameResolvedToIP("registry.example", "192.0.2.10"), "a wire name must mint forward-resolution evidence")
 }
 
 // The bare name is relayed to the stub and resolved's answer written back
-// as-is, ahead of a gate that would otherwise REFUSE it — and nothing is
-// cached, tracked or enforced.
+// as-is, ahead of a gate that would otherwise REFUSE it. Nothing is cached;
+// the answer IS tracked, so a later connection to the address is attributed
+// to the name — and with no rule naming it, the firewall is not touched.
 func TestServeSynthetic_RelaysBareNameToStub(t *testing.T) {
 	s, seen := syntheticServer(t)
 
@@ -194,9 +258,52 @@ func TestServeSynthetic_RelaysBareNameToStub(t *testing.T) {
 
 	_, cached := s.dnsCache.Get(s.generateCacheKey(&dns.Msg{Question: []dns.Question{{Name: "_gateway.", Qtype: dns.TypeA, Qclass: dns.ClassINET}}}))
 	assert.False(t, cached, "stub answers are not cached")
+	assert.Equal(t, "_gateway", s.config.LookupHostnameByIP("192.168.5.2"), "the address is attributed to the name")
 	s.hostnameIPsMutex.RLock()
 	defer s.hostnameIPsMutex.RUnlock()
-	assert.Empty(t, s.hostnameIPs, "stub answers are not tracked")
+	assert.Contains(t, s.hostnameIPs, "_gateway")
+}
+
+// A rule can name a synthetic name (#129): allow opens the gateway's address
+// on the rule's ports, deny closes it — the L4 enforcement any upstream
+// answer gets, so "_gateway" is a portable rule where a provider CIDR was.
+func TestServeSynthetic_RuleNamesTheGateway(t *testing.T) {
+	gateway := mock.MatchedBy(func(ip net.IP) bool { return ip.Equal(net.ParseIP("192.168.5.2")) })
+	ports := []config.Port{{Port: 1041, Protocol: config.ProtocolTCP}}
+	s, _ := syntheticServer(t, config.Rule{Type: config.RuleTypeHostname, Value: "_gateway", Ports: ports, Action: config.ActionAllow})
+	mockFw := s.firewall.(*firewall.MockFirewall)
+	mockFw.On("AddIP", gateway, config.ActionAllow, ports).Return(true, nil).Once()
+	m := askName(t, s, "_gateway.", dns.TypeA)
+	assert.Equal(t, dns.RcodeSuccess, m.Rcode)
+	mockFw.AssertExpectations(t)
+
+	// A deny only needs a BPF entry when the default would otherwise allow.
+	s, _ = syntheticServerWithDefault(t, config.ActionAllow, config.Rule{Type: config.RuleTypeHostname, Value: "_gateway", Action: config.ActionDeny})
+	mockFw = s.firewall.(*firewall.MockFirewall)
+	mockFw.On("AddIP", gateway, config.ActionDeny, []config.Port(nil)).Return(true, nil).Once()
+	m = askName(t, s, "_gateway.", dns.TypeA)
+	assert.Equal(t, dns.RcodeSuccess, m.Rcode, "a deny rule still resolves the name; it closes the address")
+	mockFw.AssertExpectations(t)
+}
+
+// "_gateway" is an address alias, never a name a peer presents. An all-ports
+// allow — which would L7-scope a real name's address for TLS, HTTP and QUIC —
+// must stay L4 here: no forward-resolution evidence is minted, so registerL7
+// scopes nothing (SCOPE IFF BOUND), and HTTP to the host agent carrying
+// "Host: <ip>" is not an L7 miss. Attribution is unaffected.
+func TestServeSynthetic_AllowDoesNotL7Scope(t *testing.T) {
+	s, _ := syntheticServer(t, config.Rule{Type: config.RuleTypeHostname, Value: "_gateway", Action: config.ActionAllow})
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	s.firewall.(*firewall.MockFirewall).
+		On("AddIP", mock.MatchedBy(func(ip net.IP) bool { return ip.Equal(net.ParseIP("192.168.5.2")) }), config.ActionAllow, []config.Port(nil)).
+		Return(true, nil).Once()
+
+	m := askName(t, s, "_gateway.", dns.TypeA)
+	assert.Equal(t, dns.RcodeSuccess, m.Rcode)
+	assert.Empty(t, rec.scopes, "a synthetic name must not L7-scope its address")
+	assert.False(t, s.config.NameResolvedToIP("_gateway", "192.168.5.2"), "no forward-resolution evidence for an alias")
+	assert.Equal(t, "_gateway", s.config.LookupHostnameByIP("192.168.5.2"), "attribution still applies")
 }
 
 // Whatever resolved says is what the client gets: NODATA for a family it
@@ -223,8 +330,10 @@ func TestServeSynthetic_StubUnreachableIsOrdinary(t *testing.T) {
 	assert.Equal(t, dns.RcodeRefused, m.Rcode)
 }
 
-// The localhost family resolved synthesizes beyond what /etc/hosts carries.
-func TestServeSynthetic_RelaysLocalhostFamily(t *testing.T) {
+// The localhost family resolved synthesizes beyond what /etc/hosts carries —
+// relayed, but not tracked: any label under .localhost is accepted, and
+// retaining each alias would grow hostnameIPs without bound.
+func TestServeSynthetic_RelaysLocalhostFamilyUntracked(t *testing.T) {
 	s, seen := syntheticServer(t)
 	for _, q := range []string{"api.localhost.", "localhost.localdomain.", "foo.localhost.localdomain."} {
 		m := askName(t, s, q, dns.TypeA)
@@ -233,6 +342,10 @@ func TestServeSynthetic_RelaysLocalhostFamily(t *testing.T) {
 		assert.Equal(t, "127.0.0.1", m.Answer[0].(*dns.A).A.String(), q)
 	}
 	assert.Len(t, seen(), 3)
+	assert.Empty(t, s.config.LookupHostnameByIP("127.0.0.1"))
+	s.hostnameIPsMutex.RLock()
+	defer s.hostnameIPsMutex.RUnlock()
+	assert.Empty(t, s.hostnameIPs)
 }
 
 // The search-expanded form is the first query a resolver sends for the
@@ -273,6 +386,80 @@ func TestServeSynthetic_NonINClassIsOrdinary(t *testing.T) {
 	m := ask(t, s, &MockResponseWriter{}, q)
 	assert.Equal(t, dns.RcodeRefused, m.Rcode)
 	assert.Empty(t, seen())
+}
+
+func withMachineHostname(t *testing.T, name string, err error) {
+	t.Helper()
+	prev := machineHostname
+	machineHostname = func() (string, error) { return name, err }
+	t.Cleanup(func() { machineHostname = prev })
+}
+
+func TestMachineHostnames(t *testing.T) {
+	for _, tc := range []struct {
+		hostname    string
+		err         error
+		full, label string
+	}{
+		{"Runner-ABC.corp.example.", nil, "runner-abc.corp.example", "runner-abc"},
+		{"runner-abc", nil, "runner-abc", ""},
+		{"localhost", nil, "", ""},       // the localhost family is handled on its own terms
+		{"build.localhost", nil, "", ""}, // and must not leak in through the machine name
+		{"", nil, "", ""},
+		{"runner-abc", os.ErrNotExist, "", ""},
+	} {
+		withMachineHostname(t, tc.hostname, tc.err)
+		full, label := machineHostnames()
+		assert.Equal(t, tc.full, full, tc.hostname)
+		assert.Equal(t, tc.label, label, tc.hostname)
+	}
+}
+
+// The machine's own hostname is a synthetic record too (its addresses, or
+// 127.0.0.2 with none), and /etc/hosts does not always pin it: relayed and
+// tracked like the underscore set, a fixed handful of names.
+func TestServeSynthetic_MachineHostnameRelayedAndTracked(t *testing.T) {
+	s, seen := syntheticServer(t)
+	withMachineHostname(t, "runner-abc", nil)
+
+	m := askName(t, s, "runner-abc.", dns.TypeA)
+	assert.Equal(t, dns.RcodeSuccess, m.Rcode)
+	require.Len(t, m.Answer, 1)
+	assert.Equal(t, "10.0.0.5", m.Answer[0].(*dns.A).A.String())
+	assert.Len(t, seen(), 1)
+	assert.Equal(t, "runner-abc", s.config.LookupHostnameByIP("10.0.0.5"))
+	assert.False(t, s.config.NameResolvedToIP("runner-abc", "10.0.0.5"), "the machine's own name is an alias too: no L7 evidence")
+
+	m = askName(t, s, "other-host.", dns.TypeA)
+	assert.Equal(t, dns.RcodeRefused, m.Rcode, "only the machine's own names are relayed")
+
+	// The search-expanded form a stub resolver tries first is NXDOMAIN, as
+	// for _gateway — REFUSED would end a c-ares search before the bare name.
+	s.config.SetHostSearchDomains([]string{"lan"}, s.logger)
+	m = askName(t, s, "runner-abc.lan.", dns.TypeA)
+	assert.Equal(t, dns.RcodeNameError, m.Rcode)
+
+	// hostnamectl set-hostname mid-run: the new name is served, the old one
+	// takes the ordinary path.
+	withMachineHostname(t, "renamed", nil)
+	m = askName(t, s, "renamed.", dns.TypeA)
+	assert.Equal(t, "10.0.0.6", m.Answer[0].(*dns.A).A.String())
+	m = askName(t, s, "runner-abc.", dns.TypeA)
+	assert.Equal(t, dns.RcodeRefused, m.Rcode)
+}
+
+// The stub's own loopback listeners are relayed but never tracked or
+// written: a rule naming _localdnsstub must not put 127.0.0.53 — the
+// address the relay itself depends on — into the maps.
+func TestServeSynthetic_StubListenersUntracked(t *testing.T) {
+	s, _ := syntheticServer(t, config.Rule{Type: config.RuleTypeHostname, Value: "_localdnsstub", Action: config.ActionAllow})
+	m := askName(t, s, "_localdnsstub.", dns.TypeA)
+	assert.Equal(t, dns.RcodeSuccess, m.Rcode)
+	assert.Equal(t, "127.0.0.53", m.Answer[0].(*dns.A).A.String())
+	assert.Empty(t, s.config.LookupHostnameByIP("127.0.0.53"))
+	s.hostnameIPsMutex.RLock()
+	defer s.hostnameIPsMutex.RUnlock()
+	assert.Empty(t, s.hostnameIPs)
 }
 
 // containerListenerWriter answers on the docker-bridge listener.

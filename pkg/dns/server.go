@@ -645,7 +645,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	// DNS-path output consistent with the connection-event path, which logs
 	// the lowercase hostname from the IP->hostname mapping (#65).
 	if len(r.Question) > 0 && resp.Rcode == dns.RcodeSuccess {
-		s.enforceDNSResponse(strings.ToLower(strings.TrimSuffix(r.Question[0].Name, ".")), resp, 0)
+		s.enforceDNSResponse(strings.ToLower(strings.TrimSuffix(r.Question[0].Name, ".")), resp, 0, wireAnswer)
 	}
 
 	// Return response to client
@@ -654,14 +654,32 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	}
 }
 
+// answerSource says where a DNS answer came from, for enforceDNSResponse's
+// L7 evidence: only an answer that came off the wire, for a name a peer can
+// present, may mint forward-resolution evidence.
+type answerSource int
+
+const (
+	// wireAnswer: an upstream answer, or a CNAME pre-resolve of one.
+	wireAnswer answerSource = iota
+	// localAnswer: relayed from resolved's own state — an address alias, not
+	// an identity. Scoping its address against it would make every flow
+	// there an L7 miss.
+	localAnswer
+)
+
 // enforceDNSResponse applies one successful DNS response to enforcement
 // state: rule/derived verdict matching, CNAME-chain learning, BPF map updates
 // for resolved IPs, late-allow reconciliation of previously blocked
 // connections, and pre-resolution of allowed CNAME-only responses.
 // canonicalHostname is the queried name, lowercased with the trailing dot
 // trimmed. depth bounds pre-resolve recursion (see preResolveCNAMETarget);
-// handleDNSQuery passes 0.
-func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, depth int) {
+// handleDNSQuery passes 0. source says whether the answer came off the wire
+// (wireAnswer: upstream or pre-resolve, for a name a peer can present) and
+// so may mint L7 forward-resolution evidence, or from resolved's local state
+// (localAnswer: an address alias no peer presents) and mints none, so SCOPE
+// IFF BOUND scopes nothing.
+func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, depth int, source answerSource) {
 	// Extract IPs and TTLs from response
 	ips, ttl := s.extractIPsFromResponse(resp)
 
@@ -833,8 +851,11 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 				// This is THE forward-resolution path — a real DNS answer
 				// traversing the proxy — so it (and RecordCNAMEChain below)
 				// are the only seeds of the L7 per-IP binding evidence.
-				// Reverse-DNS paths must never record it (PTR forgery).
-				s.config.RecordForwardResolution(canonicalHostname, ip.String())
+				// Reverse-DNS paths must never record it (PTR forgery), and
+				// an answer that did not come off the wire mints none.
+				if source == wireAnswer {
+					s.config.RecordForwardResolution(canonicalHostname, ip.String())
+				}
 			}
 
 			// Track the IPs we've seen for this hostname. Accumulate
@@ -1294,7 +1315,7 @@ func (s *Server) preResolveCNAMETarget(target string, depth int) {
 			if resp.Rcode != dns.RcodeSuccess {
 				continue
 			}
-			s.enforceDNSResponse(target, resp, depth)
+			s.enforceDNSResponse(target, resp, depth, wireAnswer)
 		}
 	}()
 }

@@ -37,6 +37,7 @@ import (
 // opts in through withResolvConf.
 func TestMain(m *testing.M) {
 	resolvConfPath = filepath.Join(os.TempDir(), "cargowall-dns-test-absent-resolv.conf")
+	machineHostname = func() (string, error) { return "", os.ErrNotExist }
 	os.Exit(m.Run())
 }
 
@@ -121,6 +122,8 @@ func TestHandleDNSQuery_HostSearchExpandedFormResolvesAndEnforces(t *testing.T) 
 	s := newTestServer(t, cfg, mockFw)
 	s.upstream = pc.LocalAddr().String()
 	s.filterQueries = true
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
 
 	q := new(dns.Msg)
 	q.SetQuestion("myservice.corp.lan.", dns.TypeA)
@@ -134,4 +137,10 @@ func TestHandleDNSQuery_HostSearchExpandedFormResolvesAndEnforces(t *testing.T) 
 	assert.Equal(t, dns.RcodeSuccess, w.msg.Rcode)
 	require.Len(t, w.msg.Answer, 1)
 	assert.Equal(t, "192.0.2.10", w.msg.Answer[0].(*dns.A).A.String())
+
+	// A real answer for an allowed name is a wire identity: evidence minted,
+	// address L7-scoped for the rule's (all) ports — the contrast to the
+	// synthetic path, which mints none.
+	assert.True(t, s.config.NameResolvedToIP("myservice.corp.lan", "192.0.2.10"))
+	assert.Equal(t, "all-ports", rec.scopes["192.0.2.10"])
 }

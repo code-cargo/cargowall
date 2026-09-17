@@ -47,12 +47,18 @@ func compileHostnamePattern(raw string) (hostnamePattern, error) {
 
 // Matches returns true if hostname matches the glob pattern.
 //
-// The empty hostname never matches. strings.Split("", ".") yields one empty
-// label, which "*" and "**" would otherwise consume — and "" is what an IP
-// with no reverse name looks like to callers such as gateExistingConnections,
-// which must not hand such an IP a wildcard rule's ports (#125).
+// A hostname with an empty label never matches: "" is not a DNS label, so
+// no segment, literal or wildcard, may consume one. That covers the empty
+// hostname itself, which splits to a single empty label. Rejected here, at
+// the boundary, the same way compileHostnamePattern rejects empty segments,
+// so matchSegments only ever sees well-formed labels.
 func (p *hostnamePattern) Matches(hostname string) bool {
 	labels := strings.Split(hostname, ".")
+	for _, label := range labels {
+		if label == "" {
+			return false
+		}
+	}
 	return matchSegments(p.Segments, labels)
 }
 
@@ -74,14 +80,8 @@ func matchSegments(segments []string, labels []string) bool {
 	for si := segCount - 1; si >= 0; si-- {
 		seg := segments[si]
 		// dp[si][labelCount] stays false: every segment consumes at least
-		// one label. An empty label is left false for the same reason — ""
-		// is never a DNS label (it is what "" and "a..b" split to), so no
-		// segment, wildcard or literal, may consume it. Literal segments are
-		// non-empty by construction (compileHostnamePattern).
+		// one label.
 		for li := labelCount - 1; li >= 0; li-- {
-			if labels[li] == "" {
-				continue
-			}
 			switch seg {
 			case "**":
 				// ** matches one or more labels

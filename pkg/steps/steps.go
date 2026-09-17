@@ -21,17 +21,30 @@
 // thread's tag, and the cgroup hooks copy the tag onto each socket cookie —
 // so every TC event carries the step that (transitively) created its socket.
 // Attribution only: no verdict consults these maps.
+//
+// Pid numbering: the kernel side keys everything by global (init-namespace)
+// ids; everything this package reads from /proc — the worker pid, the
+// daemon's own pid, container leaders reported by dockerd — is numbered in
+// the daemon's pid namespace, a different space whenever cargowall runs
+// inside a container (ARC runners are Kubernetes pods). The step_task_iter
+// BPF iterator bridges the two: it walks the daemon's namespace subtree,
+// seeds the kernel's global→namespace table (map_task_nspid, which is what
+// makes boundary events and socket pids resolvable) and streams the
+// process tree in global ids, so seeding and container tagging never scan
+// /proc. On a plain VM the translation is the identity.
 package steps
 
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 	"unsafe"
@@ -78,13 +91,16 @@ const maxOrdinalBase = uint64(events.MaxRealStepOrdinal)
 // Tracker owns the step-attribution BPF programs and the reconciler
 // goroutine that turns new-step ringbuf notifications into audit events.
 type Tracker struct {
-	workerPID     int
+	workerPID     int    // as numbered in the daemon's pid namespace (/proc)
+	workerTgid    uint32 // the same process, global — what step_fork compares
 	workerCmdline string
 	objs          bpf.StepBpfObjects
 	links         []link.Link
+	iter          *link.Iter // step_task_iter; also in links for Close
 	reader        *ringbuf.Reader
 	stateMap      *ebpf.Map
 	taskMap       *ebpf.Map
+	nspidMap      *ebpf.Map // map_task_nspid; cleared at Close, see there
 	auditLogger   *events.AuditLogger
 	logger        *slog.Logger
 	done          chan struct{}
@@ -96,6 +112,10 @@ type Tracker struct {
 	// DNS-path client attribution (sock_diag lookups, caching, map joins) —
 	// see clientResolver. Constructed in Start, closed in Close.
 	resolver *clientResolver
+
+	// snapshotFn produces the process tree the seeding and container-tagging
+	// paths work from; iterSnapshot in production, injectable for tests.
+	snapshotFn func() (*procSnapshot, error)
 }
 
 // Start loads the step-attribution collection against tcObjs' shared maps,
@@ -129,9 +149,23 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		return nil, fmt.Errorf("worker pid %d out of range", workerPID)
 	}
 
+	// Which pid namespace "our" pids belong to. Every /proc-derived id in
+	// this package (the worker pid above, seeding, container leaders) is
+	// numbered in it; the kernel numbers tasks globally. Identical on a
+	// plain VM, different inside a container (ARC runners).
+	pidnsIno, err := pidNamespaceInode()
+	if err != nil {
+		return nil, err
+	}
+
 	spec, err := bpf.LoadStepBpf()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load step BPF spec: %w", err)
+	}
+	if v := spec.Variables[bpf.StepBpfVarPidnsIno]; v == nil {
+		return nil, errors.New("step BPF spec has no pidns_ino variable (stale generated code)")
+	} else if err := v.Set(pidnsIno); err != nil {
+		return nil, fmt.Errorf("failed to set pidns_ino: %w", err)
 	}
 
 	t := &Tracker{
@@ -141,19 +175,22 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		workerCmdline: readCmdline(workerPID),
 		stateMap:      tcObjs.MapStepState,
 		taskMap:       tcObjs.MapTaskStep,
+		nspidMap:      tcObjs.MapTaskNspid,
 		auditLogger:   auditLogger,
 		logger:        logger,
 		done:          make(chan struct{}),
 		resolver:      newClientResolver(tcObjs.MapSockStep, tcObjs.MapSockPid, logger),
 	}
+	t.snapshotFn = t.iterSnapshot
 
-	// The three shared maps are owned by the tcbpf collection; replacing them
-	// here makes both collections operate on the same kernel maps.
+	// The shared maps are owned by the tcbpf collection; replacing them here
+	// makes both collections operate on the same kernel maps.
 	if err := spec.LoadAndAssign(&t.objs, &ebpf.CollectionOptions{
 		MapReplacements: map[string]*ebpf.Map{
 			"map_task_step":  tcObjs.MapTaskStep,
 			"map_sock_step":  tcObjs.MapSockStep,
 			"map_step_state": tcObjs.MapStepState,
+			"map_task_nspid": tcObjs.MapTaskNspid,
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to load step BPF objects (kernel BTF required): %w", err)
@@ -164,22 +201,47 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		return nil, err
 	}
 
+	// First task walk: seeds map_task_nspid for everything that predates the
+	// attach (the tracepoints keep it current from here on) and hands back
+	// the process tree in global ids — which is how the worker's /proc pid
+	// becomes the global tgid step_fork compares against.
+	snap, err := t.snapshotFn()
+	if err != nil {
+		t.Close()
+		return nil, err
+	}
+	workerTgid, ok := snap.global[workerPID]
+	if !ok {
+		t.Close()
+		return nil, fmt.Errorf("%s pid %d is not visible to the task iterator", workerComm, workerPID)
+	}
+	t.workerTgid = workerTgid
+	if pidnsIno != initPidNamespaceInode {
+		logger.Info("Running inside a pid namespace; translating task ids",
+			"pidns_ino", pidnsIno, "worker_pid", workerPID, "worker_tgid", workerTgid)
+	}
+
 	// Seed while the programs are attached but still disabled (enabled=0 makes
-	// them no-ops), then enable, then seed once more: the second pass catches
-	// processes forked during the first scan, so the only unattributed window
-	// is forks that both start and create sockets between the enable flip and
-	// the rescan. Seeding is strictly create-only (BPF_NOEXIST), so the second
-	// pass can never clobber an ordinal the now-live fork tracepoint assigned.
-	t.seedExisting()
+	// the tagging hooks no-ops), then enable, then seed once more from a fresh
+	// walk: the second pass catches processes forked during the first, so the
+	// only unattributed window is forks that both start and create sockets
+	// between the enable flip and the rescan. Seeding is strictly create-only
+	// (BPF_NOEXIST), so the second pass can never clobber an ordinal the
+	// now-live fork tracepoint assigned.
+	t.seedExisting(snap)
 	if err := t.stateMap.Put(uint32(0), bpf.TcBpfStepState{
-		WorkerTgid:  uint32(workerPID),
+		WorkerTgid:  workerTgid,
 		Enabled:     1,
 		NextOrdinal: max(opts.OrdinalBase, 1),
 	}); err != nil {
 		t.Close()
 		return nil, fmt.Errorf("failed to seed step state: %w", err)
 	}
-	t.seedExisting()
+	if snap, err := t.snapshotFn(); err == nil {
+		t.seedExisting(snap)
+	} else {
+		logger.Warn("Second seeding pass skipped", "error", err)
+	}
 
 	rd, err := ringbuf.NewReader(t.objs.MapStepEvents)
 	if err != nil {
@@ -213,7 +275,32 @@ func (t *Tracker) Close() {
 	for _, l := range t.links {
 		_ = l.Close()
 	}
+	// The tcbpf connect/sendmsg hooks outlive this tracker (they are
+	// attached by cmd/start.go, and stay up when Start fails after the
+	// iterator has already seeded the table). With the tracepoints gone
+	// nothing maintains map_task_nspid, so a recycled tid would resolve to
+	// a dead task's process. Empty it: the hooks then take their documented
+	// global-tgid fallback, exactly as when attribution was never on.
+	clearMap(t.nspidMap)
 	t.objs.Close()
+}
+
+// clearMap deletes every entry of a u32→u32 hash map.
+func clearMap(m *ebpf.Map) {
+	if m == nil {
+		return
+	}
+	var (
+		keys []uint32
+		k, v uint32
+	)
+	it := m.Iterate()
+	for it.Next(&k, &v) {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		_ = m.Delete(k)
+	}
 }
 
 func (t *Tracker) attach() error {
@@ -246,73 +333,67 @@ func (t *Tracker) attach() error {
 		return fmt.Errorf("failed to attach cgroup sock_create: %w", err)
 	}
 	t.links = append(t.links, sockLink)
+
+	iter, err := link.AttachIter(link.IterOptions{Program: t.objs.StepTaskIter})
+	if err != nil {
+		return fmt.Errorf("failed to attach task iterator: %w", err)
+	}
+	t.links = append(t.links, iter)
+	t.iter = iter
 	return nil
 }
 
-// seedExisting tags processes that predate the daemon. Worker threads get
-// StepOrdinalRunner so infra traffic (log upload, action downloads) is
-// labeled as runner overhead; existing worker child subtrees — steps that
-// ran or started before cargowall attached — get StepOrdinalPreDaemon,
-// except the daemon's own subtree, which gets StepOrdinalRunner (cargowall
-// is infrastructure, not a workflow step). Every write is create-only:
-// once the fork tracepoint is live it is the sole authority on new tags,
-// and the post-enable rescan must never replace a kernel-assigned ordinal.
-// Best-effort by nature: /proc scans race process creation, which is why
-// Start runs it twice around the enable flip.
-func (t *Tracker) seedExisting() {
-	children := buildChildrenMap()
-
+// seedExisting tags processes that predate the daemon, from one task-walk
+// snapshot. Worker threads get StepOrdinalRunner so infra traffic (log
+// upload, action downloads) is labeled as runner overhead; existing worker
+// child subtrees — steps that ran or started before cargowall attached —
+// get StepOrdinalPreDaemon, except the daemon's own subtree, which gets
+// StepOrdinalRunner (cargowall is infrastructure, not a workflow step).
+// Every write is create-only: once the fork tracepoint is live it is the
+// sole authority on new tags, and the post-enable rescan must never replace
+// a kernel-assigned ordinal. Best-effort by nature: a walk races process
+// creation, which is why Start runs it twice around the enable flip.
+func (t *Tracker) seedExisting(snap *procSnapshot) {
 	// Decide each pid's intended tag before writing anything, so a pid in
 	// the daemon's subtree is written exactly once with the right value
 	// (create-only writes mean there is no second chance).
-	self := make(map[int]bool)
-	for _, pid := range subtreePids(os.Getpid(), children) {
-		self[pid] = true
+	self := make(map[uint32]bool)
+	selfTgid, selfVisible := snap.global[os.Getpid()]
+	if selfVisible {
+		for _, pid := range snap.subtree(selfTgid) {
+			self[pid] = true
+		}
 	}
 
-	t.tagTasks(t.workerPID, events.StepOrdinalRunner, ebpf.UpdateNoExist)
-	for _, root := range children[t.workerPID] {
-		for _, pid := range subtreePids(root, children) {
+	t.tagTasks(snap, t.workerTgid, events.StepOrdinalRunner, ebpf.UpdateNoExist)
+	for _, root := range snap.children[t.workerTgid] {
+		for _, pid := range snap.subtree(root) {
 			ordinal := events.StepOrdinalPreDaemon
 			if self[pid] {
 				ordinal = events.StepOrdinalRunner
 			}
-			t.tagTasks(pid, ordinal, ebpf.UpdateNoExist)
+			t.tagTasks(snap, pid, ordinal, ebpf.UpdateNoExist)
 		}
 	}
 
 	// Standalone runs (daemon not under the worker): still label our own
 	// traffic as infrastructure. Create-only, so a no-op when the loop
 	// above already covered us.
-	for _, pid := range subtreePids(os.Getpid(), children) {
-		t.tagTasks(pid, events.StepOrdinalRunner, ebpf.UpdateNoExist)
-	}
-}
-
-// subtreePids returns pid plus all its descendant process ids.
-func subtreePids(pid int, children map[int][]int) []int {
-	pids := []int{pid}
-	for i := 0; i < len(pids); i++ {
-		pids = append(pids, children[pids[i]]...)
-	}
-	return pids
-}
-
-// tagTasks writes ordinal for every thread of pid. Seeding passes
-// UpdateNoExist so a tid the fork tracepoint already tagged keeps its
-// kernel-assigned ordinal; container leaders pass UpdateAny (see
-// TagContainerProcess for why overwrite is safe there and only there).
-func (t *Tracker) tagTasks(pid int, ordinal uint32, flags ebpf.MapUpdateFlags) {
-	tids, err := os.ReadDir("/proc/" + strconv.Itoa(pid) + "/task")
-	if err != nil {
-		return // process exited mid-scan
-	}
-	for _, tid := range tids {
-		n, err := strconv.ParseUint(tid.Name(), 10, 32)
-		if err != nil {
-			continue
+	if selfVisible {
+		for _, pid := range snap.subtree(selfTgid) {
+			t.tagTasks(snap, pid, events.StepOrdinalRunner, ebpf.UpdateNoExist)
 		}
-		_ = t.taskMap.Update(uint32(n), ordinal, flags)
+	}
+}
+
+// tagTasks writes ordinal for every thread of the (global) tgid as listed
+// in snap. Seeding passes UpdateNoExist so a tid the fork tracepoint
+// already tagged keeps its kernel-assigned ordinal; container leaders pass
+// UpdateAny (see TagContainerProcess for why overwrite is safe there and
+// only there).
+func (t *Tracker) tagTasks(snap *procSnapshot, tgid, ordinal uint32, flags ebpf.MapUpdateFlags) {
+	for _, tid := range snap.tids[tgid] {
+		_ = t.taskMap.Update(tid, ordinal, flags)
 	}
 }
 
@@ -322,6 +403,12 @@ func (t *Tracker) tagTasks(pid int, ordinal uint32, flags ebpf.MapUpdateFlags) {
 // userspace bridge that puts the launching step's ordinal on them, after
 // which sock_create tags their sockets like any other tagged task.
 //
+// pid is as dockerd reported it, i.e. numbered in the daemon's namespace
+// when dockerd shares it (the caller's cgroup identity check has already
+// confirmed that pid is the expected container in our /proc). A pid the
+// task walk cannot see — exited, or a dockerd outside our namespace — is
+// skipped.
+//
 // The leader's threads are written with UpdateAny: a freshly shim-forked
 // leader is untagged in the normal case, an exec re-tag into a long-lived
 // container must replace the container's older ordinal, and overwrite
@@ -329,10 +416,13 @@ func (t *Tracker) tagTasks(pid int, ordinal uint32, flags ebpf.MapUpdateFlags) {
 // create-only — children forked after an earlier tag already carry correct
 // kernel-inherited ordinals that must never be clobbered.
 func (t *Tracker) TagContainerProcess(pid int, ordinal uint32) {
-	t.tagTasks(pid, ordinal, ebpf.UpdateAny)
-	children := buildChildrenMap()
-	for _, p := range subtreePids(pid, children)[1:] {
-		t.tagTasks(p, ordinal, ebpf.UpdateNoExist)
+	snap, leader, ok := t.resolve(pid)
+	if !ok {
+		return
+	}
+	t.tagTasks(snap, leader, ordinal, ebpf.UpdateAny)
+	for _, p := range snap.subtree(leader)[1:] {
+		t.tagTasks(snap, p, ordinal, ebpf.UpdateNoExist)
 	}
 }
 
@@ -346,9 +436,113 @@ func (t *Tracker) TagContainerProcess(pid int, ordinal uint32) {
 // adoption is not an exec re-tag, and a recycled-tid stale entry is the
 // rarer wrong to optimize for than demoting a live container.
 func (t *Tracker) AdoptContainerProcess(pid int, ordinal uint32) {
-	for _, p := range subtreePids(pid, buildChildrenMap()) {
-		t.tagTasks(p, ordinal, ebpf.UpdateNoExist)
+	snap, leader, ok := t.resolve(pid)
+	if !ok {
+		return
 	}
+	for _, p := range snap.subtree(leader) {
+		t.tagTasks(snap, p, ordinal, ebpf.UpdateNoExist)
+	}
+}
+
+// resolve takes a fresh task walk and translates a daemon-namespace pid to
+// the global tgid the step maps are keyed by.
+func (t *Tracker) resolve(pid int) (*procSnapshot, uint32, bool) {
+	snap, err := t.snapshotFn()
+	if err != nil {
+		t.logger.Warn("Task walk failed", "error", err)
+		return nil, 0, false
+	}
+	leader, ok := snap.global[pid]
+	if !ok {
+		return nil, 0, false // exited mid-flight, or not numbered in our namespace
+	}
+	return snap, leader, true
+}
+
+// initPidNamespaceInode is PROC_PID_INIT_INO, the fixed nsfs inode of the
+// initial pid namespace — what a plain VM sees; anything else means the
+// daemon is inside a container.
+const initPidNamespaceInode uint32 = 0xEFFFFFFC
+
+// pidNamespaceInode identifies the daemon's pid namespace the way the
+// kernel does (ns_common.inum), for the step_task_iter/step_fork walk.
+func pidNamespaceInode() (uint32, error) {
+	fi, err := os.Stat("/proc/self/ns/pid")
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat pid namespace: %w", err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, errors.New("pid namespace stat has no inode")
+	}
+	return uint32(st.Ino), nil
+}
+
+// procSnapshot is one pass of the step_task_iter walk: every task in the
+// daemon's pid-namespace subtree, keyed by the global ids the step maps
+// use, plus the translation from the daemon-namespace pids userspace
+// discovers.
+type procSnapshot struct {
+	tids     map[uint32][]uint32 // global tgid → its threads' global tids
+	children map[uint32][]uint32 // global parent tgid → child global tgids
+	global   map[int]uint32      // daemon-namespace tgid → global tgid
+}
+
+// iterSnapshot runs the task iterator once and parses its output.
+func (t *Tracker) iterSnapshot() (*procSnapshot, error) {
+	rd, err := t.iter.Open()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open task iterator: %w", err)
+	}
+	defer rd.Close()
+	data, err := io.ReadAll(rd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read task iterator: %w", err)
+	}
+	return parseTaskRecords(data), nil
+}
+
+// parseTaskRecords decodes the iterator's stream of task_iter_rec (the
+// bpf2go-generated mirror of the C struct, so the layout has one source).
+// Threads contribute their tid to the leader's list and nothing else: they
+// share the leader's tree position and namespace pid. A trailing partial
+// record (a truncated read) is ignored.
+func parseTaskRecords(data []byte) *procSnapshot {
+	snap := &procSnapshot{
+		tids:     make(map[uint32][]uint32),
+		children: make(map[uint32][]uint32),
+		global:   make(map[int]uint32),
+	}
+	const recSize = int(unsafe.Sizeof(bpf.StepBpfTaskIterRec{}))
+	for off := 0; off+recSize <= len(data); off += recSize {
+		rec := (*bpf.StepBpfTaskIterRec)(unsafe.Pointer(&data[off]))
+		snap.tids[rec.Tgid] = append(snap.tids[rec.Tgid], rec.Tid)
+		if rec.Tid != rec.Tgid {
+			continue
+		}
+		snap.global[int(rec.NsTgid)] = rec.Tgid
+		if rec.Ppid != rec.Tgid {
+			snap.children[rec.Ppid] = append(snap.children[rec.Ppid], rec.Tgid)
+		}
+	}
+	return snap
+}
+
+// subtree returns root plus all its descendant tgids, breadth-first. The
+// seen set guards against a cyclic snapshot; real trees terminate.
+func (s *procSnapshot) subtree(root uint32) []uint32 {
+	pids := []uint32{root}
+	seen := map[uint32]bool{root: true}
+	for i := 0; i < len(pids); i++ {
+		for _, c := range s.children[pids[i]] {
+			if !seen[c] {
+				seen[c] = true
+				pids = append(pids, c)
+			}
+		}
+	}
+	return pids
 }
 
 // boundary records one step_child_event as observed by run(), stamped with
@@ -414,6 +608,8 @@ func (t *Tracker) run() {
 		// resolve against it promptly.
 		t.recordBoundary(ev.Ordinal, time.Now())
 
+		// ev.Tgid is numbered in our pid namespace (see map_task_nspid), so
+		// /proc reads work from inside a container too.
 		cmdline := sanitizeCmdline(t.stepCmdline(int(ev.Tgid)))
 		t.logger.Info("Workflow step process started",
 			"step_ordinal", ev.Ordinal,
@@ -569,27 +765,6 @@ func readComm(pid int) string {
 		return ""
 	}
 	return strings.TrimSpace(string(comm))
-}
-
-// buildChildrenMap snapshots the process tree as parent pid → child pids.
-func buildChildrenMap() map[int][]int {
-	children := make(map[int][]int)
-	procs, err := os.ReadDir("/proc")
-	if err != nil {
-		return children
-	}
-	for _, p := range procs {
-		pid, err := strconv.Atoi(p.Name())
-		if err != nil {
-			continue
-		}
-		ppid, ok := readPPid(pid)
-		if !ok {
-			continue
-		}
-		children[ppid] = append(children[ppid], pid)
-	}
-	return children
 }
 
 // readPPid extracts the parent pid from /proc/<pid>/stat. The comm field

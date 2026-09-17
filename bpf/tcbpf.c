@@ -101,7 +101,9 @@ struct {
     __uint(max_entries, 256 * 1024);
 } map_events SEC(".maps");
 
-// LRU hash map: socket cookie → PID (populated by cgroup programs, read by TC)
+// LRU hash map: socket cookie → PID (populated by cgroup programs, read by
+// TC). The PID is numbered in the daemon's pid namespace when the step
+// tracker is running — see map_task_nspid — so userspace can resolve it.
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, __u64);
@@ -153,7 +155,7 @@ struct {
 #define STEP_ORD_PREDAEMON 0xFFFFFFFEu  // worker children that predate cargowall
 
 struct step_state {
-    __u32 worker_tgid;   // Runner.Worker tgid (0 = not discovered)
+    __u32 worker_tgid;   // Runner.Worker global tgid (0 = not discovered)
     __u32 enabled;       // 0 = feature off, all step hooks no-op
     __u64 next_ordinal;  // next step ordinal, atomically incremented
 };
@@ -182,6 +184,31 @@ struct {
     __type(value, __u32);
     __uint(max_entries, 65536);
 } map_sock_step SEC(".maps");
+
+// global tid → tgid as numbered in the daemon's pid namespace. Maintained
+// by stepbpf.c (fork/exit tracepoints plus the task iterator that seeds
+// pre-existing tasks); empty when step attribution is off. Kernel-side
+// identity stays global everywhere — this table exists so the pid handed
+// to userspace is one it can look up in its own /proc, which differs from
+// the global number whenever cargowall runs inside a container (ARC
+// runners). Keyed by tid so any thread resolves its process.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 32768);
+} map_task_nspid SEC(".maps");
+
+// Helper: the calling thread's process id as userspace should see it — the
+// daemon-namespace tgid when the step tracker has translated this task,
+// the global tgid otherwise (identical outside a pid namespace, and the
+// best available answer while step attribution is off).
+static __always_inline __u32 sock_owner_pid(void) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 tid = (__u32)pid_tgid;
+    __u32 *ns = bpf_map_lookup_elem(&map_task_nspid, &tid);
+    return ns ? *ns : (__u32)(pid_tgid >> 32);
+}
 
 // Helper: copy the calling thread's step tag onto a socket cookie.
 // Shared by the connect/sendmsg hooks below (fallback for sockets created
@@ -543,7 +570,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
 SEC("cgroup/connect4")
 int cg_connect4(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    __u32 pid = sock_owner_pid();
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
     step_tag_socket(cookie);
     return 1;
@@ -552,7 +579,7 @@ int cg_connect4(struct bpf_sock_addr *ctx) {
 SEC("cgroup/connect6")
 int cg_connect6(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    __u32 pid = sock_owner_pid();
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
     step_tag_socket(cookie);
     return 1;
@@ -563,7 +590,7 @@ int cg_connect6(struct bpf_sock_addr *ctx) {
 SEC("cgroup/sendmsg4")
 int cg_sendmsg4(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    __u32 pid = sock_owner_pid();
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
     step_tag_socket(cookie);
     return 1;
@@ -572,7 +599,7 @@ int cg_sendmsg4(struct bpf_sock_addr *ctx) {
 SEC("cgroup/sendmsg6")
 int cg_sendmsg6(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    __u32 pid = sock_owner_pid();
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
     step_tag_socket(cookie);
     return 1;

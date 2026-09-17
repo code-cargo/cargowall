@@ -503,14 +503,15 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	if err != nil {
 		return fmt.Errorf("failed to load TC eBPF spec: %w", err)
 	}
-	// The step-attribution maps preallocate ~7MB of kernel memory at their
-	// full size (LRU hash always preallocates). Shrink them when the feature
-	// is off — every non-GitHub run — but never when it is on: stepbpf.c
-	// declares the full sizes and MapReplacements rejects mismatched specs.
+	// The step-attribution maps preallocate ~8MB of kernel memory at their
+	// full size (hash maps preallocate by default). Shrink them when the
+	// feature is off — every non-GitHub run — but never when it is on:
+	// stepbpf.c declares the full sizes and MapReplacements rejects
+	// mismatched specs.
 	if !cmd.StepAttribution {
 		// Present unless the generated spec is stale (go generate not run);
 		// verify-bpf-generated-code guards that, but don't panic if it slips.
-		for _, name := range []string{"map_task_step", "map_sock_step"} {
+		for _, name := range []string{"map_task_step", "map_sock_step", "map_task_nspid"} {
 			if m := spec.Maps[name]; m != nil {
 				m.MaxEntries = 64
 			}
@@ -536,6 +537,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 	// Attach cgroup programs for PID tracking via socket cookie.
 	// Best-effort: if attachment fails, TC filtering still works but PID will be 0.
+	// Attached before steps.Start on purpose: a socket connecting before
+	// the step tracker has seeded map_task_nspid records the global tgid
+	// (unresolvable from inside a pid namespace), but attaching later would
+	// leave those same sockets with no pid at all. The window is daemon
+	// startup — the job's step is still waiting on readiness — and only the
+	// process name of a connection made in it is affected.
 	cgroupProgs := []struct {
 		prog   *ebpf.Program
 		attach ebpf.AttachType

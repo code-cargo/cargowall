@@ -398,9 +398,34 @@ sequenceDiagram
 | `cg_connect6` | cgroup/connect6 | Maps IPv6 TCP socket cookie → PID |
 | `cg_sendmsg4` | cgroup/sendmsg4 | Maps IPv4 UDP socket cookie → PID |
 | `cg_sendmsg6` | cgroup/sendmsg6 | Maps IPv6 UDP socket cookie → PID |
-| `step_fork` / `step_exit` | tp_btf tracepoints (stepbpf.c, separate collection; needs kernel BTF) | Step attribution: mint/inherit per-step process tags, drop at exit |
+| `step_fork` / `step_exit` | tp_btf tracepoints (stepbpf.c, separate collection; needs kernel BTF) | Step attribution: mint/inherit per-step process tags, drop at exit. Also maintains `map_task_nspid` (global tid → tgid as numbered in the daemon's pid namespace) for every fork |
+| `step_task_iter` | iter/task (stepbpf.c) | Task walk run by `pkg/steps` at start and per container tag: seeds `map_task_nspid` for tasks that predate the attach and streams the process tree in global ids, so userspace never has to translate pids through `/proc` |
 | `cg_sock_create` | cgroup/sock_create (stepbpf.c) | Copies the creating thread's step tag onto each socket cookie |
 | `cg_origin_egress` | cgroup_skb/egress (originbpf.c, separate collection) | Flow-origin recorder and — in enforce mode — the primary egress verdict (issue #106). Runs in socket context, pre-NAT, inside the originating netns, so it can both attribute and enforce container traffic. Behavior is set by a runtime mode: observe (pass, record only), shadow (compute the verdict, report would-blocks, pass), enforce (drop denied traffic). Shares the rule maps with `tc_egress` via `bpf/verdict.h` |
+
+### Pid namespaces (issue #135)
+
+The kernel numbers tasks globally; everything the daemon reads from `/proc`
+— the `Runner.Worker` pid, its own pid, container leaders reported by
+dockerd — is numbered in the daemon's pid namespace. On a GitHub-hosted VM
+the two coincide. Inside a container (ARC runners are Kubernetes pods) they
+do not, and before #135 the worker's `/proc` pid was compared against
+`parent->tgid` in `step_fork`, seeding wrote `/proc` tids as map keys, and
+`map_sock_pid` handed userspace global tgids it could not resolve — every
+event came out unattributed with an empty process name.
+
+The rule now is: kernel-side identity is global everywhere; translation
+happens at the boundary, in the kernel, through `map_task_nspid`.
+`step_task_iter` (scoped by the kernel to the opener's namespace) seeds it
+and gives `pkg/steps` the process tree in global ids; `step_fork` keeps it
+current (a thread copies its process's entry, a process walks its upid
+chain to the daemon's namespace, identified by the nsfs inode passed in as
+`pidns_ino`); the cgroup hooks write the namespace tgid into `map_sock_pid`;
+boundary events carry the namespace pid so the reconciler's `/proc` read
+works. Kernel floor is unchanged: the `iter/task` target, `bpf_seq_write` and
+the `BPF_ITER_CREATE` command that opens an iterator instance all shipped in
+5.8 (uapi `bpf.h` at v5.8 lists `BPF_ITER_CREATE`; v5.7 does not), like the
+ring buffer.
 
 ## Audit Mode
 

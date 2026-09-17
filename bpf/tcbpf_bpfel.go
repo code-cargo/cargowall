@@ -77,6 +77,7 @@ const (
 	TcBpfMapMapSockPid            = "map_sock_pid"
 	TcBpfMapMapSockStep           = "map_sock_step"
 	TcBpfMapMapStepState          = "map_step_state"
+	TcBpfMapMapTaskNspid          = "map_task_nspid"
 	TcBpfMapMapTaskStep           = "map_task_step"
 	TcBpfProgCgConnect4           = "cg_connect4"
 	TcBpfProgCgConnect6           = "cg_connect6"
@@ -153,6 +154,7 @@ type TcBpfMapSpecs struct {
 	MapSockPid         *ebpf.MapSpec `ebpf:"map_sock_pid"`
 	MapSockStep        *ebpf.MapSpec `ebpf:"map_sock_step"`
 	MapStepState       *ebpf.MapSpec `ebpf:"map_step_state"`
+	MapTaskNspid       *ebpf.MapSpec `ebpf:"map_task_nspid"`
 	MapTaskStep        *ebpf.MapSpec `ebpf:"map_task_step"`
 }
 
@@ -195,6 +197,7 @@ type TcBpfMaps struct {
 	MapSockPid         *ebpf.Map `ebpf:"map_sock_pid"`
 	MapSockStep        *ebpf.Map `ebpf:"map_sock_step"`
 	MapStepState       *ebpf.Map `ebpf:"map_step_state"`
+	MapTaskNspid       *ebpf.Map `ebpf:"map_task_nspid"`
 	MapTaskStep        *ebpf.Map `ebpf:"map_task_step"`
 }
 
@@ -212,6 +215,7 @@ func (m *TcBpfMaps) Close() error {
 		m.MapSockPid,
 		m.MapSockStep,
 		m.MapStepState,
+		m.MapTaskNspid,
 		m.MapTaskStep,
 	)
 }

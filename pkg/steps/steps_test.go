@@ -17,18 +17,21 @@
 package steps
 
 import (
+	"encoding/binary"
+	"errors"
 	"log/slog"
 	"os"
 	"os/exec"
-	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sys/unix"
 
+	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
@@ -67,15 +70,63 @@ func TestReadComm_Self(t *testing.T) {
 	assert.LessOrEqual(t, len(comm), 15)
 }
 
-func TestBuildChildrenMap_ContainsSelf(t *testing.T) {
-	children := buildChildrenMap()
-	assert.Contains(t, children[os.Getppid()], os.Getpid())
+// rec encodes one task_iter_rec as the step_task_iter iterator streams it.
+func rec(tid, tgid, ppid, nsTgid uint32) []byte {
+	b := make([]byte, taskIterRecSize)
+	binary.NativeEndian.PutUint32(b[0:], tid)
+	binary.NativeEndian.PutUint32(b[4:], tgid)
+	binary.NativeEndian.PutUint32(b[8:], ppid)
+	binary.NativeEndian.PutUint32(b[12:], nsTgid)
+	return b
 }
 
-func TestSubtreePids_IncludesSelfAndDescendants(t *testing.T) {
-	children := map[int][]int{100: {200, 300}, 300: {400}}
-	assert.ElementsMatch(t, []int{100, 200, 300, 400}, subtreePids(100, children))
-	assert.Equal(t, []int{400}, subtreePids(400, children))
+func concat(recs ...[]byte) []byte {
+	var out []byte
+	for _, r := range recs {
+		out = append(out, r...)
+	}
+	return out
+}
+
+func TestParseTaskRecords_BuildsTreeAndTranslation(t *testing.T) {
+	// Global ids on the left, namespace pids on the right — deliberately
+	// different so a test that conflates them fails.
+	snap := parseTaskRecords(concat(
+		rec(1, 1, 0, 1),
+		rec(100, 100, 1, 7),
+		rec(101, 100, 1, 7), // thread of 100: contributes a tid, nothing else
+		rec(200, 200, 100, 8),
+		rec(300, 300, 200, 9),
+		rec(400, 400, 1, 10),
+		rec(5, 5, 5, 5), // self-parented: no child edge to itself
+		[]byte{1, 2, 3}, // truncated trailing record: ignored
+	))
+
+	assert.Equal(t, []uint32{100, 101}, snap.tids[100])
+	assert.Equal(t, uint32(100), snap.global[7])
+	assert.Equal(t, uint32(200), snap.global[8])
+	_, threadListed := snap.global[0]
+	assert.False(t, threadListed)
+	assert.Equal(t, []uint32{100, 400}, snap.children[1])
+	assert.Equal(t, []uint32{200}, snap.children[100])
+	assert.Empty(t, snap.children[5])
+	assert.Equal(t, []uint32{100, 200, 300}, snap.subtree(100))
+	assert.Equal(t, []uint32{400}, snap.subtree(400))
+}
+
+func TestProcSnapshot_SubtreeTerminatesOnCycle(t *testing.T) {
+	snap := &procSnapshot{children: map[uint32][]uint32{1: {2}, 2: {1}}}
+	assert.Equal(t, []uint32{1, 2}, snap.subtree(1))
+}
+
+func TestPidNamespaceInode_MatchesProcLink(t *testing.T) {
+	got, err := pidNamespaceInode()
+	require.NoError(t, err)
+	link, err := os.Readlink("/proc/self/ns/pid")
+	require.NoError(t, err)
+	want, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(link, "pid:["), "]"), 10, 32)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(want), got)
 }
 
 func TestFindAncestorByComm_FindsParent(t *testing.T) {
@@ -232,50 +283,173 @@ func newTaskMap(t *testing.T) *ebpf.Map {
 	return m
 }
 
-func TestTagContainerProcess_LeaderOverwriteDescendantCreateOnly(t *testing.T) {
-	m := newTaskMap(t)
-	tr := &Tracker{taskMap: m}
-
-	// Pin this goroutine to one OS thread so its tid is guaranteed to exist
-	// in /proc/<pid>/task both when pre-seeding and when asserting — the Go
-	// runtime creates and parks threads at will, so any other tid could race.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	selfTid := uint32(unix.Gettid())
-
-	// Two descendants of the leader (this test process): one already carries
-	// an ordinal — standing in for a child the fork tracepoint tagged — and
-	// one is untagged.
-	startSleeper := func() int {
-		cmd := exec.Command("sleep", "30")
-		require.NoError(t, cmd.Start())
-		t.Cleanup(func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		})
-		return cmd.Process.Pid
+// containerSnapshot is a synthetic task walk: leader global tgid 1000 (pid
+// 50 in our namespace) with two threads, a pre-tagged child 2000 and an
+// untagged child 3000, each with a grandchild.
+func containerSnapshot() *procSnapshot {
+	return &procSnapshot{
+		tids:     map[uint32][]uint32{1000: {1000, 1001}, 2000: {2000}, 3000: {3000}, 3100: {3100}},
+		children: map[uint32][]uint32{1000: {2000, 3000}, 3000: {3100}},
+		global:   map[int]uint32{50: 1000, 51: 2000, 52: 3000, 53: 3100},
 	}
-	preTaggedPid := startSleeper()
-	untaggedPid := startSleeper()
+}
 
-	// Pre-seed: our own tid simulates a stale leader entry (exec re-tag into
-	// a long-lived container / recycled tid), the first child a
+func newSnapshotTracker(t *testing.T, snap *procSnapshot, err error) (*Tracker, *ebpf.Map) {
+	t.Helper()
+	m := newTaskMap(t)
+	tr := &Tracker{
+		taskMap:    m,
+		logger:     slog.Default(),
+		snapshotFn: func() (*procSnapshot, error) { return snap, err },
+	}
+	return tr, m
+}
+
+func TestTagContainerProcess_LeaderOverwriteDescendantCreateOnly(t *testing.T) {
+	tr, m := newSnapshotTracker(t, containerSnapshot(), nil)
+
+	// Pre-seed: a leader thread simulates a stale entry (exec re-tag into a
+	// long-lived container / recycled tid), the first child a
 	// kernel-inherited descendant tag.
-	require.NoError(t, m.Put(selfTid, uint32(99)))
-	require.NoError(t, m.Put(uint32(preTaggedPid), uint32(7)))
+	require.NoError(t, m.Put(uint32(1001), uint32(99)))
+	require.NoError(t, m.Put(uint32(2000), uint32(7)))
 
-	tr.TagContainerProcess(os.Getpid(), 42)
+	// The caller speaks namespace pids; the map is keyed by global tids.
+	tr.TagContainerProcess(50, 42)
 
-	// Leader threads are written UpdateAny: the stale ordinal must be replaced.
 	var got uint32
-	require.NoError(t, m.Lookup(selfTid, &got))
-	assert.Equal(t, uint32(42), got, "leader tid must be overwritten (UpdateAny)")
-
-	// Descendants are create-only: a kernel-inherited ordinal survives...
-	require.NoError(t, m.Lookup(uint32(preTaggedPid), &got))
+	require.NoError(t, m.Lookup(uint32(1000), &got))
+	assert.Equal(t, uint32(42), got, "leader must be tagged under its global tid")
+	require.NoError(t, m.Lookup(uint32(1001), &got))
+	assert.Equal(t, uint32(42), got, "leader thread must be overwritten (UpdateAny)")
+	require.NoError(t, m.Lookup(uint32(2000), &got))
 	assert.Equal(t, uint32(7), got, "pre-tagged descendant must keep its ordinal (UpdateNoExist)")
-
-	// ...while an untagged descendant picks up the container's ordinal.
-	require.NoError(t, m.Lookup(uint32(untaggedPid), &got))
+	require.NoError(t, m.Lookup(uint32(3000), &got))
 	assert.Equal(t, uint32(42), got, "untagged descendant must be tagged")
+	require.NoError(t, m.Lookup(uint32(3100), &got))
+	assert.Equal(t, uint32(42), got, "grandchild must be tagged")
+	assert.Error(t, m.Lookup(uint32(50), &got), "the namespace pid itself must never be used as a key")
+}
+
+func TestAdoptContainerProcess_CreateOnlyForLeaderToo(t *testing.T) {
+	tr, m := newSnapshotTracker(t, containerSnapshot(), nil)
+	require.NoError(t, m.Put(uint32(1000), uint32(7)))
+
+	tr.AdoptContainerProcess(50, 42)
+
+	var got uint32
+	require.NoError(t, m.Lookup(uint32(1000), &got))
+	assert.Equal(t, uint32(7), got, "adoption must not demote a live leader")
+	require.NoError(t, m.Lookup(uint32(1001), &got))
+	assert.Equal(t, uint32(42), got)
+	require.NoError(t, m.Lookup(uint32(3000), &got))
+	assert.Equal(t, uint32(42), got)
+}
+
+func TestTagContainerProcess_UnknownPidAndWalkFailureAreNoOps(t *testing.T) {
+	tr, m := newSnapshotTracker(t, containerSnapshot(), nil)
+	tr.TagContainerProcess(999, 42) // exited, or numbered in another namespace
+	var got uint32
+	assert.Error(t, m.Lookup(uint32(999), &got))
+
+	failing, m2 := newSnapshotTracker(t, nil, errors.New("iterator closed"))
+	failing.TagContainerProcess(50, 42)
+	assert.Error(t, m2.Lookup(uint32(1000), &got))
+}
+
+// loadTcObjects loads the tcbpf collection that owns the tracker's shared
+// maps, exactly as cmd/start.go does before steps.Start.
+func loadTcObjects(t *testing.T) *bpf.TcBpfObjects {
+	t.Helper()
+	spec, err := bpf.LoadTcBpf()
+	require.NoError(t, err)
+	var objs bpf.TcBpfObjects
+	if err := spec.LoadAndAssign(&objs, nil); err != nil {
+		t.Skipf("tcbpf objects not loadable (needs root): %v", err)
+	}
+	t.Cleanup(func() { objs.Close() })
+	return &objs
+}
+
+// TestStart_TagsWorkerChild is the production path end to end: Start with
+// this test process declared as Runner.Worker, then fork a child and check
+// every id crossing — seeding keyed by global tids, the boundary event and
+// map_task_nspid carrying our namespace's numbering. Run on its own it
+// covers a plain VM; TestStart_InPidNamespace re-runs it inside a fresh pid
+// namespace, where every one of those crossings used to be wrong.
+func TestStart_TagsWorkerChild(t *testing.T) {
+	objs := loadTcObjects(t)
+	tr, err := Start(objs, Options{WorkerPID: os.Getpid(), OrdinalBase: 100}, nil, slog.Default())
+	if err != nil && strings.Contains(err.Error(), "BTF") {
+		t.Skipf("step tracker needs kernel BTF: %v", err)
+	}
+	require.NoError(t, err)
+	t.Cleanup(tr.Close)
+
+	snap, err := tr.snapshotFn()
+	require.NoError(t, err)
+	selfTgid, ok := snap.global[os.Getpid()]
+	require.True(t, ok, "the daemon must see itself in the task walk")
+	assert.Equal(t, selfTgid, tr.workerTgid)
+
+	// Seeding: the worker's (our) threads are runner infrastructure, keyed
+	// by global tid, and the namespace table names us by our own pid.
+	var got uint32
+	require.NoError(t, objs.MapTaskStep.Lookup(selfTgid, &got))
+	assert.Equal(t, uint32(events.StepOrdinalRunner), got)
+	require.NoError(t, objs.MapTaskNspid.Lookup(selfTgid, &got))
+	assert.Equal(t, uint32(os.Getpid()), got)
+
+	child := exec.Command("sleep", "5")
+	require.NoError(t, child.Start())
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	childPID := child.Process.Pid
+
+	snap, err = tr.snapshotFn()
+	require.NoError(t, err)
+	childTgid, ok := snap.global[childPID]
+	require.True(t, ok, "child must be visible to the task walk")
+	var ordinal uint32
+	require.NoError(t, objs.MapTaskStep.Lookup(childTgid, &ordinal),
+		"worker child must be tagged under its global tid")
+	// Ordinals are opaque group ids, not positions: transient runtime forks
+	// (Go's one-time pidfd probe) consume them too, so only the base is a
+	// floor — see Options.OrdinalBase.
+	assert.GreaterOrEqual(t, ordinal, uint32(100))
+	require.NoError(t, objs.MapTaskNspid.Lookup(childTgid, &got))
+	assert.Equal(t, uint32(childPID), got)
+
+	// The reconciler saw the boundary event (its tgid is our numbering, so
+	// the cmdline read behind it works too — visible in -v output).
+	assert.Eventually(t, func() bool { return tr.OrdinalAt(time.Now()) >= ordinal },
+		2*time.Second, 20*time.Millisecond, "boundary must reach the reconciler")
+}
+
+// TestStart_InPidNamespace re-executes TestStart_TagsWorkerChild inside a
+// fresh pid (and mount, for /proc) namespace — the shape of an ARC runner
+// pod, where /proc pids and kernel pids disagree.
+func TestStart_InPidNamespace(t *testing.T) {
+	runInPidNamespace(t, "^TestStart_TagsWorkerChild$")
+}
+
+// runInPidNamespace runs the named test of this binary under
+// unshare --pid --fork --mount-proc and requires it to pass there. Needs
+// root (like every BPF test here) and util-linux.
+func runInPidNamespace(t *testing.T, run string) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	unshare, err := exec.LookPath("unshare")
+	if err != nil {
+		t.Skip("unshare not available")
+	}
+	out, err := exec.Command(unshare, "--pid", "--fork", "--mount-proc",
+		os.Args[0], "-test.run", run, "-test.v").CombinedOutput()
+	t.Logf("inside pid namespace:\n%s", out)
+	if strings.Contains(string(out), "--- SKIP") {
+		t.Skip("inner test skipped")
+	}
+	require.NoError(t, err)
+	require.Contains(t, string(out), "--- PASS")
 }

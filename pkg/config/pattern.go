@@ -46,8 +46,19 @@ func compileHostnamePattern(raw string) (hostnamePattern, error) {
 }
 
 // Matches returns true if hostname matches the glob pattern.
+//
+// A hostname with an empty label never matches: "" is not a DNS label, so
+// no segment, literal or wildcard, may consume one. That covers the empty
+// hostname itself, which splits to a single empty label. Rejected here, at
+// the boundary, the same way compileHostnamePattern rejects empty segments,
+// so matchSegments only ever sees well-formed labels.
 func (p *hostnamePattern) Matches(hostname string) bool {
 	labels := strings.Split(hostname, ".")
+	for _, label := range labels {
+		if label == "" {
+			return false
+		}
+	}
 	return matchSegments(p.Segments, labels)
 }
 
@@ -68,21 +79,23 @@ func matchSegments(segments []string, labels []string) bool {
 
 	for si := segCount - 1; si >= 0; si-- {
 		seg := segments[si]
-		for li := labelCount; li >= 0; li-- {
+		// dp[si][labelCount] stays false: every segment consumes at least
+		// one label.
+		for li := labelCount - 1; li >= 0; li-- {
 			switch seg {
 			case "**":
 				// ** matches one or more labels
-				if li < labelCount && (dp[si][li+1] || dp[si+1][li+1]) {
+				if dp[si][li+1] || dp[si+1][li+1] {
 					dp[si][li] = true
 				}
 			case "*":
 				// * matches exactly one label
-				if li < labelCount && dp[si+1][li+1] {
+				if dp[si+1][li+1] {
 					dp[si][li] = true
 				}
 			default:
 				// Literal match
-				if li < labelCount && labels[li] == seg && dp[si+1][li+1] {
+				if labels[li] == seg && dp[si+1][li+1] {
 					dp[si][li] = true
 				}
 			}

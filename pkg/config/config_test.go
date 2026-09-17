@@ -3322,6 +3322,16 @@ func TestMatchHostnameRule_Table(t *testing.T) {
 			query:         "evil.example.com",
 			skipPortCheck: true,
 		},
+		{
+			// "" is what an IP with no reverse name looks up as; a wildcard
+			// must not fire on it (#125).
+			name: "empty hostname matches nothing, even a bare wildcard",
+			rules: []Rule{
+				{Type: RuleTypeHostname, Value: "**", Ports: []Port{{Port: 123, Protocol: ProtocolUDP}}, Action: ActionAllow},
+			},
+			query:         "",
+			skipPortCheck: true,
+		},
 
 		// ----- Deny precedence -----
 		{

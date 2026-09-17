@@ -460,6 +460,28 @@ func TestGateExistingConnections_UnresolvableAllowsObservedPortsOnly(t *testing.
 	gateExistingConnections(existingConns{"203.0.113.5": observed}, cm, fw, nil, nil, quietLogger())
 }
 
+// The unresolvable carve-out must survive a `*` / `**` hostname rule in the
+// policy. "" is not a hostname, so the wildcard must not fire on an IP with
+// no reverse name: the IP is allowed on its observed ports (443 here), not
+// the rule's (123), and nothing is scoped at L7 under an empty name (#125).
+func TestGateExistingConnections_UnresolvableIgnoresWildcardRule(t *testing.T) {
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "**", Ports: []config.Port{{Port: 123, Protocol: config.ProtocolUDP}}, Action: config.ActionAllow},
+	}, config.ActionDeny))
+
+	observed := []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}
+	fw := firewall.NewMockFirewall(t)
+	fw.EXPECT().AddIP(net.ParseIP("20.96.133.71"), config.ActionAllow, observed).Return(true, nil).Once()
+
+	rec := &cmdRecordingRegistrar{}
+	reg := l7LateRegistrar{l7: rec, cm: cm, logger: quietLogger()}
+
+	gateExistingConnections(existingConns{"20.96.133.71": observed}, cm, fw, reg, nil, quietLogger())
+
+	assert.Empty(t, rec.scopes, "scoped an IP under an empty hostname")
+}
+
 // Denied pre-existing connections must not be added to the allowlist —
 // NewMockFirewall(t) fails the test on any unexpected AddIP call.
 func TestGateExistingConnections_DeniedHostnameNotAdded(t *testing.T) {

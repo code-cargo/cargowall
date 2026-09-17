@@ -11,6 +11,32 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# The jobs below pass `mode: audit`, which is the posture they have always
+# actually run in: the CodeCargo policy for this repo resolves to audit (org
+# mode audit, repository unset), and a fetched policy wins over this input, so
+# the `enforce` these steps used to ask for never reached the daemon. Stating
+# audit makes the file honest rather than claiming an enforcement it did not
+# have. The dashboard stays authoritative — flipping the repository to enforce
+# there still takes effect on any run that can fetch a policy, so this is the
+# fallback posture, not a ceiling.
+#
+# Spelling it out also settles `api-failure-mode`, which defers to an
+# explicitly supplied `mode`: "use this step's policy as-is" and "downgrade to
+# audit" land on the same posture once that policy is audit, so a retrieval
+# failure can no longer change what the job enforces.
+#
+# Only `offline` varies. A `pull_request` run whose head is a fork never gets
+# an OIDC token — GitHub withholds it whatever the job's `permissions:` block
+# asks for — so both the policy fetch and the post-step audit push fail there.
+# Going offline skips them cleanly instead of warning twice in every job;
+# non-fork runs stay online and keep reporting to the dashboard.
+#
+# The predicate has to be `.fork` rather than head.repo.full_name against
+# github.repository: `github.event.pull_request` is null on push, so the
+# inequality would read every push to main as a fork.
+env:
+  CW_OFFLINE: ${{ github.event.pull_request.head.repo.fork && 'true' || 'false' }}
+
 
 jobs:
   checks:
@@ -22,6 +48,9 @@ jobs:
       id-token: write
     steps:
       - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        with:
+          mode: audit
+          offline: ${{ env.CW_OFFLINE }}
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -57,6 +86,9 @@ jobs:
       checks: write
     steps:
       - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        with:
+          mode: audit
+          offline: ${{ env.CW_OFFLINE }}
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -81,7 +113,13 @@ jobs:
 
       - name: Test Report
         uses: dorny/test-reporter@v3
-        if: always()
+        # The job's `checks: write` is the second permission a fork PR does not
+        # get, so publishing the check run would fail there with "Resource not
+        # accessible by integration" — after the tests themselves had already
+        # passed. The `make test-ci` step is still the gate; this only
+        # publishes its results, so skipping it off a fork costs a nicer
+        # rendering, not coverage.
+        if: ${{ always() && !github.event.pull_request.head.repo.fork }}
         with:
           name: Test Results
           path: test-results*.xml
@@ -96,6 +134,9 @@ jobs:
       id-token: write
     steps:
       - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        with:
+          mode: audit
+          offline: ${{ env.CW_OFFLINE }}
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -456,6 +497,10 @@ jobs:
 
   test-cargowall-saas:
     name: Integration Test (SaaS)
+    # This job exists to exercise the CodeCargo API path end to end, which a
+    # fork PR has no token for. Skipped rather than degraded: an offline run of
+    # it would assert nothing it is here to assert.
+    if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: build-binary
     runs-on: ubuntu-latest
     permissions:

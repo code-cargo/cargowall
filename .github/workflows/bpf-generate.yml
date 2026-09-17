@@ -18,6 +18,13 @@ on:
       - ".github/workflows/bpf-generate.yml"
 
 
+# `mode: audit` below, and offline only off a fork: a fork PR cannot mint an
+# OIDC token, so neither the policy fetch nor the audit push can work there.
+# See the matching block in ci.yml for why audit is the honest posture and why
+# the predicate is `.fork`.
+env:
+  CW_OFFLINE: ${{ github.event.pull_request.head.repo.fork && 'true' || 'false' }}
+
 
 jobs:
   verify:
@@ -31,6 +38,9 @@ jobs:
       id-token: write
     steps:
       - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        with:
+          mode: audit
+          offline: ${{ env.CW_OFFLINE }}
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 

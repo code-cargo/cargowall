@@ -537,6 +537,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 	// Attach cgroup programs for PID tracking via socket cookie.
 	// Best-effort: if attachment fails, TC filtering still works but PID will be 0.
+	// Attached before steps.Start on purpose: a socket connecting before
+	// the step tracker has seeded map_task_nspid records the global tgid
+	// (unresolvable from inside a pid namespace), but attaching later would
+	// leave those same sockets with no pid at all. The window is daemon
+	// startup — the job's step is still waiting on readiness — and only the
+	// process name of a connection made in it is affected.
 	cgroupProgs := []struct {
 		prog   *ebpf.Program
 		attach ebpf.AttachType

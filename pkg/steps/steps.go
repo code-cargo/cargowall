@@ -100,6 +100,7 @@ type Tracker struct {
 	reader        *ringbuf.Reader
 	stateMap      *ebpf.Map
 	taskMap       *ebpf.Map
+	nspidMap      *ebpf.Map // map_task_nspid; cleared at Close, see there
 	auditLogger   *events.AuditLogger
 	logger        *slog.Logger
 	done          chan struct{}
@@ -174,6 +175,7 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		workerCmdline: readCmdline(workerPID),
 		stateMap:      tcObjs.MapStepState,
 		taskMap:       tcObjs.MapTaskStep,
+		nspidMap:      tcObjs.MapTaskNspid,
 		auditLogger:   auditLogger,
 		logger:        logger,
 		done:          make(chan struct{}),
@@ -273,7 +275,32 @@ func (t *Tracker) Close() {
 	for _, l := range t.links {
 		_ = l.Close()
 	}
+	// The tcbpf connect/sendmsg hooks outlive this tracker (they are
+	// attached by cmd/start.go, and stay up when Start fails after the
+	// iterator has already seeded the table). With the tracepoints gone
+	// nothing maintains map_task_nspid, so a recycled tid would resolve to
+	// a dead task's process. Empty it: the hooks then take their documented
+	// global-tgid fallback, exactly as when attribution was never on.
+	clearMap(t.nspidMap)
 	t.objs.Close()
+}
+
+// clearMap deletes every entry of a u32→u32 hash map.
+func clearMap(m *ebpf.Map) {
+	if m == nil {
+		return
+	}
+	var (
+		keys []uint32
+		k, v uint32
+	)
+	it := m.Iterate()
+	for it.Next(&k, &v) {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		_ = m.Delete(k)
+	}
 }
 
 func (t *Tracker) attach() error {

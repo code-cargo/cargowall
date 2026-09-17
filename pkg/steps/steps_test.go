@@ -29,8 +29,10 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/events"
@@ -369,20 +371,48 @@ func loadTcObjects(t *testing.T) *bpf.TcBpfObjects {
 	return &objs
 }
 
+// connectedUDPCookie opens a UDP socket, connects it (which runs the
+// cgroup/connect4 hook in this thread's context) and returns its socket
+// cookie — the key the hook wrote map_sock_pid and map_sock_step under.
+func connectedUDPCookie(t *testing.T) uint64 {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	require.NoError(t, unix.Connect(fd, &unix.SockaddrInet4{Port: 9, Addr: [4]byte{127, 0, 0, 1}}))
+	cookie, err := unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_COOKIE)
+	require.NoError(t, err)
+	return cookie
+}
+
 // TestStart_TagsWorkerChild is the production path end to end: Start with
 // this test process declared as Runner.Worker, then fork a child and check
 // every id crossing — seeding keyed by global tids, the boundary event and
-// map_task_nspid carrying our namespace's numbering. Run on its own it
-// covers a plain VM; TestStart_InPidNamespace re-runs it inside a fresh pid
-// namespace, where every one of those crossings used to be wrong.
+// map_task_nspid carrying our namespace's numbering, and the tcbpf connect
+// hook recording a pid we can resolve. Run on its own it covers a plain
+// VM; TestStart_InPidNamespace re-runs it inside a fresh pid namespace,
+// where every one of those crossings used to be wrong.
 func TestStart_TagsWorkerChild(t *testing.T) {
 	objs := loadTcObjects(t)
+	// The connect hook is attached by cmd/start.go, not by Start; mirror
+	// that so the socket-owner path is exercised too.
+	connectLink, err := link.AttachCgroup(link.CgroupOptions{
+		Path: "/sys/fs/cgroup", Attach: ebpf.AttachCGroupInet4Connect, Program: objs.CgConnect4,
+	})
+	require.NoError(t, err, "attach cgroup/connect4")
+	t.Cleanup(func() { _ = connectLink.Close() })
+
 	tr, err := Start(objs, Options{WorkerPID: os.Getpid(), OrdinalBase: 100}, nil, slog.Default())
 	if err != nil && strings.Contains(err.Error(), "BTF") {
 		t.Skipf("step tracker needs kernel BTF: %v", err)
 	}
 	require.NoError(t, err)
-	t.Cleanup(tr.Close)
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			tr.Close()
+		}
+	})
 
 	snap, err := tr.snapshotFn()
 	require.NoError(t, err)
@@ -421,6 +451,22 @@ func TestStart_TagsWorkerChild(t *testing.T) {
 	// the cmdline read behind it works too — visible in -v output).
 	assert.Eventually(t, func() bool { return tr.OrdinalAt(time.Now()) >= ordinal },
 		2*time.Second, 20*time.Millisecond, "boundary must reach the reconciler")
+
+	// Socket owner: the connect hook stores the pid as we number it (what
+	// lookupProcessName reads), and the step tag we were seeded with.
+	cookie := connectedUDPCookie(t)
+	require.NoError(t, objs.MapSockPid.Lookup(cookie, &got))
+	assert.Equal(t, uint32(os.Getpid()), got, "map_sock_pid must carry our namespace's pid")
+	require.NoError(t, objs.MapSockStep.Lookup(cookie, &got))
+	assert.Equal(t, uint32(events.StepOrdinalRunner), got)
+
+	// After Close the connect hook is still attached but nothing maintains
+	// the translation table, so it must be empty: the hook then falls back
+	// to the global tgid rather than resolving a recycled tid to a dead task.
+	tr.Close()
+	closed = true
+	var k, v uint32
+	assert.False(t, objs.MapTaskNspid.Iterate().Next(&k, &v), "map_task_nspid must be empty after Close")
 }
 
 // TestStart_InPidNamespace re-executes TestStart_TagsWorkerChild inside a

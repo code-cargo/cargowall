@@ -1294,15 +1294,20 @@ func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLog
 		// fail-fast purpose; the intended flow (the watcher fails the job
 		// on this sentinel, so no build steps run) makes the pre-attach
 		// window harmless.
+		//
+		// ORDER: the downgrade record is written BEFORE the sentinel. The
+		// action classifies a sentinel as lockdown from this record, so the
+		// sentinel is the commit signal and is published only once the
+		// record describing it exists — a reader between the two writes
+		// would otherwise see a generic startup crash (issue #102). The
+		// record also tells the dashboard, via the summary push, that the
+		// run was locked down and why.
+		writeDowngradeFile(downgradeRecord(datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_LOCKDOWN, fe, reason), logger)
 		if cmd.FailureFile != "" {
 			if werr := writeFailureSentinel(cmd.FailureFile, reason); werr != nil {
 				logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
 			}
 		}
-		// Also recorded as a structured downgrade: if the action lets the
-		// job proceed (or the post step runs before teardown), the summary
-		// push tells the dashboard the run was locked down and why.
-		writeDowngradeFile(downgradeRecord(datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_LOCKDOWN, fe, reason), logger)
 		// No mode file: lockdown is not a SaaS-resolved posture, and the
 		// failure sentinel already carries the state the action needs.
 		return

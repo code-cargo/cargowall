@@ -243,6 +243,40 @@ func TestLoadCIConfig_LockdownSkipsLocalConfig(t *testing.T) {
 	}
 }
 
+// TestLoadCIConfig_LockdownPublishesSentinelLast: consumers poll for the
+// failure sentinel and classify lockdown from the downgrade record, so the
+// sentinel must be the last write — published before the record, a reader
+// between the two sees a lockdown with no record and treats it as a generic
+// startup crash (issue #102).
+func TestLoadCIConfig_LockdownPublishesSentinelLast(t *testing.T) {
+	setFastPolicyRetries(t)
+	redirectStateFiles(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	// Both writes atomically replace the same path, so whichever lands last
+	// is what remains: a deterministic order check with no goroutine racing
+	// two writes microseconds apart.
+	sharedPath := filepath.Join(t.TempDir(), "cargowall-state")
+	downgradeFile = sharedPath // restored by redirectStateFiles' cleanup
+
+	cmd := &StartCmd{
+		GithubAction:   true,
+		ApiUrl:         srv.URL,
+		Token:          "test-token",
+		ApiFailureMode: ApiFailureModeFail,
+		FailureFile:    sharedPath,
+	}
+	loadCIConfig(context.Background(), cmd, config.NewConfigManager(), nil, quietLogger())
+
+	require.True(t, cmd.policyLockdown)
+	data, err := os.ReadFile(sharedPath)
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(string(data), "pid="), "the failure sentinel must be written after the downgrade record, got: %s", data)
+}
+
 // TestLoadCIConfig_CancelledContextSkipsPostureHandling guards the SIGTERM
 // unwind path: a fetch killed by shutdown-signal cancellation must not be
 // misreported as an outage — no lockdown, no audit downgrade, and no

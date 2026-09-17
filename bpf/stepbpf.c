@@ -125,9 +125,10 @@ static __always_inline struct step_state *step_state(void) {
 // ns_tgid_of returns t's process id as numbered in the daemon's pid
 // namespace, or 0 when t lives outside that namespace's subtree (another
 // pod, the host) or translation is disabled. Walks the group leader's upid
-// chain from the innermost namespace outward: a task directly in the
-// daemon's namespace matches on the first probe, a task inside a nested
-// container (docker under the runner) one or two probes later.
+// chain — numbers[0] is the init namespace, numbers[level] the task's own —
+// looking for the namespace whose inode userspace passed in. The daemon's
+// namespace appears at most once in a chain, so order is irrelevant; a
+// plain bounded index keeps the flexible-array access simple.
 static __always_inline __u32 ns_tgid_of(struct task_struct *t)
 {
     if (!pidns_ino)
@@ -136,13 +137,16 @@ static __always_inline __u32 ns_tgid_of(struct task_struct *t)
     if (!p)
         return 0;
     unsigned int level = BPF_CORE_READ(p, level);
+    if (level >= PIDNS_MAX_LEVEL)
+        level = PIDNS_MAX_LEVEL - 1;
     for (unsigned int i = 0; i < PIDNS_MAX_LEVEL; i++) {
         if (i > level)
             break;
-        unsigned int l = level - i;
-        struct pid_namespace *ns = BPF_CORE_READ(p, numbers[l].ns);
-        if (BPF_CORE_READ(ns, ns.inum) == pidns_ino)
-            return BPF_CORE_READ(p, numbers[l].nr);
+        struct upid up;
+        if (bpf_core_read(&up, sizeof(up), &p->numbers[i]))
+            break;
+        if (BPF_CORE_READ(up.ns, ns.inum) == pidns_ino)
+            return up.nr;
     }
     return 0;
 }

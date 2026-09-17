@@ -17,6 +17,7 @@
 package steps
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"log/slog"
@@ -72,12 +73,9 @@ func TestReadComm_Self(t *testing.T) {
 
 // rec encodes one task_iter_rec as the step_task_iter iterator streams it.
 func rec(tid, tgid, ppid, nsTgid uint32) []byte {
-	b := make([]byte, taskIterRecSize)
-	binary.NativeEndian.PutUint32(b[0:], tid)
-	binary.NativeEndian.PutUint32(b[4:], tgid)
-	binary.NativeEndian.PutUint32(b[8:], ppid)
-	binary.NativeEndian.PutUint32(b[12:], nsTgid)
-	return b
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.NativeEndian, bpf.StepBpfTaskIterRec{Tid: tid, Tgid: tgid, Ppid: ppid, NsTgid: nsTgid})
+	return buf.Bytes()
 }
 
 func concat(recs ...[]byte) []byte {

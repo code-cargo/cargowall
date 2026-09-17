@@ -35,7 +35,6 @@
 package steps
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -453,10 +452,6 @@ func pidNamespaceInode() (uint32, error) {
 	return uint32(st.Ino), nil
 }
 
-// taskIterRecSize is sizeof(struct task_iter_rec) in bpf/stepbpf.c: four
-// native-endian u32s — tid, tgid, ppid (global) and ns_tgid.
-const taskIterRecSize = 16
-
 // procSnapshot is one pass of the step_task_iter walk: every task in the
 // daemon's pid-namespace subtree, keyed by the global ids the step maps
 // use, plus the translation from the daemon-namespace pids userspace
@@ -481,29 +476,27 @@ func (t *Tracker) iterSnapshot() (*procSnapshot, error) {
 	return parseTaskRecords(data), nil
 }
 
-// parseTaskRecords decodes the iterator's fixed-size record stream. Threads
-// contribute their tid to the leader's list and nothing else: they share
-// the leader's tree position and namespace pid. A trailing partial record
-// (a truncated read) is ignored.
+// parseTaskRecords decodes the iterator's stream of task_iter_rec (the
+// bpf2go-generated mirror of the C struct, so the layout has one source).
+// Threads contribute their tid to the leader's list and nothing else: they
+// share the leader's tree position and namespace pid. A trailing partial
+// record (a truncated read) is ignored.
 func parseTaskRecords(data []byte) *procSnapshot {
 	snap := &procSnapshot{
 		tids:     make(map[uint32][]uint32),
 		children: make(map[uint32][]uint32),
 		global:   make(map[int]uint32),
 	}
-	for off := 0; off+taskIterRecSize <= len(data); off += taskIterRecSize {
-		rec := data[off : off+taskIterRecSize]
-		tid := binary.NativeEndian.Uint32(rec[0:4])
-		tgid := binary.NativeEndian.Uint32(rec[4:8])
-		ppid := binary.NativeEndian.Uint32(rec[8:12])
-		nsTgid := binary.NativeEndian.Uint32(rec[12:16])
-		snap.tids[tgid] = append(snap.tids[tgid], tid)
-		if tid != tgid {
+	const recSize = int(unsafe.Sizeof(bpf.StepBpfTaskIterRec{}))
+	for off := 0; off+recSize <= len(data); off += recSize {
+		rec := (*bpf.StepBpfTaskIterRec)(unsafe.Pointer(&data[off]))
+		snap.tids[rec.Tgid] = append(snap.tids[rec.Tgid], rec.Tid)
+		if rec.Tid != rec.Tgid {
 			continue
 		}
-		snap.global[int(nsTgid)] = tgid
-		if ppid != tgid {
-			snap.children[ppid] = append(snap.children[ppid], tgid)
+		snap.global[int(rec.NsTgid)] = rec.Tgid
+		if rec.Ppid != rec.Tgid {
+			snap.children[rec.Ppid] = append(snap.children[rec.Ppid], rec.Tgid)
 		}
 	}
 	return snap

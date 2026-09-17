@@ -422,8 +422,10 @@ current (a thread copies its process's entry, a process walks its upid
 chain to the daemon's namespace, identified by the nsfs inode passed in as
 `pidns_ino`); the cgroup hooks write the namespace tgid into `map_sock_pid`;
 boundary events carry the namespace pid so the reconciler's `/proc` read
-works. Kernel floor is unchanged: `iter/task` and `bpf_seq_write` are 5.8,
-like the ring buffer.
+works. Kernel floor is unchanged: the `iter/task` target, `bpf_seq_write` and
+the `BPF_ITER_CREATE` command that opens an iterator instance all shipped in
+5.8 (uapi `bpf.h` at v5.8 lists `BPF_ITER_CREATE`; v5.7 does not), like the
+ring buffer.
 
 ## Audit Mode
 

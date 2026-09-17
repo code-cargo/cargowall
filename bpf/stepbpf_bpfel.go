@@ -20,6 +20,14 @@ type StepBpfStepState struct {
 	NextOrdinal uint64
 }
 
+type StepBpfTaskIterRec struct {
+	_      structs.HostLayout
+	Tid    uint32
+	Tgid   uint32
+	Ppid   uint32
+	NsTgid uint32
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.

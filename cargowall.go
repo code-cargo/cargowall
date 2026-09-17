@@ -23,7 +23,7 @@ import (
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -output-dir bpf TcBpf bpf/tcbpf.c
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -output-dir bpf StepBpf bpf/stepbpf.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -output-dir bpf -type task_iter_rec StepBpf bpf/stepbpf.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -output-dir bpf OriginBpf bpf/originbpf.c
 
 var version = "dev"

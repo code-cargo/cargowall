@@ -17,7 +17,6 @@
 package bpf
 
 import (
-	"encoding/binary"
 	"io"
 	"os"
 	"os/exec"
@@ -60,13 +59,11 @@ func globalTgid(t *testing.T, iter *link.Iter, nsPid int) (uint32, bool) {
 	defer rd.Close()
 	data, err := io.ReadAll(rd)
 	require.NoError(t, err)
-	const recSize = 16
+	const recSize = int(unsafe.Sizeof(StepBpfTaskIterRec{}))
 	for off := 0; off+recSize <= len(data); off += recSize {
-		tid := binary.NativeEndian.Uint32(data[off:])
-		tgid := binary.NativeEndian.Uint32(data[off+4:])
-		nsTgid := binary.NativeEndian.Uint32(data[off+12:])
-		if tid == tgid && int(nsTgid) == nsPid {
-			return tgid, true
+		rec := (*StepBpfTaskIterRec)(unsafe.Pointer(&data[off]))
+		if rec.Tid == rec.Tgid && int(rec.NsTgid) == nsPid {
+			return rec.Tgid, true
 		}
 	}
 	return 0, false
@@ -274,8 +271,10 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 	require.Equal(t, uintptr(st.Members[1].Offset.Bytes()), unsafe.Offsetof(ev.Ordinal))
 }
 
-// TestTaskIterRecLayoutMatchesBTF pins the iterator record layout that
-// pkg/steps decodes by hand (taskIterRecSize and the four u32 offsets).
+// TestTaskIterRecLayoutMatchesBTF pins the iterator record layout against
+// the bpf2go mirror pkg/steps decodes with: the C struct is four packed
+// u32s, and a regenerated mirror that drifted (a field reordered or
+// widened in C without `go generate`) would break the unsafe cast.
 func TestTaskIterRecLayoutMatchesBTF(t *testing.T) {
 	spec, err := LoadStepBpf()
 	require.NoError(t, err)
@@ -285,11 +284,21 @@ func TestTaskIterRecLayoutMatchesBTF(t *testing.T) {
 	st, ok := typ.(*btf.Struct)
 	require.True(t, ok, "task_iter_rec must be a struct, got %T", typ)
 
-	require.Equal(t, uint32(16), st.Size, "struct size")
+	var rec StepBpfTaskIterRec
+	require.Equal(t, uint32(unsafe.Sizeof(rec)), st.Size, "struct size")
 	require.Len(t, st.Members, 4)
-	for i, name := range []string{"tid", "tgid", "ppid", "ns_tgid"} {
-		require.Equal(t, name, st.Members[i].Name)
-		require.Equal(t, uint32(4*i), st.Members[i].Offset.Bytes())
+	want := []struct {
+		name string
+		off  uintptr
+	}{
+		{"tid", unsafe.Offsetof(rec.Tid)},
+		{"tgid", unsafe.Offsetof(rec.Tgid)},
+		{"ppid", unsafe.Offsetof(rec.Ppid)},
+		{"ns_tgid", unsafe.Offsetof(rec.NsTgid)},
+	}
+	for i, w := range want {
+		require.Equal(t, w.name, st.Members[i].Name)
+		require.Equal(t, w.off, uintptr(st.Members[i].Offset.Bytes()))
 	}
 }
 

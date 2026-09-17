@@ -69,6 +69,10 @@ test-bpf:
 	@printf "${GREEN}Running BPF tests (requires root)...${RESET}\n"
 	sudo go test -v -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/steps/ ./pkg/origin/
 
+verifier-budget:
+	@printf "${GREEN}Measuring BPF verifier budget on $$(uname -r) (requires root)...${RESET}\n"
+	sudo go run ./scripts/ci/verifierbudget
+
 test-ci:
 	@printf "${GREEN}Running CI tests...${RESET}\n"
 	go run gotest.tools/gotestsum@latest --junitfile test-results.xml --format testdox -- ./...

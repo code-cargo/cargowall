@@ -18,7 +18,7 @@ GREEN := \033[32m
 RED := \033[31m
 RESET := \033[0m
 
-.PHONY: all build ci install-tools vet fmt fmt-check generate generate-proto test test-bpf test-ci tidy clean
+.PHONY: all build ci install-tools vet fmt fmt-check generate generate-proto test test-bpf test-ci verifier-budget tidy clean
 
 .DEFAULT_GOAL := build
 

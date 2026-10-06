@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -73,9 +74,13 @@ func TestVerifierBudget(t *testing.T) {
 		if err != nil {
 			var verr *ebpf.VerifierError
 			if errors.As(err, &verr) {
-				// The rejection names the count: "BPF program is too large.
-				// Processed 1000001 insn". That is the finding, not a skip.
-				t.Errorf("verifier: collection=%s FAILED: %v", c.name, verr.Cause)
+				// The rejection is the finding, not a skip. The wrapped error
+				// names the program and ends with the verifier's own "BPF
+				// program is too large. Processed 1000001 insn"; the count is
+				// also parsed out so the line reads like the passing ones.
+				insns, _ := cargowallEbpf.ParseVerifierInsns(strings.Join(verr.Log, "\n"))
+				t.Errorf("verifier: collection=%s processed=%d pct=%.1f FAILED: %v",
+					c.name, insns, 100*float64(insns)/cargowallEbpf.InsnLimit, err)
 				continue
 			}
 			// Anything else is an environment limit (no kernel BTF for the

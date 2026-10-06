@@ -32,9 +32,10 @@ import (
 const InsnLimit = 1_000_000
 
 // processedRe matches the statistics line the verifier appends to its log
-// when a program is loaded with LogLevelStats:
-// "processed 657658 insns (limit 1000000) max_states_per_insn ...".
-var processedRe = regexp.MustCompile(`processed (\d+) insns`)
+// when a program is loaded with LogLevelStats — "processed 657658 insns
+// (limit 1000000) max_states_per_insn ..." — and the rejection it writes
+// when the limit is hit: "BPF program is too large. Processed 1000001 insn".
+var processedRe = regexp.MustCompile(`(?i)processed (\d+) insns?`)
 
 // VerifierInsns reports how many instructions the verifier processed for
 // prog. ok is false when prog was loaded without ebpf.LogLevelStats (there
@@ -48,7 +49,15 @@ func VerifierInsns(prog *ebpf.Program) (insns int, ok bool) {
 	if prog == nil {
 		return 0, false
 	}
-	m := processedRe.FindAllStringSubmatch(prog.VerifierLog, -1)
+	return ParseVerifierInsns(prog.VerifierLog)
+}
+
+// ParseVerifierInsns extracts the processed-instruction count from verifier
+// log text: the last "processed N insns" stats line of a successful load, or
+// the "Processed N insn" of a rejection (then N is the limit plus one). ok is
+// false when neither is present.
+func ParseVerifierInsns(log string) (insns int, ok bool) {
+	m := processedRe.FindAllStringSubmatch(log, -1)
 	if len(m) == 0 {
 		return 0, false
 	}

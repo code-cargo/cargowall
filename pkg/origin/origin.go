@@ -53,6 +53,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 
 	"github.com/code-cargo/cargowall/bpf"
+	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 )
 
 // The ringbuf wire layout is bpf.OriginEvent (bpf/origin_event.go) — the one
@@ -299,9 +300,15 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 			"map_default_action": tcObjs.MapDefaultAction,
 			"map_audit_mode":     tcObjs.MapAuditMode,
 		},
+		// Stats only: the count is the one number that predicts whether
+		// this program loads on an older verifier (issue #138), and the
+		// daemon's own log is the only place to read it on a runner kernel
+		// CI does not have.
+		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to load origin BPF objects: %w", err)
 	}
+	cargowallEbpf.LogVerifierStats(logger, "originbpf", &o.objs)
 
 	// Arm the loopback-device carve-out before attach: traffic egressing lo
 	// never leaves the host and was never adjudicated by TC (that includes

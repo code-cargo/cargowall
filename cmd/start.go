@@ -534,6 +534,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		return fmt.Errorf("failed to load TC eBPF objects: %w", err)
 	}
 	defer objs.Close()
+	cargowallEbpf.LogVerifierStats(logger, "tcbpf", &objs)
 
 	// Attach cgroup programs for PID tracking via socket cookie.
 	// Best-effort: if attachment fails, TC filtering still works but PID will be 0.

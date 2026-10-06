@@ -54,6 +54,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 
 	"github.com/code-cargo/cargowall/bpf"
+	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
@@ -192,9 +193,11 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 			"map_step_state": tcObjs.MapStepState,
 			"map_task_nspid": tcObjs.MapTaskNspid,
 		},
+		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to load step BPF objects (kernel BTF required): %w", err)
 	}
+	cargowallEbpf.LogVerifierStats(logger, "stepbpf", &t.objs)
 
 	if err := t.attach(); err != nil {
 		t.Close()

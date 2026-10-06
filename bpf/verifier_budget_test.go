@@ -31,9 +31,9 @@ import (
 // verifierBudgetPct is the share of the verifier's instruction limit any one
 // program may use on the kernel running this suite. It is deliberately well
 // under 100%: the count is kernel-specific (cg_origin_egress is ~660k on the
-// 6.17 kernel CI runs on and over the limit on Blacksmith's 6.6, issue
-// #138), so creep that is still comfortable here is what an older verifier
-// turns into a load failure. Raising this needs a measurement on the oldest
+// 6.17 kernel CI runs on and over the limit on Blacksmith's 6.6), so creep
+// that is still comfortable here is what an older verifier turns into a load
+// failure. Raising this needs a measurement on the oldest
 // kernel we support, not just a green CI.
 const verifierBudgetPct = 80.0
 

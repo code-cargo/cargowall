@@ -34,7 +34,7 @@ func TestParseVerifierInsns(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, 657658, n)
 
-	// Rejection text, as 6.6 wrote it on Blacksmith (issue #138).
+	// Rejection text, as 6.6 wrote it on Blacksmith.
 	n, ok = ParseVerifierInsns("BPF program is too large. Processed 1000001 insn")
 	assert.True(t, ok)
 	assert.Equal(t, 1000001, n)

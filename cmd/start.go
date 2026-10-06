@@ -518,10 +518,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}
 	}
 	// Loaded as a collection first so the verifier statistics of every
-	// program can be logged (issue #138: the count is kernel-specific and
-	// the daemon's own log is the only place to read it on a runner kernel
-	// CI does not have), then handed to the bpf2go struct, which takes over
-	// ownership of what it names.
+	// program can be logged (the count is kernel-specific, and the daemon's
+	// own log is the only place to read it on a runner kernel CI does not
+	// have), then handed to the bpf2go struct, which takes over ownership of
+	// what it names.
 	tcColl, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
 			KernelTypes: nil,

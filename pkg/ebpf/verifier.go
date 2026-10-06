@@ -49,8 +49,8 @@ var programRe = regexp.MustCompile(`program ([A-Za-z0-9_]+): load program`)
 //
 // The number is a property of the kernel as much as of the program — the
 // same cg_origin_egress verifies in ~660k instructions on 6.17 and is
-// rejected at the limit on 6.6 (issue #138) — so it is worth surfacing on
-// every kernel the daemon runs on, not only the one CI measures.
+// rejected at the limit on 6.6 — so it is worth surfacing on every kernel
+// the daemon runs on, not only the one CI measures.
 func VerifierInsns(prog *ebpf.Program) (insns int, ok bool) {
 	if prog == nil {
 		return 0, false

@@ -594,7 +594,16 @@ static __always_inline int l7_identity_gate(struct __sk_buff *skb, struct l7_ctx
 // l7_adjudicate is the whole L7 decision for one packet, called from
 // origin_handle_v4/v6 AFTER the L4 verdict has already passed it. Returns 1 to
 // pass and 0 to drop; it can only ever turn a pass into a drop.
-static __always_inline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, struct l7_ctx *c) {
+// A GLOBAL function (non-static, never inlined): the verifier checks its body
+// once, against abstract arguments, instead of once per state that reaches
+// the call. Inlined, every distinct state the IPv6 extension-header walk
+// produced re-verified the whole adjudicator — measured, the v6 path cost
+// 2.7x the v4 path for identical code, and kernel 6.6 ran past the 1M
+// instruction limit while 6.17 stopped at 657k. Pointer-to-struct arguments
+// need kernel 5.13+.
+__noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, struct l7_ctx *c) {
+    if (!c)
+        return 1;  // kernels >= 6.8 type a global function's pointer arg as nullable
     __u8 scope = l7_narrow_scope(c, l7_scope_for(c));
     if (!scope)
         return 1;  // not L7-scoped on this port: the L4 pass stands
@@ -831,7 +840,10 @@ static __always_inline int l7_hook_v4(struct __sk_buff *skb, __u8 l7mode, __u32 
     c.is_syn = is_syn;
     if (!l7_payload_window(&c, skb->len, ip_hlen, tcp_doff, tcp_seq))
         return 1;  // no window L7 can trust; the L4 verdict governs
-    return l7_adjudicate(skb, l7mode, &c);
+    // A global function's return is an unknown scalar to the caller's
+    // verifier state; the compare pins it to {0,1}, which the program's
+    // cgroup_skb return-range check needs to see.
+    return l7_adjudicate(skb, l7mode, &c) != 0;
 }
 
 static __always_inline int l7_hook_v6(struct __sk_buff *skb, __u8 l7mode, __u32 l4_off,
@@ -848,7 +860,7 @@ static __always_inline int l7_hook_v6(struct __sk_buff *skb, __u8 l7mode, __u32 
     c.is_syn = is_syn;
     if (!l7_payload_window(&c, skb->len, l4_off, tcp_doff, tcp_seq))
         return 1;
-    return l7_adjudicate(skb, l7mode, &c);
+    return l7_adjudicate(skb, l7mode, &c) != 0;  // see l7_hook_v4
 }
 
 #endif /* __SNI_H__ */

@@ -17,9 +17,15 @@
 package ebpf
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+	"log/slog"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
+	"golang.org/x/sys/unix"
 )
 
 func TestParseVerifierInsns(t *testing.T) {
@@ -42,4 +48,30 @@ func TestParseVerifierInsns(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = ParseVerifierInsns("no stats here")
 	assert.False(t, ok)
+}
+
+func TestLogVerifierRejection(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	// The shape cilium/ebpf returns for a collection load: the program name
+	// is in the wrapping, the count only in the verifier log.
+	verr := &ebpf.VerifierError{
+		Cause: unix.E2BIG,
+		Log:   []string{"; some source line", "BPF program is too large. Processed 1000001 insn", "stack depth 456"},
+	}
+	err := fmt.Errorf("assign values: field CgOriginEgress: program cg_origin_egress: load program: %w", verr)
+
+	assert.True(t, LogVerifierRejection(logger, "originbpf", err))
+	out := buf.String()
+	assert.Contains(t, out, `msg="BPF program rejected by the verifier"`)
+	assert.Contains(t, out, "collection=originbpf")
+	assert.Contains(t, out, "program=cg_origin_egress")
+	assert.Contains(t, out, "processed_insns=1000001")
+	assert.Contains(t, out, "limit=1000000")
+
+	// Not a verifier error: nothing logged, caller keeps its own message.
+	buf.Reset()
+	assert.False(t, LogVerifierRejection(logger, "tcbpf", errors.New("open /sys/fs/bpf: permission denied")))
+	assert.Empty(t, buf.String())
 }

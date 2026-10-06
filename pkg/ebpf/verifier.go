@@ -17,11 +17,12 @@
 package ebpf
 
 import (
+	"errors"
 	"log/slog"
-	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/cilium/ebpf"
 )
@@ -36,6 +37,11 @@ const InsnLimit = 1_000_000
 // (limit 1000000) max_states_per_insn ..." — and the rejection it writes
 // when the limit is hit: "BPF program is too large. Processed 1000001 insn".
 var processedRe = regexp.MustCompile(`(?i)processed (\d+) insns?`)
+
+// programRe finds the program name in cilium/ebpf's wrapping of a collection
+// load failure ("... program cg_origin_egress: load program: ..."). The
+// verifier log itself never names the program.
+var programRe = regexp.MustCompile(`program ([A-Za-z0-9_]+): load program`)
 
 // VerifierInsns reports how many instructions the verifier processed for
 // prog. ok is false when prog was loaded without ebpf.LogLevelStats (there
@@ -68,51 +74,13 @@ func ParseVerifierInsns(log string) (insns int, ok bool) {
 	return n, true
 }
 
-// Programs collects the loaded programs of a bpf2go objects struct (or a
-// pointer to one), keyed by their kernel-visible section name from the
-// `ebpf:"..."` tag. It walks embedded structs, so passing the whole
-// *XxxObjects works. Nil programs are skipped.
-func Programs(objs any) map[string]*ebpf.Program {
-	out := make(map[string]*ebpf.Program)
-	collectPrograms(reflect.ValueOf(objs), out)
-	return out
-}
-
-var programType = reflect.TypeOf((*ebpf.Program)(nil))
-
-func collectPrograms(v reflect.Value, out map[string]*ebpf.Program) {
-	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
-		if v.IsNil() {
-			return
-		}
-		v = v.Elem()
-	}
-	if v.Kind() != reflect.Struct {
-		return
-	}
-	t := v.Type()
-	for i := 0; i < t.NumField(); i++ {
-		f, fv := t.Field(i), v.Field(i)
-		if f.Type == programType {
-			if name := f.Tag.Get("ebpf"); name != "" && !fv.IsNil() {
-				out[name] = fv.Interface().(*ebpf.Program)
-			}
-			continue
-		}
-		if f.Anonymous || f.Type.Kind() == reflect.Struct {
-			collectPrograms(fv, out)
-		}
-	}
-}
-
 // LogVerifierStats logs the processed-instruction count of every program in
-// objs that was loaded with LogLevelStats. Programs using at least one
-// percent of the budget log at Info — in practice the one or two that could
-// ever hit the limit — the rest at Debug, so the startup log carries the
-// number an operator on an unfamiliar kernel needs without eleven lines of
-// noise.
-func LogVerifierStats(logger *slog.Logger, collection string, objs any) {
-	progs := Programs(objs)
+// progs (a loaded ebpf.Collection's Programs) that carries a stats line.
+// Programs using at least one percent of the budget log at Info — in
+// practice the one or two that could ever hit the limit — the rest at Debug,
+// so the startup log carries the number an operator on an unfamiliar kernel
+// needs without eleven lines of noise.
+func LogVerifierStats(logger *slog.Logger, collection string, progs map[string]*ebpf.Program) {
 	names := make([]string, 0, len(progs))
 	for n := range progs {
 		names = append(names, n)
@@ -131,4 +99,27 @@ func LogVerifierStats(logger *slog.Logger, collection string, objs any) {
 			logger.Debug("BPF program verified", attrs...)
 		}
 	}
+}
+
+// LogVerifierRejection logs the same attributes for a program the verifier
+// refused, from the error a collection load returned. This is the line that
+// matters on the kernel a program is too big for: nothing loads, so
+// LogVerifierStats never runs, and the count in the error text is only there
+// by accident of how cilium/ebpf trims the log. Returns false (and logs
+// nothing) when err is not a verifier rejection.
+func LogVerifierRejection(logger *slog.Logger, collection string, err error) bool {
+	var verr *ebpf.VerifierError
+	if !errors.As(err, &verr) {
+		return false
+	}
+	program := "unknown"
+	if m := programRe.FindStringSubmatch(err.Error()); m != nil {
+		program = m[1]
+	}
+	insns, _ := ParseVerifierInsns(strings.Join(verr.Log, "\n"))
+	logger.Error("BPF program rejected by the verifier",
+		"collection", collection, "program", program,
+		"processed_insns", insns, "limit", InsnLimit, "pct", 100*float64(insns)/InsnLimit,
+		"error", verr.Cause)
+	return true
 }

@@ -291,7 +291,11 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	// but 3b's whole purpose is to compute the verdict here. The blast
 	// radius is bounded instead by the mode gate (the program is inert until
 	// userspace raises it) and by TC remaining attached as the backstop.
-	if err := bpf.LoadOriginBpfObjects(&o.objs, &ebpf.CollectionOptions{
+	spec, err := bpf.LoadOriginBpf()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load origin BPF spec: %w", err)
+	}
+	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
 		MapReplacements: map[string]*ebpf.Map{
 			"map_cidrs":          tcObjs.MapCidrs,
 			"map_ports":          tcObjs.MapPorts,
@@ -300,15 +304,27 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 			"map_default_action": tcObjs.MapDefaultAction,
 			"map_audit_mode":     tcObjs.MapAuditMode,
 		},
-		// Stats only: the count is the one number that predicts whether
-		// this program loads on an older verifier (issue #138), and the
-		// daemon's own log is the only place to read it on a runner kernel
-		// CI does not have.
+		// Stats ONLY, unlike the TC and step collections: the count is the
+		// one number that predicts whether this program loads on an older
+		// verifier (issue #138), and the daemon's own log is the only place
+		// to read it on a runner kernel CI does not have. Branch-level
+		// logging is deliberately off — cg_origin_egress is ~660k verified
+		// instructions on 6.17, so a branch trace would be tens of MB held
+		// in Program.VerifierLog for the life of the process, and on a
+		// kernel that rejects it the retry loop would grow the log buffer
+		// to match. The rejection path below still logs the count.
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
-	}); err != nil {
+	})
+	if err != nil {
+		cargowallEbpf.LogVerifierRejection(logger, "originbpf", err)
 		return nil, fmt.Errorf("failed to load origin BPF objects: %w", err)
 	}
-	cargowallEbpf.LogVerifierStats(logger, "originbpf", &o.objs)
+	cargowallEbpf.LogVerifierStats(logger, "originbpf", coll.Programs)
+	if err := coll.Assign(&o.objs); err != nil {
+		coll.Close()
+		return nil, fmt.Errorf("failed to assign origin BPF objects: %w", err)
+	}
+	coll.Close()
 
 	// Arm the loopback-device carve-out before attach: traffic egressing lo
 	// never leaves the host and was never adjudicated by TC (that includes

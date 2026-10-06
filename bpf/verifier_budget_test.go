@@ -122,5 +122,6 @@ func TestVerifierBudget(t *testing.T) {
 	}
 }
 
-func itoa(n int) string     { return strconv.Itoa(n) }
+func itoa(n int) string { return strconv.Itoa(n) }
+
 func ftoa(f float64) string { return strconv.FormatFloat(f, 'f', 1, 64) }

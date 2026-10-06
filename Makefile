@@ -18,7 +18,7 @@ GREEN := \033[32m
 RED := \033[31m
 RESET := \033[0m
 
-.PHONY: all build ci install-tools vet fmt fmt-check generate generate-proto test test-bpf test-ci tidy clean
+.PHONY: all build ci install-tools vet fmt fmt-check generate generate-proto test test-bpf test-ci verifier-budget tidy clean
 
 .DEFAULT_GOAL := build
 
@@ -68,6 +68,10 @@ test:
 test-bpf:
 	@printf "${GREEN}Running BPF tests (requires root)...${RESET}\n"
 	sudo go test -v -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/steps/ ./pkg/origin/
+
+verifier-budget:
+	@printf "${GREEN}Measuring BPF verifier budget on $$(uname -r) (requires root)...${RESET}\n"
+	sudo go test -count=1 -run '^TestVerifierBudget$$' -v ./bpf/
 
 test-ci:
 	@printf "${GREEN}Running CI tests...${RESET}\n"

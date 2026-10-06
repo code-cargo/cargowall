@@ -113,6 +113,11 @@ together.
 450k on a 6.8 kernel and past 1,000,001 on the newer kernel CI runs — where it
 fails to load and the whole cgroup hook, L4 enforcement included, silently does
 not attach. Measure on CI's kernel before changing it.
+The daemon logs each program's `processed_insns` at startup (`BPF program
+verified`, or `BPF program rejected by the verifier` with the count the kernel
+got to), `make verifier-budget` prints them for the local kernel, and
+`TestVerifierBudget` trips at 80% of the limit on CI's kernel — which is not the
+strictest one we support: 6.6 rejects what 6.17 verifies in ~660k (issue #138).
 
 **Uncertainty.** A datagram the walk cannot resolve — an unskippable header
 (unknown version, Retry) *before* any Initial, still-skippable packets past the

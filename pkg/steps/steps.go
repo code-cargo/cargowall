@@ -54,6 +54,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 
 	"github.com/code-cargo/cargowall/bpf"
+	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
@@ -184,15 +185,20 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 	t.snapshotFn = t.iterSnapshot
 
 	// The shared maps are owned by the tcbpf collection; replacing them here
-	// makes both collections operate on the same kernel maps.
-	if err := spec.LoadAndAssign(&t.objs, &ebpf.CollectionOptions{
+	// makes both collections operate on the same kernel maps. Branch-level
+	// logging as for TC: these programs are a few thousand instructions, so
+	// the full log is cheap and a rejection stays diagnosable (cilium/ebpf
+	// only retries a failed load with branch logging when no log level was
+	// requested at all).
+	if err := cargowallEbpf.LoadObjects(logger, "stepbpf", spec, ebpf.CollectionOptions{
 		MapReplacements: map[string]*ebpf.Map{
 			"map_task_step":  tcObjs.MapTaskStep,
 			"map_sock_step":  tcObjs.MapSockStep,
 			"map_step_state": tcObjs.MapStepState,
 			"map_task_nspid": tcObjs.MapTaskNspid,
 		},
-	}); err != nil {
+		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelBranch | ebpf.LogLevelStats},
+	}, &t.objs); err != nil {
 		return nil, fmt.Errorf("failed to load step BPF objects (kernel BTF required): %w", err)
 	}
 

@@ -518,12 +518,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}
 	}
 	var objs bpf.TcBpfObjects
-	if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
+	if err := cargowallEbpf.LoadObjects(logger, "tcbpf", spec, ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
 			KernelTypes: nil,
 			LogLevel:    ebpf.LogLevelBranch | ebpf.LogLevelStats,
 		},
-	}); err != nil {
+	}, &objs); err != nil {
 		// Try to get the full verifier log
 		var verr *ebpf.VerifierError
 		if errors.As(err, &verr) {

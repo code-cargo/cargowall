@@ -18,6 +18,7 @@ package ebpf
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"sort"
@@ -105,7 +106,8 @@ func LogVerifierStats(logger *slog.Logger, collection string, progs map[string]*
 // refused, from the error a collection load returned. This is the line that
 // matters on the kernel a program is too big for: nothing loads, so
 // LogVerifierStats never runs, and the count in the error text is only there
-// by accident of how cilium/ebpf trims the log. Returns false (and logs
+// by accident of how cilium/ebpf trims the log. The count is omitted when the
+// log has none — a zero would read as a measurement. Returns false (and logs
 // nothing) when err is not a verifier rejection.
 func LogVerifierRejection(logger *slog.Logger, collection string, err error) bool {
 	var verr *ebpf.VerifierError
@@ -116,10 +118,37 @@ func LogVerifierRejection(logger *slog.Logger, collection string, err error) boo
 	if m := programRe.FindStringSubmatch(err.Error()); m != nil {
 		program = m[1]
 	}
-	insns, _ := ParseVerifierInsns(strings.Join(verr.Log, "\n"))
-	logger.Error("BPF program rejected by the verifier",
-		"collection", collection, "program", program,
-		"processed_insns", insns, "limit", InsnLimit, "pct", 100*float64(insns)/InsnLimit,
-		"error", verr.Cause)
+	attrs := []any{"collection", collection, "program", program}
+	if insns, ok := ParseVerifierInsns(strings.Join(verr.Log, "\n")); ok {
+		attrs = append(attrs, "processed_insns", insns, "pct", 100*float64(insns)/InsnLimit)
+	}
+	attrs = append(attrs, "limit", InsnLimit, "error", verr.Cause)
+	logger.Error("BPF program rejected by the verifier", attrs...)
 	return true
+}
+
+// LoadObjects is how every collection is loaded at startup: it loads spec as
+// a collection with opts, logs the verifier's processed-instruction count
+// for each program (or the rejection, when the verifier refuses one), and
+// assigns the result into to — a bpf2go objects struct, which takes
+// ownership of everything it names. The collection is then closed, on the
+// assign-failure path too: cilium clones replaced maps and finalizes .rodata
+// into the collection, and Assign moves only what the struct names, so the
+// rest would leak. One home for the metric and for that ownership rule
+// means a fourth collection cannot forget either. Callers keep their own
+// CollectionOptions — the log levels differ on purpose — and may still
+// inspect the returned error for the verifier log.
+func LoadObjects(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any) error {
+	coll, err := ebpf.NewCollectionWithOptions(spec, opts)
+	if err != nil {
+		LogVerifierRejection(logger, collection, err)
+		return err
+	}
+	LogVerifierStats(logger, collection, coll.Programs)
+	if err := coll.Assign(to); err != nil {
+		coll.Close()
+		return fmt.Errorf("assign %s objects: %w", collection, err)
+	}
+	coll.Close()
+	return nil
 }

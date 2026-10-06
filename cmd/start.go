@@ -517,19 +517,13 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			}
 		}
 	}
-	// Loaded as a collection first so the verifier statistics of every
-	// program can be logged (the count is kernel-specific, and the daemon's
-	// own log is the only place to read it on a runner kernel CI does not
-	// have), then handed to the bpf2go struct, which takes over ownership of
-	// what it names.
-	tcColl, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
+	var objs bpf.TcBpfObjects
+	if err := cargowallEbpf.LoadObjects(logger, "tcbpf", spec, ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
 			KernelTypes: nil,
 			LogLevel:    ebpf.LogLevelBranch | ebpf.LogLevelStats,
 		},
-	})
-	if err != nil {
-		cargowallEbpf.LogVerifierRejection(logger, "tcbpf", err)
+	}, &objs); err != nil {
 		// Try to get the full verifier log
 		var verr *ebpf.VerifierError
 		if errors.As(err, &verr) {
@@ -539,13 +533,6 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}
 		return fmt.Errorf("failed to load TC eBPF objects: %w", err)
 	}
-	cargowallEbpf.LogVerifierStats(logger, "tcbpf", tcColl.Programs)
-	var objs bpf.TcBpfObjects
-	if err := tcColl.Assign(&objs); err != nil {
-		tcColl.Close()
-		return fmt.Errorf("failed to assign TC eBPF objects: %w", err)
-	}
-	tcColl.Close() // whatever the struct does not name; the programs keep their maps alive
 	defer objs.Close()
 
 	// Attach cgroup programs for PID tracking via socket cookie.

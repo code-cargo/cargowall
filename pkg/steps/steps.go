@@ -185,13 +185,12 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 	t.snapshotFn = t.iterSnapshot
 
 	// The shared maps are owned by the tcbpf collection; replacing them here
-	// makes both collections operate on the same kernel maps. Loaded as a
-	// collection so each program's verifier count can be logged before the
-	// bpf2go struct takes ownership. Branch-level logging as for TC: these
-	// programs are a few thousand instructions, so the full log is cheap and
-	// a rejection stays diagnosable (cilium/ebpf only retries a failed load
-	// with branch logging when no log level was requested at all).
-	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
+	// makes both collections operate on the same kernel maps. Branch-level
+	// logging as for TC: these programs are a few thousand instructions, so
+	// the full log is cheap and a rejection stays diagnosable (cilium/ebpf
+	// only retries a failed load with branch logging when no log level was
+	// requested at all).
+	if err := cargowallEbpf.LoadObjects(logger, "stepbpf", spec, ebpf.CollectionOptions{
 		MapReplacements: map[string]*ebpf.Map{
 			"map_task_step":  tcObjs.MapTaskStep,
 			"map_sock_step":  tcObjs.MapSockStep,
@@ -199,17 +198,9 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 			"map_task_nspid": tcObjs.MapTaskNspid,
 		},
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelBranch | ebpf.LogLevelStats},
-	})
-	if err != nil {
-		cargowallEbpf.LogVerifierRejection(logger, "stepbpf", err)
+	}, &t.objs); err != nil {
 		return nil, fmt.Errorf("failed to load step BPF objects (kernel BTF required): %w", err)
 	}
-	cargowallEbpf.LogVerifierStats(logger, "stepbpf", coll.Programs)
-	if err := coll.Assign(&t.objs); err != nil {
-		coll.Close()
-		return nil, fmt.Errorf("failed to assign step BPF objects: %w", err)
-	}
-	coll.Close()
 
 	if err := t.attach(); err != nil {
 		t.Close()

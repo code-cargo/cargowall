@@ -54,13 +54,13 @@ func TestLogVerifierRejection(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
-	// The shape cilium/ebpf returns for a collection load: the program name
-	// is in the wrapping, the count only in the verifier log.
+	// The shape NewCollectionWithOptions returns: the program name is in
+	// cilium's wrapping, the count only in the verifier log.
 	verr := &ebpf.VerifierError{
 		Cause: unix.E2BIG,
 		Log:   []string{"; some source line", "BPF program is too large. Processed 1000001 insn", "stack depth 456"},
 	}
-	err := fmt.Errorf("assign values: field CgOriginEgress: program cg_origin_egress: load program: %w", verr)
+	err := fmt.Errorf("program cg_origin_egress: load program: %w", verr)
 
 	assert.True(t, LogVerifierRejection(logger, "originbpf", err))
 	out := buf.String()
@@ -69,6 +69,17 @@ func TestLogVerifierRejection(t *testing.T) {
 	assert.Contains(t, out, "program=cg_origin_egress")
 	assert.Contains(t, out, "processed_insns=1000001")
 	assert.Contains(t, out, "limit=1000000")
+
+	// A rejection whose log carries no count must not invent one.
+	buf.Reset()
+	bare := fmt.Errorf("program tc_egress: load program: %w", &ebpf.VerifierError{
+		Cause: unix.EINVAL, Log: []string{"R6 invalid mem access 'mem_or_null'"},
+	})
+	assert.True(t, LogVerifierRejection(logger, "tcbpf", bare))
+	out = buf.String()
+	assert.Contains(t, out, "program=tc_egress")
+	assert.NotContains(t, out, "processed_insns")
+	assert.NotContains(t, out, "pct=")
 
 	// Not a verifier error: nothing logged, caller keeps its own message.
 	buf.Reset()

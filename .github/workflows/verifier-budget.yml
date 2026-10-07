@@ -70,11 +70,14 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # GitHub-hosted Linux runners expose KVM, but only to root by default.
+      # Without --no-install-recommends qemu-system-x86 drags in ~80 packages
+      # (the GUI, gstreamer, pipewire) that vimto never uses; on a slow
+      # mirror that alone has taken 14 minutes. GitHub-hosted Linux runners
+      # expose KVM, but only to root by default.
       - name: Install vimto and QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
           CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0
           sudo chmod 0666 /dev/kvm
 
@@ -82,13 +85,9 @@ jobs:
         env:
           KERNEL: ghcr.io/cilium/ci-kernels:${{ matrix.kernel }}
         run: |
-          # A channel tag like longterm moves; record what it resolved to.
-          # vimto forwards stdin into the VM and waits for its EOF, so every
-          # call closes it rather than inheriting whatever the step has.
-          release=$(vimto -kernel "$KERNEL" exec -- uname -r < /dev/null)
-          echo "kernel: $release"
-
           status=0
+          # vimto forwards stdin into the VM and waits for its EOF, so close
+          # it rather than inheriting whatever the step has.
           vimto -kernel "$KERNEL" -sudo -memory 2G -smp cpus=2 -- \
             go test -count=1 -run '^TestVerifierBudget$' -v ./bpf/ < /dev/null 2>&1 \
             | tee "$RUNNER_TEMP/verifier.txt" || status=$?
@@ -98,15 +97,18 @@ jobs:
           # program went unmeasured on this kernel, which is a gap in the gate
           # rather than a pass.
           if grep -q -- '--- SKIP' "$RUNNER_TEMP/verifier.txt"; then
-            echo "::error::TestVerifierBudget skipped programs on $release — they were not measured"
+            echo "::error::TestVerifierBudget skipped programs on ci-kernels ${{ matrix.kernel }} — they were not measured"
             status=1
           fi
 
+          # A channel tag like longterm moves; the test logs the release it
+          # actually ran on.
+          release=$(grep -oE 'verifier: kernel=\S+' "$RUNNER_TEMP/verifier.txt" | head -1 | cut -d= -f2)
           {
-            echo "### BPF verifier budget on \`$release\` (ci-kernels \`${{ matrix.kernel }}\`)"
+            echo "### BPF verifier budget on \`${release:-unknown}\` (ci-kernels \`${{ matrix.kernel }}\`)"
             echo
             echo '```'
-            grep -E 'verifier:|uses .* of the verifier budget' "$RUNNER_TEMP/verifier.txt" \
+            grep -E 'verifier: collection=|uses .* of the verifier budget' "$RUNNER_TEMP/verifier.txt" \
               | sed -E 's/^\s*verifier_budget_test.go:[0-9]+: //' || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

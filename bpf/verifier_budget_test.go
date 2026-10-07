@@ -25,6 +25,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 )
@@ -53,6 +54,11 @@ const verifierBudgetPct = 80.0
 // measured rather than passing.
 func TestVerifierBudget(t *testing.T) {
 	requireBPF(t)
+
+	// The counts below mean nothing without the kernel that produced them.
+	var uts unix.Utsname
+	require.NoError(t, unix.Uname(&uts))
+	t.Logf("verifier: kernel=%s", unix.ByteSliceToString(uts.Release[:]))
 
 	collections := []struct {
 		name    string

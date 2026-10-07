@@ -1,0 +1,113 @@
+name: verifier-budget
+
+# Runs TestVerifierBudget on the oldest kernels cargowall supports, not just
+# the one ubuntu-latest happens to boot. The verifier's instruction count is
+# kernel-specific and does not even move in one direction across versions:
+# the inlined cg_origin_egress verified in 657k on CI's 6.17 and was rejected
+# at the 1M limit on Blacksmith's 6.6. A program that is comfortable on the
+# CI kernel can be a load failure on a runner's, so the gate has to measure
+# those kernels.
+#
+# Each leg boots a ci-kernels build in a QEMU microVM on an ordinary runner
+# (vimto, the same setup cilium/ebpf tests itself with). vimto shares the host
+# filesystem into the VM, so the checkout, the Go toolchain and the committed
+# bpf2go objects are all there; `go test` compiles on the host and only the
+# test binary runs in the VM, as root.
+#
+# Kernels:
+#   5.15      GitLab SaaS shared runners — the oldest kernel worth supporting
+#   6.6       Blacksmith
+#   longterm  the newest LTS, for the trend
+#
+# A ci-kernels 6.6 is not Blacksmith's 6.6 to the patch level, and its 5.15
+# is not GitLab's image. madhokie-io/dockcmd's cargowall-verifier-budget.yml
+# stays as the ground-truth measurement on a real Blacksmith runner.
+
+on:
+  pull_request:
+    paths:
+      # Same reasoning as verify-bpf-generated-code: any source or header in
+      # bpf/ can change what the verifier sees, and so can the test itself.
+      - "bpf/**"
+      - "cargowall.go"
+      - "go.mod"
+      # The stats parsing and the instruction limit the test measures against.
+      - "pkg/ebpf/**"
+      - ".github/workflows/verifier-budget.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: verifier-budget-${{ github.ref }}
+  cancel-in-progress: true
+
+# `mode: audit`, and offline only off a fork — see the matching block in
+# ci.yml.
+env:
+  CW_OFFLINE: ${{ github.event.pull_request.head.repo.fork && 'true' || 'false' }}
+
+jobs:
+  measure:
+    name: Verifier budget on ${{ matrix.kernel }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      # Every kernel's numbers are worth seeing, even when one leg fails.
+      fail-fast: false
+      matrix:
+        kernel: ["5.15", "6.6", "longterm"]
+    steps:
+      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        with:
+          mode: audit
+          offline: ${{ env.CW_OFFLINE }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # GitHub-hosted Linux runners expose KVM, but only to root by default.
+      - name: Install vimto and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+          CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0
+          sudo chmod 0666 /dev/kvm
+
+      - name: Measure
+        env:
+          KERNEL: ghcr.io/cilium/ci-kernels:${{ matrix.kernel }}
+        run: |
+          # A channel tag like longterm moves; record what it resolved to.
+          # vimto forwards stdin into the VM and waits for its EOF, so every
+          # call closes it rather than inheriting whatever the step has.
+          release=$(vimto -kernel "$KERNEL" exec -- uname -r < /dev/null)
+          echo "kernel: $release"
+
+          status=0
+          vimto -kernel "$KERNEL" -sudo -memory 2G -smp cpus=2 -- \
+            go test -count=1 -run '^TestVerifierBudget$' -v ./bpf/ < /dev/null 2>&1 \
+            | tee "$RUNNER_TEMP/verifier.txt" || status=$?
+
+          # The test skips a program it cannot load for a reason other than
+          # the verifier, and skips everything without root. Either way that
+          # program went unmeasured on this kernel, which is a gap in the gate
+          # rather than a pass.
+          if grep -q -- '--- SKIP' "$RUNNER_TEMP/verifier.txt"; then
+            echo "::error::TestVerifierBudget skipped programs on $release — they were not measured"
+            status=1
+          fi
+
+          {
+            echo "### BPF verifier budget on \`$release\` (ci-kernels \`${{ matrix.kernel }}\`)"
+            echo
+            echo '```'
+            grep -E 'verifier:|uses .* of the verifier budget' "$RUNNER_TEMP/verifier.txt" \
+              | sed -E 's/^\s*verifier_budget_test.go:[0-9]+: //' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

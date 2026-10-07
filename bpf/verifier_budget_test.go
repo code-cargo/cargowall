@@ -37,7 +37,8 @@ import (
 // global function it is 114k on 6.17 and 52k on 6.6), so creep that is still
 // comfortable here can be what another verifier turns into a load failure.
 // Raising this needs a measurement on the oldest kernel we support, not just
-// a green CI.
+// a green CI on the CI kernel: the verifier-budget workflow runs this test
+// on the oldest kernels too.
 const verifierBudgetPct = 80.0
 
 // TestVerifierBudget loads every program of every collection with verifier

@@ -308,8 +308,9 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 		// one number that predicts whether this program loads on an older
 		// verifier, and the daemon's own log is the only place to read it on
 		// a runner kernel CI does not have. Branch-level logging is
-		// deliberately off — cg_origin_egress is ~660k verified instructions
-		// on 6.17, so a branch trace would be tens of MB held in
+		// deliberately off — cg_origin_egress is over 100k verified
+		// instructions on 6.17 (657k before the adjudicator became a global
+		// function), so a branch trace would be MBs held in
 		// Program.VerifierLog for the life of the process, and on a kernel
 		// that rejects it the retry loop would grow the log buffer to match.
 		// LoadObjects still logs the count of a rejection.

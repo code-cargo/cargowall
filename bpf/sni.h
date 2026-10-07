@@ -655,12 +655,18 @@ static __always_inline int l7_identity_gate(struct __sk_buff *skb, struct l7_ctx
 // once, against abstract arguments, instead of once per state that reaches
 // the call. Inlined, every distinct state the IPv6 extension-header walk
 // produced re-verified the whole adjudicator — measured, the v6 path cost
-// 2.7x the v4 path for identical code, and kernel 6.6 ran past the 1M
-// instruction limit while 6.17 stopped at 657k. Pointer-to-struct arguments
-// need kernel 5.13+.
-__noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, struct l7_scratch *s) {
+// 2.7x the v4 path for identical code; 6.17 stopped at 657k instructions
+// and kernel 6.6, whose verifier prunes fewer states, ran past the 1M
+// limit. The arguments are the context and scalars only, which global
+// functions have accepted since kernel 5.6, under the 5.8 floor: a
+// pointer-to-struct argument would have needed 5.12, so the scratch slot
+// is passed by index and looked up here. The caller holds the same slot.
+__noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, __u32 slot) {
+    if (slot >= L7_SCRATCH_SLOTS)
+        return 1;
+    struct l7_scratch *s = bpf_map_lookup_elem(&map_l7_scratch, &slot);
     if (!s)
-        return 1;  // kernels >= 6.8 type a global function's pointer arg as nullable
+        return 1;
     struct l7_ctx *c = &s->ctx;
     __u8 scope = l7_narrow_scope(c, l7_scope_for(c));
     if (!scope)
@@ -886,6 +892,24 @@ static __always_inline int l7_payload_window(struct l7_ctx *c, __u32 skb_len, __
 // NB: cookie/cgroup_id are fetched lazily inside l7_adjudicate, after the scope
 // check — most packets go to unscoped destinations and must not pay two helper
 // calls to learn that.
+// l7_with_scratch owns everything after the family-specific fill: the
+// payload window, the call, and the depth restore. The restore is the one
+// line that must run on every path once a slot is acquired — depth is
+// sticky per CPU, and after two leaked increments every later packet on
+// that CPU takes the "no slot" path and L7 never runs there again until
+// the process restarts — so no hook gets to reimplement it. The != 0 pins
+// the global function's return, an unknown scalar to the caller's
+// verifier state, to {0,1} for the cgroup_skb return-range check.
+static __always_inline int l7_with_scratch(struct __sk_buff *skb, __u8 l7mode,
+                                           struct l7_scratch *s, __u32 *depth, __u32 slot,
+                                           __u32 l4_off, __u8 tcp_doff, __u32 tcp_seq) {
+    int pass = 1;  // no window L7 can trust: the L4 verdict governs
+    if (l7_payload_window(&s->ctx, skb->len, l4_off, tcp_doff, tcp_seq))
+        pass = l7_adjudicate(skb, l7mode, slot) != 0;
+    *depth = slot;
+    return pass;
+}
+
 static __always_inline int l7_hook_v4(struct __sk_buff *skb, __u8 l7mode, __u32 ip_hlen,
                                       __be32 daddr_net, __u32 saddr_host, __u32 daddr_host,
                                       __u8 ip_proto, __u16 src_port, __u16 dst_port,
@@ -894,6 +918,8 @@ static __always_inline int l7_hook_v4(struct __sk_buff *skb, __u8 l7mode, __u32 
     struct l7_scratch *s = l7_scratch_acquire(&depth, &slot);
     if (!s)
         return 1;  // no scratch slot: the L4 verdict governs
+    // Only the family-specific fill lives here; nothing between the acquire
+    // above and l7_with_scratch may return.
     struct l7_ctx *c = &s->ctx;
     __builtin_memset(c, 0, sizeof(*c));
     c->dst_key = daddr_net;
@@ -904,14 +930,7 @@ static __always_inline int l7_hook_v4(struct __sk_buff *skb, __u8 l7mode, __u32 
     c->ip_version = 4;
     c->ip_proto = ip_proto;
     c->is_syn = is_syn;
-    int pass = 1;  // no window L7 can trust: the L4 verdict governs
-    if (l7_payload_window(c, skb->len, ip_hlen, tcp_doff, tcp_seq))
-        // A global function's return is an unknown scalar to the caller's
-        // verifier state; the compare pins it to {0,1}, which the program's
-        // cgroup_skb return-range check needs to see.
-        pass = l7_adjudicate(skb, l7mode, s) != 0;
-    *depth = slot;
-    return pass;
+    return l7_with_scratch(skb, l7mode, s, depth, slot, ip_hlen, tcp_doff, tcp_seq);
 }
 
 static __always_inline int l7_hook_v6(struct __sk_buff *skb, __u8 l7mode, __u32 l4_off,
@@ -922,6 +941,7 @@ static __always_inline int l7_hook_v6(struct __sk_buff *skb, __u8 l7mode, __u32 
     struct l7_scratch *s = l7_scratch_acquire(&depth, &slot);
     if (!s)
         return 1;
+    // Family-specific fill only; see l7_hook_v4.
     struct l7_ctx *c = &s->ctx;
     __builtin_memset(c, 0, sizeof(*c));
     __builtin_memcpy(c->dst6, dst6, 16);
@@ -931,11 +951,7 @@ static __always_inline int l7_hook_v6(struct __sk_buff *skb, __u8 l7mode, __u32 
     c->ip_version = 6;
     c->ip_proto = ip_proto;
     c->is_syn = is_syn;
-    int pass = 1;
-    if (l7_payload_window(c, skb->len, l4_off, tcp_doff, tcp_seq))
-        pass = l7_adjudicate(skb, l7mode, s) != 0;  // see l7_hook_v4
-    *depth = slot;
-    return pass;
+    return l7_with_scratch(skb, l7mode, s, depth, slot, l4_off, tcp_doff, tcp_seq);
 }
 
 #endif /* __SNI_H__ */

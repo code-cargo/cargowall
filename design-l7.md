@@ -117,19 +117,22 @@ not attach. Measure on CI's kernel before changing it.
 **Verified once, not once per caller state.** The adjudicator used to be
 `__always_inline`, which meant the verifier re-walked all of it for every
 distinct state that reached the call — and the IPv6 extension-header walk
-produces several, so the v6 path cost 2.7x the v4 path for identical code. On
-kernel 6.6 (Blacksmith runners), whose verifier prunes fewer states than 6.17,
-that ran past the limit at 657k on the kernel CI measures. `l7_adjudicate` is
+produces several, so the v6 path cost 2.7x the v4 path for identical code. The
+6.17 kernel CI measures on verified the inlined program in 657,658
+instructions; kernel 6.6 (Blacksmith runners), whose verifier prunes fewer
+states, ran past the 1M limit and the hook did not load. `l7_adjudicate` is
 now a global function (non-static, never inlined): the verifier checks its body
 once against abstract arguments and callers pay only for the call. Measured
-with `TestVerifierBudget`: 113,633 on 6.17, 51,702 on 6.6. Three things follow
+with `TestVerifierBudget`: 113,633 on 6.17, 51,702 on 6.6. Four things follow
 from that shape and must stay true:
 
-- Its return is an unknown scalar to the caller, so the hooks compare it to
-  zero; a cgroup_skb program has to prove its exit value is in [0, 3].
-- Kernels from 6.8 type its pointer argument as nullable; it checks for NULL.
-  Pointer-to-struct arguments to global functions need kernel 5.13, which this
-  collection now requires (the TC collection keeps the 5.8 floor).
+- Its arguments are the skb context and scalars (the scratch slot index),
+  which global functions have accepted since kernel 5.6, under the 5.8 floor.
+  A pointer-to-struct argument would have needed kernel 5.12 and dropped 5.8
+  and 5.10 hosts off the hook, so the scratch is looked up inside the function
+  by index instead.
+- Its return is an unknown scalar to the caller, so `l7_with_scratch` compares
+  it to zero; a cgroup_skb program has to prove its exit value is in [0, 3].
 - A global function's frame adds to its caller's against the 512-byte BPF
   stack, and the two came to 640. `struct l7_scratch` — the L7 context, the
   flow key and value temporaries, the QUIC walk's buffers — therefore lives in
@@ -140,11 +143,20 @@ from that shape and must stay true:
   overwrite the outer's state. Interrupt nesting is LIFO, so a plain increment
   and restore suffices. Anything new that needs more than a few bytes of state
   goes in the scratch struct, not on the stack.
+- The depth restore is owned by `l7_with_scratch`, the one function that runs
+  after a slot is acquired. Depth is sticky per CPU: a path that returns between
+  the acquire and the restore leaks an increment, and after two leaks every
+  later packet on that CPU takes the no-slot path, L7 never runs there again
+  until the process restarts, and the packets pass. The hooks only fill the
+  family-specific part of the context.
+
 The daemon logs each program's `processed_insns` at startup (`BPF program
 verified`, or `BPF program rejected by the verifier` with the count the kernel
 got to), `make verifier-budget` prints them for the local kernel, and
-`TestVerifierBudget` trips at 80% of the limit on CI's kernel — which is not the
-strictest one we support: 6.6 rejects what 6.17 verifies in ~660k (issue #138).
+`TestVerifierBudget` trips at 80% of the limit on CI's kernel. That kernel is
+not the strictest one we support: before the global-function change, 6.6
+rejected what 6.17 verified in 657k, and the two still disagree (51k against
+113k) on the same program. Measure a budget change on both.
 
 **Uncertainty.** A datagram the walk cannot resolve — an unskippable header
 (unknown version, Retry) *before* any Initial, still-skippable packets past the

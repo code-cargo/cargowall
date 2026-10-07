@@ -18,10 +18,14 @@ reach. It never widens an L4 verdict — only narrows one.
 At `cgroup_skb/egress` only (`bpf/sni.h`, `#included` by `originbpf.c`), as a
 narrowing filter after the L4 allow. TC is post-NAT with no socket and no
 reassembly path, so it cannot compute an L7 verdict; it stays the run-wide L4
-backstop. If the cgroup hook detaches or fails to load, enforcement degrades to
-TC's L4-only verdict and the shared-edge hole reopens for the run — the same
-degradation posture design.md records for container attribution, which rides
-the same hook.
+backstop. If the cgroup hook (or the L7 layer on it) cannot come up at
+startup, what happens depends on the rung, the same rule design.md records for
+container attribution, which rides the same hook: under an enforce `--tls-sni`
+rung (which requires `--container-egress=enforce`) startup fails rather than
+run with the shared-edge hole open; under `--tls-sni=observe` the loss warns,
+the run continues on TC's L4-only verdict, and the job summary lists the
+posture as not applied. `postureLedger.lose` (`cmd/postures.go`) is the one
+place that decides.
 
 ## Kernel and oracle
 
@@ -111,8 +115,10 @@ together.
 (pinned equal to `sni.MaxCoalescedPackets`) costs ~20k of `cg_origin_egress`'s
 1M instruction limit per rung. Raising it to 12 took the program from 236k to
 450k on a 6.8 kernel and past 1,000,001 on the newer kernel CI runs — where it
-fails to load and the whole cgroup hook, L4 enforcement included, silently does
-not attach. Measure on CI's kernel before changing it.
+fails to load and the whole cgroup hook, L4 enforcement included, does not
+attach. Under an enforce rung of either flag that fails startup; under observe
+the run continues without the hook and the job summary lists the posture as
+not applied. Measure on CI's kernel before changing it.
 
 **Verified once, not once per caller state.** The adjudicator used to be
 `__always_inline`, which meant the verifier re-walked all of it for every

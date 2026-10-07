@@ -49,16 +49,19 @@ import (
 //
 // Every method is nil-receiver safe: a nil *containerAttribution IS the
 // disabled feature, so startCargoWall wires the subsystem unconditionally
-// instead of threading flag checks through the boot sequence. All failures
-// are warn-only, which stays correct under --container-egress=enforce only because TC
-// egress remains attached: losing this subsystem degrades enforcement to
-// TC-only, it never leaves traffic unpoliced.
+// instead of threading flag checks through the boot sequence. Under
+// --container-egress=observe failures are warn-only: losing this subsystem
+// costs attribution and the would-block measurement, never policing, since
+// TC egress stays attached. Under enforce, losing the hook fails startup
+// (see postureLedger.lose): TC alone would still police, but not the
+// pre-NAT/loopback/bridge egress the operator asked to have enforced.
 type containerAttribution struct {
 	stepTracker *steps.Tracker
 	mode        origin.Mode      // target posture, applied by enableMode after gating
 	observer    *origin.Observer // nil when the observer failed to load/attach
 	enricher    *containers.Enricher
 	tracker     *containers.Tracker // nil until startUserspace succeeds
+	postures    *postureLedger      // decides what losing the posture means
 	logger      *slog.Logger
 }
 
@@ -87,42 +90,42 @@ func resolveMode(containerEgress string) origin.Mode {
 // newContainerAttribution is the kernel-half phase. Returns nil (feature
 // off) when disabled or when step attribution isn't live: without step tags
 // the observer's ordinals would always be zero, and the step-map shrink for
-// disabled attribution makes container tagging meaningless anyway.
-func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.Tracker, tcObjs *bpf.TcBpfObjects, logger *slog.Logger) *containerAttribution {
+// disabled attribution makes container tagging meaningless anyway. stepErr
+// is why step attribution failed, carried into the lost posture's reason. A
+// non-nil error means a requested enforce posture was lost and startup must
+// fail.
+func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.Tracker, stepErr error,
+	tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
+) (*containerAttribution, error) {
 	if !enabled {
-		return nil
+		return nil, nil
 	}
 	if stepTracker == nil {
-		if mode == origin.ModeEnforce {
-			// Never drop a requested enforcement posture silently: the
-			// operator believes pre-NAT/loopback/bridge egress is policed.
-			logger.Warn("Container attribution disabled and --container-egress=enforce DROPPED " +
-				"(requires active step attribution) — egress policing falls back to post-NAT TC only")
-		} else {
-			logger.Warn("Container attribution disabled (requires active step attribution)")
+		reason := "step attribution not active"
+		if stepErr != nil {
+			reason = "step attribution unavailable: " + p.errReason(stepErr)
 		}
-		return nil
+		return nil, p.lose(postureContainerEgress, reason)
 	}
 	a := &containerAttribution{
 		stepTracker: stepTracker,
 		mode:        mode,
 		enricher:    &containers.Enricher{},
+		postures:    p,
 		logger:      logger,
 	}
 	obs, err := origin.Start(tcObjs, logger)
 	if err != nil {
-		// Warn-only, and still correct under phase 3b: TC egress remains
-		// attached and enforcing, so losing this hook degrades enforcement
-		// to TC-only (plus the loss of container attribution) rather than
-		// leaving traffic unpoliced. That is precisely why TC stays.
-		// target_mode makes a dropped --container-egress=enforce request visible.
-		logger.Warn("Container egress hook disabled — enforcement falls back to TC egress only",
-			"target_mode", mode.String(), "error", err)
+		// Under observe the hook is telemetry: carry on with container
+		// tagging off and TC enforcing as always.
+		if lerr := p.lose(postureContainerEgress, p.errReason(err)); lerr != nil {
+			return nil, lerr
+		}
 	} else {
 		a.observer = obs
 		logger.Info("Container egress hook attached", "target_mode", mode.String())
 	}
-	return a
+	return a, nil
 }
 
 // wireVerdicts routes the cgroup hook's verdicts into the shared
@@ -167,23 +170,24 @@ func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificat
 	})
 }
 
-// enableMode raises the cgroup hook to its configured posture, returning
-// whether it reached it. MUST be called only after the allowlist, DNS/infra
-// auto-allows, and existing-connection gating are programmed — the same
-// attach-before-program guard that makes cmd/start.go attach TC last.
+// enableMode raises the cgroup hook to its configured posture. MUST be
+// called only after the allowlist, DNS/infra auto-allows, and
+// existing-connection gating are programmed — the same attach-before-program
+// guard that makes cmd/start.go attach TC last.
 //
-// A failure leaves the hook in observe: no enforcement from it, TC still
-// enforcing. Degraded, never fail-open.
+// A failure leaves the hook in its inert boot mode. Under observe that is
+// recorded and startup carries on; under enforce the returned error fails
+// startup.
 func (a *containerAttribution) enableMode() error {
 	if a == nil || a.observer == nil || a.mode == origin.ModeObserve {
 		return nil // nothing to raise
 	}
 	if err := a.observer.SetMode(a.mode); err != nil {
-		// The dropped target posture is named so a lost --container-egress=enforce is
-		// visible in the log, not just in the returned error.
-		a.logger.Warn("Container egress hook stays in observe mode",
-			"target_mode", a.mode.String(), "error", err)
-		return err
+		// The hook is left in the kernel's inert boot mode, which computes no
+		// verdict, so neither flag rung survives. The reason names the hook
+		// attached so it is not mistaken for a load failure.
+		return a.postures.lose(postureContainerEgress,
+			"hook attached but could not be raised from its inert boot mode: "+a.postures.errReason(err))
 	}
 	return nil
 }

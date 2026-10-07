@@ -103,27 +103,86 @@ func LogVerifierStats(logger *slog.Logger, collection string, progs map[string]*
 	}
 }
 
+// Rejection is what a verifier refusal says about itself: the program the
+// kernel refused and, when the log carries it, how many instructions it got
+// through before giving up.
+type Rejection struct {
+	Program string // "unknown" when cilium's wrapping does not name it
+	Insns   int    // 0 when HasInsns is false
+	// HasInsns is false when the log has no count; a zero would read as a
+	// measurement.
+	HasInsns bool
+	Cause    error
+}
+
+// ParseRejection extracts the Rejection from the error a collection load
+// returned. ok is false when err is not a verifier rejection.
+func ParseRejection(err error) (r Rejection, ok bool) {
+	var verr *ebpf.VerifierError
+	if !errors.As(err, &verr) {
+		return Rejection{}, false
+	}
+	r = Rejection{Program: "unknown", Cause: verr.Cause}
+	if m := programRe.FindStringSubmatch(err.Error()); m != nil {
+		r.Program = m[1]
+	}
+	r.Insns, r.HasInsns = ParseVerifierInsns(strings.Join(verr.Log, "\n"))
+	return r, true
+}
+
+// String is the one-line form a degraded posture reports as its reason —
+// "verifier rejected cg_origin_egress: 1,000,001 insns" — short enough for a
+// job-summary table cell, unlike the error, which can carry the whole log.
+func (r Rejection) String() string { return r.On("") }
+
+// On is String naming the kernel that refused the program — the budget is a
+// property of the kernel as much as of the program. An empty kernel is
+// omitted.
+func (r Rejection) On(kernel string) string {
+	subject := r.Program
+	if kernel != "" {
+		subject += " on " + kernel
+	}
+	if !r.HasInsns {
+		return fmt.Sprintf("verifier rejected %s: %v", subject, r.Cause)
+	}
+	return fmt.Sprintf("verifier rejected %s: %s insns", subject, groupThousands(r.Insns))
+}
+
+// groupThousands renders n with comma separators: an instruction count next
+// to the 1,000,000 limit is unreadable without them.
+func groupThousands(n int) string {
+	if n < 0 {
+		return "-" + groupThousands(-n)
+	}
+	s := strconv.Itoa(n)
+	var b strings.Builder
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
+}
+
 // LogVerifierRejection logs the same attributes for a program the verifier
 // refused, from the error a collection load returned. This is the line that
 // matters on the kernel a program is too big for: nothing loads, so
 // LogVerifierStats never runs, and the count in the error text is only there
 // by accident of how cilium/ebpf trims the log. The count is omitted when the
-// log has none — a zero would read as a measurement. Returns false (and logs
-// nothing) when err is not a verifier rejection.
+// log has none. Returns false (and logs nothing) when err is not a verifier
+// rejection.
 func LogVerifierRejection(logger *slog.Logger, collection string, err error) bool {
-	var verr *ebpf.VerifierError
-	if !errors.As(err, &verr) {
+	r, ok := ParseRejection(err)
+	if !ok {
 		return false
 	}
-	program := "unknown"
-	if m := programRe.FindStringSubmatch(err.Error()); m != nil {
-		program = m[1]
+	attrs := []any{"collection", collection, "program", r.Program}
+	if r.HasInsns {
+		attrs = append(attrs, "processed_insns", r.Insns, "pct", 100*float64(r.Insns)/InsnLimit)
 	}
-	attrs := []any{"collection", collection, "program", program}
-	if insns, ok := ParseVerifierInsns(strings.Join(verr.Log, "\n")); ok {
-		attrs = append(attrs, "processed_insns", insns, "pct", 100*float64(insns)/InsnLimit)
-	}
-	attrs = append(attrs, "limit", InsnLimit, "error", verr.Cause)
+	attrs = append(attrs, "limit", InsnLimit, "error", r.Cause)
 	logger.Error("BPF program rejected by the verifier", attrs...)
 	return true
 }

@@ -41,29 +41,29 @@ type l7Feature struct {
 	// targetMode is the posture raise() applies once the scope maps have
 	// warmed, mirroring how the origin mode is raised after the allowlist.
 	targetMode uint8
+	postures   *postureLedger
 	logger     *slog.Logger
 }
 
 // startL7 constructs and starts the oracle, and hands the DNS proxy the
 // registrar so resolved IPs are L7-scoped. It runs EARLY — the mode gate stays
 // off until raise(), so startup resolutions scope their destinations before any
-// flow is adjudicated. Returns nil when --tls-sni is off, or when the cgroup
-// hook it rides is not running.
+// flow is adjudicated. Returns nil when --tls-sni is off, or when an observe
+// posture could not start. A non-nil error means a requested enforce posture
+// was lost and startup must fail: without it the shared-edge hole stays open.
 func startL7(cmd *StartCmd, obs *origin.Observer, enricher *containers.Enricher,
 	configMgr *config.Manager, dnsServer *dns.Server, auditLogger *events.AuditLogger,
-	notificationTracker *events.NotificationTracker, logger *slog.Logger,
-) *l7Feature {
+	notificationTracker *events.NotificationTracker, p *postureLedger, logger *slog.Logger,
+) (*l7Feature, error) {
 	if cmd.TLSSNI == TLSSNIOff {
-		return nil
+		return nil, nil
 	}
 	if obs == nil {
-		// The RUNTIME downgrade (attribution disabled, observer load/attach
-		// failure), as loud as a dropped --container-egress=enforce: the operator asked
-		// for SNI pinning, and without it the shared-edge hole stays open with
-		// nothing else in the logs saying so.
-		logger.Warn("--tls-sni requested but the cgroup egress hook is not running — " +
-			"L7 SNI enforcement is OFF and shared-edge IPs stay L4-only")
-		return nil
+		// Under enforce this is unreachable in practice — the enforce rungs
+		// require --container-egress=enforce, whose loss already failed
+		// startup — but the ledger decides either way. Why the hook is down
+		// is the container-egress row's to say.
+		return nil, p.lose(postureTLSSNI, "the cgroup egress hook it rides is not running")
 	}
 
 	// The policy's second tier is bound to the live proxy, so the set the
@@ -80,11 +80,10 @@ func startL7(cmd *StartCmd, obs *origin.Observer, enricher *containers.Enricher,
 		Sink:    l7Sink(obs, enricher, configMgr, auditLogger, notificationTracker, logger),
 	})
 	if err != nil {
-		logger.Warn("L7 SNI enforcement disabled", "error", err)
-		return nil
+		return nil, p.lose(postureTLSSNI, p.errReason(err))
 	}
 
-	f := &l7Feature{oracle: oracle, cm: configMgr, targetMode: origin.L7ModeObserve, logger: logger}
+	f := &l7Feature{oracle: oracle, cm: configMgr, targetMode: origin.L7ModeObserve, postures: p, logger: logger}
 	if cmd.TLSSNI == TLSSNIEnforce || cmd.TLSSNI == TLSSNIEnforcePinned {
 		f.targetMode = origin.L7ModeEnforce
 	}
@@ -98,7 +97,7 @@ func startL7(cmd *StartCmd, obs *origin.Observer, enricher *containers.Enricher,
 	}
 	logger.Info("L7 SNI enforcement prepared",
 		"target_mode", l7ModeName(f.targetMode), "pin_ip", cmd.TLSSNI == TLSSNIEnforcePinned)
-	return f
+	return f, nil
 }
 
 // raise lifts the L7 mode gate to its target posture. Called from the boot
@@ -106,13 +105,14 @@ func startL7(cmd *StartCmd, obs *origin.Observer, enricher *containers.Enricher,
 // conditioned on the cgroup hook reaching its own posture: the two gates are
 // separate map keys and the kernel's L7 drop never consults ORIGIN_MODE, so
 // coupling them only meant an origin SetMode failure silently took L7 —
-// observe mode included — off entirely.
-func (f *l7Feature) raise() {
+// observe mode included — off entirely. A non-nil error means an enforce
+// posture was lost and startup must fail.
+func (f *l7Feature) raise() error {
 	if err := f.oracle.SetMode(f.targetMode); err != nil {
-		f.logger.Warn("L7 stays off", "target_mode", l7ModeName(f.targetMode), "error", err)
-		return
+		return f.postures.lose(postureTLSSNI, "mode gate could not be raised: "+f.postures.errReason(err))
 	}
 	f.logger.Info("L7 SNI enforcement active", "mode", l7ModeName(f.targetMode))
+	return nil
 }
 
 // registrar is what the L4 paths take alongside the firewall so a /32 they

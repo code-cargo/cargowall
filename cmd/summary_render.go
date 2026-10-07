@@ -23,6 +23,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -60,6 +61,7 @@ type summaryData struct {
 	ordinalSteps    map[uint32]int // step ordinal → index into steps
 	auditMode       bool
 	workflowRunLink string
+	postures        []postureRecord
 }
 
 // tallyEvents counts events by outcome class.
@@ -84,6 +86,30 @@ func tallyEvents(evts []events.AuditEvent) (blocked, allowed, dnsBlocked, protoB
 		}
 	}
 	return
+}
+
+// renderPostures writes a table of the postures that did not come up as
+// requested, with why. Only observe rungs can appear (a lost enforce rung
+// fails startup), so the table says the measurement never ran — without it,
+// an observe run reporting no would-blocks reads exactly like a clean one.
+// Nothing at all when every requested posture applied.
+func renderPostures(w io.Writer, recs []postureRecord) {
+	var lost []postureRecord
+	for _, r := range recs {
+		if r.degraded() {
+			lost = append(lost, r)
+		}
+	}
+	if len(lost) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "### Postures not applied")
+	fmt.Fprintln(w, "| Posture | Requested | Applied | Reason |")
+	fmt.Fprintln(w, "|---------|-----------|---------|--------|")
+	for _, r := range lost {
+		fmt.Fprintf(w, "| `%s` | %s | **%s** | %s |\n", mdCode(r.Posture), mdCell(r.Requested), mdCell(r.Applied), mdCell(r.Reason))
+	}
+	fmt.Fprintln(w)
 }
 
 func (c *SummaryCmd) generateSummary(d summaryData) {
@@ -117,6 +143,10 @@ func (c *SummaryCmd) generateSummary(d summaryData) {
 		fmt.Fprintln(c.output, "## CargoWall (Enforce Mode)")
 	}
 	fmt.Fprintln(c.output)
+
+	// Above the link: a posture the run did not have is not a detail to
+	// click through to.
+	renderPostures(c.output, d.postures)
 
 	// When a SaaS link is available, condense output: just header + link
 	if d.workflowRunLink != "" {

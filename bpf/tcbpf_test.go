@@ -50,7 +50,7 @@ func TestMain(m *testing.M) {
 func requireBPF(t *testing.T) {
 	t.Helper()
 	if !bpfAvailable {
-		skipUnmeasured(t, "BPF not available (requires root/CAP_BPF)")
+		t.Skip("BPF not available (requires root/CAP_BPF)")
 	}
 }
 

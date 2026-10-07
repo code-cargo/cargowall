@@ -50,7 +50,9 @@ const verifierBudgetPct = 80.0
 const verifierGateEnv = "CARGOWALL_VERIFIER_GATE"
 
 // skipUnmeasured skips t, or fails it when the run is the verifier-budget
-// gate. Every path on which a program goes unmeasured comes through here.
+// gate. Every path on which TestVerifierBudget leaves a program unmeasured
+// comes through here; the rest of the suite skips through requireBPF and
+// never reads the gate.
 func skipUnmeasured(t *testing.T, format string, args ...any) {
 	t.Helper()
 	if os.Getenv(verifierGateEnv) != "" {
@@ -71,7 +73,9 @@ func skipUnmeasured(t *testing.T, format string, args ...any) {
 // measured rather than passing — and fails it under the gate, see
 // skipUnmeasured.
 func TestVerifierBudget(t *testing.T) {
-	requireBPF(t)
+	if !bpfAvailable {
+		skipUnmeasured(t, "BPF not available (requires root/CAP_BPF)")
+	}
 
 	// The counts below mean nothing without the kernel that produced them.
 	var uts unix.Utsname

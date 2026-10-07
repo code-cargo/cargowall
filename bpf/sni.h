@@ -274,6 +274,63 @@ struct l7_ctx {
     struct l7_quic_id quic;  // filled by the coalesced walk; zero on TCP
 };
 
+// Scratch for the L7 path, in a per-CPU map rather than on the stack: the
+// BPF stack is 512 bytes for the whole call chain, and with l7_adjudicate a
+// global function its frame adds to the caller's (352 + 288 bytes with
+// these on the stack). Two slots picked by a per-CPU depth counter, because
+// a cgroup_skb egress program can be re-entered on the same CPU by a
+// softirq — a retransmit timer's ip_output landing while a process-context
+// send is mid-program — and the inner run must not scribble over the
+// outer's state. Interrupt nesting is strictly LIFO, so a plain increment
+// and restore is enough: the inner run completes before the outer resumes,
+// whichever side of the increment it interrupted.
+#define L7_SCRATCH_SLOTS 2
+
+struct l7_scratch {
+    struct l7_ctx ctx;
+    struct l7_flow_key key;
+    struct l7_flow_val val;    // the flow's current entry, copied for mutation
+    struct l7_flow_val fresh;  // a new entry being written
+    struct l7_quic_scratch q;  // the coalesced walk's buffers
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, struct l7_scratch);
+    __uint(max_entries, L7_SCRATCH_SLOTS);
+} map_l7_scratch SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1);
+} map_l7_depth SEC(".maps");
+
+// l7_scratch_acquire hands out this CPU's next free slot and bumps the
+// depth, or returns NULL when nesting runs deeper than the slots (never
+// observed; the caller lets the L4 verdict stand). The caller restores the
+// depth to *slot when it is done.
+static __always_inline struct l7_scratch *l7_scratch_acquire(__u32 **depth, __u32 *slot) {
+    __u32 zero = 0;
+    __u32 *d = bpf_map_lookup_elem(&map_l7_depth, &zero);
+    if (!d)
+        return NULL;
+    __u32 n = *d;
+    if (n >= L7_SCRATCH_SLOTS)
+        return NULL;
+    *d = n + 1;
+    struct l7_scratch *sc = bpf_map_lookup_elem(&map_l7_scratch, &n);
+    if (!sc) {
+        *d = n;
+        return NULL;
+    }
+    *depth = d;
+    *slot = n;
+    return sc;
+}
+
 static __always_inline __u8 l7_scope_for(struct l7_ctx *c) {
     if (c->ip_version == 4) {
         __u8 *s = bpf_map_lookup_elem(&map_l7_scope, &c->dst_key);
@@ -601,9 +658,10 @@ static __always_inline int l7_identity_gate(struct __sk_buff *skb, struct l7_ctx
 // 2.7x the v4 path for identical code, and kernel 6.6 ran past the 1M
 // instruction limit while 6.17 stopped at 657k. Pointer-to-struct arguments
 // need kernel 5.13+.
-__noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, struct l7_ctx *c) {
-    if (!c)
+__noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, struct l7_scratch *s) {
+    if (!s)
         return 1;  // kernels >= 6.8 type a global function's pointer arg as nullable
+    struct l7_ctx *c = &s->ctx;
     __u8 scope = l7_narrow_scope(c, l7_scope_for(c));
     if (!scope)
         return 1;  // not L7-scoped on this port: the L4 pass stands
@@ -617,7 +675,7 @@ __noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, struct l7_ctx *
         // CRYPTO.
         __u32 end = c->payload_off + c->payload_len;
         __u32 walked_to = c->payload_off;
-        l7_quic_find_initial(skb, c->payload_off, end, &c->quic, &walked_to);
+        l7_quic_find_initial(skb, c->payload_off, end, &c->quic, &walked_to, &s->q);
         // A GSO batch is several datagrams in one skb; the walk above modelled
         // only the first. Everything it did not reach has to be cleared too.
         l7_quic_gso_tail(skb, c->payload_off, end, skb->gso_size, skb->gso_segs,
@@ -637,19 +695,20 @@ __noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, struct l7_ctx *
     if (c->ip_proto == IPPROTO_UDP && c->quic.uncertain)
         return l7_refuse(skb, c, scope, l7mode, L7_STAT_GATE_REFUSED);
 
-    struct l7_flow_key key;
-    l7_flow_key_init(&key, c);
+    struct l7_flow_key *key = &s->key;
+    l7_flow_key_init(key, c);
     // SNAPSHOT the value rather than mutating through the map pointer.
     // map_l7_flow is an LRU hash: a concurrent userspace Update frees the old
     // node to the freelist, where it can be recycled for a DIFFERENT flow, so
     // an in-place write through a stale pointer would stamp this flow's state
     // onto that one. Every mutation below goes through bpf_map_update_elem.
-    struct l7_flow_val *stp = bpf_map_lookup_elem(&map_l7_flow, &key);
-    struct l7_flow_val stv = {};
+    struct l7_flow_val *stp = bpf_map_lookup_elem(&map_l7_flow, key);
+    struct l7_flow_val *stv = &s->val;
+    __builtin_memset(stv, 0, sizeof(*stv));
     struct l7_flow_val *st = NULL;
     if (stp) {
-        stv = *stp;
-        st = &stv;
+        *stv = *stp;
+        st = stv;
     }
 
     // QUIC identity check, BEFORE the state machine: one UDP socket can carry
@@ -685,10 +744,11 @@ __noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, struct l7_ctx *
     }
 
     if (c->is_syn && c->payload_len == 0) {
-        struct l7_flow_val v = {};
-        v.state = L7_STATE_NEED_HELLO;
-        v.ts = bpf_ktime_get_ns();
-        bpf_map_update_elem(&map_l7_flow, &key, &v, BPF_ANY);
+        struct l7_flow_val *v = &s->fresh;
+        __builtin_memset(v, 0, sizeof(*v));
+        v->state = L7_STATE_NEED_HELLO;
+        v->ts = bpf_ktime_get_ns();
+        bpf_map_update_elem(&map_l7_flow, key, v, BPF_ANY);
         return 1;
     }
     if (c->payload_len == 0)
@@ -735,20 +795,21 @@ __noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, struct l7_ctx *
             st->last_punt_seq = c->seq;
             st->last_punt_len = plen;
             st->state = L7_STATE_PENDING;
-            int r = l7_commit_pending(&key, st, !repin, l7mode);
+            int r = l7_commit_pending(key, st, !repin, l7mode);
             if (r >= 0)
                 return r;
         }
     } else if (l7_punt(skb, c, scope, flags)) {
-        struct l7_flow_val v = {};
-        v.state = L7_STATE_PENDING;
-        v.punts = 1;
-        v.last_punt_seq = c->seq;
-        v.last_punt_len = plen;
-        v.dcid_len = c->quic.dcid_len;  // the cycle's identity (zero for TCP)
-        __builtin_memcpy(v.dcid, c->quic.dcid, 20);
-        v.ts = bpf_ktime_get_ns();
-        int r = l7_commit_pending(&key, &v, 1, l7mode);
+        struct l7_flow_val *v = &s->fresh;
+        __builtin_memset(v, 0, sizeof(*v));
+        v->state = L7_STATE_PENDING;
+        v->punts = 1;
+        v->last_punt_seq = c->seq;
+        v->last_punt_len = plen;
+        v->dcid_len = c->quic.dcid_len;  // the cycle's identity (zero for TCP)
+        __builtin_memcpy(v->dcid, c->quic.dcid, 20);
+        v->ts = bpf_ktime_get_ns();
+        int r = l7_commit_pending(key, v, 1, l7mode);
         if (r >= 0)
             return r;
     }
@@ -829,38 +890,52 @@ static __always_inline int l7_hook_v4(struct __sk_buff *skb, __u8 l7mode, __u32 
                                       __be32 daddr_net, __u32 saddr_host, __u32 daddr_host,
                                       __u8 ip_proto, __u16 src_port, __u16 dst_port,
                                       __u8 is_syn, __u8 tcp_doff, __u32 tcp_seq) {
-    struct l7_ctx c = {};
-    c.dst_key = daddr_net;
-    c.dst_ip = daddr_host;
-    c.src_ip = saddr_host;
-    c.src_port = src_port;
-    c.dst_port = dst_port;
-    c.ip_version = 4;
-    c.ip_proto = ip_proto;
-    c.is_syn = is_syn;
-    if (!l7_payload_window(&c, skb->len, ip_hlen, tcp_doff, tcp_seq))
-        return 1;  // no window L7 can trust; the L4 verdict governs
-    // A global function's return is an unknown scalar to the caller's
-    // verifier state; the compare pins it to {0,1}, which the program's
-    // cgroup_skb return-range check needs to see.
-    return l7_adjudicate(skb, l7mode, &c) != 0;
+    __u32 *depth, slot;
+    struct l7_scratch *s = l7_scratch_acquire(&depth, &slot);
+    if (!s)
+        return 1;  // no scratch slot: the L4 verdict governs
+    struct l7_ctx *c = &s->ctx;
+    __builtin_memset(c, 0, sizeof(*c));
+    c->dst_key = daddr_net;
+    c->dst_ip = daddr_host;
+    c->src_ip = saddr_host;
+    c->src_port = src_port;
+    c->dst_port = dst_port;
+    c->ip_version = 4;
+    c->ip_proto = ip_proto;
+    c->is_syn = is_syn;
+    int pass = 1;  // no window L7 can trust: the L4 verdict governs
+    if (l7_payload_window(c, skb->len, ip_hlen, tcp_doff, tcp_seq))
+        // A global function's return is an unknown scalar to the caller's
+        // verifier state; the compare pins it to {0,1}, which the program's
+        // cgroup_skb return-range check needs to see.
+        pass = l7_adjudicate(skb, l7mode, s) != 0;
+    *depth = slot;
+    return pass;
 }
 
 static __always_inline int l7_hook_v6(struct __sk_buff *skb, __u8 l7mode, __u32 l4_off,
                                       const __u8 dst6[16], const __u8 src6[16],
                                       __u8 ip_proto, __u16 src_port, __u16 dst_port,
                                       __u8 is_syn, __u8 tcp_doff, __u32 tcp_seq) {
-    struct l7_ctx c = {};
-    __builtin_memcpy(c.dst6, dst6, 16);
-    __builtin_memcpy(c.src6, src6, 16);
-    c.src_port = src_port;
-    c.dst_port = dst_port;
-    c.ip_version = 6;
-    c.ip_proto = ip_proto;
-    c.is_syn = is_syn;
-    if (!l7_payload_window(&c, skb->len, l4_off, tcp_doff, tcp_seq))
+    __u32 *depth, slot;
+    struct l7_scratch *s = l7_scratch_acquire(&depth, &slot);
+    if (!s)
         return 1;
-    return l7_adjudicate(skb, l7mode, &c) != 0;  // see l7_hook_v4
+    struct l7_ctx *c = &s->ctx;
+    __builtin_memset(c, 0, sizeof(*c));
+    __builtin_memcpy(c->dst6, dst6, 16);
+    __builtin_memcpy(c->src6, src6, 16);
+    c->src_port = src_port;
+    c->dst_port = dst_port;
+    c->ip_version = 6;
+    c->ip_proto = ip_proto;
+    c->is_syn = is_syn;
+    int pass = 1;
+    if (l7_payload_window(c, skb->len, l4_off, tcp_doff, tcp_seq))
+        pass = l7_adjudicate(skb, l7mode, s) != 0;  // see l7_hook_v4
+    *depth = slot;
+    return pass;
 }
 
 #endif /* __SNI_H__ */

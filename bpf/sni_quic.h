@@ -55,6 +55,17 @@ struct l7_quic_id {
     __u8 uncertain;
 };
 
+// The walk's working buffers, kept off the BPF stack (see struct l7_scratch
+// in sni.h for why): the per-packet header parse, the first packet's DCID
+// that later coalesced packets are compared against, and the bounded load
+// buffer a variable-length DCID is read through.
+struct l7_quic_scratch {
+    struct l7_quic_id pkt;
+    __u8 first[20];
+    __u8 first_len;
+    __u8 buf[32];
+};
+
 // l7_dcid_bytes_eq compares two connection IDs exactly. The client picks the
 // DCID, so a folded/hashed identity would be forgeable by search.
 static __always_inline int l7_dcid_bytes_eq(const __u8 *a, __u8 alen,
@@ -103,7 +114,7 @@ static __always_inline int l7_read_varint(struct __sk_buff *skb, __u32 off, __u3
 // and SKIP. The skippable-header rules below are stated once, for both walks,
 // at skipLongHeader in pkg/sni/quic.go.
 static __always_inline int l7_quic_one(struct __sk_buff *skb, __u32 off, __u32 end,
-                                       struct l7_quic_id *pkt, __u32 *next) {
+                                       struct l7_quic_id *pkt, __u32 *next, __u8 *buf) {
     __u8 b0;
     if (!l7_load_u8(skb, off, end, &b0) || !(b0 & 0x80))
         return L7_QPKT_STOP;  // short header / end
@@ -138,12 +149,12 @@ static __always_inline int l7_quic_one(struct __sk_buff *skb, __u32 off, __u32 e
     // structurally (dlen is not a power of two, so clang cannot delete the
     // mask), then copy a CONSTANT 20 out.
     if (dlen >= 1) {
-        __u8 scratch[32] = {};
+        __builtin_memset(buf, 0, 32);
         __u32 n = ((__u32)(dlen - 1) & 31) + 1;
-        if (off + 6 + n > end || bpf_skb_load_bytes(skb, off + 6, scratch, n) < 0)
+        if (off + 6 + n > end || bpf_skb_load_bytes(skb, off + 6, buf, n) < 0)
             return L7_QPKT_UNSURE;  // truncated
         pkt->dcid_len = dlen;
-        __builtin_memcpy(pkt->dcid, scratch, 20);
+        __builtin_memcpy(pkt->dcid, buf, 20);
     }
 
     if (type != initial_type) {
@@ -218,15 +229,17 @@ static __always_inline int l7_quic_one(struct __sk_buff *skb, __u32 off, __u32 e
 //
 // design-l7.md has the rationale; this comment is the contract.
 static __always_inline void l7_quic_find_initial(struct __sk_buff *skb, __u32 off, __u32 end,
-                                                 struct l7_quic_id *id, __u32 *walked_to) {
-    __u8 first[20] = {};
-    __u8 first_len = 0;
+                                                 struct l7_quic_id *id, __u32 *walked_to,
+                                                 struct l7_quic_scratch *q) {
+    __builtin_memset(q->first, 0, 20);
+    q->first_len = 0;
     __u8 saw_first = 0;
     __u8 saw_initial = 0;
     for (int i = 0; i < L7_QUIC_MAX_COALESCED; i++) {
         __u32 next = off;
-        struct l7_quic_id pkt = {};
-        int r = l7_quic_one(skb, off, end, &pkt, &next);
+        struct l7_quic_id *pkt = &q->pkt;
+        __builtin_memset(pkt, 0, sizeof(*pkt));
+        int r = l7_quic_one(skb, off, end, pkt, &next, q->buf);
         if (r == L7_QPKT_STOP)
             break;
         if (r == L7_QPKT_UNSURE) {
@@ -237,9 +250,9 @@ static __always_inline void l7_quic_find_initial(struct __sk_buff *skb, __u32 of
         // One datagram, one connection.
         if (!saw_first) {
             saw_first = 1;
-            first_len = pkt.dcid_len;
-            __builtin_memcpy(first, pkt.dcid, 20);
-        } else if (!l7_dcid_bytes_eq(first, first_len, pkt.dcid, pkt.dcid_len)) {
+            q->first_len = pkt->dcid_len;
+            __builtin_memcpy(q->first, pkt->dcid, 20);
+        } else if (!l7_dcid_bytes_eq(q->first, q->first_len, pkt->dcid, pkt->dcid_len)) {
             id->uncertain = 1;
             break;
         }
@@ -257,8 +270,8 @@ static __always_inline void l7_quic_find_initial(struct __sk_buff *skb, __u32 of
     // The identity is reported only when an Initial actually carried it: a
     // datagram of non-Initials alone has no first-flight identity to pin.
     if (saw_initial) {
-        id->dcid_len = first_len;
-        __builtin_memcpy(id->dcid, first, 20);
+        id->dcid_len = q->first_len;
+        __builtin_memcpy(id->dcid, q->first, 20);
     }
 }
 

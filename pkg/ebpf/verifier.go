@@ -48,10 +48,11 @@ var programRe = regexp.MustCompile(`program ([A-Za-z0-9_]+): load program`)
 // prog. ok is false when prog was loaded without ebpf.LogLevelStats (there
 // is no stats line to read) or the log is otherwise unparseable.
 //
-// The number is a property of the kernel as much as of the program — the
-// same cg_origin_egress verifies in ~660k instructions on 6.17 and is
-// rejected at the limit on 6.6 — so it is worth surfacing on every kernel
-// the daemon runs on, not only the one CI measures.
+// The number is a property of the kernel as much as of the program: the
+// inlined cg_origin_egress verified in 657k instructions on 6.17 and was
+// rejected at the limit on 6.6; as a global function it is 114k on 6.17 and
+// 52k on 6.6. So it is worth surfacing on every kernel the daemon runs on,
+// not only the one CI measures.
 func VerifierInsns(prog *ebpf.Program) (insns int, ok bool) {
 	if prog == nil {
 		return 0, false

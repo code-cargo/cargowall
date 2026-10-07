@@ -33,6 +33,52 @@ type OriginBpfL7FlowVal struct {
 	Dcid        [20]uint8
 }
 
+type OriginBpfL7Scratch struct {
+	_   structs.HostLayout
+	Ctx struct {
+		_          structs.HostLayout
+		Cookie     uint64
+		CgroupId   uint64
+		DstKey     uint32
+		DstIp      uint32
+		SrcIp      uint32
+		Dst6       [16]uint8
+		Src6       [16]uint8
+		SrcPort    uint16
+		DstPort    uint16
+		IpVersion  uint8
+		IpProto    uint8
+		_          [2]byte
+		PayloadOff uint32
+		PayloadLen uint32
+		Seq        uint32
+		IsSyn      uint8
+		AltPort    uint8
+		Quic       struct {
+			_         structs.HostLayout
+			DcidLen   uint8
+			Dcid      [20]uint8
+			Uncertain uint8
+		}
+	}
+	Key   OriginBpfL7FlowKey
+	Val   OriginBpfL7FlowVal
+	Fresh OriginBpfL7FlowVal
+	Q     struct {
+		_   structs.HostLayout
+		Pkt struct {
+			_         structs.HostLayout
+			DcidLen   uint8
+			Dcid      [20]uint8
+			Uncertain uint8
+		}
+		First    [20]uint8
+		FirstLen uint8
+		Buf      [32]uint8
+	}
+	_ [7]byte
+}
+
 type OriginBpfLpmKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
@@ -98,10 +144,12 @@ const (
 	OriginBpfMapMapCidrs             = "map_cidrs"
 	OriginBpfMapMapCidrsV6           = "map_cidrs_v6"
 	OriginBpfMapMapDefaultAction     = "map_default_action"
+	OriginBpfMapMapL7Depth           = "map_l7_depth"
 	OriginBpfMapMapL7Events          = "map_l7_events"
 	OriginBpfMapMapL7Flow            = "map_l7_flow"
 	OriginBpfMapMapL7Scope           = "map_l7_scope"
 	OriginBpfMapMapL7ScopeV6         = "map_l7_scope_v6"
+	OriginBpfMapMapL7Scratch         = "map_l7_scratch"
 	OriginBpfMapMapL7Stats           = "map_l7_stats"
 	OriginBpfMapMapLocalNets         = "map_local_nets"
 	OriginBpfMapMapLocalNetsV6       = "map_local_nets_v6"
@@ -168,10 +216,12 @@ type OriginBpfMapSpecs struct {
 	MapCidrs         *ebpf.MapSpec `ebpf:"map_cidrs"`
 	MapCidrsV6       *ebpf.MapSpec `ebpf:"map_cidrs_v6"`
 	MapDefaultAction *ebpf.MapSpec `ebpf:"map_default_action"`
+	MapL7Depth       *ebpf.MapSpec `ebpf:"map_l7_depth"`
 	MapL7Events      *ebpf.MapSpec `ebpf:"map_l7_events"`
 	MapL7Flow        *ebpf.MapSpec `ebpf:"map_l7_flow"`
 	MapL7Scope       *ebpf.MapSpec `ebpf:"map_l7_scope"`
 	MapL7ScopeV6     *ebpf.MapSpec `ebpf:"map_l7_scope_v6"`
+	MapL7Scratch     *ebpf.MapSpec `ebpf:"map_l7_scratch"`
 	MapL7Stats       *ebpf.MapSpec `ebpf:"map_l7_stats"`
 	MapLocalNets     *ebpf.MapSpec `ebpf:"map_local_nets"`
 	MapLocalNetsV6   *ebpf.MapSpec `ebpf:"map_local_nets_v6"`
@@ -214,10 +264,12 @@ type OriginBpfMaps struct {
 	MapCidrs         *ebpf.Map `ebpf:"map_cidrs"`
 	MapCidrsV6       *ebpf.Map `ebpf:"map_cidrs_v6"`
 	MapDefaultAction *ebpf.Map `ebpf:"map_default_action"`
+	MapL7Depth       *ebpf.Map `ebpf:"map_l7_depth"`
 	MapL7Events      *ebpf.Map `ebpf:"map_l7_events"`
 	MapL7Flow        *ebpf.Map `ebpf:"map_l7_flow"`
 	MapL7Scope       *ebpf.Map `ebpf:"map_l7_scope"`
 	MapL7ScopeV6     *ebpf.Map `ebpf:"map_l7_scope_v6"`
+	MapL7Scratch     *ebpf.Map `ebpf:"map_l7_scratch"`
 	MapL7Stats       *ebpf.Map `ebpf:"map_l7_stats"`
 	MapLocalNets     *ebpf.Map `ebpf:"map_local_nets"`
 	MapLocalNetsV6   *ebpf.Map `ebpf:"map_local_nets_v6"`
@@ -234,10 +286,12 @@ func (m *OriginBpfMaps) Close() error {
 		m.MapCidrs,
 		m.MapCidrsV6,
 		m.MapDefaultAction,
+		m.MapL7Depth,
 		m.MapL7Events,
 		m.MapL7Flow,
 		m.MapL7Scope,
 		m.MapL7ScopeV6,
+		m.MapL7Scratch,
 		m.MapL7Stats,
 		m.MapLocalNets,
 		m.MapLocalNetsV6,

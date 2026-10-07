@@ -58,7 +58,7 @@ import (
 type containerAttribution struct {
 	stepTracker *steps.Tracker
 	mode        origin.Mode      // target posture, applied by enableMode after gating
-	observer    *origin.Observer // nil when the observer failed to load/attach
+	observer    *origin.Observer // never nil: a hook that failed to load leaves no containerAttribution
 	enricher    *containers.Enricher
 	tracker     *containers.Tracker // nil until startUserspace succeeds
 	postures    *postureLedger      // decides what losing the posture means
@@ -107,25 +107,24 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		}
 		return nil, p.lose(postureContainerEgress, reason)
 	}
-	a := &containerAttribution{
+	obs, err := origin.Start(tcObjs, logger)
+	if err != nil {
+		// nil, like the step-tracker arm: a nil value IS the disabled
+		// feature, and every later call keys off the receiver. A live value
+		// with no hook would still write the loopback infra-allow and start
+		// docker tracking that has nothing to enrich. Under observe the loss
+		// is recorded and TC enforces as always; under enforce it is fatal.
+		return nil, p.lose(postureContainerEgress, p.errReason(err))
+	}
+	logger.Info("Container egress hook attached", "target_mode", mode.String())
+	return &containerAttribution{
 		stepTracker: stepTracker,
 		mode:        mode,
+		observer:    obs,
 		enricher:    &containers.Enricher{},
 		postures:    p,
 		logger:      logger,
-	}
-	obs, err := origin.Start(tcObjs, logger)
-	if err != nil {
-		// Under observe the hook is telemetry: carry on with container
-		// tagging off and TC enforcing as always.
-		if lerr := p.lose(postureContainerEgress, p.errReason(err)); lerr != nil {
-			return nil, lerr
-		}
-	} else {
-		a.observer = obs
-		logger.Info("Container egress hook attached", "target_mode", mode.String())
-	}
-	return a, nil
+	}, nil
 }
 
 // wireVerdicts routes the cgroup hook's verdicts into the shared
@@ -140,7 +139,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificationTracker *events.NotificationTracker,
 	auditLogger *events.AuditLogger, fw events.FirewallUpdater, l7 events.L7LateRegistrar,
 ) {
-	if a == nil || a.observer == nil {
+	if a == nil {
 		return
 	}
 	enricher := a.enricher
@@ -179,7 +178,7 @@ func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificat
 // recorded and startup carries on; under enforce the returned error fails
 // startup.
 func (a *containerAttribution) enableMode() error {
-	if a == nil || a.observer == nil || a.mode == origin.ModeObserve {
+	if a == nil || a.mode == origin.ModeObserve {
 		return nil // nothing to raise
 	}
 	if err := a.observer.SetMode(a.mode); err != nil {
@@ -213,10 +212,10 @@ func (a *containerAttribution) containerEnricher() *containers.Enricher {
 // AllowLocalNetwork: the carve-out policy (width cap, host-address
 // locality, bridge-device exemption, fail-closed enumeration) lives ON the
 // map write in pkg/origin — a permanent workload-influenced exemption must
-// not depend on which caller reached it. With no observer there is nothing
-// adjudicating, so there is nothing to carve.
+// not depend on which caller reached it. With no hook (nil receiver) there
+// is nothing adjudicating, so there is nothing to carve.
 func (a *containerAttribution) allowLocalNetwork(prefix netip.Prefix) error {
-	if a == nil || a.observer == nil {
+	if a == nil {
 		return nil
 	}
 	return a.observer.AllowLocalNetwork(prefix)
@@ -250,7 +249,7 @@ func (a *containerAttribution) ensureLoopbackAllowed(configMgr *config.Manager) 
 // compose stacks must not lose bridge-local traffic to enforce-mode EPERM
 // (or pollute shadow telemetry with false would-blocks) in that window.
 func (a *containerAttribution) preallowLocalNetworks(ctx context.Context) {
-	if a == nil || a.observer == nil || a.mode == origin.ModeObserve {
+	if a == nil || a.mode == origin.ModeObserve {
 		return
 	}
 	if subnet, err := network.GetDockerBridgeSubnet(); err == nil {
@@ -292,9 +291,9 @@ func (a *containerAttribution) enricherArg() events.ContainerEnricher {
 }
 
 // observerProgram exposes the observer for BPF runtime-stats logging; nil
-// when the observer isn't running.
+// when the hook isn't running (nil receiver).
 func (a *containerAttribution) observerProgram() *ebpf.Program {
-	if a == nil || a.observer == nil {
+	if a == nil {
 		return nil
 	}
 	return a.observer.Program()
@@ -329,7 +328,5 @@ func (a *containerAttribution) Close() {
 	if a.tracker != nil {
 		a.tracker.Close()
 	}
-	if a.observer != nil {
-		a.observer.Close()
-	}
+	a.observer.Close()
 }

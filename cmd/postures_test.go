@@ -35,6 +35,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/origin"
+	"github.com/code-cargo/cargowall/pkg/steps"
 )
 
 // verifierTooLarge is the error shape origin.Start returned on the 6.6
@@ -174,6 +175,27 @@ func TestPostures_ContainerAttributionWithoutStepTracker(t *testing.T) {
 	assert.Nil(t, a)
 	require.NoError(t, err)
 	assert.Equal(t, "step attribution unavailable: kernel BTF not found", p.records[0].Reason)
+}
+
+// A hook that fails to load leaves NO attribution, on every rung: a nil
+// receiver is the disabled feature, and a live one with no hook would still
+// write the loopback infra-allow and start docker tracking with nothing to
+// enrich. Under observe the loss is recorded and startup continues; under
+// enforce it is fatal. (origin.Start refuses nil TC objects before touching
+// the kernel, which stands in for a verifier rejection here.)
+func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
+	p, _ := ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
+	a, err := newContainerAttribution(true, origin.ModeShadow, &steps.Tracker{}, nil, nil, p, p.logger)
+	require.NoError(t, err)
+	assert.Nil(t, a, "a failed load under observe must return the disabled feature")
+	assert.True(t, p.records[0].degraded())
+	assert.Equal(t, "off", p.records[0].Applied)
+	assert.Equal(t, "nil TC BPF objects", p.records[0].Reason)
+
+	p, _ = ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
+	a, err = newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, nil, p, p.logger)
+	assert.Nil(t, a)
+	assert.EqualError(t, err, "--container-egress=enforce requested but could not be applied: nil TC BPF objects")
 }
 
 // The file sits in world-writable /tmp and its strings reach markdown: a

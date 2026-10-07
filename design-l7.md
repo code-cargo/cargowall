@@ -154,9 +154,10 @@ The daemon logs each program's `processed_insns` at startup (`BPF program
 verified`, or `BPF program rejected by the verifier` with the count the kernel
 got to), `make verifier-budget` prints them for the local kernel, and
 `TestVerifierBudget` trips at 80% of the limit on CI's kernel. That kernel is
-not the strictest one we support: before the global-function change, 6.6
-rejected what 6.17 verified in 657k, and the two still disagree (51k against
-113k) on the same program. Measure a budget change on both.
+not the strictest one we support, nor the most lenient: with the inlined
+adjudicator, 6.6 rejected what 6.17 verified in 657k; with the global function,
+6.6 verifies the same program in 52k where 6.17 takes 114k. Measure a budget
+change on both.
 
 **Uncertainty.** A datagram the walk cannot resolve — an unskippable header
 (unknown version, Retry) *before* any Initial, still-skippable packets past the

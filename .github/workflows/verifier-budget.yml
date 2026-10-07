@@ -1,0 +1,130 @@
+name: verifier-budget
+
+# Runs TestVerifierBudget on the kernels customers' runners boot (GitLab SaaS
+# 5.15, Blacksmith 6.6) and on the newest LTS for the trend, not just on the
+# one ubuntu-latest happens to boot. The verifier's instruction count is
+# kernel-specific and does not even move in one direction across versions:
+# the inlined cg_origin_egress verified in 657k on CI's 6.17 and was rejected
+# at the 1M limit on Blacksmith's 6.6. A program that is comfortable on the
+# CI kernel can be a load failure on a runner's, so the gate has to measure
+# those kernels.
+#
+# Each leg boots a ci-kernels build in a QEMU microVM on an ordinary runner
+# (vimto, the same setup cilium/ebpf tests itself with). vimto shares the host
+# filesystem into the VM, so the checkout, the Go toolchain and the committed
+# bpf2go objects are all there; `go test` compiles on the host and only the
+# test binary runs in the VM, as root.
+#
+# Kernels:
+#   5.15      GitLab SaaS shared runners
+#   6.6       Blacksmith
+#   longterm  the newest LTS, for the trend
+#
+# A ci-kernels 6.6 is not Blacksmith's 6.6 to the patch level, and its 5.15
+# is not GitLab's image. madhokie-io/dockcmd's cargowall-verifier-budget.yml
+# stays as the ground-truth measurement on a real Blacksmith runner.
+
+on:
+  pull_request:
+    paths:
+      # Same reasoning as verify-bpf-generated-code: any source or header in
+      # bpf/ can change what the verifier sees, and so can the test itself.
+      - "bpf/**"
+      - "cargowall.go"
+      - "go.mod"
+      # The stats parsing and the instruction limit the test measures against.
+      - "pkg/ebpf/**"
+      - ".github/workflows/verifier-budget.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: verifier-budget-${{ github.ref }}
+  cancel-in-progress: true
+
+# `mode: audit`, and offline only off a fork — see the matching block in
+# ci.yml.
+env:
+  CW_OFFLINE: ${{ github.event.pull_request.head.repo.fork && 'true' || 'false' }}
+
+jobs:
+  measure:
+    name: Verifier budget on ${{ matrix.kernel }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      # Every kernel's numbers are worth seeing, even when one leg fails.
+      fail-fast: false
+      matrix:
+        kernel: ["5.15", "6.6", "longterm"]
+    steps:
+      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        with:
+          mode: audit
+          offline: ${{ env.CW_OFFLINE }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Without --no-install-recommends qemu-system-x86 drags in ~80 packages
+      # (the GUI, gstreamer, pipewire) that vimto never uses. GitHub-hosted
+      # Linux runners expose KVM, but only to root by default.
+      #
+      # The runner's apt mirror sometimes stalls: apt falls back to
+      # archive.ubuntu.com and crawls rather than failing, so per-fetch
+      # timeouts never fire and the leg runs into the job timeout. A healthy
+      # attempt takes under 30s; bound each one and start over, which usually
+      # lands on a mirror that answers.
+      - name: Install vimto and QEMU
+        timeout-minutes: 10
+        run: |
+          for attempt in 1 2 3 4; do
+            if timeout 120 sudo apt-get update \
+              && timeout 120 sudo apt-get install -y --no-install-recommends qemu-system-x86; then
+              break
+            fi
+            [ "$attempt" = 4 ] && { echo "::error::apt failed 4 times"; exit 1; }
+            echo "::warning::apt attempt $attempt stalled or failed; retrying"
+            sudo dpkg --configure -a || true
+          done
+          CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0
+          sudo chmod 0666 /dev/kvm
+
+      - name: Measure
+        env:
+          KERNEL: ghcr.io/cilium/ci-kernels:${{ matrix.kernel }}
+          # Fail rather than skip a program the test cannot measure; vimto
+          # carries the environment into the VM. See skipUnmeasured.
+          CARGOWALL_VERIFIER_GATE: "1"
+        run: |
+          status=0
+          # vimto forwards stdin into the VM and waits for its EOF, so close
+          # it rather than inheriting whatever the step has.
+          vimto -kernel "$KERNEL" -sudo -memory 2G -smp cpus=2 -- \
+            go test -count=1 -run '^TestVerifierBudget$' -v ./bpf/ < /dev/null 2>&1 \
+            | tee "$RUNNER_TEMP/verifier.txt" || status=$?
+
+          # A channel tag like longterm moves; the test logs the release it
+          # actually ran on. Absent when the VM failed to boot or the test
+          # died early — exactly when the summary matters, so it must not
+          # end the step under bash -eo pipefail.
+          release=$(grep -oE 'verifier: kernel=\S+' "$RUNNER_TEMP/verifier.txt" | head -1 | cut -d= -f2 || true)
+          {
+            echo "### BPF verifier budget on \`${release:-unknown}\` (ci-kernels \`${{ matrix.kernel }}\`)"
+            echo
+            echo '```'
+            if grep -q 'verifier: collection=' "$RUNNER_TEMP/verifier.txt"; then
+              grep -E 'verifier: collection=|uses .* of the verifier budget' "$RUNNER_TEMP/verifier.txt" \
+                | sed -E 's/^\s*verifier_budget_test.go:[0-9]+: //' || true
+            else
+              # Nothing was measured: show how the run ended instead.
+              tail -n 30 "$RUNNER_TEMP/verifier.txt"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

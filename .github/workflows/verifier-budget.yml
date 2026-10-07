@@ -72,17 +72,26 @@ jobs:
           go-version-file: go.mod
 
       # Without --no-install-recommends qemu-system-x86 drags in ~80 packages
-      # (the GUI, gstreamer, pipewire) that vimto never uses; on a slow
-      # mirror that alone has taken 14 minutes. GitHub-hosted Linux runners
-      # expose KVM, but only to root by default. A stalled runner mirror has
-      # also hung `apt-get update` until the job timed out: bound each fetch
-      # and retry it rather than wait on a dead connection.
+      # (the GUI, gstreamer, pipewire) that vimto never uses. GitHub-hosted
+      # Linux runners expose KVM, but only to root by default.
+      #
+      # The runner's apt mirror sometimes stalls: apt falls back to
+      # archive.ubuntu.com and crawls rather than failing, so per-fetch
+      # timeouts never fire and the leg runs into the job timeout. A healthy
+      # attempt takes under 30s; bound each one and start over, which usually
+      # lands on a mirror that answers.
       - name: Install vimto and QEMU
-        timeout-minutes: 8
+        timeout-minutes: 10
         run: |
-          apt_opts="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
-          sudo apt-get $apt_opts update
-          sudo apt-get $apt_opts install -y --no-install-recommends qemu-system-x86
+          for attempt in 1 2 3 4; do
+            if timeout 120 sudo apt-get update \
+              && timeout 120 sudo apt-get install -y --no-install-recommends qemu-system-x86; then
+              break
+            fi
+            [ "$attempt" = 4 ] && { echo "::error::apt failed 4 times"; exit 1; }
+            echo "::warning::apt attempt $attempt stalled or failed; retrying"
+            sudo dpkg --configure -a || true
+          done
           CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0
           sudo chmod 0666 /dev/kvm
 

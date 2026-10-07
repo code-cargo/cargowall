@@ -113,6 +113,33 @@ together.
 450k on a 6.8 kernel and past 1,000,001 on the newer kernel CI runs — where it
 fails to load and the whole cgroup hook, L4 enforcement included, silently does
 not attach. Measure on CI's kernel before changing it.
+
+**Verified once, not once per caller state.** The adjudicator used to be
+`__always_inline`, which meant the verifier re-walked all of it for every
+distinct state that reached the call — and the IPv6 extension-header walk
+produces several, so the v6 path cost 2.7x the v4 path for identical code. On
+kernel 6.6 (Blacksmith runners), whose verifier prunes fewer states than 6.17,
+that ran past the limit at 657k on the kernel CI measures. `l7_adjudicate` is
+now a global function (non-static, never inlined): the verifier checks its body
+once against abstract arguments and callers pay only for the call. Measured
+with `TestVerifierBudget`: 113,633 on 6.17, 51,702 on 6.6. Three things follow
+from that shape and must stay true:
+
+- Its return is an unknown scalar to the caller, so the hooks compare it to
+  zero; a cgroup_skb program has to prove its exit value is in [0, 3].
+- Kernels from 6.8 type its pointer argument as nullable; it checks for NULL.
+  Pointer-to-struct arguments to global functions need kernel 5.13, which this
+  collection now requires (the TC collection keeps the 5.8 floor).
+- A global function's frame adds to its caller's against the 512-byte BPF
+  stack, and the two came to 640. `struct l7_scratch` — the L7 context, the
+  flow key and value temporaries, the QUIC walk's buffers — therefore lives in
+  a per-CPU map (`map_l7_scratch`), bringing the chain to 280+192. Two slots,
+  chosen by a per-CPU depth counter: a cgroup_skb egress program can be
+  re-entered on the same CPU by a softirq (a retransmit timer's `ip_output`
+  while a process-context send is mid-program), and the inner run must not
+  overwrite the outer's state. Interrupt nesting is LIFO, so a plain increment
+  and restore suffices. Anything new that needs more than a few bytes of state
+  goes in the scratch struct, not on the stack.
 The daemon logs each program's `processed_insns` at startup (`BPF program
 verified`, or `BPF program rejected by the verifier` with the count the kernel
 got to), `make verifier-budget` prints them for the local kernel, and

@@ -1,7 +1,8 @@
 name: verifier-budget
 
-# Runs TestVerifierBudget on the oldest kernels cargowall supports, not just
-# the one ubuntu-latest happens to boot. The verifier's instruction count is
+# Runs TestVerifierBudget on the kernels customers' runners boot (GitLab SaaS
+# 5.15, Blacksmith 6.6) and on the newest LTS for the trend, not just on the
+# one ubuntu-latest happens to boot. The verifier's instruction count is
 # kernel-specific and does not even move in one direction across versions:
 # the inlined cg_origin_egress verified in 657k on CI's 6.17 and was rejected
 # at the 1M limit on Blacksmith's 6.6. A program that is comfortable on the
@@ -15,7 +16,7 @@ name: verifier-budget
 # test binary runs in the VM, as root.
 #
 # Kernels:
-#   5.15      GitLab SaaS shared runners — the oldest kernel worth supporting
+#   5.15      GitLab SaaS shared runners
 #   6.6       Blacksmith
 #   longterm  the newest LTS, for the trend
 #
@@ -73,17 +74,24 @@ jobs:
       # Without --no-install-recommends qemu-system-x86 drags in ~80 packages
       # (the GUI, gstreamer, pipewire) that vimto never uses; on a slow
       # mirror that alone has taken 14 minutes. GitHub-hosted Linux runners
-      # expose KVM, but only to root by default.
+      # expose KVM, but only to root by default. A stalled runner mirror has
+      # also hung `apt-get update` until the job timed out: bound each fetch
+      # and retry it rather than wait on a dead connection.
       - name: Install vimto and QEMU
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86
+          apt_opts="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          sudo apt-get $apt_opts update
+          sudo apt-get $apt_opts install -y --no-install-recommends qemu-system-x86
           CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0
           sudo chmod 0666 /dev/kvm
 
       - name: Measure
         env:
           KERNEL: ghcr.io/cilium/ci-kernels:${{ matrix.kernel }}
+          # Fail rather than skip a program the test cannot measure; vimto
+          # carries the environment into the VM. See skipUnmeasured.
+          CARGOWALL_VERIFIER_GATE: "1"
         run: |
           status=0
           # vimto forwards stdin into the VM and waits for its EOF, so close
@@ -92,24 +100,22 @@ jobs:
             go test -count=1 -run '^TestVerifierBudget$' -v ./bpf/ < /dev/null 2>&1 \
             | tee "$RUNNER_TEMP/verifier.txt" || status=$?
 
-          # The test skips a program it cannot load for a reason other than
-          # the verifier, and skips everything without root. Either way that
-          # program went unmeasured on this kernel, which is a gap in the gate
-          # rather than a pass.
-          if grep -q -- '--- SKIP' "$RUNNER_TEMP/verifier.txt"; then
-            echo "::error::TestVerifierBudget skipped programs on ci-kernels ${{ matrix.kernel }} — they were not measured"
-            status=1
-          fi
-
           # A channel tag like longterm moves; the test logs the release it
-          # actually ran on.
-          release=$(grep -oE 'verifier: kernel=\S+' "$RUNNER_TEMP/verifier.txt" | head -1 | cut -d= -f2)
+          # actually ran on. Absent when the VM failed to boot or the test
+          # died early — exactly when the summary matters, so it must not
+          # end the step under bash -eo pipefail.
+          release=$(grep -oE 'verifier: kernel=\S+' "$RUNNER_TEMP/verifier.txt" | head -1 | cut -d= -f2 || true)
           {
             echo "### BPF verifier budget on \`${release:-unknown}\` (ci-kernels \`${{ matrix.kernel }}\`)"
             echo
             echo '```'
-            grep -E 'verifier: collection=|uses .* of the verifier budget' "$RUNNER_TEMP/verifier.txt" \
-              | sed -E 's/^\s*verifier_budget_test.go:[0-9]+: //' || true
+            if grep -q 'verifier: collection=' "$RUNNER_TEMP/verifier.txt"; then
+              grep -E 'verifier: collection=|uses .* of the verifier budget' "$RUNNER_TEMP/verifier.txt" \
+                | sed -E 's/^\s*verifier_budget_test.go:[0-9]+: //' || true
+            else
+              # Nothing was measured: show how the run ended instead.
+              tail -n 30 "$RUNNER_TEMP/verifier.txt"
+            fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"

@@ -71,7 +71,7 @@ test-bpf:
 
 verifier-budget:
 	@printf "${GREEN}Measuring BPF verifier budget on $$(uname -r) (requires root)...${RESET}\n"
-	sudo go test -count=1 -run '^TestVerifierBudget$$' -v ./bpf/
+	sudo CARGOWALL_VERIFIER_GATE=1 go test -count=1 -run '^TestVerifierBudget$$' -v ./bpf/
 
 test-ci:
 	@printf "${GREEN}Running CI tests...${RESET}\n"

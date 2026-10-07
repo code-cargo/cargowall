@@ -18,6 +18,7 @@ package bpf
 
 import (
 	"errors"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,10 +38,26 @@ import (
 // the 6.17 kernel CI runs on and over the limit on Blacksmith's 6.6; as a
 // global function it is 114k on 6.17 and 52k on 6.6), so creep that is still
 // comfortable here can be what another verifier turns into a load failure.
-// Raising this needs a measurement on the oldest kernel we support, not just
-// a green CI on the CI kernel: the verifier-budget workflow runs this test
-// on the oldest kernels too.
+// Raising this needs a measurement on the kernels customers boot, not just a
+// green CI on the CI kernel: the verifier-budget workflow runs this test on
+// 5.15, 6.6 and the newest LTS.
 const verifierBudgetPct = 80.0
+
+// verifierGateEnv marks a run as the verifier-budget gate (the verifier-budget
+// workflow and `make verifier-budget`). The suite skips what the current
+// environment cannot load; the gate's job is to measure every program, so
+// there an unmeasured program is a failure, not a skip.
+const verifierGateEnv = "CARGOWALL_VERIFIER_GATE"
+
+// skipUnmeasured skips t, or fails it when the run is the verifier-budget
+// gate. Every path on which a program goes unmeasured comes through here.
+func skipUnmeasured(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv(verifierGateEnv) != "" {
+		t.Fatalf(format+" (unmeasured; %s is set)", append(args, verifierGateEnv)...)
+	}
+	t.Skipf(format, args...)
+}
 
 // TestVerifierBudget loads every program of every collection with verifier
 // statistics and logs the processed-instruction count per program, so the
@@ -51,7 +68,8 @@ const verifierBudgetPct = 80.0
 // behind it. A verifier rejection or a missing stats line fails that
 // subtest; a program this environment cannot load at all (no kernel BTF for
 // the step collection, say) skips it, so the run shows the program was not
-// measured rather than passing.
+// measured rather than passing — and fails it under the gate, see
+// skipUnmeasured.
 func TestVerifierBudget(t *testing.T) {
 	requireBPF(t)
 
@@ -100,7 +118,7 @@ func TestVerifierBudget(t *testing.T) {
 				if err != nil {
 					var verr *ebpf.VerifierError
 					if !errors.As(err, &verr) {
-						t.Skipf("verifier: collection=%s program=%s not loadable here: %v", c.name, name, err)
+						skipUnmeasured(t, "verifier: collection=%s program=%s not loadable here: %v", c.name, name, err)
 					}
 					// The rejection is the finding: report it in the same
 					// shape as a passing line, with the count when the log

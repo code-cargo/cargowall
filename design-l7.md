@@ -117,14 +117,14 @@ not attach. Measure on CI's kernel before changing it.
 **Verified once, not once per caller state.** The adjudicator used to be
 `__always_inline`, which meant the verifier re-walked all of it for every
 distinct state that reached the call — and the IPv6 extension-header walk
-produces several, so the v6 path cost 2.7x the v4 path for identical code. The
-6.17 kernel CI measures on verified the inlined program in 657,658
-instructions; kernel 6.6 (Blacksmith runners), whose verifier prunes fewer
-states, ran past the 1M limit and the hook did not load. `l7_adjudicate` is
-now a global function (non-static, never inlined): the verifier checks its body
-once against abstract arguments and callers pay only for the call. Measured
-with `TestVerifierBudget`: 113,633 on 6.17, 51,702 on 6.6. Four things follow
-from that shape and must stay true:
+produces several, so the v6 path cost 2.7x the v4 path for identical code. On
+the 6.17 kernel CI uses, the inlined program verified in 657,658 instructions;
+on kernel 6.6 (Blacksmith runners), whose verifier prunes fewer states, it ran
+past the 1M limit and the hook did not load. `l7_adjudicate` is now a global
+function (non-static, never inlined): the verifier checks its body once against
+abstract arguments and callers pay only for the call. Measured with
+`TestVerifierBudget`: 114,097 on 6.17, 52,049 on 6.6. Four things follow from
+that shape and must stay true:
 
 - Its arguments are the skb context and scalars (the scratch slot index),
   which global functions have accepted since kernel 5.6, under the 5.8 floor.

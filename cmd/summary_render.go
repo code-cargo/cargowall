@@ -61,7 +61,7 @@ type summaryData struct {
 	ordinalSteps    map[uint32]int // step ordinal → index into steps
 	auditMode       bool
 	workflowRunLink string
-	postures        []postureRecord
+	postures        []postureLine
 }
 
 // tallyEvents counts events by outcome class.
@@ -93,8 +93,8 @@ func tallyEvents(evts []events.AuditEvent) (blocked, allowed, dnsBlocked, protoB
 // fails startup), so the table says the measurement never ran — without it,
 // an observe run reporting no would-blocks reads exactly like a clean one.
 // Nothing at all when every requested posture applied.
-func renderPostures(w io.Writer, recs []postureRecord) {
-	var lost []postureRecord
+func renderPostures(w io.Writer, recs []postureLine) {
+	var lost []postureLine
 	for _, r := range recs {
 		if r.degraded() {
 			lost = append(lost, r)

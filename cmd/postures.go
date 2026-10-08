@@ -47,20 +47,26 @@ const (
 // cell and must leave the whole record well inside readStateFile's cap.
 const maxPostureReasonBytes = 300
 
-// postureRecord is one layer's line in posturesFile. Values are flag rungs
-// ("off", "observe", "enforce", "enforce-pinned").
-type postureRecord struct {
+// postureLine is one layer's line in posturesFile, the whole of what
+// crosses from `cargowall start` to `cargowall summary`. Values are flag
+// rungs ("off", "observe", "enforce", "enforce-pinned").
+type postureLine struct {
 	Posture   string `json:"posture"`
 	Requested string `json:"requested"`
 	Applied   string `json:"applied"`
 	// Why Applied is not Requested; empty when they match.
 	Reason string `json:"reason,omitempty"`
+}
 
+func (l postureLine) degraded() bool { return l.Applied != l.Requested }
+
+// postureLayer is a registered layer in the ledger: its line plus the
+// registration decision, which never leaves the process.
+type postureLayer struct {
+	postureLine
 	off        string // this flag's own off rung, what a loss leaves applied
 	failClosed bool   // the requested rung promises drops: losing it fails startup
 }
-
-func (r postureRecord) degraded() bool { return r.Applied != r.Requested }
 
 // postureLedger knows what each layer was asked for and decides what losing
 // it means. Only layers requested above off are tracked: an off layer
@@ -68,9 +74,9 @@ func (r postureRecord) degraded() bool { return r.Applied != r.Requested }
 // enforce rung into a failed start, and a missing one must not quietly
 // degrade instead.
 type postureLedger struct {
-	records []postureRecord
-	kernel  string // uname release, for verifier reasons: the budget is per-kernel
-	logger  *slog.Logger
+	layers []postureLayer
+	kernel string // uname release, for verifier reasons: the budget is per-kernel
+	logger *slog.Logger
 }
 
 // newPostures registers each layer against its OWN flag's constants: the
@@ -89,25 +95,37 @@ func (p *postureLedger) register(posture, requested, off string, failClosed bool
 	if requested == "" || requested == off {
 		return
 	}
-	p.records = append(p.records, postureRecord{
-		Posture: posture, Requested: requested, Applied: requested,
-		off: off, failClosed: failClosed,
+	p.layers = append(p.layers, postureLayer{
+		postureLine: postureLine{Posture: posture, Requested: requested, Applied: requested},
+		off:         off,
+		failClosed:  failClosed,
 	})
 }
 
-func (p *postureLedger) find(posture string) *postureRecord {
-	for i := range p.records {
-		if p.records[i].Posture == posture {
-			return &p.records[i]
+func (p *postureLedger) find(posture string) *postureLayer {
+	for i := range p.layers {
+		if p.layers[i].Posture == posture {
+			return &p.layers[i]
 		}
 	}
 	return nil
 }
 
+// lines is what write publishes.
+func (p *postureLedger) lines() []postureLine {
+	out := make([]postureLine, len(p.layers))
+	for i, l := range p.layers {
+		out[i] = l.postureLine
+	}
+	return out
+}
+
 // lose reports that posture could not come up. There is no partial descent:
-// every way a layer fails leaves it computing no verdict, so the record goes
-// to off — the fatal case included, so the record always agrees with the
-// failure sentinel — keeping the first reason. The ledger owns the log line.
+// every way a layer fails leaves it computing no verdict, so the layer goes
+// to off, keeping the first reason. The ledger owns the log line. On the
+// fatal path the failure sentinel is what leaves the process — write runs
+// only once both raises succeed — so the in-memory mark there serves the
+// log and the ledger's own consistency, nothing downstream.
 //
 // A fail-closed rung returns an error the caller must fail startup with: TC
 // egress would still police post-NAT traffic, but the job would run without
@@ -150,7 +168,7 @@ func (p *postureLedger) errReason(err error) string {
 // write publishes the record for the summary step. Best-effort like the
 // mode file: a failed write only costs the summary its Postures block.
 func (p *postureLedger) write() {
-	data, err := json.Marshal(p.records)
+	data, err := json.Marshal(p.lines())
 	if err == nil {
 		err = writeSentinel(posturesFile, data)
 	}
@@ -174,12 +192,12 @@ func truncateReason(s string) string {
 // unreadable. Read through readStateFile: the path is fixed and
 // world-writable. Every string is sanitized here because it is echoed into
 // markdown.
-func readPostures() []postureRecord {
+func readPostures() []postureLine {
 	sf, ok := readStateFile(posturesFile)
 	if !ok {
 		return nil
 	}
-	var recs []postureRecord
+	var recs []postureLine
 	if err := json.Unmarshal(sf.data, &recs); err != nil {
 		slog.Debug("Postures record unreadable — omitting", "path", posturesFile, "error", err)
 		return nil

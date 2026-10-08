@@ -49,16 +49,17 @@ import (
 //
 // Every method is nil-receiver safe: a nil *containerAttribution IS the
 // disabled feature, so startCargoWall wires the subsystem unconditionally
-// instead of threading flag checks through the boot sequence. Under
-// --container-egress=observe failures are warn-only: losing this subsystem
-// costs attribution and the would-block measurement, never policing, since
-// TC egress stays attached. Under enforce, losing the hook fails startup
+// instead of threading flag checks through the boot sequence. A live value
+// may still have no hook (observer nil): under --container-egress=observe a
+// hook that fails to load costs the would-block measurement and pre-NAT
+// enrichment, never policing (TC egress stays attached), and docker
+// tracking keeps running without it. Under enforce, losing the hook fails startup
 // (see postureLedger.lose): TC alone would still police, but not the
 // pre-NAT/loopback/bridge egress the operator asked to have enforced.
 type containerAttribution struct {
 	stepTracker *steps.Tracker
 	mode        origin.Mode      // target posture, applied by enableMode after gating
-	observer    *origin.Observer // never nil: a hook that failed to load leaves no containerAttribution
+	observer    *origin.Observer // nil when the hook failed to load/attach under observe
 	enricher    *containers.Enricher
 	tracker     *containers.Tracker // nil until startUserspace succeeds
 	postures    *postureLedger      // decides what losing the posture means
@@ -107,24 +108,29 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		}
 		return nil, p.lose(postureContainerEgress, reason)
 	}
-	obs, err := origin.Start(tcObjs, logger)
-	if err != nil {
-		// nil, like the step-tracker arm: a nil value IS the disabled
-		// feature, and every later call keys off the receiver. A live value
-		// with no hook would still write the loopback infra-allow and start
-		// docker tracking that has nothing to enrich. Under observe the loss
-		// is recorded and TC enforces as always; under enforce it is fatal.
-		return nil, p.lose(postureContainerEgress, p.errReason(err))
-	}
-	logger.Info("Container egress hook attached", "target_mode", mode.String())
-	return &containerAttribution{
+	a := &containerAttribution{
 		stepTracker: stepTracker,
 		mode:        mode,
-		observer:    obs,
 		enricher:    &containers.Enricher{},
 		postures:    p,
 		logger:      logger,
-	}, nil
+	}
+	obs, err := origin.Start(tcObjs, logger)
+	if err != nil {
+		// Fatal under enforce. Under observe only the hook is lost: the
+		// value stays live with a nil observer, because docker tracking
+		// does not need the hook — step tagging of container processes and
+		// bridge DNS attribution ride the step tagger and the tracker's IP
+		// index, and containers.Start supports a nil observer (Enrich
+		// no-ops). The hook methods below each check for it.
+		if lerr := p.lose(postureContainerEgress, p.errReason(err)); lerr != nil {
+			return nil, lerr
+		}
+		return a, nil
+	}
+	a.observer = obs
+	logger.Info("Container egress hook attached", "target_mode", mode.String())
+	return a, nil
 }
 
 // wireVerdicts routes the cgroup hook's verdicts into the shared
@@ -139,7 +145,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificationTracker *events.NotificationTracker,
 	auditLogger *events.AuditLogger, fw events.FirewallUpdater, l7 events.L7LateRegistrar,
 ) {
-	if a == nil {
+	if a == nil || a.observer == nil {
 		return
 	}
 	enricher := a.enricher
@@ -172,13 +178,14 @@ func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificat
 // enableMode raises the cgroup hook to its configured posture. MUST be
 // called only after the allowlist, DNS/infra auto-allows, and
 // existing-connection gating are programmed — the same attach-before-program
-// guard that makes cmd/start.go attach TC last.
+// guard that makes cmd/start.go attach TC last. With no hook there is
+// nothing to raise; its loss was recorded at load.
 //
 // A failure leaves the hook in its inert boot mode. Under observe that is
 // recorded and startup carries on; under enforce the returned error fails
 // startup.
 func (a *containerAttribution) enableMode() error {
-	if a == nil || a.mode == origin.ModeObserve {
+	if a == nil || a.observer == nil || a.mode == origin.ModeObserve {
 		return nil // nothing to raise
 	}
 	if err := a.observer.SetMode(a.mode); err != nil {
@@ -212,10 +219,10 @@ func (a *containerAttribution) containerEnricher() *containers.Enricher {
 // AllowLocalNetwork: the carve-out policy (width cap, host-address
 // locality, bridge-device exemption, fail-closed enumeration) lives ON the
 // map write in pkg/origin — a permanent workload-influenced exemption must
-// not depend on which caller reached it. With no hook (nil receiver) there
-// is nothing adjudicating, so there is nothing to carve.
+// not depend on which caller reached it. With no hook there is nothing
+// adjudicating, so there is nothing to carve.
 func (a *containerAttribution) allowLocalNetwork(prefix netip.Prefix) error {
-	if a == nil {
+	if a == nil || a.observer == nil {
 		return nil
 	}
 	return a.observer.AllowLocalNetwork(prefix)
@@ -230,13 +237,13 @@ func (a *containerAttribution) allowLocalNetwork(prefix netip.Prefix) error {
 // loopback out directly; this half makes the allowance visible in the
 // rendered policy rather than hidden in bytecode. On the facade, not in
 // startCargoWall: the type exists so boot doesn't thread feature checks,
-// and a nil receiver — attribution off, or step attribution dead — is
-// exactly the case where the hook never adjudicates and no allowance is
-// needed. MUST run before UpdateAllowlistTC programs the maps. (It no longer
+// and no hook — attribution off, step attribution dead, or the hook failed
+// to load — is exactly the case where nothing adjudicates and no allowance
+// is needed. MUST run before UpdateAllowlistTC programs the maps. (It no longer
 // has to follow the config load: auto-allows are journalled and re-applied
 // across loads, issue #119.)
 func (a *containerAttribution) ensureLoopbackAllowed(configMgr *config.Manager) {
-	if a == nil {
+	if a == nil || a.observer == nil {
 		return
 	}
 	configMgr.EnsureInfraAllowed([]string{"127.0.0.0/8", "::1/128"}, nil, config.AutoAddedTypeLoopback)
@@ -249,7 +256,7 @@ func (a *containerAttribution) ensureLoopbackAllowed(configMgr *config.Manager) 
 // compose stacks must not lose bridge-local traffic to enforce-mode EPERM
 // (or pollute shadow telemetry with false would-blocks) in that window.
 func (a *containerAttribution) preallowLocalNetworks(ctx context.Context) {
-	if a == nil || a.mode == origin.ModeObserve {
+	if a == nil || a.observer == nil || a.mode == origin.ModeObserve {
 		return
 	}
 	if subnet, err := network.GetDockerBridgeSubnet(); err == nil {
@@ -291,9 +298,9 @@ func (a *containerAttribution) enricherArg() events.ContainerEnricher {
 }
 
 // observerProgram exposes the observer for BPF runtime-stats logging; nil
-// when the hook isn't running (nil receiver).
+// when the hook isn't running.
 func (a *containerAttribution) observerProgram() *ebpf.Program {
-	if a == nil {
+	if a == nil || a.observer == nil {
 		return nil
 	}
 	return a.observer.Program()
@@ -328,5 +335,7 @@ func (a *containerAttribution) Close() {
 	if a.tracker != nil {
 		a.tracker.Close()
 	}
-	a.observer.Close()
+	if a.observer != nil {
+		a.observer.Close()
+	}
 }

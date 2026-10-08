@@ -18,12 +18,14 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +36,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
+	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/origin"
 	"github.com/code-cargo/cargowall/pkg/steps"
 )
@@ -53,22 +56,12 @@ func ledgerWithLog(t *testing.T, egress, sni string) (*postureLedger, *bytes.Buf
 	return newPostures(cmd, "6.6.141", slog.New(slog.NewTextHandler(&buf, nil))), &buf
 }
 
-// public strips the in-memory registration fields, leaving what the file
-// carries.
-func public(recs []postureRecord) []postureRecord {
-	out := make([]postureRecord, len(recs))
-	for i, r := range recs {
-		out[i] = postureRecord{Posture: r.Posture, Requested: r.Requested, Applied: r.Applied, Reason: r.Reason}
-	}
-	return out
-}
-
 func TestPostures_OffLayersAreNotTracked(t *testing.T) {
 	p, _ := ledgerWithLog(t, ContainerEgressOff, TLSSNIOff)
-	assert.Empty(t, p.records)
+	assert.Empty(t, p.layers)
 
 	p, _ = ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
-	assert.Equal(t, []postureRecord{{Posture: postureContainerEgress, Requested: "observe", Applied: "observe"}}, public(p.records))
+	assert.Equal(t, []postureLine{{Posture: postureContainerEgress, Requested: "observe", Applied: "observe"}}, p.lines())
 }
 
 // Every rung that promises drops is fail-closed, each checked against its
@@ -123,7 +116,7 @@ func TestPostures_LostObserveIsRecordedNotFatal(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, l7f)
 
-	assert.Equal(t, []postureRecord{
+	assert.Equal(t, []postureLine{
 		{
 			Posture: postureContainerEgress, Requested: "observe", Applied: "off",
 			Reason: "verifier rejected cg_origin_egress on 6.6.141: 1,000,001 insns",
@@ -132,14 +125,14 @@ func TestPostures_LostObserveIsRecordedNotFatal(t *testing.T) {
 			Posture: postureTLSSNI, Requested: "observe", Applied: "off",
 			Reason: "the cgroup egress hook it rides is not running",
 		},
-	}, public(p.records))
+	}, p.lines())
 	out := buf.String()
 	assert.Equal(t, 2, strings.Count(out, "level=WARN"), out)
 	assert.NotContains(t, out, "level=ERROR")
 	assert.Contains(t, out, `msg="--tls-sni=observe requested but could not be applied"`)
 
 	p.write()
-	assert.Equal(t, public(p.records), readPostures(), "the summary must read back exactly what start wrote")
+	assert.Equal(t, p.lines(), readPostures(), "the summary must read back exactly what start wrote")
 }
 
 // A second loss of the same layer keeps the first reason: it is the cause,
@@ -148,7 +141,7 @@ func TestPostures_FirstReasonKept(t *testing.T) {
 	p, _ := ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
 	require.NoError(t, p.lose(postureContainerEgress, "first"))
 	require.NoError(t, p.lose(postureContainerEgress, "second"))
-	assert.Equal(t, "first", p.records[0].Reason)
+	assert.Equal(t, "first", p.layers[0].Reason)
 }
 
 // A layer that was never requested promised nothing, so losing it is not
@@ -174,23 +167,37 @@ func TestPostures_ContainerAttributionWithoutStepTracker(t *testing.T) {
 	a, err = newContainerAttribution(true, origin.ModeShadow, nil, stepErr, nil, p, p.logger)
 	assert.Nil(t, a)
 	require.NoError(t, err)
-	assert.Equal(t, "step attribution unavailable: kernel BTF not found", p.records[0].Reason)
+	assert.Equal(t, "step attribution unavailable: kernel BTF not found", p.layers[0].Reason)
 }
 
-// A hook that fails to load leaves NO attribution, on every rung: a nil
-// receiver is the disabled feature, and a live one with no hook would still
-// write the loopback infra-allow and start docker tracking with nothing to
-// enrich. Under observe the loss is recorded and startup continues; under
-// enforce it is fatal. (origin.Start refuses nil TC objects before touching
-// the kernel, which stands in for a verifier rejection here.)
+// A hook that fails to load under observe costs the hook, not container
+// attribution: the value stays live with a nil observer so docker tracking
+// (container step tagging, bridge DNS attribution) still starts, the hook
+// methods all stand down, and the loss is recorded once. Under enforce it is
+// fatal. (origin.Start refuses nil TC objects before touching the kernel,
+// which stands in for a verifier rejection here.)
 func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
-	p, _ := ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
+	p, buf := ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
 	a, err := newContainerAttribution(true, origin.ModeShadow, &steps.Tracker{}, nil, nil, p, p.logger)
 	require.NoError(t, err)
-	assert.Nil(t, a, "a failed load under observe must return the disabled feature")
-	assert.True(t, p.records[0].degraded())
-	assert.Equal(t, "off", p.records[0].Applied)
-	assert.Equal(t, "nil TC BPF objects", p.records[0].Reason)
+	require.NotNil(t, a, "docker tracking does not need the hook")
+	assert.Nil(t, a.originObserver())
+	assert.NotNil(t, a.containerEnricher())
+	assert.Equal(t, postureLine{
+		Posture: postureContainerEgress, Requested: "observe", Applied: "off", Reason: "nil TC BPF objects",
+	}, p.lines()[0])
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+	a.ensureLoopbackAllowed(cm)
+	assert.Empty(t, cm.GetResolvedRules(), "the loopback allowance exists for the hook, which is not running")
+	assert.Nil(t, a.observerProgram())
+	require.NoError(t, a.allowLocalNetwork(netip.MustParsePrefix("172.17.0.0/16")))
+	a.preallowLocalNetworks(context.Background())
+	a.wireVerdicts(nil, nil, nil, nil, nil)
+	require.NoError(t, a.enableMode(), "nothing to raise, and the loss is already recorded")
+	assert.Equal(t, 1, strings.Count(buf.String(), "could not be applied"), "the loss is logged once")
+	a.Close()
 
 	p, _ = ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
 	a, err = newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, nil, p, p.logger)
@@ -202,7 +209,7 @@ func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
 // planted newline must not start a new line.
 func TestPostures_ReadSanitizes(t *testing.T) {
 	redirectStateFiles(t)
-	planted, err := json.Marshal([]postureRecord{{
+	planted, err := json.Marshal([]postureLine{{
 		Posture: "tls-sni", Requested: "observe", Applied: "off",
 		Reason: "boom\n::error::injected " + strings.Repeat("x", 1000),
 	}})
@@ -223,12 +230,12 @@ func TestRenderPostures(t *testing.T) {
 	renderPostures(&buf, nil)
 	assert.Empty(t, buf.String(), "nothing requested, nothing rendered")
 
-	renderPostures(&buf, []postureRecord{
+	renderPostures(&buf, []postureLine{
 		{Posture: postureContainerEgress, Requested: "observe", Applied: "observe"},
 	})
 	assert.Empty(t, buf.String(), "everything applied: no new noise")
 
-	renderPostures(&buf, []postureRecord{
+	renderPostures(&buf, []postureLine{
 		{Posture: postureContainerEgress, Requested: "observe", Applied: "off", Reason: "a|b"},
 		{Posture: postureTLSSNI, Requested: "observe", Applied: "observe"},
 	})

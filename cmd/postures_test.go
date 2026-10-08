@@ -192,6 +192,7 @@ func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
 	a.ensureLoopbackAllowed(cm)
 	assert.Empty(t, cm.GetResolvedRules(), "the loopback allowance exists for the hook, which is not running")
 	assert.Nil(t, a.observerProgram())
+	assert.Nil(t, a.subnetCarver(a.allowLocalNetwork), "no hook: bridge-subnet discovery stays off")
 	require.NoError(t, a.allowLocalNetwork(netip.MustParsePrefix("172.17.0.0/16")))
 	a.preallowLocalNetworks(context.Background())
 	a.wireVerdicts(nil, nil, nil, nil, nil)

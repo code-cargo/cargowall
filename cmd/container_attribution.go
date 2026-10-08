@@ -306,6 +306,17 @@ func (a *containerAttribution) observerProgram() *ebpf.Program {
 	return a.observer.Program()
 }
 
+// subnetCarver is the bridge-subnet discovery callback the tracker gets:
+// nil with no hook. Carving exists for the hook, and the tracker reads a
+// non-nil callback as "discovery on" and a nil error as "carved", so one
+// that no-ops would have it stamp subnets as carved with nothing carving.
+func (a *containerAttribution) subnetCarver(allow func(prefix netip.Prefix) error) func(prefix netip.Prefix) error {
+	if a == nil || a.observer == nil {
+		return nil
+	}
+	return allow
+}
+
 // startUserspace is the late phase: docker-events tracking, tagging, DNS
 // client attribution (only meaningful when the bridge listener exists), and
 // bridge-subnet discovery (allowLocalSubnet, may be nil).
@@ -313,7 +324,7 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 	if a == nil {
 		return
 	}
-	ctr, err := containers.Start(ctx, containers.Options{AllowLocalSubnet: allowLocalSubnet}, a.stepTracker, a.observer, auditLogger, a.logger)
+	ctr, err := containers.Start(ctx, containers.Options{AllowLocalSubnet: a.subnetCarver(allowLocalSubnet)}, a.stepTracker, a.observer, auditLogger, a.logger)
 	if err != nil {
 		a.logger.Warn("Container attribution disabled", "error", err)
 		return

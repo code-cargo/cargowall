@@ -86,6 +86,11 @@ func (c *SummaryCmd) Run() error {
 		return fmt.Errorf("failed to parse steps JSON: %w", err)
 	}
 
+	// Postures `cargowall start` could not apply (observe rungs only — a
+	// lost enforce rung fails startup). Rendered near the top of every
+	// summary shape.
+	postures := readPostures()
+
 	// Read audit log
 	auditEvents, err := c.readAuditLog()
 	if err != nil {
@@ -158,6 +163,7 @@ func (c *SummaryCmd) Run() error {
 
 		fmt.Fprintln(c.output, "## CargoWall")
 		fmt.Fprintln(c.output)
+		renderPostures(c.output, postures)
 		if workflowRunLink != "" {
 			fmt.Fprintf(c.output, "[View full details on CodeCargo](%s)\n", workflowRunLink)
 		} else {
@@ -218,6 +224,7 @@ func (c *SummaryCmd) Run() error {
 		ordinalSteps:    ordinalSteps,
 		auditMode:       auditMode,
 		workflowRunLink: workflowRunLink,
+		postures:        postures,
 	})
 
 	return nil

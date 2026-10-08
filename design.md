@@ -551,8 +551,19 @@ attach-before-program guard that makes TC attach last.
 
 **What TC still enforces.** Traffic with no local socket in our cgroup root:
 `AF_PACKET`/raw sends, non-IP frames, genuinely forwarded packets, TCP
-minisockets — plus everything, if the cgroup hook fails to load or attach
-(warn-only by design, because TC remains).
+minisockets.
+
+**When the hook cannot come up.** Losing the hook (load or attach failure,
+no step attribution, a failed raise) means different things per rung. Under
+`--container-egress=observe` the hook is measurement: the loss warns, the run
+continues with TC enforcing as always, and the job summary lists the posture
+as not applied — an observe run that never ran reads exactly like a clean
+one otherwise. Under `--container-egress=enforce` the loss fails startup: TC
+would still police post-NAT traffic, but not the pre-NAT, loopback, and
+bridge egress the operator asked to have enforced, and reporting that after
+the job ran is the fail-open direction. `--tls-sni` follows the same rule
+for its enforce rungs. The policy lives in one place, `postureLedger`
+(`cmd/postures.go`).
 
 **One post-verdict pipeline.** Both hooks feed the same steps in
 `pkg/events` (`outcome.go`): hostname/CNAME resolution, late-allow

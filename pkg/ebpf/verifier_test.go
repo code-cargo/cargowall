@@ -86,3 +86,31 @@ func TestLogVerifierRejection(t *testing.T) {
 	assert.False(t, LogVerifierRejection(logger, "tcbpf", errors.New("open /sys/fs/bpf: permission denied")))
 	assert.Empty(t, buf.String())
 }
+
+func TestRejectionString(t *testing.T) {
+	// The Blacksmith rejection, as a degraded posture reports it.
+	err := fmt.Errorf("program cg_origin_egress: load program: %w", &ebpf.VerifierError{
+		Cause: unix.E2BIG,
+		Log:   []string{"BPF program is too large. Processed 1000001 insn"},
+	})
+	r, ok := ParseRejection(err)
+	assert.True(t, ok)
+	assert.Equal(t, "verifier rejected cg_origin_egress: 1,000,001 insns", r.String())
+	assert.Equal(t, "verifier rejected cg_origin_egress on 6.6.141: 1,000,001 insns", r.On("6.6.141"))
+
+	// No count in the log: the cause stands in, never a zero.
+	r, ok = ParseRejection(fmt.Errorf("program tc_egress: load program: %w", &ebpf.VerifierError{
+		Cause: unix.EINVAL, Log: []string{"R6 invalid mem access 'mem_or_null'"},
+	}))
+	assert.True(t, ok)
+	assert.Equal(t, "verifier rejected tc_egress: "+unix.EINVAL.Error(), r.String())
+
+	_, ok = ParseRejection(errors.New("open /sys/fs/bpf: permission denied"))
+	assert.False(t, ok)
+}
+
+func TestGroupThousands(t *testing.T) {
+	for n, want := range map[int]string{0: "0", 999: "999", 1000: "1,000", 51702: "51,702", 1000001: "1,000,001", -1234: "-1,234"} {
+		assert.Equal(t, want, groupThousands(n))
+	}
+}

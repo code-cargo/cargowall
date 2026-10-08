@@ -45,16 +45,17 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// redirectStateFiles points the effective-mode and downgrade state files at
-// tempdir paths for the duration of the test, restoring the real paths on
-// cleanup.
+// redirectStateFiles points the effective-mode, downgrade, and postures
+// state files at tempdir paths for the duration of the test, restoring the
+// real paths on cleanup.
 func redirectStateFiles(t *testing.T) (modePath, downgradePath string) {
 	t.Helper()
-	oldMode, oldDowngrade := modeFile, downgradeFile
+	oldMode, oldDowngrade, oldPostures := modeFile, downgradeFile, posturesFile
 	dir := t.TempDir()
 	modeFile = filepath.Join(dir, "cargowall-mode")
 	downgradeFile = filepath.Join(dir, "cargowall-downgrade")
-	t.Cleanup(func() { modeFile, downgradeFile = oldMode, oldDowngrade })
+	posturesFile = filepath.Join(dir, "cargowall-postures")
+	t.Cleanup(func() { modeFile, downgradeFile, posturesFile = oldMode, oldDowngrade, oldPostures })
 	return modeFile, downgradeFile
 }
 

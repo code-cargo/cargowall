@@ -235,8 +235,8 @@ func (c *StartCmd) AfterApply() error {
 	// nil and the requested posture evaporates. (Runs after preset
 	// expansion, so --github-action — which implies both — satisfies the
 	// requirement.) Step attribution can still fail at RUNTIME (no kernel
-	// BTF, no Runner.Worker); that residual downgrade is warned loudly in
-	// newContainerAttribution.
+	// BTF, no Runner.Worker); under an enforce rung that fails startup too
+	// (postureLedger.lose), under observe it warns.
 	// A zero value is the unset flag, not a bad one: Kong fills the default
 	// when it parses, but a StartCmd built in code (tests, embedders) reaches
 	// here with "" and must mean off rather than fail validation.
@@ -263,8 +263,8 @@ func (c *StartCmd) AfterApply() error {
 	// hook's program, so it cannot adjudicate a packet that hook never sees.
 	// (Runs after preset expansion, so --github-action satisfies the step
 	// requirement.) Step attribution can still fail at RUNTIME (no kernel BTF,
-	// no Runner.Worker); that residual downgrade is warned loudly in
-	// newContainerAttribution.
+	// no Runner.Worker); under an enforce rung that fails startup too
+	// (postureLedger.lose), under observe it warns.
 	if egress > 0 && !c.StepAttribution {
 		return fmt.Errorf("--container-egress=%s requires --step-attribution "+
 			"(container attribution rides on step attribution)", c.ContainerEgress)
@@ -339,13 +339,14 @@ func (c *StartCmd) applyCIPreset(mode CIMode) {
 	case CIModeGithubAction:
 		c.AutoAllowGitHubHosts = true
 		// Per-step attribution is GitHub-only: it keys off the Runner.Worker
-		// process. Degrades to a warning when the worker or kernel BTF is
-		// missing, so it is safe to imply here.
+		// process. Not an enforcement layer: when the worker or kernel BTF is
+		// missing it warns, and the layers riding it report their own loss.
 		c.StepAttribution = true
-		// The cgroup egress hook rides on step attribution and degrades the
-		// same way (audit-only observer + docker-events tagging, warn-only on
-		// any failure), so observe is equally safe to imply. Never lowers a
-		// posture the operator asked for explicitly.
+		// The cgroup egress hook rides on step attribution. The implied rung
+		// is observe because losing observe stays non-fatal (warned and
+		// listed in the summary); losing enforce fails startup, so enforce
+		// is never implied. Never lowers a posture the operator asked for
+		// explicitly.
 		if rung(containerEgressRungs, c.ContainerEgress) < rung(containerEgressRungs, ContainerEgressObserve) {
 			c.ContainerEgress = ContainerEgressObserve
 		}

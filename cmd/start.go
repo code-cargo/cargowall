@@ -569,16 +569,20 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	}
 
 	// Step attribution: tag processes/sockets with the workflow step that
-	// created them so audit events carry a causal step ordinal. Optional by
-	// design — it needs kernel BTF and a Runner.Worker process, and a failure
-	// here must never degrade enforcement, so it only warns.
+	// created them so audit events carry a causal step ordinal. Not an
+	// enforcement layer — it needs kernel BTF and a Runner.Worker process,
+	// and its own failure only warns. The cgroup egress hook rides it, so
+	// stepErr is handed on and that layer reports the loss through the
+	// posture ledger (fatal under --container-egress=enforce).
 	var stepTracker *steps.Tracker
+	var stepErr error
 	if cmd.StepAttribution {
 		tracker, err := steps.Start(&objs, steps.Options{
 			WorkerPID:   cmd.RunnerWorkerPID,
 			OrdinalBase: uint64(cmd.StepOrdinalBase),
 		}, auditLogger, logger)
 		if err != nil {
+			stepErr = err
 			logger.Warn("Step attribution disabled", "error", err)
 		} else {
 			stepTracker = tracker
@@ -598,8 +602,14 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// two-phase boot order — observer before the event reader, docker
 	// tracking after the dockerd restart — lives in containerAttribution;
 	// a nil value is the disabled feature and every call below no-ops.
-	attribution := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
-		resolveMode(cmd.ContainerEgress), stepTracker, &objs, logger)
+	// postures decides what losing a requested layer means: a lost enforce
+	// rung fails startup, a lost observe rung is recorded for the summary.
+	postures := newPostures(cmd, caps.KernelVersion, logger)
+	attribution, err := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
+		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, &objs, postures, logger)
+	if err != nil {
+		return err
+	}
 	defer attribution.Close()
 
 	// Userspace half of the loopback carve-out pair — must run before
@@ -612,8 +622,11 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// resolutions below — so destinations resolved at boot are L7-scoped. The
 	// mode gate stays off until l7f.raise() below, so nothing is adjudicated
 	// against cold scope maps. nil means the feature is off.
-	l7f := startL7(cmd, attribution.originObserver(), attribution.containerEnricher(),
-		configMgr, dnsServer, auditLogger, notificationTracker, logger)
+	l7f, err := startL7(cmd, attribution.originObserver(), attribution.containerEnricher(),
+		configMgr, dnsServer, auditLogger, notificationTracker, postures, logger)
+	if err != nil {
+		return err
+	}
 
 	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
 	// load-bearing under --container-egress=enforce — the docker bridge
@@ -794,6 +807,17 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	if err != nil {
 		return fmt.Errorf("failed to attach TC egress: %w", err)
 	}
+	// Registered with teardowns, not a bare defer: on TCX kernels the link
+	// dies with the process fd anyway, but the legacy clsact fallback
+	// (kernels <6.6) installs a netlink cls_bpf filter that OUTLIVES the
+	// process — a force-exit that skipped this would leave the filter
+	// attached and enforcing with nothing left to remove it. Registered
+	// before anything below can fail startup, for the same reason.
+	defer teardowns.add(func() {
+		if cerr := egressLink.Close(); cerr != nil {
+			logger.Warn("Failed to detach TC egress", "error", cerr)
+		}
+	})()
 
 	// Same ordering contract, applied to the cgroup egress hook: it has been
 	// attached since early startup (the join store needs it) but inert in
@@ -809,22 +833,18 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// — so a failed origin SetMode says nothing about whether L7 can
 	// adjudicate. Gating the raise on it meant one map-write failure left L7 in
 	// OFF, including --tls-sni's observe mode, whose measurement is the only
-	// data the enforce rollout is decided on. enableMode logs its own failure
-	// and each posture's log line now states its own truth.
-	_ = attribution.enableMode()
-	if l7f != nil {
-		l7f.raise()
+	// data the enforce rollout is decided on. Each returns an error only for
+	// a lost enforce rung, which fails startup.
+	if err := attribution.enableMode(); err != nil {
+		return err
 	}
-	// Registered with teardowns, not a bare defer: on TCX kernels the link
-	// dies with the process fd anyway, but the legacy clsact fallback
-	// (kernels <6.6) installs a netlink cls_bpf filter that OUTLIVES the
-	// process — a force-exit that skipped this would leave the filter
-	// attached and enforcing with nothing left to remove it.
-	defer teardowns.add(func() {
-		if cerr := egressLink.Close(); cerr != nil {
-			logger.Warn("Failed to detach TC egress", "error", cerr)
+	if l7f != nil {
+		if err := l7f.raise(); err != nil {
+			return err
 		}
-	})()
+	}
+	// Every posture is final here: publish the record before ready.
+	postures.write()
 
 	// Log appropriate config source
 	switch {
@@ -1073,7 +1093,7 @@ func startupInterrupted(ctx context.Context, logger *slog.Logger, phase string) 
 // removeStaleStateFiles clears the state files a previous run may have left
 // behind, warning (not failing) on anything but absence.
 func removeStaleStateFiles(cmd *StartCmd, logger *slog.Logger) {
-	for _, path := range []string{cmd.ReadyFile, cmd.FailureFile, modeFile, downgradeFile} {
+	for _, path := range []string{cmd.ReadyFile, cmd.FailureFile, modeFile, downgradeFile, posturesFile} {
 		if path == "" {
 			continue
 		}

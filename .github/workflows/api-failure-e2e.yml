@@ -55,12 +55,18 @@ jobs:
   audit-downgrade:
     name: Retrieval failure downgrades to audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     timeout-minutes: 15
     # Shared by both binaries: `start` binds it via kong env, and
     # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
     env:
       CARGOWALL_PIDFILE: /tmp/cargowall.pid
     steps:
+      - name: CargoWall
+        uses: code-cargo/cargowall-action@7943209964cc5472fee8aa1e02cde8a2f0dd0414 # v1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: actions/setup-go@v6
@@ -173,12 +179,18 @@ jobs:
   hung-downgrade:
     name: Hung fetch downgrades to audit inside the readiness window
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     timeout-minutes: 15
     # Shared by both binaries: `start` binds it via kong env, and
     # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
     env:
       CARGOWALL_PIDFILE: /tmp/cargowall.pid
     steps:
+      - name: CargoWall
+        uses: code-cargo/cargowall-action@7943209964cc5472fee8aa1e02cde8a2f0dd0414 # v1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: actions/setup-go@v6
@@ -277,12 +289,18 @@ jobs:
   fail-lockdown:
     name: Retrieval failure locks down under fail
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     timeout-minutes: 15
     # Shared by both binaries: `start` binds it via kong env, and
     # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
     env:
       CARGOWALL_PIDFILE: /tmp/cargowall.pid
     steps:
+      - name: CargoWall
+        uses: code-cargo/cargowall-action@7943209964cc5472fee8aa1e02cde8a2f0dd0414 # v1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: actions/setup-go@v6
@@ -381,12 +399,18 @@ jobs:
   not-onboarded:
     name: 404 must not change posture even under fail
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     timeout-minutes: 15
     # Shared by both binaries: `start` binds it via kong env, and
     # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
     env:
       CARGOWALL_PIDFILE: /tmp/cargowall.pid
     steps:
+      - name: CargoWall
+        uses: code-cargo/cargowall-action@7943209964cc5472fee8aa1e02cde8a2f0dd0414 # v1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: actions/setup-go@v6
@@ -470,12 +494,18 @@ jobs:
   sigterm-unwind:
     name: SIGTERM mid-fetch unwinds host mutations
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     timeout-minutes: 15
     # Shared by both binaries: `start` binds it via kong env, and
     # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
     env:
       CARGOWALL_PIDFILE: /tmp/cargowall.pid
     steps:
+      - name: CargoWall
+        uses: code-cargo/cargowall-action@7943209964cc5472fee8aa1e02cde8a2f0dd0414 # v1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: actions/setup-go@v6
@@ -578,6 +608,10 @@ jobs:
   double-sigterm-force:
     name: Second SIGTERM force-tears down host mutations
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     timeout-minutes: 15
     env:
       CARGOWALL_PIDFILE: /tmp/cargowall.pid
@@ -587,6 +621,8 @@ jobs:
       # one that actually restores host state.
       OTEL_EXPORTER_OTLP_ENDPOINT: http://10.255.255.1:4318
     steps:
+      - name: CargoWall
+        uses: code-cargo/cargowall-action@7943209964cc5472fee8aa1e02cde8a2f0dd0414 # v1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: actions/setup-go@v6

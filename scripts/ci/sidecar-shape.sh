@@ -51,7 +51,9 @@ pod() {
   docker pull -q "$SIDECAR_IMAGE"
   sudo rm -rf "$STATE_DIR"
   mkdir -p "$STATE_DIR"
-  cat > "$STATE_DIR/config.json" <<JSON
+  # No rule for the upstream: start auto-allows the --dns-upstream host,
+  # and the SaaS sidecar relies on exactly that.
+  cat > "$STATE_DIR/config.json" <<'JSON'
 {
   "defaultAction": "deny",
   "rules": [
@@ -59,12 +61,6 @@ pod() {
       "type": "hostname",
       "value": "github.com",
       "ports": [{"port": 443, "protocol": "tcp"}],
-      "action": "allow"
-    },
-    {
-      "type": "cidr",
-      "value": "$DNS_UPSTREAM_IP/32",
-      "ports": [{"port": 53, "protocol": "udp"}, {"port": 53, "protocol": "tcp"}],
       "action": "allow"
     }
   ]
@@ -80,7 +76,9 @@ JSON
 
 # What this locks: no --github-action or --gitlab-ci, so no iptables DNS
 # redirect and no Docker DNS rewrite; the workload reaches the proxy at
-# 127.0.0.1:53 only through the pod resolv.conf. Policy comes from a file
+# 127.0.0.1:53 only through the pod resolv.conf. Query filtering stays off,
+# as it is for the operator-injected sidecar, so a denied name still
+# resolves and the block lands at TC. Policy comes from a file
 # rather than an API fetch. The ready file sits on the bind mount so the
 # host can see it; the operator's probe reads the default
 # /tmp/cargowall-ready inside the container instead.
@@ -96,24 +94,20 @@ start() {
       --dns-upstream "$DNS_UPSTREAM_IP:53" \
       --audit-log /state/audit.json \
       --ready-file /state/ready \
+      --failure-file /state/failed \
       --debug > /dev/null
   echo "✅ sidecar started"
 }
 
+# Both sentinels sit on the bind mount, so the host-side wait-ready sees a
+# failure reason instead of timing out on a missing ready file.
 wait_ready() {
-  for _ in $(seq 1 60); do
-    if [ -f "$STATE_DIR/ready" ]; then
-      echo "✅ sidecar ready"
-      return
-    fi
-    if [ "$(docker inspect -f '{{.State.Running}}' cw-sidecar)" != "true" ]; then
-      echo "❌ sidecar exited before ready (exit $(docker inspect -f '{{.State.ExitCode}}' cw-sidecar))"
-      exit 1
-    fi
-    sleep 0.5
-  done
-  echo "❌ sidecar not ready after 30s"
-  exit 1
+  if ! ./bin/cargowall wait-ready --ready-file "$STATE_DIR/ready" \
+      --failure-file "$STATE_DIR/failed" --timeout 30s; then
+    echo "❌ sidecar not ready (running=$(docker inspect -f '{{.State.Running}}' cw-sidecar), exit=$(docker inspect -f '{{.State.ExitCode}}' cw-sidecar))"
+    exit 1
+  fi
+  echo "✅ sidecar ready"
 }
 
 # Guards the harness itself: if a docker default ever changes, the job must
@@ -199,10 +193,10 @@ verify_audit() {
   echo "✅ audit log records both blocks, nothing for the allowed host"
 }
 
-# SIGTERM, as kubelet sends it. A clean teardown exits 0 and detaches TC, so
+# SIGTERM, as kubelet sends it, with kubelet's default 30s grace period. A clean teardown exits 0 and detaches TC, so
 # the workload's egress is unfiltered again.
 stop() {
-  docker stop -t 15 cw-sidecar > /dev/null
+  docker stop -t 30 cw-sidecar > /dev/null
   code=$(docker inspect -f '{{.State.ExitCode}}' cw-sidecar)
   if [ "$code" -ne 0 ]; then
     echo "❌ sidecar exited $code on SIGTERM"

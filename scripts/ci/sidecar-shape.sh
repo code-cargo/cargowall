@@ -99,15 +99,23 @@ start() {
   echo "✅ sidecar started"
 }
 
-# Both sentinels sit on the bind mount, so the host-side wait-ready sees a
-# failure reason instead of timing out on a missing ready file.
+# The waiter runs inside the sidecar's pid namespace, where the sentinels'
+# pid stamp (1) is the live cargowall; a host-side wait-ready would see
+# systemd at pid 1 and fall back to the mtime anchor, timing out on an
+# early ready and ignoring an early failure. If the sidecar has already
+# exited, exec fails at once and the failure sentinel on the bind mount is
+# the reason.
 wait_ready() {
-  if ! ./bin/cargowall wait-ready --ready-file "$STATE_DIR/ready" \
-      --failure-file "$STATE_DIR/failed" --timeout 30s; then
-    echo "❌ sidecar not ready (running=$(docker inspect -f '{{.State.Running}}' cw-sidecar), exit=$(docker inspect -f '{{.State.ExitCode}}' cw-sidecar))"
-    exit 1
+  if docker exec cw-sidecar cargowall wait-ready \
+      --ready-file /state/ready --failure-file /state/failed --timeout 30s; then
+    echo "✅ sidecar ready"
+    return
   fi
-  echo "✅ sidecar ready"
+  echo "❌ sidecar not ready (running=$(docker inspect -f '{{.State.Running}}' cw-sidecar), exit=$(docker inspect -f '{{.State.ExitCode}}' cw-sidecar))"
+  if [ -s "$STATE_DIR/failed" ]; then
+    echo "failure sentinel: $(head -c 2048 "$STATE_DIR/failed")"
+  fi
+  exit 1
 }
 
 # Guards the harness itself: if a docker default ever changes, the job must
@@ -130,6 +138,17 @@ verify_shape() {
     echo "❌ sidecar and workload are in different network namespaces"
     exit 1
   fi
+  if [ "$(ns cw-client net)" = "$(host_ns net)" ]; then
+    echo "❌ the pod netns is the host's — TC would attach to the runner"
+    exit 1
+  fi
+  # The pod dnsConfig: the workload's only resolver is the proxy.
+  nameservers=$(docker exec cw-client grep '^nameserver' /etc/resolv.conf)
+  if [ "$nameservers" != "nameserver 127.0.0.1" ]; then
+    echo "❌ workload resolv.conf does not point only at 127.0.0.1"
+    docker exec cw-client cat /etc/resolv.conf
+    exit 1
+  fi
   if [ "$(docker exec cw-sidecar cat /proc/self/cgroup)" != "0::/" ]; then
     echo "❌ sidecar is not at its cgroup namespace root"
     docker exec cw-sidecar cat /proc/self/cgroup
@@ -141,7 +160,7 @@ verify_shape() {
       exit 1
     fi
   done
-  echo "✅ shape: own pid + cgroup namespace, shared netns, one pod cgroup"
+  echo "✅ shape: own pid + cgroup namespace, shared non-host netns, resolver 127.0.0.1, one pod cgroup"
 }
 
 # Resolution goes through the proxy at 127.0.0.1 (the pod resolv.conf); the

@@ -1,0 +1,60 @@
+name: ARC Probe
+
+# Records what an ARC runner pod looks like from inside the runner container
+# (namespaces, cgroup placement, dind visibility, container DNS path) for
+# pod-aware attribution work. Manual only: the runners are self-hosted and
+# this repository is public, so nothing a fork can trigger may target them.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner scale set label to probe
+        type: string
+        default: codecargo-dev-runner-4x
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe ${{ inputs.runner }}
+    if: github.repository == 'code-cargo/cargowall'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Built on the runner: the release artifacts are amd64 and these
+      # runners are arm64. The BPF objects are committed, so this is a plain
+      # Go build.
+      - name: Build cargowall
+        run: CGO_ENABLED=0 go build -o bin/cargowall ./cargowall.go
+
+      # The job body lives in scripts/ci/arc-probe.sh; this YAML is wiring.
+      # shape and host-cgroup run before cargowall so they record the pod as
+      # the runner found it.
+      - name: Pod shape
+        run: bash scripts/ci/arc-probe.sh shape
+
+      - name: Host cgroup mount
+        run: bash scripts/ci/arc-probe.sh host-cgroup
+
+      # Audit mode: this probes shared infrastructure, so it blocks nothing.
+      - name: Start CargoWall (audit)
+        uses: code-cargo/cargowall-action@26aec383085c2e0ce11fdebc2f5d942bcc43db25 # main, v2.0.0-rc.10
+        with:
+          mode: audit
+          offline: 'true'
+          binary-path: ./bin/cargowall
+
+      # Its own step so the probe traffic carries its own step ordinal.
+      - name: DNS probe (host and dind container)
+        run: bash scripts/ci/arc-probe.sh dns-probe
+
+      - name: Attribution report
+        if: always()
+        run: bash scripts/ci/arc-probe.sh report

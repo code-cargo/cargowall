@@ -16,16 +16,25 @@
 # Body of the test-cargowall-sidecar-shape CI job: cargowall as a sidecar
 # container in a Kubernetes-style pod, the shape the CodeCargo SaaS runs it
 # in. Every other e2e job runs the binary on the host, so this is the only
-# coverage of an agent with its own pid and cgroup namespaces sharing a
-# network namespace with the workload.
+# coverage of an agent with its own pid namespace sharing a network
+# namespace with the workload, on a host where other pods run beside it.
 #
 # The pod is built from plain docker containers:
 #   cw-pod      owns the network namespace (the pause container); its
 #               resolv.conf points at 127.0.0.1, as the pod dnsConfig does
-#   cw-sidecar  privileged cargowall, private pid + cgroup namespace, joined
-#               to cw-pod's netns; no CI preset, file policy (see start)
+#   cw-sidecar  privileged cargowall, private pid namespace, the HOST cgroup
+#               namespace, joined to cw-pod's netns; no CI preset, file
+#               policy (see start)
 #   cw-client   the workload, joined to cw-pod's netns
 # All three sit under one --cgroup-parent slice, the pod cgroup.
+#
+# The host cgroup namespace is what the SaaS sidecar gets: the operator sets
+# privileged and nothing else, and on cgroup v2 containerd's CRI gives a
+# container a cgroup namespace only when it is not privileged. Its
+# /sys/fs/cgroup is therefore the node's whole tree.
+#
+#   cw-neighbour  a second pod (own netns, own slice) with no sidecar: a
+#                 sidecar's enforcement must stay inside its own pod
 #
 # ci.yml stays wiring: one workflow step per subcommand.
 #
@@ -34,6 +43,7 @@
 set -euo pipefail
 
 POD_SLICE=cwpod.slice
+NEIGHBOUR_SLICE=cwneighbour.slice
 STATE_DIR=/tmp/cw-sidecar
 CLIENT_IMAGE=curlimages/curl:8.10.1
 SIDECAR_IMAGE=alpine:3.20
@@ -71,7 +81,9 @@ JSON
   docker run -d --name cw-client --cgroup-parent "$POD_SLICE" \
     --network container:cw-pod \
     --entrypoint sleep "$CLIENT_IMAGE" infinity > /dev/null
-  echo "✅ pod up: cw-pod (netns owner), cw-client (workload)"
+  docker run -d --name cw-neighbour --cgroup-parent "$NEIGHBOUR_SLICE" \
+    --entrypoint sleep "$CLIENT_IMAGE" infinity > /dev/null
+  echo "✅ pod up: cw-pod (netns owner), cw-client (workload); neighbour pod cw-neighbour"
 }
 
 # What this locks: no --github-action or --gitlab-ci, so no iptables DNS
@@ -85,7 +97,7 @@ JSON
 # ready file disappear in stop.
 start() {
   docker run -d --name cw-sidecar --cgroup-parent "$POD_SLICE" \
-    --privileged --cgroupns private \
+    --privileged --cgroupns host \
     --network container:cw-pod \
     -v "$PWD/bin/cargowall:/usr/local/bin/cargowall:ro" \
     -v "$STATE_DIR:/state" \
@@ -125,16 +137,18 @@ verify_shape() {
   ns() { docker exec "$1" readlink "/proc/self/ns/$2"; }
   host_ns() { sudo readlink "/proc/1/ns/$1"; }
 
-  for kind in pid cgroup; do
-    if [ "$(ns cw-sidecar "$kind")" = "$(host_ns "$kind")" ]; then
-      echo "❌ sidecar shares the host $kind namespace"
-      exit 1
-    fi
-    if [ "$(ns cw-sidecar "$kind")" = "$(ns cw-client "$kind")" ]; then
-      echo "❌ sidecar shares the workload's $kind namespace"
-      exit 1
-    fi
-  done
+  if [ "$(ns cw-sidecar pid)" = "$(host_ns pid)" ]; then
+    echo "❌ sidecar shares the host pid namespace"
+    exit 1
+  fi
+  if [ "$(ns cw-sidecar pid)" = "$(ns cw-client pid)" ]; then
+    echo "❌ sidecar shares the workload's pid namespace"
+    exit 1
+  fi
+  if [ "$(ns cw-sidecar cgroup)" != "$(host_ns cgroup)" ]; then
+    echo "❌ sidecar has its own cgroup namespace; a privileged pod container does not"
+    exit 1
+  fi
   if [ "$(ns cw-sidecar net)" != "$(ns cw-client net)" ]; then
     echo "❌ sidecar and workload are in different network namespaces"
     exit 1
@@ -150,9 +164,14 @@ verify_shape() {
     docker exec cw-client cat /etc/resolv.conf
     exit 1
   fi
-  if [ "$(docker exec cw-sidecar cat /proc/self/cgroup)" != "0::/" ]; then
-    echo "❌ sidecar is not at its cgroup namespace root"
+  # In the host cgroup namespace the sidecar sees its absolute path.
+  if ! docker exec cw-sidecar grep -q "^0::/$POD_SLICE/" /proc/self/cgroup; then
+    echo "❌ sidecar does not see its own absolute cgroup path under $POD_SLICE"
     docker exec cw-sidecar cat /proc/self/cgroup
+    exit 1
+  fi
+  if [ "$(ns cw-neighbour net)" = "$(ns cw-client net)" ]; then
+    echo "❌ neighbour pod shares the pod's netns"
     exit 1
   fi
   for c in cw-sidecar cw-client; do
@@ -161,7 +180,7 @@ verify_shape() {
       exit 1
     fi
   done
-  echo "✅ shape: own pid + cgroup namespace, shared non-host netns, resolver 127.0.0.1, one pod cgroup"
+  echo "✅ shape: own pid ns, host cgroup ns, shared non-host netns, resolver 127.0.0.1, one pod cgroup, separate neighbour pod"
 }
 
 # Resolution goes through the proxy at 127.0.0.1 (the pod resolv.conf); the
@@ -188,6 +207,15 @@ blocked_ip() {
   echo "✅ 1.1.1.1 blocked"
 }
 
+# 1.1.1.1 is blocked in the pod; from the neighbour pod it must not be.
+neighbour() {
+  if ! docker exec cw-neighbour curl -sf --connect-timeout 10 --max-time 30 -o /dev/null http://1.1.1.1; then
+    echo "❌ 1.1.1.1 blocked from the neighbour pod — enforcement leaked out of the sidecar's pod"
+    exit 1
+  fi
+  echo "✅ neighbour pod unaffected"
+}
+
 verify_audit() {
   if ! sudo test -s "$AUDIT_LOG"; then
     echo "❌ audit log not written"
@@ -210,7 +238,12 @@ verify_audit() {
     echo "❌ github.com was blocked"
     exit 1
   fi
-  echo "✅ audit log records both blocks, nothing for the allowed host"
+  neighbour_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' cw-neighbour)
+  if [ "$(sudo jq -s --arg ip "$neighbour_ip" '[.[] | select(.src_ip == $ip)] | length' "$AUDIT_LOG")" -ne 0 ]; then
+    echo "❌ audit log has events from the neighbour pod ($neighbour_ip)"
+    exit 1
+  fi
+  echo "✅ audit log records both blocks, nothing for the allowed host or the neighbour pod"
 }
 
 # SIGTERM, as kubelet sends it, with kubelet's default 30s grace period. A clean teardown exits 0 and detaches TC, so
@@ -240,7 +273,7 @@ logs() {
 }
 
 cleanup() {
-  docker rm -f cw-client cw-sidecar cw-pod > /dev/null 2>&1 || true
+  docker rm -f cw-client cw-sidecar cw-pod cw-neighbour > /dev/null 2>&1 || true
 }
 
 case "${1:-}" in
@@ -251,6 +284,7 @@ case "${1:-}" in
   allowed) allowed ;;
   blocked) blocked ;;
   blocked-ip) blocked_ip ;;
+  neighbour) neighbour ;;
   verify-audit) verify_audit ;;
   stop) stop ;;
   logs) logs ;;

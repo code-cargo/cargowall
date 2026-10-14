@@ -515,8 +515,8 @@ jobs:
 
       # The job body lives in scripts/ci/sidecar-shape.sh; this YAML is
       # wiring only. The pod is three docker containers sharing one netns;
-      # cargowall runs in its own pid and cgroup namespace, as the SaaS
-      # sidecar does.
+      # cargowall runs in its own pid namespace and the host cgroup
+      # namespace, as the privileged SaaS sidecar does, beside a second pod.
       - name: Build the pod (netns owner + workload)
         run: bash scripts/ci/sidecar-shape.sh pod
 
@@ -537,6 +537,9 @@ jobs:
 
       - name: Disallowed bare IP blocked
         run: bash scripts/ci/sidecar-shape.sh blocked-ip
+
+      - name: Neighbour pod unaffected
+        run: bash scripts/ci/sidecar-shape.sh neighbour
 
       - name: Validate audit log
         run: bash scripts/ci/sidecar-shape.sh verify-audit

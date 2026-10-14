@@ -79,9 +79,10 @@ JSON
 # 127.0.0.1:53 only through the pod resolv.conf. Query filtering stays off,
 # as it is for the operator-injected sidecar, so a denied name still
 # resolves and the block lands at TC. Policy comes from a file
-# rather than an API fetch. The ready file sits on the bind mount so the
-# host can see it; the operator's probe reads the default
-# /tmp/cargowall-ready inside the container instead.
+# rather than an API fetch. Readiness is probed inside the sidecar, as the
+# operator's probe is (see wait_ready); the sentinels sit on the bind mount
+# so the host can still read the failure file after an exit and watch the
+# ready file disappear in stop.
 start() {
   docker run -d --name cw-sidecar --cgroup-parent "$POD_SLICE" \
     --privileged --cgroupns private \
@@ -143,7 +144,7 @@ verify_shape() {
     exit 1
   fi
   # The pod dnsConfig: the workload's only resolver is the proxy.
-  nameservers=$(docker exec cw-client grep '^nameserver' /etc/resolv.conf)
+  nameservers=$(docker exec cw-client grep '^nameserver' /etc/resolv.conf || true)
   if [ "$nameservers" != "nameserver 127.0.0.1" ]; then
     echo "❌ workload resolv.conf does not point only at 127.0.0.1"
     docker exec cw-client cat /etc/resolv.conf

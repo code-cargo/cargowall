@@ -23,8 +23,7 @@
 #   cw-pod      owns the network namespace (the pause container); its
 #               resolv.conf points at 127.0.0.1, as the pod dnsConfig does
 #   cw-sidecar  privileged cargowall, private pid + cgroup namespace, joined
-#               to cw-pod's netns; non-GitHub mode with the SaaS flag set,
-#               an offline policy file standing in for the NATS policy hook
+#               to cw-pod's netns; no CI preset, file policy (see start)
 #   cw-client   the workload, joined to cw-pod's netns
 # All three sit under one --cgroup-parent slice, the pod cgroup.
 #
@@ -79,8 +78,12 @@ JSON
   echo "✅ pod up: cw-pod (netns owner), cw-client (workload)"
 }
 
-# The operator's flag set (cargo-operator buildCargoWallSidecar) minus the
-# NATS policy hook, which falls through to --config when absent.
+# What this locks: no --github-action or --gitlab-ci, so no iptables DNS
+# redirect and no Docker DNS rewrite; the workload reaches the proxy at
+# 127.0.0.1:53 only through the pod resolv.conf. Policy comes from a file
+# rather than an API fetch. The ready file sits on the bind mount so the
+# host can see it; the operator's probe reads the default
+# /tmp/cargowall-ready inside the container instead.
 start() {
   docker run -d --name cw-sidecar --cgroup-parent "$POD_SLICE" \
     --privileged --cgroupns private \
@@ -209,8 +212,10 @@ stop() {
     echo "❌ ready sentinel left behind"
     exit 1
   fi
-  if ! client curl -sf --connect-timeout 10 --max-time 30 -o /dev/null --resolve example.com:443:"$(dig +short example.com A | head -1)" https://example.com; then
-    echo "❌ example.com still blocked after the sidecar stopped — teardown left a filter attached"
+  # The inverse of blocked_ip: a bare IP needs no resolver, and the pod's
+  # resolver died with the proxy.
+  if ! client curl -sf --connect-timeout 10 --max-time 30 -o /dev/null http://1.1.1.1; then
+    echo "❌ 1.1.1.1 still blocked after the sidecar stopped — teardown left a filter attached"
     exit 1
   fi
   echo "✅ clean SIGTERM teardown; workload egress unfiltered again"

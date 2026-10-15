@@ -54,8 +54,8 @@ AUDIT_LOG="$STATE_DIR/audit.json"
 
 client() { docker exec cw-client "$@"; }
 
-# Pull before anything joins the pod: once cargowall enforces, the pod's
-# DNS is the proxy and its policy does not allow a registry.
+# dockerd pulls from the host netns, which no filter touches; pulling here
+# only keeps the pull output out of the timed steps.
 pod() {
   docker pull -q "$CLIENT_IMAGE"
   docker pull -q "$SIDECAR_IMAGE"
@@ -124,8 +124,11 @@ wait_ready() {
     echo "✅ sidecar ready"
     return
   fi
-  echo "❌ sidecar not ready (running=$(docker inspect -f '{{.State.Running}}' cw-sidecar), exit=$(docker inspect -f '{{.State.ExitCode}}' cw-sidecar))"
-  if [ -s "$STATE_DIR/failed" ]; then
+  running=$(docker inspect -f '{{.State.Running}}' cw-sidecar)
+  echo "❌ sidecar not ready (running=$running, exit=$(docker inspect -f '{{.State.ExitCode}}' cw-sidecar))"
+  # A live waiter has already printed the reason; only an exited sidecar
+  # leaves the sentinel unread.
+  if [ "$running" != true ] && [ -s "$STATE_DIR/failed" ]; then
     echo "failure sentinel: $(head -c 2048 "$STATE_DIR/failed")"
   fi
   exit 1
@@ -134,26 +137,36 @@ wait_ready() {
 # Guards the harness itself: if a docker default ever changes, the job must
 # fail here rather than go on passing against a shape the SaaS does not run.
 verify_shape() {
+  # Assignments, not inline substitutions, so a container that died after
+  # wait-ready fails here under errexit instead of comparing empty strings.
   ns() { docker exec "$1" readlink "/proc/self/ns/$2"; }
-  host_ns() { sudo readlink "/proc/1/ns/$1"; }
+  host_pid=$(sudo readlink /proc/1/ns/pid)
+  host_cgroup=$(sudo readlink /proc/1/ns/cgroup)
+  host_net=$(sudo readlink /proc/1/ns/net)
+  sidecar_pid=$(ns cw-sidecar pid)
+  sidecar_cgroup=$(ns cw-sidecar cgroup)
+  sidecar_net=$(ns cw-sidecar net)
+  client_pid=$(ns cw-client pid)
+  client_net=$(ns cw-client net)
+  neighbour_net=$(ns cw-neighbour net)
 
-  if [ "$(ns cw-sidecar pid)" = "$(host_ns pid)" ]; then
+  if [ "$sidecar_pid" = "$host_pid" ]; then
     echo "❌ sidecar shares the host pid namespace"
     exit 1
   fi
-  if [ "$(ns cw-sidecar pid)" = "$(ns cw-client pid)" ]; then
+  if [ "$sidecar_pid" = "$client_pid" ]; then
     echo "❌ sidecar shares the workload's pid namespace"
     exit 1
   fi
-  if [ "$(ns cw-sidecar cgroup)" != "$(host_ns cgroup)" ]; then
+  if [ "$sidecar_cgroup" != "$host_cgroup" ]; then
     echo "❌ sidecar has its own cgroup namespace; a privileged pod container does not"
     exit 1
   fi
-  if [ "$(ns cw-sidecar net)" != "$(ns cw-client net)" ]; then
+  if [ "$sidecar_net" != "$client_net" ]; then
     echo "❌ sidecar and workload are in different network namespaces"
     exit 1
   fi
-  if [ "$(ns cw-client net)" = "$(host_ns net)" ]; then
+  if [ "$client_net" = "$host_net" ]; then
     echo "❌ the pod netns is the host's — TC would attach to the runner"
     exit 1
   fi
@@ -170,16 +183,21 @@ verify_shape() {
     docker exec cw-sidecar cat /proc/self/cgroup
     exit 1
   fi
-  if [ "$(ns cw-neighbour net)" = "$(ns cw-client net)" ]; then
+  if [ "$neighbour_net" = "$client_net" ]; then
     echo "❌ neighbour pod shares the pod's netns"
     exit 1
   fi
+  cgroup_of() { sudo cat "/proc/$(docker inspect -f '{{.State.Pid}}' "$1")/cgroup"; }
   for c in cw-sidecar cw-client; do
-    if ! sudo grep -q "/$POD_SLICE/" "/proc/$(docker inspect -f '{{.State.Pid}}' "$c")/cgroup"; then
+    if ! cgroup_of "$c" | grep -q "^0::/$POD_SLICE/"; then
       echo "❌ $c is not under the pod slice $POD_SLICE"
       exit 1
     fi
   done
+  if ! cgroup_of cw-neighbour | grep -q "^0::/$NEIGHBOUR_SLICE/"; then
+    echo "❌ cw-neighbour is not under its own slice $NEIGHBOUR_SLICE"
+    exit 1
+  fi
   echo "✅ shape: own pid ns, host cgroup ns, shared non-host netns, resolver 127.0.0.1, one pod cgroup, separate neighbour pod"
 }
 
@@ -191,23 +209,28 @@ allowed() {
   echo "✅ github.com reachable from the workload"
 }
 
-blocked() {
-  if client curl -sf --connect-timeout 5 --max-time 10 -o /dev/null https://example.com; then
-    echo "❌ example.com reachable — enforcement is not applied to the workload"
-    exit 1
-  fi
-  echo "✅ example.com blocked"
+# A TC drop of the SYN is a connect timeout (curl exit 28). Any other
+# failure, a resolve failure (6) above all, happened before TC and proves
+# nothing about enforcement.
+expect_blocked() {
+  rc=0
+  client curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$1" || rc=$?
+  case $rc in
+    0) echo "❌ $1 reachable — enforcement is not applied to the workload"; exit 1 ;;
+    28) echo "✅ $1 blocked" ;;
+    *) echo "❌ $1 failed with curl exit $rc, not a connect timeout — it never reached TC"; exit 1 ;;
+  esac
 }
 
-blocked_ip() {
-  if client curl -sf --connect-timeout 5 --max-time 10 -o /dev/null http://1.1.1.1; then
-    echo "❌ 1.1.1.1 reachable — enforcement is not applied to the workload"
-    exit 1
-  fi
-  echo "✅ 1.1.1.1 blocked"
-}
+blocked() { expect_blocked https://example.com; }
+
+blocked_ip() { expect_blocked http://1.1.1.1; }
 
 # 1.1.1.1 is blocked in the pod; from the neighbour pod it must not be.
+# TC lives in the pod's own netns and cannot reach the neighbour, so this
+# guards the cgroup side: the sidecar's cgroup programs attach at its
+# /sys/fs/cgroup, which in the host cgroup namespace is the node root, and
+# any of them that ever returns a verdict would drop this connection.
 neighbour() {
   if ! docker exec cw-neighbour curl -sf --connect-timeout 10 --max-time 30 -o /dev/null http://1.1.1.1; then
     echo "❌ 1.1.1.1 blocked from the neighbour pod — enforcement leaked out of the sidecar's pod"
@@ -217,21 +240,21 @@ neighbour() {
 }
 
 verify_audit() {
-  if ! sudo test -s "$AUDIT_LOG"; then
+  if ! test -s "$AUDIT_LOG"; then
     echo "❌ audit log not written"
     exit 1
   fi
-  count() { sudo jq -s "[.[] | select(.event_type == \"connection_blocked\" and .blocked == true) | select($1)] | length" "$AUDIT_LOG"; }
+  count() { jq -s "[.[] | select(.event_type == \"connection_blocked\" and .blocked == true) | select($1)] | length" "$AUDIT_LOG"; }
 
   # By name: the proxy resolved it, so the blocked IP carries the hostname.
   if [ "$(count '(.dst_hostname // "") | contains("example.com")')" -eq 0 ]; then
     echo "❌ no enforced connection_blocked for example.com"
-    sudo jq -s '.[] | select(.event_type == "connection_blocked")' "$AUDIT_LOG"
+    jq -s '.[] | select(.event_type == "connection_blocked")' "$AUDIT_LOG"
     exit 1
   fi
   if [ "$(count '.dst_ip == "1.1.1.1"')" -eq 0 ]; then
     echo "❌ no enforced connection_blocked for 1.1.1.1"
-    sudo jq -s '.[] | select(.event_type == "connection_blocked")' "$AUDIT_LOG"
+    jq -s '.[] | select(.event_type == "connection_blocked")' "$AUDIT_LOG"
     exit 1
   fi
   if [ "$(count '(.dst_hostname // "") | contains("github.com")')" -ne 0 ]; then
@@ -239,15 +262,16 @@ verify_audit() {
     exit 1
   fi
   neighbour_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' cw-neighbour)
-  if [ "$(sudo jq -s --arg ip "$neighbour_ip" '[.[] | select(.src_ip == $ip)] | length' "$AUDIT_LOG")" -ne 0 ]; then
+  if [ "$(jq -s --arg ip "$neighbour_ip" '[.[] | select(.src_ip == $ip)] | length' "$AUDIT_LOG")" -ne 0 ]; then
     echo "❌ audit log has events from the neighbour pod ($neighbour_ip)"
     exit 1
   fi
   echo "✅ audit log records both blocks, nothing for the allowed host or the neighbour pod"
 }
 
-# SIGTERM, as kubelet sends it, with kubelet's default 30s grace period. A clean teardown exits 0 and detaches TC, so
-# the workload's egress is unfiltered again.
+# SIGTERM, as kubelet sends it, with kubelet's default 30s grace period. A
+# clean teardown exits 0 and detaches TC, so the workload's egress is
+# unfiltered again.
 stop() {
   docker stop -t 30 cw-sidecar > /dev/null
   code=$(docker inspect -f '{{.State.ExitCode}}' cw-sidecar)

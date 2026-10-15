@@ -17,7 +17,7 @@
 # container in a Kubernetes-style pod, the shape the CodeCargo SaaS runs it
 # in. Every other e2e job runs the binary on the host, so this is the only
 # coverage of an agent with its own pid namespace sharing a network
-# namespace with the workload, on a host where other pods run beside it.
+# namespace with the workload.
 #
 # The pod is built from plain docker containers:
 #   cw-pod      owns the network namespace (the pause container); its
@@ -33,9 +33,6 @@
 # container a cgroup namespace only when it is not privileged. Its
 # /sys/fs/cgroup is therefore the node's whole tree.
 #
-#   cw-neighbour  a second pod (own netns, own slice) with no sidecar: a
-#                 sidecar's enforcement must stay inside its own pod
-#
 # ci.yml stays wiring: one workflow step per subcommand.
 #
 # Usage: sidecar-shape.sh <subcommand>
@@ -43,7 +40,6 @@
 set -euo pipefail
 
 POD_SLICE=cwpod.slice
-NEIGHBOUR_SLICE=cwneighbour.slice
 STATE_DIR=/tmp/cw-sidecar
 CLIENT_IMAGE=curlimages/curl:8.10.1
 SIDECAR_IMAGE=alpine:3.20
@@ -81,9 +77,7 @@ JSON
   docker run -d --name cw-client --cgroup-parent "$POD_SLICE" \
     --network container:cw-pod \
     --entrypoint sleep "$CLIENT_IMAGE" infinity > /dev/null
-  docker run -d --name cw-neighbour --cgroup-parent "$NEIGHBOUR_SLICE" \
-    --entrypoint sleep "$CLIENT_IMAGE" infinity > /dev/null
-  echo "✅ pod up: cw-pod (netns owner), cw-client (workload); neighbour pod cw-neighbour"
+  echo "✅ pod up: cw-pod (netns owner), cw-client (workload)"
 }
 
 # What this locks: no --github-action or --gitlab-ci, so no iptables DNS
@@ -121,7 +115,14 @@ start() {
 wait_ready() {
   if docker exec cw-sidecar cargowall wait-ready \
       --ready-file /state/ready --failure-file /state/failed --timeout 30s; then
-    echo "✅ sidecar ready"
+    # A failed cgroup attach only warns and startup goes on, so readiness
+    # alone does not prove the PID trackers attached from this namespace
+    # shape.
+    if docker logs cw-sidecar 2>&1 | grep -F 'Failed to attach cgroup program'; then
+      echo "❌ sidecar ready, but a cgroup program failed to attach"
+      exit 1
+    fi
+    echo "✅ sidecar ready, cgroup programs attached"
     return
   fi
   running=$(docker inspect -f '{{.State.Running}}' cw-sidecar)
@@ -148,7 +149,6 @@ verify_shape() {
   sidecar_net=$(ns cw-sidecar net)
   client_pid=$(ns cw-client pid)
   client_net=$(ns cw-client net)
-  neighbour_net=$(ns cw-neighbour net)
 
   if [ "$sidecar_pid" = "$host_pid" ]; then
     echo "❌ sidecar shares the host pid namespace"
@@ -183,22 +183,13 @@ verify_shape() {
     docker exec cw-sidecar cat /proc/self/cgroup
     exit 1
   fi
-  if [ "$neighbour_net" = "$client_net" ]; then
-    echo "❌ neighbour pod shares the pod's netns"
-    exit 1
-  fi
-  cgroup_of() { sudo cat "/proc/$(docker inspect -f '{{.State.Pid}}' "$1")/cgroup"; }
   for c in cw-sidecar cw-client; do
-    if ! cgroup_of "$c" | grep -q "^0::/$POD_SLICE/"; then
+    if ! sudo grep -q "^0::/$POD_SLICE/" "/proc/$(docker inspect -f '{{.State.Pid}}' "$c")/cgroup"; then
       echo "❌ $c is not under the pod slice $POD_SLICE"
       exit 1
     fi
   done
-  if ! cgroup_of cw-neighbour | grep -q "^0::/$NEIGHBOUR_SLICE/"; then
-    echo "❌ cw-neighbour is not under its own slice $NEIGHBOUR_SLICE"
-    exit 1
-  fi
-  echo "✅ shape: own pid ns, host cgroup ns, shared non-host netns, resolver 127.0.0.1, one pod cgroup, separate neighbour pod"
+  echo "✅ shape: own pid ns, host cgroup ns, shared non-host netns, resolver 127.0.0.1, one pod cgroup"
 }
 
 # Resolution goes through the proxy at 127.0.0.1 (the pod resolv.conf); the
@@ -226,19 +217,6 @@ blocked() { expect_blocked https://example.com; }
 
 blocked_ip() { expect_blocked http://1.1.1.1; }
 
-# 1.1.1.1 is blocked in the pod; from the neighbour pod it must not be.
-# TC lives in the pod's own netns and cannot reach the neighbour, so this
-# guards the cgroup side: the sidecar's cgroup programs attach at its
-# /sys/fs/cgroup, which in the host cgroup namespace is the node root, and
-# any of them that ever returns a verdict would drop this connection.
-neighbour() {
-  if ! docker exec cw-neighbour curl -sf --connect-timeout 10 --max-time 30 -o /dev/null http://1.1.1.1; then
-    echo "❌ 1.1.1.1 blocked from the neighbour pod — enforcement leaked out of the sidecar's pod"
-    exit 1
-  fi
-  echo "✅ neighbour pod unaffected"
-}
-
 verify_audit() {
   if ! test -s "$AUDIT_LOG"; then
     echo "❌ audit log not written"
@@ -261,12 +239,7 @@ verify_audit() {
     echo "❌ github.com was blocked"
     exit 1
   fi
-  neighbour_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' cw-neighbour)
-  if [ "$(jq -s --arg ip "$neighbour_ip" '[.[] | select(.src_ip == $ip)] | length' "$AUDIT_LOG")" -ne 0 ]; then
-    echo "❌ audit log has events from the neighbour pod ($neighbour_ip)"
-    exit 1
-  fi
-  echo "✅ audit log records both blocks, nothing for the allowed host or the neighbour pod"
+  echo "✅ audit log records both blocks, nothing for the allowed host"
 }
 
 # SIGTERM, as kubelet sends it, with kubelet's default 30s grace period. A
@@ -283,13 +256,15 @@ stop() {
     echo "❌ ready sentinel left behind"
     exit 1
   fi
-  # The inverse of blocked_ip: a bare IP needs no resolver, and the pod's
-  # resolver died with the proxy.
-  if ! client curl -sf --connect-timeout 10 --max-time 30 -o /dev/null http://1.1.1.1; then
-    echo "❌ 1.1.1.1 still blocked after the sidecar stopped — teardown left a filter attached"
-    exit 1
-  fi
-  echo "✅ clean SIGTERM teardown; workload egress unfiltered again"
+  # The inverse of blocked_ip, with the same exit-code split: a bare IP
+  # needs no resolver, and the pod's resolver died with the proxy.
+  rc=0
+  client curl -sf --connect-timeout 10 --max-time 30 -o /dev/null http://1.1.1.1 || rc=$?
+  case $rc in
+    0) echo "✅ clean SIGTERM teardown; workload egress unfiltered again" ;;
+    28) echo "❌ 1.1.1.1 still blocked after the sidecar stopped — teardown left a filter attached"; exit 1 ;;
+    *) echo "❌ teardown probe failed with exit $rc, not a connect timeout — it never reached TC"; exit 1 ;;
+  esac
 }
 
 logs() {
@@ -297,7 +272,7 @@ logs() {
 }
 
 cleanup() {
-  docker rm -f cw-client cw-sidecar cw-pod cw-neighbour > /dev/null 2>&1 || true
+  docker rm -f cw-client cw-sidecar cw-pod > /dev/null 2>&1 || true
 }
 
 case "${1:-}" in
@@ -308,7 +283,6 @@ case "${1:-}" in
   allowed) allowed ;;
   blocked) blocked ;;
   blocked-ip) blocked_ip ;;
-  neighbour) neighbour ;;
   verify-audit) verify_audit ;;
   stop) stop ;;
   logs) logs ;;

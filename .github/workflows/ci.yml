@@ -495,6 +495,63 @@ jobs:
         if: always()
         run: bash scripts/ci/gitlab-ci.sh emergency
 
+  test-cargowall-sidecar-shape:
+    name: Integration Test (Sidecar Shape)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
+
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
+
+      # The job body lives in scripts/ci/sidecar-shape.sh; this YAML is
+      # wiring only. The pod is three docker containers sharing one netns;
+      # cargowall runs in its own pid namespace and the host cgroup
+      # namespace, as the privileged SaaS sidecar does.
+      - name: Build the pod (netns owner + workload)
+        run: bash scripts/ci/sidecar-shape.sh pod
+
+      - name: Start CargoWall as a sidecar container
+        run: bash scripts/ci/sidecar-shape.sh start
+
+      - name: Wait for the ready sentinel
+        run: bash scripts/ci/sidecar-shape.sh wait-ready
+
+      - name: Verify the namespace shape
+        run: bash scripts/ci/sidecar-shape.sh verify-shape
+
+      - name: Allowed host reachable from the workload
+        run: bash scripts/ci/sidecar-shape.sh allowed
+
+      - name: Disallowed host blocked
+        run: bash scripts/ci/sidecar-shape.sh blocked
+
+      - name: Disallowed bare IP blocked
+        run: bash scripts/ci/sidecar-shape.sh blocked-ip
+
+      - name: Validate audit log
+        run: bash scripts/ci/sidecar-shape.sh verify-audit
+
+      - name: SIGTERM teardown
+        run: bash scripts/ci/sidecar-shape.sh stop
+
+      - name: Show sidecar log (debug aid)
+        if: always()
+        run: bash scripts/ci/sidecar-shape.sh logs
+
+      - name: Cleanup
+        if: always()
+        run: bash scripts/ci/sidecar-shape.sh cleanup
+
   test-cargowall-saas:
     name: Integration Test (SaaS)
     # This job exists to exercise the CodeCargo API path end to end, which a

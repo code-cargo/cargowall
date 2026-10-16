@@ -125,14 +125,22 @@ wait_ready() {
     echo "✅ sidecar ready, cgroup programs attached"
     return
   fi
-  running=$(docker inspect -f '{{.State.Running}}' cw-sidecar)
-  echo "❌ sidecar not ready (running=$running, exit=$(docker inspect -f '{{.State.ExitCode}}' cw-sidecar))"
-  # A live waiter has already printed the reason; only an exited sidecar
-  # leaves the sentinel unread.
-  if [ "$running" != true ] && [ -s "$STATE_DIR/failed" ]; then
+  state=$(docker inspect -f 'running={{.State.Running}}, exit={{.State.ExitCode}}' cw-sidecar 2>&1 || true)
+  echo "❌ sidecar not ready ($state)"
+  # Printed even when the waiter already gave the reason: a sidecar that
+  # dies mid-wait kills the waiter with it, and can still read as running.
+  if [ -s "$STATE_DIR/failed" ]; then
     echo "failure sentinel: $(head -c 2048 "$STATE_DIR/failed")"
   fi
   exit 1
+}
+
+# A literal prefix match on a cgroup v2 /proc/<pid>/cgroup line.
+under_pod_slice() {
+  case "$1" in
+    "0::/$POD_SLICE/"*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Guards the harness itself: if a docker default ever changes, the job must
@@ -178,13 +186,13 @@ verify_shape() {
     exit 1
   fi
   # In the host cgroup namespace the sidecar sees its absolute path.
-  if ! docker exec cw-sidecar grep -q "^0::/$POD_SLICE/" /proc/self/cgroup; then
+  if ! under_pod_slice "$(docker exec cw-sidecar cat /proc/self/cgroup)"; then
     echo "❌ sidecar does not see its own absolute cgroup path under $POD_SLICE"
     docker exec cw-sidecar cat /proc/self/cgroup
     exit 1
   fi
-  for c in cw-sidecar cw-client; do
-    if ! sudo grep -q "^0::/$POD_SLICE/" "/proc/$(docker inspect -f '{{.State.Pid}}' "$c")/cgroup"; then
+  for c in cw-pod cw-sidecar cw-client; do
+    if ! under_pod_slice "$(sudo cat "/proc/$(docker inspect -f '{{.State.Pid}}' "$c")/cgroup")"; then
       echo "❌ $c is not under the pod slice $POD_SLICE"
       exit 1
     fi
@@ -200,10 +208,36 @@ allowed() {
   echo "✅ github.com reachable from the workload"
 }
 
-# A TC drop of the SYN is a connect timeout (curl exit 28). Any other
-# failure, a resolve failure (6) above all, happened before TC and proves
-# nothing about enforcement.
+# Classifies one request from the workload by curl's timings, not its exit
+# code alone: exit 28 is also a resolve that stalled past --connect-timeout,
+# and a connection that got through can still fail on TLS or an HTTP error.
+#   connected  the TCP handshake completed
+#   dropped    resolved, then the connect timed out: TC dropped the SYN
+#   unreached  anything else, a failed resolve or exec above all
+probe() {
+  rc=0
+  out=$(client curl -s -o /dev/null --connect-timeout "$2" --max-time "$3" \
+    -w '%{time_namelookup} %{time_connect}' "$1") || rc=$?
+  read -r lookup connect <<< "$out"
+  if awk -v t="${connect:-0}" 'BEGIN { exit !(t > 0) }'; then
+    echo connected
+  elif [ "$rc" -eq 28 ] && awk -v t="${lookup:-0}" 'BEGIN { exit !(t > 0) }'; then
+    echo dropped
+  else
+    echo "unreached (curl exit $rc)"
+  fi
+}
+
 expect_blocked() {
+  result=$(probe "$1" 5 10)
+  case "$result" in
+    dropped) echo "✅ $1 blocked" ;;
+    connected) echo "❌ $1 reachable — enforcement is not applied to the workload"; exit 1 ;;
+    *) echo "❌ $1 $result — the request never reached TC"; exit 1 ;;
+  esac
+}
+
+blocked() {
   rc=0
   client curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$1" || rc=$?
   case $rc in
@@ -222,23 +256,22 @@ verify_audit() {
     echo "❌ audit log not written"
     exit 1
   fi
-  count() { jq -s "[.[] | select(.event_type == \"connection_blocked\" and .blocked == true) | select($1)] | length" "$AUDIT_LOG"; }
+  # A torn or unreadable log fails here, before any count can read empty.
+  jq -s empty "$AUDIT_LOG"
 
+  # Assigned, so a jq failure stops the step under errexit.
+  expect_blocks() {
+    n=$(jq -s "[.[] | select(.event_type == \"connection_blocked\" and .blocked == true) | select($1)] | length" "$AUDIT_LOG")
+    if ! [ "$n" "$2" 0 ]; then
+      echo "❌ $3"
+      jq -s '.[] | select(.event_type == "connection_blocked")' "$AUDIT_LOG"
+      exit 1
+    fi
+  }
   # By name: the proxy resolved it, so the blocked IP carries the hostname.
-  if [ "$(count '(.dst_hostname // "") | contains("example.com")')" -eq 0 ]; then
-    echo "❌ no enforced connection_blocked for example.com"
-    jq -s '.[] | select(.event_type == "connection_blocked")' "$AUDIT_LOG"
-    exit 1
-  fi
-  if [ "$(count '.dst_ip == "1.1.1.1"')" -eq 0 ]; then
-    echo "❌ no enforced connection_blocked for 1.1.1.1"
-    jq -s '.[] | select(.event_type == "connection_blocked")' "$AUDIT_LOG"
-    exit 1
-  fi
-  if [ "$(count '(.dst_hostname // "") | contains("github.com")')" -ne 0 ]; then
-    echo "❌ github.com was blocked"
-    exit 1
-  fi
+  expect_blocks '(.dst_hostname // "") | contains("example.com")' -gt "no enforced connection_blocked for example.com"
+  expect_blocks '.dst_ip == "1.1.1.1"' -gt "no enforced connection_blocked for 1.1.1.1"
+  expect_blocks '(.dst_hostname // "") | contains("github.com")' -eq "github.com was blocked"
   echo "✅ audit log records both blocks, nothing for the allowed host"
 }
 
@@ -256,14 +289,16 @@ stop() {
     echo "❌ ready sentinel left behind"
     exit 1
   fi
-  # The inverse of blocked_ip, with the same exit-code split: a bare IP
-  # needs no resolver, and the pod's resolver died with the proxy.
-  rc=0
-  client curl -sf --connect-timeout 10 --max-time 30 -o /dev/null http://1.1.1.1 || rc=$?
-  case $rc in
-    0) echo "✅ clean SIGTERM teardown; workload egress unfiltered again" ;;
-    28) echo "❌ 1.1.1.1 still blocked after the sidecar stopped — teardown left a filter attached"; exit 1 ;;
-    *) echo "❌ teardown probe failed with exit $rc, not a connect timeout — it never reached TC"; exit 1 ;;
+  # The inverse of blocked_ip: a bare IP needs no resolver, and the pod's
+  # resolver died with the proxy. On a tcx kernel (6.6+, as CI runs) the
+  # kernel drops the link when the process's fd closes, so this proves
+  # nothing outlived the process rather than that teardown detached it;
+  # the clsact path, where a filter can outlive the process, is below 6.6.
+  result=$(probe http://1.1.1.1 10 30)
+  case "$result" in
+    connected) echo "✅ clean SIGTERM teardown; workload egress unfiltered again" ;;
+    dropped) echo "❌ 1.1.1.1 still blocked after the sidecar stopped — a filter outlived the sidecar"; exit 1 ;;
+    *) echo "❌ teardown probe $result — it never reached TC"; exit 1 ;;
   esac
 }
 

@@ -205,16 +205,23 @@ allowed() {
 # code alone: exit 28 is also a resolve that stalled past --connect-timeout,
 # and a connection that got through can still fail on TLS or an HTTP error.
 #   connected  the TCP handshake completed
-#   dropped    resolved, then the connect timed out: TC dropped the SYN
+#   dropped    the connect timed out after a completed resolve (for a bare
+#              IPv4 URL there is none to wait for): TC dropped the SYN
 #   unreached  anything else, a failed resolve or exec above all
 probe() {
   rc=0
   out=$(client curl -s -o /dev/null --connect-timeout "$2" --max-time "$3" \
     -w '%{time_namelookup} %{time_connect}' "$1") || rc=$?
   read -r lookup connect <<< "$out"
+  host=${1#*://}
+  host=${host%%[/:]*}
+  case "$host" in
+    *[!0-9.]*) ;;
+    *) lookup=literal ;;
+  esac
   if awk -v t="${connect:-0}" 'BEGIN { exit !(t > 0) }'; then
     echo connected
-  elif [ "$rc" -eq 28 ] && awk -v t="${lookup:-0}" 'BEGIN { exit !(t > 0) }'; then
+  elif [ "$rc" -eq 28 ] && { [ "$lookup" = literal ] || awk -v t="${lookup:-0}" 'BEGIN { exit !(t > 0) }'; }; then
     echo dropped
   else
     echo "unreached (curl exit $rc)"
@@ -227,16 +234,6 @@ expect_blocked() {
     dropped) echo "✅ $1 blocked" ;;
     connected) echo "❌ $1 reachable — enforcement is not applied to the workload"; exit 1 ;;
     *) echo "❌ $1 $result — the request never reached TC"; exit 1 ;;
-  esac
-}
-
-blocked() {
-  rc=0
-  client curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$1" || rc=$?
-  case $rc in
-    0) echo "❌ $1 reachable — enforcement is not applied to the workload"; exit 1 ;;
-    28) echo "✅ $1 blocked" ;;
-    *) echo "❌ $1 failed with curl exit $rc, not a connect timeout — it never reached TC"; exit 1 ;;
   esac
 }
 

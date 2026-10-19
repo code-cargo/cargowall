@@ -115,14 +115,7 @@ start() {
 wait_ready() {
   if docker exec cw-sidecar cargowall wait-ready \
       --ready-file /state/ready --failure-file /state/failed --timeout 30s; then
-    # A failed cgroup attach only warns and startup goes on, so readiness
-    # alone does not prove the PID trackers attached from this namespace
-    # shape.
-    if docker logs cw-sidecar 2>&1 | grep -F 'Failed to attach cgroup program'; then
-      echo "❌ sidecar ready, but a cgroup program failed to attach"
-      exit 1
-    fi
-    echo "✅ sidecar ready, cgroup programs attached"
+    echo "✅ sidecar ready"
     return
   fi
   state=$(docker inspect -f 'running={{.State.Running}}, exit={{.State.ExitCode}}' cw-sidecar 2>&1 || true)
@@ -251,28 +244,29 @@ blocked() { expect_blocked https://example.com; }
 
 blocked_ip() { expect_blocked http://1.1.1.1; }
 
+# The pid check is the cgroup half of the shape: the connect hooks write the
+# socket's pid and the TC event copies it. With no step tracker it is the
+# node-global tgid, unresolvable in the sidecar's /proc, so process stays
+# empty; but it is non-zero only if a hook attached here fired.
 verify_audit() {
   if ! test -s "$AUDIT_LOG"; then
     echo "❌ audit log not written"
     exit 1
   fi
-  # A torn or unreadable log fails here, before any count can read empty.
-  jq -s empty "$AUDIT_LOG"
-
-  # Assigned, so a jq failure stops the step under errexit.
-  expect_blocks() {
-    n=$(jq -s "[.[] | select(.event_type == \"connection_blocked\" and .blocked == true) | select($1)] | length" "$AUDIT_LOG")
-    if ! [ "$n" "$2" 0 ]; then
-      echo "❌ $3"
-      jq -s '.[] | select(.event_type == "connection_blocked")' "$AUDIT_LOG"
-      exit 1
-    fi
-  }
-  # By name: the proxy resolved it, so the blocked IP carries the hostname.
-  expect_blocks '(.dst_hostname // "") | contains("example.com")' -gt "no enforced connection_blocked for example.com"
-  expect_blocks '.dst_ip == "1.1.1.1"' -gt "no enforced connection_blocked for 1.1.1.1"
-  expect_blocks '(.dst_hostname // "") | contains("github.com")' -eq "github.com was blocked"
-  echo "✅ audit log records both blocks, nothing for the allowed host"
+  # One pass, assigned: a torn line or a jq failure stops the step.
+  summary=$(jq -s -c '
+    [.[] | select(.event_type == "connection_blocked" and .blocked == true)]
+    | [.[] | select(.dst_hostname == "example.com")] as $name
+    | [.[] | select(.dst_ip == "1.1.1.1")] as $ip
+    | {example_com: ($name | length), ip_1111: ($ip | length),
+       github_com: ([.[] | select(.dst_hostname == "github.com")] | length),
+       no_pid: ([$name[], $ip[] | select((.pid // 0) <= 0)] | length)}' "$AUDIT_LOG")
+  if ! jq -e '.example_com > 0 and .ip_1111 > 0 and .github_com == 0 and .no_pid == 0' <<< "$summary" > /dev/null; then
+    echo "❌ audit log: $summary (want example_com > 0, ip_1111 > 0, github_com 0, no_pid 0)"
+    jq -s -c '.[] | select(.event_type == "connection_blocked")' "$AUDIT_LOG"
+    exit 1
+  fi
+  echo "✅ audit log: both blocks recorded with a hook pid, nothing for the allowed host ($summary)"
 }
 
 # SIGTERM, as kubelet sends it, with kubelet's default 30s grace period. A

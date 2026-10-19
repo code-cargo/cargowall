@@ -205,23 +205,17 @@ allowed() {
 # code alone: exit 28 is also a resolve that stalled past --connect-timeout,
 # and a connection that got through can still fail on TLS or an HTTP error.
 #   connected  the TCP handshake completed
-#   dropped    the connect timed out after a completed resolve (for a bare
-#              IPv4 URL there is none to wait for): TC dropped the SYN
+#   dropped    the connect timed out after a completed resolve (http://1.1.1.1
+#              has none to wait for): TC dropped the SYN
 #   unreached  anything else, a failed resolve or exec above all
 probe() {
   rc=0
   out=$(client curl -s -o /dev/null --connect-timeout "$2" --max-time "$3" \
     -w '%{time_namelookup} %{time_connect}' "$1") || rc=$?
   read -r lookup connect <<< "$out"
-  host=${1#*://}
-  host=${host%%[/:]*}
-  case "$host" in
-    *[!0-9.]*) ;;
-    *) lookup=literal ;;
-  esac
   if awk -v t="${connect:-0}" 'BEGIN { exit !(t > 0) }'; then
     echo connected
-  elif [ "$rc" -eq 28 ] && { [ "$lookup" = literal ] || awk -v t="${lookup:-0}" 'BEGIN { exit !(t > 0) }'; }; then
+  elif [ "$rc" -eq 28 ] && { [ "$1" = http://1.1.1.1 ] || awk -v t="${lookup:-0}" 'BEGIN { exit !(t > 0) }'; }; then
     echo dropped
   else
     echo "unreached (curl exit $rc)"

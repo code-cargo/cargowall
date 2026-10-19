@@ -329,7 +329,10 @@ jobs:
     permissions:
       contents: read
       actions: read
+      id-token: write
     steps:
+      - name: CargoWall
+        uses: code-cargo/cargowall-action@7943209964cc5472fee8aa1e02cde8a2f0dd0414 # v1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download binary
@@ -381,7 +384,10 @@ jobs:
     permissions:
       contents: read
       actions: read
+      id-token: write
     steps:
+      - name: CargoWall
+        uses: code-cargo/cargowall-action@7943209964cc5472fee8aa1e02cde8a2f0dd0414 # v1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download binary
@@ -429,7 +435,10 @@ jobs:
     permissions:
       contents: read
       actions: read
+      id-token: write
     steps:
+      - name: CargoWall
+        uses: code-cargo/cargowall-action@7943209964cc5472fee8aa1e02cde8a2f0dd0414 # v1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download binary

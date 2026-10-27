@@ -98,7 +98,7 @@ jobs:
 
       - name: Start cargowall (api-failure-mode=audit)
         run: |
-          sudo -E ./bin/cargowall start \
+          sudo --preserve-env=CARGOWALL_PIDFILE ./bin/cargowall start \
             --github-action \
             --dns-upstream 8.8.8.8:53 \
             --api-url http://127.0.0.1:18080 \
@@ -145,7 +145,7 @@ jobs:
 
       - name: Start cargowall again WITHOUT --audit-log (audit-summary:false shape)
         run: |
-          sudo -E ./bin/cargowall start \
+          sudo --preserve-env=CARGOWALL_PIDFILE ./bin/cargowall start \
             --github-action \
             --dns-upstream 8.8.8.8:53 \
             --api-url http://127.0.0.1:18080 \
@@ -224,7 +224,7 @@ jobs:
 
       - name: Start cargowall (hanging API + audit) — ready must land inside the window
         run: |
-          sudo -E ./bin/cargowall start \
+          sudo --preserve-env=CARGOWALL_PIDFILE ./bin/cargowall start \
             --github-action \
             --dns-upstream 8.8.8.8:53 \
             --api-url http://127.0.0.1:18080 \
@@ -328,7 +328,7 @@ jobs:
 
       - name: Start cargowall (api-failure-mode=fail) — wait-ready must fail fast with the reason
         run: |
-          sudo -E ./bin/cargowall start \
+          sudo --preserve-env=CARGOWALL_PIDFILE ./bin/cargowall start \
             --github-action \
             --dns-upstream 8.8.8.8:53 \
             --api-url http://127.0.0.1:18080 \
@@ -451,7 +451,7 @@ jobs:
 
       - name: Start cargowall (404 + api-failure-mode=fail) — must come up on local config
         run: |
-          sudo -E ./bin/cargowall start \
+          sudo --preserve-env=CARGOWALL_PIDFILE ./bin/cargowall start \
             --github-action \
             --config /etc/cargowall/config.json \
             --dns-upstream 8.8.8.8:53 \
@@ -532,7 +532,7 @@ jobs:
 
       - name: SIGTERM cargowall while the fetch hangs, assert clean unwind
         run: |
-          sudo -E ./bin/cargowall start \
+          sudo --preserve-env=CARGOWALL_PIDFILE ./bin/cargowall start \
             --github-action \
             --dns-upstream 8.8.8.8:53 \
             --api-url http://127.0.0.1:18080 \
@@ -642,7 +642,9 @@ jobs:
           # (that is the point of the feature), so the signals must come from
           # an already-root process — same shape as the sudo-lockdown jobs in
           # ci.yml. Audit mode keeps the runner usable throughout.
-          sudo -E bash -c '
+          # Named, not -E: sudo-rs (Ubuntu 26.04) ignores -E, and without the
+          # endpoint there is no exporter to stretch the graceful unwind.
+          sudo --preserve-env=CARGOWALL_PIDFILE,OTEL_EXPORTER_OTLP_ENDPOINT bash -c '
             ./bin/cargowall start \
               --github-action \
               --config /etc/cargowall/config.json \

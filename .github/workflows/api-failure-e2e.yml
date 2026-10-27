@@ -51,10 +51,18 @@ concurrency:
 permissions:
   contents: read
 
+# Jobs whose behavior depends on the runner's kernel or distro (BPF test
+# runs, iptables, sudo, the resolver setup) run on a matrix of the current
+# Ubuntu LTS and the one before it, so a new runner image shows up as one
+# failing leg instead of a broken main.
 jobs:
   audit-downgrade:
     name: Retrieval failure downgrades to audit
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 15
     # Shared by both binaries: `start` binds it via kong env, and
     # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
@@ -162,7 +170,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: audit-downgrade-logs
+          name: audit-downgrade-logs-${{ matrix.os }}
           path: |
             /tmp/cargowall.log
             /tmp/cargowall-noauditlog.log
@@ -172,7 +180,11 @@ jobs:
 
   hung-downgrade:
     name: Hung fetch downgrades to audit inside the readiness window
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 15
     # Shared by both binaries: `start` binds it via kong env, and
     # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
@@ -267,7 +279,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: hung-downgrade-logs
+          name: hung-downgrade-logs-${{ matrix.os }}
           path: |
             /tmp/cargowall.log
             /tmp/cargowall.ndjson
@@ -276,7 +288,11 @@ jobs:
 
   fail-lockdown:
     name: Retrieval failure locks down under fail
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 15
     # Shared by both binaries: `start` binds it via kong env, and
     # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
@@ -372,7 +388,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: fail-lockdown-logs
+          name: fail-lockdown-logs-${{ matrix.os }}
           path: |
             /tmp/cargowall.log
             /tmp/mockapi.log
@@ -380,7 +396,11 @@ jobs:
 
   not-onboarded:
     name: 404 must not change posture even under fail
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 15
     # Shared by both binaries: `start` binds it via kong env, and
     # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
@@ -461,7 +481,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: not-onboarded-logs
+          name: not-onboarded-logs-${{ matrix.os }}
           path: |
             /tmp/cargowall.log
             /tmp/mockapi.log
@@ -469,7 +489,11 @@ jobs:
 
   sigterm-unwind:
     name: SIGTERM mid-fetch unwinds host mutations
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 15
     # Shared by both binaries: `start` binds it via kong env, and
     # `wait-ready` uses it to anchor failure-sentinel freshness to the run.
@@ -569,7 +593,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: sigterm-unwind-logs
+          name: sigterm-unwind-logs-${{ matrix.os }}
           path: |
             /tmp/cargowall.log
             /tmp/mockapi.log
@@ -577,7 +601,11 @@ jobs:
 
   double-sigterm-force:
     name: Second SIGTERM force-tears down host mutations
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 15
     env:
       CARGOWALL_PIDFILE: /tmp/cargowall.pid
@@ -715,6 +743,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: double-sigterm-force-logs
+          name: double-sigterm-force-logs-${{ matrix.os }}
           path: /tmp/cargowall.log
           if-no-files-found: ignore

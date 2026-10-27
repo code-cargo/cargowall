@@ -92,11 +92,14 @@ func resolveMode(containerEgress string) origin.Mode {
 // off) when disabled or when step attribution isn't live: without step tags
 // the observer's ordinals would always be zero, and the step-map shrink for
 // disabled attribution makes container tagging meaningless anyway. stepErr
-// is why step attribution failed, carried into the lost posture's reason. A
-// non-nil error means a requested enforce posture was lost and startup must
-// fail.
+// is why step attribution failed, carried into the lost posture's reason.
+// scopeProblem, when set, is why a hook at /sys/fs/cgroup would not judge
+// exactly this job's traffic (podenv.Shape.HookScopeProblem): the hook is
+// then never loaded, and docker tracking runs without it, as after a load
+// failure. A non-nil error means a requested enforce posture was lost and
+// startup must fail.
 func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.Tracker, stepErr error,
-	tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
+	scopeProblem string, tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
 ) (*containerAttribution, error) {
 	if !enabled {
 		return nil, nil
@@ -114,6 +117,12 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		enricher:    &containers.Enricher{},
 		postures:    p,
 		logger:      logger,
+	}
+	if scopeProblem != "" {
+		if lerr := p.lose(postureContainerEgress, scopeProblem); lerr != nil {
+			return nil, lerr
+		}
+		return a, nil
 	}
 	obs, err := origin.Start(tcObjs, logger)
 	if err != nil {

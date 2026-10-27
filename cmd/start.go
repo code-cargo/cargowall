@@ -53,6 +53,7 @@ import (
 	"github.com/code-cargo/cargowall/pkg/lockdown"
 	"github.com/code-cargo/cargowall/pkg/network"
 	"github.com/code-cargo/cargowall/pkg/otlp"
+	"github.com/code-cargo/cargowall/pkg/podenv"
 	"github.com/code-cargo/cargowall/pkg/steps"
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
@@ -249,7 +250,18 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		os.Exit(1)
 	}()
 
+	// What container this runs in decides whether the daemon's config is
+	// ours to rewrite and whether the cgroup hook would judge only this
+	// job (see podenv.Shape.HookScopeProblem).
+	shape, err := podenv.Detect(dockerSocket)
+	if err != nil {
+		logger.Debug("Environment probe incomplete", "error", err)
+	}
+	logger.Info("Runtime environment", "host_cgroupns", shape.HostCgroupNS, "cgroup", shape.CgroupPath,
+		"dockerd_foreign", shape.Dockerd.Foreign)
+
 	var dnsServer *dns.Server
+	var containerDNS *dockerDNS
 	var dockerBridgeIP string
 	// Tracks whether the iptables DNS redirect is actually in place, so the
 	// post-snapshot systemd-resolved cache flush runs only when there is a
@@ -279,34 +291,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}
 
 		if cmd.DockerDNSInterception {
-			var err error
-			dockerBridgeIP, err = network.GetDockerBridgeIP()
-			if err != nil {
-				logger.Debug("Docker bridge not found, container DNS filtering unavailable", "error", err)
-			} else {
-				// Add docker bridge IP as additional listen address, marked
-				// container-serving so queries arriving there attribute via
-				// the container-IP lookup, never the host-netns sockdiag path.
-				dnsServer.AddContainerListenAddr(dockerBridgeIP + ":53")
-				logger.Info("Docker DNS interception enabled", "docker_bridge", dockerBridgeIP)
-
-				// Configure Docker to use our DNS proxy. Restore is deferred
-				// even on ConfigureDockerDNS failure — best-effort matches
-				// the previous shutdown semantic and guards against partial
-				// writes to daemon.json that the user expects rolled back.
-				// Registered BEFORE the mutation: a signal landing inside
-				// ConfigureDockerDNS must not leave daemon.json rewritten
-				// with no undo registered. RestoreDockerDNS is best-effort
-				// and safe when the write never happened.
-				defer teardowns.add(func() {
-					if err := network.RestoreDockerDNS(logger); err != nil {
-						logger.Warn("Failed to restore Docker DNS", "error", err)
-					}
-				})()
-				if err := network.ConfigureDockerDNS(dockerBridgeIP, logger); err != nil {
-					logger.Warn("Failed to configure Docker DNS", "error", err)
-				}
-			}
+			var restore func()
+			containerDNS, restore = startDockerDNS(dnsServer, shape.Dockerd, teardowns, logger)
+			defer restore()
+			dockerBridgeIP = containerDNS.bridgeIP
 		}
 
 		dnsErrCh := make(chan error, 1)
@@ -339,12 +327,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			// registered undo. Deleting rules that were never added is a
 			// logged no-op.
 			teardownRedirect := teardowns.add(func() {
-				if err := network.TeardownDNSRedirect(logger); err != nil {
+				if err := network.TeardownDNSRedirect(logger, dockerBridgeIP); err != nil {
 					logger.Warn("Failed to tear down DNS redirect", "error", err)
 				}
 			})
 			defer teardownRedirect()
-			if err := network.SetupDNSRedirect(logger); err != nil {
+			if err := network.SetupDNSRedirect(logger, dockerBridgeIP); err != nil {
 				logger.Warn("Failed to set up DNS redirect (iptables)", "error", err)
 			} else {
 				dnsRedirectActive = true
@@ -606,7 +594,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// rung fails startup, a lost observe rung is recorded for the summary.
 	postures := newPostures(cmd, caps.KernelVersion, logger)
 	attribution, err := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
-		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, &objs, postures, logger)
+		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, shape.HookScopeProblem(), &objs, postures, logger)
 	if err != nil {
 		return err
 	}
@@ -898,14 +886,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		enableSudoLockdown(cfg, logger)
 	}
 
-	// Restart Docker daemon so containers pick up the DNS configuration
-	// written to daemon.json by ConfigureDockerDNS. Docker's SIGHUP handler
-	// does NOT reload DNS settings — a full restart is required.
-	if cmd.DockerDNSInterception && dockerBridgeIP != "" {
-		if err := network.RestartDockerDaemon(logger); err != nil {
-			logger.Warn("Failed to restart Docker daemon for DNS config", "error", err)
-		}
-	}
+	// Restart Docker daemon so containers pick up the rewritten daemon.json.
+	containerDNS.restartDaemon()
 
 	// Container attribution, userspace half — after the dockerd restart
 	// above, for the ordering reasons containerAttribution documents.

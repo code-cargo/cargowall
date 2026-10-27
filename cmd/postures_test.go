@@ -158,13 +158,13 @@ func TestPostures_ContainerAttributionWithoutStepTracker(t *testing.T) {
 	stepErr := errors.New("kernel BTF not found\nsecond line")
 
 	p, _ := ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
-	a, err := newContainerAttribution(true, origin.ModeEnforce, nil, stepErr, nil, p, p.logger)
+	a, err := newContainerAttribution(true, origin.ModeEnforce, nil, stepErr, "", nil, p, p.logger)
 	assert.Nil(t, a)
 	assert.EqualError(t, err, "--container-egress=enforce requested but could not be applied: "+
 		"step attribution unavailable: kernel BTF not found")
 
 	p, _ = ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
-	a, err = newContainerAttribution(true, origin.ModeShadow, nil, stepErr, nil, p, p.logger)
+	a, err = newContainerAttribution(true, origin.ModeShadow, nil, stepErr, "", nil, p, p.logger)
 	assert.Nil(t, a)
 	require.NoError(t, err)
 	assert.Equal(t, "step attribution unavailable: kernel BTF not found", p.layers[0].Reason)
@@ -178,7 +178,7 @@ func TestPostures_ContainerAttributionWithoutStepTracker(t *testing.T) {
 // which stands in for a verifier rejection here.)
 func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
 	p, buf := ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
-	a, err := newContainerAttribution(true, origin.ModeShadow, &steps.Tracker{}, nil, nil, p, p.logger)
+	a, err := newContainerAttribution(true, origin.ModeShadow, &steps.Tracker{}, nil, "", nil, p, p.logger)
 	require.NoError(t, err)
 	require.NotNil(t, a, "docker tracking does not need the hook")
 	assert.Nil(t, a.originObserver())
@@ -201,9 +201,33 @@ func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
 	a.Close()
 
 	p, _ = ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
-	a, err = newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, nil, p, p.logger)
+	a, err = newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, "", nil, p, p.logger)
 	assert.Nil(t, a)
 	assert.EqualError(t, err, "--container-egress=enforce requested but could not be applied: nil TC BPF objects")
+}
+
+// A hook whose /sys/fs/cgroup would judge more than this job (a privileged
+// pod's node root) is never loaded: fatal under enforce, and under observe
+// docker tracking runs without it, the reason recorded. Nil TC objects
+// prove origin.Start was never reached: it would have recorded their
+// refusal instead.
+func TestPostures_ContainerAttributionHookScope(t *testing.T) {
+	const scope = "the cgroup hook would attach at the node root"
+
+	p, _ := ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
+	a, err := newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, scope, nil, p, p.logger)
+	assert.Nil(t, a)
+	assert.EqualError(t, err, "--container-egress=enforce requested but could not be applied: "+scope)
+
+	p, _ = ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
+	a, err = newContainerAttribution(true, origin.ModeShadow, &steps.Tracker{}, nil, scope, nil, p, p.logger)
+	require.NoError(t, err)
+	require.NotNil(t, a, "docker tracking does not need the hook")
+	assert.Nil(t, a.originObserver())
+	assert.Equal(t, postureLine{
+		Posture: postureContainerEgress, Requested: "observe", Applied: "off", Reason: scope,
+	}, p.lines()[0])
+	a.Close()
 }
 
 // The file sits in world-writable /tmp and its strings reach markdown: a

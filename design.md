@@ -480,6 +480,9 @@ The DNS proxy handles Kubernetes service discovery by:
 - `ConfigureDockerDNS(bridgeIP)` writes `{"dns": ["<bridgeIP>"]}` to `/etc/docker/daemon.json` (with backup)
 - Docker daemon requires a full restart (`systemctl restart docker`) for DNS changes — SIGHUP is not sufficient
 - `RestoreDockerDNS()` restores the original daemon.json from backup on shutdown
+- With `--dns-redirect-iptables`, nat PREROUTING DNATs port 53 arriving on `docker0` or any `br-+` bridge to `<bridgeIP>:53`, inserted ahead of Docker's own rules. That traffic is forwarded, not originated here, so the OUTPUT redirect never sees it: without these rules a container that names its own resolver (`--dns 8.8.8.8`, a hard-coded server, a daemon whose config cargowall cannot rewrite) resolves around the proxy. DNAT keeps the source, so the proxy still attributes by container IP.
+- `pkg/podenv` probes the daemon behind the socket (`SO_PEERCRED`, then its mount namespace). A daemon in another container — the Docker-in-Docker sidecar of an ARC runner pod — reads its own daemon.json and no service manager here can restart it, so the rewrite and restart are skipped and the PREROUTING redirect alone covers its containers.
+- The same probe gates the cgroup egress hook (`--container-egress`): in a Kubernetes pod in the host cgroup namespace, `/sys/fs/cgroup` is the node root, and a hook there would judge every pod on the node; in a private cgroup namespace beside a foreign daemon, the hook cannot see its containers. Either way the posture is lost (fatal under enforce, recorded under observe) and docker tracking runs without the hook.
 
 ### Container Attribution (issue #106, phase 3a — audit-only)
 

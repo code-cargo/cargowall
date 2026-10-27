@@ -93,13 +93,13 @@ func resolveMode(containerEgress string) origin.Mode {
 // the observer's ordinals would always be zero, and the step-map shrink for
 // disabled attribution makes container tagging meaningless anyway. stepErr
 // is why step attribution failed, carried into the lost posture's reason.
-// scopeProblem, when set, is why a hook at /sys/fs/cgroup would not judge
-// exactly this job's traffic (podenv.Shape.HookScopeProblem): the hook is
-// then never loaded, and docker tracking runs without it, as after a load
-// failure. A non-nil error means a requested enforce posture was lost and
-// startup must fail.
+// scopeErr, when set, is why a hook at /sys/fs/cgroup would not judge
+// exactly this job's traffic, or why that could not be shown
+// (podenv.Shape.HookScope): the hook is then never loaded, the same loss
+// as a load failure. A non-nil error means a requested enforce posture was
+// lost and startup must fail.
 func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.Tracker, stepErr error,
-	scopeProblem string, tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
+	scopeErr error, tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
 ) (*containerAttribution, error) {
 	if !enabled {
 		return nil, nil
@@ -118,13 +118,11 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		postures:    p,
 		logger:      logger,
 	}
-	if scopeProblem != "" {
-		if lerr := p.lose(postureContainerEgress, scopeProblem); lerr != nil {
-			return nil, lerr
-		}
-		return a, nil
+	var obs *origin.Observer
+	err := scopeErr
+	if err == nil {
+		obs, err = origin.Start(tcObjs, logger)
 	}
-	obs, err := origin.Start(tcObjs, logger)
 	if err != nil {
 		// Fatal under enforce. Under observe only the hook is lost: the
 		// value stays live with a nil observer, because docker tracking

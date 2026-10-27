@@ -252,13 +252,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 	// What container this runs in decides whether the daemon's config is
 	// ours to rewrite and whether the cgroup hook would judge only this
-	// job (see podenv.Shape.HookScopeProblem).
-	shape, err := podenv.Detect(dockerSocket)
-	if err != nil {
-		logger.Debug("Environment probe incomplete", "error", err)
-	}
-	logger.Info("Runtime environment", "host_cgroupns", shape.HostCgroupNS, "cgroup", shape.CgroupPath,
-		"dockerd_foreign", shape.Dockerd.Foreign)
+	// job (see podenv.Shape.HookScope).
+	shape := podenv.Detect(dockerSocket)
+	logger.Info("Runtime environment", "cgroupns", shape.CgroupNS.String(), "cgroupns_reason", shape.CgroupNSReason,
+		"cgroup", shape.CgroupPath, "dockerd", shape.Dockerd.Kind.String(), "dockerd_reason", shape.Dockerd.Reason)
 
 	var dnsServer *dns.Server
 	var containerDNS *dockerDNS
@@ -594,7 +591,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// rung fails startup, a lost observe rung is recorded for the summary.
 	postures := newPostures(cmd, caps.KernelVersion, logger)
 	attribution, err := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
-		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, shape.HookScopeProblem(), &objs, postures, logger)
+		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, shape.HookScope(), &objs, postures, logger)
 	if err != nil {
 		return err
 	}

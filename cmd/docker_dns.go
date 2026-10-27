@@ -42,10 +42,12 @@ type dockerDNS struct {
 	logger   *slog.Logger
 }
 
-// startDockerDNS adds the bridge listener and, for a local daemon, rewrites
-// daemon.json. The returned undo restores daemon.json; the caller defers it.
-// It is registered before the rewrite, so a signal landing mid-write still
-// has one, and restoring a file that was never written is safe.
+// startDockerDNS adds the bridge listener and, only for a daemon proven
+// local, rewrites daemon.json: a foreign or unidentified one is left alone,
+// and the redirect covers its containers. The returned undo restores
+// daemon.json; the caller defers it. It is registered before the rewrite,
+// so a signal landing mid-write still has one, and restoring a file that
+// was never written is safe.
 func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, teardowns *teardownList,
 	logger *slog.Logger,
 ) (*dockerDNS, func()) {
@@ -61,9 +63,9 @@ func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, teardowns *te
 	dnsServer.AddContainerListenAddr(bridgeIP + ":53")
 	logger.Info("Docker DNS interception enabled", "docker_bridge", bridgeIP)
 
-	if dockerd.Foreign {
-		logger.Info("Docker daemon runs in another container; leaving its config alone, container DNS is redirected at the bridge",
-			"reason", dockerd.Reason)
+	if dockerd.Kind != podenv.DockerdLocal {
+		logger.Info("Docker daemon not proven local; leaving its config alone, container DNS is redirected at the bridge",
+			"dockerd", dockerd.Kind.String(), "reason", dockerd.Reason)
 		return d, func() {}
 	}
 	undo := teardowns.add(func() {
@@ -73,6 +75,7 @@ func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, teardowns *te
 	})
 	if err := network.ConfigureDockerDNS(bridgeIP, logger); err != nil {
 		logger.Warn("Failed to configure Docker DNS", "error", err)
+		return d, undo
 	}
 	d.restart = true
 	return d, undo

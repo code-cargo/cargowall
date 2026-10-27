@@ -19,6 +19,7 @@ package podenv
 import (
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -36,36 +37,52 @@ func TestParseCgroupV2Path(t *testing.T) {
 	}
 }
 
-func TestHookScopeProblem(t *testing.T) {
+// Only a positively proven shape lets the hook load; every unknown is a
+// problem, never the permissive answer.
+func TestHookScope(t *testing.T) {
 	pod := "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-a.scope"
-	foreign := Dockerd{Foreign: true, Reason: "its pid is outside our pid namespace"}
+	foreign := Dockerd{Kind: DockerdForeign, Reason: "its pid is outside our pid namespace"}
+	unknownD := Dockerd{Kind: DockerdUnknown, Reason: "dial: timeout"}
 	cases := []struct {
 		name  string
 		shape Shape
-		want  bool
+		ok    bool
 	}{
-		{"hosted runner", Shape{HostCgroupNS: true, CgroupPath: "/system.slice/runner.service"}, false},
-		{"privileged pod: node root", Shape{HostCgroupNS: true, CgroupPath: pod}, true},
-		{"privileged pod with dind: still node root", Shape{HostCgroupNS: true, CgroupPath: pod, Dockerd: foreign}, true},
-		{"private cgroupns, foreign dockerd", Shape{CgroupPath: "/", Dockerd: foreign}, true},
-		{"private cgroupns, own or no dockerd", Shape{CgroupPath: "/"}, false},
+		{"hosted runner", Shape{CgroupNS: CgroupNSHost, CgroupPath: "/system.slice/runner.service", Dockerd: Dockerd{Kind: DockerdLocal}}, true},
+		{"hosted runner, daemon unidentified", Shape{CgroupNS: CgroupNSHost, CgroupPath: "/system.slice/runner.service", Dockerd: unknownD}, true},
+		{"privileged pod: node root", Shape{CgroupNS: CgroupNSHost, CgroupPath: pod}, false},
+		{"privileged pod with dind: still node root", Shape{CgroupNS: CgroupNSHost, CgroupPath: pod, Dockerd: foreign}, false},
+		{"host cgroupns, path unread", Shape{CgroupNS: CgroupNSHost, Dockerd: Dockerd{Kind: DockerdLocal}}, false},
+		{"private cgroupns, foreign dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: foreign}, false},
+		{"private cgroupns, unidentified dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: unknownD}, false},
+		{"private cgroupns, no dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: Dockerd{Kind: DockerdAbsent}}, true},
+		{"private cgroupns, own dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: Dockerd{Kind: DockerdLocal}}, true},
 		{"unprobed", Shape{}, false},
 	}
 	for _, tc := range cases {
-		if got := tc.shape.HookScopeProblem() != ""; got != tc.want {
-			t.Errorf("%s: problem=%v, want %v (%q)", tc.name, got, tc.want, tc.shape.HookScopeProblem())
+		err := tc.shape.HookScope()
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: HookScope() = %v, want ok=%v", tc.name, err, tc.ok)
 		}
 	}
 }
 
 func TestProbeDockerd_NoSocket(t *testing.T) {
-	d, err := probeDockerd(filepath.Join(t.TempDir(), "docker.sock"))
-	if err != nil || d.Foreign {
-		t.Fatalf("absent socket: got %+v, %v; want not foreign, no error", d, err)
+	if d := probeDockerd(filepath.Join(t.TempDir(), "docker.sock")); d.Kind != DockerdAbsent {
+		t.Fatalf("absent socket: got %+v, want absent", d)
 	}
 }
 
-// A listener in our own process shares our mount namespace: not foreign.
+// A dial failing with neither ENOENT nor ECONNREFUSED (here EINVAL, a path
+// longer than sun_path) is unknown, with the error kept.
+func TestProbeDockerd_Unknown(t *testing.T) {
+	d := probeDockerd("/" + strings.Repeat("x", 200))
+	if d.Kind != DockerdUnknown || d.Reason == "" {
+		t.Fatalf("non-socket path: got %+v, want unknown with a reason", d)
+	}
+}
+
+// A listener in our own process shares our mount namespace: local.
 func TestProbeDockerd_Local(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "docker.sock")
 	l, err := net.Listen("unix", sock)
@@ -78,8 +95,7 @@ func TestProbeDockerd_Local(t *testing.T) {
 			c.Close()
 		}
 	}()
-	d, err := probeDockerd(sock)
-	if err != nil || d.Foreign {
-		t.Fatalf("local listener: got %+v, %v; want not foreign, no error", d, err)
+	if d := probeDockerd(sock); d.Kind != DockerdLocal {
+		t.Fatalf("local listener: got %+v, want local", d)
 	}
 }

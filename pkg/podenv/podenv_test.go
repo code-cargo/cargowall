@@ -52,7 +52,7 @@ func TestHookScope(t *testing.T) {
 		{"hosted runner, daemon unidentified", Shape{CgroupNS: CgroupNSHost, CgroupPath: "/system.slice/runner.service", Dockerd: unknownD}, true},
 		{"privileged pod: node root", Shape{CgroupNS: CgroupNSHost, CgroupPath: pod}, false},
 		{"privileged pod with dind: still node root", Shape{CgroupNS: CgroupNSHost, CgroupPath: pod, Dockerd: foreign}, false},
-		{"host cgroupns, path unread", Shape{CgroupNS: CgroupNSHost, Dockerd: Dockerd{Kind: DockerdLocal}}, false},
+		{"host cgroupns, path unread", Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied", Dockerd: Dockerd{Kind: DockerdLocal}}, false},
 		{"private cgroupns, foreign dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: foreign}, false},
 		{"private cgroupns, unidentified dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: unknownD}, false},
 		{"private cgroupns, no dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: Dockerd{Kind: DockerdAbsent}}, true},
@@ -64,6 +64,12 @@ func TestHookScope(t *testing.T) {
 		if (err == nil) != tc.ok {
 			t.Errorf("%s: HookScope() = %v, want ok=%v", tc.name, err, tc.ok)
 		}
+	}
+
+	// An unknown fact carries its probe error into the posture reason.
+	err := Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied"}.HookScope()
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("unread cgroup path: HookScope() = %v, want the read error in it", err)
 	}
 }
 

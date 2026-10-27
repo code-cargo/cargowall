@@ -255,7 +255,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// job (see podenv.Shape.HookScope).
 	shape := podenv.Detect(dockerSocket)
 	logger.Info("Runtime environment", "cgroupns", shape.CgroupNS.String(), "cgroupns_reason", shape.CgroupNSReason,
-		"cgroup", shape.CgroupPath, "dockerd", shape.Dockerd.Kind.String(), "dockerd_reason", shape.Dockerd.Reason)
+		"cgroup", shape.CgroupPath, "cgroup_reason", shape.CgroupPathReason,
+		"dockerd", shape.Dockerd.Kind.String(), "dockerd_reason", shape.Dockerd.Reason)
 
 	var dnsServer *dns.Server
 	var containerDNS *dockerDNS

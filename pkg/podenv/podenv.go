@@ -109,7 +109,10 @@ type Shape struct {
 	// absolute in the host namespace, relative to our own root otherwise.
 	// Empty when it could not be read.
 	CgroupPath string
-	Dockerd    Dockerd
+	// CgroupPathReason is why CgroupPath is empty: the read error, or a
+	// file with no cgroup v2 entry.
+	CgroupPathReason string
+	Dockerd          Dockerd
 }
 
 // HookScope is nil when a cgroup program attached at /sys/fs/cgroup would
@@ -129,7 +132,7 @@ func (s Shape) HookScope() error {
 		return fmt.Errorf("cgroup namespace unknown (%s)", s.CgroupNSReason)
 	case CgroupNSHost:
 		if s.CgroupPath == "" {
-			return errors.New("cgroup path unknown in the host cgroup namespace")
+			return fmt.Errorf("cgroup path unknown in the host cgroup namespace (%s)", s.CgroupPathReason)
 		}
 		// kubelet names its tree kubepods under both the cgroupfs and
 		// systemd drivers.
@@ -161,8 +164,10 @@ func Detect(dockerSocket string) Shape {
 	} else {
 		s.CgroupNS = CgroupNSPrivate
 	}
-	if data, err := os.ReadFile("/proc/self/cgroup"); err == nil {
-		s.CgroupPath = parseCgroupV2Path(data)
+	if data, err := os.ReadFile("/proc/self/cgroup"); err != nil {
+		s.CgroupPathReason = err.Error()
+	} else if s.CgroupPath = parseCgroupV2Path(data); s.CgroupPath == "" {
+		s.CgroupPathReason = "no cgroup v2 entry in /proc/self/cgroup"
 	}
 	s.Dockerd = probeDockerd(dockerSocket)
 	return s

@@ -366,6 +366,29 @@ func TestStartCmd_AfterApply_OrthogonalFlagsPreservedWhenSetExplicitly(t *testin
 	assert.Equal(t, CIModeNone, cmd.CIMode())
 }
 
+// Any loopback upstream loops under the redirect: the resolver there
+// re-queries from an unmarked socket, which is DNAT'd back into the proxy.
+// Without the redirect (or with DNS tracking off, which disables it) a
+// loopback upstream is fine, and a real resolver is fine either way.
+func TestStartCmd_AfterApply_LoopbackUpstreamRefusedUnderRedirect(t *testing.T) {
+	for _, upstream := range []string{"127.0.0.100:53", "127.0.0.53:53", "127.0.0.1:53", "[::1]:53", "[::ffff:127.0.0.1]:53", "localhost:53", "127.0.0.100"} {
+		cmd := &StartCmd{DNSRedirectIptables: true, DNSUpstream: upstream}
+		require.ErrorContains(t, cmd.AfterApply(), "is a loopback resolver", upstream)
+	}
+	cmd := &StartCmd{GithubAction: true, DNSUpstream: "127.0.0.100:53"}
+	require.ErrorContains(t, cmd.AfterApply(), "is a loopback resolver", "the preset turns the redirect on")
+
+	for _, cmd := range []*StartCmd{
+		{DNSRedirectIptables: true, DNSUpstream: "168.63.129.16:53"},
+		{DNSRedirectIptables: true, DNSUpstream: "[2001:4860:4860::8888]:53"},
+		{DNSRedirectIptables: true, DNSUpstream: "kube-dns.kube-system.svc:53"},
+		{DNSUpstream: "127.0.0.100:53"},
+		{DNSRedirectIptables: true, DisableDNSTracking: true, DNSUpstream: "127.0.0.100:53"},
+	} {
+		require.NoError(t, cmd.AfterApply(), "%+v", *cmd)
+	}
+}
+
 // An enforcement posture must never be silently discarded: without the step
 // attribution the hook rides on there is nothing to enforce at, and a startup
 // that quietly dropped the request is indistinguishable from one that honored

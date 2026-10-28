@@ -47,6 +47,27 @@ func setOriginScopeStamped(t *testing.T, objs *OriginBpfObjects) {
 	require.NoError(t, objs.MapOriginConfig.Put(uint32(originCfgKeyScope), uint8(originScopeStamped)))
 }
 
+// map_sock_scope is declared twice: stepbpf.c owns it and originbpf.c
+// carries a stand-in the step collection's map replaces. cilium/ebpf rejects
+// a replacement whose spec differs, and the replacement happens only in the
+// scoped shape (a privileged pod), which no CI job runs, so a drift would
+// ship and then fail ARC startup. Compared from the specs: no kernel needed.
+func TestSockScopeMapSpecsMatch(t *testing.T) {
+	stepSpec, err := LoadStepBpf()
+	require.NoError(t, err)
+	originSpec, err := LoadOriginBpf()
+	require.NoError(t, err)
+	owner := stepSpec.Maps[StepBpfMapMapSockScope]
+	standIn := originSpec.Maps[OriginBpfMapMapSockScope]
+	require.NotNil(t, owner, "stepbpf.c must declare map_sock_scope")
+	require.NotNil(t, standIn, "originbpf.c must declare map_sock_scope")
+	require.Equal(t, owner.Type, standIn.Type, "map type")
+	require.Equal(t, owner.KeySize, standIn.KeySize, "key size")
+	require.Equal(t, owner.ValueSize, standIn.ValueSize, "value size")
+	require.Equal(t, owner.MaxEntries, standIn.MaxEntries, "max entries")
+	require.Equal(t, owner.Flags, standIn.Flags, "flags")
+}
+
 // Under the stamped scope the hook judges only sockets in map_sock_scope.
 // A PROG_TEST_RUN socket is fresh and never stamped, so packets the
 // whole-machine scope drops must pass, and leave no record.

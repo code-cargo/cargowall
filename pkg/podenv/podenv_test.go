@@ -75,6 +75,11 @@ func TestHookScope(t *testing.T) {
 		{"private cgroupns, no dockerd", private(Dockerd{Kind: DockerdAbsent}), true, false},
 		{"private cgroupns, own dockerd", private(local), true, false},
 		{"unprobed", Shape{}, false, false},
+		// A kind with no rule fails closed, wherever its switch sits.
+		{"unnamed cgroup namespace kind", Shape{CgroupNS: CgroupNS(99), CgroupPath: "/", PidNS: PidNSHost, Dockerd: local}, false, false},
+		{"unnamed pid namespace kind", host(pod, PidNS(99), foreign), false, false},
+		{"unnamed dockerd kind, scoped", host(pod, PidNSPrivate, Dockerd{Kind: DockerdKind(99)}), false, true},
+		{"unnamed dockerd kind, private cgroupns", private(Dockerd{Kind: DockerdKind(99)}), false, false},
 	}
 	for _, tc := range cases {
 		stamped, err := tc.shape.HookScope()

@@ -20,7 +20,15 @@
 // monotonically increasing ordinal, every other fork inherits the forking
 // thread's tag, and the cgroup hooks copy the tag onto each socket cookie —
 // so every TC event carries the step that (transitively) created its socket.
-// Attribution only: no verdict consults these maps.
+// Attribution only: no verdict consults these maps, with one exception.
+// map_sock_scope (Options.StampScope) is the set of sockets the cgroup
+// egress hook judges when it sits at a cgroup root other containers share,
+// and a socket missing from it passes the hook. It is written here because
+// map_task_nspid becomes valid here, before the hook attaches, and the
+// origin collection loads it in place of its own stand-in (ScopeStamps).
+// Close must not assume the hook is gone: start.go closes the observer
+// first and the origin collection holds its own reference to the map, but
+// nothing here may clear or reshape it while the hook might still read it.
 //
 // Pid numbering: the kernel side keys everything by global (init-namespace)
 // ids; everything this package reads from /proc — the worker pid, the
@@ -292,7 +300,8 @@ func (t *Tracker) ScopeStamps() *ebpf.Map {
 // Close disables tagging, detaches the programs, and stops the reconciler,
 // waiting for an in-flight boundary event to finish writing before returning
 // so the audit logger (whose deferred Close runs after ours) is still alive
-// for it.
+// for it. It leaves map_sock_scope as it is: the egress hook may still be
+// reading it (see the package comment).
 func (t *Tracker) Close() {
 	// Best-effort disable so the tcbpf-side hooks stop tagging immediately,
 	// even though the collection below is about to go away anyway.

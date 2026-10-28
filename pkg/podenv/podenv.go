@@ -202,7 +202,9 @@ func (s Shape) HookScope() (stamped bool, err error) {
 	return s.ScopeByPidNamespace(), nil
 }
 
-// hookRefusal is HookScope's refusal table.
+// hookRefusal is HookScope's refusal table. Every switch names each value
+// it allows, and refuses anything else, so a kind added later fails closed
+// until it is given a rule.
 func (s Shape) hookRefusal() error {
 	switch s.CgroupNS {
 	case CgroupNSUnknown:
@@ -223,22 +225,32 @@ func (s Shape) hookRefusal() error {
 			}
 		case PidNSPrivate:
 			switch s.Dockerd.Kind {
+			case DockerdAbsent, DockerdLocal, DockerdForeign:
 			case DockerdHidden:
 				return fmt.Errorf("the cgroup hook judges only our pid namespace, and the docker daemon's "+
 					"containers are outside it (%s)", s.Dockerd.Reason)
 			case DockerdUnknown:
 				return fmt.Errorf("the cgroup hook judges only our pid namespace, beside an unidentified dockerd (%s)",
 					s.Dockerd.Reason)
+			default:
+				return fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
 			}
+		default:
+			return fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
 		}
 	case CgroupNSPrivate:
 		switch s.Dockerd.Kind {
+		case DockerdAbsent, DockerdLocal:
 		case DockerdForeign, DockerdHidden:
 			return fmt.Errorf("the cgroup hook cannot reach containers of a dockerd in another container (%s)",
 				s.Dockerd.Reason)
 		case DockerdUnknown:
 			return fmt.Errorf("in a private cgroup namespace beside an unidentified dockerd (%s)", s.Dockerd.Reason)
+		default:
+			return fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
 		}
+	default:
+		return fmt.Errorf("cgroup namespace kind %d has no hook-scope rule", s.CgroupNS)
 	}
 	return nil
 }

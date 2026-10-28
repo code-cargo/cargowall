@@ -226,6 +226,8 @@ func (s Shape) hookRefusal() error {
 		case PidNSPrivate:
 			switch s.Dockerd.Kind {
 			case DockerdAbsent, DockerdLocal, DockerdForeign:
+				// Allowed. Go cases do not fall through: Foreign, the ARC
+				// shape, loads the hook.
 			case DockerdHidden:
 				return fmt.Errorf("the cgroup hook judges only our pid namespace, and the docker daemon's "+
 					"containers are outside it (%s)", s.Dockerd.Reason)
@@ -241,6 +243,7 @@ func (s Shape) hookRefusal() error {
 	case CgroupNSPrivate:
 		switch s.Dockerd.Kind {
 		case DockerdAbsent, DockerdLocal:
+			// Allowed. Go cases do not fall through.
 		case DockerdForeign, DockerdHidden:
 			return fmt.Errorf("the cgroup hook cannot reach containers of a dockerd in another container (%s)",
 				s.Dockerd.Reason)

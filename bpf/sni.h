@@ -899,13 +899,20 @@ static __always_inline int l7_payload_window(struct l7_ctx *c, __u32 skb_len, __
 // that CPU takes the "no slot" path and L7 never runs there again until
 // the process restarts — so no hook gets to reimplement it. The != 0 pins
 // the global function's return, an unknown scalar to the caller's
-// verifier state, to {0,1} for the cgroup_skb return-range check.
+// verifier state, to {0,1} for the cgroup_skb return-range check. The
+// compiler can see that l7_adjudicate only returns 0 or 1 and drop the
+// comparison as redundant (clang 21 does), which hands the verifier the raw
+// return again; barrier_var hides the value from that proof so the
+// comparison is always emitted.
 static __always_inline int l7_with_scratch(struct __sk_buff *skb, __u8 l7mode,
                                            struct l7_scratch *s, __u32 *depth, __u32 slot,
                                            __u32 l4_off, __u8 tcp_doff, __u32 tcp_seq) {
     int pass = 1;  // no window L7 can trust: the L4 verdict governs
-    if (l7_payload_window(&s->ctx, skb->len, l4_off, tcp_doff, tcp_seq))
-        pass = l7_adjudicate(skb, l7mode, slot) != 0;
+    if (l7_payload_window(&s->ctx, skb->len, l4_off, tcp_doff, tcp_seq)) {
+        int verdict = l7_adjudicate(skb, l7mode, slot);
+        barrier_var(verdict);
+        pass = verdict != 0;
+    }
     *depth = slot;
     return pass;
 }

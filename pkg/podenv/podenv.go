@@ -17,14 +17,14 @@
 // Package podenv describes the container environment cargowall itself runs
 // in: whose cgroup tree its root-cgroup hooks land on, whose processes share
 // its pid namespace, and whether the Docker daemon on the socket is one it
-// can reconfigure. A runner VM, a
-// Kubernetes pod with a Docker-in-Docker sidecar and a SaaS sidecar all
-// look alike from the flags; these facts are what tell them apart.
+// can reconfigure. A runner VM, a Kubernetes pod with a Docker-in-Docker
+// sidecar and a SaaS sidecar all look alike from the flags; these facts are
+// what tell them apart.
 //
-// Every fact has an explicit unknown state. A probe that fails says so,
-// and no caller may read unknown as the permissive answer: an unknown
-// cgroup namespace keeps the cgroup egress hook out, and an unknown daemon
-// keeps its config untouched.
+// Every fact has an explicit unknown state. A probe that fails says so, and
+// no caller may read an unknown it depends on as the permissive answer: an
+// unknown cgroup namespace or mount keeps the cgroup egress hook out, and an
+// unknown daemon keeps its config untouched.
 package podenv
 
 import (
@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -48,6 +49,9 @@ const (
 	initCgroupNamespace = 0xEFFFFFFB
 	initPidNamespace    = 0xEFFFFFFC
 )
+
+// cgroupRoot is where every cgroup program attaches.
+const cgroupRoot = "/sys/fs/cgroup"
 
 // CgroupNS is which cgroup namespace cargowall runs in.
 type CgroupNS int
@@ -67,6 +71,31 @@ func (c CgroupNS) String() string {
 		return "host"
 	case CgroupNSPrivate:
 		return "private"
+	}
+	return "unknown"
+}
+
+// CgroupMount is whether /sys/fs/cgroup is the cgroup tree /proc/self/cgroup
+// describes. The cgroup namespace alone does not say: the tree a path names
+// is the mount's, so the host's cgroupfs bound into a container with a
+// private cgroup namespace reads "/" in /proc/self/cgroup while
+// /sys/fs/cgroup is the machine's root.
+type CgroupMount int
+
+const (
+	CgroupMountUnknown CgroupMount = iota // the probe failed
+	// CgroupMountOurs: our pid is in /sys/fs/cgroup<CgroupPath>/cgroup.procs.
+	CgroupMountOurs
+	// CgroupMountOther: it is not, so the mount is some other tree.
+	CgroupMountOther
+)
+
+func (m CgroupMount) String() string {
+	switch m {
+	case CgroupMountOurs:
+		return "ours"
+	case CgroupMountOther:
+		return "other"
 	}
 	return "unknown"
 }
@@ -103,8 +132,9 @@ const (
 	// DockerdLocal: the daemon shares our mount namespace, so its
 	// daemon.json is ours and our service manager can restart it.
 	DockerdLocal
-	// DockerdForeign: the daemon runs in another container that shares our
-	// pid namespace: its pid is visible, its mount namespace is not ours.
+	// DockerdForeign: the daemon's pid is visible but its mount namespace is
+	// not ours: another container sharing our pid namespace, or the host's
+	// own daemon when we share the host's.
 	DockerdForeign
 	// DockerdHidden: the daemon's pid is outside our pid namespace, so
 	// neither it nor any container it starts is visible to us.
@@ -145,10 +175,19 @@ type Shape struct {
 	// CgroupPathReason is why CgroupPath is empty: the read error, or a
 	// file with no cgroup v2 entry.
 	CgroupPathReason string
-	PidNS            PidNS
+	// CgroupMount is whether /sys/fs/cgroup is the tree CgroupPath is in.
+	CgroupMount CgroupMount
+	// CgroupMountReason is the evidence for Other, or the probe error for
+	// Unknown.
+	CgroupMountReason string
+	PidNS             PidNS
 	// PidNSReason is the probe error when PidNS is unknown.
 	PidNSReason string
 	Dockerd     Dockerd
+	// DockerHost is DOCKER_HOST when it names a daemon other than the probed
+	// socket. The job's containers then belong to a daemon nothing probed,
+	// so an absent or local result on the socket says nothing about them.
+	DockerHost string
 }
 
 // HookScope decides whether a cgroup program attached at /sys/fs/cgroup can
@@ -171,6 +210,10 @@ type Shape struct {
 // The error says why the hook would not judge exactly this job, or why that
 // cannot be shown:
 //
+//   - /sys/fs/cgroup must be shown to be the tree our cgroup path is in
+//     (CgroupMount). Otherwise the attach point is not what the namespace
+//     says: the host's cgroupfs bound into a private cgroup namespace would
+//     put the unstamped hook at the machine's root.
 //   - In a Kubernetes pod in the host cgroup and pid namespaces (a
 //     privileged hostPID pod), /sys/fs/cgroup is the node root and every
 //     task on the node is ours to see: the hook would judge every pod and
@@ -178,19 +221,30 @@ type Shape struct {
 //   - Limited to our pid namespace, beside a dockerd outside it, the
 //     daemon's containers are outside it too, and the hook never judges
 //     their traffic.
-//   - In a private cgroup namespace beside a dockerd that is not ours (in
-//     another container, or with its pid outside our pid namespace, which
-//     may be the host's own daemon), the daemon's containers may live
-//     outside our subtree, where the hook never sees them.
+//   - In a private cgroup namespace beside a dockerd that is not ours
+//     (another container's, or the host's own, whether its pid is visible
+//     or not), the daemon's containers may live outside our subtree, where
+//     the hook never sees them.
+//   - Wherever the daemon decides coverage, a DOCKER_HOST naming a daemon
+//     other than the probed socket refuses: the job's containers belong to
+//     that daemon, and nothing here identified it.
 //   - An unidentified fact refuses where it decides who the hook judges:
-//     the cgroup namespace always; in the host cgroup namespace, the cgroup
-//     path and the pid namespace; and the daemon wherever its containers
-//     could escape the hook (limited to our pid namespace, or in a private
-//     cgroup namespace). Elsewhere an unknown cannot change that and is not
-//     read: on a runner VM the hook judges the whole machine whatever the
-//     daemon is, and in a private cgroup namespace the cgroup subtree, not
-//     the pid namespace, bounds it. A kind added later with no rule here is
-//     refused until it is given one.
+//     the cgroup namespace, the cgroup path and the mount always; in the
+//     host cgroup namespace, the pid namespace; and the daemon wherever its
+//     containers could escape the hook (limited to our pid namespace, or in
+//     a private cgroup namespace). Elsewhere an unknown cannot change that
+//     and is not read: on a runner VM the hook judges the whole machine
+//     whatever the daemon is, and in a private cgroup namespace the proven
+//     cgroup subtree, not the pid namespace, bounds it. A kind added later
+//     with no rule here is refused until it is given one.
+//
+// Two premises are accepted rather than proven. A process in the host
+// cgroup and pid namespaces outside kubelet's tree is taken to be the
+// machine's own firewall, as on a runner VM: nothing positively marks a
+// machine single-tenant, and the kubepods refusal guards the multi-tenant
+// shape cargowall is known to be deployed in. And the daemon probe
+// identifies whoever listens on the socket, so a proxy in our own
+// container forwarding to a remote daemon reads as local.
 //
 // Two limits of the scoped hook are accepted rather than refused, and
 // design.md describes both. Our own sockets that missed a stamp pass with
@@ -202,21 +256,26 @@ func (s Shape) HookScope() (stamped bool, err error) {
 	case CgroupNSUnknown:
 		return false, fmt.Errorf("cgroup namespace unknown (%s)", s.CgroupNSReason)
 	case CgroupNSHost:
-		if s.CgroupPath == "" {
-			return false, fmt.Errorf("cgroup path unknown in the host cgroup namespace (%s)", s.CgroupPathReason)
+		if err := s.attachPointRefusal(); err != nil {
+			return false, err
 		}
 		switch s.PidNS {
 		case PidNSUnknown:
 			return false, fmt.Errorf("pid namespace unknown in the host cgroup namespace (%s)", s.PidNSReason)
 		case PidNSHost:
-			// kubelet names its tree kubepods under both the cgroupfs and
-			// systemd drivers.
-			if strings.Contains(s.CgroupPath, "/kubepods") {
+			// kubelet's tree is kubepods under the cgroupfs driver and
+			// <root>-kubepods.slice under the systemd driver with a cgroup
+			// root of its own, so the name is matched anywhere in the path:
+			// a false match only refuses.
+			if strings.Contains(s.CgroupPath, "kubepods") {
 				return false, errors.New("running in a Kubernetes pod in the host cgroup and pid namespaces: " +
 					"the cgroup hook would attach at the node root and judge every pod on the node")
 			}
 			return false, nil
 		case PidNSPrivate:
+			if err := s.dockerHostRefusal(); err != nil {
+				return false, err
+			}
 			switch s.Dockerd.Kind {
 			case DockerdAbsent, DockerdLocal, DockerdForeign:
 				return true, nil
@@ -233,12 +292,18 @@ func (s Shape) HookScope() (stamped bool, err error) {
 			return false, fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
 		}
 	case CgroupNSPrivate:
+		if err := s.attachPointRefusal(); err != nil {
+			return false, err
+		}
+		if err := s.dockerHostRefusal(); err != nil {
+			return false, err
+		}
 		switch s.Dockerd.Kind {
 		case DockerdAbsent, DockerdLocal:
 			return false, nil
 		case DockerdForeign:
-			return false, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd in another container (%s)",
-				s.Dockerd.Reason)
+			return false, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd outside this container, "+
+				"another container's or the host's own (%s)", s.Dockerd.Reason)
 		case DockerdHidden:
 			return false, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd we cannot see, "+
 				"possibly the host's own (%s)", s.Dockerd.Reason)
@@ -252,13 +317,42 @@ func (s Shape) HookScope() (stamped bool, err error) {
 	}
 }
 
+// attachPointRefusal says why /sys/fs/cgroup cannot be shown to be the
+// cgroup tree this process is in, or nil when it can.
+func (s Shape) attachPointRefusal() error {
+	if s.CgroupPath == "" {
+		return fmt.Errorf("cgroup path unknown (%s)", s.CgroupPathReason)
+	}
+	switch s.CgroupMount {
+	case CgroupMountOurs:
+		return nil
+	case CgroupMountOther:
+		return fmt.Errorf("%s is not the cgroup tree this process is in (%s)", cgroupRoot, s.CgroupMountReason)
+	case CgroupMountUnknown:
+		return fmt.Errorf("cannot show %s is the cgroup tree this process is in (%s)", cgroupRoot, s.CgroupMountReason)
+	default:
+		return fmt.Errorf("cgroup mount kind %d has no hook-scope rule", s.CgroupMount)
+	}
+}
+
+// dockerHostRefusal says why the job's daemon is not the one probed, or nil.
+func (s Shape) dockerHostRefusal() error {
+	if s.DockerHost != "" {
+		return fmt.Errorf("DOCKER_HOST=%s names a docker daemon the probe did not reach, "+
+			"whose containers the hook may not see", s.DockerHost)
+	}
+	return nil
+}
+
 // LogArgs is every fact and probe error, as slog key-value pairs.
 func (s Shape) LogArgs() []any {
 	return []any{
 		"cgroupns", s.CgroupNS.String(), "cgroupns_reason", s.CgroupNSReason,
 		"cgroup", s.CgroupPath, "cgroup_reason", s.CgroupPathReason,
+		"cgroup_mount", s.CgroupMount.String(), "cgroup_mount_reason", s.CgroupMountReason,
 		"pidns", s.PidNS.String(), "pidns_reason", s.PidNSReason,
 		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
+		"docker_host", s.DockerHost,
 	}
 }
 
@@ -279,6 +373,11 @@ func Detect(dockerSocket string) Shape {
 	} else if s.CgroupPath = parseCgroupV2Path(data); s.CgroupPath == "" {
 		s.CgroupPathReason = "no cgroup v2 entry in /proc/self/cgroup"
 	}
+	if s.CgroupPath != "" {
+		s.CgroupMount, s.CgroupMountReason = probeCgroupMount(cgroupRoot, s.CgroupPath, os.Getpid())
+	} else {
+		s.CgroupMountReason = "no cgroup path to look for"
+	}
 	if ino, err := nsInode("/proc/self/ns/pid"); err != nil {
 		s.PidNSReason = err.Error()
 	} else if ino == initPidNamespace {
@@ -287,7 +386,41 @@ func Detect(dockerSocket string) Shape {
 		s.PidNS = PidNSPrivate
 	}
 	s.Dockerd = probeDockerd(dockerSocket)
+	s.DockerHost = dockerHostElsewhere(os.Getenv("DOCKER_HOST"), dockerSocket)
 	return s
+}
+
+// probeCgroupMount reports whether root is the cgroup tree path is in,
+// by looking for pid in that cgroup's member list. cgroup.procs lists pids
+// as numbered in the reader's pid namespace, which is ours.
+func probeCgroupMount(root, path string, pid int) (CgroupMount, string) {
+	procs := filepath.Join(root, path, "cgroup.procs")
+	data, err := os.ReadFile(procs)
+	if errors.Is(err, os.ErrNotExist) {
+		return CgroupMountOther, fmt.Sprintf("%s has no cgroup %s", root, path)
+	}
+	if err != nil {
+		return CgroupMountUnknown, err.Error()
+	}
+	want := strconv.Itoa(pid)
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == want {
+			return CgroupMountOurs, ""
+		}
+	}
+	return CgroupMountOther, fmt.Sprintf("pid %d is not in %s", pid, procs)
+}
+
+// dockerHostElsewhere returns DOCKER_HOST when it names a daemon other than
+// the one on socket, and "" when it is unset or names that socket.
+func dockerHostElsewhere(dockerHost, socket string) string {
+	if dockerHost == "" {
+		return ""
+	}
+	if p, ok := strings.CutPrefix(dockerHost, "unix://"); ok && filepath.Clean(p) == filepath.Clean(socket) {
+		return ""
+	}
+	return dockerHost
 }
 
 // parseCgroupV2Path returns the path of the unified hierarchy line

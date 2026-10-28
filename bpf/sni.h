@@ -24,7 +24,7 @@
 #define L7_MODE_OBSERVE 1  // parse, punt, count — never drop
 #define L7_MODE_ENFORCE 2  // fail closed: drop until a name is adjudicated
 
-// map_origin_config key 2 (0, 1 and 3, the egress scope, are originbpf.c's).
+// map_origin_config key 2 (0 and 1 belong to originbpf.c; 3 is reserved).
 #define ORIGIN_CFG_KEY_L7_MODE 2
 
 // Which L7 dimension applies to a destination IP. Mirrored by pkg/bpf's Go

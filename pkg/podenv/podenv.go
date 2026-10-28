@@ -151,27 +151,21 @@ type Shape struct {
 	Dockerd     Dockerd
 }
 
-// ScopeByPidNamespace reports whether the cgroup egress hook must judge
-// only sockets created by tasks in our pid namespace. That is the case in
-// the host cgroup namespace outside the host pid namespace: the hook
-// attaches at the root of the machine's cgroup tree, which other containers
-// share, while our pid namespace holds only this job's processes (in a pod
-// that shares one, the runner's, dockerd's and those of every container
-// dockerd starts).
-func (s Shape) ScopeByPidNamespace() bool {
-	return s.CgroupNS == CgroupNSHost && s.PidNS == PidNSPrivate
-}
-
 // HookScope decides whether a cgroup program attached at /sys/fs/cgroup can
 // judge exactly this job's traffic, and how. Loading the hook and stamping
-// sockets are one decision, so both answers come from here:
+// sockets are one decision, so both answers come from here, and every leaf
+// of the table below returns its own:
 //
 //   - nil error, stamped false: every socket under the attach point is this
 //     job's (a runner VM, or a private cgroup namespace), and the hook
 //     judges them all.
-//   - nil error, stamped true: the attach point is shared, and the hook must
-//     judge only the sockets stamped as created in our pid namespace
-//     (ScopeByPidNamespace). Without the stamps it would judge other pods.
+//   - nil error, stamped true: the host cgroup namespace outside the host
+//     pid namespace. The attach point is the root of the machine's cgroup
+//     tree, which other containers share, while our pid namespace holds
+//     only this job's processes (in a pod that shares one, the runner's,
+//     dockerd's and those of every container dockerd starts). The hook must
+//     judge only the sockets stamped as created there; without the stamps
+//     it would judge other pods.
 //   - an error: the hook must not load, and stamped is false.
 //
 // The error says why the hook would not judge exactly this job, or why that
@@ -188,7 +182,8 @@ func (s Shape) ScopeByPidNamespace() bool {
 //     the daemon's containers may live outside our subtree, where the hook
 //     never sees them.
 //   - A namespace, cgroup path or daemon that could not be identified
-//     proves none of this.
+//     proves none of this, and a kind added later with no rule here is
+//     refused until it is given one.
 //
 // Two limits of the scoped hook are accepted rather than refused, and
 // design.md describes both. Our own sockets that missed a stamp pass with
@@ -196,66 +191,55 @@ func (s Shape) ScopeByPidNamespace() bool {
 // Kubernetes container mode) is outside this pod's pid namespace and
 // interface, beyond every layer here, as it was before the scope.
 func (s Shape) HookScope() (stamped bool, err error) {
-	if err := s.hookRefusal(); err != nil {
-		return false, err
-	}
-	return s.ScopeByPidNamespace(), nil
-}
-
-// hookRefusal is HookScope's refusal table. Every switch names each value
-// it allows, and refuses anything else, so a kind added later fails closed
-// until it is given a rule.
-func (s Shape) hookRefusal() error {
 	switch s.CgroupNS {
 	case CgroupNSUnknown:
-		return fmt.Errorf("cgroup namespace unknown (%s)", s.CgroupNSReason)
+		return false, fmt.Errorf("cgroup namespace unknown (%s)", s.CgroupNSReason)
 	case CgroupNSHost:
 		if s.CgroupPath == "" {
-			return fmt.Errorf("cgroup path unknown in the host cgroup namespace (%s)", s.CgroupPathReason)
+			return false, fmt.Errorf("cgroup path unknown in the host cgroup namespace (%s)", s.CgroupPathReason)
 		}
 		switch s.PidNS {
 		case PidNSUnknown:
-			return fmt.Errorf("pid namespace unknown in the host cgroup namespace (%s)", s.PidNSReason)
+			return false, fmt.Errorf("pid namespace unknown in the host cgroup namespace (%s)", s.PidNSReason)
 		case PidNSHost:
 			// kubelet names its tree kubepods under both the cgroupfs and
 			// systemd drivers.
 			if strings.Contains(s.CgroupPath, "/kubepods") {
-				return errors.New("running in a Kubernetes pod in the host cgroup and pid namespaces: " +
+				return false, errors.New("running in a Kubernetes pod in the host cgroup and pid namespaces: " +
 					"the cgroup hook would attach at the node root and judge every pod on the node")
 			}
+			return false, nil
 		case PidNSPrivate:
 			switch s.Dockerd.Kind {
 			case DockerdAbsent, DockerdLocal, DockerdForeign:
-				// Allowed. Go cases do not fall through: Foreign, the ARC
-				// shape, loads the hook.
+				return true, nil
 			case DockerdHidden:
-				return fmt.Errorf("the cgroup hook judges only our pid namespace, and the docker daemon's "+
+				return false, fmt.Errorf("the cgroup hook judges only our pid namespace, and the docker daemon's "+
 					"containers are outside it (%s)", s.Dockerd.Reason)
 			case DockerdUnknown:
-				return fmt.Errorf("the cgroup hook judges only our pid namespace, beside an unidentified dockerd (%s)",
+				return false, fmt.Errorf("the cgroup hook judges only our pid namespace, beside an unidentified dockerd (%s)",
 					s.Dockerd.Reason)
 			default:
-				return fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
+				return false, fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
 			}
 		default:
-			return fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
+			return false, fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
 		}
 	case CgroupNSPrivate:
 		switch s.Dockerd.Kind {
 		case DockerdAbsent, DockerdLocal:
-			// Allowed. Go cases do not fall through.
+			return false, nil
 		case DockerdForeign, DockerdHidden:
-			return fmt.Errorf("the cgroup hook cannot reach containers of a dockerd in another container (%s)",
+			return false, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd in another container (%s)",
 				s.Dockerd.Reason)
 		case DockerdUnknown:
-			return fmt.Errorf("in a private cgroup namespace beside an unidentified dockerd (%s)", s.Dockerd.Reason)
+			return false, fmt.Errorf("in a private cgroup namespace beside an unidentified dockerd (%s)", s.Dockerd.Reason)
 		default:
-			return fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
+			return false, fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
 		}
 	default:
-		return fmt.Errorf("cgroup namespace kind %d has no hook-scope rule", s.CgroupNS)
+		return false, fmt.Errorf("cgroup namespace kind %d has no hook-scope rule", s.CgroupNS)
 	}
-	return nil
 }
 
 // LogArgs is every fact and probe error, as slog key-value pairs.

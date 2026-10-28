@@ -53,10 +53,10 @@ func TestHookScope(t *testing.T) {
 		return Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", PidNS: PidNSPrivate, Dockerd: d}
 	}
 	cases := []struct {
-		name   string
-		shape  Shape
-		ok     bool
-		scoped bool
+		name    string
+		shape   Shape
+		ok      bool
+		stamped bool
 	}{
 		{"hosted runner", host(runner, PidNSHost, local), true, false},
 		{"hosted runner, daemon unidentified", host(runner, PidNSHost, unknownD), true, false},
@@ -64,8 +64,8 @@ func TestHookScope(t *testing.T) {
 		{"ARC runner pod sharing a pid namespace with dind", host(pod, PidNSPrivate, foreign), true, true},
 		{"privileged pod, no dockerd", host(pod, PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, true},
 		{"privileged pod running its own dockerd", host(pod, PidNSPrivate, local), true, true},
-		{"privileged pod, dind not sharing the pid namespace", host(pod, PidNSPrivate, hidden), false, true},
-		{"privileged pod, daemon unidentified", host(pod, PidNSPrivate, unknownD), false, true},
+		{"privileged pod, dind not sharing the pid namespace", host(pod, PidNSPrivate, hidden), false, false},
+		{"privileged pod, daemon unidentified", host(pod, PidNSPrivate, unknownD), false, false},
 		{"privileged container outside Kubernetes", host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, true},
 		{"host cgroupns, pid namespace unread", Shape{CgroupNS: CgroupNSHost, CgroupPath: runner, PidNSReason: "stat: permission denied", Dockerd: local}, false, false},
 		{"host cgroupns, path unread", Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied", PidNS: PidNSHost, Dockerd: local}, false, false},
@@ -78,7 +78,7 @@ func TestHookScope(t *testing.T) {
 		// A kind with no rule fails closed, wherever its switch sits.
 		{"unnamed cgroup namespace kind", Shape{CgroupNS: CgroupNS(99), CgroupPath: "/", PidNS: PidNSHost, Dockerd: local}, false, false},
 		{"unnamed pid namespace kind", host(pod, PidNS(99), foreign), false, false},
-		{"unnamed dockerd kind, scoped", host(pod, PidNSPrivate, Dockerd{Kind: DockerdKind(99)}), false, true},
+		{"unnamed dockerd kind, privileged pod", host(pod, PidNSPrivate, Dockerd{Kind: DockerdKind(99)}), false, false},
 		{"unnamed dockerd kind, private cgroupns", private(Dockerd{Kind: DockerdKind(99)}), false, false},
 	}
 	for _, tc := range cases {
@@ -86,12 +86,12 @@ func TestHookScope(t *testing.T) {
 		if (err == nil) != tc.ok {
 			t.Errorf("%s: HookScope() error = %v, want ok=%v", tc.name, err, tc.ok)
 		}
-		if got := tc.shape.ScopeByPidNamespace(); got != tc.scoped {
-			t.Errorf("%s: ScopeByPidNamespace() = %v, want %v", tc.name, got, tc.scoped)
+		if stamped != tc.stamped {
+			t.Errorf("%s: HookScope() stamped = %v, want %v", tc.name, stamped, tc.stamped)
 		}
 		// A refused hook never asks for stamps: nothing would read them.
-		if want := tc.ok && tc.scoped; stamped != want {
-			t.Errorf("%s: HookScope() stamped = %v, want %v", tc.name, stamped, want)
+		if err != nil && stamped {
+			t.Errorf("%s: HookScope() refused and still asked for stamps", tc.name)
 		}
 	}
 

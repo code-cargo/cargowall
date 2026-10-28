@@ -95,6 +95,11 @@ func TestVerifierBudget(t *testing.T) {
 			return spec.Variables[StepBpfVarPidnsIno].Set(pidnsInode(t))
 		}},
 		{"originbpf", LoadOriginBpf, nil},
+		// stamped_only is a load-time constant, so a privileged pod runs a
+		// different program from a runner VM's. Measure both.
+		{"originbpf_stamped_only", LoadOriginBpf, func(spec *ebpf.CollectionSpec) error {
+			return spec.Variables[OriginBpfVarStampedOnly].Set(uint8(1))
+		}},
 	}
 
 	for _, c := range collections {

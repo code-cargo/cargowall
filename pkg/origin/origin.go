@@ -64,13 +64,6 @@ import (
 const (
 	cfgKeyMode       = uint32(0)
 	cfgKeyLoCarveout = uint32(1)
-	cfgKeyScope      = uint32(3)
-)
-
-// Hook scopes, mirroring ORIGIN_SCOPE_* in originbpf.c.
-const (
-	scopeAll     = uint8(0)
-	scopeStamped = uint8(1)
 )
 
 // Mode is the cgroup hook's enforcement posture, mirroring ORIGIN_MODE_* in
@@ -315,12 +308,19 @@ func Start(tcObjs *bpf.TcBpfObjects, scopeStamps *ebpf.Map, logger *slog.Logger)
 		"map_default_action": tcObjs.MapDefaultAction,
 		"map_audit_mode":     tcObjs.MapAuditMode,
 	}
-	scope := scopeAll
 	if scopeStamps != nil {
+		// Set before load, with the map it reads: the program never judges,
+		// even briefly, a socket that is not this job's.
+		v := spec.Variables[bpf.OriginBpfVarStampedOnly]
+		if v == nil {
+			return nil, errors.New("origin BPF spec has no stamped_only variable (stale generated code)")
+		}
+		if err := v.Set(uint8(1)); err != nil {
+			return nil, fmt.Errorf("failed to set stamped_only: %w", err)
+		}
 		replacements[bpf.OriginBpfMapMapSockScope] = scopeStamps
-		scope = scopeStamped
 	} else if m := spec.Maps[bpf.OriginBpfMapMapSockScope]; m != nil {
-		// The hook never reads the stand-in under scopeAll.
+		// Only a stamped_only program reads the stand-in.
 		m.MaxEntries = 64
 	}
 	if err := cargowallEbpf.LoadObjects(logger, "originbpf", spec, ebpf.CollectionOptions{
@@ -349,12 +349,6 @@ func Start(tcObjs *bpf.TcBpfObjects, scopeStamps *ebpf.Map, logger *slog.Logger)
 	if err := o.objs.MapOriginConfig.Put(cfgKeyLoCarveout, uint8(1)); err != nil {
 		o.objs.Close()
 		return nil, fmt.Errorf("failed to arm loopback carve-out: %w", err)
-	}
-	// The scope too is set before attach: a hook at a shared root must never
-	// judge, even briefly, sockets that are not this job's.
-	if err := o.objs.MapOriginConfig.Put(cfgKeyScope, scope); err != nil {
-		o.objs.Close()
-		return nil, fmt.Errorf("failed to set hook scope: %w", err)
 	}
 
 	// Telemetry: what else is attached at the root cgroup (Docker's or

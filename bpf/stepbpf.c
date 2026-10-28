@@ -47,8 +47,8 @@ const volatile __u32 pidns_ino = 0;
 
 // Nonzero makes cg_sock_create stamp each socket a task in the daemon's pid
 // namespace creates into map_sock_scope. Set by userspace before load when
-// the cgroup egress hook is limited to that namespace (podenv's
-// ScopeByPidNamespace); zero leaves the stamping out of the program.
+// podenv's HookScope says the cgroup egress hook judges only stamped
+// sockets; zero leaves the stamping out of the program.
 const volatile __u8 stamp_scope = 0;
 
 // ---- Shared with tcbpf.c (replaced at load time; shapes must match) ----

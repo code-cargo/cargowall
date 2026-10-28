@@ -162,6 +162,7 @@ const (
 	OriginBpfProgCgOriginEgress      = "cg_origin_egress"
 	OriginBpfVarBtfAnchorL7Event     = "btf_anchor_l7_event"
 	OriginBpfVarBtfAnchorOriginEvent = "btf_anchor_origin_event"
+	OriginBpfVarStampedOnly          = "stamped_only"
 )
 
 // LoadOriginBpf returns the embedded CollectionSpec for OriginBpf.
@@ -240,6 +241,7 @@ type OriginBpfMapSpecs struct {
 type OriginBpfVariableSpecs struct {
 	BtfAnchorL7Event     *ebpf.VariableSpec `ebpf:"btf_anchor_l7_event"`
 	BtfAnchorOriginEvent *ebpf.VariableSpec `ebpf:"btf_anchor_origin_event"`
+	StampedOnly          *ebpf.VariableSpec `ebpf:"stamped_only"`
 }
 
 // OriginBpfObjects contains all objects after they have been loaded into the kernel.
@@ -313,6 +315,7 @@ func (m *OriginBpfMaps) Close() error {
 type OriginBpfVariables struct {
 	BtfAnchorL7Event     *ebpf.Variable `ebpf:"btf_anchor_l7_event"`
 	BtfAnchorOriginEvent *ebpf.Variable `ebpf:"btf_anchor_origin_event"`
+	StampedOnly          *ebpf.Variable `ebpf:"stamped_only"`
 }
 
 // OriginBpfPrograms contains all programs after they have been loaded into the kernel.

@@ -35,16 +35,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Mirrors of ORIGIN_CFG_KEY_SCOPE and ORIGIN_SCOPE_STAMPED in originbpf.c,
-// pinned by TestOriginConstantsMatchBpfSource in pkg/origin.
-const (
-	originCfgKeyScope  = 3
-	originScopeStamped = 1
-)
-
-func setOriginScopeStamped(t *testing.T, objs *OriginBpfObjects) {
+// loadOriginObjectsStampedOnly loads the origin collection the way
+// origin.Start does in a privileged pod: stamped_only set before load. The
+// collection keeps its own stand-in map_sock_scope, which a test stamps
+// directly.
+func loadOriginObjectsStampedOnly(t *testing.T) *OriginBpfObjects {
 	t.Helper()
-	require.NoError(t, objs.MapOriginConfig.Put(uint32(originCfgKeyScope), uint8(originScopeStamped)))
+	requireBPF(t)
+	spec, err := LoadOriginBpf()
+	require.NoError(t, err)
+	require.NoError(t, spec.Variables[OriginBpfVarStampedOnly].Set(uint8(1)))
+	var objs OriginBpfObjects
+	require.NoError(t, spec.LoadAndAssign(&objs, nil))
+	t.Cleanup(func() { objs.Close() })
+	return &objs
 }
 
 // map_sock_scope is declared twice: stepbpf.c owns it and originbpf.c
@@ -68,17 +72,16 @@ func TestSockScopeMapSpecsMatch(t *testing.T) {
 	require.Equal(t, owner.Flags, standIn.Flags, "flags")
 }
 
-// Under the stamped scope the hook judges only sockets in map_sock_scope.
-// A PROG_TEST_RUN socket is fresh and never stamped, so packets the
-// whole-machine scope drops must pass, and leave no record.
+// With stamped_only set the hook judges only sockets in map_sock_scope. A
+// PROG_TEST_RUN socket is fresh and never stamped, so packets the default
+// program drops must pass, and leave no record.
 func TestOriginScopeStampedPassesUnstampedSockets(t *testing.T) {
-	objs := loadOriginObjects(t)
-	seedOriginRules(t, objs)
-	setOriginMode(t, objs, originModeEnforce)
-
-	rd, err := ringbuf.NewReader(objs.MapOriginEvents)
-	require.NoError(t, err)
-	t.Cleanup(func() { rd.Close() })
+	all := loadOriginObjects(t)
+	stamped := loadOriginObjectsStampedOnly(t)
+	for _, objs := range []*OriginBpfObjects{all, stamped} {
+		seedOriginRules(t, objs)
+		setOriginMode(t, objs, originModeEnforce)
+	}
 
 	denied := []struct {
 		name   string
@@ -89,19 +92,20 @@ func TestOriginScopeStampedPassesUnstampedSockets(t *testing.T) {
 		{"v6 TCP SYN", craftIPv6TCP(t, "2001:db8::1", 443)},
 		{"invalid IHL", craftInvalidIHLIPv4(t)},
 	}
-	// The default scope first, so a pass below can only be the scope.
+	// The default program first, so a pass below can only be the scope.
 	for _, d := range denied {
-		ret, _, err := objs.CgOriginEgress.Test(d.packet)
+		ret, _, err := all.CgOriginEgress.Test(d.packet)
 		require.NoError(t, err)
-		require.Equal(t, uint32(0), ret, "%s: the whole-machine scope must drop it", d.name)
+		require.Equal(t, uint32(0), ret, "%s: the default program must drop it", d.name)
 	}
-	require.NotEmpty(t, collectOriginRecords(t, rd, 200*time.Millisecond))
 
-	setOriginScopeStamped(t, objs)
+	rd, err := ringbuf.NewReader(stamped.MapOriginEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { rd.Close() })
 	for _, d := range denied {
-		ret, _, err := objs.CgOriginEgress.Test(d.packet)
+		ret, _, err := stamped.CgOriginEgress.Test(d.packet)
 		require.NoError(t, err)
-		require.Equal(t, uint32(1), ret, "%s: an unstamped socket must pass the stamped scope", d.name)
+		require.Equal(t, uint32(1), ret, "%s: an unstamped socket must pass a stamped_only program", d.name)
 	}
 	require.Empty(t, collectOriginRecords(t, rd, 200*time.Millisecond),
 		"an out-of-scope socket must leave no record")
@@ -136,9 +140,8 @@ func enterTestCgroup(t *testing.T) string {
 // which rides lo and is adjudicated with the loopback carve-out off, as it
 // is in tests, so nothing leaves the machine.
 func TestOriginScopeRealSocket(t *testing.T) {
-	objs := loadOriginObjects(t)
+	objs := loadOriginObjectsStampedOnly(t)
 	seedOriginRules(t, objs) // deny by default
-	setOriginScopeStamped(t, objs)
 	setOriginMode(t, objs, originModeEnforce)
 
 	l, err := link.AttachCgroup(link.CgroupOptions{

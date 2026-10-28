@@ -179,6 +179,12 @@ func (s Shape) ScopeByPidNamespace() bool {
 //     never sees them.
 //   - A namespace, cgroup path or daemon that could not be identified
 //     proves none of this.
+//
+// Two limits of the scoped hook are accepted rather than refused, and
+// design.md describes both. Our own sockets that missed a stamp pass with
+// only TC's verdict, so they get no L7 check. Work in other pods (ARC's
+// Kubernetes container mode) is outside this pod's pid namespace and
+// interface, beyond every layer here, as it was before the scope.
 func (s Shape) HookScope() error {
 	switch s.CgroupNS {
 	case CgroupNSUnknown:

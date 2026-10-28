@@ -100,7 +100,8 @@ expect_denied() {
     echo "❌ $label should be blocked by sudo lockdown"
     exit 1
   }
-  if echo "$output" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+  # Classic sudo's wordings, then sudo-rs's (Ubuntu 26.04's default sudo).
+  if echo "$output" | grep -qiE "not allowed|not in sudoers|may not run|a password is required|afraid I can't do that"; then
     echo "✅ $label denied by sudo"
   else
     echo "❌ $label failed but not due to sudoers denial: $output"

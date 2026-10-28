@@ -45,7 +45,13 @@ permissions:
 jobs:
   local:
     name: Local collector round-trip
-    runs-on: ubuntu-latest
+    # The OTLP settings reach cargowall through sudo, which the distro's
+    # sudo implementation decides: cover the current Ubuntu LTS and the last.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -112,8 +118,10 @@ jobs:
           # Audit mode: events are exported with would_deny verdicts but no
           # traffic is actually blocked, so runner infrastructure (results
           # upload, Azure metadata, ...) cannot break. The collector endpoint
-          # is loopback, which the TC egress filter never sees.
-          sudo -E ./bin/cargowall start \
+          # is loopback, which the TC egress filter never sees. sudo-env.sh
+          # carries the step's environment through sudo (sudo-rs ignores -E).
+          bash scripts/ci/sudo-env.sh \
+            ./bin/cargowall start \
             --config /etc/cargowall/config.json \
             --dns-upstream 8.8.8.8:53 \
             --dns-redirect-iptables \
@@ -183,7 +191,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: otel-e2e-local-output
+          name: otel-e2e-local-output-${{ matrix.os }}
           path: |
             /tmp/otelcol/out/records.json
             /tmp/cargowall.ndjson
@@ -247,7 +255,8 @@ jobs:
           OTEL_SERVICE_NAME: cargowall-e2e
           OTEL_RESOURCE_ATTRIBUTES: test.run.id=${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          sudo -E ./bin/cargowall start \
+          bash scripts/ci/sudo-env.sh \
+            ./bin/cargowall start \
             --config /etc/cargowall/config.json \
             --dns-upstream 8.8.8.8:53 \
             --dns-redirect-iptables \

@@ -38,6 +38,10 @@ env:
   CW_OFFLINE: ${{ github.event.pull_request.head.repo.fork && 'true' || 'false' }}
 
 
+# Jobs whose behavior depends on the runner's kernel or distro (BPF test
+# runs, iptables, sudo, the resolver setup) run on a matrix of the current
+# Ubuntu LTS and the one before it, so a new runner image shows up as one
+# failing leg instead of a broken main.
 jobs:
   checks:
     name: Lint & Build
@@ -78,7 +82,11 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     permissions:
       contents: read
       actions: read
@@ -121,7 +129,7 @@ jobs:
         # rendering, not coverage.
         if: ${{ always() && !github.event.pull_request.head.repo.fork }}
         with:
-          name: Test Results
+          name: Test Results (${{ matrix.os }})
           path: test-results*.xml
           reporter: java-junit
 
@@ -144,14 +152,11 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install eBPF dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev
-
-      - name: Generate BPF objects
-        run: go generate ./...
-
+      # Builds the committed BPF objects, which bpf-generate.yml holds to
+      # clang 18; every integration leg loads this one binary. Regenerating
+      # here would pick up whatever clang the image prefers and change the
+      # program under both legs at once. The Test matrix is where the
+      # runner's own clang is exercised.
       - name: Build cargowall
         run: make build
 
@@ -165,7 +170,11 @@ jobs:
   test-cargowall-enforce:
     name: Integration Test (Enforce Mode)
     needs: build-binary
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     permissions:
       contents: read
       actions: read
@@ -247,7 +256,11 @@ jobs:
   test-cargowall-cgroup-enforce:
     name: Integration Test (Cgroup Enforce)
     needs: build-binary
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     permissions:
       contents: read
       actions: read
@@ -293,7 +306,11 @@ jobs:
   test-cargowall-audit:
     name: Integration Test (Audit Mode)
     needs: build-binary
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     permissions:
       contents: read
       actions: read
@@ -325,7 +342,11 @@ jobs:
   test-sudo-lockdown:
     name: Integration Test (Sudo Lockdown)
     needs: build-binary
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     permissions:
       contents: read
       actions: read
@@ -377,7 +398,11 @@ jobs:
   test-sudo-lockdown-full-block:
     name: Integration Test (Sudo Lockdown - Full Block)
     needs: build-binary
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     permissions:
       contents: read
       actions: read
@@ -425,7 +450,11 @@ jobs:
   test-cargowall-gitlab-ci:
     name: Integration Test (GitLab CI mode)
     needs: build-binary
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     permissions:
       contents: read
       actions: read
@@ -498,7 +527,11 @@ jobs:
   test-cargowall-sidecar-shape:
     name: Integration Test (Sidecar Shape)
     needs: build-binary
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     permissions:
       contents: read
     steps:
@@ -559,7 +592,11 @@ jobs:
     # it would assert nothing it is here to assert.
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: build-binary
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     permissions:
       contents: read
       actions: read

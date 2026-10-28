@@ -162,10 +162,20 @@ func (s Shape) ScopeByPidNamespace() bool {
 	return s.CgroupNS == CgroupNSHost && s.PidNS == PidNSPrivate
 }
 
-// HookScope is nil when a cgroup program attached at /sys/fs/cgroup would
-// judge exactly this job's traffic, with ScopeByPidNamespace's limit where
-// it applies, and otherwise says why it would not or why that cannot be
-// shown:
+// HookScope decides whether a cgroup program attached at /sys/fs/cgroup can
+// judge exactly this job's traffic, and how. Loading the hook and stamping
+// sockets are one decision, so both answers come from here:
+//
+//   - nil error, stamped false: every socket under the attach point is this
+//     job's (a runner VM, or a private cgroup namespace), and the hook
+//     judges them all.
+//   - nil error, stamped true: the attach point is shared, and the hook must
+//     judge only the sockets stamped as created in our pid namespace
+//     (ScopeByPidNamespace). Without the stamps it would judge other pods.
+//   - an error: the hook must not load, and stamped is false.
+//
+// The error says why the hook would not judge exactly this job, or why that
+// cannot be shown:
 //
 //   - In a Kubernetes pod in the host cgroup and pid namespaces (a
 //     privileged hostPID pod), /sys/fs/cgroup is the node root and every
@@ -185,7 +195,15 @@ func (s Shape) ScopeByPidNamespace() bool {
 // only TC's verdict, so they get no L7 check. Work in other pods (ARC's
 // Kubernetes container mode) is outside this pod's pid namespace and
 // interface, beyond every layer here, as it was before the scope.
-func (s Shape) HookScope() error {
+func (s Shape) HookScope() (stamped bool, err error) {
+	if err := s.hookRefusal(); err != nil {
+		return false, err
+	}
+	return s.ScopeByPidNamespace(), nil
+}
+
+// hookRefusal is HookScope's refusal table.
+func (s Shape) hookRefusal() error {
 	switch s.CgroupNS {
 	case CgroupNSUnknown:
 		return fmt.Errorf("cgroup namespace unknown (%s)", s.CgroupNSReason)

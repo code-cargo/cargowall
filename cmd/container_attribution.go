@@ -93,15 +93,16 @@ func resolveMode(containerEgress string) origin.Mode {
 // the observer's ordinals would always be zero, and the step-map shrink for
 // disabled attribution makes container tagging meaningless anyway. stepErr
 // is why step attribution failed, carried into the lost posture's reason.
-// scopeErr, when set, is why a hook at /sys/fs/cgroup would not judge
-// exactly this job's traffic, or why that could not be shown
-// (podenv.Shape.HookScope): the hook is then never loaded, the same loss
-// as a load failure. Otherwise the hook judges what the tracker stamps, when
-// it stamps (steps.Tracker.ScopeStamps), and every socket when it does not.
-// A non-nil error means a requested enforce posture was lost and startup
-// must fail.
+// stamped and scopeErr are podenv.Shape.HookScope's one decision. scopeErr,
+// when set, is why a hook at /sys/fs/cgroup would not judge exactly this
+// job's traffic, or why that could not be shown: the hook is then never
+// loaded, the same loss as a load failure. stamped means the hook may judge
+// only the sockets the tracker stamps (steps.Tracker.ScopeStamps); a tracker
+// with no stamps is then the same loss, never a hook that judges every
+// socket under a shared root. A non-nil error means a requested enforce
+// posture was lost and startup must fail.
 func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.Tracker, stepErr error,
-	scopeErr error, tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
+	stamped bool, scopeErr error, tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
 ) (*containerAttribution, error) {
 	if !enabled {
 		return nil, nil
@@ -121,9 +122,16 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		logger:      logger,
 	}
 	var obs *origin.Observer
+	var stamps *ebpf.Map
 	err := scopeErr
+	if err == nil && stamped {
+		if stamps = stepTracker.ScopeStamps(); stamps == nil {
+			err = errors.New("the cgroup hook may judge only sockets created in our pid namespace, " +
+				"and the step tracker is not stamping them")
+		}
+	}
 	if err == nil {
-		obs, err = origin.Start(tcObjs, stepTracker.ScopeStamps(), logger)
+		obs, err = origin.Start(tcObjs, stamps, logger)
 	}
 	if err != nil {
 		// Fatal under enforce. Under observe only the hook is lost: the
@@ -139,7 +147,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 	}
 	a.observer = obs
 	logger.Info("Container egress hook attached", "target_mode", mode.String(),
-		"pid_namespace_only", stepTracker.ScopeStamps() != nil)
+		"pid_namespace_only", stamped)
 	return a, nil
 }
 

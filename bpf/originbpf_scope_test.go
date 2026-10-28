@@ -18,7 +18,11 @@ package bpf
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -82,13 +86,34 @@ func TestOriginScopeStampedPassesUnstampedSockets(t *testing.T) {
 		"an out-of-scope socket must leave no record")
 }
 
+// enterTestCgroup creates a cgroup, moves the test process into it, and
+// returns its path. A program attached there sees only this process's
+// sockets, so a deny-all enforce policy can never affect the rest of the
+// host, whatever the program under test gets wrong. Cleanup moves the
+// process back to the root and removes the cgroup.
+func enterTestCgroup(t *testing.T) string {
+	t.Helper()
+	cgRoot := "/sys/fs/cgroup"
+	cgPath := filepath.Join(cgRoot, fmt.Sprintf("cargowall-origin-test-%d", os.Getpid()))
+	if err := os.Mkdir(cgPath, 0o755); err != nil {
+		t.Skipf("cannot create test cgroup: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(cgPath) })
+	self := []byte(strconv.Itoa(os.Getpid()))
+	if err := os.WriteFile(filepath.Join(cgPath, "cgroup.procs"), self, 0); err != nil {
+		t.Skipf("cannot enter test cgroup: %v", err)
+	}
+	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(cgRoot, "cgroup.procs"), self, 0) })
+	return cgPath
+}
+
 // TestOriginScopeRealSocket covers the stamped half, which PROG_TEST_RUN's
-// unknowable cookies cannot: the hook enforces at the real root cgroup, and
-// only a socket whose cookie is stamped is judged. Enforcing at the root of
-// a shared test host is safe here only because of the scope: every other
-// socket on it passes. The destination is the host's own address, which
-// rides lo and is adjudicated with the loopback carve-out off, as it is in
-// tests, so nothing leaves the machine.
+// unknowable cookies cannot: with real sockets, only the one whose cookie is
+// stamped is judged. The deny-all enforce policy attaches to a private
+// cgroup this process moves into, never the host root, so a broken scope
+// check can only fail this test. The destination is the host's own address,
+// which rides lo and is adjudicated with the loopback carve-out off, as it
+// is in tests, so nothing leaves the machine.
 func TestOriginScopeRealSocket(t *testing.T) {
 	objs := loadOriginObjects(t)
 	seedOriginRules(t, objs) // deny by default
@@ -96,12 +121,12 @@ func TestOriginScopeRealSocket(t *testing.T) {
 	setOriginMode(t, objs, originModeEnforce)
 
 	l, err := link.AttachCgroup(link.CgroupOptions{
-		Path:    "/sys/fs/cgroup",
+		Path:    enterTestCgroup(t),
 		Attach:  ebpf.AttachCGroupInetEgress,
 		Program: objs.CgOriginEgress,
 	})
 	if err != nil {
-		t.Skipf("cannot attach cgroup_skb/egress at root cgroup: %v", err)
+		t.Skipf("cannot attach cgroup_skb/egress at test cgroup: %v", err)
 	}
 	t.Cleanup(func() { l.Close() })
 

@@ -77,17 +77,21 @@ func TestHookScope(t *testing.T) {
 		{"unprobed", Shape{}, false, false},
 	}
 	for _, tc := range cases {
-		err := tc.shape.HookScope()
+		stamped, err := tc.shape.HookScope()
 		if (err == nil) != tc.ok {
-			t.Errorf("%s: HookScope() = %v, want ok=%v", tc.name, err, tc.ok)
+			t.Errorf("%s: HookScope() error = %v, want ok=%v", tc.name, err, tc.ok)
 		}
 		if got := tc.shape.ScopeByPidNamespace(); got != tc.scoped {
 			t.Errorf("%s: ScopeByPidNamespace() = %v, want %v", tc.name, got, tc.scoped)
 		}
+		// A refused hook never asks for stamps: nothing would read them.
+		if want := tc.ok && tc.scoped; stamped != want {
+			t.Errorf("%s: HookScope() stamped = %v, want %v", tc.name, stamped, want)
+		}
 	}
 
 	// An unknown fact carries its probe error into the posture reason.
-	err := Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied"}.HookScope()
+	_, err := Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied"}.HookScope()
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("unread cgroup path: HookScope() = %v, want the read error in it", err)
 	}

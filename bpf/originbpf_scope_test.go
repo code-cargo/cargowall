@@ -119,7 +119,7 @@ func TestOriginScopeStampedPassesUnstampedSockets(t *testing.T) {
 func enterTestCgroup(t *testing.T) string {
 	t.Helper()
 	cgRoot := "/sys/fs/cgroup"
-	cgPath := filepath.Join(cgRoot, fmt.Sprintf("cargowall-origin-test-%d", os.Getpid()))
+	cgPath := filepath.Join(cgRoot, fmt.Sprintf("cargowall-bpf-test-%d", os.Getpid()))
 	if err := os.Mkdir(cgPath, 0o755); err != nil {
 		t.Skipf("cannot create test cgroup: %v", err)
 	}

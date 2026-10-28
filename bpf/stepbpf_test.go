@@ -346,8 +346,11 @@ func TestSockCreateStampsScope(t *testing.T) {
 			}
 			t.Cleanup(func() { objs.Close() })
 
+			// A private cgroup the test process moves into, not the host
+			// root: a 0 from cgroup/sock_create rejects the socket, so a
+			// broken return must fail this test, not socket() machine-wide.
 			l, err := link.AttachCgroup(link.CgroupOptions{
-				Path:    "/sys/fs/cgroup",
+				Path:    enterTestCgroup(t),
 				Attach:  ebpf.AttachCGroupInetSockCreate,
 				Program: objs.CgSockCreate,
 			})

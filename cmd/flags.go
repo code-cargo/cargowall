@@ -112,8 +112,8 @@ type StartCmd struct {
 
 	// Orthogonal CI plumbing flags — usable on any CI system (or standalone).
 	// Each is also implied by a CI preset above.
-	DNSRedirectIptables    bool `help:"Install iptables OUTPUT NAT rules redirecting outbound DNS (UDP+TCP/53) to the local proxy at 127.0.0.1:53" default:"false" env:"CARGOWALL_DNS_REDIRECT_IPTABLES"`
-	DockerDNSInterception  bool `help:"Listen on the Docker bridge IP for DNS, rewrite /etc/docker/daemon.json so containers use the proxy, and restart the Docker daemon" default:"false" env:"CARGOWALL_DOCKER_DNS_INTERCEPTION"`
+	DNSRedirectIptables    bool `help:"Install iptables NAT rules redirecting outbound DNS (UDP+TCP/53) to the local proxy at 127.0.0.1:53, and, with the Docker bridge listener, container DNS arriving on a docker bridge to that listener" default:"false" env:"CARGOWALL_DNS_REDIRECT_IPTABLES"`
+	DockerDNSInterception  bool `help:"Listen on the Docker bridge IP for DNS, rewrite /etc/docker/daemon.json so containers use the proxy, and restart the Docker daemon (the rewrite and restart are skipped for a daemon in another container)" default:"false" env:"CARGOWALL_DOCKER_DNS_INTERCEPTION"`
 	DNSQueryFiltering      bool `help:"Filter DNS queries against the firewall policy (blocks DNS tunneling)" default:"false" env:"CARGOWALL_DNS_QUERY_FILTERING"`
 	PrepopulateDNSCache    bool `help:"Pre-populate the BPF allowlist from the systemd-resolved cache and reverse-DNS existing connections at startup" default:"false" env:"CARGOWALL_PREPOPULATE_DNS_CACHE"`
 	AutoAllowCloudMetadata bool `help:"Auto-allow cloud metadata endpoints (AWS / Azure / GCP, auto-detected; override with CARGOWALL_CLOUD_PROVIDER=aws|azure|gcp)" default:"false" env:"CARGOWALL_AUTO_ALLOW_CLOUD_METADATA"`

@@ -117,11 +117,29 @@ func TestDNSRedirectRules_Shape(t *testing.T) {
 		"INPUT -p udp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP",
 		"INPUT -p tcp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP",
 	}
-	if len(dnsRedirectRules) != len(want) {
-		t.Fatalf("dnsRedirectRules has %d rules, want %d", len(dnsRedirectRules), len(want))
+	assertRules(t, dnsRedirectRules(""), want)
+
+	// With a bridge listener, the container rules follow every host rule,
+	// so teardown removes them first and the host redirect outlives them.
+	want = append(want,
+		"-I PREROUTING -t nat -i docker0 -p udp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
+		"-I PREROUTING -t nat -i docker0 -p tcp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
+		"-I PREROUTING -t nat -i br-+ -p udp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
+		"-I PREROUTING -t nat -i br-+ -p tcp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
+	)
+	assertRules(t, dnsRedirectRules("172.17.0.1"), want)
+}
+
+func assertRules(t *testing.T, rules []dnsRedirectRule, want []string) {
+	t.Helper()
+	if len(rules) != len(want) {
+		t.Fatalf("got %d rules, want %d", len(rules), len(want))
 	}
-	for i, r := range dnsRedirectRules {
+	for i, r := range rules {
 		got := r.chain + " " + strings.Join(r.args, " ")
+		if r.insert {
+			got = "-I " + got
+		}
 		if got != want[i] {
 			t.Errorf("rule %d:\n  got  %q\n  want %q", i, got, want[i])
 		}

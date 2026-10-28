@@ -32,6 +32,7 @@ type StepBpfTaskIterRec struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	StepBpfMapMapSockScope            = "map_sock_scope"
 	StepBpfMapMapSockStep             = "map_sock_step"
 	StepBpfMapMapStepEvents           = "map_step_events"
 	StepBpfMapMapStepState            = "map_step_state"
@@ -44,6 +45,7 @@ const (
 	StepBpfVarBtfAnchorStepChildEvent = "btf_anchor_step_child_event"
 	StepBpfVarBtfAnchorTaskIterRec    = "btf_anchor_task_iter_rec"
 	StepBpfVarPidnsIno                = "pidns_ino"
+	StepBpfVarStampScope              = "stamp_scope"
 )
 
 // LoadStepBpf returns the embedded CollectionSpec for StepBpf.
@@ -98,6 +100,7 @@ type StepBpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type StepBpfMapSpecs struct {
+	MapSockScope  *ebpf.MapSpec `ebpf:"map_sock_scope"`
 	MapSockStep   *ebpf.MapSpec `ebpf:"map_sock_step"`
 	MapStepEvents *ebpf.MapSpec `ebpf:"map_step_events"`
 	MapStepState  *ebpf.MapSpec `ebpf:"map_step_state"`
@@ -112,6 +115,7 @@ type StepBpfVariableSpecs struct {
 	BtfAnchorStepChildEvent *ebpf.VariableSpec `ebpf:"btf_anchor_step_child_event"`
 	BtfAnchorTaskIterRec    *ebpf.VariableSpec `ebpf:"btf_anchor_task_iter_rec"`
 	PidnsIno                *ebpf.VariableSpec `ebpf:"pidns_ino"`
+	StampScope              *ebpf.VariableSpec `ebpf:"stamp_scope"`
 }
 
 // StepBpfObjects contains all objects after they have been loaded into the kernel.
@@ -134,6 +138,7 @@ func (o *StepBpfObjects) Close() error {
 //
 // It can be passed to LoadStepBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type StepBpfMaps struct {
+	MapSockScope  *ebpf.Map `ebpf:"map_sock_scope"`
 	MapSockStep   *ebpf.Map `ebpf:"map_sock_step"`
 	MapStepEvents *ebpf.Map `ebpf:"map_step_events"`
 	MapStepState  *ebpf.Map `ebpf:"map_step_state"`
@@ -143,6 +148,7 @@ type StepBpfMaps struct {
 
 func (m *StepBpfMaps) Close() error {
 	return _StepBpfClose(
+		m.MapSockScope,
 		m.MapSockStep,
 		m.MapStepEvents,
 		m.MapStepState,
@@ -158,6 +164,7 @@ type StepBpfVariables struct {
 	BtfAnchorStepChildEvent *ebpf.Variable `ebpf:"btf_anchor_step_child_event"`
 	BtfAnchorTaskIterRec    *ebpf.Variable `ebpf:"btf_anchor_task_iter_rec"`
 	PidnsIno                *ebpf.Variable `ebpf:"pidns_ino"`
+	StampScope              *ebpf.Variable `ebpf:"stamp_scope"`
 }
 
 // StepBpfPrograms contains all programs after they have been loaded into the kernel.

@@ -158,6 +158,7 @@ const (
 	OriginBpfMapMapOriginSeen        = "map_origin_seen"
 	OriginBpfMapMapPorts             = "map_ports"
 	OriginBpfMapMapPortsV6           = "map_ports_v6"
+	OriginBpfMapMapSockScope         = "map_sock_scope"
 	OriginBpfProgCgOriginEgress      = "cg_origin_egress"
 	OriginBpfVarBtfAnchorL7Event     = "btf_anchor_l7_event"
 	OriginBpfVarBtfAnchorOriginEvent = "btf_anchor_origin_event"
@@ -230,6 +231,7 @@ type OriginBpfMapSpecs struct {
 	MapOriginSeen    *ebpf.MapSpec `ebpf:"map_origin_seen"`
 	MapPorts         *ebpf.MapSpec `ebpf:"map_ports"`
 	MapPortsV6       *ebpf.MapSpec `ebpf:"map_ports_v6"`
+	MapSockScope     *ebpf.MapSpec `ebpf:"map_sock_scope"`
 }
 
 // OriginBpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -278,6 +280,7 @@ type OriginBpfMaps struct {
 	MapOriginSeen    *ebpf.Map `ebpf:"map_origin_seen"`
 	MapPorts         *ebpf.Map `ebpf:"map_ports"`
 	MapPortsV6       *ebpf.Map `ebpf:"map_ports_v6"`
+	MapSockScope     *ebpf.Map `ebpf:"map_sock_scope"`
 }
 
 func (m *OriginBpfMaps) Close() error {
@@ -300,6 +303,7 @@ func (m *OriginBpfMaps) Close() error {
 		m.MapOriginSeen,
 		m.MapPorts,
 		m.MapPortsV6,
+		m.MapSockScope,
 	)
 }
 

@@ -41,28 +41,48 @@ func TestParseCgroupV2Path(t *testing.T) {
 // problem, never the permissive answer.
 func TestHookScope(t *testing.T) {
 	pod := "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-a.scope"
-	foreign := Dockerd{Kind: DockerdForeign, Reason: "its pid is outside our pid namespace"}
+	runner := "/system.slice/runner.service"
+	local := Dockerd{Kind: DockerdLocal}
+	foreign := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace"}
+	hidden := Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
 	unknownD := Dockerd{Kind: DockerdUnknown, Reason: "dial: timeout"}
+	host := func(path string, pidns PidNS, d Dockerd) Shape {
+		return Shape{CgroupNS: CgroupNSHost, CgroupPath: path, PidNS: pidns, Dockerd: d}
+	}
+	private := func(d Dockerd) Shape {
+		return Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", PidNS: PidNSPrivate, Dockerd: d}
+	}
 	cases := []struct {
-		name  string
-		shape Shape
-		ok    bool
+		name   string
+		shape  Shape
+		ok     bool
+		scoped bool
 	}{
-		{"hosted runner", Shape{CgroupNS: CgroupNSHost, CgroupPath: "/system.slice/runner.service", Dockerd: Dockerd{Kind: DockerdLocal}}, true},
-		{"hosted runner, daemon unidentified", Shape{CgroupNS: CgroupNSHost, CgroupPath: "/system.slice/runner.service", Dockerd: unknownD}, true},
-		{"privileged pod: node root", Shape{CgroupNS: CgroupNSHost, CgroupPath: pod}, false},
-		{"privileged pod with dind: still node root", Shape{CgroupNS: CgroupNSHost, CgroupPath: pod, Dockerd: foreign}, false},
-		{"host cgroupns, path unread", Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied", Dockerd: Dockerd{Kind: DockerdLocal}}, false},
-		{"private cgroupns, foreign dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: foreign}, false},
-		{"private cgroupns, unidentified dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: unknownD}, false},
-		{"private cgroupns, no dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: Dockerd{Kind: DockerdAbsent}}, true},
-		{"private cgroupns, own dockerd", Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", Dockerd: Dockerd{Kind: DockerdLocal}}, true},
-		{"unprobed", Shape{}, false},
+		{"hosted runner", host(runner, PidNSHost, local), true, false},
+		{"hosted runner, daemon unidentified", host(runner, PidNSHost, unknownD), true, false},
+		{"hostPID pod: node root, every task visible", host(pod, PidNSHost, local), false, false},
+		{"ARC runner pod sharing a pid namespace with dind", host(pod, PidNSPrivate, foreign), true, true},
+		{"privileged pod, no dockerd", host(pod, PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, true},
+		{"privileged pod running its own dockerd", host(pod, PidNSPrivate, local), true, true},
+		{"privileged pod, dind not sharing the pid namespace", host(pod, PidNSPrivate, hidden), false, true},
+		{"privileged pod, daemon unidentified", host(pod, PidNSPrivate, unknownD), false, true},
+		{"privileged container outside Kubernetes", host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, true},
+		{"host cgroupns, pid namespace unread", Shape{CgroupNS: CgroupNSHost, CgroupPath: runner, PidNSReason: "stat: permission denied", Dockerd: local}, false, false},
+		{"host cgroupns, path unread", Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied", PidNS: PidNSHost, Dockerd: local}, false, false},
+		{"private cgroupns, foreign dockerd", private(foreign), false, false},
+		{"private cgroupns, hidden dockerd", private(hidden), false, false},
+		{"private cgroupns, unidentified dockerd", private(unknownD), false, false},
+		{"private cgroupns, no dockerd", private(Dockerd{Kind: DockerdAbsent}), true, false},
+		{"private cgroupns, own dockerd", private(local), true, false},
+		{"unprobed", Shape{}, false, false},
 	}
 	for _, tc := range cases {
 		err := tc.shape.HookScope()
 		if (err == nil) != tc.ok {
 			t.Errorf("%s: HookScope() = %v, want ok=%v", tc.name, err, tc.ok)
+		}
+		if got := tc.shape.ScopeByPidNamespace(); got != tc.scoped {
+			t.Errorf("%s: ScopeByPidNamespace() = %v, want %v", tc.name, got, tc.scoped)
 		}
 	}
 
@@ -70,6 +90,14 @@ func TestHookScope(t *testing.T) {
 	err := Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied"}.HookScope()
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("unread cgroup path: HookScope() = %v, want the read error in it", err)
+	}
+}
+
+// The test process's own namespaces are known, whichever they are.
+func TestDetect_Namespaces(t *testing.T) {
+	s := Detect(filepath.Join(t.TempDir(), "docker.sock"))
+	if s.CgroupNS == CgroupNSUnknown || s.PidNS == PidNSUnknown {
+		t.Fatalf("Detect() = %+v, want both namespaces identified", s)
 	}
 }
 

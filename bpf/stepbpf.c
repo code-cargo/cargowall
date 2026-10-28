@@ -45,6 +45,12 @@
 // rather than matching garbage.
 const volatile __u32 pidns_ino = 0;
 
+// Nonzero makes cg_sock_create stamp each socket a task in the daemon's pid
+// namespace creates into map_sock_scope. Set by userspace before load when
+// the cgroup egress hook is limited to that namespace (podenv's
+// ScopeByPidNamespace); zero leaves the stamping out of the program.
+const volatile __u8 stamp_scope = 0;
+
 // ---- Shared with tcbpf.c (replaced at load time; shapes must match) ----
 
 struct step_state {
@@ -82,6 +88,20 @@ struct {
 } map_task_nspid SEC(".maps");
 
 // ---- Owned by this collection ----
+
+// Sockets created by a task in the daemon's pid namespace, by cookie. The
+// cgroup egress hook (originbpf.c, loaded with this map as a replacement)
+// judges only these when it sits at the root of a cgroup tree other
+// containers share. Stamped at creation because the creating task may exit
+// while its socket lives on, taking its map_task_nspid entry with it.
+// Only this job's tasks are stamped, so other tenants' sockets never evict
+// ours; an evicted or missing stamp passes the hook and is left to TC.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u64);
+    __type(value, __u8);
+    __uint(max_entries, 65536);
+} map_sock_scope SEC(".maps");
 
 // New-step notifications for the userspace reconciler: emitted once per new
 // direct child process of Runner.Worker, before the child runs user code.
@@ -228,13 +248,22 @@ int BPF_PROG(step_exit, struct task_struct *task)
 // in process context, so the cookie carries the creator's step for the
 // socket's whole life. The connect/sendmsg hooks in tcbpf.c re-tag as a
 // fallback for sockets created before attach.
+//
+// The scope stamp comes first and ignores step_state.enabled: membership
+// in our pid namespace is map_task_nspid's, which is maintained from attach
+// regardless of the step gate.
 SEC("cgroup/sock_create")
 int cg_sock_create(struct bpf_sock *ctx)
 {
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+    if (stamp_scope && bpf_map_lookup_elem(&map_task_nspid, &tid)) {
+        __u64 cookie = bpf_get_socket_cookie(ctx);
+        __u8 in_scope = 1;
+        bpf_map_update_elem(&map_sock_scope, &cookie, &in_scope, BPF_ANY);
+    }
     struct step_state *st = step_state();
     if (!st || !st->enabled)
         return 1;
-    __u32 tid = (__u32)bpf_get_current_pid_tgid();
     __u32 *ord = bpf_map_lookup_elem(&map_task_step, &tid);
     if (ord) {
         __u64 cookie = bpf_get_socket_cookie(ctx);

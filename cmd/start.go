@@ -254,9 +254,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// ours to rewrite and whether the cgroup hook would judge only this
 	// job (see podenv.Shape.HookScope).
 	shape := podenv.Detect(dockerSocket)
-	logger.Info("Runtime environment", "cgroupns", shape.CgroupNS.String(), "cgroupns_reason", shape.CgroupNSReason,
-		"cgroup", shape.CgroupPath, "cgroup_reason", shape.CgroupPathReason,
-		"dockerd", shape.Dockerd.Kind.String(), "dockerd_reason", shape.Dockerd.Reason)
+	logger.Info("Runtime environment", shape.LogArgs()...)
 
 	var dnsServer *dns.Server
 	var containerDNS *dockerDNS
@@ -566,6 +564,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		tracker, err := steps.Start(&objs, steps.Options{
 			WorkerPID:   cmd.RunnerWorkerPID,
 			OrdinalBase: uint64(cmd.StepOrdinalBase),
+			StampScope:  cmd.ContainerEgress != ContainerEgressOff && shape.ScopeByPidNamespace(),
 		}, auditLogger, logger)
 		if err != nil {
 			stepErr = err

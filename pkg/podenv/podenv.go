@@ -15,8 +15,9 @@
 //go:build linux
 
 // Package podenv describes the container environment cargowall itself runs
-// in: whose cgroup tree its root-cgroup hooks land on, and whether the
-// Docker daemon on the socket is one it can reconfigure. A runner VM, a
+// in: whose cgroup tree its root-cgroup hooks land on, whose processes share
+// its pid namespace, and whether the Docker daemon on the socket is one it
+// can reconfigure. A runner VM, a
 // Kubernetes pod with a Docker-in-Docker sidecar and a SaaS sidecar all
 // look alike from the flags; these facts are what tell them apart.
 //
@@ -41,9 +42,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// initCgroupNamespace is the inode of the initial cgroup namespace, a fixed
-// kernel constant (PROC_CGROUP_INIT_INO).
-const initCgroupNamespace = 0xEFFFFFFB
+// Inodes of the initial cgroup and pid namespaces, fixed kernel constants
+// (PROC_CGROUP_INIT_INO, PROC_PID_INIT_INO).
+const (
+	initCgroupNamespace = 0xEFFFFFFB
+	initPidNamespace    = 0xEFFFFFFC
+)
 
 // CgroupNS is which cgroup namespace cargowall runs in.
 type CgroupNS int
@@ -67,6 +71,29 @@ func (c CgroupNS) String() string {
 	return "unknown"
 }
 
+// PidNS is which pid namespace cargowall runs in.
+type PidNS int
+
+const (
+	PidNSUnknown PidNS = iota // the probe failed
+	// PidNSHost: the initial namespace, where every task on the machine is
+	// visible.
+	PidNSHost
+	// PidNSPrivate: a namespace of our own: our container's processes and,
+	// in a pod that shares one namespace, every container's in the pod.
+	PidNSPrivate
+)
+
+func (p PidNS) String() string {
+	switch p {
+	case PidNSHost:
+		return "host"
+	case PidNSPrivate:
+		return "private"
+	}
+	return "unknown"
+}
+
 // DockerdKind is what is behind the Docker socket.
 type DockerdKind int
 
@@ -76,9 +103,12 @@ const (
 	// DockerdLocal: the daemon shares our mount namespace, so its
 	// daemon.json is ours and our service manager can restart it.
 	DockerdLocal
-	// DockerdForeign: the daemon runs in another container (its pid is
-	// outside our pid namespace, or it has another mount namespace).
+	// DockerdForeign: the daemon runs in another container that shares our
+	// pid namespace: its pid is visible, its mount namespace is not ours.
 	DockerdForeign
+	// DockerdHidden: the daemon's pid is outside our pid namespace, so
+	// neither it nor any container it starts is visible to us.
+	DockerdHidden
 )
 
 func (k DockerdKind) String() string {
@@ -89,6 +119,8 @@ func (k DockerdKind) String() string {
 		return "local"
 	case DockerdForeign:
 		return "foreign"
+	case DockerdHidden:
+		return "hidden"
 	}
 	return "unknown"
 }
@@ -96,7 +128,8 @@ func (k DockerdKind) String() string {
 // Dockerd describes the daemon behind the Docker socket.
 type Dockerd struct {
 	Kind DockerdKind
-	// Reason is the evidence for Foreign, or the probe error for Unknown.
+	// Reason is the evidence for Foreign or Hidden, or the probe error for
+	// Unknown.
 	Reason string
 }
 
@@ -112,20 +145,40 @@ type Shape struct {
 	// CgroupPathReason is why CgroupPath is empty: the read error, or a
 	// file with no cgroup v2 entry.
 	CgroupPathReason string
-	Dockerd          Dockerd
+	PidNS            PidNS
+	// PidNSReason is the probe error when PidNS is unknown.
+	PidNSReason string
+	Dockerd     Dockerd
+}
+
+// ScopeByPidNamespace reports whether the cgroup egress hook must judge
+// only sockets created by tasks in our pid namespace. That is the case in
+// the host cgroup namespace outside the host pid namespace: the hook
+// attaches at the root of the machine's cgroup tree, which other containers
+// share, while our pid namespace holds only this job's processes (in a pod
+// that shares one, the runner's, dockerd's and those of every container
+// dockerd starts).
+func (s Shape) ScopeByPidNamespace() bool {
+	return s.CgroupNS == CgroupNSHost && s.PidNS == PidNSPrivate
 }
 
 // HookScope is nil when a cgroup program attached at /sys/fs/cgroup would
-// judge exactly this job's traffic, and otherwise says why it would not or
-// why that cannot be shown:
+// judge exactly this job's traffic, with ScopeByPidNamespace's limit where
+// it applies, and otherwise says why it would not or why that cannot be
+// shown:
 //
-//   - In a Kubernetes pod in the host cgroup namespace (a privileged pod
-//     container), /sys/fs/cgroup is the node root: the hook would judge
-//     every pod and node daemon, other tenants' jobs included.
-//   - In a private cgroup namespace beside a foreign or unidentified
-//     dockerd, the daemon's containers may live outside our subtree, where
-//     the hook never sees them.
-//   - A cgroup namespace or path that could not be read proves neither.
+//   - In a Kubernetes pod in the host cgroup and pid namespaces (a
+//     privileged hostPID pod), /sys/fs/cgroup is the node root and every
+//     task on the node is ours to see: the hook would judge every pod and
+//     node daemon, other tenants' jobs included.
+//   - Limited to our pid namespace, beside a dockerd outside it, the
+//     daemon's containers are outside it too, and the hook never judges
+//     their traffic.
+//   - In a private cgroup namespace beside a dockerd in another container,
+//     the daemon's containers may live outside our subtree, where the hook
+//     never sees them.
+//   - A namespace, cgroup path or daemon that could not be identified
+//     proves none of this.
 func (s Shape) HookScope() error {
 	switch s.CgroupNS {
 	case CgroupNSUnknown:
@@ -134,15 +187,29 @@ func (s Shape) HookScope() error {
 		if s.CgroupPath == "" {
 			return fmt.Errorf("cgroup path unknown in the host cgroup namespace (%s)", s.CgroupPathReason)
 		}
-		// kubelet names its tree kubepods under both the cgroupfs and
-		// systemd drivers.
-		if strings.Contains(s.CgroupPath, "/kubepods") {
-			return errors.New("running in a Kubernetes pod in the host cgroup namespace: " +
-				"the cgroup hook would attach at the node root and judge every pod on the node")
+		switch s.PidNS {
+		case PidNSUnknown:
+			return fmt.Errorf("pid namespace unknown in the host cgroup namespace (%s)", s.PidNSReason)
+		case PidNSHost:
+			// kubelet names its tree kubepods under both the cgroupfs and
+			// systemd drivers.
+			if strings.Contains(s.CgroupPath, "/kubepods") {
+				return errors.New("running in a Kubernetes pod in the host cgroup and pid namespaces: " +
+					"the cgroup hook would attach at the node root and judge every pod on the node")
+			}
+		case PidNSPrivate:
+			switch s.Dockerd.Kind {
+			case DockerdHidden:
+				return fmt.Errorf("the cgroup hook judges only our pid namespace, and the docker daemon's "+
+					"containers are outside it (%s)", s.Dockerd.Reason)
+			case DockerdUnknown:
+				return fmt.Errorf("the cgroup hook judges only our pid namespace, beside an unidentified dockerd (%s)",
+					s.Dockerd.Reason)
+			}
 		}
 	case CgroupNSPrivate:
 		switch s.Dockerd.Kind {
-		case DockerdForeign:
+		case DockerdForeign, DockerdHidden:
 			return fmt.Errorf("the cgroup hook cannot reach containers of a dockerd in another container (%s)",
 				s.Dockerd.Reason)
 		case DockerdUnknown:
@@ -150,6 +217,16 @@ func (s Shape) HookScope() error {
 		}
 	}
 	return nil
+}
+
+// LogArgs is every fact and probe error, as slog key-value pairs.
+func (s Shape) LogArgs() []any {
+	return []any{
+		"cgroupns", s.CgroupNS.String(), "cgroupns_reason", s.CgroupNSReason,
+		"cgroup", s.CgroupPath, "cgroup_reason", s.CgroupPathReason,
+		"pidns", s.PidNS.String(), "pidns_reason", s.PidNSReason,
+		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
+	}
 }
 
 // Detect probes the environment. A probe that fails records unknown and
@@ -168,6 +245,13 @@ func Detect(dockerSocket string) Shape {
 		s.CgroupPathReason = err.Error()
 	} else if s.CgroupPath = parseCgroupV2Path(data); s.CgroupPath == "" {
 		s.CgroupPathReason = "no cgroup v2 entry in /proc/self/cgroup"
+	}
+	if ino, err := nsInode("/proc/self/ns/pid"); err != nil {
+		s.PidNSReason = err.Error()
+	} else if ino == initPidNamespace {
+		s.PidNS = PidNSHost
+	} else {
+		s.PidNS = PidNSPrivate
 	}
 	s.Dockerd = probeDockerd(dockerSocket)
 	return s
@@ -210,7 +294,7 @@ func probeDockerd(socket string) Dockerd {
 		return unknown(err)
 	}
 	if pid == 0 {
-		return Dockerd{Kind: DockerdForeign, Reason: "its pid is outside our pid namespace"}
+		return Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
 	}
 	ours, err := nsInode("/proc/self/ns/mnt")
 	if err != nil {

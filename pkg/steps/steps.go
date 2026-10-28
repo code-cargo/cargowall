@@ -80,6 +80,9 @@ type Options struct {
 	// correlation happens downstream by matching step_boundary cmdlines,
 	// never by assuming ordinal == plan index.
 	OrdinalBase uint64
+	// StampScope stamps every socket a task in our pid namespace creates,
+	// for a cgroup egress hook that must judge only those (ScopeStamps).
+	StampScope bool
 }
 
 // maxOrdinalBase bounds --step-ordinal-base away from the reserved
@@ -102,6 +105,7 @@ type Tracker struct {
 	stateMap      *ebpf.Map
 	taskMap       *ebpf.Map
 	nspidMap      *ebpf.Map // map_task_nspid; cleared at Close, see there
+	stampScope    bool      // Options.StampScope
 	auditLogger   *events.AuditLogger
 	logger        *slog.Logger
 	done          chan struct{}
@@ -168,9 +172,20 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 	} else if err := v.Set(pidnsIno); err != nil {
 		return nil, fmt.Errorf("failed to set pidns_ino: %w", err)
 	}
+	if opts.StampScope {
+		if v := spec.Variables[bpf.StepBpfVarStampScope]; v == nil {
+			return nil, errors.New("step BPF spec has no stamp_scope variable (stale generated code)")
+		} else if err := v.Set(uint8(1)); err != nil {
+			return nil, fmt.Errorf("failed to set stamp_scope: %w", err)
+		}
+	} else if m := spec.Maps[bpf.StepBpfMapMapSockScope]; m != nil {
+		// Nothing writes the map, so don't preallocate it at full size.
+		m.MaxEntries = 64
+	}
 
 	t := &Tracker{
-		workerPID: workerPID,
+		workerPID:  workerPID,
+		stampScope: opts.StampScope,
 		// Snapshot the worker's argv so the reconciler can detect a
 		// pre-exec cmdline read (the child briefly shares/copies it).
 		workerCmdline: readCmdline(workerPID),
@@ -262,6 +277,17 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 
 // WorkerPID returns the Runner.Worker process ID being tracked.
 func (t *Tracker) WorkerPID() int { return t.workerPID }
+
+// ScopeStamps returns the map of sockets created by tasks in our pid
+// namespace, or nil when the tracker was not asked to stamp them
+// (Options.StampScope). The cgroup egress hook loads it in place of its own
+// to judge only those sockets.
+func (t *Tracker) ScopeStamps() *ebpf.Map {
+	if !t.stampScope {
+		return nil
+	}
+	return t.objs.MapSockScope
+}
 
 // Close disables tagging, detaches the programs, and stops the reconciler,
 // waiting for an in-flight boundary event to finish writing before returning

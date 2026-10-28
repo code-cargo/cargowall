@@ -64,6 +64,13 @@ import (
 const (
 	cfgKeyMode       = uint32(0)
 	cfgKeyLoCarveout = uint32(1)
+	cfgKeyScope      = uint32(3)
+)
+
+// Hook scopes, mirroring ORIGIN_SCOPE_* in originbpf.c.
+const (
+	scopeAll     = uint8(0)
+	scopeStamped = uint8(1)
 )
 
 // Mode is the cgroup hook's enforcement posture, mirroring ORIGIN_MODE_* in
@@ -262,7 +269,12 @@ func (o *Observer) EnableL7(opts L7Options) (*L7, error) {
 // Start loads the origin collection, attaches the observer at the root
 // cgroup, and starts the reader. Nothing here can affect enforcement; any
 // error means the caller runs without container attribution.
-func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
+//
+// scopeStamps, when non-nil, is the step tracker's map of sockets created by
+// tasks in our pid namespace (steps.Tracker.ScopeStamps): the hook then
+// judges only those, and every other socket under the root cgroup passes it
+// untouched. nil judges every socket.
+func Start(tcObjs *bpf.TcBpfObjects, scopeStamps *ebpf.Map, logger *slog.Logger) (*Observer, error) {
 	if tcObjs == nil {
 		return nil, errors.New("nil TC BPF objects")
 	}
@@ -295,15 +307,24 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load origin BPF spec: %w", err)
 	}
+	replacements := map[string]*ebpf.Map{
+		"map_cidrs":          tcObjs.MapCidrs,
+		"map_ports":          tcObjs.MapPorts,
+		"map_cidrs_v6":       tcObjs.MapCidrsV6,
+		"map_ports_v6":       tcObjs.MapPortsV6,
+		"map_default_action": tcObjs.MapDefaultAction,
+		"map_audit_mode":     tcObjs.MapAuditMode,
+	}
+	scope := scopeAll
+	if scopeStamps != nil {
+		replacements[bpf.OriginBpfMapMapSockScope] = scopeStamps
+		scope = scopeStamped
+	} else if m := spec.Maps[bpf.OriginBpfMapMapSockScope]; m != nil {
+		// The hook never reads the stand-in under scopeAll.
+		m.MaxEntries = 64
+	}
 	if err := cargowallEbpf.LoadObjects(logger, "originbpf", spec, ebpf.CollectionOptions{
-		MapReplacements: map[string]*ebpf.Map{
-			"map_cidrs":          tcObjs.MapCidrs,
-			"map_ports":          tcObjs.MapPorts,
-			"map_cidrs_v6":       tcObjs.MapCidrsV6,
-			"map_ports_v6":       tcObjs.MapPortsV6,
-			"map_default_action": tcObjs.MapDefaultAction,
-			"map_audit_mode":     tcObjs.MapAuditMode,
-		},
+		MapReplacements: replacements,
 		// Stats ONLY, unlike the TC and step collections: the count is the
 		// one number that predicts whether this program loads on an older
 		// verifier, and the daemon's own log is the only place to read it on
@@ -328,6 +349,12 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	if err := o.objs.MapOriginConfig.Put(cfgKeyLoCarveout, uint8(1)); err != nil {
 		o.objs.Close()
 		return nil, fmt.Errorf("failed to arm loopback carve-out: %w", err)
+	}
+	// The scope too is set before attach: a hook at a shared root must never
+	// judge, even briefly, sockets that are not this job's.
+	if err := o.objs.MapOriginConfig.Put(cfgKeyScope, scope); err != nil {
+		o.objs.Close()
+		return nil, fmt.Errorf("failed to set hook scope: %w", err)
 	}
 
 	// Telemetry: what else is attached at the root cgroup (Docker's or

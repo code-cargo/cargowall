@@ -107,6 +107,12 @@
 // map_origin_config keys.
 #define ORIGIN_CFG_KEY_MODE 0         // ORIGIN_MODE_*
 #define ORIGIN_CFG_KEY_LO_CARVEOUT 1  // 1 = carve out skb->ifindex == lo (see below)
+#define ORIGIN_CFG_KEY_SCOPE 3        // ORIGIN_SCOPE_*
+
+// Which sockets the hook judges, read per packet from map_origin_config.
+// Userspace writes it once, before attach.
+#define ORIGIN_SCOPE_ALL     0  // every socket under the attach point
+#define ORIGIN_SCOPE_STAMPED 1  // only sockets stamped in map_sock_scope
 
 // One record per observed flow origin. 8-byte fields first so the packed C
 // layout equals Go's natural layout (72 bytes, no hidden padding); addresses
@@ -146,9 +152,8 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
     __type(value, __u8);
-    // Keys 0 (mode) and 1 (lo carveout) here, plus 2 (L7 mode) owned by
-    // sni.h; key 3 is reserved. The map stays sized at 4 so a future keyed
-    // toggle needs no resize.
+    // Keys 0 (mode), 1 (lo carveout) and 3 (scope) here, plus 2 (L7 mode)
+    // owned by sni.h.
     __uint(max_entries, 4);
 } map_origin_config SEC(".maps");
 
@@ -156,6 +161,36 @@ static __always_inline __u8 origin_mode(void) {
     __u32 key = ORIGIN_CFG_KEY_MODE;
     __u8 *mode = bpf_map_lookup_elem(&map_origin_config, &key);
     return mode ? *mode : ORIGIN_MODE_OBSERVE;  // absent = inert
+}
+
+// Sockets created by a task in the daemon's pid namespace, stamped by
+// cg_sock_create in stepbpf.c. Owned there: this declaration is replaced by
+// the step collection's map when the scope is ORIGIN_SCOPE_STAMPED, and is
+// an empty stand-in otherwise. Shape must match stepbpf.c.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u64);
+    __type(value, __u8);
+    __uint(max_entries, 65536);
+} map_sock_scope SEC(".maps");
+
+// origin_in_scope reports whether this hook judges the packet's socket.
+// On a runner VM it judges all of them. In a privileged pod in the host
+// cgroup namespace the attach point is the node root, so it judges only
+// sockets this job's tasks created: another pod's traffic is not ours to
+// drop or report, and TC on our own interface still polices everything
+// that leaves through it, including our sockets that missed a stamp (made
+// before the step tracker started, accepted from a listener, or evicted).
+// A GLOBAL function, like l7_adjudicate: inlined, its two lookup outcomes
+// reached the rest of the hook as distinct states, and kernel 6.18
+// verified much of the hook twice (75k instructions became 112k).
+__noinline int origin_in_scope(struct __sk_buff *skb) {
+    __u32 key = ORIGIN_CFG_KEY_SCOPE;
+    __u8 *scope = bpf_map_lookup_elem(&map_origin_config, &key);
+    if (!scope || *scope != ORIGIN_SCOPE_STAMPED)
+        return 1;
+    __u64 cookie = bpf_get_socket_cookie(skb);
+    return bpf_map_lookup_elem(&map_sock_scope, &cookie) != NULL;
 }
 
 // Local-only networks (docker bridge subnets), carved out of adjudication
@@ -743,6 +778,12 @@ int cg_origin_egress(struct __sk_buff *skb) {
     //     is pinned to pkg/network.DNSProxyFWMark by
     //     TestDNSProxyFWMarkMatchesGoConstant.
     if (skb->mark == DNS_PROXY_FW_MARK)
+        return 1;
+
+    // Out of scope: pass with no verdict, no record and no L7 inspection.
+    // A 1 never overrides another attached program (see the end of this
+    // function).
+    if (!origin_in_scope(skb))
         return 1;
 
     __u8 mode = origin_mode();

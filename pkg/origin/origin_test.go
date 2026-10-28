@@ -432,6 +432,9 @@ func TestOriginConstantsMatchBpfSource(t *testing.T) {
 		"ORIGIN_FLAG_TCP_MIDSTREAM":  uint64(bpf.OriginFlagTCPMidstream),
 		"ORIGIN_CFG_KEY_MODE":        uint64(cfgKeyMode),
 		"ORIGIN_CFG_KEY_LO_CARVEOUT": uint64(cfgKeyLoCarveout),
+		"ORIGIN_CFG_KEY_SCOPE":       uint64(cfgKeyScope),
+		"ORIGIN_SCOPE_ALL":           uint64(scopeAll),
+		"ORIGIN_SCOPE_STAMPED":       uint64(scopeStamped),
 	}
 	for name, want := range defines {
 		re := regexp.MustCompile(`(?m)^#define ` + name + `\s+(0x[0-9A-Fa-f]+|\d+)\b`)

@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -32,6 +33,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // stepChildEventT mirrors struct step_child_event in stepbpf.c.
@@ -316,4 +318,63 @@ func TestStepMapsShrunkLoad(t *testing.T) {
 	var objs TcBpfObjects
 	require.NoError(t, spec.LoadAndAssign(&objs, nil))
 	objs.Close()
+}
+
+// TestSockCreateStampsScope pins the scope stamp the cgroup egress hook
+// relies on: cg_sock_create stamps a socket exactly when its creating
+// thread is in map_task_nspid, and only with stamp_scope set.
+func TestSockCreateStampsScope(t *testing.T) {
+	for _, stamp := range []bool{true, false} {
+		t.Run("stamp_scope="+strconv.FormatBool(stamp), func(t *testing.T) {
+			tcObjs := loadBPFObjects(t)
+			spec, err := LoadStepBpf()
+			require.NoError(t, err)
+			require.NoError(t, spec.Variables[StepBpfVarPidnsIno].Set(pidnsInode(t)))
+			if stamp {
+				require.NoError(t, spec.Variables[StepBpfVarStampScope].Set(uint8(1)))
+			}
+			var objs StepBpfObjects
+			if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
+				MapReplacements: map[string]*ebpf.Map{
+					"map_task_step":  tcObjs.MapTaskStep,
+					"map_sock_step":  tcObjs.MapSockStep,
+					"map_step_state": tcObjs.MapStepState,
+					"map_task_nspid": tcObjs.MapTaskNspid,
+				},
+			}); err != nil {
+				t.Skipf("step BPF objects not loadable (kernel BTF required): %v", err)
+			}
+			t.Cleanup(func() { objs.Close() })
+
+			l, err := link.AttachCgroup(link.CgroupOptions{
+				Path:    "/sys/fs/cgroup",
+				Attach:  ebpf.AttachCGroupInetSockCreate,
+				Program: objs.CgSockCreate,
+			})
+			require.NoError(t, err, "attach cgroup sock_create")
+			t.Cleanup(func() { l.Close() })
+
+			// The stamp keys on the creating thread, so create every socket
+			// from one pinned thread.
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			newSocket := func() uint64 {
+				fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+				require.NoError(t, err)
+				defer unix.Close(fd)
+				cookie, err := unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_COOKIE)
+				require.NoError(t, err)
+				return cookie
+			}
+			stamped := func(cookie uint64) bool {
+				var v uint8
+				return objs.MapSockScope.Lookup(cookie, &v) == nil
+			}
+
+			require.False(t, stamped(newSocket()), "a thread outside map_task_nspid must not stamp")
+			tid := uint32(unix.Gettid())
+			require.NoError(t, tcObjs.MapTaskNspid.Put(tid, uint32(os.Getpid())))
+			require.Equal(t, stamp, stamped(newSocket()), "a thread in map_task_nspid stamps iff stamp_scope")
+		})
+	}
 }

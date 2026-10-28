@@ -236,7 +236,7 @@ Useful flags (most available as env vars — see `cargowall start --help`):
 |---|---|---|
 | `--config` | `CARGOWALL_CONFIG` | Path to the policy JSON file |
 | `--interface` | `CARGOWALL_INTERFACE` | Network interface to attach to (auto-detected if empty) |
-| `--dns-upstream` | `CARGOWALL_DNS_UPSTREAM` | Upstream DNS server (required) |
+| `--dns-upstream` | `CARGOWALL_DNS_UPSTREAM` | Upstream DNS server (required). With `--dns-redirect-iptables` it must not be a loopback resolver (`127.0.0.0/8`, `::1`): its own upstream queries would be redirected back into the proxy |
 | `--audit-mode` | `CARGOWALL_AUDIT_MODE` | Log only — don't block (recommended for rollout) |
 | `--audit-log` | `CARGOWALL_AUDIT_LOG` | NDJSON audit log path |
 | `--api-failure-mode` | `CARGOWALL_API_FAILURE_MODE` | Posture when the CodeCargo policy can't be retrieved: `local` (default — use env/file config), `audit` (downgrade to audit mode), `fail` (deny-all lockdown: ready sentinel withheld, failure sentinel written, process stays up). Only genuine retrieval failures trigger it — a 404/401/400 always falls back to local config |

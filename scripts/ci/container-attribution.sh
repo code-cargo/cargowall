@@ -85,7 +85,7 @@ bridge() {
     curl -sf --max-time 5 http://127.0.0.1:18083/ > /dev/null && { ok=true; break; }
   done
   $ok || { echo "❌ published container port unreachable"; docker logs cw-bridge-server; exit 1; }
-  SERVER_IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' cw-bridge-server)
+  SERVER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' cw-bridge-server)
   c2c=false
   for i in 1 2 3 4 5; do
     docker run --rm alpine:latest wget -q -T 5 -O- "http://$SERVER_IP:8080/" > /dev/null 2>&1 && { c2c=true; break; }

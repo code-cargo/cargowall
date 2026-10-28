@@ -144,7 +144,7 @@ verify_bridge_local() (
   docker run -d --name cw-bridge-enforce -p 18084:8080 alpine:latest sh -c "$serve"
   retry "published port dead under cgroup enforcement" \
     curl -sf --max-time 5 http://127.0.0.1:18084/
-  SERVER_IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' cw-bridge-enforce)
+  SERVER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' cw-bridge-enforce)
   retry "container→container dead under cgroup enforcement" \
     docker run --rm alpine:latest wget -q -T 5 -O- "http://$SERVER_IP:8080/"
 

@@ -118,9 +118,9 @@ jobs:
           # Audit mode: events are exported with would_deny verdicts but no
           # traffic is actually blocked, so runner infrastructure (results
           # upload, Azure metadata, ...) cannot break. The collector endpoint
-          # is loopback, which the TC egress filter never sees. The variables
-          # are named because sudo-rs (Ubuntu 26.04) ignores -E.
-          sudo --preserve-env=OTEL_EXPORTER_OTLP_ENDPOINT,OTEL_EXPORTER_OTLP_COMPRESSION,OTEL_SERVICE_NAME,OTEL_RESOURCE_ATTRIBUTES \
+          # is loopback, which the TC egress filter never sees. sudo-env.sh
+          # carries the step's environment through sudo (sudo-rs ignores -E).
+          bash scripts/ci/sudo-env.sh \
             ./bin/cargowall start \
             --config /etc/cargowall/config.json \
             --dns-upstream 8.8.8.8:53 \
@@ -255,7 +255,7 @@ jobs:
           OTEL_SERVICE_NAME: cargowall-e2e
           OTEL_RESOURCE_ATTRIBUTES: test.run.id=${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          sudo --preserve-env=OTEL_EXPORTER_OTLP_ENDPOINT,OTEL_EXPORTER_OTLP_HEADERS,OTEL_EXPORTER_OTLP_COMPRESSION,OTEL_SERVICE_NAME,OTEL_RESOURCE_ATTRIBUTES \
+          bash scripts/ci/sudo-env.sh \
             ./bin/cargowall start \
             --config /etc/cargowall/config.json \
             --dns-upstream 8.8.8.8:53 \

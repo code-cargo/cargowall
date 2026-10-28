@@ -266,7 +266,7 @@ sudo --preserve-env=OTEL_EXPORTER_OTLP_ENDPOINT,OTEL_EXPORTER_OTLP_HEADERS \
   cargowall start --config /etc/cargowall/config.json --dns-upstream 8.8.8.8:53
 ```
 
-Name the variables rather than using `sudo -E`: `sudo-rs`, the default `sudo` from Ubuntu 26.04, ignores `-E`, and cargowall would start with none of them.
+Name the variables rather than using `sudo -E`: `sudo-rs`, the default `sudo` from Ubuntu 26.04, ignores `-E`, and cargowall would start with none of them. Every variable you set from the list below has to appear in `--preserve-env`, not only the two this example exports; one left off is dropped without an error.
 
 Supported variables (per the [OTLP exporter spec](https://opentelemetry.io/docs/specs/otel/protocol/exporter/)): `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_COMPRESSION` (`gzip`), `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, and their `_LOGS_`-specific variants. Only the `http/protobuf` transport is supported — `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` disables export with a warning (the firewall itself is unaffected).
 

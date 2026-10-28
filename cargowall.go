@@ -23,7 +23,10 @@ import (
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -output-dir bpf TcBpf bpf/tcbpf.c
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -output-dir bpf -type task_iter_rec StepBpf bpf/stepbpf.c
+// StepBpf is built for BPF v3: step_fork allocates ordinals with a fetching
+// atomic add, which needs BPF_FETCH. clang 18 emitted it under bpf2go's
+// default -mcpu=v1 anyway; clang 21 enforces the CPU level and refuses.
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -cflags -mcpu=v3 -output-dir bpf -type task_iter_rec StepBpf bpf/stepbpf.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -output-dir bpf OriginBpf bpf/originbpf.c
 
 var version = "dev"

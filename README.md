@@ -245,8 +245,8 @@ Useful flags (most available as env vars — see `cargowall start --help`):
 | `--debug` | — | Verbose logging |
 | `--github-action` | `CARGOWALL_GITHUB_ACTION` | GitHub Actions preset (expands the orthogonal flags below) |
 | `--gitlab-ci` | `CARGOWALL_GITLAB_CI` | GitLab CI preset (same plumbing, GitLab service host auto-allow instead) |
-| `--dns-redirect-iptables` | `CARGOWALL_DNS_REDIRECT_IPTABLES` | iptables DNAT outbound :53 → `127.0.0.1:53` |
-| `--docker-dns-interception` | `CARGOWALL_DOCKER_DNS_INTERCEPTION` | Listen on the Docker bridge IP and rewrite `/etc/docker/daemon.json` |
+| `--dns-redirect-iptables` | `CARGOWALL_DNS_REDIRECT_IPTABLES` | iptables DNAT outbound :53 → `127.0.0.1:53`; with `--docker-dns-interception`, also container :53 arriving on a docker bridge → the bridge listener |
+| `--docker-dns-interception` | `CARGOWALL_DOCKER_DNS_INTERCEPTION` | Listen on the Docker bridge IP and rewrite `/etc/docker/daemon.json` (skipped for a daemon in another container, such as a dind sidecar) |
 | `--dns-query-filtering` | `CARGOWALL_DNS_QUERY_FILTERING` | Filter DNS queries against the policy (blocks DNS tunneling). CNAME targets of allowed hosts are auto-permitted, so CNAME-chasing clients aren't refused |
 | `--prepopulate-dns-cache` | `CARGOWALL_PREPOPULATE_DNS_CACHE` | Seed the BPF allowlist from systemd-resolved + existing TCP connections |
 | `--auto-allow-cloud-metadata` | `CARGOWALL_AUTO_ALLOW_CLOUD_METADATA` | Allow IMDS at `169.254.169.254`; detects AWS / Azure / GCP via DMI (override with `CARGOWALL_CLOUD_PROVIDER=aws\|azure\|gcp`, case-insensitive; unknown values are ignored and detection falls through to DMI / wireserver signals) and adds provider-specific allows: Azure wireserver + infra hostnames + `.internal.cloudapp.net`, AWS `.compute.internal` + `.ec2.internal`, GCP `.google.internal` |

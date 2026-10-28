@@ -21,8 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"syscall"
 	"time"
 
@@ -35,7 +37,7 @@ const DNSProxyFWMark = 0xCA12
 
 // MarkDNSProxySocket is a net Control function (Dialer.Control or
 // ListenConfig.Control) that stamps DNSProxyFWMark on the socket, so its
-// traffic matches the RETURN exemptions in dnsRedirectRules instead of
+// traffic matches the RETURN exemptions in hostDNSRedirectRules instead of
 // being DNAT'd back into the proxy. Every socket cargowall itself uses on
 // the port-53 path — the proxy's upstream client, its listeners, and the
 // startup stub peek — must carry the mark.
@@ -53,30 +55,32 @@ func MarkDNSProxySocket(_, _ string, c syscall.RawConn) error {
 var dnsProxyFWMarkStr = fmt.Sprintf("0x%X", DNSProxyFWMark)
 
 // dnsRedirectRule is one iptables rule of the redirect: the chain it lives
-// in plus its match/target arguments.
+// in plus its match/target arguments. An insert rule goes to the head of
+// its chain instead of the tail.
 type dnsRedirectRule struct {
-	chain string
-	args  []string
+	chain  string
+	args   []string
+	insert bool
 }
 
-// dnsRedirectRules defines the iptables rules for DNS redirection.
+// hostDNSRedirectRules are the redirect for traffic this netns originates.
 // Order matters: RETURN rules for marked packets must come before DNAT
 // rules, and teardown deletes in REVERSE so the exemptions outlive the
 // DNAT they exempt from.
-var dnsRedirectRules = []dnsRedirectRule{
+var hostDNSRedirectRules = []dnsRedirectRule{
 	// Exempt the CargoWall DNS proxy's upstream queries (marked with DNSProxyFWMark)
-	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"}},
-	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"}},
+	{chain: "OUTPUT", args: []string{"-t", "nat", "-p", "udp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"}},
+	{chain: "OUTPUT", args: []string{"-t", "nat", "-p", "tcp", "--dport", "53", "-m", "mark", "--mark", dnsProxyFWMarkStr, "-j", "RETURN"}},
 	// DNAT the systemd-resolved stub too: a stub-following client otherwise
 	// reaches resolved, which re-queries upstream from its OWN socket —
 	// laundering the querying process away from the sockdiag join and
 	// serving warm cache hits the proxy never sees. Marked stub peeks are
 	// exempted above; 127.0.0.1 (the proxy listen) stays un-DNATed.
-	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "-d", "127.0.0.53", "--dport", "53", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
-	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "-d", "127.0.0.53", "--dport", "53", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
+	{chain: "OUTPUT", args: []string{"-t", "nat", "-p", "udp", "-d", "127.0.0.53", "--dport", "53", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
+	{chain: "OUTPUT", args: []string{"-t", "nat", "-p", "tcp", "-d", "127.0.0.53", "--dport", "53", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
 	// Redirect all other outbound DNS to the local proxy
-	{"OUTPUT", []string{"-t", "nat", "-p", "udp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
-	{"OUTPUT", []string{"-t", "nat", "-p", "tcp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
+	{chain: "OUTPUT", args: []string{"-t", "nat", "-p", "udp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
+	{chain: "OUTPUT", args: []string{"-t", "nat", "-p", "tcp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"}},
 	// Reverse-direction guard: an inbound sport-53 packet must not CREATE a
 	// flow — a reply racing the conntrack flush would re-create it reversed,
 	// with a null NAT binding no later flush can see (design.md, "DNS
@@ -86,23 +90,58 @@ var dnsRedirectRules = []dnsRedirectRule{
 	// later external-resolver query, even now that stub-destined lo traffic
 	// IS DNAT'd — and dropping a stub or proxy reply mid-transaction would
 	// cost the client its full resolver timeout.
-	{"INPUT", []string{"-p", "udp", "!", "-i", "lo", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
-	{"INPUT", []string{"-p", "tcp", "!", "-i", "lo", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
+	{chain: "INPUT", args: []string{"-p", "udp", "!", "-i", "lo", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
+	{chain: "INPUT", args: []string{"-p", "tcp", "!", "-i", "lo", "--sport", "53", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"}},
+}
+
+// dnsRedirectRules is the full redirect. With a docker bridge IP it adds
+// PREROUTING DNAT for DNS that containers send through a docker bridge,
+// default (docker0) or user-defined (br-+, which also matches bridges
+// created later), to the proxy's container listener on that IP. That
+// traffic is forwarded, not originated here, so the OUTPUT rules never
+// see it: a container that names its own resolver (--dns, a hard-coded
+// 8.8.8.8, a dockerd whose daemon.json cargowall cannot rewrite) would
+// otherwise resolve around the proxy. DNAT keeps the source address, so
+// the proxy still attributes the query by container IP. The rules go to
+// the head of PREROUTING, ahead of Docker's own DNAT for published ports.
+func dnsRedirectRules(bridgeIP string) []dnsRedirectRule {
+	if bridgeIP == "" {
+		return hostDNSRedirectRules
+	}
+	to := net.JoinHostPort(bridgeIP, "53")
+	rules := slices.Clone(hostDNSRedirectRules)
+	for _, iface := range []string{"docker0", "br-+"} {
+		for _, proto := range []string{"udp", "tcp"} {
+			rules = append(rules, dnsRedirectRule{
+				chain:  "PREROUTING",
+				args:   []string{"-t", "nat", "-i", iface, "-p", proto, "--dport", "53", "-j", "DNAT", "--to-destination", to},
+				insert: true,
+			})
+		}
+	}
+	return rules
 }
 
 // SetupDNSRedirect adds iptables DNAT rules to redirect all outbound DNS
 // (UDP+TCP port 53) to the local proxy at 127.0.0.1:53, plus the INPUT
 // guard that keeps flushed flows from being re-picked-up in reverse.
 // Packets marked with DNSProxyFWMark (the DNS proxy's upstream queries) are exempted.
-func SetupDNSRedirect(logger *slog.Logger) error {
-	for _, rule := range dnsRedirectRules {
-		args := append([]string{"-A", rule.chain}, rule.args...)
+// A non-empty bridgeIP, where the proxy has a container listener, also
+// redirects container DNS crossing a docker bridge (see dnsRedirectRules);
+// teardown must be given the same bridgeIP.
+func SetupDNSRedirect(logger *slog.Logger, bridgeIP string) error {
+	for _, rule := range dnsRedirectRules(bridgeIP) {
+		op := "-A"
+		if rule.insert {
+			op = "-I"
+		}
+		args := append([]string{op, rule.chain}, rule.args...)
 		cmd := exec.Command("iptables", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("iptables -A %s %v failed: %w (output: %s)", rule.chain, rule.args, err, out)
+			return fmt.Errorf("iptables %s %s %v failed: %w (output: %s)", op, rule.chain, rule.args, err, out)
 		}
 	}
-	logger.Info("DNS redirect iptables rules installed")
+	logger.Info("DNS redirect iptables rules installed", "container_bridge_redirect", bridgeIP != "")
 
 	// Purge DNS flow state predating the rules — nat verdicts are per-flow,
 	// so those flows would keep bypassing the proxy (see FlushDNSConntrack).
@@ -128,7 +167,7 @@ var flushResolvedTimeout = 5 * time.Second
 
 // FlushResolvedCache clears systemd-resolved's DNS cache via
 // `resolvectl flush-caches`. Client packets to the stub are DNAT'd to the
-// proxy by dnsRedirectRules, so the residual warm-cache exposure is lookups
+// proxy by hostDNSRedirectRules, so the residual warm-cache exposure is lookups
 // that reach resolved WITHOUT a client DNS packet — nss-resolve's
 // D-Bus/varlink path — plus resolved's own upstream re-queries: a warm
 // cache hit there is served invisibly, the proxy never sees the name, and
@@ -190,11 +229,12 @@ func FlushResolvedCache(ctx context.Context, logger *slog.Logger) error {
 // rules they exempt the proxy's own upstream queries from — deleting in
 // install order would leave a two-exec window where the proxy's queries
 // DNAT back onto itself.
-func TeardownDNSRedirect(logger *slog.Logger) error {
+func TeardownDNSRedirect(logger *slog.Logger, bridgeIP string) error {
 	var lastErr error
 	removed := 0
-	for i := len(dnsRedirectRules) - 1; i >= 0; i-- {
-		rule := dnsRedirectRules[i]
+	rules := dnsRedirectRules(bridgeIP)
+	for i := len(rules) - 1; i >= 0; i-- {
+		rule := rules[i]
 		args := append([]string{"-D", rule.chain}, rule.args...)
 		cmd := exec.Command("iptables", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {

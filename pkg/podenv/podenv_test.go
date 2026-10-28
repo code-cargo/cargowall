@@ -37,8 +37,9 @@ func TestParseCgroupV2Path(t *testing.T) {
 	}
 }
 
-// Only a positively proven shape lets the hook load; every unknown is a
-// problem, never the permissive answer.
+// The hook loads only when the facts that decide who it judges are proven.
+// An unknown that decides that refuses; one that cannot change it (a runner
+// VM's daemon, a private cgroup namespace's pid namespace) is not read.
 func TestHookScope(t *testing.T) {
 	pod := "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-a.scope"
 	runner := "/system.slice/runner.service"

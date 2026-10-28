@@ -367,8 +367,11 @@ func Start(tcObjs *bpf.TcBpfObjects, scopeStamps *ebpf.Map, logger *slog.Logger)
 	// ALLOW_MULTI before anything else. The pre/post program query logged
 	// below is the observational check that nobody was displaced.
 	l, err := link.AttachCgroup(link.CgroupOptions{
-		// Root cgroup, same rationale as the connect/sendmsg hooks: observe
-		// every process on the machine, containers included.
+		// Root cgroup: every socket on the machine reaches the program,
+		// containers included. Without scopeStamps it judges all of them (a
+		// runner VM). With them it judges only sockets this job's tasks
+		// created, and passes the rest, a neighbour pod's included, with no
+		// verdict and no record.
 		Path:    "/sys/fs/cgroup",
 		Attach:  ebpf.AttachCGroupInetEgress,
 		Program: o.objs.CgOriginEgress,

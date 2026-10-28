@@ -178,11 +178,18 @@ type Shape struct {
 //   - Limited to our pid namespace, beside a dockerd outside it, the
 //     daemon's containers are outside it too, and the hook never judges
 //     their traffic.
-//   - In a private cgroup namespace beside a dockerd in another container,
-//     the daemon's containers may live outside our subtree, where the hook
-//     never sees them.
-//   - A namespace, cgroup path or daemon that could not be identified
-//     proves none of this, and a kind added later with no rule here is
+//   - In a private cgroup namespace beside a dockerd that is not ours (in
+//     another container, or with its pid outside our pid namespace, which
+//     may be the host's own daemon), the daemon's containers may live
+//     outside our subtree, where the hook never sees them.
+//   - An unidentified fact refuses where it decides who the hook judges:
+//     the cgroup namespace always; in the host cgroup namespace, the cgroup
+//     path and the pid namespace; and the daemon wherever its containers
+//     could escape the hook (limited to our pid namespace, or in a private
+//     cgroup namespace). Elsewhere an unknown cannot change that and is not
+//     read: on a runner VM the hook judges the whole machine whatever the
+//     daemon is, and in a private cgroup namespace the cgroup subtree, not
+//     the pid namespace, bounds it. A kind added later with no rule here is
 //     refused until it is given one.
 //
 // Two limits of the scoped hook are accepted rather than refused, and
@@ -229,9 +236,12 @@ func (s Shape) HookScope() (stamped bool, err error) {
 		switch s.Dockerd.Kind {
 		case DockerdAbsent, DockerdLocal:
 			return false, nil
-		case DockerdForeign, DockerdHidden:
+		case DockerdForeign:
 			return false, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd in another container (%s)",
 				s.Dockerd.Reason)
+		case DockerdHidden:
+			return false, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd we cannot see, "+
+				"possibly the host's own (%s)", s.Dockerd.Reason)
 		case DockerdUnknown:
 			return false, fmt.Errorf("in a private cgroup namespace beside an unidentified dockerd (%s)", s.Dockerd.Reason)
 		default:

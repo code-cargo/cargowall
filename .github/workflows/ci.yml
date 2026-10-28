@@ -152,14 +152,11 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install eBPF dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev
-
-      - name: Generate BPF objects
-        run: go generate ./...
-
+      # Builds the committed BPF objects, which bpf-generate.yml holds to
+      # clang 18; every integration leg loads this one binary. Regenerating
+      # here would pick up whatever clang the image prefers and change the
+      # program under both legs at once. The Test matrix is where the
+      # runner's own clang is exercised.
       - name: Build cargowall
         run: make build
 

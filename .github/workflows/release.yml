@@ -31,14 +31,9 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install eBPF dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev
-
-      - name: Generate BPF objects
-        run: go generate ./...
-
+      # Ships the committed BPF objects, which bpf-generate.yml holds to
+      # clang 18. Regenerating here would ship whatever clang the image
+      # prefers.
       - name: Determine version tag
         id: tag
         run: |

@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -112,8 +114,8 @@ type StartCmd struct {
 
 	// Orthogonal CI plumbing flags — usable on any CI system (or standalone).
 	// Each is also implied by a CI preset above.
-	DNSRedirectIptables    bool `help:"Install iptables OUTPUT NAT rules redirecting outbound DNS (UDP+TCP/53) to the local proxy at 127.0.0.1:53" default:"false" env:"CARGOWALL_DNS_REDIRECT_IPTABLES"`
-	DockerDNSInterception  bool `help:"Listen on the Docker bridge IP for DNS, rewrite /etc/docker/daemon.json so containers use the proxy, and restart the Docker daemon" default:"false" env:"CARGOWALL_DOCKER_DNS_INTERCEPTION"`
+	DNSRedirectIptables    bool `help:"Install iptables NAT rules redirecting outbound DNS (UDP+TCP/53) to the local proxy at 127.0.0.1:53, and, with the Docker bridge listener, container DNS arriving on a docker bridge to that listener" default:"false" env:"CARGOWALL_DNS_REDIRECT_IPTABLES"`
+	DockerDNSInterception  bool `help:"Listen on the Docker bridge IP for DNS, rewrite /etc/docker/daemon.json so containers use the proxy, and restart the Docker daemon (the rewrite and restart are skipped for a daemon in another container)" default:"false" env:"CARGOWALL_DOCKER_DNS_INTERCEPTION"`
 	DNSQueryFiltering      bool `help:"Filter DNS queries against the firewall policy (blocks DNS tunneling)" default:"false" env:"CARGOWALL_DNS_QUERY_FILTERING"`
 	PrepopulateDNSCache    bool `help:"Pre-populate the BPF allowlist from the systemd-resolved cache and reverse-DNS existing connections at startup" default:"false" env:"CARGOWALL_PREPOPULATE_DNS_CACHE"`
 	AutoAllowCloudMetadata bool `help:"Auto-allow cloud metadata endpoints (AWS / Azure / GCP, auto-detected; override with CARGOWALL_CLOUD_PROVIDER=aws|azure|gcp)" default:"false" env:"CARGOWALL_AUTO_ALLOW_CLOUD_METADATA"`
@@ -226,6 +228,18 @@ func (c *StartCmd) AfterApply() error {
 		return fmt.Errorf("--api-failure-mode must be one of %q, %q, %q (got %q)",
 			ApiFailureModeAudit, ApiFailureModeLocal, ApiFailureModeFail, c.ApiFailureMode)
 	}
+	// A loopback upstream under the DNS redirect is a loop, not a
+	// configuration. Whatever listens there (systemd-resolved's stub, a
+	// caching forwarder) sends its own upstream queries from a socket that
+	// does not carry the proxy's mark, so the OUTPUT redirect DNATs them back
+	// into the proxy, which forwards them to the loopback resolver again
+	// until it runs out of concurrent queries and DNS for the whole job is
+	// wedged. Refused here rather than discovered as a readiness timeout.
+	if c.DNSRedirectIptables && !c.DisableDNSTracking && loopbackUpstream(c.DNSUpstream) {
+		return fmt.Errorf("--dns-upstream %s is a loopback resolver, which --dns-redirect-iptables would loop "+
+			"(its own upstream queries are redirected back into the proxy); pass the resolver it forwards to instead",
+			c.DNSUpstream)
+	}
 	// Refuse rather than silently downgrade: an operator who asked for
 	// enforcement believes pre-NAT/loopback/bridge egress is policed, and a
 	// run that quietly dropped that request is indistinguishable from one
@@ -280,6 +294,22 @@ func (c *StartCmd) AfterApply() error {
 		return fmt.Errorf("--tls-sni=%s requires --container-egress=enforce", c.TLSSNI)
 	}
 	return nil
+}
+
+// loopbackUpstream reports whether a --dns-upstream value ("host:port", or a
+// bare host) names a loopback resolver: anything in 127.0.0.0/8, ::1, an
+// IPv4-mapped loopback, or localhost. A hostname that is not an address is
+// not judged here.
+func loopbackUpstream(upstream string) bool {
+	host, _, err := net.SplitHostPort(upstream)
+	if err != nil {
+		host = strings.Trim(upstream, "[]")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	return err == nil && addr.Unmap().IsLoopback()
 }
 
 // --container-egress values, in ascending strictness. The root-cgroup hook has

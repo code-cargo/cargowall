@@ -46,6 +46,15 @@ scenarios() {
   # record is where container DNS attribution shows up.
   docker run --rm alpine:latest sh -c 'sleep 1; wget -q --timeout=5 https://container-dns-probe.example.com || true'
 
+  # Containers that name their own resolver: --dns on the default bridge,
+  # and a direct query to 8.8.8.8 from a user-defined bridge created after
+  # cargowall started. The host originates neither query, so only the
+  # PREROUTING redirect on the bridges brings them to the proxy.
+  docker run --rm --dns 8.8.8.8 alpine:latest sh -c 'sleep 1; nslookup container-dns-bypass-docker0.example.com || true'
+  docker network create cw-dns-udn > /dev/null
+  docker run --rm --network cw-dns-udn alpine:latest sh -c 'sleep 1; nslookup container-dns-bypass-udn.example.com 8.8.8.8 || true'
+  docker network rm cw-dns-udn > /dev/null
+
   # Give the three detached containers time to finish their fetches.
   sleep 12
   cat /tmp/cargowall-concurrent-cids
@@ -161,6 +170,17 @@ validate() {
     echo "❌ No dns_blocked events carry container attribution"
     EVENTS_VALID=false
   fi
+
+  # A container's own resolver must not route around the proxy: each bypass
+  # name is blocked there by name, and attributed to its container.
+  for name in container-dns-bypass-docker0.example.com container-dns-bypass-udn.example.com; do
+    BYPASS=$(jq -s --arg name "$name" '[.[] | select(.event_type == "dns_blocked" and ((.dst_hostname // "") | rtrimstr(".")) == $name and .container_origin == true)] | length' "$AUDIT_LOG")
+    echo "$name: container-attributed dns_blocked=$BYPASS"
+    if [ "$BYPASS" -eq 0 ]; then
+      echo "❌ $name never reached the proxy from its container (resolver bypass)"
+      EVENTS_VALID=false
+    fi
+  done
 
   # Concurrent-container correctness: each TEST-NET destination's blocked
   # connection events must carry exactly the container that fetched it

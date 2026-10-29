@@ -35,6 +35,8 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // loadOriginObjectsScoped loads the origin collection the way origin.Start
@@ -48,10 +50,9 @@ func loadOriginObjectsScoped(t *testing.T, pod string) *OriginBpfObjects {
 	require.NoError(t, err)
 	require.NoError(t, spec.Variables[OriginBpfVarScoped].Set(uint8(1)))
 	if pod != "" {
-		rel, err := filepath.Rel("/sys/fs/cgroup", pod)
-		require.NoError(t, err)
 		require.NoError(t, spec.Variables[OriginBpfVarScopePodCgroup].Set(cgroupID(t, pod)))
-		require.NoError(t, spec.Variables[OriginBpfVarScopePodLevel].Set(uint32(len(strings.Split(rel, "/")))))
+		require.NoError(t, spec.Variables[OriginBpfVarScopePodLevel].Set(
+			podenv.CgroupLevel(strings.TrimPrefix(pod, podenv.CgroupRoot))))
 	}
 	var objs OriginBpfObjects
 	require.NoError(t, spec.LoadAndAssign(&objs, nil))

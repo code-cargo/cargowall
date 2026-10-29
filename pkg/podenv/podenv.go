@@ -31,8 +31,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -64,6 +68,26 @@ func PidNamespaceInode() (uint32, error) {
 // CgroupRoot is where every cgroup program attaches: the tree whose mount
 // Detect proves (CgroupMount) and whose paths /proc/<pid>/cgroup gives.
 const CgroupRoot = "/sys/fs/cgroup"
+
+// CgroupID is the id of the cgroup at path below CgroupRoot, as a BPF
+// program reads it: its cgroupfs inode, on 64-bit kernels.
+func CgroupID(path string) (uint64, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(filepath.Join(CgroupRoot, path), &st); err != nil {
+		return 0, err
+	}
+	return st.Ino, nil
+}
+
+// CgroupLevel is the depth of the cgroup at an absolute path below the
+// root, which is level 0.
+func CgroupLevel(path string) uint32 {
+	path = strings.Trim(filepath.Clean(path), "/")
+	if path == "" {
+		return 0
+	}
+	return uint32(strings.Count(path, "/") + 1)
+}
 
 // CgroupNS is which cgroup namespace cargowall runs in.
 type CgroupNS int
@@ -141,7 +165,10 @@ func (p PidNS) String() string {
 type SocketCgroups int
 
 const (
-	SocketCgroupsUnknown SocketCgroups = iota // the probe failed
+	// SocketCgroupsUnknown: the probe failed, or was not run because
+	// nothing reads it (a runner VM, where the hook is at the machine's
+	// root and unscoped).
+	SocketCgroupsUnknown SocketCgroups = iota
 	// SocketCgroupsKept: a socket's cgroup is always the one it was made in.
 	SocketCgroupsKept
 	// SocketCgroupsShared: the cgroup shares a word with the v1 data, so a
@@ -222,10 +249,15 @@ type Shape struct {
 	// PidNSReason is the probe error when PidNS is unknown.
 	PidNSReason string
 	Dockerd     Dockerd
-	// DockerHost is DOCKER_HOST when it names a daemon other than the probed
-	// socket. The job's containers then belong to a daemon nothing probed,
-	// so an absent or local result on the socket says nothing about them.
-	DockerHost string
+	// DockerHost is the daemon the docker CLI is set to use, when it is not
+	// the probed socket, and DockerHostSetting what set it (DOCKER_HOST, or
+	// a docker context). The job's containers then belong to a daemon
+	// nothing probed, so an absent or local result on the socket says
+	// nothing about them. DockerHostReason is why the CLI's daemon could
+	// not be identified.
+	DockerHost        string
+	DockerHostSetting string
+	DockerHostReason  string
 	// Kernel is the running kernel's release, as Detect was given it.
 	Kernel string
 	// SocketCgroups is whether this kernel keeps socket cgroups, and
@@ -359,11 +391,16 @@ func (s Shape) attachPointRefusal() error {
 	}
 }
 
-// dockerHostRefusal says why the job's daemon is not the one probed, or nil.
+// dockerHostRefusal says why the job's daemon is not, or cannot be shown
+// to be, the one probed, or nil.
 func (s Shape) dockerHostRefusal() error {
+	if s.DockerHostReason != "" {
+		return fmt.Errorf("the docker daemon the CLI is set to use is unidentified (%s), "+
+			"and its containers may be ones the hook does not see", s.DockerHostReason)
+	}
 	if s.DockerHost != "" {
-		return fmt.Errorf("DOCKER_HOST=%s names a docker daemon the probe did not reach, "+
-			"whose containers the hook may not see", s.DockerHost)
+		return fmt.Errorf("%s names %s, a docker daemon the probe did not reach, "+
+			"whose containers the hook may not see", s.DockerHostSetting, s.DockerHost)
 	}
 	return nil
 }
@@ -450,7 +487,8 @@ func (s Shape) LogArgs() []any {
 		"cgroup_mount", s.CgroupMount.String(), "cgroup_mount_reason", s.CgroupMountReason,
 		"pidns", s.PidNS.String(), "pidns_reason", s.PidNSReason,
 		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
-		"docker_host", s.DockerHost, "kernel", s.Kernel,
+		"docker_host", s.DockerHost, "docker_host_setting", s.DockerHostSetting,
+		"docker_host_reason", s.DockerHostReason, "kernel", s.Kernel,
 		"socket_cgroups", s.SocketCgroups.String(), "socket_cgroups_reason", s.SocketCgroupsReason,
 	}
 }
@@ -485,8 +523,18 @@ func Detect(dockerSocket, kernel string) Shape {
 		s.PidNS = PidNSPrivate
 	}
 	s.Dockerd = probeDockerd(dockerSocket)
-	s.DockerHost = dockerHostElsewhere(os.Getenv("DOCKER_HOST"), dockerSocket)
-	s.SocketCgroups, s.SocketCgroupsReason = probeSocketCgroups(kernel)
+	if host, setting, err := dockerCLIHost(os.Getenv); err != nil {
+		s.DockerHostReason = err.Error()
+	} else if host != "" && dockerHostElsewhere(host, dockerSocket) {
+		s.DockerHost, s.DockerHostSetting = host, setting
+	}
+	// The probe parses the kernel's BTF, and in the host cgroup and pid
+	// namespaces nothing reads its answer.
+	if s.CgroupNS == CgroupNSHost && s.PidNS == PidNSHost {
+		s.SocketCgroupsReason = "not probed: the hook is at the machine's root and judges every socket"
+	} else {
+		s.SocketCgroups, s.SocketCgroupsReason = probeSocketCgroups(kernel)
+	}
 	return s
 }
 
@@ -511,29 +559,90 @@ func probeCgroupMount(root, path string, pid int) (CgroupMount, string) {
 	return CgroupMountOther, fmt.Sprintf("pid %d is not in %s", pid, procs)
 }
 
-// dockerHostElsewhere returns DOCKER_HOST when it names a daemon other than
-// the one on socket, and "" when it is unset or names that socket. Two
-// spellings of one socket are the same daemon: /var/run is a symlink to
-// /run on most distributions. They are compared with their directories'
-// symlinks resolved, so the spellings match before the daemon has made
-// its socket too.
-func dockerHostElsewhere(dockerHost, socket string) string {
-	if dockerHost == "" {
-		return ""
+// defaultDockerHost is the docker CLI's default socket, which an empty
+// unix:// address means too.
+const defaultDockerHost = "/var/run/docker.sock"
+
+// dockerCLIHost is the daemon address the docker CLI would use in the
+// environment getenv reads, resolved as the CLI resolves it: DOCKER_HOST;
+// else the context DOCKER_CONTEXT names, else the config file's current
+// context, through that context's stored endpoint. setting says which; ""
+// is the default context, the default socket. A context that cannot be
+// read is an error, as it is to the CLI.
+func dockerCLIHost(getenv func(string) string) (host, setting string, err error) {
+	if h := getenv("DOCKER_HOST"); h != "" {
+		return h, "DOCKER_HOST", nil
 	}
-	p, ok := strings.CutPrefix(dockerHost, "unix://")
+	dir := getenv("DOCKER_CONFIG")
+	if dir == "" {
+		if home := getenv("HOME"); home != "" {
+			dir = filepath.Join(home, ".docker")
+		}
+	}
+	name, setting := getenv("DOCKER_CONTEXT"), "DOCKER_CONTEXT"
+	if name == "" && dir != "" {
+		config := filepath.Join(dir, "config.json")
+		data, err := os.ReadFile(config)
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", "", nil
+		}
+		if err != nil {
+			return "", "", err
+		}
+		var cfg struct {
+			CurrentContext string `json:"currentContext"`
+		}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return "", "", fmt.Errorf("%s: %w", config, err)
+		}
+		name, setting = cfg.CurrentContext, config+"'s currentContext"
+	}
+	if name == "" || name == "default" {
+		return "", "", nil
+	}
+	setting = fmt.Sprintf("docker context %q (from %s)", name, setting)
+	if dir == "" {
+		return "", "", fmt.Errorf("%s: no docker config directory", setting)
+	}
+	sum := sha256.Sum256([]byte(name))
+	data, err := os.ReadFile(filepath.Join(dir, "contexts", "meta", hex.EncodeToString(sum[:]), "meta.json"))
+	if err != nil {
+		return "", "", fmt.Errorf("%s: %w", setting, err)
+	}
+	var meta struct {
+		Endpoints map[string]struct{ Host string }
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return "", "", fmt.Errorf("%s: %w", setting, err)
+	}
+	if host = meta.Endpoints["docker"].Host; host == "" {
+		return "", "", fmt.Errorf("%s names no docker endpoint", setting)
+	}
+	return host, setting, nil
+}
+
+// dockerHostElsewhere reports whether a docker daemon address names a
+// daemon other than the one on socket. Two spellings of one socket are the
+// same daemon: /var/run is a symlink to /run on most distributions. They
+// are compared with their directories' symlinks resolved, so the spellings
+// match before the daemon has made its socket too.
+func dockerHostElsewhere(host, socket string) bool {
+	p, ok := strings.CutPrefix(host, "unix://")
 	if !ok {
-		return dockerHost
+		return true
+	}
+	if p == "" {
+		p = defaultDockerHost
 	}
 	if resolveDir(p) == resolveDir(socket) {
-		return ""
+		return false
 	}
 	if a, err := os.Stat(p); err == nil {
 		if b, err := os.Stat(socket); err == nil && os.SameFile(a, b) {
-			return ""
+			return false
 		}
 	}
-	return dockerHost
+	return true
 }
 
 // resolveDir is path with the symlinks in its directory resolved, or just

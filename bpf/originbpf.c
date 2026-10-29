@@ -184,6 +184,7 @@ struct {
     __type(key, __u64);
     __type(value, __u8);
     __uint(max_entries, 64);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
 } map_scope_cgroups SEC(".maps");
 
 // Local-only networks (docker bridge subnets), carved out of adjudication

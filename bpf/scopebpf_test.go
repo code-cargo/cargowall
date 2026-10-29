@@ -38,17 +38,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// scopeStatSlot is the map_scope_stats slot scopebpf.c #defines as name,
-// read from the source so these tests cannot drift from it.
-func scopeStatSlot(t *testing.T, name string) uint32 {
-	t.Helper()
+// TestScopeStatSlotsMatchSource pins the ScopeStat* slots to SCOPE_STAT_*
+// in scopebpf.c: a drift would report one shortfall as another, or read
+// past the map.
+func TestScopeStatSlotsMatchSource(t *testing.T) {
 	src, err := os.ReadFile("scopebpf.c")
 	require.NoError(t, err)
-	m := regexp.MustCompile(`(?m)^#define ` + name + `\s+(\d+)\b`).FindSubmatch(src)
-	require.NotNil(t, m, "scopebpf.c must #define %s", name)
-	slot, err := strconv.ParseUint(string(m[1]), 10, 32)
-	require.NoError(t, err)
-	return uint32(slot)
+	for name, want := range map[string]uint64{
+		"SCOPE_STAT_FULL":   ScopeStatFull,
+		"SCOPE_STAT_ROOT":   ScopeStatRoot,
+		"SCOPE_STAT_FAILED": ScopeStatFailed,
+		"SCOPE_STAT_SHARED": ScopeStatShared,
+		"SCOPE_STATS_MAX":   ScopeStatsMax,
+	} {
+		m := regexp.MustCompile(`(?m)^#define ` + name + `\s+(\d+)\b`).FindSubmatch(src)
+		require.NotNil(t, m, "scopebpf.c must #define %s", name)
+		got, err := strconv.ParseUint(string(m[1]), 10, 32)
+		require.NoError(t, err)
+		require.Equal(t, want, got, "%s drifted between scopebpf.c and scope_stats.go", name)
+	}
 }
 
 // loadScope loads the scope collection for the pid namespace ino. Each
@@ -104,10 +112,10 @@ func scopeRecorded(t *testing.T, objs *ScopeBpfObjects, path string) bool {
 	return objs.MapScopeCgroups.Lookup(cgroupID(t, path), &v) == nil
 }
 
-func scopeStat(t *testing.T, objs *ScopeBpfObjects, name string) uint64 {
+func scopeStat(t *testing.T, objs *ScopeBpfObjects, slot uint32) uint64 {
 	t.Helper()
 	var n uint64
-	require.NoError(t, objs.MapScopeStats.Lookup(scopeStatSlot(t, name), &n))
+	require.NoError(t, objs.MapScopeStats.Lookup(slot, &n))
 	return n
 }
 
@@ -153,16 +161,20 @@ func childOf(t *testing.T, parent int) int {
 }
 
 // heldPidNamespace makes a pid namespace that lives until cleanup, and
-// returns its inode and a way to start a process in it from outside, as a
+// returns its inode and a way to start a process in it from outside (sleep
+// unless a command is given), as a
 // runtime's exec does: the process is in the namespace and still in the
 // test's cgroup, which it shares with its parent outside. With it as the
 // scope's namespace, nothing else on the machine counts as ours.
-func heldPidNamespace(t *testing.T) (uint32, func() int) {
+func heldPidNamespace(t *testing.T) (uint32, func(command ...string) int) {
 	t.Helper()
 	ino, initPid := heldPidNamespaceInit(t)
 	nsInit := strconv.Itoa(initPid)
-	enter := func() int {
-		cmd := startPinned(t, exec.Command("nsenter", "-t", nsInit, "-p", "--", "sleep", "60"))
+	enter := func(command ...string) int {
+		if len(command) == 0 {
+			command = []string{"sleep", "60"}
+		}
+		cmd := startPinned(t, exec.Command("nsenter", append([]string{"-t", nsInit, "-p", "--"}, command...)...))
 		pid := childOf(t, cmd.Process.Pid)
 		// Killing nsenter leaves its child behind, which would keep the
 		// cgroups it moved into from being removed.
@@ -207,7 +219,7 @@ func TestScopeAttachRecordsMoves(t *testing.T) {
 
 		moveInto(t, "/sys/fs/cgroup", pid)
 		require.False(t, scopeRecorded(t, objs, "/sys/fs/cgroup"), "the root cgroup is never recorded")
-		require.Equal(t, uint64(1), scopeStat(t, objs, "SCOPE_STAT_ROOT"), "entering the root cgroup is counted")
+		require.Equal(t, uint64(1), scopeStat(t, objs, ScopeStatRoot), "entering the root cgroup is counted")
 	})
 	t.Run("another pid namespace", func(t *testing.T) {
 		objs := loadScope(t, 1, 0)
@@ -376,7 +388,23 @@ func TestScopeWalkListsOurCgroups(t *testing.T) {
 		ids = runScopeWalk(t, objs)
 		require.False(t, ids[cgroupID(t, dst)], "the task has left")
 		require.False(t, ids[cgroupID(t, "/sys/fs/cgroup")], "the root cgroup is never listed")
-		require.Equal(t, uint64(1), scopeStat(t, objs, "SCOPE_STAT_ROOT"), "a task of ours there is counted")
+		require.Equal(t, uint64(1), scopeStat(t, objs, ScopeStatRoot), "a task of ours there is counted")
+
+		// Once a process, however many threads it has.
+		if _, err := exec.LookPath("python3"); err != nil {
+			t.Skip("no python3 for a threaded process")
+		}
+		threaded := enter("python3", "-c",
+			"import threading, time\n"+
+				"for _ in range(4): threading.Thread(target=time.sleep, args=(60,), daemon=True).start()\n"+
+				"time.sleep(60)")
+		require.Eventually(t, func() bool {
+			tasks, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", threaded))
+			return err == nil && len(tasks) == 5
+		}, 5*time.Second, 20*time.Millisecond)
+		moveInto(t, "/sys/fs/cgroup", threaded)
+		runScopeWalk(t, objs)
+		require.Equal(t, uint64(1+2), scopeStat(t, objs, ScopeStatRoot), "this walk counts the sleep and the threaded process once each")
 	})
 }
 
@@ -461,6 +489,42 @@ func TestScopeReleaseForgetsCgroups(t *testing.T) {
 	require.True(t, recorded(v1ID), "a v1 cgroup's release deletes nothing")
 }
 
+// A cgroup leaves the scope as soon as a task outside our pid namespace
+// enters it, by a move (systemd restarting a unit into the cgroup a job of
+// ours was left in) or by clone3 into it: it is no longer this job's alone.
+// Entering a cgroup that is not in the scope counts nothing.
+func TestScopeLeavesCgroupsOthersEnter(t *testing.T) {
+	requireBPF(t)
+	moved := siblingCgroup(t, "moved-into")
+	cloned := siblingCgroup(t, "cloned-into")
+	other := siblingCgroup(t, "other")
+	ino, enter := heldPidNamespace(t)
+	objs := loadScope(t, ino, 0)
+	attachScopeTracing(t, objs.ScopeAttach)
+	attachScopeTracing(t, objs.ScopeFork)
+	ours := enter()
+	moveInto(t, moved, ours)
+	moveInto(t, cloned, ours)
+	require.True(t, scopeRecorded(t, objs, moved))
+	require.True(t, scopeRecorded(t, objs, cloned))
+
+	foreign := startPinned(t, exec.Command("sleep", "60")).Process.Pid
+	moveInto(t, other, foreign)
+	require.Zero(t, scopeStat(t, objs, ScopeStatShared), "a cgroup outside the scope")
+	moveInto(t, moved, foreign)
+	require.False(t, scopeRecorded(t, objs, moved), "a move into it by a task outside our pid namespace")
+	require.Equal(t, uint64(1), scopeStat(t, objs, ScopeStatShared))
+
+	dir, err := os.Open(cloned)
+	require.NoError(t, err)
+	defer dir.Close()
+	child := exec.Command("/bin/true")
+	child.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(dir.Fd())}
+	require.NoError(t, child.Run())
+	require.False(t, scopeRecorded(t, objs, cloned), "a clone3 child of a task outside our pid namespace")
+	require.Equal(t, uint64(2), scopeStat(t, objs, ScopeStatShared))
+}
+
 // A cgroup that finds the map full is counted, not recorded.
 func TestScopeFullIsCounted(t *testing.T) {
 	requireBPF(t)
@@ -474,6 +538,6 @@ func TestScopeFullIsCounted(t *testing.T) {
 	require.True(t, scopeRecorded(t, objs, first))
 	moveInto(t, second, pid)
 	require.False(t, scopeRecorded(t, objs, second))
-	require.Equal(t, uint64(1), scopeStat(t, objs, "SCOPE_STAT_FULL"))
-	require.Zero(t, scopeStat(t, objs, "SCOPE_STAT_FAILED"), "a full map is not another failure")
+	require.Equal(t, uint64(1), scopeStat(t, objs, ScopeStatFull))
+	require.Zero(t, scopeStat(t, objs, ScopeStatFailed), "a full map is not another failure")
 }

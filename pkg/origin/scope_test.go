@@ -25,7 +25,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -37,26 +36,6 @@ import (
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/podenv"
 )
-
-// TestScopeStatSlotsMatchKernel pins podScope's stat slots to
-// SCOPE_STAT_* in scopebpf.c: a drift would report one shortfall as
-// another, or read past the map.
-func TestScopeStatSlotsMatchKernel(t *testing.T) {
-	src, err := os.ReadFile("../../bpf/scopebpf.c")
-	require.NoError(t, err)
-	for name, want := range map[string]uint64{
-		"SCOPE_STAT_FULL":   scopeStatFull,
-		"SCOPE_STAT_ROOT":   scopeStatRoot,
-		"SCOPE_STAT_FAILED": scopeStatFailed,
-		"SCOPE_STATS_MAX":   scopeStatsMax,
-	} {
-		m := regexp.MustCompile(`(?m)^#define ` + name + `\s+(\d+)\b`).FindSubmatch(src)
-		require.NotNil(t, m, "scopebpf.c must #define %s", name)
-		got, err := strconv.ParseUint(string(m[1]), 10, 32)
-		require.NoError(t, err)
-		require.Equal(t, want, got, "%s drifted between scopebpf.c and pkg/origin", name)
-	}
-}
 
 // A cgroup is shared when cgroup.threads lists a task as 0, which is how a
 // reader's pid namespace numbers a task outside it.
@@ -169,9 +148,14 @@ func TestPodScopeWalkInner(t *testing.T) {
 	s, err := startPodScope(slog.New(slog.NewTextHandler(&log, nil)), strings.TrimPrefix(pod, podenv.CgroupRoot))
 	require.NoError(t, err)
 	t.Cleanup(s.close)
+	idOf := func(path string) uint64 {
+		id, err := podenv.CgroupID(strings.TrimPrefix(path, podenv.CgroupRoot))
+		require.NoError(t, err)
+		return id
+	}
 	recorded := func(path string) bool {
 		var v uint8
-		return s.cgroups().Lookup(cgroupID(strings.TrimPrefix(path, podenv.CgroupRoot)), &v) == nil
+		return s.cgroups().Lookup(idOf(path), &v) == nil
 	}
 	require.True(t, recorded(own), "a cgroup only our tasks are in, its name starting with a dot")
 	require.False(t, recorded(shared), "a cgroup a task outside our pid namespace is in too")
@@ -179,6 +163,11 @@ func TestPodScopeWalkInner(t *testing.T) {
 	require.False(t, recorded(filepath.Join(pod, "shared")), "a cgroup under the pod's is the hook's to judge")
 	require.NotContains(t, log.String(), strings.TrimPrefix(filepath.Join(pod, "shared"), podenv.CgroupRoot),
 		"and is not reported: its sockets do not pass")
+
+	// A cgroup a task outside the namespace entered between the walk's look
+	// and the record is taken out again by the second look.
+	s.record(idOf(shared), strings.TrimPrefix(shared, podenv.CgroupRoot))
+	require.False(t, recorded(shared), "a cgroup found shared once recorded is taken out")
 }
 
 // loadWalkScope loads the scope collection for the pid namespace ino with a

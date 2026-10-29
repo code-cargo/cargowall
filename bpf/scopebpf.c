@@ -24,13 +24,17 @@
 // it for the job (an MPTCP subflow takes its parent's cgroup, an SMC
 // connection's TCP socket is made in the caller's context), or it predates
 // cargowall. This collection records the entered cgroups in
-// map_scope_cgroups, and forgets each when it is released, which
-// pkg/origin loads into the origin collection in place of its stand-in. It is its own collection, loaded only in that
-// shape, so a failure here costs the scope and nothing else.
+// map_scope_cgroups, which pkg/origin loads into the origin collection in
+// place of its stand-in, and forgets each when it is released. It is its
+// own collection, loaded only in that shape, so a failure here costs the
+// scope and nothing else.
 //
 // A cgroup is recorded once a task of ours enters it: moves there
 // (scope_attach) or is created there by clone3's CLONE_INTO_CGROUP
-// (scope_fork). A cgroup a task of ours merely inherits is never recorded
+// (scope_fork). It leaves the scope as soon as a task outside our pid
+// namespace enters it the same way, such as a node service systemd
+// restarts into the cgroup a job of ours was left in: it is no longer this
+// job's alone. A cgroup a task of ours merely inherits is never recorded
 // on that account. A container runtime that runs a process in a container
 // (runc exec, kubectl exec) creates it in our pid namespace while it is
 // still in the runtime's own cgroup, and only then moves it; recording that
@@ -58,14 +62,18 @@ const volatile __u32 pidns_ino = 0;
 
 // Cgroup v2 ids a task of ours has entered, and those the startup walk
 // found only our tasks in. An entry lives until its cgroup is released
-// (scope_release), which is after every socket made in it is gone. A
-// hash, not an LRU: nothing is ever evicted, and a cgroup that finds the
-// map full is counted (SCOPE_STAT_FULL) instead of displacing another.
+// (scope_release), which is after every socket made in it is gone, and a
+// removed cgroup whose memory is still charged (page cache written to a
+// volume, say) is not released until that memory is reclaimed. So the map
+// is large and allocated as it fills. A hash, not an LRU: nothing is ever
+// evicted, and a cgroup that finds the map full is counted
+// (SCOPE_STAT_FULL) instead of displacing another.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u64);
     __type(value, __u8);
-    __uint(max_entries, 8192);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
 } map_scope_cgroups SEC(".maps");
 
 // What the scope could not record, for pkg/origin to report: each counts
@@ -74,7 +82,8 @@ struct {
 #define SCOPE_STAT_FULL 0    // map_scope_cgroups was full
 #define SCOPE_STAT_ROOT 1    // a task of ours entered, or was in, the root cgroup
 #define SCOPE_STAT_FAILED 2  // any other update failure, such as a busy bucket
-#define SCOPE_STATS_MAX 3
+#define SCOPE_STAT_SHARED 3  // a task outside our pid namespace entered a recorded cgroup
+#define SCOPE_STATS_MAX 4
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -97,16 +106,12 @@ static __always_inline struct cgroup *dfl_cgroup(struct task_struct *t)
 
 // scope_id is cg's id for the scope, or 0 for none. The root cgroup holds
 // the kernel's own sockets and the node's, never a pod's alone, so it is
-// never in scope, and a task of ours there (one that moved itself, which
-// takes privilege) is counted: its sockets are never judged.
+// never in scope; a task of ours there (one that moved itself, which takes
+// privilege) has sockets that are never judged, and the callers count it.
 static __always_inline __u64 scope_id(struct cgroup *cg)
 {
-    if (!cg)
+    if (!cg || BPF_CORE_READ(cg, level) == 0)
         return 0;
-    if (BPF_CORE_READ(cg, level) == 0) {
-        scope_count(SCOPE_STAT_ROOT);
-        return 0;
-    }
     return BPF_CORE_READ(cg, kn, id);
 }
 
@@ -115,8 +120,11 @@ static __always_inline __u64 scope_id(struct cgroup *cg)
 static __always_inline void scope_enter(struct cgroup *cg)
 {
     __u64 id = scope_id(cg);
-    if (!id)
+    if (!id) {
+        if (cg)
+            scope_count(SCOPE_STAT_ROOT);
         return;
+    }
     if (bpf_map_lookup_elem(&map_scope_cgroups, &id))
         return;
     __u8 one = 1;
@@ -127,22 +135,39 @@ static __always_inline void scope_enter(struct cgroup *cg)
         scope_count(SCOPE_STAT_FAILED);
 }
 
+// scope_leave takes cg out of the scope, if it is in it, when a task
+// outside our pid namespace enters it: judging the cgroup would judge that
+// task. The job's own tasks there now pass, so it is counted.
+static __always_inline void scope_leave(struct cgroup *cg)
+{
+    __u64 id = scope_id(cg);
+    if (!id || !bpf_map_lookup_elem(&map_scope_cgroups, &id))
+        return;
+    if (!bpf_map_delete_elem(&map_scope_cgroups, &id))
+        scope_count(SCOPE_STAT_SHARED);
+}
+
 // A task created by clone3 in the cgroup CLONE_INTO_CGROUP named, before
-// it runs. The flag, not a comparison with the parent's cgroup: this fires
+// it runs: a task of ours enters it, any other leaves it out of the scope.
+// The flag, not a comparison with the parent's cgroup: this fires
 // once the fork has let go of the lock that keeps its parent from moving,
 // so a parent moved in that instant would make an inherited cgroup look
 // entered. Every other fork returns after one test.
 SEC("tp_btf/task_newtask")
 int BPF_PROG(scope_fork, struct task_struct *task, __u64 clone_flags)
 {
-    if (!(clone_flags & CLONE_INTO_CGROUP) || !ns_tgid_of(task))
+    if (!(clone_flags & CLONE_INTO_CGROUP))
         return 0;
-    scope_enter(dfl_cgroup(task));
+    if (ns_tgid_of(task))
+        scope_enter(dfl_cgroup(task));
+    else
+        scope_leave(dfl_cgroup(task));
     return 0;
 }
 
-// A task moving into dst, such as runc placing a container's first process.
-// Fires just after the move, once per migration, for the thread-group
+// A task moving into dst, such as runc placing a container's first process,
+// or systemd starting a unit's: a task of ours enters it, any other leaves
+// it out of the scope. Fires just after the move, once per migration, for the thread-group
 // leader when a whole group moves, and for every hierarchy, of which only
 // the default one decides socket cgroups. dst, not the leader's own cgroup:
 // a leader that has exited stays where it was while its live threads move.
@@ -150,9 +175,12 @@ SEC("tp_btf/cgroup_attach_task")
 int BPF_PROG(scope_attach, struct cgroup *dst, const char *path,
              struct task_struct *task, bool threadgroup)
 {
-    if (BPF_CORE_READ(dst, root, hierarchy_id) != 0 || !ns_tgid_of(task))
+    if (BPF_CORE_READ(dst, root, hierarchy_id) != 0)
         return 0;
-    scope_enter(dst);
+    if (ns_tgid_of(task))
+        scope_enter(dst);
+    else
+        scope_leave(dst);
     return 0;
 }
 
@@ -189,9 +217,12 @@ int scope_task_iter(struct bpf_iter__task *ctx)
     __u32 tgid = ns_tgid_of(t);
     if (!tgid)
         return 0;
-    __u64 rec[2] = {scope_id(dfl_cgroup(t)), tgid};
+    struct cgroup *cg = dfl_cgroup(t);
+    __u64 rec[2] = {scope_id(cg), tgid};
     if (rec[0])
         bpf_seq_write(ctx->meta->seq, rec, sizeof(rec));
+    else if (cg && BPF_CORE_READ(t, pid) == BPF_CORE_READ(t, tgid))
+        scope_count(SCOPE_STAT_ROOT);  // once a process, not once a thread
     return 0;
 }
 

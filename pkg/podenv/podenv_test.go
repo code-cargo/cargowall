@@ -46,7 +46,8 @@ func TestParseCgroupV2Path(t *testing.T) {
 // VM's daemon or DOCKER_HOST, a private cgroup namespace's pid namespace)
 // is not read.
 func TestHookScope(t *testing.T) {
-	pod := "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-a.scope"
+	const podCg = "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod0e4b1f2a_7c3d_4e5f_8a9b_0c1d2e3f4a5b.slice"
+	pod := podCg + "/cri-containerd-a.scope"
 	runner := "/system.slice/runner.service"
 	local := Dockerd{Kind: DockerdLocal}
 	foreign := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace"}
@@ -64,69 +65,78 @@ func TestHookScope(t *testing.T) {
 	onKernel := func(k string) func(*Shape) { return func(s *Shape) { s.Kernel = k } }
 	with := func(s Shape, f func(*Shape)) Shape { f(&s); return s }
 	remoteDaemon := func(s *Shape) { s.DockerHost = "tcp://localhost:2376" }
+	all := Scope{}
+	inPod := Scope{Limited: true, PodCgroup: podCg}
 	cases := []struct {
-		name   string
-		shape  Shape
-		ok     bool
-		scoped bool
+		name  string
+		shape Shape
+		ok    bool
+		want  Scope
 	}{
-		{"hosted runner", host(runner, PidNSHost, local), true, false},
-		{"hosted runner, daemon unidentified", host(runner, PidNSHost, unknownD), true, false},
-		{"hostPID pod: node root, every task visible", host(pod, PidNSHost, local), false, false},
-		{"ARC runner pod sharing a pid namespace with dind", host(pod, PidNSPrivate, foreign), true, true},
-		{"privileged pod, no dockerd", host(pod, PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, true},
-		{"privileged pod running its own dockerd", host(pod, PidNSPrivate, local), true, true},
-		{"privileged pod, dind not sharing the pid namespace", host(pod, PidNSPrivate, hidden), false, false},
-		{"privileged pod, daemon unidentified", host(pod, PidNSPrivate, unknownD), false, false},
-		{"privileged container outside Kubernetes", host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, true},
-		// Scoped, a socket's cgroup must be whose it is, which 5.14 and
-		// older can stop tracking. Unscoped, the hook judges every socket
-		// under the attach point whatever its cgroup.
-		{"privileged pod on 5.15", with(host(pod, PidNSPrivate, foreign), onKernel("5.15.0-1084-aws")), true, true},
-		{"privileged pod on 5.14", with(host(pod, PidNSPrivate, foreign), onKernel("5.14.21")), false, false},
-		{"privileged pod on 5.10", with(host(pod, PidNSPrivate, foreign), onKernel("5.10.240-238.959.amzn2.x86_64")), false, false},
-		{"privileged pod, kernel unread", with(host(pod, PidNSPrivate, foreign), onKernel("")), false, false},
-		{"hosted runner on 5.10", with(host(runner, PidNSHost, local), onKernel("5.10.0")), true, false},
-		{"private cgroupns on 5.10", with(private(local), onKernel("5.10.0")), true, false},
+		{"hosted runner", host(runner, PidNSHost, local), true, all},
+		{"hosted runner, daemon unidentified", host(runner, PidNSHost, unknownD), true, all},
+		{"hostPID pod: node root, every task visible", host(pod, PidNSHost, local), false, all},
+		{"ARC runner pod sharing a pid namespace with dind", host(pod, PidNSPrivate, foreign), true, inPod},
+		{"privileged pod, no dockerd", host(pod, PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, inPod},
+		{"privileged pod running its own dockerd", host(pod, PidNSPrivate, local), true, inPod},
+		{"privileged pod, dind not sharing the pid namespace", host(pod, PidNSPrivate, hidden), false, all},
+		{"privileged pod, daemon unidentified", host(pod, PidNSPrivate, unknownD), false, all},
+		{"privileged container outside Kubernetes", host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, Scope{Limited: true}},
+		// The pod's other containers are judged by its cgroup, so a pod
+		// whose cgroup cannot be found would leave them out.
+		{"privileged pod, no pod cgroup in the path", host("/kubepods.slice/cri-containerd-a.scope", PidNSPrivate, foreign), false, all},
+		{
+			"privileged pod, cgroupfs driver", host("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate, foreign), true,
+			Scope{Limited: true, PodCgroup: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
+		},
+		// A socket's cgroup must be whose it is wherever the hook is
+		// attached below the machine's root or judges only our cgroups,
+		// which 5.14 and older can stop tracking. Attached at the machine's
+		// root and unscoped, it judges every socket whatever its cgroup.
+		{"privileged pod on 5.15", with(host(pod, PidNSPrivate, foreign), onKernel("5.15.0-1084-aws")), true, inPod},
+		{"privileged pod on 5.14", with(host(pod, PidNSPrivate, foreign), onKernel("5.14.21")), false, all},
+		{"privileged pod on 5.10", with(host(pod, PidNSPrivate, foreign), onKernel("5.10.240-238.959.amzn2.x86_64")), false, all},
+		{"privileged pod, kernel unread", with(host(pod, PidNSPrivate, foreign), onKernel("")), false, all},
+		{"hosted runner on 5.10", with(host(runner, PidNSHost, local), onKernel("5.10.0")), true, all},
+		{"private cgroupns on 5.15", with(private(local), onKernel("5.15.0-1084-aws")), true, all},
+		{"private cgroupns on 5.10", with(private(local), onKernel("5.10.0")), false, all},
+		{"private cgroupns, kernel unread", with(private(local), onKernel("")), false, all},
 		// The host's daemon, through its socket, starts containers outside
 		// our pid namespace, which the scope never reaches.
-		{"privileged container outside Kubernetes, the host's dockerd", host("/system.slice/docker-a.scope", PidNSPrivate, hidden), false, false},
-		{"hostPID pod, systemd driver under a custom cgroup root", host("/custom.slice/custom-kubepods.slice/custom-kubepods-pod1.slice/cri-containerd-a.scope", PidNSHost, local), false, false},
-		{"host cgroupns, pid namespace unread", with(host(runner, PidNSUnknown, local), func(s *Shape) { s.PidNSReason = "stat: permission denied" }), false, false},
-		{"host cgroupns, path unread", Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied", PidNS: PidNSHost, Dockerd: local}, false, false},
-		{"host cgroupns, mount unproven", with(host(runner, PidNSHost, local), func(s *Shape) { s.CgroupMount = CgroupMountUnknown }), false, false},
-		{"host cgroupns, mount is another tree", with(host(runner, PidNSHost, local), func(s *Shape) { s.CgroupMount = CgroupMountOther }), false, false},
-		{"privileged pod, DOCKER_HOST names another daemon", with(host(pod, PidNSPrivate, Dockerd{Kind: DockerdAbsent}), remoteDaemon), false, false},
-		{"hosted runner, DOCKER_HOST names another daemon", with(host(runner, PidNSHost, local), remoteDaemon), true, false},
-		{"private cgroupns, foreign dockerd", private(foreign), false, false},
-		{"private cgroupns, hidden dockerd", private(hidden), false, false},
-		{"private cgroupns, unidentified dockerd", private(unknownD), false, false},
-		{"private cgroupns, no dockerd", private(Dockerd{Kind: DockerdAbsent}), true, false},
-		{"private cgroupns, own dockerd", private(local), true, false},
-		{"host cgroupfs bound into a private cgroupns", with(private(local), func(s *Shape) { s.CgroupMount = CgroupMountOther }), false, false},
-		{"private cgroupns, path unread", with(private(local), func(s *Shape) { s.CgroupPath = "" }), false, false},
-		{"private cgroupns, DOCKER_HOST names another daemon", with(private(local), remoteDaemon), false, false},
-		{"private cgroupns, pid namespace unread", with(private(local), func(s *Shape) { s.PidNS = PidNSUnknown }), true, false},
-		{"private cgroupns, host pid namespace", with(private(local), func(s *Shape) { s.PidNS = PidNSHost }), true, false},
-		{"unprobed", Shape{}, false, false},
+		{"privileged container outside Kubernetes, the host's dockerd", host("/system.slice/docker-a.scope", PidNSPrivate, hidden), false, all},
+		{"hostPID pod, systemd driver under a custom cgroup root", host("/custom.slice/custom-kubepods.slice/custom-kubepods-pod0e4b1f2a_7c3d_4e5f_8a9b_0c1d2e3f4a5b.slice/cri-containerd-a.scope", PidNSHost, local), false, all},
+		{"host cgroupns, pid namespace unread", with(host(runner, PidNSUnknown, local), func(s *Shape) { s.PidNSReason = "stat: permission denied" }), false, all},
+		{"host cgroupns, path unread", Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied", PidNS: PidNSHost, Dockerd: local}, false, all},
+		{"host cgroupns, mount unproven", with(host(runner, PidNSHost, local), func(s *Shape) { s.CgroupMount = CgroupMountUnknown }), false, all},
+		{"host cgroupns, mount is another tree", with(host(runner, PidNSHost, local), func(s *Shape) { s.CgroupMount = CgroupMountOther }), false, all},
+		{"privileged pod, DOCKER_HOST names another daemon", with(host(pod, PidNSPrivate, Dockerd{Kind: DockerdAbsent}), remoteDaemon), false, all},
+		{"hosted runner, DOCKER_HOST names another daemon", with(host(runner, PidNSHost, local), remoteDaemon), true, all},
+		{"private cgroupns, foreign dockerd", private(foreign), false, all},
+		{"private cgroupns, hidden dockerd", private(hidden), false, all},
+		{"private cgroupns, unidentified dockerd", private(unknownD), false, all},
+		{"private cgroupns, no dockerd", private(Dockerd{Kind: DockerdAbsent}), true, all},
+		{"private cgroupns, own dockerd", private(local), true, all},
+		{"host cgroupfs bound into a private cgroupns", with(private(local), func(s *Shape) { s.CgroupMount = CgroupMountOther }), false, all},
+		{"private cgroupns, path unread", with(private(local), func(s *Shape) { s.CgroupPath = "" }), false, all},
+		{"private cgroupns, DOCKER_HOST names another daemon", with(private(local), remoteDaemon), false, all},
+		{"private cgroupns, pid namespace unread", with(private(local), func(s *Shape) { s.PidNS = PidNSUnknown }), true, all},
+		{"private cgroupns, host pid namespace", with(private(local), func(s *Shape) { s.PidNS = PidNSHost }), true, all},
+		{"unprobed", Shape{}, false, all},
 		// A kind with no rule fails closed, wherever its switch sits.
-		{"unnamed cgroup namespace kind", Shape{CgroupNS: CgroupNS(99), CgroupPath: "/", CgroupMount: CgroupMountOurs, PidNS: PidNSHost, Dockerd: local}, false, false},
-		{"unnamed cgroup mount kind", with(host(runner, PidNSHost, local), func(s *Shape) { s.CgroupMount = CgroupMount(99) }), false, false},
-		{"unnamed pid namespace kind", host(pod, PidNS(99), foreign), false, false},
-		{"unnamed dockerd kind, privileged pod", host(pod, PidNSPrivate, Dockerd{Kind: DockerdKind(99)}), false, false},
-		{"unnamed dockerd kind, private cgroupns", private(Dockerd{Kind: DockerdKind(99)}), false, false},
+		{"unnamed cgroup namespace kind", Shape{CgroupNS: CgroupNS(99), CgroupPath: "/", CgroupMount: CgroupMountOurs, PidNS: PidNSHost, Dockerd: local}, false, all},
+		{"unnamed cgroup mount kind", with(host(runner, PidNSHost, local), func(s *Shape) { s.CgroupMount = CgroupMount(99) }), false, all},
+		{"unnamed pid namespace kind", host(pod, PidNS(99), foreign), false, all},
+		{"unnamed dockerd kind, privileged pod", host(pod, PidNSPrivate, Dockerd{Kind: DockerdKind(99)}), false, all},
+		{"unnamed dockerd kind, private cgroupns", private(Dockerd{Kind: DockerdKind(99)}), false, all},
 	}
 	for _, tc := range cases {
-		scoped, err := tc.shape.HookScope()
+		got, err := tc.shape.HookScope()
 		if (err == nil) != tc.ok {
 			t.Errorf("%s: HookScope() error = %v, want ok=%v", tc.name, err, tc.ok)
 		}
-		if scoped != tc.scoped {
-			t.Errorf("%s: HookScope() scoped = %v, want %v", tc.name, scoped, tc.scoped)
-		}
-		// A refused hook never asks for a scope: nothing would read it.
-		if err != nil && scoped {
-			t.Errorf("%s: HookScope() refused and still asked for a scope", tc.name)
+		// A refused hook gets the zero scope: nothing would read it.
+		if got != tc.want {
+			t.Errorf("%s: HookScope() = %+v, want %+v", tc.name, got, tc.want)
 		}
 	}
 
@@ -137,15 +147,40 @@ func TestHookScope(t *testing.T) {
 	}
 }
 
+// The pod's cgroup is the deepest component of kubelet's tree that names a
+// pod, under either driver; nothing else that merely says "pod" counts.
+func TestPodCgroup(t *testing.T) {
+	const uid = "0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"
+	escaped := strings.ReplaceAll(uid, "-", "_")
+	cases := map[string]string{
+		"/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod" + escaped + ".slice/cri-containerd-a.scope": "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod" + escaped + ".slice",
+		"/kubepods.slice/kubepods-pod" + escaped + ".slice/cri-containerd-a.scope":                                      "/kubepods.slice/kubepods-pod" + escaped + ".slice",
+		"/custom.slice/custom-kubepods.slice/custom-kubepods-pod" + escaped + ".slice/cri-containerd-a.scope":           "/custom.slice/custom-kubepods.slice/custom-kubepods-pod" + escaped + ".slice",
+		"/kubepods/burstable/pod" + uid + "/0123abcd":                                                                   "/kubepods/burstable/pod" + uid,
+		"/kubepods/pod" + uid + "/0123abcd":                                                                             "/kubepods/pod" + uid,
+		// A static pod's uid is a hash of its manifest.
+		"/kubepods/burstable/pod0123456789abcdef0123456789abcdef/0123abcd": "/kubepods/burstable/pod0123456789abcdef0123456789abcdef",
+		"/kubepods.slice/kubepods-burstable.slice/cri-containerd-a.scope":  "",
+		"/kubepods.slice/kubepods-pod1.slice/cri-containerd-a.scope":       "",
+		"/kubepods.slice/podman-" + uid + ".scope":                         "",
+		"/": "",
+	}
+	for in, want := range cases {
+		if got := podCgroup(in); got != want {
+			t.Errorf("podCgroup(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // The test process's own namespaces are known, whichever they are, and
 // /sys/fs/cgroup is the tree it is in.
 func TestDetect_Namespaces(t *testing.T) {
-	s := Detect(filepath.Join(t.TempDir(), "docker.sock"))
+	s := Detect(filepath.Join(t.TempDir(), "docker.sock"), "6.17.0-1022-azure")
 	if s.CgroupNS == CgroupNSUnknown || s.PidNS == PidNSUnknown {
 		t.Fatalf("Detect() = %+v, want both namespaces identified", s)
 	}
-	if s.Kernel == "" {
-		t.Fatalf("Detect() read no kernel release")
+	if s.Kernel != "6.17.0-1022-azure" {
+		t.Fatalf("Detect() kernel = %q, want the release it was given", s.Kernel)
 	}
 	// The mount can only be ours where /sys/fs/cgroup is the unified
 	// hierarchy itself, not a v1 or hybrid layout.
@@ -256,6 +291,11 @@ func TestDockerHostElsewhere(t *testing.T) {
 	if missing := "unix://" + filepath.Join(root, "var", "run", "other.sock"); dockerHostElsewhere(missing, probed) != missing {
 		t.Errorf("a socket that does not exist is not the probed one")
 	}
+	// Before the daemon has made its socket, the spellings still match.
+	notYet := filepath.Join(root, "run", "later.sock")
+	if got := dockerHostElsewhere("unix://"+filepath.Join(root, "var", "run", "later.sock"), notYet); got != "" {
+		t.Errorf("symlinked spelling of a socket not yet made: got %q, want the same daemon", got)
+	}
 }
 
 func TestProbeDockerd_NoSocket(t *testing.T) {
@@ -285,6 +325,26 @@ func TestProbeDockerd_Refused(t *testing.T) {
 	l.Close()
 	if d := probeDockerd(sock); d.Kind != DockerdUnknown || !strings.Contains(d.Reason, "refused") {
 		t.Fatalf("socket with no listener: got %+v, want unknown, refused", d)
+	}
+}
+
+// Something at the socket's path that is not a socket refuses a connection
+// too, but no daemon made it: a directory a bind mount left where no
+// socket existed, or a file. Neither is a daemon.
+func TestProbeDockerd_NotASocket(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "docker.sock")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if d := probeDockerd(dir); d.Kind != DockerdAbsent {
+		t.Errorf("directory at the socket path: got %+v, want absent", d)
+	}
+	file := filepath.Join(t.TempDir(), "docker.sock")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if d := probeDockerd(file); d.Kind != DockerdAbsent {
+		t.Errorf("file at the socket path: got %+v, want absent", d)
 	}
 }
 

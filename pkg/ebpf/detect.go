@@ -100,19 +100,19 @@ func Detect() *Capabilities {
 // constraint — TCX (6.6+) is preferred, but pkg/tc transparently falls back to
 // the legacy clsact qdisc (4.5+), so kernels 5.8–6.5 are fully supported.
 func isKernelSupported(version string) bool {
-	var major, minor int
-	_, err := fmt.Sscanf(version, "%d.%d", &major, &minor)
-	if err != nil {
-		return false
-	}
+	ok, err := KernelAtLeast(version, 5, 8)
+	return err == nil && ok
+}
 
-	if major > 5 {
-		return true // 6.x and newer
+// KernelAtLeast reports whether the kernel release (uname -r, as in
+// Capabilities.KernelVersion) is major.minor or later. A release that does
+// not start with major.minor is an error.
+func KernelAtLeast(release string, major, minor int) (bool, error) {
+	var gotMajor, gotMinor int
+	if _, err := fmt.Sscanf(release, "%d.%d", &gotMajor, &gotMinor); err != nil {
+		return false, fmt.Errorf("kernel release %q: %w", release, err)
 	}
-	if major == 5 {
-		return minor >= 8 // 5.8+ for ringbuf; 5.0–5.7 rejected
-	}
-	return false // 4.x and older
+	return gotMajor > major || gotMajor == major && gotMinor >= minor, nil
 }
 
 // hasCapability checks if the current process has the specified capability

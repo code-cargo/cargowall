@@ -54,6 +54,7 @@ import (
 
 	"github.com/code-cargo/cargowall/bpf"
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // The ringbuf wire layout is bpf.OriginEvent (bpf/origin_event.go) — the one
@@ -264,11 +265,12 @@ func (o *Observer) EnableL7(opts L7Options) (*L7, error) {
 // cgroup, and starts the reader. Nothing here can affect enforcement; any
 // error means the caller runs without container attribution.
 //
-// scoped limits the hook to sockets in the cgroups tasks in our pid
-// namespace have entered (podenv.Shape.HookScope's answer): Start then
-// records them first (podScope), and every other socket under the root
-// cgroup passes the hook untouched. Unscoped, it judges every socket.
-func Start(tcObjs *bpf.TcBpfObjects, scoped bool, logger *slog.Logger) (*Observer, error) {
+// scope is podenv.Shape.HookScope's answer. Limited, the hook judges only
+// sockets under scope.PodCgroup and those in the cgroups tasks in our pid
+// namespace have entered, which Start records first (podScope), and every
+// other socket under the root cgroup passes the hook untouched. Otherwise
+// it judges every socket.
+func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*Observer, error) {
 	if tcObjs == nil {
 		return nil, errors.New("nil TC BPF objects")
 	}
@@ -288,6 +290,23 @@ func Start(tcObjs *bpf.TcBpfObjects, scoped bool, logger *slog.Logger) (*Observe
 		degradedCh:   make(chan Record, degradedQueueDepth),
 		degradedDone: make(chan struct{}),
 	}
+
+	// Until Start returns the Observer, a failure releases what it built, in
+	// the order Close does: the link, the collection, then the scope. Each
+	// is nil or empty until built, and closing it then does nothing.
+	started := false
+	defer func() {
+		if started {
+			return
+		}
+		if o.link != nil {
+			_ = o.link.Close()
+		}
+		o.objs.Close()
+		if o.scope != nil {
+			o.scope.close()
+		}
+	}()
 
 	// The rule/config maps are owned by the tcbpf collection; replacing them
 	// here makes both hooks read one set of kernel maps, so the enforcing
@@ -309,31 +328,20 @@ func Start(tcObjs *bpf.TcBpfObjects, scoped bool, logger *slog.Logger) (*Observe
 		"map_default_action": tcObjs.MapDefaultAction,
 		"map_audit_mode":     tcObjs.MapAuditMode,
 	}
-	if scoped {
+	if scope.Limited {
 		// Set before load, with the map it reads: the program never judges,
 		// even briefly, a socket that is not this job's. The stand-in takes
 		// the scope map's size.
-		v, m := spec.Variables[bpf.OriginBpfVarScoped], spec.Maps[bpf.OriginBpfMapMapScopeCgroups]
-		if v == nil || m == nil {
-			return nil, errors.New("origin BPF spec has no scoped variable or scope map (stale generated code)")
+		if err := setScope(spec, scope.PodCgroup); err != nil {
+			return nil, err
 		}
-		if err := v.Set(uint8(1)); err != nil {
-			return nil, fmt.Errorf("failed to set scoped: %w", err)
-		}
-		scope, err := startPodScope(logger)
+		s, err := startPodScope(logger)
 		if err != nil {
 			return nil, err
 		}
-		o.scope = scope
-		m.MaxEntries = scope.cgroups().MaxEntries()
-		replacements[bpf.OriginBpfMapMapScopeCgroups] = scope.cgroups()
-	}
-	// Every failure below releases what Start built, the scope included.
-	fail := func(err error) (*Observer, error) {
-		if o.scope != nil {
-			o.scope.close()
-		}
-		return nil, err
+		o.scope = s
+		spec.Maps[bpf.OriginBpfMapMapScopeCgroups].MaxEntries = s.cgroups().MaxEntries()
+		replacements[bpf.OriginBpfMapMapScopeCgroups] = s.cgroups()
 	}
 	if err := cargowallEbpf.LoadObjects(logger, "originbpf", spec, ebpf.CollectionOptions{
 		MapReplacements: replacements,
@@ -349,7 +357,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scoped bool, logger *slog.Logger) (*Observe
 		// LoadObjects still logs the count of a rejection.
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
 	}, &o.objs); err != nil {
-		return fail(fmt.Errorf("failed to load origin BPF objects: %w", err))
+		return nil, fmt.Errorf("failed to load origin BPF objects: %w", err)
 	}
 
 	// Arm the loopback-device carve-out before attach: traffic egressing lo
@@ -359,8 +367,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scoped bool, logger *slog.Logger) (*Observe
 	// rather than hardwired only because PROG_TEST_RUN pins every test skb
 	// to the loopback device — see origin_lo_carveout in originbpf.c.
 	if err := o.objs.MapOriginConfig.Put(cfgKeyLoCarveout, uint8(1)); err != nil {
-		o.objs.Close()
-		return fail(fmt.Errorf("failed to arm loopback carve-out: %w", err))
+		return nil, fmt.Errorf("failed to arm loopback carve-out: %w", err)
 	}
 
 	// Telemetry: what else is attached at the root cgroup (Docker's or
@@ -383,31 +390,30 @@ func Start(tcObjs *bpf.TcBpfObjects, scoped bool, logger *slog.Logger) (*Observe
 		// machine's root in the host cgroup namespace, our container's
 		// subtree in a private one. Every socket under it reaches the
 		// program. Unscoped it judges all of them (a runner VM, or our own
-		// container). Scoped it judges only sockets in a cgroup this job's
-		// tasks have entered, and passes the rest, a neighbour pod's
-		// included, with no verdict and no record.
+		// container). Scoped it judges only this job's, under our pod's
+		// cgroup or in a cgroup this job's tasks have entered, and passes
+		// the rest, a neighbour pod's included, with no verdict and no
+		// record.
 		Path:    "/sys/fs/cgroup",
 		Attach:  ebpf.AttachCGroupInetEgress,
 		Program: o.objs.CgOriginEgress,
 	})
 	if err != nil {
-		o.objs.Close()
-		return fail(fmt.Errorf("failed to attach cgroup_skb/egress observer: %w", err))
+		return nil, fmt.Errorf("failed to attach cgroup_skb/egress observer: %w", err)
 	}
 	o.link = l
 	o.logAttachedEgressPrograms("post-attach")
 
 	rd, err := ringbuf.NewReader(o.objs.MapOriginEvents)
 	if err != nil {
-		_ = l.Close()
-		o.objs.Close()
-		return fail(fmt.Errorf("failed to create origin event reader: %w", err))
+		return nil, fmt.Errorf("failed to create origin event reader: %w", err)
 	}
 	o.reader = rd
 	go o.run()
 	go o.reportLoop()
 	go o.degradedLoop()
 
+	started = true
 	return o, nil
 }
 

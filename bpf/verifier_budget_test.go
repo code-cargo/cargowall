@@ -100,8 +100,16 @@ func TestVerifierBudget(t *testing.T) {
 		}},
 		{"originbpf", LoadOriginBpf, nil},
 		// scoped is a load-time constant, so a privileged pod runs a
-		// different program from a runner VM's. Measure both.
+		// different program from a runner VM's. Measure both, the scoped one
+		// with a pod's cgroup set, as in a Kubernetes pod: at zero the
+		// verifier prunes the pod check as dead.
 		{"originbpf_scoped", LoadOriginBpf, func(spec *ebpf.CollectionSpec) error {
+			if err := spec.Variables[OriginBpfVarScopePodCgroup].Set(uint64(1)); err != nil {
+				return err
+			}
+			if err := spec.Variables[OriginBpfVarScopePodLevel].Set(uint32(3)); err != nil {
+				return err
+			}
 			return spec.Variables[OriginBpfVarScoped].Set(uint8(1))
 		}},
 	}

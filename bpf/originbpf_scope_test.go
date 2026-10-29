@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -37,14 +38,21 @@ import (
 )
 
 // loadOriginObjectsScoped loads the origin collection the way origin.Start
-// does in a privileged pod: scoped set before load. The collection keeps
-// its own stand-in map_scope_cgroups, which a test fills directly.
-func loadOriginObjectsScoped(t *testing.T) *OriginBpfObjects {
+// does in a privileged pod: scoped set before load, with the pod's cgroup
+// when pod is not "". The collection keeps its own stand-in
+// map_scope_cgroups, which a test fills directly.
+func loadOriginObjectsScoped(t *testing.T, pod string) *OriginBpfObjects {
 	t.Helper()
 	requireBPF(t)
 	spec, err := LoadOriginBpf()
 	require.NoError(t, err)
 	require.NoError(t, spec.Variables[OriginBpfVarScoped].Set(uint8(1)))
+	if pod != "" {
+		rel, err := filepath.Rel("/sys/fs/cgroup", pod)
+		require.NoError(t, err)
+		require.NoError(t, spec.Variables[OriginBpfVarScopePodCgroup].Set(cgroupID(t, pod)))
+		require.NoError(t, spec.Variables[OriginBpfVarScopePodLevel].Set(uint32(len(strings.Split(rel, "/")))))
+	}
 	var objs OriginBpfObjects
 	require.NoError(t, spec.LoadAndAssign(&objs, nil))
 	t.Cleanup(func() { objs.Close() })
@@ -78,7 +86,7 @@ func TestScopeCgroupsMapSpecsMatch(t *testing.T) {
 // program drops must pass, and leave no record.
 func TestOriginScopedPassesOtherCgroups(t *testing.T) {
 	all := loadOriginObjects(t)
-	scoped := loadOriginObjectsScoped(t)
+	scoped := loadOriginObjectsScoped(t, "")
 	for _, objs := range []*OriginBpfObjects{all, scoped} {
 		seedOriginRules(t, objs)
 		setOriginMode(t, objs, originModeEnforce)
@@ -116,21 +124,45 @@ func TestOriginScopedPassesOtherCgroups(t *testing.T) {
 // returns its path. A program attached there sees only this process's
 // sockets, so a deny-all enforce policy can never affect the rest of the
 // host, whatever the program under test gets wrong. Cleanup moves the
-// process back to the root and removes the cgroup.
+// process back to where it was and removes the cgroup.
 func enterTestCgroup(t *testing.T) string {
 	t.Helper()
-	cgRoot := "/sys/fs/cgroup"
-	cgPath := filepath.Join(cgRoot, fmt.Sprintf("cargowall-bpf-test-%d", os.Getpid()))
+	cgPath := filepath.Join("/sys/fs/cgroup", fmt.Sprintf("cargowall-bpf-test-%d", os.Getpid()))
 	if err := os.Mkdir(cgPath, 0o755); err != nil {
 		t.Skipf("cannot create test cgroup: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(cgPath) })
-	self := []byte(strconv.Itoa(os.Getpid()))
-	if err := os.WriteFile(filepath.Join(cgPath, "cgroup.procs"), self, 0); err != nil {
+	if err := moveSelfOrErr(t, cgPath); err != nil {
 		t.Skipf("cannot enter test cgroup: %v", err)
 	}
-	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(cgRoot, "cgroup.procs"), self, 0) })
 	return cgPath
+}
+
+// moveSelf moves the test process into the cgroup at path, and back to
+// the cgroup it was in at cleanup, so no test leaves the binary somewhere
+// a later test does not expect.
+func moveSelf(t *testing.T, path string) {
+	t.Helper()
+	require.NoError(t, moveSelfOrErr(t, path))
+}
+
+func moveSelfOrErr(t *testing.T, path string) error {
+	t.Helper()
+	data, err := os.ReadFile("/proc/self/cgroup")
+	require.NoError(t, err)
+	var home string
+	for _, line := range strings.Split(string(data), "\n") {
+		if p, ok := strings.CutPrefix(line, "0::"); ok {
+			home = p
+		}
+	}
+	require.NotEmpty(t, home, "no cgroup v2 entry in /proc/self/cgroup")
+	self := []byte(strconv.Itoa(os.Getpid()))
+	if err := os.WriteFile(filepath.Join(path, "cgroup.procs"), self, 0); err != nil {
+		return err
+	}
+	t.Cleanup(func() { _ = os.WriteFile(filepath.Join("/sys/fs/cgroup", home, "cgroup.procs"), self, 0) })
+	return nil
 }
 
 // cgroupID is the id bpf_skb_cgroup_id reports for the cgroup at path: its
@@ -152,7 +184,7 @@ func cgroupID(t *testing.T, path string) uint64 {
 // adjudicated with the loopback carve-out off, as it is in tests, so
 // nothing leaves the machine.
 func TestOriginScopeRealSocket(t *testing.T) {
-	objs := loadOriginObjectsScoped(t)
+	objs := loadOriginObjectsScoped(t, "")
 	seedOriginRules(t, objs) // deny by default
 	setOriginMode(t, objs, originModeEnforce)
 
@@ -242,4 +274,60 @@ func TestOriginScopeRealSocket(t *testing.T) {
 			require.NotZero(t, soErr, "an MPTCP connection from a recorded cgroup to a denied destination must not connect")
 		}
 	})
+}
+
+// Scoped in a pod, a socket in any cgroup under the pod's is judged though
+// none is recorded: a container the node's runtime started, after startup
+// or outside our pid namespace, is the pod's all the same. A socket beside
+// the pod passes. The deny-all enforce policy attaches to a private cgroup
+// holding both, which this process moves between.
+func TestOriginScopePodSubtree(t *testing.T) {
+	root := enterTestCgroup(t)
+	pod := filepath.Join(root, "pod")
+	container := filepath.Join(pod, "container")
+	neighbour := filepath.Join(root, "neighbour")
+	for _, dir := range []string{pod, container, neighbour} {
+		require.NoError(t, os.Mkdir(dir, 0o755))
+		t.Cleanup(func() { _ = os.Remove(dir) })
+	}
+	objs := loadOriginObjectsScoped(t, pod)
+	seedOriginRules(t, objs) // deny by default
+	setOriginMode(t, objs, originModeEnforce)
+	l, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    root,
+		Attach:  ebpf.AttachCGroupInetEgress,
+		Program: objs.CgOriginEgress,
+	})
+	if err != nil {
+		t.Skipf("cannot attach cgroup_skb/egress at test cgroup: %v", err)
+	}
+	t.Cleanup(func() { l.Close() })
+
+	hostIP := hostOwnIPv4(t)
+	ln, err := net.Listen("tcp4", hostIP.String()+":0")
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	dial := func() error {
+		conn, err := net.DialTimeout("tcp4", ln.Addr().String(), 1500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+		}
+		return err
+	}
+
+	moveSelf(t, container)
+	require.Error(t, dial(), "a socket in a cgroup under the pod's is judged")
+	moveSelf(t, neighbour)
+	require.NoError(t, dial(), "a socket beside the pod passes")
+	moveSelf(t, pod)
+	require.Error(t, dial(), "and one in the pod's cgroup itself is judged")
 }

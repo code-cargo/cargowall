@@ -31,6 +31,7 @@ import (
 	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/network"
 	"github.com/code-cargo/cargowall/pkg/origin"
+	"github.com/code-cargo/cargowall/pkg/podenv"
 	"github.com/code-cargo/cargowall/pkg/steps"
 )
 
@@ -93,17 +94,17 @@ func resolveMode(containerEgress string) origin.Mode {
 // the observer's ordinals would always be zero, and the step-map shrink for
 // disabled attribution makes container tagging meaningless anyway. stepErr
 // is why step attribution failed, carried into the lost posture's reason.
-// scoped and scopeErr are podenv.Shape.HookScope's one decision. scopeErr,
+// scope and scopeErr are podenv.Shape.HookScope's one decision. scopeErr,
 // when set, is why a hook at /sys/fs/cgroup would not judge exactly this
 // job's traffic, or why that could not be shown: the hook is then never
-// loaded, the same loss as a load failure. scoped means the hook may judge
-// only sockets in the cgroups our pid namespace's tasks have entered, which
-// origin.Start records before it attaches; a failure to record them is the
-// same loss, never a hook that judges every socket under a shared root. A
-// non-nil error means a requested enforce posture was lost and startup
-// must fail.
+// loaded, the same loss as a load failure. A Limited scope means the hook
+// may judge only this job's sockets, under our pod's cgroup or in the
+// cgroups our pid namespace's tasks have entered, which origin.Start
+// records before it attaches; a failure to record them is the same loss,
+// never a hook that judges every socket under a shared root. A non-nil
+// error means a requested enforce posture was lost and startup must fail.
 func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.Tracker, stepErr error,
-	scoped bool, scopeErr error, tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
+	scope podenv.Scope, scopeErr error, tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
 ) (*containerAttribution, error) {
 	if !enabled {
 		return nil, nil
@@ -125,7 +126,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 	var obs *origin.Observer
 	err := scopeErr
 	if err == nil {
-		obs, err = origin.Start(tcObjs, scoped, logger)
+		obs, err = origin.Start(tcObjs, scope, logger)
 	}
 	if err != nil {
 		// Fatal under enforce. Under observe only the hook is lost: the
@@ -141,7 +142,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 	}
 	a.observer = obs
 	logger.Info("Container egress hook attached", "target_mode", mode.String(),
-		"pid_namespace_only", scoped)
+		"scoped", scope.Limited, "pod_cgroup", scope.PodCgroup)
 	return a, nil
 }
 

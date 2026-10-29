@@ -253,7 +253,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// What container this runs in decides whether the daemon's config is
 	// ours to rewrite and whether the cgroup hook would judge only this
 	// job (see podenv.Shape.HookScope).
-	shape := podenv.Detect(dockerSocket)
+	shape := podenv.Detect(dockerSocket, caps.KernelVersion)
 	logger.Info("Runtime environment", shape.LogArgs()...)
 
 	var dnsServer *dns.Server
@@ -589,9 +589,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// postures decides what losing a requested layer means: a lost enforce
 	// rung fails startup, a lost observe rung is recorded for the summary.
 	postures := newPostures(cmd, caps.KernelVersion, logger)
-	hookScoped, hookScopeErr := shape.HookScope()
+	hookScope, hookScopeErr := shape.HookScope()
 	attribution, err := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
-		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, hookScoped, hookScopeErr, &objs, postures, logger)
+		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, hookScope, hookScopeErr, &objs, postures, logger)
 	if err != nil {
 		return err
 	}

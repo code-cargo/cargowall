@@ -19,12 +19,14 @@ package podenv
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf/btf"
 	"golang.org/x/sys/unix"
@@ -66,6 +68,9 @@ func TestHookScope(t *testing.T) {
 	}
 	sockets := func(c SocketCgroups) func(*Shape) { return func(s *Shape) { s.SocketCgroups = c } }
 	with := func(s Shape, f func(*Shape)) Shape { f(&s); return s }
+	nested := func(path string, pidns PidNS, d Dockerd) Shape {
+		return with(host(path, pidns, d), func(s *Shape) { s.CgroupNS = CgroupNSPrivate })
+	}
 	remoteDaemon := func(s *Shape) { s.DockerHost, s.DockerHostSetting = "tcp://localhost:2376", "DOCKER_HOST" }
 	unreadContext := func(s *Shape) { s.DockerHostReason = `docker context "ci" (from DOCKER_CONTEXT): no such file` }
 	all := Scope{}
@@ -91,6 +96,19 @@ func TestHookScope(t *testing.T) {
 			Scope{Limited: true, Subtree: "/system.slice/docker-a.scope"},
 		},
 		{"own pid namespace in the root cgroup", host("/", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), false, all},
+		// A private cgroup namespace rooted above our cgroup is a tree others
+		// share: a nested node's (kind, minikube's docker driver), whose
+		// privileged pods share the node's namespace, or our container's
+		// own when we sit below its root (dind's /init).
+		{
+			"nested node: privileged pod in the node's cgroup namespace", nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true,
+			Scope{Limited: true, Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
+		},
+		{"nested node: hostPID pod", nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSHost, local), false, all},
+		{"private cgroupns below its root, own pid namespace", nested("/init", PidNSPrivate, local), true, Scope{Limited: true, Subtree: "/init"}},
+		{"private cgroupns below its root, beside another container's dockerd", nested("/init", PidNSPrivate, foreign), true, Scope{Limited: true, Subtree: "/init"}},
+		{"private cgroupns below its root, host pid namespace", nested("/init", PidNSHost, local), true, all},
+		{"private cgroupns below its root, host pid namespace, socket cgroups shared", with(nested("/init", PidNSHost, local), sockets(SocketCgroupsShared)), false, all},
 		// The pod's other containers are judged by its cgroup, so a pod
 		// whose cgroup cannot be found would leave them out.
 		{"privileged pod, no pod cgroup in the path", host("/kubepods.slice/cri-containerd-a.scope", PidNSPrivate, foreign), false, all},
@@ -205,6 +223,48 @@ func TestDetect_Namespaces(t *testing.T) {
 	}
 	if s.CgroupMount != CgroupMountOurs {
 		t.Fatalf("Detect() cgroup mount = %v (%s), want ours", s.CgroupMount, s.CgroupMountReason)
+	}
+}
+
+// A threaded cgroup has no process list (reading cgroup.procs fails with
+// EOPNOTSUPP), so the mount is proven from its thread list, which holds
+// our main thread.
+func TestProbeCgroupMount_Threaded(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to make cgroups")
+	}
+	home, err := ReadCgroupPath("/proc/self/cgroup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain := filepath.Join(CgroupRoot, fmt.Sprintf("cargowall-podenv-test-%d", os.Getpid()))
+	threaded := filepath.Join(domain, "t")
+	for _, d := range []string{domain, threaded} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Skipf("cannot make test cgroup: %v", err)
+		}
+	}
+	self := []byte(strconv.Itoa(os.Getpid()))
+	t.Cleanup(func() {
+		_ = os.WriteFile(filepath.Join(CgroupRoot, home, "cgroup.procs"), self, 0)
+		for _, d := range []string{threaded, domain} {
+			for i := 0; i < 50 && os.Remove(d) != nil; i++ {
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	})
+	write := func(file, data string) {
+		t.Helper()
+		if err := os.WriteFile(file, []byte(data), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(domain, "cgroup.procs"), string(self))
+	write(filepath.Join(threaded, "cgroup.type"), "threaded")
+	write(filepath.Join(threaded, "cgroup.threads"), string(self))
+	rel := strings.TrimPrefix(threaded, CgroupRoot)
+	if m, why := probeCgroupMount(CgroupRoot, rel, os.Getpid()); m != CgroupMountOurs {
+		t.Fatalf("threaded cgroup: got %v (%s), want ours", m, why)
 	}
 }
 
@@ -424,8 +484,12 @@ func TestDockerCLIHost(t *testing.T) {
 	check("DOCKER_CONTEXT over the config", env("DOCKER_CONTEXT", "default"), "", false)
 	config(`{"auths":{}}`)
 	check("a config with no current context", env(), "", false)
+	// As the CLI reads it: an empty config is none, and one it cannot
+	// parse is ignored for the default context.
+	config(``)
+	check("an empty config", env(), "", false)
 	config(`{not json`)
-	check("an unreadable config", env(), "", true)
+	check("a config the CLI cannot parse either", env(), "", false)
 	home := func(k string) string { return map[string]string{"HOME": filepath.Dir(dir)}[k] }
 	check("a HOME with no .docker", home, "", false)
 

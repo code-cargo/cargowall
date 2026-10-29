@@ -88,7 +88,7 @@ func attachScopeTracing(t *testing.T, p *ebpf.Program) {
 }
 
 // runScopeWalk runs the startup walk and returns the cgroup ids it lists,
-// from records of a cgroup id and a process id.
+// from records of a cgroup id, a process id and the cgroup's level.
 func runScopeWalk(t *testing.T, objs *ScopeBpfObjects) map[uint64]bool {
 	t.Helper()
 	it, err := link.AttachIter(link.IterOptions{Program: objs.ScopeTaskIter})
@@ -99,9 +99,9 @@ func runScopeWalk(t *testing.T, objs *ScopeBpfObjects) map[uint64]bool {
 	defer rd.Close()
 	out, err := io.ReadAll(rd)
 	require.NoError(t, err)
-	require.Zero(t, len(out)%16, "the walk writes whole records")
+	require.Zero(t, len(out)%24, "the walk writes whole records")
 	ids := make(map[uint64]bool)
-	for i := 0; i < len(out); i += 16 {
+	for i := 0; i < len(out); i += 24 {
 		require.NotZero(t, binary.NativeEndian.Uint64(out[i+8:]), "each record names its process")
 		ids[binary.NativeEndian.Uint64(out[i:])] = true
 	}
@@ -124,9 +124,9 @@ func scopeStat(t *testing.T, objs *ScopeBpfObjects, slot uint32) uint64 {
 // siblingCgroup creates a cgroup beside the one enterTestCgroup makes.
 func siblingCgroup(t *testing.T, name string) string {
 	t.Helper()
-	path := filepath.Join("/sys/fs/cgroup", fmt.Sprintf("cargowall-bpf-test-%d-%s", os.Getpid(), name))
+	path := filepath.Join(podenv.CgroupRoot, fmt.Sprintf("cargowall-bpf-test-%d-%s", os.Getpid(), name))
 	require.NoError(t, os.Mkdir(path, 0o755))
-	t.Cleanup(func() { _ = os.Remove(path) })
+	t.Cleanup(func() { removeCgroup(t, path) })
 	return path
 }
 
@@ -227,8 +227,8 @@ func TestScopeAttachRecordsMoves(t *testing.T) {
 		moveInto(t, dst, pid)
 		require.True(t, scopeRecorded(t, objs, dst), "moving into a cgroup records it")
 
-		moveInto(t, "/sys/fs/cgroup", pid)
-		require.False(t, scopeRecorded(t, objs, "/sys/fs/cgroup"), "the root cgroup is never recorded")
+		moveInto(t, podenv.CgroupRoot, pid)
+		require.False(t, scopeRecorded(t, objs, podenv.CgroupRoot), "the root cgroup is never recorded")
 		require.Equal(t, uint64(1), scopeStat(t, objs, ScopeStatRoot), "entering the root cgroup is counted")
 	})
 	t.Run("another pid namespace", func(t *testing.T) {
@@ -280,7 +280,7 @@ func TestScopeAttachRecordsDestinationPastAZombieLeader(t *testing.T) {
 		}
 		cg, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%s/cgroup", pid, task.Name()))
 		require.NoError(t, err)
-		moved = moved || strings.TrimSpace(string(cg)) == "0::"+strings.TrimPrefix(dst, "/sys/fs/cgroup")
+		moved = moved || strings.TrimSpace(string(cg)) == "0::"+strings.TrimPrefix(dst, podenv.CgroupRoot)
 	}
 	require.True(t, moved, "the live thread must have moved")
 	require.True(t, scopeRecorded(t, objs, dst), "the destination is recorded")
@@ -394,10 +394,10 @@ func TestScopeWalkListsOurCgroups(t *testing.T) {
 		require.True(t, ids[cgroupID(t, dst)], "the namespace's task's cgroup")
 		require.False(t, ids[cgroupID(t, foreign)], "a cgroup only a task outside the namespace is in")
 
-		moveInto(t, "/sys/fs/cgroup", pid)
+		moveInto(t, podenv.CgroupRoot, pid)
 		ids = runScopeWalk(t, objs)
 		require.False(t, ids[cgroupID(t, dst)], "the task has left")
-		require.False(t, ids[cgroupID(t, "/sys/fs/cgroup")], "the root cgroup is never listed")
+		require.False(t, ids[cgroupID(t, podenv.CgroupRoot)], "the root cgroup is never listed")
 		require.Equal(t, uint64(1), scopeStat(t, objs, ScopeStatRoot), "a task of ours there is counted")
 
 		// Once a process, however many threads it has.
@@ -412,7 +412,7 @@ func TestScopeWalkListsOurCgroups(t *testing.T) {
 			tasks, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", threaded))
 			return err == nil && len(tasks) == 5
 		}, 5*time.Second, 20*time.Millisecond)
-		moveInto(t, "/sys/fs/cgroup", threaded)
+		moveInto(t, podenv.CgroupRoot, threaded)
 		runScopeWalk(t, objs)
 		require.Equal(t, uint64(1+2), scopeStat(t, objs, ScopeStatRoot), "this walk counts the sleep and the threaded process once each")
 	})
@@ -454,7 +454,7 @@ func TestScopeReleaseForgetsCgroups(t *testing.T) {
 	made := func(name string) (string, uint64) {
 		dir := filepath.Join(root, name)
 		require.NoError(t, os.Mkdir(dir, 0o755))
-		t.Cleanup(func() { _ = os.Remove(dir) })
+		t.Cleanup(func() { removeCgroup(t, dir) })
 		id := cgroupID(t, dir)
 		require.NoError(t, objs.MapScopeCgroups.Put(id, uint8(1)))
 		return dir, id
@@ -546,14 +546,13 @@ func TestScopeLeavesTheSubtreeAlone(t *testing.T) {
 	sub := siblingCgroup(t, "subtree")
 	inside := filepath.Join(sub, "container")
 	require.NoError(t, os.Mkdir(inside, 0o755))
-	t.Cleanup(func() { _ = os.Remove(inside) })
+	t.Cleanup(func() { removeCgroup(t, inside) })
 	outside := siblingCgroup(t, "outside")
 	ino, enter := heldPidNamespace(t)
 	spec, err := LoadScopeBpf()
 	require.NoError(t, err)
 	require.NoError(t, spec.Variables[ScopeBpfVarPidnsIno].Set(ino))
 	require.NoError(t, spec.Variables[ScopeBpfVarSubtreeCgroup].Set(cgroupID(t, sub)))
-	require.NoError(t, spec.Variables[ScopeBpfVarSubtreeLevel].Set(podenv.CgroupLevel(strings.TrimPrefix(sub, podenv.CgroupRoot))))
 	objs := &ScopeBpfObjects{}
 	require.NoError(t, spec.LoadAndAssign(objs, nil))
 	t.Cleanup(func() { objs.Close() })

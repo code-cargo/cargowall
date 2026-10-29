@@ -332,18 +332,14 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		// Set before load, with the map it reads: the program never judges,
 		// even briefly, a socket that is not this job's. The stand-in takes
 		// the scope map's size.
-		sub, err := subtreeOf(scope.Subtree)
-		if err != nil {
-			return nil, err
-		}
-		if err := setCgroupScope(spec, sub); err != nil {
-			return nil, err
-		}
-		s, err := startCgroupScope(logger, sub)
+		s, err := startCgroupScope(logger, scope.Subtree)
 		if err != nil {
 			return nil, err
 		}
 		o.cgroups = s
+		if err := setCgroupScope(spec, s.sub); err != nil {
+			return nil, err
+		}
 		spec.Maps[bpf.OriginBpfMapMapScopeCgroups].MaxEntries = s.cgroups().MaxEntries()
 		replacements[bpf.OriginBpfMapMapScopeCgroups] = s.cgroups()
 	}

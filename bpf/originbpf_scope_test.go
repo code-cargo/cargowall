@@ -136,11 +136,26 @@ func enterTestCgroup(t *testing.T) string {
 	} else if err != nil {
 		t.Skipf("cannot create test cgroup: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Remove(cgPath) })
+	t.Cleanup(func() { removeCgroup(t, cgPath) })
 	if err := moveSelfOrErr(t, cgPath); err != nil {
 		t.Skipf("cannot enter test cgroup: %v", err)
 	}
 	return cgPath
+}
+
+// removeCgroup removes a test cgroup at cleanup, waiting out a task that is
+// still leaving it, and fails the test that leaked it if it stays: a later
+// test would otherwise find it and fail in its place.
+func removeCgroup(t *testing.T, path string) {
+	t.Helper()
+	var err error
+	for i := 0; i < 250; i++ {
+		if err = os.Remove(path); err == nil || errors.Is(err, fs.ErrNotExist) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("test cgroup %s left behind: %v", path, err)
 }
 
 // moveSelf moves the test process into the cgroup at path, and back to
@@ -288,7 +303,7 @@ func TestOriginScopePodSubtree(t *testing.T) {
 	neighbour := filepath.Join(root, "neighbour")
 	for _, dir := range []string{pod, container, neighbour} {
 		require.NoError(t, os.Mkdir(dir, 0o755))
-		t.Cleanup(func() { _ = os.Remove(dir) })
+		t.Cleanup(func() { removeCgroup(t, dir) })
 	}
 	objs := loadOriginObjectsScoped(t, pod)
 	seedOriginRules(t, objs) // deny by default

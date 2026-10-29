@@ -86,15 +86,15 @@ func TestUnder(t *testing.T) {
 // the pod's is left out silently, shared or not: the hook judges it as the
 // pod's. The outer test makes the cgroups and the foreign tasks; the inner
 // one runs in a new pid namespace.
-func TestPodScopeWalkLeavesSharedCgroups(t *testing.T) {
+func TestCgroupScopeWalkLeavesSharedCgroups(t *testing.T) {
 	requireBPFOrigin(t)
 	unshare, err := exec.LookPath("unshare")
 	if err != nil {
 		t.Skip("unshare not available")
 	}
-	dir := fmt.Sprintf("/sys/fs/cgroup/cargowall-origin-test-%d", os.Getpid())
+	dir := filepath.Join(podenv.CgroupRoot, fmt.Sprintf("cargowall-origin-test-%d", os.Getpid()))
 	pod := filepath.Join(dir, "pod")
-	cgroups := []string{dir, filepath.Join(dir, "shared"), filepath.Join(dir, ".own"), pod, filepath.Join(pod, "shared")}
+	cgroups := []string{dir, filepath.Join(dir, "shared"), filepath.Join(dir, ".own"), pod, filepath.Join(pod, "shared"), filepath.Join(pod, "runner")}
 	for _, d := range cgroups {
 		require.NoError(t, os.Mkdir(d, 0o755))
 	}
@@ -116,24 +116,27 @@ func TestPodScopeWalkLeavesSharedCgroups(t *testing.T) {
 	}
 
 	cmd := exec.Command(unshare, "--pid", "--fork", "--mount-proc",
-		os.Args[0], "-test.run", "^TestPodScopeWalkInner$", "-test.v")
+		os.Args[0], "-test.run", "^TestCgroupScopeWalkInner$", "-test.v")
 	cmd.Env = append(os.Environ(), "CARGOWALL_SCOPE_TEST_CGROUPS="+dir)
 	out, err := cmd.CombinedOutput()
 	t.Logf("inside pid namespace:\n%s", out)
 	require.NoError(t, err)
-	require.Contains(t, string(out), "--- PASS: TestPodScopeWalkInner")
+	require.Contains(t, string(out), "--- PASS: TestCgroupScopeWalkInner")
 }
 
-// TestPodScopeWalkInner is TestPodScopeWalkLeavesSharedCgroups' half in a
+// TestCgroupScopeWalkInner is TestCgroupScopeWalkLeavesSharedCgroups' half in a
 // pid namespace of its own; on its own it skips.
-func TestPodScopeWalkInner(t *testing.T) {
+func TestCgroupScopeWalkInner(t *testing.T) {
 	dir := os.Getenv("CARGOWALL_SCOPE_TEST_CGROUPS")
 	if dir == "" {
-		t.Skip("run by TestPodScopeWalkLeavesSharedCgroups")
+		t.Skip("run by TestCgroupScopeWalkLeavesSharedCgroups")
 	}
 	requireBPFOrigin(t)
 	shared, own := filepath.Join(dir, "shared"), filepath.Join(dir, ".own")
 	pod := filepath.Join(dir, "pod")
+	// cargowall runs in the pod, as it does on a runner: its own cgroup is
+	// under the subtree, which is where the walk reads the subtree's level.
+	require.NoError(t, os.WriteFile(filepath.Join(pod, "runner", "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0))
 	for _, cg := range []string{shared, own, filepath.Join(pod, "shared")} {
 		c := exec.Command("sleep", "60")
 		require.NoError(t, c.Start())
@@ -145,11 +148,12 @@ func TestPodScopeWalkInner(t *testing.T) {
 	}
 
 	var log bytes.Buffer
-	sub, err := subtreeOf(strings.TrimPrefix(pod, podenv.CgroupRoot))
-	require.NoError(t, err)
-	s, err := startCgroupScope(slog.New(slog.NewTextHandler(&log, nil)), sub)
+	podRel := strings.TrimPrefix(pod, podenv.CgroupRoot)
+	s, err := startCgroupScope(slog.New(slog.NewTextHandler(&log, nil)), podRel)
 	require.NoError(t, err)
 	t.Cleanup(s.close)
+	// In the host cgroup namespace a path's depth is the kernel's level.
+	require.Equal(t, podenv.CgroupLevel(podRel), s.sub.level, "the walk read the subtree's level")
 	idOf := func(path string) uint64 {
 		id, err := podenv.CgroupID(strings.TrimPrefix(path, podenv.CgroupRoot))
 		require.NoError(t, err)
@@ -179,8 +183,33 @@ func TestPodScopeWalkInner(t *testing.T) {
 	// A walk that finds a cgroup shared takes out an entry a tracepoint made
 	// for it while the walk ran.
 	require.NoError(t, s.cgroups().Put(idOf(shared), uint8(1)))
-	require.NoError(t, s.walk(sub.path))
+	require.NoError(t, s.walk())
 	require.False(t, recorded(shared), "the walk takes a shared cgroup out")
+	require.Equal(t, 1, strings.Count(log.String(), sharedRel), "and reports it once, not on every walk")
+
+	// A cgroup taken out while a task outside the namespace was in it, as a
+	// tracepoint does, is recorded again by the next walk once it holds
+	// only ours.
+	require.NoError(t, s.cgroups().Delete(idOf(own)))
+	require.NoError(t, s.walk())
+	require.True(t, recorded(own), "a cgroup ours alone again is recorded again")
+}
+
+// The subtree's kernel level is our own cgroup's, less how far below the
+// subtree we are: in a nested node's cgroup namespace the paths are the
+// namespace's and the levels the machine's.
+func TestSubtreeLevel(t *testing.T) {
+	const pod = "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"
+	got, err := subtreeLevel(pod, pod+"/0123abcd", 7)
+	require.NoError(t, err)
+	require.Equal(t, uint32(6), got, "a node namespace rooted 3 levels down")
+	got, err = subtreeLevel(pod, pod, 6)
+	require.NoError(t, err)
+	require.Equal(t, uint32(6), got)
+	_, err = subtreeLevel(pod, "/system.slice/x.scope", 7)
+	require.Error(t, err, "our cgroup outside the subtree")
+	_, err = subtreeLevel("/a", "/a/b/c", 2)
+	require.Error(t, err, "a subtree at or above the root")
 }
 
 // loadWalkScope loads the scope collection for the pid namespace ino with a
@@ -193,7 +222,10 @@ func loadWalkScope(t *testing.T, ino, maxEntries uint32) *cgroupScope {
 	require.NoError(t, spec.Variables[bpf.ScopeBpfVarPidnsIno].Set(ino))
 	spec.Maps[bpf.ScopeBpfMapMapScopeCgroups].MaxEntries = maxEntries
 	var log bytes.Buffer
-	s := &cgroupScope{logger: slog.New(slog.NewTextHandler(&log, nil))}
+	s := &cgroupScope{
+		logger: slog.New(slog.NewTextHandler(&log, nil)),
+		shared: make(map[uint64]bool), unrecorded: make(map[uint64]bool),
+	}
 	require.NoError(t, spec.LoadAndAssign(&s.objs, nil))
 	t.Cleanup(s.release)
 	return s
@@ -202,20 +234,20 @@ func loadWalkScope(t *testing.T, ino, maxEntries uint32) *cgroupScope {
 // A walk that lists no task of ours (here, of a pid namespace no task is
 // in) fails rather than leave the scope empty under a hook that reports
 // itself attached.
-func TestPodScopeWalkNeedsOwnCgroup(t *testing.T) {
+func TestCgroupScopeWalkNeedsOwnCgroup(t *testing.T) {
 	s := loadWalkScope(t, 1, 64)
-	require.ErrorContains(t, s.walk(""), "did not list this process's cgroup")
+	require.ErrorContains(t, s.walk(), "did not list this process's cgroup")
 }
 
 // A map too small for every cgroup the walk records costs those cgroups,
 // with a warning, as in the kernel, and not the scope. From the host pid
 // namespace every task on the machine is ours, so the walk finds plenty.
-func TestPodScopeWalkFullMapWarns(t *testing.T) {
+func TestCgroupScopeWalkFullMapWarns(t *testing.T) {
 	ino, err := podenv.PidNamespaceInode()
 	require.NoError(t, err)
 	s := loadWalkScope(t, ino, 1)
 	var log bytes.Buffer
 	s.logger = slog.New(slog.NewTextHandler(&log, nil))
-	require.NoError(t, s.walk(""))
+	require.NoError(t, s.walk())
 	require.Contains(t, log.String(), "could not record a cgroup")
 }

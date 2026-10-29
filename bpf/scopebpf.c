@@ -54,10 +54,9 @@
 const volatile __u32 pidns_ino = 0;
 
 // The cgroup whose whole subtree the hook judges (scope_subtree_cgroup in
-// originbpf.c) and its level, written by userspace before load. Nothing in
-// it is recorded or taken out: it is the job's whatever enters it.
+// originbpf.c), written by userspace before load. Nothing in it is
+// recorded or taken out: it is the job's whatever enters it.
 const volatile __u64 subtree_cgroup = 0;
-const volatile __u32 subtree_level = 0;
 
 #include "pidns.h"
 
@@ -122,21 +121,26 @@ static __always_inline __u64 scope_id(struct cgroup *cg)
     return BPF_CORE_READ(cg, kn, id);
 }
 
-// How far below the job's subtree cgroup in_subtree looks.
+// How many of a cgroup's ancestors in_subtree looks at.
 #define SUBTREE_MAX_DEPTH 32
 
 // in_subtree reports whether cg is the job's subtree cgroup or below it,
-// by its parents: a cgroup's self is its first member, so a parent css is
-// the parent cgroup. A cgroup deeper than SUBTREE_MAX_DEPTH below it reads
-// as outside it, which only records a cgroup the hook judges anyway.
+// by its own and its parents' ids: a cgroup's self is its first member, so
+// a parent css is the parent cgroup. By id, not by level: in a cgroup
+// namespace rooted below the machine's (a nested node's) userspace sees a
+// path, not a level. A cgroup more than SUBTREE_MAX_DEPTH below it reads as
+// outside it, which only records a cgroup the hook judges anyway; pkg/origin
+// matches by path, with no bound.
 static __always_inline bool in_subtree(struct cgroup *cg)
 {
     if (!subtree_cgroup)
         return false;
-    int level = BPF_CORE_READ(cg, level);
-    for (int i = 0; i < SUBTREE_MAX_DEPTH && level > (int)subtree_level; i++, level--)
+    for (int i = 0; i < SUBTREE_MAX_DEPTH && cg; i++) {
+        if (BPF_CORE_READ(cg, kn, id) == subtree_cgroup)
+            return true;
         cg = (struct cgroup *)BPF_CORE_READ(cg, self.parent);
-    return cg && level == (int)subtree_level && BPF_CORE_READ(cg, kn, id) == subtree_cgroup;
+    }
+    return false;
 }
 
 // scope_enter records cg, which a task of ours has entered. The lookup
@@ -230,9 +234,12 @@ int BPF_PROG(scope_release, struct cgroup *cg, const char *path)
 // say whether it entered it: a job left running by a shell someone
 // nsenter'd into our pid namespace from a node daemon's cgroup is still in
 // that cgroup, adopted by our namespace's init. It writes each task of
-// ours to the iterator's output instead, as its cgroup id and its process
-// id in our namespace, two u64s, and pkg/origin records each cgroup that
-// no task outside our pid namespace is in. The kernel scopes the walk to
+// ours to the iterator's output instead, as its cgroup's id, its process
+// id in our namespace and its cgroup's level, three u64s, and pkg/origin
+// records each cgroup that no task outside our pid namespace is in. The
+// level is the kernel's, which userspace cannot read from a path in a
+// cgroup namespace rooted below the machine's. pkg/origin runs the walk at
+// startup and again on every report tick. The kernel scopes the walk to
 // the opener's pid namespace.
 SEC("iter/task")
 int scope_task_iter(struct bpf_iter__task *ctx)
@@ -244,7 +251,7 @@ int scope_task_iter(struct bpf_iter__task *ctx)
     if (!tgid)
         return 0;
     struct cgroup *cg = dfl_cgroup(t);
-    __u64 rec[2] = {scope_id(cg), tgid};
+    __u64 rec[3] = {scope_id(cg), tgid, cg ? BPF_CORE_READ(cg, level) : 0};
     if (rec[0])
         bpf_seq_write(ctx->meta->seq, rec, sizeof(rec));
     else if (cg && BPF_CORE_READ(t, pid) == BPF_CORE_READ(t, tgid))

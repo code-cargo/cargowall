@@ -24,7 +24,6 @@ const (
 	ScopeBpfProgScopeTaskIter  = "scope_task_iter"
 	ScopeBpfVarPidnsIno        = "pidns_ino"
 	ScopeBpfVarSubtreeCgroup   = "subtree_cgroup"
-	ScopeBpfVarSubtreeLevel    = "subtree_level"
 )
 
 // LoadScopeBpf returns the embedded CollectionSpec for ScopeBpf.
@@ -89,7 +88,6 @@ type ScopeBpfMapSpecs struct {
 type ScopeBpfVariableSpecs struct {
 	PidnsIno      *ebpf.VariableSpec `ebpf:"pidns_ino"`
 	SubtreeCgroup *ebpf.VariableSpec `ebpf:"subtree_cgroup"`
-	SubtreeLevel  *ebpf.VariableSpec `ebpf:"subtree_level"`
 }
 
 // ScopeBpfObjects contains all objects after they have been loaded into the kernel.
@@ -129,7 +127,6 @@ func (m *ScopeBpfMaps) Close() error {
 type ScopeBpfVariables struct {
 	PidnsIno      *ebpf.Variable `ebpf:"pidns_ino"`
 	SubtreeCgroup *ebpf.Variable `ebpf:"subtree_cgroup"`
-	SubtreeLevel  *ebpf.Variable `ebpf:"subtree_level"`
 }
 
 // ScopeBpfPrograms contains all programs after they have been loaded into the kernel.

@@ -100,9 +100,6 @@ func TestVerifierBudget(t *testing.T) {
 			if err := spec.Variables[ScopeBpfVarSubtreeCgroup].Set(uint64(1)); err != nil {
 				return err
 			}
-			if err := spec.Variables[ScopeBpfVarSubtreeLevel].Set(uint32(3)); err != nil {
-				return err
-			}
 			return spec.Variables[ScopeBpfVarPidnsIno].Set(pidnsInode(t))
 		}},
 		{"originbpf", LoadOriginBpf, nil},

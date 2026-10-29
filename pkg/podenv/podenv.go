@@ -287,9 +287,10 @@ type Scope struct {
 // judge exactly this job's traffic, and how: loading the hook and scoping
 // it are one decision. A nil error with the zero Scope judges every socket
 // under the attach point, which is all this job's (a runner VM, or a
-// private cgroup namespace). A Limited Scope is for the host cgroup
-// namespace outside the host pid namespace (a privileged pod), where the
-// attach point is the machine's root. An error means the hook must not
+// private cgroup namespace rooted at our own cgroup). A Limited Scope is
+// for a cgroup tree others share, outside the host pid namespace (a
+// privileged pod), where the attach point is that tree's root: the
+// machine's, or a nested node's. An error means the hook must not
 // load, and says why it would not judge exactly this job or why that
 // cannot be shown. Every leaf returns its own answer, an unidentified fact
 // refuses wherever it could change who the hook judges, and a kind with no
@@ -306,7 +307,7 @@ func (s Shape) HookScope() (Scope, error) {
 	if err := s.attachPointRefusal(); err != nil {
 		return Scope{}, err
 	}
-	if s.CgroupNS == CgroupNSPrivate {
+	if s.ownRoot() {
 		if err := s.partialRefusal(); err != nil {
 			return Scope{}, err
 		}
@@ -325,19 +326,27 @@ func (s Shape) HookScope() (Scope, error) {
 			return Scope{}, fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
 		}
 	}
-	// kubelet's tree is kubepods under the cgroupfs driver and
-	// <root>-kubepods.slice under the systemd driver with a cgroup root of
-	// its own, so the name is matched anywhere in the path. A false match
-	// only refuses: outright in the host pid namespace, and outside it for
-	// want of a pod cgroup in the path.
+	// /sys/fs/cgroup is a tree others share: the machine's root in the host
+	// cgroup namespace, or, in a private one rooted above our cgroup, that
+	// root, such as a nested node's (kind, minikube's docker driver) whose
+	// privileged pods share its namespace. kubelet's tree is kubepods under
+	// the cgroupfs driver and <root>-kubepods.slice under the systemd driver
+	// with a cgroup root of its own, so the name is matched anywhere in the
+	// path. A false match only refuses: outright in the host pid namespace,
+	// and outside it for want of a pod cgroup in the path.
 	kubepods := strings.Contains(s.CgroupPath, "kubepods")
 	switch s.PidNS {
 	case PidNSUnknown:
-		return Scope{}, fmt.Errorf("pid namespace unknown in the host cgroup namespace (%s)", s.PidNSReason)
+		return Scope{}, fmt.Errorf("pid namespace unknown where the cgroup tree is shared (%s)", s.PidNSReason)
 	case PidNSHost:
 		if kubepods {
-			return Scope{}, errors.New("running in a Kubernetes pod in the host cgroup and pid namespaces: " +
+			return Scope{}, errors.New("running in a Kubernetes pod in the node's cgroup and pid namespaces: " +
 				"the cgroup hook would attach at the node root and judge every pod on the node")
+		}
+		if !s.machineFirewall() {
+			if err := s.partialRefusal(); err != nil {
+				return Scope{}, err
+			}
 		}
 		return Scope{}, nil
 	case PidNSPrivate:
@@ -369,6 +378,22 @@ func (s Shape) HookScope() (Scope, error) {
 	default:
 		return Scope{}, fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
 	}
+}
+
+// ownRoot reports whether /sys/fs/cgroup is our own container's cgroup: a
+// private cgroup namespace whose root our cgroup is. Every socket under it
+// is then our container's. A private namespace whose root is above us is
+// not ours alone.
+func (s Shape) ownRoot() bool {
+	return s.CgroupNS == CgroupNSPrivate && s.CgroupPath == "/"
+}
+
+// machineFirewall reports whether the hook would attach at the machine's
+// root in the host pid namespace: a runner VM, where it judges every socket
+// and reads neither the daemon nor the kernel's socket cgroups. Detect
+// skips probing what only the other shapes read.
+func (s Shape) machineFirewall() bool {
+	return s.CgroupNS == CgroupNSHost && s.PidNS == PidNSHost
 }
 
 // partialRefusal says why a hook that judges part of the machine, below its
@@ -541,10 +566,10 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 		s.DockerHost, s.DockerHostSetting = host, setting
 	}
 	// The probe parses the kernel's BTF, and nothing reads its answer
-	// without the hook, or in the host cgroup and pid namespaces.
+	// without the hook, or on a runner VM (machineFirewall).
 	if !egressHook {
 		s.SocketCgroupsReason = "not probed: the cgroup egress hook is off"
-	} else if s.CgroupNS == CgroupNSHost && s.PidNS == PidNSHost {
+	} else if s.machineFirewall() {
 		s.SocketCgroupsReason = "not probed: the hook is at the machine's root and judges every socket"
 	} else {
 		s.SocketCgroups, s.SocketCgroupsReason = probeSocketCgroups(kernel)
@@ -558,6 +583,12 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 func probeCgroupMount(root, path string, pid int) (CgroupMount, string) {
 	procs := filepath.Join(root, path, "cgroup.procs")
 	data, err := os.ReadFile(procs)
+	if errors.Is(err, unix.EOPNOTSUPP) {
+		// A threaded cgroup has no process list; its thread list holds our
+		// main thread, whose id is our pid.
+		procs = filepath.Join(root, path, "cgroup.threads")
+		data, err = os.ReadFile(procs)
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		return CgroupMountOther, fmt.Sprintf("%s has no cgroup %s", root, path)
 	}
@@ -617,11 +648,14 @@ func dockerCLIHost(getenv func(string) string) (host, setting string, err error)
 		if err != nil {
 			return "", "", err
 		}
+		// As the CLI reads it: an empty file is no config, and one it
+		// cannot parse is warned about and then ignored, for the default
+		// context.
 		var cfg struct {
 			CurrentContext string `json:"currentContext"`
 		}
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return "", "", fmt.Errorf("%s: %w", config, err)
+		if len(bytes.TrimSpace(data)) == 0 || json.Unmarshal(data, &cfg) != nil {
+			return "", "", nil
 		}
 		name, setting = cfg.CurrentContext, config+"'s currentContext"
 	}

@@ -31,6 +31,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf/link"
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/cargowall/bpf"
@@ -94,7 +95,10 @@ func TestCgroupScopeWalkLeavesSharedCgroups(t *testing.T) {
 	}
 	dir := filepath.Join(podenv.CgroupRoot, fmt.Sprintf("cargowall-origin-test-%d", os.Getpid()))
 	pod := filepath.Join(dir, "pod")
-	cgroups := []string{dir, filepath.Join(dir, "shared"), filepath.Join(dir, ".own"), pod, filepath.Join(pod, "shared"), filepath.Join(pod, "runner")}
+	cgroups := []string{
+		dir, filepath.Join(dir, "shared"), filepath.Join(dir, ".own"), filepath.Join(dir, "theirs"),
+		pod, filepath.Join(pod, "shared"), filepath.Join(pod, "runner"),
+	}
 	for _, d := range cgroups {
 		require.NoError(t, os.Mkdir(d, 0o755))
 	}
@@ -105,7 +109,7 @@ func TestCgroupScopeWalkLeavesSharedCgroups(t *testing.T) {
 			}
 		}
 	})
-	for _, cg := range []string{filepath.Join(dir, "shared"), filepath.Join(pod, "shared")} {
+	for _, cg := range []string{filepath.Join(dir, "shared"), filepath.Join(dir, "theirs"), filepath.Join(pod, "shared")} {
 		daemon := exec.Command("sleep", "60")
 		require.NoError(t, daemon.Start())
 		t.Cleanup(func() {
@@ -150,6 +154,10 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 
 	var log bytes.Buffer
 	podRel := strings.TrimPrefix(pod, podenv.CgroupRoot)
+	// The test walks by hand; the tick would race it.
+	saved := scopeStatsInterval
+	scopeStatsInterval = time.Hour
+	t.Cleanup(func() { scopeStatsInterval = saved })
 	s, err := startCgroupScope(slog.New(slog.NewTextHandler(&log, nil)), podRel)
 	require.NoError(t, err)
 	t.Cleanup(s.close)
@@ -192,6 +200,15 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	require.NoError(t, s.walk(false))
 	require.True(t, recorded(own), "a cgroup ours alone again is recorded again")
 
+	// A recorded cgroup that holds no task of ours, only another's, is
+	// taken out too, though the walk lists it nowhere: as one a task of
+	// ours entered beside the other and has since left.
+	theirs := filepath.Join(dir, "theirs")
+	require.NoError(t, s.cgroups().Put(idOf(theirs), uint8(1)))
+	require.NoError(t, s.walk(false))
+	require.False(t, recorded(theirs), "a recorded cgroup only another task is in")
+	require.Contains(t, log.String(), strings.TrimPrefix(theirs, podenv.CgroupRoot), "and it is reported")
+
 	// A task of ours in the root cgroup is reported once, however many
 	// walks find it there.
 	require.Equal(t, 1, strings.Count(log.String(), "in the root cgroup"), "reported by the first walk")
@@ -226,9 +243,15 @@ func loadWalkScope(t *testing.T, ino, maxEntries uint32) *cgroupScope {
 	require.NoError(t, spec.Variables[bpf.ScopeBpfVarPidnsIno].Set(ino))
 	spec.Maps[bpf.ScopeBpfMapMapScopeCgroups].MaxEntries = maxEntries
 	var log bytes.Buffer
-	s := &cgroupScope{logger: slog.New(slog.NewTextHandler(&log, nil)), last: newWalkFindings()}
+	s := &cgroupScope{
+		logger: slog.New(slog.NewTextHandler(&log, nil)), last: newWalkFindings(),
+		paths: make(map[uint64]string), settled: make(map[uint64]bool),
+	}
 	require.NoError(t, spec.LoadAndAssign(&s.objs, nil))
 	t.Cleanup(s.release)
+	s.iter, err = link.AttachIter(link.IterOptions{Program: s.objs.ScopeTaskIter})
+	require.NoError(t, err)
+	s.links = append(s.links, s.iter)
 	return s
 }
 

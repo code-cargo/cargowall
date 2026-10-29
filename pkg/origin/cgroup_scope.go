@@ -40,8 +40,8 @@ import (
 )
 
 // scopeStatsInterval is how often cgroupScope walks the tasks again and
-// reports what it could not record.
-const scopeStatsInterval = 10 * time.Second
+// reports what it could not record. A test that walks by hand lengthens it.
+var scopeStatsInterval = 10 * time.Second
 
 // cgroupScope owns the scope collection (bpf/scopebpf.c): the cgroups that
 // tasks in our pid namespace have entered, which a scoped hook judges
@@ -59,6 +59,7 @@ const scopeStatsInterval = 10 * time.Second
 type cgroupScope struct {
 	objs     bpf.ScopeBpfObjects
 	links    []link.Link
+	iter     *link.Iter // the task walk, attached once and opened per walk
 	logger   *slog.Logger
 	sub      subtree
 	stop     chan struct{}
@@ -67,6 +68,12 @@ type cgroupScope struct {
 	// What the last walk found and logged, so the next logs only what is
 	// new, and keeps only what it finds again. Owned by the walk.
 	last walkFindings
+	// Where the walk last found each recorded cgroup, and the recorded
+	// cgroups it can no longer find (removed, or outside our cgroup
+	// namespace's root), which it stops looking for. Both hold only ids
+	// still in the map. Owned by the walk.
+	paths   map[uint64]string
+	settled map[uint64]bool
 }
 
 // walkFindings is what one walk found that it logs: cgroups shared with a
@@ -74,13 +81,14 @@ type cgroupScope struct {
 // and processes of ours in the root cgroup or outside our cgroup
 // namespace's root, where the hook never sees their sockets.
 type walkFindings struct {
-	shared, unrecorded, unreadable map[uint64]bool
-	inRoot, outside                map[uint32]bool
+	shared, unremoved, unrecorded, unreadable map[uint64]bool
+	inRoot, outside                           map[uint32]bool
 }
 
 func newWalkFindings() walkFindings {
 	return walkFindings{
-		shared: make(map[uint64]bool), unrecorded: make(map[uint64]bool), unreadable: make(map[uint64]bool),
+		shared: make(map[uint64]bool), unremoved: make(map[uint64]bool),
+		unrecorded: make(map[uint64]bool), unreadable: make(map[uint64]bool),
 		inRoot: make(map[uint32]bool), outside: make(map[uint32]bool),
 	}
 }
@@ -159,7 +167,7 @@ func startCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, er
 	}
 	s := &cgroupScope{
 		logger: logger, sub: sub, stop: make(chan struct{}), done: make(chan struct{}),
-		last: newWalkFindings(),
+		last: newWalkFindings(), paths: make(map[uint64]string), settled: make(map[uint64]bool),
 	}
 	if err := cargowallEbpf.LoadObjects(logger, "scopebpf", spec, ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
@@ -174,6 +182,11 @@ func startCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, er
 		}
 		s.links = append(s.links, l)
 	}
+	if s.iter, err = link.AttachIter(link.IterOptions{Program: s.objs.ScopeTaskIter}); err != nil {
+		s.release()
+		return nil, fmt.Errorf("cgroup scope: failed to attach the task walk: %w", err)
+	}
+	s.links = append(s.links, s.iter)
 	if err := s.walk(true); err != nil {
 		s.release()
 		return nil, fmt.Errorf("cgroup scope: task walk: %w", err)
@@ -197,7 +210,8 @@ func (s *cgroupScope) cgroups() *ebpf.Map { return s.objs.MapScopeCgroups }
 // walk records it again. The check reads cgroup.threads, which numbers
 // each task as our pid namespace does, so a task outside it reads as 0.
 // A cgroup that cannot be read is reported and passed over, and the rest
-// are still reconciled.
+// are still reconciled. Then it checks the recorded cgroups the listing
+// did not reach (reconcileRecorded).
 //
 // The first walk, at startup, must list this process's own cgroup, which
 // is in the subtree: one that lists none of ours would leave the scope
@@ -214,6 +228,7 @@ func (s *cgroupScope) walk(first bool) error {
 		}
 	}
 	found := newWalkFindings()
+	done := make(map[uint64]bool) // listed cgroups this pass reconciled, or the subtree covers
 	for id, l := range tasks {
 		if l.level == 0 {
 			for tgid := range l.tgids {
@@ -225,38 +240,140 @@ func (s *cgroupScope) walk(first bool) error {
 			}
 			continue
 		}
-		path, where := cgroupPathOf(id, l.tgids)
-		if where == cgroupOutside {
-			for tgid := range l.tgids {
-				found.outside[tgid] = true
-				if !s.last.outside[tgid] {
-					s.logger.Warn("A task of this job is in a cgroup outside our cgroup namespace's root, "+
-						"which the cgroup hook never sees", "pid", tgid, "cgroup", path)
-				}
+		path, ok, outside := cgroupPathOf(id, l.tgids)
+		for tgid, p := range outside {
+			found.outside[tgid] = true
+			if !s.last.outside[tgid] {
+				s.logger.Warn("A task of this job is in a cgroup outside our cgroup namespace's root, "+
+					"which the cgroup hook never sees", "pid", tgid, "cgroup", p)
 			}
+		}
+		if !ok {
+			continue // its tasks have gone (a move was recorded): reconcileRecorded has it
+		}
+		done[id] = true
+		if under(path, s.sub.path) {
 			continue
 		}
-		if where == cgroupGoneAway || under(path, s.sub.path) {
-			continue // its tasks have gone (a move was recorded), or the subtree covers it
-		}
+		s.paths[id] = path
 		existed := s.recorded(id)
-		shared, err := sharedCgroup(filepath.Join(podenv.CgroupRoot, path))
-		switch {
-		case cgroupGone(err):
-		case err != nil:
-			found.unreadable[id] = true
-			if !s.last.unreadable[id] {
-				s.logger.Warn("Container egress cgroup scope cannot read a cgroup this job is in, and leaves it as it is",
-					"cgroup", path, "error", err)
+		s.reconcile(id, path, &found, func() {
+			if !existed {
+				s.record(id, path, &found)
 			}
-		case shared:
-			s.leave(id, path, &found)
-		case !existed:
-			s.record(id, path, &found)
-		}
+		})
 	}
+	s.reconcileRecorded(done, &found)
 	s.last = found
 	return nil
+}
+
+// reconcile reads the cgroup at path, id, and takes it out of the scope if
+// a task outside our pid namespace is in it, or else runs ours. A cgroup
+// removed meanwhile is neither; one that cannot be read is reported.
+func (s *cgroupScope) reconcile(id uint64, path string, found *walkFindings, ours func()) {
+	shared, err := sharedCgroup(filepath.Join(podenv.CgroupRoot, path))
+	switch {
+	case cgroupGone(err):
+	case err != nil:
+		found.unreadable[id] = true
+		if !s.last.unreadable[id] {
+			s.logger.Warn("Container egress cgroup scope cannot read a cgroup this job is in, and leaves it as it is",
+				"cgroup", path, "error", err)
+		}
+	case shared:
+		s.leave(id, path, found)
+	default:
+		ours()
+	}
+}
+
+// reconcileRecorded checks the cgroups in the scope that the listing did
+// not reconcile, which hold no task of ours it could find: one a task of ours entered
+// beside another task, or at the same moment as one, and has since left,
+// or one a failed delete left in. Each is found where the walk last saw it
+// or, failing that, by one look over the cgroup tree. One that is not
+// there has been removed (no task can enter it again) or lies outside our
+// cgroup namespace's root (beyond the hook), and is not looked for again.
+func (s *cgroupScope) reconcileRecorded(done map[uint64]bool, found *walkFindings) {
+	var ids []uint64
+	var id uint64
+	var v uint8
+	for it := s.objs.MapScopeCgroups.Iterate(); it.Next(&id, &v); {
+		ids = append(ids, id)
+	}
+	inMap := make(map[uint64]bool, len(ids))
+	var lost []uint64
+	for _, id := range ids {
+		inMap[id] = true
+		if done[id] || s.settled[id] {
+			continue
+		}
+		if p, ok := s.paths[id]; !ok || !isCgroup(p, id) {
+			lost = append(lost, id)
+		}
+	}
+	if len(lost) > 0 {
+		for id, p := range cgroupPaths(lost) {
+			s.paths[id] = p
+		}
+		for _, id := range lost {
+			if p, ok := s.paths[id]; !ok || !isCgroup(p, id) {
+				s.settled[id] = true
+				delete(s.paths, id)
+			}
+		}
+	}
+	for _, id := range ids {
+		if done[id] || s.settled[id] {
+			continue
+		}
+		s.reconcile(id, s.paths[id], found, func() {})
+	}
+	for id := range s.paths {
+		if !inMap[id] {
+			delete(s.paths, id)
+		}
+	}
+	for id := range s.settled {
+		if !inMap[id] {
+			delete(s.settled, id)
+		}
+	}
+}
+
+// isCgroup reports whether the cgroup at path is still id.
+func isCgroup(path string, id uint64) bool {
+	got, err := podenv.CgroupID(path)
+	return err == nil && got == id
+}
+
+// cgroupPaths looks over the cgroup tree for the cgroups with the given
+// ids, and returns the paths it found them at.
+func cgroupPaths(ids []uint64) map[uint64]string {
+	want := make(map[uint64]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	paths := make(map[uint64]string)
+	_ = filepath.WalkDir(podenv.CgroupRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if id := info.Sys().(*syscall.Stat_t).Ino; want[id] {
+			rel, _ := filepath.Rel(podenv.CgroupRoot, path)
+			paths[id] = filepath.Join("/", rel)
+			if len(paths) == len(want) {
+				return fs.SkipAll
+			}
+		}
+		return nil
+	})
+	return paths
 }
 
 // checkOwn requires the task walk to have listed this process's own
@@ -317,7 +434,14 @@ func (s *cgroupScope) record(id uint64, path string, found *walkFindings) {
 // namespace is in it, which the hook must not judge. Logged when the last
 // walk did not find it shared.
 func (s *cgroupScope) leave(id uint64, path string, found *walkFindings) {
-	_ = s.objs.MapScopeCgroups.Delete(id)
+	if err := s.objs.MapScopeCgroups.Delete(id); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		found.unremoved[id] = true
+		if !s.last.unremoved[id] {
+			s.logger.Warn("Container egress cgroup scope could not take out a cgroup it shares with tasks outside "+
+				"this job, whose sockets the hook still judges", "cgroup", path, "error", err)
+		}
+		return
+	}
 	found.shared[id] = true
 	if !s.last.shared[id] {
 		s.logger.Warn("A task of this job is in a cgroup shared with tasks outside it, "+
@@ -335,12 +459,7 @@ type listed struct {
 // walkTasks runs the task walk and returns what it listed of each cgroup,
 // by id.
 func (s *cgroupScope) walkTasks() (map[uint64]*listed, error) {
-	it, err := link.AttachIter(link.IterOptions{Program: s.objs.ScopeTaskIter})
-	if err != nil {
-		return nil, err
-	}
-	defer it.Close()
-	rd, err := it.Open()
+	rd, err := s.iter.Open()
 	if err != nil {
 		return nil, err
 	}
@@ -364,49 +483,34 @@ func (s *cgroupScope) walkTasks() (map[uint64]*listed, error) {
 	return tasks, nil
 }
 
-// Where cgroupPathOf found a cgroup.
-const (
-	cgroupFound    = iota
-	cgroupGoneAway // none of the processes listed in it is there now
-	cgroupOutside  // outside our cgroup namespace's root: "/.." in its path
-)
-
 // cgroupPathOf finds the path of cgroup id through a process the walk
 // listed in it: the process's own cgroup or, when that is no longer id
 // (the process has moved, or the task was a thread in a cgroup of its
-// own), one of its threads'. A path outside our cgroup namespace's root,
-// above /sys/fs/cgroup, cannot be read and is reported as such.
-func cgroupPathOf(id uint64, tgids map[uint32]bool) (string, int) {
+// own), one of its threads'. False when none of them is in it now. It also
+// returns, by process, a cgroup path it met outside our cgroup namespace's
+// root (above /sys/fs/cgroup, where "/.." starts it), which cannot be read:
+// that process is beyond the hook, whatever id is.
+func cgroupPathOf(id uint64, tgids map[uint32]bool) (string, bool, map[uint32]string) {
+	outside := make(map[uint32]string)
 	for tgid := range tgids {
 		proc := fmt.Sprintf("/proc/%d", tgid)
-		if path, where := cgroupIn(proc+"/cgroup", id); where != cgroupGoneAway {
-			return path, where
-		}
-		threads, _ := filepath.Glob(proc + "/task/*/cgroup")
-		for _, f := range threads {
-			if path, where := cgroupIn(f, id); where != cgroupGoneAway {
-				return path, where
+		files := []string{proc + "/cgroup"}
+		for i := 0; i < len(files); i++ {
+			path, err := podenv.ReadCgroupPath(files[i])
+			switch {
+			case err != nil:
+			case strings.HasPrefix(path, "/.."):
+				outside[tgid] = path
+			case isCgroup(path, id):
+				return path, true, outside
+			}
+			if i == 0 {
+				threads, _ := filepath.Glob(proc + "/task/*/cgroup")
+				files = append(files, threads...)
 			}
 		}
 	}
-	return "", cgroupGoneAway
-}
-
-// cgroupIn is where a /proc cgroup file puts cgroup id: found, outside our
-// cgroup namespace's root, or neither, when the file names another cgroup
-// or cannot be read.
-func cgroupIn(file string, id uint64) (string, int) {
-	path, err := podenv.ReadCgroupPath(file)
-	switch {
-	case err != nil:
-		return "", cgroupGoneAway
-	case strings.HasPrefix(path, "/.."):
-		return path, cgroupOutside
-	}
-	if got, err := podenv.CgroupID(path); err == nil && got == id {
-		return path, cgroupFound
-	}
-	return "", cgroupGoneAway
+	return "", false, outside
 }
 
 // under reports whether the cgroup at path is sub or below it, by path:
@@ -448,6 +552,7 @@ func (s *cgroupScope) watch() {
 	defer close(s.done)
 	t := time.NewTicker(scopeStatsInterval)
 	defer t.Stop()
+	var failing string // the walk's last error, logged once until it changes
 	for {
 		select {
 		case <-s.stop:
@@ -455,7 +560,14 @@ func (s *cgroupScope) watch() {
 			return
 		case <-t.C:
 			if err := s.walk(false); err != nil {
-				s.logger.Warn("Container egress cgroup scope: task walk failed", "error", err)
+				if err.Error() != failing {
+					failing = err.Error()
+					s.logger.Warn("Container egress cgroup scope: task walk failed, and the scope stands as it was",
+						"error", err)
+				}
+			} else if failing != "" {
+				failing = ""
+				s.logger.Info("Container egress cgroup scope: task walk recovered")
 			}
 			s.report()
 		}

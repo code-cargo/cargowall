@@ -605,7 +605,7 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 		s.PidNS = PidNSPrivate
 	}
 	s.Dockerd = probeDockerd(dockerSocket)
-	if host, setting, err := dockerCLIHost(os.Getenv); err != nil {
+	if host, setting, err := dockerCLIHost(dockerEnv()); err != nil {
 		s.DockerHostReason = err.Error()
 	} else if host != "" && dockerHostElsewhere(host, dockerSocket) {
 		s.DockerHost, s.DockerHostSetting = host, setting
@@ -652,6 +652,38 @@ func probeCgroupMount(root, path string, pid int) (CgroupMount, string) {
 // defaultDockerHost is the docker CLI's default socket, which an empty
 // unix:// address means too.
 const defaultDockerHost = "/var/run/docker.sock"
+
+// dockerEnv is the environment the job's docker CLI runs in, which says
+// which daemon it uses: under sudo, sudo's own, which is our parent's and
+// the job's, since a plain sudo strips DOCKER_HOST and hands us root's
+// HOME; otherwise ours.
+func dockerEnv() func(string) string {
+	if os.Getenv("SUDO_UID") == "" {
+		return os.Getenv
+	}
+	ppid := os.Getppid()
+	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", ppid))
+	if err != nil || strings.TrimSpace(string(comm)) != "sudo" {
+		return os.Getenv
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", ppid))
+	if err != nil {
+		return os.Getenv
+	}
+	env := parseEnviron(data)
+	return func(k string) string { return env[k] }
+}
+
+// parseEnviron parses a /proc/<pid>/environ: NUL-separated KEY=value.
+func parseEnviron(data []byte) map[string]string {
+	env := make(map[string]string)
+	for _, kv := range bytes.Split(data, []byte{0}) {
+		if k, v, ok := strings.Cut(string(kv), "="); ok && k != "" {
+			env[k] = v
+		}
+	}
+	return env
+}
 
 // passwdHome is the current user's home directory from the passwd
 // database, or "".

@@ -473,25 +473,28 @@ func TestScopeReleaseForgetsCgroups(t *testing.T) {
 	// The default hierarchy only: a v1 cgroup's id can repeat a v2 one's,
 	// so the release of a cgroup in a v1 hierarchy (a named one, with no
 	// controllers) must leave an entry with its id alone. A v2 cgroup
-	// released alongside shows the releases have run.
-	mnt := t.TempDir()
-	if err := unix.Mount("cgroup", mnt, "cgroup", 0, "none,name=cargowall-test"); err != nil {
-		t.Skipf("cannot mount a v1 hierarchy: %v", err)
-	}
-	t.Cleanup(func() { _ = unix.Unmount(mnt, 0) })
-	v1 := filepath.Join(mnt, "v1")
-	require.NoError(t, os.Mkdir(v1, 0o755))
-	t.Cleanup(func() { _ = os.Remove(v1) })
-	fi, err := os.Stat(v1)
-	require.NoError(t, err)
-	v1ID := fi.Sys().(*syscall.Stat_t).Ino
-	require.NoError(t, objs.MapScopeCgroups.Put(v1ID, uint8(1)))
-	v2, v2ID := made("v2")
-	require.NoError(t, os.Remove(v1))
-	require.NoError(t, os.Remove(v2))
-	require.Eventually(t, func() bool { return !recorded(v2ID) }, 5*time.Second, 20*time.Millisecond)
-	time.Sleep(200 * time.Millisecond)
-	require.True(t, recorded(v1ID), "a v1 cgroup's release deletes nothing")
+	// released alongside shows the releases have run. A kernel without v1
+	// skips this part alone.
+	t.Run("v1 hierarchy", func(t *testing.T) {
+		mnt := t.TempDir()
+		if err := unix.Mount("cgroup", mnt, "cgroup", 0, "none,name=cargowall-test"); err != nil {
+			t.Skipf("cannot mount a v1 hierarchy: %v", err)
+		}
+		t.Cleanup(func() { _ = unix.Unmount(mnt, 0) })
+		v1 := filepath.Join(mnt, "v1")
+		require.NoError(t, os.Mkdir(v1, 0o755))
+		t.Cleanup(func() { _ = os.Remove(v1) })
+		fi, err := os.Stat(v1)
+		require.NoError(t, err)
+		v1ID := fi.Sys().(*syscall.Stat_t).Ino
+		require.NoError(t, objs.MapScopeCgroups.Put(v1ID, uint8(1)))
+		v2, v2ID := made("v2")
+		require.NoError(t, os.Remove(v1))
+		require.NoError(t, os.Remove(v2))
+		require.Eventually(t, func() bool { return !recorded(v2ID) }, 5*time.Second, 20*time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
+		require.True(t, recorded(v1ID), "a v1 cgroup's release deletes nothing")
+	})
 }
 
 // A cgroup leaves the scope as soon as a task outside our pid namespace

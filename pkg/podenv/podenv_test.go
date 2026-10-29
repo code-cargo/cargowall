@@ -242,6 +242,20 @@ func TestDetect_Namespaces(t *testing.T) {
 	}
 }
 
+// /proc/<pid>/environ is NUL-separated KEY=value, values free to hold "=".
+func TestParseEnviron(t *testing.T) {
+	env := parseEnviron([]byte("HOME=/home/runner\x00DOCKER_HOST=tcp://a:2376\x00X=a=b\x00\x00junk\x00"))
+	want := map[string]string{"HOME": "/home/runner", "DOCKER_HOST": "tcp://a:2376", "X": "a=b"}
+	if len(env) != len(want) {
+		t.Fatalf("parseEnviron = %v, want %v", env, want)
+	}
+	for k, v := range want {
+		if env[k] != v {
+			t.Errorf("parseEnviron[%q] = %q, want %q", k, env[k], v)
+		}
+	}
+}
+
 // A threaded cgroup has no process list (reading cgroup.procs fails with
 // EOPNOTSUPP), so the mount is proven from its thread list, which holds
 // our main thread.

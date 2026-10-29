@@ -110,7 +110,7 @@
 
 // Nonzero: judge only sockets in a cgroup recorded in map_scope_cgroups,
 // and pass every other one. Set by userspace before load, in the same step
-// that loads the step collection's map in place of the stand-in below,
+// that loads the scope collection's map in place of the stand-in below,
 // because it never changes after attach. A load-time constant rather than a
 // config byte, so the program has one way into the rest of the hook either
 // way: at zero the verifier drops the check (a runner VM), and at one only
@@ -168,13 +168,13 @@ static __always_inline __u8 origin_mode(void) {
     return mode ? *mode : ORIGIN_MODE_OBSERVE;  // absent = inert
 }
 
-// Cgroups a task in the daemon's pid namespace has occupied, recorded by
-// the step programs in stepbpf.c. Owned there: this declaration is replaced
-// by the step collection's map, at that map's size, when scoped is set, and
-// is an empty stand-in otherwise. Shape must match stepbpf.c (pinned by
+// Cgroups a task in the daemon's pid namespace has entered, recorded by
+// scopebpf.c. Owned there: this declaration is replaced by the scope
+// collection's map, at that map's size, when scoped is set, and is an empty
+// stand-in otherwise. Shape must match scopebpf.c (pinned by
 // TestScopeCgroupsMapSpecsMatch).
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u64);
     __type(value, __u8);
     __uint(max_entries, 64);

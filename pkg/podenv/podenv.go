@@ -47,8 +47,15 @@ import (
 // (PROC_CGROUP_INIT_INO, PROC_PID_INIT_INO).
 const (
 	initCgroupNamespace = 0xEFFFFFFB
-	initPidNamespace    = 0xEFFFFFFC
+	InitPidNamespace    = 0xEFFFFFFC
 )
+
+// PidNamespaceInode is the inode of our own pid namespace, which the BPF
+// programs compare each task's pid chain against.
+func PidNamespaceInode() (uint32, error) {
+	ino, err := nsInode("/proc/self/ns/pid")
+	return uint32(ino), err
+}
 
 // cgroupRoot is where every cgroup program attaches.
 const cgroupRoot = "/sys/fs/cgroup"
@@ -188,6 +195,8 @@ type Shape struct {
 	// socket. The job's containers then belong to a daemon nothing probed,
 	// so an absent or local result on the socket says nothing about them.
 	DockerHost string
+	// Kernel is the running kernel's release, empty when uname failed.
+	Kernel string
 }
 
 // HookScope decides whether a cgroup program attached at /sys/fs/cgroup can
@@ -203,8 +212,8 @@ type Shape struct {
 //     tree, which other pods share, while our pid namespace holds only this
 //     job's processes (in a pod that shares one, the runner's, dockerd's
 //     and those of every container dockerd starts). The hook must judge
-//     only sockets in the cgroups those processes occupy; judging the rest
-//     would judge other pods.
+//     only sockets in the cgroups those processes have entered; judging the
+//     rest would judge other pods.
 //   - an error: the hook must not load, and scoped is false.
 //
 // The error says why the hook would not judge exactly this job, or why that
@@ -221,6 +230,9 @@ type Shape struct {
 //   - Limited to our pid namespace, beside a dockerd outside it, the
 //     daemon's containers are outside it too, and the hook never judges
 //     their traffic.
+//   - Limited to our pid namespace on a kernel older than 5.15, or one whose
+//     release cannot be read, a socket's cgroup is not a reliable sign of
+//     whose it is (see socketCgroupRefusal).
 //   - In a private cgroup namespace beside a dockerd that is not ours
 //     (another container's, or the host's own, whether its pid is visible
 //     or not), the daemon's containers may live outside our subtree, where
@@ -247,14 +259,17 @@ type Shape struct {
 // to a remote daemon reads as local, and it runs once, so a daemon that
 // has not yet made its socket reads as absent; scoped, that daemon's
 // containers are judged anyway when it shares our pid namespace, and missed
-// when it does not. And scoped, a cgroup one of our tasks occupies is taken
-// to hold only this pod's tasks, as a container runtime arranges by giving
-// each container a cgroup of its own: a process outside our pid namespace
-// in such a cgroup would be judged as ours.
+// when it does not. And scoped, a cgroup one of our tasks has entered is
+// taken to hold only this pod's tasks, as a container runtime arranges by
+// giving each container a cgroup of its own: a process outside our pid
+// namespace in such a cgroup would be judged as ours. The scope never records a
+// cgroup a task merely shares with a parent outside our pid namespace, so
+// a process a runtime places in our namespace from its own cgroup, before
+// moving it (runc exec), does not bring the runtime's cgroup in.
 //
 // Three limits are accepted rather than refused, and design.md describes
-// them. Scoped, a socket in a cgroup none of our tasks has been seen in
-// passes with only TC's verdict, so it gets no L7 check. Work in other pods
+// them. Scoped, a socket in a cgroup none of our tasks has entered passes
+// with only TC's verdict, so it gets no L7 check. Work in other pods
 // (ARC's Kubernetes container mode) is outside this pod's pid namespace and
 // interface, beyond every layer here, as it was before the scope. And
 // DOCKER_HOST is read once, from cargowall's own environment, so a step
@@ -284,6 +299,9 @@ func (s Shape) HookScope() (scoped bool, err error) {
 			return false, nil
 		case PidNSPrivate:
 			if err := s.dockerHostRefusal(); err != nil {
+				return false, err
+			}
+			if err := s.socketCgroupRefusal(); err != nil {
 				return false, err
 			}
 			switch s.Dockerd.Kind {
@@ -354,6 +372,24 @@ func (s Shape) dockerHostRefusal() error {
 	return nil
 }
 
+// socketCgroupRefusal says why this kernel cannot be trusted to put this
+// job's sockets in this job's cgroups, which is what the scoped hook judges
+// by, or nil from 5.15 on. Up to 5.14 a v1 net_cls or net_prio hierarchy
+// in use anywhere on the machine turns socket cgroups off, and every socket
+// made after that reads as the root cgroup, which the scope never records.
+func (s Shape) socketCgroupRefusal() error {
+	var major, minor int
+	if _, err := fmt.Sscanf(s.Kernel, "%d.%d", &major, &minor); err != nil {
+		return fmt.Errorf("the cgroup hook judges only our pid namespace's cgroups, "+
+			"and the kernel release %q is unreadable", s.Kernel)
+	}
+	if major < 5 || major == 5 && minor < 15 {
+		return fmt.Errorf("the cgroup hook judges only our pid namespace's cgroups, which kernel %s "+
+			"can stop tracking for sockets (5.15 or later is needed)", s.Kernel)
+	}
+	return nil
+}
+
 // LogArgs is every fact and probe error, as slog key-value pairs.
 func (s Shape) LogArgs() []any {
 	return []any{
@@ -362,7 +398,7 @@ func (s Shape) LogArgs() []any {
 		"cgroup_mount", s.CgroupMount.String(), "cgroup_mount_reason", s.CgroupMountReason,
 		"pidns", s.PidNS.String(), "pidns_reason", s.PidNSReason,
 		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
-		"docker_host", s.DockerHost,
+		"docker_host", s.DockerHost, "kernel", s.Kernel,
 	}
 }
 
@@ -388,15 +424,19 @@ func Detect(dockerSocket string) Shape {
 	} else {
 		s.CgroupMountReason = "no cgroup path to look for"
 	}
-	if ino, err := nsInode("/proc/self/ns/pid"); err != nil {
+	if ino, err := PidNamespaceInode(); err != nil {
 		s.PidNSReason = err.Error()
-	} else if ino == initPidNamespace {
+	} else if ino == InitPidNamespace {
 		s.PidNS = PidNSHost
 	} else {
 		s.PidNS = PidNSPrivate
 	}
 	s.Dockerd = probeDockerd(dockerSocket)
 	s.DockerHost = dockerHostElsewhere(os.Getenv("DOCKER_HOST"), dockerSocket)
+	var uts unix.Utsname
+	if unix.Uname(&uts) == nil {
+		s.Kernel = unix.ByteSliceToString(uts.Release[:])
+	}
 	return s
 }
 

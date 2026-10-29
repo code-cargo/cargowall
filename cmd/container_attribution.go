@@ -97,12 +97,11 @@ func resolveMode(containerEgress string) origin.Mode {
 // when set, is why a hook at /sys/fs/cgroup would not judge exactly this
 // job's traffic, or why that could not be shown: the hook is then never
 // loaded, the same loss as a load failure. scoped means the hook may judge
-// only sockets in the cgroups the tracker records
-// (steps.Tracker.ScopeCgroups); a tracker recording none is then the same
-// loss, never a hook that judges every socket under a shared root. start.go
-// asks the tracker to record from the same decision, so that loss guards
-// the wiring rather than a shape. A non-nil error means a requested enforce
-// posture was lost and startup must fail.
+// only sockets in the cgroups our pid namespace's tasks have entered, which
+// origin.Start records before it attaches; a failure to record them is the
+// same loss, never a hook that judges every socket under a shared root. A
+// non-nil error means a requested enforce posture was lost and startup
+// must fail.
 func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.Tracker, stepErr error,
 	scoped bool, scopeErr error, tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
 ) (*containerAttribution, error) {
@@ -124,16 +123,9 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		logger:      logger,
 	}
 	var obs *origin.Observer
-	var scopeCgroups *ebpf.Map
 	err := scopeErr
-	if err == nil && scoped {
-		if scopeCgroups = stepTracker.ScopeCgroups(); scopeCgroups == nil {
-			err = errors.New("the cgroup hook may judge only cgroups our pid namespace occupies, " +
-				"and the step tracker is not recording them")
-		}
-	}
 	if err == nil {
-		obs, err = origin.Start(tcObjs, scopeCgroups, logger)
+		obs, err = origin.Start(tcObjs, scoped, logger)
 	}
 	if err != nil {
 		// Fatal under enforce. Under observe only the hook is lost: the

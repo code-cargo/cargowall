@@ -32,21 +32,18 @@ type StepBpfTaskIterRec struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	StepBpfMapMapScopeCgroups         = "map_scope_cgroups"
 	StepBpfMapMapSockStep             = "map_sock_step"
 	StepBpfMapMapStepEvents           = "map_step_events"
 	StepBpfMapMapStepState            = "map_step_state"
 	StepBpfMapMapTaskNspid            = "map_task_nspid"
 	StepBpfMapMapTaskStep             = "map_task_step"
 	StepBpfProgCgSockCreate           = "cg_sock_create"
-	StepBpfProgStepCgroupAttach       = "step_cgroup_attach"
 	StepBpfProgStepExit               = "step_exit"
 	StepBpfProgStepFork               = "step_fork"
 	StepBpfProgStepTaskIter           = "step_task_iter"
 	StepBpfVarBtfAnchorStepChildEvent = "btf_anchor_step_child_event"
 	StepBpfVarBtfAnchorTaskIterRec    = "btf_anchor_task_iter_rec"
 	StepBpfVarPidnsIno                = "pidns_ino"
-	StepBpfVarScopeCgroups            = "scope_cgroups"
 )
 
 // LoadStepBpf returns the embedded CollectionSpec for StepBpf.
@@ -91,23 +88,21 @@ type StepBpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type StepBpfProgramSpecs struct {
-	CgSockCreate     *ebpf.ProgramSpec `ebpf:"cg_sock_create"`
-	StepCgroupAttach *ebpf.ProgramSpec `ebpf:"step_cgroup_attach"`
-	StepExit         *ebpf.ProgramSpec `ebpf:"step_exit"`
-	StepFork         *ebpf.ProgramSpec `ebpf:"step_fork"`
-	StepTaskIter     *ebpf.ProgramSpec `ebpf:"step_task_iter"`
+	CgSockCreate *ebpf.ProgramSpec `ebpf:"cg_sock_create"`
+	StepExit     *ebpf.ProgramSpec `ebpf:"step_exit"`
+	StepFork     *ebpf.ProgramSpec `ebpf:"step_fork"`
+	StepTaskIter *ebpf.ProgramSpec `ebpf:"step_task_iter"`
 }
 
 // StepBpfMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type StepBpfMapSpecs struct {
-	MapScopeCgroups *ebpf.MapSpec `ebpf:"map_scope_cgroups"`
-	MapSockStep     *ebpf.MapSpec `ebpf:"map_sock_step"`
-	MapStepEvents   *ebpf.MapSpec `ebpf:"map_step_events"`
-	MapStepState    *ebpf.MapSpec `ebpf:"map_step_state"`
-	MapTaskNspid    *ebpf.MapSpec `ebpf:"map_task_nspid"`
-	MapTaskStep     *ebpf.MapSpec `ebpf:"map_task_step"`
+	MapSockStep   *ebpf.MapSpec `ebpf:"map_sock_step"`
+	MapStepEvents *ebpf.MapSpec `ebpf:"map_step_events"`
+	MapStepState  *ebpf.MapSpec `ebpf:"map_step_state"`
+	MapTaskNspid  *ebpf.MapSpec `ebpf:"map_task_nspid"`
+	MapTaskStep   *ebpf.MapSpec `ebpf:"map_task_step"`
 }
 
 // StepBpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -117,7 +112,6 @@ type StepBpfVariableSpecs struct {
 	BtfAnchorStepChildEvent *ebpf.VariableSpec `ebpf:"btf_anchor_step_child_event"`
 	BtfAnchorTaskIterRec    *ebpf.VariableSpec `ebpf:"btf_anchor_task_iter_rec"`
 	PidnsIno                *ebpf.VariableSpec `ebpf:"pidns_ino"`
-	ScopeCgroups            *ebpf.VariableSpec `ebpf:"scope_cgroups"`
 }
 
 // StepBpfObjects contains all objects after they have been loaded into the kernel.
@@ -140,17 +134,15 @@ func (o *StepBpfObjects) Close() error {
 //
 // It can be passed to LoadStepBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type StepBpfMaps struct {
-	MapScopeCgroups *ebpf.Map `ebpf:"map_scope_cgroups"`
-	MapSockStep     *ebpf.Map `ebpf:"map_sock_step"`
-	MapStepEvents   *ebpf.Map `ebpf:"map_step_events"`
-	MapStepState    *ebpf.Map `ebpf:"map_step_state"`
-	MapTaskNspid    *ebpf.Map `ebpf:"map_task_nspid"`
-	MapTaskStep     *ebpf.Map `ebpf:"map_task_step"`
+	MapSockStep   *ebpf.Map `ebpf:"map_sock_step"`
+	MapStepEvents *ebpf.Map `ebpf:"map_step_events"`
+	MapStepState  *ebpf.Map `ebpf:"map_step_state"`
+	MapTaskNspid  *ebpf.Map `ebpf:"map_task_nspid"`
+	MapTaskStep   *ebpf.Map `ebpf:"map_task_step"`
 }
 
 func (m *StepBpfMaps) Close() error {
 	return _StepBpfClose(
-		m.MapScopeCgroups,
 		m.MapSockStep,
 		m.MapStepEvents,
 		m.MapStepState,
@@ -166,24 +158,21 @@ type StepBpfVariables struct {
 	BtfAnchorStepChildEvent *ebpf.Variable `ebpf:"btf_anchor_step_child_event"`
 	BtfAnchorTaskIterRec    *ebpf.Variable `ebpf:"btf_anchor_task_iter_rec"`
 	PidnsIno                *ebpf.Variable `ebpf:"pidns_ino"`
-	ScopeCgroups            *ebpf.Variable `ebpf:"scope_cgroups"`
 }
 
 // StepBpfPrograms contains all programs after they have been loaded into the kernel.
 //
 // It can be passed to LoadStepBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type StepBpfPrograms struct {
-	CgSockCreate     *ebpf.Program `ebpf:"cg_sock_create"`
-	StepCgroupAttach *ebpf.Program `ebpf:"step_cgroup_attach"`
-	StepExit         *ebpf.Program `ebpf:"step_exit"`
-	StepFork         *ebpf.Program `ebpf:"step_fork"`
-	StepTaskIter     *ebpf.Program `ebpf:"step_task_iter"`
+	CgSockCreate *ebpf.Program `ebpf:"cg_sock_create"`
+	StepExit     *ebpf.Program `ebpf:"step_exit"`
+	StepFork     *ebpf.Program `ebpf:"step_fork"`
+	StepTaskIter *ebpf.Program `ebpf:"step_task_iter"`
 }
 
 func (p *StepBpfPrograms) Close() error {
 	return _StepBpfClose(
 		p.CgSockCreate,
-		p.StepCgroupAttach,
 		p.StepExit,
 		p.StepFork,
 		p.StepTaskIter,

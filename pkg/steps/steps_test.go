@@ -23,7 +23,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -117,16 +116,6 @@ func TestParseTaskRecords_BuildsTreeAndTranslation(t *testing.T) {
 func TestProcSnapshot_SubtreeTerminatesOnCycle(t *testing.T) {
 	snap := &procSnapshot{children: map[uint32][]uint32{1: {2}, 2: {1}}}
 	assert.Equal(t, []uint32{1, 2}, snap.subtree(1))
-}
-
-func TestPidNamespaceInode_MatchesProcLink(t *testing.T) {
-	got, err := pidNamespaceInode()
-	require.NoError(t, err)
-	link, err := os.Readlink("/proc/self/ns/pid")
-	require.NoError(t, err)
-	want, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(link, "pid:["), "]"), 10, 32)
-	require.NoError(t, err)
-	assert.Equal(t, uint32(want), got)
 }
 
 func TestFindAncestorByComm_FindsParent(t *testing.T) {

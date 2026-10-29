@@ -558,14 +558,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// and its own failure only warns. The cgroup egress hook rides it, so
 	// stepErr is handed on and that layer reports the loss through the
 	// posture ledger (fatal under --container-egress=enforce).
-	hookScoped, hookScopeErr := shape.HookScope()
 	var stepTracker *steps.Tracker
 	var stepErr error
 	if cmd.StepAttribution {
 		tracker, err := steps.Start(&objs, steps.Options{
-			WorkerPID:    cmd.RunnerWorkerPID,
-			OrdinalBase:  uint64(cmd.StepOrdinalBase),
-			ScopeCgroups: cmd.ContainerEgress != ContainerEgressOff && hookScoped,
+			WorkerPID:   cmd.RunnerWorkerPID,
+			OrdinalBase: uint64(cmd.StepOrdinalBase),
 		}, auditLogger, logger)
 		if err != nil {
 			stepErr = err
@@ -591,6 +589,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// postures decides what losing a requested layer means: a lost enforce
 	// rung fails startup, a lost observe rung is recorded for the summary.
 	postures := newPostures(cmd, caps.KernelVersion, logger)
+	hookScoped, hookScopeErr := shape.HookScope()
 	attribution, err := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
 		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, hookScoped, hookScopeErr, &objs, postures, logger)
 	if err != nil {

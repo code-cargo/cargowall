@@ -51,21 +51,21 @@ func loadOriginObjectsScoped(t *testing.T) *OriginBpfObjects {
 	return &objs
 }
 
-// map_scope_cgroups is declared twice: stepbpf.c owns it and originbpf.c
-// carries a stand-in the step collection's map replaces. cilium/ebpf rejects
+// map_scope_cgroups is declared twice: scopebpf.c owns it and originbpf.c
+// carries a stand-in the scope collection's map replaces. cilium/ebpf rejects
 // a replacement whose spec differs, and the replacement happens only in the
 // scoped shape (a privileged pod), which no CI job runs, so a drift would
 // ship and then fail ARC startup. The size is the exception: origin.Start
 // gives the stand-in the replacement's. Compared from the specs: no kernel
 // needed.
 func TestScopeCgroupsMapSpecsMatch(t *testing.T) {
-	stepSpec, err := LoadStepBpf()
+	scopeSpec, err := LoadScopeBpf()
 	require.NoError(t, err)
 	originSpec, err := LoadOriginBpf()
 	require.NoError(t, err)
-	owner := stepSpec.Maps[StepBpfMapMapScopeCgroups]
+	owner := scopeSpec.Maps[ScopeBpfMapMapScopeCgroups]
 	standIn := originSpec.Maps[OriginBpfMapMapScopeCgroups]
-	require.NotNil(t, owner, "stepbpf.c must declare map_scope_cgroups")
+	require.NotNil(t, owner, "scopebpf.c must declare map_scope_cgroups")
 	require.NotNil(t, standIn, "originbpf.c must declare map_scope_cgroups")
 	require.Equal(t, owner.Type, standIn.Type, "map type")
 	require.Equal(t, owner.KeySize, standIn.KeySize, "key size")

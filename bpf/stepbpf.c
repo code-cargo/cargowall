@@ -45,11 +45,7 @@
 // rather than matching garbage.
 const volatile __u32 pidns_ino = 0;
 
-// Nonzero makes the step programs record in map_scope_cgroups every cgroup
-// a task in the daemon's pid namespace occupies. Set by userspace before
-// load when podenv's HookScope says the cgroup egress hook judges only
-// those cgroups' sockets; zero leaves the recording out of every program.
-const volatile __u8 scope_cgroups = 0;
+#include "pidns.h"
 
 // ---- Shared with tcbpf.c (replaced at load time; shapes must match) ----
 
@@ -89,30 +85,6 @@ struct {
 
 // ---- Owned by this collection ----
 
-// Cgroup v2 ids a task in the daemon's pid namespace has occupied. The
-// cgroup egress hook (originbpf.c, loaded with this map as a replacement)
-// judges only sockets in these cgroups when it sits at the root of a cgroup
-// tree other pods share. Keyed on the cgroup, not the socket, because every
-// socket our tasks give rise to lives in a cgroup one of them occupies:
-// those they create, from any thread including an io_uring worker; those
-// the kernel creates for them (an MPTCP subflow takes its parent's cgroup,
-// an SMC connection's TCP socket is made in the caller's context); and
-// those that predate cargowall or were accepted from our listeners. A
-// cgroup is recorded when one of our tasks is forked into it, migrates
-// into it, or is found in it by the startup walk, each before the task
-// runs there, and membership is read from the task's own pid chain, never
-// from map_task_nspid. Cgroup ids are never reused, so an entry that
-// outlives its cgroup is harmless and nothing deletes one. Sized by
-// pkg/steps when recording (64 is the unused size): the LRU evicts only
-// once a job has occupied more cgroups than that, least recently used
-// first.
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, __u64);
-    __type(value, __u8);
-    __uint(max_entries, 64);
-} map_scope_cgroups SEC(".maps");
-
 // New-step notifications for the userspace reconciler: emitted once per new
 // direct child process of Runner.Worker, before the child runs user code.
 // tgid is the child's pid as numbered in the daemon's namespace, so the
@@ -144,56 +116,11 @@ struct task_iter_rec {
 
 const struct task_iter_rec *btf_anchor_task_iter_rec __attribute__((unused));
 
-// MAX_PID_NS_LEVEL: a task's upid chain is at most this deep.
-#define PIDNS_MAX_LEVEL 32
-
 static __always_inline struct step_state *step_state(void) {
     __u32 key = 0;
     return bpf_map_lookup_elem(&map_step_state, &key);
 }
 
-// ns_tgid_of returns t's process id as numbered in the daemon's pid
-// namespace, or 0 when t lives outside that namespace's subtree (another
-// pod, the host) or translation is disabled. Walks the group leader's upid
-// chain — numbers[0] is the init namespace, numbers[level] the task's own —
-// looking for the namespace whose inode userspace passed in. The daemon's
-// namespace appears at most once in a chain, so order is irrelevant; a
-// plain bounded index keeps the flexible-array access simple.
-static __always_inline __u32 ns_tgid_of(struct task_struct *t)
-{
-    if (!pidns_ino)
-        return 0;
-    struct pid *p = BPF_CORE_READ(t, group_leader, thread_pid);
-    if (!p)
-        return 0;
-    unsigned int level = BPF_CORE_READ(p, level);
-    if (level >= PIDNS_MAX_LEVEL)
-        level = PIDNS_MAX_LEVEL - 1;
-    for (unsigned int i = 0; i < PIDNS_MAX_LEVEL; i++) {
-        if (i > level)
-            break;
-        struct upid up;
-        if (bpf_core_read(&up, sizeof(up), &p->numbers[i]))
-            break;
-        if (BPF_CORE_READ(up.ns, ns.inum) == pidns_ino)
-            return up.nr;
-    }
-    return 0;
-}
-
-// scope_record_cgroup records the cgroup v2 cgroup t occupies. Callers have
-// shown t is in the daemon's pid namespace from its own pid chain. The root
-// cgroup is never recorded: no task of a pod lives there, and judging it
-// would judge sockets the kernel itself owns.
-static __always_inline void scope_record_cgroup(struct task_struct *t)
-{
-    struct cgroup *cg = BPF_CORE_READ(t, cgroups, dfl_cgrp);
-    if (!cg || BPF_CORE_READ(cg, level) == 0)
-        return;
-    __u64 id = BPF_CORE_READ(cg, kn, id);
-    __u8 one = 1;
-    bpf_map_update_elem(&map_scope_cgroups, &id, &one, BPF_ANY);
-}
 
 // Tag propagation. Runs synchronously inside fork(), in the parent's
 // context, so the child's tag exists before its first instruction — step
@@ -223,25 +150,15 @@ int BPF_PROG(step_fork, struct task_struct *parent, struct task_struct *child)
     __u32 child_tgid = child->tgid;
 
     __u32 ns_tgid = 0;
-    __u8 walked = 0;
     if (child_tgid == parent_tgid) {
         __u32 *pns = bpf_map_lookup_elem(&map_task_nspid, &parent_tid);
         if (pns)
             ns_tgid = *pns;
     }
-    if (!ns_tgid) {
+    if (!ns_tgid)
         ns_tgid = ns_tgid_of(child);
-        walked = 1;
-    }
     if (ns_tgid)
         bpf_map_update_elem(&map_task_nspid, &child_tid, &ns_tgid, BPF_ANY);
-
-    // The child's cgroup, which clone3's CLONE_INTO_CGROUP can make differ
-    // from the parent's, even for a thread. Membership comes from the
-    // child's own pid chain, never the thread shortcut above: an entry that
-    // outlived its task would put another pod's cgroup in scope.
-    if (scope_cgroups && (walked ? ns_tgid : ns_tgid_of(child)))
-        scope_record_cgroup(child);
 
     struct step_state *st = step_state();
     if (!st || !st->enabled)
@@ -278,21 +195,6 @@ int BPF_PROG(step_exit, struct task_struct *task)
     return 0;
 }
 
-// A task entering another cgroup, such as runc placing a container's first
-// process before it runs there. Fires after the move, once per migration
-// (for the leader when a whole thread group moves) and for every
-// hierarchy. The task's v2 cgroup is what bpf_skb_cgroup_id reports, so that
-// is what is recorded, whichever hierarchy moved. Attached only when
-// recording.
-SEC("tp_btf/cgroup_attach_task")
-int BPF_PROG(step_cgroup_attach, struct cgroup *dst, const char *path,
-             struct task_struct *task, bool threadgroup)
-{
-    if (scope_cgroups && ns_tgid_of(task))
-        scope_record_cgroup(task);
-    return 0;
-}
-
 // Primary socket-tagging path: fires at socket() for every family/protocol
 // in process context, so the cookie carries the creator's step for the
 // socket's whole life. The connect/sendmsg hooks in tcbpf.c re-tag as a
@@ -319,8 +221,7 @@ int cg_sock_create(struct bpf_sock *ctx)
 // scopes the iteration to the opener's pid namespace — only the daemon's
 // subtree is visited — and ns_tgid_of filters, defensively, anything it
 // cannot map. Re-running it is idempotent, so container tagging takes a
-// fresh pass per call. When recording, it also records the cgroup of every
-// task it finds, which covers the tasks that predate the tracepoints.
+// fresh pass per call.
 SEC("iter/task")
 int step_task_iter(struct bpf_iter__task *ctx)
 {
@@ -330,8 +231,6 @@ int step_task_iter(struct bpf_iter__task *ctx)
     __u32 ns_tgid = ns_tgid_of(t);
     if (!ns_tgid)
         return 0;
-    if (scope_cgroups)
-        scope_record_cgroup(t);
     struct task_iter_rec rec = {
         .tid = t->pid,
         .tgid = t->tgid,

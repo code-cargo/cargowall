@@ -94,15 +94,13 @@ func TestVerifierBudget(t *testing.T) {
 		{"stepbpf", LoadStepBpf, func(spec *ebpf.CollectionSpec) error {
 			return spec.Variables[StepBpfVarPidnsIno].Set(pidnsInode(t))
 		}},
-		// scope_cgroups and scoped are load-time constants, so a privileged
-		// pod runs different programs from a runner VM's. Measure both.
-		{"stepbpf_scope_cgroups", LoadStepBpf, func(spec *ebpf.CollectionSpec) error {
-			if err := spec.Variables[StepBpfVarPidnsIno].Set(pidnsInode(t)); err != nil {
-				return err
-			}
-			return spec.Variables[StepBpfVarScopeCgroups].Set(uint8(1))
+		// Loaded only in a privileged pod, with pidns_ino set as for stepbpf.
+		{"scopebpf", LoadScopeBpf, func(spec *ebpf.CollectionSpec) error {
+			return spec.Variables[ScopeBpfVarPidnsIno].Set(pidnsInode(t))
 		}},
 		{"originbpf", LoadOriginBpf, nil},
+		// scoped is a load-time constant, so a privileged pod runs a
+		// different program from a runner VM's. Measure both.
 		{"originbpf_scoped", LoadOriginBpf, func(spec *ebpf.CollectionSpec) error {
 			return spec.Variables[OriginBpfVarScoped].Set(uint8(1))
 		}},

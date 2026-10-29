@@ -230,26 +230,6 @@ func TestPostures_ContainerAttributionHookScope(t *testing.T) {
 	a.Close()
 }
 
-// A scoped decision, with a tracker that is not recording cgroups, loses the
-// posture: loading the hook with no scope map would judge every socket
-// under a shared root.
-func TestPostures_ContainerAttributionScopeMissing(t *testing.T) {
-	const reason = "the cgroup hook may judge only cgroups our pid namespace occupies, and the step tracker is not recording them"
-
-	p, _ := ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
-	a, err := newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, true, nil, nil, p, p.logger)
-	assert.Nil(t, a)
-	assert.EqualError(t, err, "--container-egress=enforce requested but could not be applied: "+reason)
-
-	p, _ = ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
-	a, err = newContainerAttribution(true, origin.ModeShadow, &steps.Tracker{}, nil, true, nil, nil, p, p.logger)
-	require.NoError(t, err)
-	require.NotNil(t, a)
-	assert.Nil(t, a.originObserver())
-	assert.Equal(t, reason, p.lines()[0].Reason)
-	a.Close()
-}
-
 // The file sits in world-writable /tmp and its strings reach markdown: a
 // planted newline must not start a new line.
 func TestPostures_ReadSanitizes(t *testing.T) {

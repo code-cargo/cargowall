@@ -20,8 +20,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestParseCgroupV2Path(t *testing.T) {
@@ -49,14 +52,16 @@ func TestHookScope(t *testing.T) {
 	foreign := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace"}
 	hidden := Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
 	unknownD := Dockerd{Kind: DockerdUnknown, Reason: "dial: timeout"}
-	// Both helpers have the mount proven, so each case is decided by the
-	// fact it names.
+	// Both helpers have the mount proven on a current kernel, so each case
+	// is decided by the fact it names.
+	const kernel = "6.17.0-1022-azure"
 	host := func(path string, pidns PidNS, d Dockerd) Shape {
-		return Shape{CgroupNS: CgroupNSHost, CgroupPath: path, CgroupMount: CgroupMountOurs, PidNS: pidns, Dockerd: d}
+		return Shape{CgroupNS: CgroupNSHost, CgroupPath: path, CgroupMount: CgroupMountOurs, PidNS: pidns, Dockerd: d, Kernel: kernel}
 	}
 	private := func(d Dockerd) Shape {
-		return Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", CgroupMount: CgroupMountOurs, PidNS: PidNSPrivate, Dockerd: d}
+		return Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", CgroupMount: CgroupMountOurs, PidNS: PidNSPrivate, Dockerd: d, Kernel: kernel}
 	}
+	onKernel := func(k string) func(*Shape) { return func(s *Shape) { s.Kernel = k } }
 	with := func(s Shape, f func(*Shape)) Shape { f(&s); return s }
 	remoteDaemon := func(s *Shape) { s.DockerHost = "tcp://localhost:2376" }
 	cases := []struct {
@@ -74,6 +79,15 @@ func TestHookScope(t *testing.T) {
 		{"privileged pod, dind not sharing the pid namespace", host(pod, PidNSPrivate, hidden), false, false},
 		{"privileged pod, daemon unidentified", host(pod, PidNSPrivate, unknownD), false, false},
 		{"privileged container outside Kubernetes", host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, true},
+		// Scoped, a socket's cgroup must be whose it is, which 5.14 and
+		// older can stop tracking. Unscoped, the hook judges every socket
+		// under the attach point whatever its cgroup.
+		{"privileged pod on 5.15", with(host(pod, PidNSPrivate, foreign), onKernel("5.15.0-1084-aws")), true, true},
+		{"privileged pod on 5.14", with(host(pod, PidNSPrivate, foreign), onKernel("5.14.21")), false, false},
+		{"privileged pod on 5.10", with(host(pod, PidNSPrivate, foreign), onKernel("5.10.240-238.959.amzn2.x86_64")), false, false},
+		{"privileged pod, kernel unread", with(host(pod, PidNSPrivate, foreign), onKernel("")), false, false},
+		{"hosted runner on 5.10", with(host(runner, PidNSHost, local), onKernel("5.10.0")), true, false},
+		{"private cgroupns on 5.10", with(private(local), onKernel("5.10.0")), true, false},
 		// The host's daemon, through its socket, starts containers outside
 		// our pid namespace, which the scope never reaches.
 		{"privileged container outside Kubernetes, the host's dockerd", host("/system.slice/docker-a.scope", PidNSPrivate, hidden), false, false},
@@ -130,8 +144,35 @@ func TestDetect_Namespaces(t *testing.T) {
 	if s.CgroupNS == CgroupNSUnknown || s.PidNS == PidNSUnknown {
 		t.Fatalf("Detect() = %+v, want both namespaces identified", s)
 	}
+	if s.Kernel == "" {
+		t.Fatalf("Detect() read no kernel release")
+	}
+	// The mount can only be ours where /sys/fs/cgroup is the unified
+	// hierarchy itself, not a v1 or hybrid layout.
+	var fs unix.Statfs_t
+	if err := unix.Statfs(cgroupRoot, &fs); err != nil || fs.Type != unix.CGROUP2_SUPER_MAGIC {
+		t.Skipf("%s is not a cgroup2 mount here; the mount check has nothing to prove", cgroupRoot)
+	}
 	if s.CgroupMount != CgroupMountOurs {
 		t.Fatalf("Detect() cgroup mount = %v (%s), want ours", s.CgroupMount, s.CgroupMountReason)
+	}
+}
+
+func TestPidNamespaceInode_MatchesProcLink(t *testing.T) {
+	got, err := PidNamespaceInode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(link, "pid:["), "]"), 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uint32(want) != got {
+		t.Fatalf("PidNamespaceInode() = %d, want %d from %s", got, want, link)
 	}
 }
 

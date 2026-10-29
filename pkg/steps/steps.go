@@ -20,16 +20,7 @@
 // monotonically increasing ordinal, every other fork inherits the forking
 // thread's tag, and the cgroup hooks copy the tag onto each socket cookie —
 // so every TC event carries the step that (transitively) created its socket.
-// Attribution only: no verdict consults these maps, with one exception.
-// map_scope_cgroups (Options.ScopeCgroups) is the set of cgroups whose
-// sockets the cgroup egress hook judges when it sits at a cgroup root other
-// pods share, and a socket in any other cgroup passes the hook. It is
-// written here because the fork tracepoint and the task walk that know our
-// pid namespace live here, and they record before the hook attaches; the
-// origin collection loads it in place of its own stand-in (ScopeCgroups).
-// Close must not assume the hook is gone: start.go closes the observer
-// first and the origin collection holds its own reference to the map, but
-// nothing here may clear or reshape it while the hook might still read it.
+// Attribution only: no verdict consults these maps.
 //
 // Pid numbering: the kernel side keys everything by global (init-namespace)
 // ids; everything this package reads from /proc — the worker pid, the
@@ -53,7 +44,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode/utf8"
 	"unsafe"
@@ -65,6 +55,7 @@ import (
 	"github.com/code-cargo/cargowall/bpf"
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 	"github.com/code-cargo/cargowall/pkg/events"
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // workerComm is the /proc/<pid>/comm value of the GitHub Actions runner's
@@ -89,17 +80,7 @@ type Options struct {
 	// correlation happens downstream by matching step_boundary cmdlines,
 	// never by assuming ordinal == plan index.
 	OrdinalBase uint64
-	// ScopeCgroups records every cgroup a task in our pid namespace
-	// occupies, for a cgroup egress hook that must judge only those
-	// cgroups' sockets (ScopeCgroups).
-	ScopeCgroups bool
 }
-
-// scopeCgroupsCapacity sizes map_scope_cgroups when recording. An entry is
-// a cgroup this job's tasks have occupied, so the bound is on containers
-// started in one run, not sockets; past it the LRU forgets the least
-// recently used.
-const scopeCgroupsCapacity = 65536
 
 // maxOrdinalBase bounds --step-ordinal-base away from the reserved
 // StepOrdinal* sentinels: the kernel increments a u64 counter but truncates
@@ -121,7 +102,6 @@ type Tracker struct {
 	stateMap      *ebpf.Map
 	taskMap       *ebpf.Map
 	nspidMap      *ebpf.Map // map_task_nspid; cleared at Close, see there
-	scopeCgroups  bool      // Options.ScopeCgroups
 	auditLogger   *events.AuditLogger
 	logger        *slog.Logger
 	done          chan struct{}
@@ -174,7 +154,7 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 	// this package (the worker pid above, seeding, container leaders) is
 	// numbered in it; the kernel numbers tasks globally. Identical on a
 	// plain VM, different inside a container (ARC runners).
-	pidnsIno, err := pidNamespaceInode()
+	pidnsIno, err := podenv.PidNamespaceInode()
 	if err != nil {
 		return nil, err
 	}
@@ -188,20 +168,9 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 	} else if err := v.Set(pidnsIno); err != nil {
 		return nil, fmt.Errorf("failed to set pidns_ino: %w", err)
 	}
-	if opts.ScopeCgroups {
-		v, m := spec.Variables[bpf.StepBpfVarScopeCgroups], spec.Maps[bpf.StepBpfMapMapScopeCgroups]
-		if v == nil || m == nil {
-			return nil, errors.New("step BPF spec has no scope_cgroups variable or map (stale generated code)")
-		}
-		if err := v.Set(uint8(1)); err != nil {
-			return nil, fmt.Errorf("failed to set scope_cgroups: %w", err)
-		}
-		m.MaxEntries = scopeCgroupsCapacity
-	}
 
 	t := &Tracker{
-		workerPID:    workerPID,
-		scopeCgroups: opts.ScopeCgroups,
+		workerPID: workerPID,
 		// Snapshot the worker's argv so the reconciler can detect a
 		// pre-exec cmdline read (the child briefly shares/copies it).
 		workerCmdline: readCmdline(workerPID),
@@ -253,7 +222,7 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		return nil, fmt.Errorf("%s pid %d is not visible to the task iterator", workerComm, workerPID)
 	}
 	t.workerTgid = workerTgid
-	if pidnsIno != initPidNamespaceInode {
+	if pidnsIno != podenv.InitPidNamespace {
 		logger.Info("Running inside a pid namespace; translating task ids",
 			"pidns_ino", pidnsIno, "worker_pid", workerPID, "worker_tgid", workerTgid)
 	}
@@ -294,22 +263,10 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 // WorkerPID returns the Runner.Worker process ID being tracked.
 func (t *Tracker) WorkerPID() int { return t.workerPID }
 
-// ScopeCgroups returns the map of cgroups tasks in our pid namespace have
-// occupied, or nil when the tracker was not asked to record them
-// (Options.ScopeCgroups). The cgroup egress hook loads it in place of its
-// own to judge only those cgroups' sockets.
-func (t *Tracker) ScopeCgroups() *ebpf.Map {
-	if !t.scopeCgroups {
-		return nil
-	}
-	return t.objs.MapScopeCgroups
-}
-
 // Close disables tagging, detaches the programs, and stops the reconciler,
 // waiting for an in-flight boundary event to finish writing before returning
 // so the audit logger (whose deferred Close runs after ours) is still alive
-// for it. It leaves map_scope_cgroups as it is: the egress hook may still
-// be reading it (see the package comment).
+// for it.
 func (t *Tracker) Close() {
 	// Best-effort disable so the tcbpf-side hooks stop tagging immediately,
 	// even though the collection below is about to go away anyway.
@@ -370,19 +327,6 @@ func (t *Tracker) attach() error {
 		return fmt.Errorf("failed to attach sched_process_exit: %w", err)
 	}
 	t.links = append(t.links, exitLink)
-
-	// Before the task walk, so a task that moves while the walk runs is
-	// recorded by one or the other.
-	if t.scopeCgroups {
-		attachLink, err := link.AttachTracing(link.TracingOptions{
-			Program:    t.objs.StepCgroupAttach,
-			AttachType: ebpf.AttachTraceRawTp,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to attach cgroup_attach_task: %w", err)
-		}
-		t.links = append(t.links, attachLink)
-	}
 
 	// Same root-cgroup attachment rationale as the connect/sendmsg hooks in
 	// StartCargoWall: tag socket creation for every process on the machine.
@@ -520,25 +464,6 @@ func (t *Tracker) resolve(pid int) (*procSnapshot, uint32, bool) {
 		return nil, 0, false // exited mid-flight, or not numbered in our namespace
 	}
 	return snap, leader, true
-}
-
-// initPidNamespaceInode is PROC_PID_INIT_INO, the fixed nsfs inode of the
-// initial pid namespace — what a plain VM sees; anything else means the
-// daemon is inside a container.
-const initPidNamespaceInode uint32 = 0xEFFFFFFC
-
-// pidNamespaceInode identifies the daemon's pid namespace the way the
-// kernel does (ns_common.inum), for the step_task_iter/step_fork walk.
-func pidNamespaceInode() (uint32, error) {
-	fi, err := os.Stat("/proc/self/ns/pid")
-	if err != nil {
-		return 0, fmt.Errorf("failed to stat pid namespace: %w", err)
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, errors.New("pid namespace stat has no inode")
-	}
-	return uint32(st.Ino), nil
 }
 
 // procSnapshot is one pass of the step_task_iter walk: every task in the

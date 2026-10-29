@@ -77,7 +77,8 @@ func attachScopeTracing(t *testing.T, p *ebpf.Program) {
 	t.Cleanup(func() { l.Close() })
 }
 
-// runScopeWalk runs the startup walk and returns the cgroup ids it lists.
+// runScopeWalk runs the startup walk and returns the cgroup ids it lists,
+// from records of a cgroup id and a process id.
 func runScopeWalk(t *testing.T, objs *ScopeBpfObjects) map[uint64]bool {
 	t.Helper()
 	it, err := link.AttachIter(link.IterOptions{Program: objs.ScopeTaskIter})
@@ -88,9 +89,10 @@ func runScopeWalk(t *testing.T, objs *ScopeBpfObjects) map[uint64]bool {
 	defer rd.Close()
 	out, err := io.ReadAll(rd)
 	require.NoError(t, err)
-	require.Zero(t, len(out)%8, "the walk writes whole cgroup ids")
+	require.Zero(t, len(out)%16, "the walk writes whole records")
 	ids := make(map[uint64]bool)
-	for i := 0; i < len(out); i += 8 {
+	for i := 0; i < len(out); i += 16 {
+		require.NotZero(t, binary.NativeEndian.Uint64(out[i+8:]), "each record names its process")
 		ids[binary.NativeEndian.Uint64(out[i:])] = true
 	}
 	return ids
@@ -397,6 +399,66 @@ func TestScopeIgnoresARuntimesCgroup(t *testing.T) {
 
 	moveInto(t, container, pid)
 	require.True(t, scopeRecorded(t, objs, container), "the cgroup it then moves into")
+}
+
+// A released cgroup leaves the map, which is when nothing can carry its id
+// again: not at removal, while a socket made in it is still open, but once
+// that socket is gone too.
+func TestScopeReleaseForgetsCgroups(t *testing.T) {
+	requireBPF(t)
+	objs := loadScope(t, pidnsInode(t), 0)
+	attachScopeTracing(t, objs.ScopeRelease)
+	recorded := func(id uint64) bool {
+		var v uint8
+		return objs.MapScopeCgroups.Lookup(id, &v) == nil
+	}
+	root := enterTestCgroup(t)
+	made := func(name string) (string, uint64) {
+		dir := filepath.Join(root, name)
+		require.NoError(t, os.Mkdir(dir, 0o755))
+		t.Cleanup(func() { _ = os.Remove(dir) })
+		id := cgroupID(t, dir)
+		require.NoError(t, objs.MapScopeCgroups.Put(id, uint8(1)))
+		return dir, id
+	}
+
+	empty, emptyID := made("empty")
+	require.NoError(t, os.Remove(empty))
+	require.Eventually(t, func() bool { return !recorded(emptyID) }, 5*time.Second, 20*time.Millisecond,
+		"a removed cgroup with nothing in it is released and forgotten")
+
+	held, heldID := made("held")
+	moveSelf(t, held)
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0))
+	require.NoError(t, os.Remove(held))
+	time.Sleep(500 * time.Millisecond)
+	require.True(t, recorded(heldID), "a removed cgroup a socket was made in stays while the socket is open")
+	require.NoError(t, unix.Close(fd))
+	require.Eventually(t, func() bool { return !recorded(heldID) }, 5*time.Second, 20*time.Millisecond,
+		"and is forgotten once the socket is gone")
+
+	// The default hierarchy only: a v1 cgroup's id can repeat a v2 one's,
+	// so the release of a cgroup in a v1 hierarchy (a named one, with no
+	// controllers) must leave an entry with its id alone. A v2 cgroup
+	// released alongside shows the releases have run.
+	mnt := t.TempDir()
+	if err := unix.Mount("cgroup", mnt, "cgroup", 0, "none,name=cargowall-test"); err != nil {
+		t.Skipf("cannot mount a v1 hierarchy: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(mnt, 0) })
+	v1 := filepath.Join(mnt, "v1")
+	require.NoError(t, os.Mkdir(v1, 0o755))
+	t.Cleanup(func() { _ = os.Remove(v1) })
+	v1ID := cgroupID(t, v1)
+	require.NoError(t, objs.MapScopeCgroups.Put(v1ID, uint8(1)))
+	v2, v2ID := made("v2")
+	require.NoError(t, os.Remove(v1))
+	require.NoError(t, os.Remove(v2))
+	require.Eventually(t, func() bool { return !recorded(v2ID) }, 5*time.Second, 20*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
+	require.True(t, recorded(v1ID), "a v1 cgroup's release deletes nothing")
 }
 
 // A cgroup that finds the map full is counted, not recorded.

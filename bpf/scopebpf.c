@@ -24,8 +24,8 @@
 // it for the job (an MPTCP subflow takes its parent's cgroup, an SMC
 // connection's TCP socket is made in the caller's context), or it predates
 // cargowall. This collection records the entered cgroups in
-// map_scope_cgroups, which pkg/origin loads into the origin collection in
-// place of its stand-in. It is its own collection, loaded only in that
+// map_scope_cgroups, and forgets each when it is released, which
+// pkg/origin loads into the origin collection in place of its stand-in. It is its own collection, loaded only in that
 // shape, so a failure here costs the scope and nothing else.
 //
 // A cgroup is recorded once a task of ours enters it: moves there
@@ -57,8 +57,8 @@ const volatile __u32 pidns_ino = 0;
 #define CLONE_INTO_CGROUP 0x200000000ULL
 
 // Cgroup v2 ids a task of ours has entered, and those the startup walk
-// found only our tasks in. Cgroup ids are never reused, so an entry that
-// outlives its cgroup is harmless and nothing deletes one. A
+// found only our tasks in. An entry lives until its cgroup is released
+// (scope_release), which is after every socket made in it is gone. A
 // hash, not an LRU: nothing is ever evicted, and a cgroup that finds the
 // map full is counted (SCOPE_STAT_FULL) instead of displacing another.
 struct {
@@ -95,20 +95,28 @@ static __always_inline struct cgroup *dfl_cgroup(struct task_struct *t)
     return BPF_CORE_READ(t, cgroups, dfl_cgrp);
 }
 
-// scope_enter records cg, which a task of ours has entered. The root cgroup
-// holds the kernel's own sockets and the node's, never a pod's alone, so it
-// is counted rather than recorded: a task of ours there (one that moved
-// itself, which takes privilege) has sockets the hook never judges. The
-// lookup first keeps an existing cgroup from costing a write.
-static __always_inline void scope_enter(struct cgroup *cg)
+// scope_id is cg's id for the scope, or 0 for none. The root cgroup holds
+// the kernel's own sockets and the node's, never a pod's alone, so it is
+// never in scope, and a task of ours there (one that moved itself, which
+// takes privilege) is counted: its sockets are never judged.
+static __always_inline __u64 scope_id(struct cgroup *cg)
 {
     if (!cg)
-        return;
+        return 0;
     if (BPF_CORE_READ(cg, level) == 0) {
         scope_count(SCOPE_STAT_ROOT);
-        return;
+        return 0;
     }
-    __u64 id = BPF_CORE_READ(cg, kn, id);
+    return BPF_CORE_READ(cg, kn, id);
+}
+
+// scope_enter records cg, which a task of ours has entered. The lookup
+// first keeps an existing cgroup from costing a write.
+static __always_inline void scope_enter(struct cgroup *cg)
+{
+    __u64 id = scope_id(cg);
+    if (!id)
+        return;
     if (bpf_map_lookup_elem(&map_scope_cgroups, &id))
         return;
     __u8 one = 1;
@@ -148,30 +156,42 @@ int BPF_PROG(scope_attach, struct cgroup *dst, const char *path,
     return 0;
 }
 
+// A cgroup being freed: its last task and its last socket are gone, so
+// no packet can carry its id again, and cgroup ids are never reused. Fires
+// for every hierarchy, and v1 ids can repeat v2 ones, so only the default
+// hierarchy's are ours to delete.
+SEC("tp_btf/cgroup_release")
+int BPF_PROG(scope_release, struct cgroup *cg, const char *path)
+{
+    if (BPF_CORE_READ(cg, root, hierarchy_id) != 0)
+        return 0;
+    __u64 id = BPF_CORE_READ(cg, kn, id);
+    bpf_map_delete_elem(&map_scope_cgroups, &id);
+    return 0;
+}
+
 // The startup walk, run by pkg/origin after the tracepoints attach and
 // before the hook does, for tasks that entered their cgroup before
 // cargowall started. It records nothing, because a task's cgroup does not
 // say whether it entered it: a job left running by a shell someone
 // nsenter'd into our pid namespace from a node daemon's cgroup is still in
-// that cgroup, adopted by our namespace's init. It writes the cgroup id of
-// each task of ours to the iterator's output instead, and pkg/origin
-// records each one that no task outside our pid namespace is in. The
-// kernel scopes the walk to the opener's pid namespace.
+// that cgroup, adopted by our namespace's init. It writes each task of
+// ours to the iterator's output instead, as its cgroup id and its process
+// id in our namespace, two u64s, and pkg/origin records each cgroup that
+// no task outside our pid namespace is in. The kernel scopes the walk to
+// the opener's pid namespace.
 SEC("iter/task")
 int scope_task_iter(struct bpf_iter__task *ctx)
 {
     struct task_struct *t = ctx->task;
-    if (!t || !ns_tgid_of(t))
+    if (!t)
         return 0;
-    struct cgroup *cg = dfl_cgroup(t);
-    if (!cg)
+    __u32 tgid = ns_tgid_of(t);
+    if (!tgid)
         return 0;
-    if (BPF_CORE_READ(cg, level) == 0) {
-        scope_count(SCOPE_STAT_ROOT);
-        return 0;
-    }
-    __u64 id = BPF_CORE_READ(cg, kn, id);
-    bpf_seq_write(ctx->meta->seq, &id, sizeof(id));
+    __u64 rec[2] = {scope_id(dfl_cgroup(t)), tgid};
+    if (rec[0])
+        bpf_seq_write(ctx->meta->seq, rec, sizeof(rec));
     return 0;
 }
 

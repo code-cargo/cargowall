@@ -47,9 +47,6 @@ const (
 	scopeStatsMax
 )
 
-// cgroupRoot is the machine's cgroup tree in the scoped shape.
-const cgroupRoot = "/sys/fs/cgroup"
-
 // scopeStatsInterval is how often podScope checks what it could not record.
 const scopeStatsInterval = 10 * time.Second
 
@@ -84,7 +81,7 @@ func setScope(spec *ebpf.CollectionSpec, podCgroup string) error {
 	}
 	// A cgroup's id is its cgroupfs inode on 64-bit kernels, and its level
 	// its depth below the root.
-	fi, err := os.Stat(filepath.Join(cgroupRoot, podCgroup))
+	fi, err := os.Stat(filepath.Join(podenv.CgroupRoot, podCgroup))
 	if err != nil {
 		return fmt.Errorf("pod cgroup: %w", err)
 	}
@@ -101,10 +98,11 @@ func setScope(spec *ebpf.CollectionSpec, podCgroup string) error {
 // startPodScope loads the scope collection for our pid namespace, attaches
 // its tracepoints, then walks the tasks that predate them, so a task that
 // enters a cgroup while the walk runs is recorded by one or the other.
+// podCgroup is our pod's cgroup, which the hook judges whole, or "".
 // The verifier logs only its statistics, as for the origin collection: a
 // branch-level log of each program would be kept for the life of the
 // process.
-func startPodScope(logger *slog.Logger) (*podScope, error) {
+func startPodScope(logger *slog.Logger, podCgroup string) (*podScope, error) {
 	ino, err := podenv.PidNamespaceInode()
 	if err != nil {
 		return nil, fmt.Errorf("pod scope: %w", err)
@@ -124,7 +122,7 @@ func startPodScope(logger *slog.Logger) (*podScope, error) {
 	}, &s.objs); err != nil {
 		return nil, fmt.Errorf("pod scope: failed to load BPF objects: %w", err)
 	}
-	for _, p := range []*ebpf.Program{s.objs.ScopeFork, s.objs.ScopeAttach} {
+	for _, p := range []*ebpf.Program{s.objs.ScopeFork, s.objs.ScopeAttach, s.objs.ScopeRelease} {
 		l, err := link.AttachTracing(link.TracingOptions{Program: p, AttachType: ebpf.AttachTraceRawTp})
 		if err != nil {
 			s.release()
@@ -132,7 +130,7 @@ func startPodScope(logger *slog.Logger) (*podScope, error) {
 		}
 		s.links = append(s.links, l)
 	}
-	if err := s.walk(); err != nil {
+	if err := s.walk(podCgroup); err != nil {
 		s.release()
 		return nil, fmt.Errorf("pod scope: task walk: %w", err)
 	}
@@ -143,34 +141,40 @@ func startPodScope(logger *slog.Logger) (*podScope, error) {
 // cgroups is the map the scoped hook loads in place of its stand-in.
 func (s *podScope) cgroups() *ebpf.Map { return s.objs.MapScopeCgroups }
 
-// walk records each cgroup the startup walk lists, our tasks' cgroups,
-// that no task outside our pid namespace is in. A task's cgroup does not
-// say it entered it. A task of ours in the same cgroup as a node daemon or
-// another pod's task was left there (a job an nsenter'd shell started) or
-// is about to be moved out (a runtime's exec), and recording that cgroup
-// would judge the daemon or the pod. Such a cgroup is reported and left
-// out, and the task's sockets pass. The check reads cgroup.threads, which
-// numbers each task as our pid namespace does, so a task outside it reads
-// as 0.
-func (s *podScope) walk() error {
-	ids, err := s.walkCgroups()
-	if err != nil || len(ids) == 0 {
-		return err
-	}
-	paths, err := cgroupPaths(cgroupRoot)
+// walk records the cgroups the startup walk lists, our tasks' cgroups,
+// that are this job's alone: outside our pod's cgroup, which the hook
+// judges whole, and holding no task outside our pid namespace. A task's
+// cgroup does not say it entered it. A task of ours in the same cgroup as
+// a node daemon or another pod's task was left there (a job an nsenter'd
+// shell started) or is about to be moved out (a runtime's exec), and
+// recording that cgroup would judge the daemon or the pod. Such a cgroup is
+// reported and left out, and the task's sockets pass. The check reads
+// cgroup.threads, which numbers each task as our pid namespace does, so a
+// task outside it reads as 0. The walk must list this process's own
+// cgroup: one that lists none of ours would leave the scope empty while
+// the hook reports it attached.
+func (s *podScope) walk(podCgroup string) error {
+	tasks, err := s.walkTasks()
 	if err != nil {
 		return err
 	}
-	for id := range ids {
-		path, ok := paths[id]
-		if !ok {
-			continue // removed since the walk
+	own, err := podenv.ReadCgroupPath("/proc/self/cgroup")
+	if err != nil {
+		return err
+	}
+	if _, ok := tasks[cgroupID(own)]; !ok {
+		return fmt.Errorf("the task walk did not list this process's cgroup %s", own)
+	}
+	for id, tgids := range tasks {
+		path, ok := cgroupPathOf(id, tgids)
+		if !ok || under(path, podCgroup) {
+			continue // its tasks have gone (a move was recorded), or the pod's cgroup covers it
 		}
-		shared, err := sharedCgroup(filepath.Join(cgroupRoot, path))
+		shared, err := sharedCgroup(filepath.Join(podenv.CgroupRoot, path))
+		if cgroupGone(err) {
+			continue
+		}
 		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				continue
-			}
 			return err
 		}
 		if shared {
@@ -178,16 +182,22 @@ func (s *podScope) walk() error {
 				"where its sockets pass the cgroup hook", "cgroup", path)
 			continue
 		}
+		// As in the kernel, a cgroup the map cannot take costs its own
+		// sockets, not the scope. One released since the walk listed it
+		// stays, a dead id: ids are never reused.
 		if err := s.objs.MapScopeCgroups.Update(id, uint8(1), ebpf.UpdateNoExist); err != nil &&
 			!errors.Is(err, ebpf.ErrKeyExist) {
-			return fmt.Errorf("recording cgroup %s: %w", path, err)
+			s.logger.Warn("Container egress scope could not record a cgroup this job is in, "+
+				"and its sockets pass the cgroup hook", "cgroup", path, "error", err,
+				"capacity", s.objs.MapScopeCgroups.MaxEntries())
 		}
 	}
 	return nil
 }
 
-// walkCgroups runs the task walk and returns the cgroup ids it wrote.
-func (s *podScope) walkCgroups() (map[uint64]struct{}, error) {
+// walkTasks runs the task walk and returns, for each cgroup id it listed,
+// the processes (as numbered in our pid namespace) it listed there.
+func (s *podScope) walkTasks() (map[uint64]map[uint32]bool, error) {
 	it, err := link.AttachIter(link.IterOptions{Program: s.objs.ScopeTaskIter})
 	if err != nil {
 		return nil, err
@@ -202,40 +212,59 @@ func (s *podScope) walkCgroups() (map[uint64]struct{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(out)%8 != 0 {
-		return nil, fmt.Errorf("task walk wrote %d bytes, not a whole number of cgroup ids", len(out))
+	if len(out)%16 != 0 {
+		return nil, fmt.Errorf("task walk wrote %d bytes, not a whole number of records", len(out))
 	}
-	ids := make(map[uint64]struct{})
-	for i := 0; i < len(out); i += 8 {
-		ids[binary.NativeEndian.Uint64(out[i:])] = struct{}{}
+	tasks := make(map[uint64]map[uint32]bool)
+	for i := 0; i < len(out); i += 16 {
+		id, tgid := binary.NativeEndian.Uint64(out[i:]), uint32(binary.NativeEndian.Uint64(out[i+8:]))
+		if tasks[id] == nil {
+			tasks[id] = make(map[uint32]bool)
+		}
+		tasks[id][tgid] = true
 	}
-	return ids, nil
+	return tasks, nil
 }
 
-// cgroupPaths maps each cgroup under root to its path below it, by id: a
-// cgroup's id is its cgroupfs inode on 64-bit kernels. A cgroup removed
-// while the tree is read is left out.
-func cgroupPaths(root string) (map[uint64]string, error) {
-	paths := make(map[uint64]string)
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if path == root {
-				return err
+// cgroupPathOf finds the path of cgroup id through a process the walk
+// listed in it: the process's own cgroup or, when that is no longer id
+// (the process has moved, or the task was a thread in a cgroup of its
+// own), one of its threads'. False when none of them is there now.
+func cgroupPathOf(id uint64, tgids map[uint32]bool) (string, bool) {
+	for tgid := range tgids {
+		proc := fmt.Sprintf("/proc/%d", tgid)
+		if path, err := podenv.ReadCgroupPath(proc + "/cgroup"); err == nil && cgroupID(path) == id {
+			return path, true
+		}
+		threads, _ := filepath.Glob(proc + "/task/*/cgroup")
+		for _, f := range threads {
+			if path, err := podenv.ReadCgroupPath(f); err == nil && cgroupID(path) == id {
+				return path, true
 			}
-			return nil
 		}
-		if !d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		rel, _ := filepath.Rel(root, path)
-		paths[info.Sys().(*syscall.Stat_t).Ino] = "/" + strings.TrimPrefix(rel, ".")
-		return nil
-	})
-	return paths, err
+	}
+	return "", false
+}
+
+// cgroupID is the id of the cgroup at path, its cgroupfs inode on 64-bit
+// kernels, or 0 when it cannot be read.
+func cgroupID(path string) uint64 {
+	fi, err := os.Stat(filepath.Join(podenv.CgroupRoot, path))
+	if err != nil {
+		return 0
+	}
+	return fi.Sys().(*syscall.Stat_t).Ino
+}
+
+// under reports whether the cgroup at path is pod's or below it.
+func under(path, pod string) bool {
+	return pod != "" && (path == pod || strings.HasPrefix(path, pod+"/"))
+}
+
+// cgroupGone reports whether err says the cgroup was removed: a file of a
+// removed cgroup is missing, or, opened before the removal, reads ENODEV.
+func cgroupGone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENODEV)
 }
 
 // sharedCgroup reports whether the cgroup at dir holds a task outside our

@@ -541,7 +541,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		l, err := link.AttachCgroup(link.CgroupOptions{
 			// Root cgroup: cargowall is a host-level firewall, so we attach to the
 			// root cgroup to capture PID info for all processes on the machine.
-			Path:    "/sys/fs/cgroup",
+			Path:    podenv.CgroupRoot,
 			Attach:  cp.attach,
 			Program: cp.prog,
 		})

@@ -33,6 +33,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/code-cargo/cargowall/bpf"
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // TestScopeStatSlotsMatchKernel pins podScope's stat slots to
@@ -75,31 +78,35 @@ func TestSharedCgroup(t *testing.T) {
 	require.True(t, errors.Is(err, fs.ErrNotExist), "a removed cgroup: %v", err)
 }
 
-// cgroupPaths names every directory under the root by its inode, the
-// cgroup id a 64-bit kernel reports.
-func TestCgroupPaths(t *testing.T) {
-	root := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "kubepods.slice", "pod.slice"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "kubepods.slice", "cgroup.threads"), nil, 0o644))
-	paths, err := cgroupPaths(root)
-	require.NoError(t, err)
-	ino := func(rel string) uint64 {
-		fi, err := os.Stat(filepath.Join(root, rel))
-		require.NoError(t, err)
-		return fi.Sys().(*syscall.Stat_t).Ino
+// A cgroup removed during the walk is skipped, not an error: its files are
+// missing, or, opened before the removal, read ENODEV.
+func TestCgroupGone(t *testing.T) {
+	for err, want := range map[error]bool{
+		&fs.PathError{Op: "open", Path: "x", Err: syscall.ENOENT}: true,
+		&fs.PathError{Op: "read", Path: "x", Err: syscall.ENODEV}: true,
+		&fs.PathError{Op: "open", Path: "x", Err: syscall.EACCES}: false,
+		nil: false,
+	} {
+		require.Equal(t, want, cgroupGone(err), "%v", err)
 	}
-	require.Equal(t, map[uint64]string{
-		ino("."):                        "/",
-		ino("kubepods.slice"):           "/kubepods.slice",
-		ino("kubepods.slice/pod.slice"): "/kubepods.slice/pod.slice",
-	}, paths)
+}
+
+func TestUnder(t *testing.T) {
+	const pod = "/kubepods.slice/kubepods-pod1.slice"
+	require.True(t, under(pod, pod))
+	require.True(t, under(pod+"/cri-containerd-a.scope", pod))
+	require.False(t, under(pod+"x/cri-containerd-a.scope", pod), "a sibling whose name extends the pod's")
+	require.False(t, under("/docker/a", pod))
+	require.False(t, under(pod, ""), "no pod cgroup covers nothing")
 }
 
 // The startup walk, run from our own pid namespace as in a pod, records a
-// cgroup only our tasks are in and leaves out one that a task outside the
-// namespace is in too: there, a task of ours was left in a node daemon's
-// cgroup, which recording would judge. The outer test makes that cgroup
-// and its foreign task; the inner one runs in a new pid namespace.
+// cgroup only our tasks are in, whatever its name, and leaves out one that
+// a task outside the namespace is in too: there, a task of ours was left
+// in a node daemon's cgroup, which recording would judge. A cgroup under
+// the pod's is left out silently, shared or not: the hook judges it as the
+// pod's. The outer test makes the cgroups and the foreign tasks; the inner
+// one runs in a new pid namespace.
 func TestPodScopeWalkLeavesSharedCgroups(t *testing.T) {
 	requireBPFOrigin(t)
 	unshare, err := exec.LookPath("unshare")
@@ -107,24 +114,27 @@ func TestPodScopeWalkLeavesSharedCgroups(t *testing.T) {
 		t.Skip("unshare not available")
 	}
 	dir := fmt.Sprintf("/sys/fs/cgroup/cargowall-origin-test-%d", os.Getpid())
-	shared := filepath.Join(dir, "shared")
-	for _, d := range []string{dir, shared, filepath.Join(dir, "own")} {
+	pod := filepath.Join(dir, "pod")
+	cgroups := []string{dir, filepath.Join(dir, "shared"), filepath.Join(dir, ".own"), pod, filepath.Join(pod, "shared")}
+	for _, d := range cgroups {
 		require.NoError(t, os.Mkdir(d, 0o755))
 	}
 	t.Cleanup(func() {
-		for _, d := range []string{shared, filepath.Join(dir, "own"), dir} {
-			for i := 0; i < 50 && os.Remove(d) != nil; i++ {
+		for i := len(cgroups) - 1; i >= 0; i-- {
+			for j := 0; j < 50 && os.Remove(cgroups[i]) != nil; j++ {
 				time.Sleep(20 * time.Millisecond)
 			}
 		}
 	})
-	daemon := exec.Command("sleep", "60")
-	require.NoError(t, daemon.Start())
-	t.Cleanup(func() {
-		_ = daemon.Process.Kill()
-		_ = daemon.Wait()
-	})
-	require.NoError(t, os.WriteFile(filepath.Join(shared, "cgroup.procs"), []byte(strconv.Itoa(daemon.Process.Pid)), 0))
+	for _, cg := range []string{filepath.Join(dir, "shared"), filepath.Join(pod, "shared")} {
+		daemon := exec.Command("sleep", "60")
+		require.NoError(t, daemon.Start())
+		t.Cleanup(func() {
+			_ = daemon.Process.Kill()
+			_ = daemon.Wait()
+		})
+		require.NoError(t, os.WriteFile(filepath.Join(cg, "cgroup.procs"), []byte(strconv.Itoa(daemon.Process.Pid)), 0))
+	}
 
 	cmd := exec.Command(unshare, "--pid", "--fork", "--mount-proc",
 		os.Args[0], "-test.run", "^TestPodScopeWalkInner$", "-test.v")
@@ -143,30 +153,67 @@ func TestPodScopeWalkInner(t *testing.T) {
 		t.Skip("run by TestPodScopeWalkLeavesSharedCgroups")
 	}
 	requireBPFOrigin(t)
-	ours := func(cgroup string) {
+	shared, own := filepath.Join(dir, "shared"), filepath.Join(dir, ".own")
+	pod := filepath.Join(dir, "pod")
+	for _, cg := range []string{shared, own, filepath.Join(pod, "shared")} {
 		c := exec.Command("sleep", "60")
 		require.NoError(t, c.Start())
 		t.Cleanup(func() {
 			_ = c.Process.Kill()
 			_ = c.Wait()
 		})
-		require.NoError(t, os.WriteFile(filepath.Join(cgroup, "cgroup.procs"), []byte(strconv.Itoa(c.Process.Pid)), 0))
+		require.NoError(t, os.WriteFile(filepath.Join(cg, "cgroup.procs"), []byte(strconv.Itoa(c.Process.Pid)), 0))
 	}
-	shared, own := filepath.Join(dir, "shared"), filepath.Join(dir, "own")
-	ours(shared)
-	ours(own)
 
 	var log bytes.Buffer
-	s, err := startPodScope(slog.New(slog.NewTextHandler(&log, nil)))
+	s, err := startPodScope(slog.New(slog.NewTextHandler(&log, nil)), strings.TrimPrefix(pod, podenv.CgroupRoot))
 	require.NoError(t, err)
 	t.Cleanup(s.close)
 	recorded := func(path string) bool {
-		fi, err := os.Stat(path)
-		require.NoError(t, err)
 		var v uint8
-		return s.cgroups().Lookup(fi.Sys().(*syscall.Stat_t).Ino, &v) == nil
+		return s.cgroups().Lookup(cgroupID(strings.TrimPrefix(path, podenv.CgroupRoot)), &v) == nil
 	}
-	require.True(t, recorded(own), "a cgroup only our tasks are in")
+	require.True(t, recorded(own), "a cgroup only our tasks are in, its name starting with a dot")
 	require.False(t, recorded(shared), "a cgroup a task outside our pid namespace is in too")
-	require.Contains(t, log.String(), strings.TrimPrefix(shared, cgroupRoot), "the cgroup left out is reported")
+	require.Contains(t, log.String(), strings.TrimPrefix(shared, podenv.CgroupRoot), "the cgroup left out is reported")
+	require.False(t, recorded(filepath.Join(pod, "shared")), "a cgroup under the pod's is the hook's to judge")
+	require.NotContains(t, log.String(), strings.TrimPrefix(filepath.Join(pod, "shared"), podenv.CgroupRoot),
+		"and is not reported: its sockets do not pass")
+}
+
+// loadWalkScope loads the scope collection for the pid namespace ino with a
+// map of maxEntries, unattached, for the walk alone.
+func loadWalkScope(t *testing.T, ino, maxEntries uint32) *podScope {
+	t.Helper()
+	requireBPFOrigin(t)
+	spec, err := bpf.LoadScopeBpf()
+	require.NoError(t, err)
+	require.NoError(t, spec.Variables[bpf.ScopeBpfVarPidnsIno].Set(ino))
+	spec.Maps[bpf.ScopeBpfMapMapScopeCgroups].MaxEntries = maxEntries
+	var log bytes.Buffer
+	s := &podScope{logger: slog.New(slog.NewTextHandler(&log, nil))}
+	require.NoError(t, spec.LoadAndAssign(&s.objs, nil))
+	t.Cleanup(s.release)
+	return s
+}
+
+// A walk that lists no task of ours (here, of a pid namespace no task is
+// in) fails rather than leave the scope empty under a hook that reports
+// itself attached.
+func TestPodScopeWalkNeedsOwnCgroup(t *testing.T) {
+	s := loadWalkScope(t, 1, 64)
+	require.ErrorContains(t, s.walk(""), "did not list this process's cgroup")
+}
+
+// A map too small for every cgroup the walk records costs those cgroups,
+// with a warning, as in the kernel, and not the scope. From the host pid
+// namespace every task on the machine is ours, so the walk finds plenty.
+func TestPodScopeWalkFullMapWarns(t *testing.T) {
+	ino, err := podenv.PidNamespaceInode()
+	require.NoError(t, err)
+	s := loadWalkScope(t, ino, 1)
+	var log bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&log, nil))
+	require.NoError(t, s.walk(""))
+	require.Contains(t, log.String(), "could not record a cgroup")
 }

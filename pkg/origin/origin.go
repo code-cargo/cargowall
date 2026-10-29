@@ -335,7 +335,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		if err := setScope(spec, scope.PodCgroup); err != nil {
 			return nil, err
 		}
-		s, err := startPodScope(logger)
+		s, err := startPodScope(logger, scope.PodCgroup)
 		if err != nil {
 			return nil, err
 		}
@@ -394,7 +394,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		// cgroup or in a cgroup this job's tasks have entered, and passes
 		// the rest, a neighbour pod's included, with no verdict and no
 		// record.
-		Path:    "/sys/fs/cgroup",
+		Path:    podenv.CgroupRoot,
 		Attach:  ebpf.AttachCGroupInetEgress,
 		Program: o.objs.CgOriginEgress,
 	})
@@ -561,7 +561,7 @@ func (o *Observer) Blocked() uint64 { return o.blocked.Load() }
 func (o *Observer) Records() uint64 { return o.records.Load() }
 
 func (o *Observer) logAttachedEgressPrograms(when string) {
-	cg, err := os.Open("/sys/fs/cgroup")
+	cg, err := os.Open(podenv.CgroupRoot)
 	if err != nil {
 		o.logger.Debug("Cannot open root cgroup for program query", "error", err)
 		return

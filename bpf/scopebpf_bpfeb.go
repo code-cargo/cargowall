@@ -20,6 +20,7 @@ const (
 	ScopeBpfMapMapScopeStats   = "map_scope_stats"
 	ScopeBpfProgScopeAttach    = "scope_attach"
 	ScopeBpfProgScopeFork      = "scope_fork"
+	ScopeBpfProgScopeRelease   = "scope_release"
 	ScopeBpfProgScopeTaskIter  = "scope_task_iter"
 	ScopeBpfVarPidnsIno        = "pidns_ino"
 )
@@ -68,6 +69,7 @@ type ScopeBpfSpecs struct {
 type ScopeBpfProgramSpecs struct {
 	ScopeAttach   *ebpf.ProgramSpec `ebpf:"scope_attach"`
 	ScopeFork     *ebpf.ProgramSpec `ebpf:"scope_fork"`
+	ScopeRelease  *ebpf.ProgramSpec `ebpf:"scope_release"`
 	ScopeTaskIter *ebpf.ProgramSpec `ebpf:"scope_task_iter"`
 }
 
@@ -130,6 +132,7 @@ type ScopeBpfVariables struct {
 type ScopeBpfPrograms struct {
 	ScopeAttach   *ebpf.Program `ebpf:"scope_attach"`
 	ScopeFork     *ebpf.Program `ebpf:"scope_fork"`
+	ScopeRelease  *ebpf.Program `ebpf:"scope_release"`
 	ScopeTaskIter *ebpf.Program `ebpf:"scope_task_iter"`
 }
 
@@ -137,6 +140,7 @@ func (p *ScopeBpfPrograms) Close() error {
 	return _ScopeBpfClose(
 		p.ScopeAttach,
 		p.ScopeFork,
+		p.ScopeRelease,
 		p.ScopeTaskIter,
 	)
 }

@@ -331,7 +331,7 @@ func (t *Tracker) attach() error {
 	// Same root-cgroup attachment rationale as the connect/sendmsg hooks in
 	// StartCargoWall: tag socket creation for every process on the machine.
 	sockLink, err := link.AttachCgroup(link.CgroupOptions{
-		Path:    "/sys/fs/cgroup",
+		Path:    podenv.CgroupRoot,
 		Attach:  ebpf.AttachCGroupInetSockCreate,
 		Program: t.objs.CgSockCreate,
 	})

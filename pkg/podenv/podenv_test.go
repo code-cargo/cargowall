@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cilium/ebpf/btf"
 	"golang.org/x/sys/unix"
 )
 
@@ -53,16 +54,15 @@ func TestHookScope(t *testing.T) {
 	foreign := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace"}
 	hidden := Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
 	unknownD := Dockerd{Kind: DockerdUnknown, Reason: "dial: timeout"}
-	// Both helpers have the mount proven on a current kernel, so each case
-	// is decided by the fact it names.
-	const kernel = "6.17.0-1022-azure"
+	// Both helpers have the mount proven on a kernel that keeps socket
+	// cgroups, so each case is decided by the fact it names.
 	host := func(path string, pidns PidNS, d Dockerd) Shape {
-		return Shape{CgroupNS: CgroupNSHost, CgroupPath: path, CgroupMount: CgroupMountOurs, PidNS: pidns, Dockerd: d, Kernel: kernel}
+		return Shape{CgroupNS: CgroupNSHost, CgroupPath: path, CgroupMount: CgroupMountOurs, PidNS: pidns, Dockerd: d, SocketCgroups: SocketCgroupsKept}
 	}
 	private := func(d Dockerd) Shape {
-		return Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", CgroupMount: CgroupMountOurs, PidNS: PidNSPrivate, Dockerd: d, Kernel: kernel}
+		return Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", CgroupMount: CgroupMountOurs, PidNS: PidNSPrivate, Dockerd: d, SocketCgroups: SocketCgroupsKept}
 	}
-	onKernel := func(k string) func(*Shape) { return func(s *Shape) { s.Kernel = k } }
+	sockets := func(c SocketCgroups) func(*Shape) { return func(s *Shape) { s.SocketCgroups = c } }
 	with := func(s Shape, f func(*Shape)) Shape { f(&s); return s }
 	remoteDaemon := func(s *Shape) { s.DockerHost = "tcp://localhost:2376" }
 	all := Scope{}
@@ -91,16 +91,14 @@ func TestHookScope(t *testing.T) {
 		},
 		// A socket's cgroup must be whose it is wherever the hook is
 		// attached below the machine's root or judges only our cgroups,
-		// which 5.14 and older can stop tracking. Attached at the machine's
-		// root and unscoped, it judges every socket whatever its cgroup.
-		{"privileged pod on 5.15", with(host(pod, PidNSPrivate, foreign), onKernel("5.15.0-1084-aws")), true, inPod},
-		{"privileged pod on 5.14", with(host(pod, PidNSPrivate, foreign), onKernel("5.14.21")), false, all},
-		{"privileged pod on 5.10", with(host(pod, PidNSPrivate, foreign), onKernel("5.10.240-238.959.amzn2.x86_64")), false, all},
-		{"privileged pod, kernel unread", with(host(pod, PidNSPrivate, foreign), onKernel("")), false, all},
-		{"hosted runner on 5.10", with(host(runner, PidNSHost, local), onKernel("5.10.0")), true, all},
-		{"private cgroupns on 5.15", with(private(local), onKernel("5.15.0-1084-aws")), true, all},
-		{"private cgroupns on 5.10", with(private(local), onKernel("5.10.0")), false, all},
-		{"private cgroupns, kernel unread", with(private(local), onKernel("")), false, all},
+		// which a kernel that shares it with the v1 data can stop
+		// tracking. Attached at the machine's root and unscoped, it judges
+		// every socket whatever its cgroup.
+		{"privileged pod, socket cgroups shared", with(host(pod, PidNSPrivate, foreign), sockets(SocketCgroupsShared)), false, all},
+		{"privileged pod, socket cgroups unknown", with(host(pod, PidNSPrivate, foreign), sockets(SocketCgroupsUnknown)), false, all},
+		{"hosted runner, socket cgroups shared", with(host(runner, PidNSHost, local), sockets(SocketCgroupsShared)), true, all},
+		{"private cgroupns, socket cgroups shared", with(private(local), sockets(SocketCgroupsShared)), false, all},
+		{"private cgroupns, socket cgroups unknown", with(private(local), sockets(SocketCgroupsUnknown)), false, all},
 		// The host's daemon, through its socket, starts containers outside
 		// our pid namespace, which the scope never reaches.
 		{"privileged container outside Kubernetes, the host's dockerd", host("/system.slice/docker-a.scope", PidNSPrivate, hidden), false, all},
@@ -128,6 +126,7 @@ func TestHookScope(t *testing.T) {
 		{"unnamed pid namespace kind", host(pod, PidNS(99), foreign), false, all},
 		{"unnamed dockerd kind, privileged pod", host(pod, PidNSPrivate, Dockerd{Kind: DockerdKind(99)}), false, all},
 		{"unnamed dockerd kind, private cgroupns", private(Dockerd{Kind: DockerdKind(99)}), false, all},
+		{"unnamed socket cgroups kind", with(private(local), sockets(SocketCgroups(99))), false, all},
 	}
 	for _, tc := range cases {
 		got, err := tc.shape.HookScope()
@@ -182,11 +181,14 @@ func TestDetect_Namespaces(t *testing.T) {
 	if s.Kernel != "6.17.0-1022-azure" {
 		t.Fatalf("Detect() kernel = %q, want the release it was given", s.Kernel)
 	}
+	if s.SocketCgroups == SocketCgroupsUnknown {
+		t.Fatalf("Detect() socket cgroups unknown (%s)", s.SocketCgroupsReason)
+	}
 	// The mount can only be ours where /sys/fs/cgroup is the unified
 	// hierarchy itself, not a v1 or hybrid layout.
 	var fs unix.Statfs_t
-	if err := unix.Statfs(cgroupRoot, &fs); err != nil || fs.Type != unix.CGROUP2_SUPER_MAGIC {
-		t.Skipf("%s is not a cgroup2 mount here; the mount check has nothing to prove", cgroupRoot)
+	if err := unix.Statfs(CgroupRoot, &fs); err != nil || fs.Type != unix.CGROUP2_SUPER_MAGIC {
+		t.Skipf("%s is not a cgroup2 mount here; the mount check has nothing to prove", CgroupRoot)
 	}
 	if s.CgroupMount != CgroupMountOurs {
 		t.Fatalf("Detect() cgroup mount = %v (%s), want ours", s.CgroupMount, s.CgroupMountReason)
@@ -208,6 +210,63 @@ func TestPidNamespaceInode_MatchesProcLink(t *testing.T) {
 	}
 	if uint32(want) != got {
 		t.Fatalf("PidNamespaceInode() = %d, want %d from %s", got, want, link)
+	}
+}
+
+// The kernel keeps socket cgroups once sock_cgroup_data has a cgroup
+// member of its own; before, the pointer shared a union with the v1 data.
+func TestSocketCgroupsOf(t *testing.T) {
+	u32 := &btf.Int{Name: "u32", Size: 4}
+	kept := &btf.Struct{Name: "sock_cgroup_data", Size: 16, Members: []btf.Member{
+		{Name: "cgroup", Type: &btf.Pointer{Target: &btf.Struct{Name: "cgroup"}}},
+		{Name: "classid", Type: u32, Offset: 64},
+	}}
+	shared := &btf.Struct{Name: "sock_cgroup_data", Size: 8, Members: []btf.Member{
+		{Name: "", Type: &btf.Union{Size: 8, Members: []btf.Member{{Name: "val", Type: &btf.Int{Name: "u64", Size: 8}}}}},
+	}}
+	if got := socketCgroupsOf(kept); got != SocketCgroupsKept {
+		t.Errorf("5.15 layout: got %v, want kept", got)
+	}
+	if got := socketCgroupsOf(shared); got != SocketCgroupsShared {
+		t.Errorf("5.10 layout before the fix: got %v, want shared", got)
+	}
+}
+
+// The probe answers on this kernel, from its BTF when it has any.
+func TestProbeSocketCgroups(t *testing.T) {
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err != nil {
+		t.Fatal(err)
+	}
+	release := unix.ByteSliceToString(uts.Release[:])
+	got, why := probeSocketCgroups(release)
+	t.Logf("kernel %s: socket cgroups %v (%s)", release, got, why)
+	if got == SocketCgroupsUnknown {
+		t.Fatalf("probe failed: %s", why)
+	}
+	if _, err := btf.LoadKernelSpec(); err == nil && why != "kernel BTF" {
+		t.Errorf("kernel BTF loads, but the probe decided by %q", why)
+	}
+}
+
+// A /proc cgroup file gives its v2 path, and one with none is an error.
+func TestReadCgroupPath(t *testing.T) {
+	dir := t.TempDir()
+	write := func(data string) string {
+		f := filepath.Join(dir, "cgroup")
+		if err := os.WriteFile(f, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	if got, err := ReadCgroupPath(write("1:name=systemd:/x\n0::/kubepods.slice/a.scope\n")); err != nil || got != "/kubepods.slice/a.scope" {
+		t.Errorf("got %q, %v", got, err)
+	}
+	if _, err := ReadCgroupPath(write("12:memory:/docker/x\n")); err == nil {
+		t.Errorf("a v1-only file must be an error")
+	}
+	if _, err := ReadCgroupPath(filepath.Join(dir, "gone")); err == nil {
+		t.Errorf("a missing file must be an error")
 	}
 }
 

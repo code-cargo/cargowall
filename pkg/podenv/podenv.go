@@ -41,6 +41,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cilium/ebpf/btf"
 	"golang.org/x/sys/unix"
 
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
@@ -60,8 +61,9 @@ func PidNamespaceInode() (uint32, error) {
 	return uint32(ino), err
 }
 
-// cgroupRoot is where every cgroup program attaches.
-const cgroupRoot = "/sys/fs/cgroup"
+// CgroupRoot is where every cgroup program attaches: the tree whose mount
+// Detect proves (CgroupMount) and whose paths /proc/<pid>/cgroup gives.
+const CgroupRoot = "/sys/fs/cgroup"
 
 // CgroupNS is which cgroup namespace cargowall runs in.
 type CgroupNS int
@@ -133,6 +135,32 @@ func (p PidNS) String() string {
 	return "unknown"
 }
 
+// SocketCgroups is whether the kernel keeps each socket's cgroup v2 apart
+// from its v1 net_cls and net_prio data, which a hook below the machine's
+// root, or one that judges only this job's cgroups, depends on.
+type SocketCgroups int
+
+const (
+	SocketCgroupsUnknown SocketCgroups = iota // the probe failed
+	// SocketCgroupsKept: a socket's cgroup is always the one it was made in.
+	SocketCgroupsKept
+	// SocketCgroupsShared: the cgroup shares a word with the v1 data, so a
+	// v1 net_cls or net_prio hierarchy in use anywhere on the machine turns
+	// socket cgroups off, and every socket made after that reads as the
+	// root cgroup.
+	SocketCgroupsShared
+)
+
+func (c SocketCgroups) String() string {
+	switch c {
+	case SocketCgroupsKept:
+		return "kept"
+	case SocketCgroupsShared:
+		return "shared"
+	}
+	return "unknown"
+}
+
 // DockerdKind is what is behind the Docker socket.
 type DockerdKind int
 
@@ -200,6 +228,10 @@ type Shape struct {
 	DockerHost string
 	// Kernel is the running kernel's release, as Detect was given it.
 	Kernel string
+	// SocketCgroups is whether this kernel keeps socket cgroups, and
+	// SocketCgroupsReason the evidence, or the probe error for Unknown.
+	SocketCgroups       SocketCgroups
+	SocketCgroupsReason string
 }
 
 // Scope is what a cgroup program attached at /sys/fs/cgroup judges. The
@@ -319,9 +351,9 @@ func (s Shape) attachPointRefusal() error {
 	case CgroupMountOurs:
 		return nil
 	case CgroupMountOther:
-		return fmt.Errorf("%s is not the cgroup tree this process is in (%s)", cgroupRoot, s.CgroupMountReason)
+		return fmt.Errorf("%s is not the cgroup tree this process is in (%s)", CgroupRoot, s.CgroupMountReason)
 	case CgroupMountUnknown:
-		return fmt.Errorf("cannot show %s is the cgroup tree this process is in (%s)", cgroupRoot, s.CgroupMountReason)
+		return fmt.Errorf("cannot show %s is the cgroup tree this process is in (%s)", CgroupRoot, s.CgroupMountReason)
 	default:
 		return fmt.Errorf("cgroup mount kind %d has no hook-scope rule", s.CgroupMount)
 	}
@@ -336,23 +368,59 @@ func (s Shape) dockerHostRefusal() error {
 	return nil
 }
 
-// socketCgroupRefusal says why this kernel cannot be trusted to put this
-// job's sockets in this job's cgroups, or nil from 5.15 on. A hook attached
+// socketCgroupRefusal says why this kernel cannot be shown to put this
+// job's sockets in this job's cgroups, or nil when it can. A hook attached
 // below the machine's root, or one that judges only this job's cgroups,
-// depends on that. Up to 5.14 a v1 net_cls or net_prio hierarchy in use
-// anywhere on the machine turns socket cgroups off, and every socket made
-// after that reads as the root cgroup: it never reaches a program attached
-// below the root, and the scope never records the root.
+// depends on that: a socket that reads as the root cgroup never reaches a
+// program attached below the root, and the scope never records the root.
 func (s Shape) socketCgroupRefusal() error {
-	ok, err := cargowallEbpf.KernelAtLeast(s.Kernel, 5, 15)
-	if err != nil {
-		return fmt.Errorf("the cgroup hook needs sockets' cgroups, and the kernel is unidentified (%w)", err)
+	switch s.SocketCgroups {
+	case SocketCgroupsKept:
+		return nil
+	case SocketCgroupsShared:
+		return fmt.Errorf("the cgroup hook needs sockets' cgroups, which kernel %s can stop tracking (%s)",
+			s.Kernel, s.SocketCgroupsReason)
+	case SocketCgroupsUnknown:
+		return fmt.Errorf("the cgroup hook needs sockets' cgroups, and whether kernel %s keeps them is unknown (%s)",
+			s.Kernel, s.SocketCgroupsReason)
+	default:
+		return fmt.Errorf("socket cgroups kind %d has no hook-scope rule", s.SocketCgroups)
 	}
-	if !ok {
-		return fmt.Errorf("the cgroup hook needs sockets' cgroups, which kernel %s can stop tracking "+
-			"(5.15 or later is needed)", s.Kernel)
+}
+
+// probeSocketCgroups reads struct sock_cgroup_data from the kernel's BTF.
+// The fix that keeps socket cgroups (8520e224f547, in 5.15) gave the
+// cgroup pointer a member of its own, out of the union with the v1 data,
+// and stable kernels that took it (5.10.y did) have that member too, which
+// their release cannot show. Without BTF, or without the type, the release
+// decides.
+func probeSocketCgroups(kernel string) (SocketCgroups, string) {
+	spec, err := btf.LoadKernelSpec()
+	if err == nil {
+		var st *btf.Struct
+		if err = spec.TypeByName("sock_cgroup_data", &st); err == nil {
+			return socketCgroupsOf(st), "kernel BTF"
+		}
 	}
-	return nil
+	ok, verr := cargowallEbpf.KernelAtLeast(kernel, 5, 15)
+	switch {
+	case verr != nil:
+		return SocketCgroupsUnknown, fmt.Sprintf("%v, and %v", err, verr)
+	case ok:
+		return SocketCgroupsKept, "release 5.15 or later"
+	default:
+		return SocketCgroupsShared, fmt.Sprintf("release older than 5.15, and %v", err)
+	}
+}
+
+// socketCgroupsOf decides from struct sock_cgroup_data's members.
+func socketCgroupsOf(st *btf.Struct) SocketCgroups {
+	for _, m := range st.Members {
+		if m.Name == "cgroup" {
+			return SocketCgroupsKept
+		}
+	}
+	return SocketCgroupsShared
 }
 
 // podCgroupName matches the pod level of kubelet's tree: pod<uid> under the
@@ -383,6 +451,7 @@ func (s Shape) LogArgs() []any {
 		"pidns", s.PidNS.String(), "pidns_reason", s.PidNSReason,
 		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
 		"docker_host", s.DockerHost, "kernel", s.Kernel,
+		"socket_cgroups", s.SocketCgroups.String(), "socket_cgroups_reason", s.SocketCgroupsReason,
 	}
 }
 
@@ -398,13 +467,13 @@ func Detect(dockerSocket, kernel string) Shape {
 	} else {
 		s.CgroupNS = CgroupNSPrivate
 	}
-	if data, err := os.ReadFile("/proc/self/cgroup"); err != nil {
+	if path, err := ReadCgroupPath("/proc/self/cgroup"); err != nil {
 		s.CgroupPathReason = err.Error()
-	} else if s.CgroupPath = parseCgroupV2Path(data); s.CgroupPath == "" {
-		s.CgroupPathReason = "no cgroup v2 entry in /proc/self/cgroup"
+	} else {
+		s.CgroupPath = path
 	}
 	if s.CgroupPath != "" {
-		s.CgroupMount, s.CgroupMountReason = probeCgroupMount(cgroupRoot, s.CgroupPath, os.Getpid())
+		s.CgroupMount, s.CgroupMountReason = probeCgroupMount(CgroupRoot, s.CgroupPath, os.Getpid())
 	} else {
 		s.CgroupMountReason = "no cgroup path to look for"
 	}
@@ -417,6 +486,7 @@ func Detect(dockerSocket, kernel string) Shape {
 	}
 	s.Dockerd = probeDockerd(dockerSocket)
 	s.DockerHost = dockerHostElsewhere(os.Getenv("DOCKER_HOST"), dockerSocket)
+	s.SocketCgroups, s.SocketCgroupsReason = probeSocketCgroups(kernel)
 	return s
 }
 
@@ -474,6 +544,22 @@ func resolveDir(path string) string {
 		return filepath.Join(dir, filepath.Base(path))
 	}
 	return path
+}
+
+// ReadCgroupPath returns the cgroup v2 path a /proc cgroup file gives
+// (/proc/<pid>/cgroup, or a thread's under /proc/<pid>/task): absolute in
+// the host cgroup namespace, relative to our own root otherwise. A v1-only
+// file, with no v2 entry, is an error.
+func ReadCgroupPath(file string) (string, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return "", err
+	}
+	path := parseCgroupV2Path(data)
+	if path == "" {
+		return "", fmt.Errorf("no cgroup v2 entry in %s", file)
+	}
+	return path, nil
 }
 
 // parseCgroupV2Path returns the path of the unified hierarchy line

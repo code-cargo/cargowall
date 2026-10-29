@@ -108,14 +108,15 @@
 #define ORIGIN_CFG_KEY_MODE 0         // ORIGIN_MODE_*
 #define ORIGIN_CFG_KEY_LO_CARVEOUT 1  // 1 = carve out skb->ifindex == lo (see below)
 
-// Nonzero: judge only the sockets stamped in map_sock_scope, and pass every
-// other one. Set by userspace before load, in the same step that loads the
-// step collection's stamp map in place of the stand-in below, because it
-// never changes after attach. A load-time constant rather than a config
-// byte, so the program has one way into the rest of the hook either way:
-// at zero the verifier drops the check (a runner VM), and at one only a
-// stamped socket gets past it (a privileged pod at a shared cgroup root).
-const volatile __u8 stamped_only = 0;
+// Nonzero: judge only sockets in a cgroup recorded in map_scope_cgroups,
+// and pass every other one. Set by userspace before load, in the same step
+// that loads the step collection's map in place of the stand-in below,
+// because it never changes after attach. A load-time constant rather than a
+// config byte, so the program has one way into the rest of the hook either
+// way: at zero the verifier drops the check (a runner VM), and at one only
+// a socket in one of our cgroups gets past it (a privileged pod at a shared
+// cgroup root).
+const volatile __u8 scoped = 0;
 
 // One record per observed flow origin. 8-byte fields first so the packed C
 // layout equals Go's natural layout (72 bytes, no hidden padding); addresses
@@ -167,17 +168,17 @@ static __always_inline __u8 origin_mode(void) {
     return mode ? *mode : ORIGIN_MODE_OBSERVE;  // absent = inert
 }
 
-// Sockets created by a task in the daemon's pid namespace, stamped by
-// cg_sock_create in stepbpf.c. Owned there: this declaration is replaced by
-// the step collection's map when stamped_only is set, and is an empty
-// stand-in otherwise. Shape must match stepbpf.c (pinned by
-// TestSockScopeMapSpecsMatch).
+// Cgroups a task in the daemon's pid namespace has occupied, recorded by
+// the step programs in stepbpf.c. Owned there: this declaration is replaced
+// by the step collection's map, at that map's size, when scoped is set, and
+// is an empty stand-in otherwise. Shape must match stepbpf.c (pinned by
+// TestScopeCgroupsMapSpecsMatch).
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, __u64);
     __type(value, __u8);
-    __uint(max_entries, 65536);
-} map_sock_scope SEC(".maps");
+    __uint(max_entries, 64);
+} map_scope_cgroups SEC(".maps");
 
 // Local-only networks (docker bridge subnets), carved out of adjudication
 // the way loopback is. OWNED by this collection and deliberately NOT in
@@ -766,17 +767,15 @@ int cg_origin_egress(struct __sk_buff *skb) {
     if (skb->mark == DNS_PROXY_FW_MARK)
         return 1;
 
-    // At a cgroup root other containers share, judge only sockets this
-    // job's tasks created: another pod's traffic is not ours to drop or
-    // report. Anything else passes with no verdict, no record and no L7
-    // inspection, and TC on our own interface still polices what leaves
-    // through it, including our sockets that missed a stamp (made before
-    // the step tracker started, accepted from a listener, or evicted). A 1
-    // never overrides another attached program (see the end of this
-    // function).
-    if (stamped_only) {
-        __u64 cookie = bpf_get_socket_cookie(skb);
-        if (!bpf_map_lookup_elem(&map_sock_scope, &cookie))
+    // At a cgroup root other pods share, judge only sockets in a cgroup one
+    // of this job's tasks occupies: another pod's traffic is not ours to
+    // drop or report. Anything else passes with no verdict, no record and
+    // no L7 inspection, and TC on our own interface still polices what
+    // leaves through it. A 1 never overrides another attached program (see
+    // the end of this function).
+    if (scoped) {
+        __u64 cgroup = bpf_skb_cgroup_id(skb);
+        if (!bpf_map_lookup_elem(&map_scope_cgroups, &cgroup))
             return 1;
     }
 

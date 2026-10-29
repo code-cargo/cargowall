@@ -128,7 +128,7 @@ type DockerdKind int
 
 const (
 	DockerdUnknown DockerdKind = iota // the probe failed
-	DockerdAbsent                     // no socket, or nothing listening on it
+	DockerdAbsent                     // no socket
 	// DockerdLocal: the daemon shares our mount namespace, so its
 	// daemon.json is ours and our service manager can restart it.
 	DockerdLocal
@@ -191,21 +191,21 @@ type Shape struct {
 }
 
 // HookScope decides whether a cgroup program attached at /sys/fs/cgroup can
-// judge exactly this job's traffic, and how. Loading the hook and stamping
-// sockets are one decision, so both answers come from here, and every leaf
-// of the table below returns its own:
+// judge exactly this job's traffic, and how. Loading the hook and scoping it
+// are one decision, so both answers come from here, and every leaf of the
+// table below returns its own:
 //
-//   - nil error, stamped false: every socket under the attach point is this
+//   - nil error, scoped false: every socket under the attach point is this
 //     job's (a runner VM, or a private cgroup namespace), and the hook
 //     judges them all.
-//   - nil error, stamped true: the host cgroup namespace outside the host
+//   - nil error, scoped true: the host cgroup namespace outside the host
 //     pid namespace. The attach point is the root of the machine's cgroup
-//     tree, which other containers share, while our pid namespace holds
-//     only this job's processes (in a pod that shares one, the runner's,
-//     dockerd's and those of every container dockerd starts). The hook must
-//     judge only the sockets stamped as created there; without the stamps
-//     it would judge other pods.
-//   - an error: the hook must not load, and stamped is false.
+//     tree, which other pods share, while our pid namespace holds only this
+//     job's processes (in a pod that shares one, the runner's, dockerd's
+//     and those of every container dockerd starts). The hook must judge
+//     only sockets in the cgroups those processes occupy; judging the rest
+//     would judge other pods.
+//   - an error: the hook must not load, and scoped is false.
 //
 // The error says why the hook would not judge exactly this job, or why that
 // cannot be shown:
@@ -213,7 +213,7 @@ type Shape struct {
 //   - /sys/fs/cgroup must be shown to be the tree our cgroup path is in
 //     (CgroupMount). Otherwise the attach point is not what the namespace
 //     says: the host's cgroupfs bound into a private cgroup namespace would
-//     put the unstamped hook at the machine's root.
+//     put the unscoped hook at the machine's root.
 //   - In a Kubernetes pod in the host cgroup and pid namespaces (a
 //     privileged hostPID pod), /sys/fs/cgroup is the node root and every
 //     task on the node is ours to see: the hook would judge every pod and
@@ -238,20 +238,30 @@ type Shape struct {
 //     cgroup subtree, not the pid namespace, bounds it. A kind added later
 //     with no rule here is refused until it is given one.
 //
-// Two premises are accepted rather than proven. A process in the host
+// Three premises are accepted rather than proven. A process in the host
 // cgroup and pid namespaces outside kubelet's tree is taken to be the
 // machine's own firewall, as on a runner VM: nothing positively marks a
 // machine single-tenant, and the kubepods refusal guards the multi-tenant
-// shape cargowall is known to be deployed in. And the daemon probe
-// identifies whoever listens on the socket, so a proxy in our own
-// container forwarding to a remote daemon reads as local.
+// shape cargowall is known to be deployed in. The daemon probe identifies
+// whoever listens on the socket, so a proxy in our own container forwarding
+// to a remote daemon reads as local, and it runs once, so a daemon that
+// has not yet made its socket reads as absent; scoped, that daemon's
+// containers are judged anyway when it shares our pid namespace, and missed
+// when it does not. And scoped, a cgroup one of our tasks occupies is taken
+// to hold only this pod's tasks, as a container runtime arranges by giving
+// each container a cgroup of its own: a process outside our pid namespace
+// in such a cgroup would be judged as ours.
 //
-// Two limits of the scoped hook are accepted rather than refused, and
-// design.md describes both. Our own sockets that missed a stamp pass with
-// only TC's verdict, so they get no L7 check. Work in other pods (ARC's
-// Kubernetes container mode) is outside this pod's pid namespace and
-// interface, beyond every layer here, as it was before the scope.
-func (s Shape) HookScope() (stamped bool, err error) {
+// Three limits are accepted rather than refused, and design.md describes
+// them. Scoped, a socket in a cgroup none of our tasks has been seen in
+// passes with only TC's verdict, so it gets no L7 check. Work in other pods
+// (ARC's Kubernetes container mode) is outside this pod's pid namespace and
+// interface, beyond every layer here, as it was before the scope. And
+// DOCKER_HOST is read once, from cargowall's own environment, so a step
+// that later points docker at another daemon is not seen: that daemon's
+// containers are judged only where they fall inside the scope anyway (our
+// pid namespace, or our cgroup subtree).
+func (s Shape) HookScope() (scoped bool, err error) {
 	switch s.CgroupNS {
 	case CgroupNSUnknown:
 		return false, fmt.Errorf("cgroup namespace unknown (%s)", s.CgroupNSReason)
@@ -412,13 +422,24 @@ func probeCgroupMount(root, path string, pid int) (CgroupMount, string) {
 }
 
 // dockerHostElsewhere returns DOCKER_HOST when it names a daemon other than
-// the one on socket, and "" when it is unset or names that socket.
+// the one on socket, and "" when it is unset or names that socket. Two
+// spellings of one socket are the same daemon: /var/run is a symlink to
+// /run on most distributions.
 func dockerHostElsewhere(dockerHost, socket string) string {
 	if dockerHost == "" {
 		return ""
 	}
-	if p, ok := strings.CutPrefix(dockerHost, "unix://"); ok && filepath.Clean(p) == filepath.Clean(socket) {
+	p, ok := strings.CutPrefix(dockerHost, "unix://")
+	if !ok {
+		return dockerHost
+	}
+	if filepath.Clean(p) == filepath.Clean(socket) {
 		return ""
+	}
+	if a, err := os.Stat(p); err == nil {
+		if b, err := os.Stat(socket); err == nil && os.SameFile(a, b) {
+			return ""
+		}
 	}
 	return dockerHost
 }
@@ -449,7 +470,10 @@ func probeDockerd(socket string) Dockerd {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", socket)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ECONNREFUSED) {
+		// Only a missing socket is absent. One that refuses was made by a
+		// daemon that is not listening: still starting, or gone and
+		// perhaps coming back, which this one probe cannot tell apart.
+		if errors.Is(err, os.ErrNotExist) {
 			return Dockerd{Kind: DockerdAbsent}
 		}
 		return unknown(fmt.Errorf("dial %s: %w", socket, err))

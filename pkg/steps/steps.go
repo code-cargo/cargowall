@@ -21,11 +21,12 @@
 // thread's tag, and the cgroup hooks copy the tag onto each socket cookie —
 // so every TC event carries the step that (transitively) created its socket.
 // Attribution only: no verdict consults these maps, with one exception.
-// map_sock_scope (Options.StampScope) is the set of sockets the cgroup
-// egress hook judges when it sits at a cgroup root other containers share,
-// and a socket missing from it passes the hook. It is written here because
-// map_task_nspid becomes valid here, before the hook attaches, and the
-// origin collection loads it in place of its own stand-in (ScopeStamps).
+// map_scope_cgroups (Options.ScopeCgroups) is the set of cgroups whose
+// sockets the cgroup egress hook judges when it sits at a cgroup root other
+// pods share, and a socket in any other cgroup passes the hook. It is
+// written here because the fork tracepoint and the task walk that know our
+// pid namespace live here, and they record before the hook attaches; the
+// origin collection loads it in place of its own stand-in (ScopeCgroups).
 // Close must not assume the hook is gone: start.go closes the observer
 // first and the origin collection holds its own reference to the map, but
 // nothing here may clear or reshape it while the hook might still read it.
@@ -88,10 +89,17 @@ type Options struct {
 	// correlation happens downstream by matching step_boundary cmdlines,
 	// never by assuming ordinal == plan index.
 	OrdinalBase uint64
-	// StampScope stamps every socket a task in our pid namespace creates,
-	// for a cgroup egress hook that must judge only those (ScopeStamps).
-	StampScope bool
+	// ScopeCgroups records every cgroup a task in our pid namespace
+	// occupies, for a cgroup egress hook that must judge only those
+	// cgroups' sockets (ScopeCgroups).
+	ScopeCgroups bool
 }
+
+// scopeCgroupsCapacity sizes map_scope_cgroups when recording. An entry is
+// a cgroup this job's tasks have occupied, so the bound is on containers
+// started in one run, not sockets; past it the LRU forgets the least
+// recently used.
+const scopeCgroupsCapacity = 65536
 
 // maxOrdinalBase bounds --step-ordinal-base away from the reserved
 // StepOrdinal* sentinels: the kernel increments a u64 counter but truncates
@@ -113,7 +121,7 @@ type Tracker struct {
 	stateMap      *ebpf.Map
 	taskMap       *ebpf.Map
 	nspidMap      *ebpf.Map // map_task_nspid; cleared at Close, see there
-	stampScope    bool      // Options.StampScope
+	scopeCgroups  bool      // Options.ScopeCgroups
 	auditLogger   *events.AuditLogger
 	logger        *slog.Logger
 	done          chan struct{}
@@ -180,20 +188,20 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 	} else if err := v.Set(pidnsIno); err != nil {
 		return nil, fmt.Errorf("failed to set pidns_ino: %w", err)
 	}
-	if opts.StampScope {
-		if v := spec.Variables[bpf.StepBpfVarStampScope]; v == nil {
-			return nil, errors.New("step BPF spec has no stamp_scope variable (stale generated code)")
-		} else if err := v.Set(uint8(1)); err != nil {
-			return nil, fmt.Errorf("failed to set stamp_scope: %w", err)
+	if opts.ScopeCgroups {
+		v, m := spec.Variables[bpf.StepBpfVarScopeCgroups], spec.Maps[bpf.StepBpfMapMapScopeCgroups]
+		if v == nil || m == nil {
+			return nil, errors.New("step BPF spec has no scope_cgroups variable or map (stale generated code)")
 		}
-	} else if m := spec.Maps[bpf.StepBpfMapMapSockScope]; m != nil {
-		// Nothing writes the map, so don't preallocate it at full size.
-		m.MaxEntries = 64
+		if err := v.Set(uint8(1)); err != nil {
+			return nil, fmt.Errorf("failed to set scope_cgroups: %w", err)
+		}
+		m.MaxEntries = scopeCgroupsCapacity
 	}
 
 	t := &Tracker{
-		workerPID:  workerPID,
-		stampScope: opts.StampScope,
+		workerPID:    workerPID,
+		scopeCgroups: opts.ScopeCgroups,
 		// Snapshot the worker's argv so the reconciler can detect a
 		// pre-exec cmdline read (the child briefly shares/copies it).
 		workerCmdline: readCmdline(workerPID),
@@ -286,22 +294,22 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 // WorkerPID returns the Runner.Worker process ID being tracked.
 func (t *Tracker) WorkerPID() int { return t.workerPID }
 
-// ScopeStamps returns the map of sockets created by tasks in our pid
-// namespace, or nil when the tracker was not asked to stamp them
-// (Options.StampScope). The cgroup egress hook loads it in place of its own
-// to judge only those sockets.
-func (t *Tracker) ScopeStamps() *ebpf.Map {
-	if !t.stampScope {
+// ScopeCgroups returns the map of cgroups tasks in our pid namespace have
+// occupied, or nil when the tracker was not asked to record them
+// (Options.ScopeCgroups). The cgroup egress hook loads it in place of its
+// own to judge only those cgroups' sockets.
+func (t *Tracker) ScopeCgroups() *ebpf.Map {
+	if !t.scopeCgroups {
 		return nil
 	}
-	return t.objs.MapSockScope
+	return t.objs.MapScopeCgroups
 }
 
 // Close disables tagging, detaches the programs, and stops the reconciler,
 // waiting for an in-flight boundary event to finish writing before returning
 // so the audit logger (whose deferred Close runs after ours) is still alive
-// for it. It leaves map_sock_scope as it is: the egress hook may still be
-// reading it (see the package comment).
+// for it. It leaves map_scope_cgroups as it is: the egress hook may still
+// be reading it (see the package comment).
 func (t *Tracker) Close() {
 	// Best-effort disable so the tcbpf-side hooks stop tagging immediately,
 	// even though the collection below is about to go away anyway.
@@ -362,6 +370,19 @@ func (t *Tracker) attach() error {
 		return fmt.Errorf("failed to attach sched_process_exit: %w", err)
 	}
 	t.links = append(t.links, exitLink)
+
+	// Before the task walk, so a task that moves while the walk runs is
+	// recorded by one or the other.
+	if t.scopeCgroups {
+		attachLink, err := link.AttachTracing(link.TracingOptions{
+			Program:    t.objs.StepCgroupAttach,
+			AttachType: ebpf.AttachTraceRawTp,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to attach cgroup_attach_task: %w", err)
+		}
+		t.links = append(t.links, attachLink)
+	}
 
 	// Same root-cgroup attachment rationale as the connect/sendmsg hooks in
 	// StartCargoWall: tag socket creation for every process on the machine.

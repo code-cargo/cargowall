@@ -60,10 +60,10 @@ func TestHookScope(t *testing.T) {
 	with := func(s Shape, f func(*Shape)) Shape { f(&s); return s }
 	remoteDaemon := func(s *Shape) { s.DockerHost = "tcp://localhost:2376" }
 	cases := []struct {
-		name    string
-		shape   Shape
-		ok      bool
-		stamped bool
+		name   string
+		shape  Shape
+		ok     bool
+		scoped bool
 	}{
 		{"hosted runner", host(runner, PidNSHost, local), true, false},
 		{"hosted runner, daemon unidentified", host(runner, PidNSHost, unknownD), true, false},
@@ -74,6 +74,9 @@ func TestHookScope(t *testing.T) {
 		{"privileged pod, dind not sharing the pid namespace", host(pod, PidNSPrivate, hidden), false, false},
 		{"privileged pod, daemon unidentified", host(pod, PidNSPrivate, unknownD), false, false},
 		{"privileged container outside Kubernetes", host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, true},
+		// The host's daemon, through its socket, starts containers outside
+		// our pid namespace, which the scope never reaches.
+		{"privileged container outside Kubernetes, the host's dockerd", host("/system.slice/docker-a.scope", PidNSPrivate, hidden), false, false},
 		{"hostPID pod, systemd driver under a custom cgroup root", host("/custom.slice/custom-kubepods.slice/custom-kubepods-pod1.slice/cri-containerd-a.scope", PidNSHost, local), false, false},
 		{"host cgroupns, pid namespace unread", with(host(runner, PidNSUnknown, local), func(s *Shape) { s.PidNSReason = "stat: permission denied" }), false, false},
 		{"host cgroupns, path unread", Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied", PidNS: PidNSHost, Dockerd: local}, false, false},
@@ -100,16 +103,16 @@ func TestHookScope(t *testing.T) {
 		{"unnamed dockerd kind, private cgroupns", private(Dockerd{Kind: DockerdKind(99)}), false, false},
 	}
 	for _, tc := range cases {
-		stamped, err := tc.shape.HookScope()
+		scoped, err := tc.shape.HookScope()
 		if (err == nil) != tc.ok {
 			t.Errorf("%s: HookScope() error = %v, want ok=%v", tc.name, err, tc.ok)
 		}
-		if stamped != tc.stamped {
-			t.Errorf("%s: HookScope() stamped = %v, want %v", tc.name, stamped, tc.stamped)
+		if scoped != tc.scoped {
+			t.Errorf("%s: HookScope() scoped = %v, want %v", tc.name, scoped, tc.scoped)
 		}
-		// A refused hook never asks for stamps: nothing would read them.
-		if err != nil && stamped {
-			t.Errorf("%s: HookScope() refused and still asked for stamps", tc.name)
+		// A refused hook never asks for a scope: nothing would read it.
+		if err != nil && scoped {
+			t.Errorf("%s: HookScope() refused and still asked for a scope", tc.name)
 		}
 	}
 
@@ -190,6 +193,28 @@ func TestDockerHostElsewhere(t *testing.T) {
 			t.Errorf("dockerHostElsewhere(%q) = %q, want %q", in, got, want)
 		}
 	}
+
+	// Another spelling of the same socket, as /var/run is of /run.
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "run"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "run", "docker.sock"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "var"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../run", filepath.Join(root, "var", "run")); err != nil {
+		t.Fatal(err)
+	}
+	probed := filepath.Join(root, "run", "docker.sock")
+	if got := dockerHostElsewhere("unix://"+filepath.Join(root, "var", "run", "docker.sock"), probed); got != "" {
+		t.Errorf("symlinked spelling of the socket: got %q, want the same daemon", got)
+	}
+	if missing := "unix://" + filepath.Join(root, "var", "run", "other.sock"); dockerHostElsewhere(missing, probed) != missing {
+		t.Errorf("a socket that does not exist is not the probed one")
+	}
 }
 
 func TestProbeDockerd_NoSocket(t *testing.T) {
@@ -198,12 +223,27 @@ func TestProbeDockerd_NoSocket(t *testing.T) {
 	}
 }
 
-// A dial failing with neither ENOENT nor ECONNREFUSED (here EINVAL, a path
-// longer than sun_path) is unknown, with the error kept.
+// A dial failing with anything but ENOENT (here EINVAL, a path longer than
+// sun_path) is unknown, with the error kept.
 func TestProbeDockerd_Unknown(t *testing.T) {
 	d := probeDockerd("/" + strings.Repeat("x", 200))
 	if d.Kind != DockerdUnknown || d.Reason == "" {
 		t.Fatalf("non-socket path: got %+v, want unknown with a reason", d)
+	}
+}
+
+// A socket with nothing listening on it was made by a daemon that is still
+// starting or has gone, so it is unknown, not absent.
+func TestProbeDockerd_Refused(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "docker.sock")
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: sock, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.SetUnlinkOnClose(false)
+	l.Close()
+	if d := probeDockerd(sock); d.Kind != DockerdUnknown || !strings.Contains(d.Reason, "refused") {
+		t.Fatalf("socket with no listener: got %+v, want unknown, refused", d)
 	}
 }
 

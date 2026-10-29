@@ -230,11 +230,11 @@ func TestPostures_ContainerAttributionHookScope(t *testing.T) {
 	a.Close()
 }
 
-// A scope that requires stamps, with a tracker that is not stamping, loses
-// the posture: loading the hook with no stamp map would judge every socket
+// A scoped decision, with a tracker that is not recording cgroups, loses the
+// posture: loading the hook with no scope map would judge every socket
 // under a shared root.
-func TestPostures_ContainerAttributionStampsMissing(t *testing.T) {
-	const reason = "the cgroup hook may judge only sockets created in our pid namespace, and the step tracker is not stamping them"
+func TestPostures_ContainerAttributionScopeMissing(t *testing.T) {
+	const reason = "the cgroup hook may judge only cgroups our pid namespace occupies, and the step tracker is not recording them"
 
 	p, _ := ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
 	a, err := newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, true, nil, nil, p, p.logger)

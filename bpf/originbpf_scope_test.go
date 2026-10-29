@@ -18,6 +18,7 @@ package bpf
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -35,50 +36,50 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// loadOriginObjectsStampedOnly loads the origin collection the way
-// origin.Start does in a privileged pod: stamped_only set before load. The
-// collection keeps its own stand-in map_sock_scope, which a test stamps
-// directly.
-func loadOriginObjectsStampedOnly(t *testing.T) *OriginBpfObjects {
+// loadOriginObjectsScoped loads the origin collection the way origin.Start
+// does in a privileged pod: scoped set before load. The collection keeps
+// its own stand-in map_scope_cgroups, which a test fills directly.
+func loadOriginObjectsScoped(t *testing.T) *OriginBpfObjects {
 	t.Helper()
 	requireBPF(t)
 	spec, err := LoadOriginBpf()
 	require.NoError(t, err)
-	require.NoError(t, spec.Variables[OriginBpfVarStampedOnly].Set(uint8(1)))
+	require.NoError(t, spec.Variables[OriginBpfVarScoped].Set(uint8(1)))
 	var objs OriginBpfObjects
 	require.NoError(t, spec.LoadAndAssign(&objs, nil))
 	t.Cleanup(func() { objs.Close() })
 	return &objs
 }
 
-// map_sock_scope is declared twice: stepbpf.c owns it and originbpf.c
+// map_scope_cgroups is declared twice: stepbpf.c owns it and originbpf.c
 // carries a stand-in the step collection's map replaces. cilium/ebpf rejects
 // a replacement whose spec differs, and the replacement happens only in the
 // scoped shape (a privileged pod), which no CI job runs, so a drift would
-// ship and then fail ARC startup. Compared from the specs: no kernel needed.
-func TestSockScopeMapSpecsMatch(t *testing.T) {
+// ship and then fail ARC startup. The size is the exception: origin.Start
+// gives the stand-in the replacement's. Compared from the specs: no kernel
+// needed.
+func TestScopeCgroupsMapSpecsMatch(t *testing.T) {
 	stepSpec, err := LoadStepBpf()
 	require.NoError(t, err)
 	originSpec, err := LoadOriginBpf()
 	require.NoError(t, err)
-	owner := stepSpec.Maps[StepBpfMapMapSockScope]
-	standIn := originSpec.Maps[OriginBpfMapMapSockScope]
-	require.NotNil(t, owner, "stepbpf.c must declare map_sock_scope")
-	require.NotNil(t, standIn, "originbpf.c must declare map_sock_scope")
+	owner := stepSpec.Maps[StepBpfMapMapScopeCgroups]
+	standIn := originSpec.Maps[OriginBpfMapMapScopeCgroups]
+	require.NotNil(t, owner, "stepbpf.c must declare map_scope_cgroups")
+	require.NotNil(t, standIn, "originbpf.c must declare map_scope_cgroups")
 	require.Equal(t, owner.Type, standIn.Type, "map type")
 	require.Equal(t, owner.KeySize, standIn.KeySize, "key size")
 	require.Equal(t, owner.ValueSize, standIn.ValueSize, "value size")
-	require.Equal(t, owner.MaxEntries, standIn.MaxEntries, "max entries")
 	require.Equal(t, owner.Flags, standIn.Flags, "flags")
 }
 
-// With stamped_only set the hook judges only sockets in map_sock_scope. A
-// PROG_TEST_RUN socket is fresh and never stamped, so packets the default
+// With scoped set the hook judges only sockets in a cgroup recorded in
+// map_scope_cgroups. Nothing is recorded here, so packets the default
 // program drops must pass, and leave no record.
-func TestOriginScopeStampedPassesUnstampedSockets(t *testing.T) {
+func TestOriginScopedPassesOtherCgroups(t *testing.T) {
 	all := loadOriginObjects(t)
-	stamped := loadOriginObjectsStampedOnly(t)
-	for _, objs := range []*OriginBpfObjects{all, stamped} {
+	scoped := loadOriginObjectsScoped(t)
+	for _, objs := range []*OriginBpfObjects{all, scoped} {
 		seedOriginRules(t, objs)
 		setOriginMode(t, objs, originModeEnforce)
 	}
@@ -99,13 +100,13 @@ func TestOriginScopeStampedPassesUnstampedSockets(t *testing.T) {
 		require.Equal(t, uint32(0), ret, "%s: the default program must drop it", d.name)
 	}
 
-	rd, err := ringbuf.NewReader(stamped.MapOriginEvents)
+	rd, err := ringbuf.NewReader(scoped.MapOriginEvents)
 	require.NoError(t, err)
 	t.Cleanup(func() { rd.Close() })
 	for _, d := range denied {
-		ret, _, err := stamped.CgOriginEgress.Test(d.packet)
+		ret, _, err := scoped.CgOriginEgress.Test(d.packet)
 		require.NoError(t, err)
-		require.Equal(t, uint32(1), ret, "%s: an unstamped socket must pass a stamped_only program", d.name)
+		require.Equal(t, uint32(1), ret, "%s: a socket outside the recorded cgroups must pass a scoped program", d.name)
 	}
 	require.Empty(t, collectOriginRecords(t, rd, 200*time.Millisecond),
 		"an out-of-scope socket must leave no record")
@@ -132,20 +133,32 @@ func enterTestCgroup(t *testing.T) string {
 	return cgPath
 }
 
-// TestOriginScopeRealSocket covers the stamped half, which PROG_TEST_RUN's
-// unknowable cookies cannot: with real sockets, only the one whose cookie is
-// stamped is judged. The deny-all enforce policy attaches to a private
-// cgroup this process moves into, never the host root, so a broken scope
-// check can only fail this test. The destination is the host's own address,
-// which rides lo and is adjudicated with the loopback carve-out off, as it
-// is in tests, so nothing leaves the machine.
+// cgroupID is the id bpf_skb_cgroup_id reports for the cgroup at path: its
+// cgroupfs inode, on 64-bit kernels.
+func cgroupID(t *testing.T, path string) uint64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	require.NoError(t, err)
+	return fi.Sys().(*syscall.Stat_t).Ino
+}
+
+// TestOriginScopeRealSocket covers the recorded half, which PROG_TEST_RUN
+// cannot: with real sockets, those in a recorded cgroup are judged, MPTCP's
+// included, whose packets travel on a subflow socket the kernel creates
+// itself and which only the cgroup ties to its creator. The deny-all
+// enforce policy attaches to a private cgroup this process moves into,
+// never the host root, so a broken scope check can only fail this test.
+// The destination is the host's own address, which rides lo and is
+// adjudicated with the loopback carve-out off, as it is in tests, so
+// nothing leaves the machine.
 func TestOriginScopeRealSocket(t *testing.T) {
-	objs := loadOriginObjectsStampedOnly(t)
+	objs := loadOriginObjectsScoped(t)
 	seedOriginRules(t, objs) // deny by default
 	setOriginMode(t, objs, originModeEnforce)
 
+	cg := enterTestCgroup(t)
 	l, err := link.AttachCgroup(link.CgroupOptions{
-		Path:    enterTestCgroup(t),
+		Path:    cg,
 		Attach:  ebpf.AttachCGroupInetEgress,
 		Program: objs.CgOriginEgress,
 	})
@@ -173,18 +186,15 @@ func TestOriginScopeRealSocket(t *testing.T) {
 	}()
 
 	conn, err := net.DialTimeout("tcp4", ln.Addr().String(), 2*time.Second)
-	require.NoError(t, err, "an unstamped socket must connect past the enforcing hook")
+	require.NoError(t, err, "a socket in an unrecorded cgroup must connect past the enforcing hook")
 	conn.Close()
 
-	// Stamp between socket() and connect(), where cg_sock_create would.
+	require.NoError(t, objs.MapScopeCgroups.Put(cgroupID(t, cg), uint8(1)))
 	var cookie uint64
 	d := net.Dialer{Timeout: 1500 * time.Millisecond, Control: func(_, _ string, c syscall.RawConn) error {
 		var serr error
 		if err := c.Control(func(fd uintptr) {
 			cookie, serr = unix.GetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_COOKIE)
-			if serr == nil {
-				serr = objs.MapSockScope.Put(cookie, uint8(1))
-			}
 		}); err != nil {
 			return err
 		}
@@ -192,7 +202,7 @@ func TestOriginScopeRealSocket(t *testing.T) {
 	}}
 	if conn, err := d.Dial("tcp4", ln.Addr().String()); err == nil {
 		conn.Close()
-		t.Fatal("a stamped socket to a denied destination must not connect")
+		t.Fatal("a socket in a recorded cgroup to a denied destination must not connect")
 	}
 	require.NotZero(t, cookie)
 
@@ -200,7 +210,7 @@ func TestOriginScopeRealSocket(t *testing.T) {
 	rd.SetDeadline(time.Now().Add(3 * time.Second))
 	for {
 		record, err := rd.Read()
-		require.NoError(t, err, "the stamped socket's drop must leave a record")
+		require.NoError(t, err, "the recorded cgroup's drop must leave a record")
 		require.GreaterOrEqual(t, len(record.RawSample), int(unsafe.Sizeof(OriginEvent{})))
 		r := *(*OriginEvent)(unsafe.Pointer(&record.RawSample[0]))
 		if r.Cookie != cookie {
@@ -210,4 +220,26 @@ func TestOriginScopeRealSocket(t *testing.T) {
 		require.Equal(t, wantDst, r.DstIp)
 		break
 	}
+
+	t.Run("MPTCP", func(t *testing.T) {
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK, unix.IPPROTO_MPTCP)
+		if errors.Is(err, unix.EPROTONOSUPPORT) || errors.Is(err, unix.ENOPROTOOPT) || errors.Is(err, unix.EINVAL) {
+			t.Skipf("no MPTCP on this kernel: %v", err)
+		}
+		require.NoError(t, err)
+		defer unix.Close(fd)
+		sa := &unix.SockaddrInet4{Port: ln.Addr().(*net.TCPAddr).Port}
+		copy(sa.Addr[:], hostIP)
+		if err := unix.Connect(fd, sa); err != nil && !errors.Is(err, unix.EINPROGRESS) {
+			t.Fatalf("connect: %v", err)
+		}
+		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+		n, err := unix.Poll(pfd, 1500)
+		require.NoError(t, err)
+		if n > 0 {
+			soErr, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR)
+			require.NoError(t, err)
+			require.NotZero(t, soErr, "an MPTCP connection from a recorded cgroup to a denied destination must not connect")
+		}
+	})
 }

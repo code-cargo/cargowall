@@ -263,11 +263,11 @@ func (o *Observer) EnableL7(opts L7Options) (*L7, error) {
 // cgroup, and starts the reader. Nothing here can affect enforcement; any
 // error means the caller runs without container attribution.
 //
-// scopeStamps, when non-nil, is the step tracker's map of sockets created by
-// tasks in our pid namespace (steps.Tracker.ScopeStamps): the hook then
-// judges only those, and every other socket under the root cgroup passes it
-// untouched. nil judges every socket.
-func Start(tcObjs *bpf.TcBpfObjects, scopeStamps *ebpf.Map, logger *slog.Logger) (*Observer, error) {
+// scopeCgroups, when non-nil, is the step tracker's map of cgroups tasks in
+// our pid namespace have occupied (steps.Tracker.ScopeCgroups): the hook
+// then judges only sockets in those cgroups, and every other socket under
+// the root cgroup passes it untouched. nil judges every socket.
+func Start(tcObjs *bpf.TcBpfObjects, scopeCgroups *ebpf.Map, logger *slog.Logger) (*Observer, error) {
 	if tcObjs == nil {
 		return nil, errors.New("nil TC BPF objects")
 	}
@@ -308,20 +308,19 @@ func Start(tcObjs *bpf.TcBpfObjects, scopeStamps *ebpf.Map, logger *slog.Logger)
 		"map_default_action": tcObjs.MapDefaultAction,
 		"map_audit_mode":     tcObjs.MapAuditMode,
 	}
-	if scopeStamps != nil {
+	if scopeCgroups != nil {
 		// Set before load, with the map it reads: the program never judges,
-		// even briefly, a socket that is not this job's.
-		v := spec.Variables[bpf.OriginBpfVarStampedOnly]
-		if v == nil {
-			return nil, errors.New("origin BPF spec has no stamped_only variable (stale generated code)")
+		// even briefly, a socket that is not this job's. The stand-in takes
+		// the replacement's size, which pkg/steps chose.
+		v, m := spec.Variables[bpf.OriginBpfVarScoped], spec.Maps[bpf.OriginBpfMapMapScopeCgroups]
+		if v == nil || m == nil {
+			return nil, errors.New("origin BPF spec has no scoped variable or scope map (stale generated code)")
 		}
 		if err := v.Set(uint8(1)); err != nil {
-			return nil, fmt.Errorf("failed to set stamped_only: %w", err)
+			return nil, fmt.Errorf("failed to set scoped: %w", err)
 		}
-		replacements[bpf.OriginBpfMapMapSockScope] = scopeStamps
-	} else if m := spec.Maps[bpf.OriginBpfMapMapSockScope]; m != nil {
-		// Only a stamped_only program reads the stand-in.
-		m.MaxEntries = 64
+		m.MaxEntries = scopeCgroups.MaxEntries()
+		replacements[bpf.OriginBpfMapMapScopeCgroups] = scopeCgroups
 	}
 	if err := cargowallEbpf.LoadObjects(logger, "originbpf", spec, ebpf.CollectionOptions{
 		MapReplacements: replacements,
@@ -370,10 +369,10 @@ func Start(tcObjs *bpf.TcBpfObjects, scopeStamps *ebpf.Map, logger *slog.Logger)
 		// The tree podenv.Shape.HookScope showed this process is in: the
 		// machine's root in the host cgroup namespace, our container's
 		// subtree in a private one. Every socket under it reaches the
-		// program. Without scopeStamps it judges all of them (a runner VM,
-		// or our own container). With them it judges only sockets this
-		// job's tasks created, and passes the rest, a neighbour pod's
-		// included, with no verdict and no record.
+		// program. Without scopeCgroups it judges all of them (a runner VM,
+		// or our own container). With them it judges only sockets in a
+		// cgroup this job's tasks occupy, and passes the rest, a neighbour
+		// pod's included, with no verdict and no record.
 		Path:    "/sys/fs/cgroup",
 		Attach:  ebpf.AttachCGroupInetEgress,
 		Program: o.objs.CgOriginEgress,

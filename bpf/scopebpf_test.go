@@ -87,9 +87,10 @@ func attachScopeTracing(t *testing.T, p *ebpf.Program) {
 	t.Cleanup(func() { l.Close() })
 }
 
-// runScopeWalk runs the startup walk and returns the cgroup ids it lists,
-// from records of a cgroup id, a process id and the cgroup's level.
-func runScopeWalk(t *testing.T, objs *ScopeBpfObjects) map[uint64]bool {
+// runScopeWalk runs the startup walk and returns the cgroups it lists, by
+// id, with the level it wrote for each, from records of a cgroup id, a
+// process id and the cgroup's level.
+func runScopeWalk(t *testing.T, objs *ScopeBpfObjects) map[uint64]uint32 {
 	t.Helper()
 	it, err := link.AttachIter(link.IterOptions{Program: objs.ScopeTaskIter})
 	require.NoError(t, err)
@@ -100,12 +101,12 @@ func runScopeWalk(t *testing.T, objs *ScopeBpfObjects) map[uint64]bool {
 	out, err := io.ReadAll(rd)
 	require.NoError(t, err)
 	require.Zero(t, len(out)%24, "the walk writes whole records")
-	ids := make(map[uint64]bool)
+	levels := make(map[uint64]uint32)
 	for i := 0; i < len(out); i += 24 {
 		require.NotZero(t, binary.NativeEndian.Uint64(out[i+8:]), "each record names its process")
-		ids[binary.NativeEndian.Uint64(out[i:])] = true
+		levels[binary.NativeEndian.Uint64(out[i:])] = uint32(binary.NativeEndian.Uint64(out[i+16:]))
 	}
-	return ids
+	return levels
 }
 
 func scopeRecorded(t *testing.T, objs *ScopeBpfObjects, path string) bool {
@@ -370,16 +371,19 @@ func TestScopeForkIgnoresAParentMovedMidFork(t *testing.T) {
 	require.False(t, scopeRecorded(t, objs, b), "a cgroup the children only inherited (%d forks)", forks.Load())
 }
 
-// The startup walk lists the cgroup of each task of ours and records
-// nothing itself (pkg/origin decides which to record); a task of ours in
-// the root cgroup is counted instead.
+// The startup walk lists the cgroup of each task of ours, with its level,
+// and records nothing itself: pkg/origin decides which to record, and
+// reports a task of ours in the root cgroup.
 func TestScopeWalkListsOurCgroups(t *testing.T) {
 	requireBPF(t)
 	t.Run("our pid namespace", func(t *testing.T) {
 		objs := loadScope(t, pidnsInode(t), 0)
 		cg := enterTestCgroup(t)
-		ids := runScopeWalk(t, objs)
-		require.True(t, ids[cgroupID(t, cg)], "the test process's cgroup")
+		levels := runScopeWalk(t, objs)
+		level, listed := levels[cgroupID(t, cg)]
+		require.True(t, listed, "the test process's cgroup")
+		require.Equal(t, podenv.CgroupLevel(strings.TrimPrefix(cg, podenv.CgroupRoot)), level,
+			"at the kernel's level, which in the host cgroup namespace is the path's depth")
 		require.False(t, scopeRecorded(t, objs, cg), "the walk records nothing")
 	})
 	t.Run("another pid namespace", func(t *testing.T) {
@@ -390,31 +394,20 @@ func TestScopeWalkListsOurCgroups(t *testing.T) {
 		objs := loadScope(t, ino, 0)
 		pid := enter()
 		moveInto(t, dst, pid)
-		ids := runScopeWalk(t, objs)
-		require.True(t, ids[cgroupID(t, dst)], "the namespace's task's cgroup")
-		require.False(t, ids[cgroupID(t, foreign)], "a cgroup only a task outside the namespace is in")
+		levels := runScopeWalk(t, objs)
+		_, listed := levels[cgroupID(t, dst)]
+		require.True(t, listed, "the namespace's task's cgroup")
+		_, listed = levels[cgroupID(t, foreign)]
+		require.False(t, listed, "a cgroup only a task outside the namespace is in")
 
 		moveInto(t, podenv.CgroupRoot, pid)
-		ids = runScopeWalk(t, objs)
-		require.False(t, ids[cgroupID(t, dst)], "the task has left")
-		require.False(t, ids[cgroupID(t, podenv.CgroupRoot)], "the root cgroup is never listed")
-		require.Equal(t, uint64(1), scopeStat(t, objs, ScopeStatRoot), "a task of ours there is counted")
-
-		// Once a process, however many threads it has.
-		if _, err := exec.LookPath("python3"); err != nil {
-			t.Skip("no python3 for a threaded process")
-		}
-		threaded := enter("python3", "-c",
-			"import threading, time\n"+
-				"for _ in range(4): threading.Thread(target=time.sleep, args=(60,), daemon=True).start()\n"+
-				"time.sleep(60)")
-		require.Eventually(t, func() bool {
-			tasks, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", threaded))
-			return err == nil && len(tasks) == 5
-		}, 5*time.Second, 20*time.Millisecond)
-		moveInto(t, podenv.CgroupRoot, threaded)
-		runScopeWalk(t, objs)
-		require.Equal(t, uint64(1+2), scopeStat(t, objs, ScopeStatRoot), "this walk counts the sleep and the threaded process once each")
+		levels = runScopeWalk(t, objs)
+		_, listed = levels[cgroupID(t, dst)]
+		require.False(t, listed, "the task has left")
+		level, listed := levels[cgroupID(t, podenv.CgroupRoot)]
+		require.True(t, listed, "the root cgroup is listed, for pkg/origin to report")
+		require.Zero(t, level)
+		require.Zero(t, scopeStat(t, objs, ScopeStatRoot), "the walk counts nothing: it runs on every tick")
 	})
 }
 

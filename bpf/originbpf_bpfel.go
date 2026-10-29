@@ -164,7 +164,6 @@ const (
 	OriginBpfVarBtfAnchorOriginEvent = "btf_anchor_origin_event"
 	OriginBpfVarScopeSubtreeCgroup   = "scope_subtree_cgroup"
 	OriginBpfVarScopeSubtreeLevel    = "scope_subtree_level"
-	OriginBpfVarScoped               = "scoped"
 )
 
 // LoadOriginBpf returns the embedded CollectionSpec for OriginBpf.
@@ -245,7 +244,6 @@ type OriginBpfVariableSpecs struct {
 	BtfAnchorOriginEvent *ebpf.VariableSpec `ebpf:"btf_anchor_origin_event"`
 	ScopeSubtreeCgroup   *ebpf.VariableSpec `ebpf:"scope_subtree_cgroup"`
 	ScopeSubtreeLevel    *ebpf.VariableSpec `ebpf:"scope_subtree_level"`
-	Scoped               *ebpf.VariableSpec `ebpf:"scoped"`
 }
 
 // OriginBpfObjects contains all objects after they have been loaded into the kernel.
@@ -321,7 +319,6 @@ type OriginBpfVariables struct {
 	BtfAnchorOriginEvent *ebpf.Variable `ebpf:"btf_anchor_origin_event"`
 	ScopeSubtreeCgroup   *ebpf.Variable `ebpf:"scope_subtree_cgroup"`
 	ScopeSubtreeLevel    *ebpf.Variable `ebpf:"scope_subtree_level"`
-	Scoped               *ebpf.Variable `ebpf:"scoped"`
 }
 
 // OriginBpfPrograms contains all programs after they have been loaded into the kernel.

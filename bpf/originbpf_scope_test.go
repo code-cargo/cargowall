@@ -41,20 +41,17 @@ import (
 )
 
 // loadOriginObjectsScoped loads the origin collection the way origin.Start
-// does in a privileged pod: scoped set before load, with the pod's cgroup
-// when pod is not "". The collection keeps its own stand-in
+// does in a privileged pod: scoped before load to the job's subtree, the
+// cgroup at subtree. The collection keeps its own stand-in
 // map_scope_cgroups, which a test fills directly.
-func loadOriginObjectsScoped(t *testing.T, pod string) *OriginBpfObjects {
+func loadOriginObjectsScoped(t *testing.T, subtree string) *OriginBpfObjects {
 	t.Helper()
 	requireBPF(t)
 	spec, err := LoadOriginBpf()
 	require.NoError(t, err)
-	require.NoError(t, spec.Variables[OriginBpfVarScoped].Set(uint8(1)))
-	if pod != "" {
-		require.NoError(t, spec.Variables[OriginBpfVarScopeSubtreeCgroup].Set(cgroupID(t, pod)))
-		require.NoError(t, spec.Variables[OriginBpfVarScopeSubtreeLevel].Set(
-			podenv.CgroupLevel(strings.TrimPrefix(pod, podenv.CgroupRoot))))
-	}
+	require.NoError(t, spec.Variables[OriginBpfVarScopeSubtreeCgroup].Set(cgroupID(t, subtree)))
+	require.NoError(t, spec.Variables[OriginBpfVarScopeSubtreeLevel].Set(
+		podenv.CgroupLevel(strings.TrimPrefix(subtree, podenv.CgroupRoot))))
 	var objs OriginBpfObjects
 	require.NoError(t, spec.LoadAndAssign(&objs, nil))
 	t.Cleanup(func() { objs.Close() })
@@ -88,7 +85,7 @@ func TestScopeCgroupsMapSpecsMatch(t *testing.T) {
 // program drops must pass, and leave no record.
 func TestOriginScopedPassesOtherCgroups(t *testing.T) {
 	all := loadOriginObjects(t)
-	scoped := loadOriginObjectsScoped(t, "")
+	scoped := loadOriginObjectsScoped(t, siblingCgroup(t, "elsewhere"))
 	for _, objs := range []*OriginBpfObjects{all, scoped} {
 		seedOriginRules(t, objs)
 		setOriginMode(t, objs, originModeEnforce)
@@ -199,7 +196,8 @@ func cgroupID(t *testing.T, path string) uint64 {
 // adjudicated with the loopback carve-out off, as it is in tests, so
 // nothing leaves the machine.
 func TestOriginScopeRealSocket(t *testing.T) {
-	objs := loadOriginObjectsScoped(t, "")
+	requireBPF(t)
+	objs := loadOriginObjectsScoped(t, siblingCgroup(t, "elsewhere"))
 	seedOriginRules(t, objs) // deny by default
 	setOriginMode(t, objs, originModeEnforce)
 

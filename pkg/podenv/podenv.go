@@ -227,6 +227,10 @@ type Dockerd struct {
 	// Reason is the evidence for Foreign or Hidden, or the probe error for
 	// Unknown.
 	Reason string
+	// Cgroup is a Foreign daemon's cgroup v2 path as /proc/<pid>/cgroup
+	// gives it in our cgroup namespace, "" when it could not be read. A
+	// path under our namespace's root does not start with "/..".
+	Cgroup string
 }
 
 // Shape is what Detect found.
@@ -270,18 +274,20 @@ type Shape struct {
 // Scope is what a cgroup program attached at /sys/fs/cgroup judges. The
 // zero value is every socket under the attach point.
 type Scope struct {
-	// Limited: only this job's sockets, those under Subtree and those in a
-	// cgroup a task of our pid namespace has entered. The attach point is
-	// the root of the machine's tree, which other pods share, and every
-	// other socket passes.
-	Limited bool
-	// Subtree, when Limited, is the cgroup, absolute, whose whole subtree is
-	// this job's, whatever enters it: our Kubernetes pod's, since every
+	// Subtree, when set, limits the hook to this job's sockets: those under
+	// this cgroup, whose whole subtree is the job's whatever enters it, and
+	// those in a cgroup a task of our pid namespace has entered. Every other
+	// socket passes: the attach point is the root of a tree other workloads
+	// share. The subtree is our Kubernetes pod's cgroup, since every
 	// container in the pod is the job's, whichever pid namespace it shares
 	// and whoever started it; outside Kubernetes, our own (our container's),
 	// which a runtime's exec into it enters from outside our pid namespace.
+	// A path as our cgroup namespace gives it.
 	Subtree string
 }
+
+// Limited reports whether the hook judges only this job's sockets.
+func (s Scope) Limited() bool { return s.Subtree != "" }
 
 // HookScope decides whether a cgroup program attached at /sys/fs/cgroup can
 // judge exactly this job's traffic, and how: loading the hook and scoping
@@ -307,48 +313,21 @@ func (s Shape) HookScope() (Scope, error) {
 	if err := s.attachPointRefusal(); err != nil {
 		return Scope{}, err
 	}
-	if s.ownRoot() {
-		if err := s.partialRefusal(); err != nil {
-			return Scope{}, err
-		}
-		switch s.Dockerd.Kind {
-		case DockerdAbsent, DockerdLocal:
-			return Scope{}, nil
-		case DockerdForeign:
-			return Scope{}, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd outside this container, "+
-				"another container's or the host's own (%s)", s.Dockerd.Reason)
-		case DockerdHidden:
-			return Scope{}, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd we cannot see, "+
-				"possibly the host's own (%s)", s.Dockerd.Reason)
-		case DockerdUnknown:
-			return Scope{}, fmt.Errorf("in a private cgroup namespace beside an unidentified dockerd (%s)", s.Dockerd.Reason)
-		default:
-			return Scope{}, fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
-		}
+	if s.CgroupNS == CgroupNSPrivate {
+		return s.privateScope()
 	}
-	// /sys/fs/cgroup is a tree others share: the machine's root in the host
-	// cgroup namespace, or, in a private one rooted above our cgroup, that
-	// root, such as a nested node's (kind, minikube's docker driver) whose
-	// privileged pods share its namespace. kubelet's tree is kubepods under
-	// the cgroupfs driver and <root>-kubepods.slice under the systemd driver
-	// with a cgroup root of its own, so the name is matched anywhere in the
-	// path. A false match only refuses: outright in the host pid namespace,
-	// and outside it for want of a pod cgroup in the path.
-	kubepods := strings.Contains(s.CgroupPath, "kubepods")
+	// /sys/fs/cgroup is the machine's root, which every pod and daemon on
+	// it shares.
+	kubepods := s.kubepods()
 	switch s.PidNS {
 	case PidNSUnknown:
-		return Scope{}, fmt.Errorf("pid namespace unknown where the cgroup tree is shared (%s)", s.PidNSReason)
+		return Scope{}, fmt.Errorf("pid namespace unknown in the host cgroup namespace (%s)", s.PidNSReason)
 	case PidNSHost:
 		if kubepods {
-			return Scope{}, errors.New("running in a Kubernetes pod in the node's cgroup and pid namespaces: " +
+			return Scope{}, errors.New("running in a Kubernetes pod in the host cgroup and pid namespaces: " +
 				"the cgroup hook would attach at the node root and judge every pod on the node")
 		}
-		if !s.machineFirewall() {
-			if err := s.partialRefusal(); err != nil {
-				return Scope{}, err
-			}
-		}
-		return Scope{}, nil
+		return Scope{}, nil // machineFirewall
 	case PidNSPrivate:
 	default:
 		return Scope{}, fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
@@ -356,16 +335,12 @@ func (s Shape) HookScope() (Scope, error) {
 	if err := s.partialRefusal(); err != nil {
 		return Scope{}, err
 	}
-	scope := Scope{Limited: true, Subtree: s.CgroupPath}
-	if kubepods {
-		if scope.Subtree = podCgroup(s.CgroupPath); scope.Subtree == "" {
-			return Scope{}, fmt.Errorf("in a Kubernetes pod whose cgroup is not in %s: the cgroup hook "+
-				"would not judge the pod's other containers", s.CgroupPath)
-		}
-	} else if CgroupLevel(s.CgroupPath) == 0 {
-		return Scope{}, errors.New("in the root cgroup outside the host pid namespace: no cgroup of this job's own " +
-			"holds its tasks, and the root holds every task on the machine")
+	scope, err := s.limitedScope(kubepods)
+	if err != nil {
+		return Scope{}, err
 	}
+	// Under the machine's root every daemon's containers reach the hook,
+	// and those of one in our pid namespace are recorded as they start.
 	switch s.Dockerd.Kind {
 	case DockerdAbsent, DockerdLocal, DockerdForeign:
 		return scope, nil
@@ -380,12 +355,82 @@ func (s Shape) HookScope() (Scope, error) {
 	}
 }
 
-// ownRoot reports whether /sys/fs/cgroup is our own container's cgroup: a
-// private cgroup namespace whose root our cgroup is. Every socket under it
-// is then our container's. A private namespace whose root is above us is
-// not ours alone.
-func (s Shape) ownRoot() bool {
-	return s.CgroupNS == CgroupNSPrivate && s.CgroupPath == "/"
+// privateScope decides for a private cgroup namespace, where
+// /sys/fs/cgroup is the namespace's root, below the machine's. The hook
+// sees only what is under it, and no scope widens that, so a daemon whose
+// containers could live outside it refuses whatever our path. The path
+// then decides only how much the hook judges: where our cgroup is the root
+// it is our own container's, and the hook judges all of it; where the root
+// is above us it is a tree others may share, such as a nested node's
+// (kind, minikube's docker driver), whose privileged pods share the node
+// container's namespace.
+func (s Shape) privateScope() (Scope, error) {
+	if err := s.partialRefusal(); err != nil {
+		return Scope{}, err
+	}
+	switch s.Dockerd.Kind {
+	case DockerdAbsent, DockerdLocal:
+	case DockerdForeign:
+		// Its containers are where it puts them, under its own cgroup's
+		// view; when that cgroup is under our root, so are they.
+		if s.Dockerd.Cgroup == "" || strings.HasPrefix(s.Dockerd.Cgroup, "/..") {
+			return Scope{}, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd outside this container, "+
+				"another container's or the host's own (%s)", s.Dockerd.Reason)
+		}
+	case DockerdHidden:
+		return Scope{}, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd we cannot see, "+
+			"possibly the host's own (%s)", s.Dockerd.Reason)
+	case DockerdUnknown:
+		return Scope{}, fmt.Errorf("in a private cgroup namespace beside an unidentified dockerd (%s)", s.Dockerd.Reason)
+	default:
+		return Scope{}, fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
+	}
+	if s.CgroupPath == "/" {
+		return Scope{}, nil
+	}
+	kubepods := s.kubepods()
+	switch s.PidNS {
+	case PidNSUnknown:
+		return Scope{}, fmt.Errorf("pid namespace unknown in a cgroup namespace rooted above our cgroup (%s)", s.PidNSReason)
+	case PidNSHost:
+		if kubepods {
+			return Scope{}, errors.New("running in a Kubernetes pod in the node's cgroup and pid namespaces: " +
+				"the cgroup hook would attach at the node root and judge every pod on the node")
+		}
+		return Scope{}, nil
+	case PidNSPrivate:
+		return s.limitedScope(kubepods)
+	default:
+		return Scope{}, fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
+	}
+}
+
+// kubepods reports whether our cgroup is in kubelet's tree: kubepods under
+// the cgroupfs driver, <root>-kubepods.slice under the systemd driver with
+// a cgroup root of its own, so the name is matched anywhere in the path. A
+// false match only refuses: outright in the host pid namespace, and outside
+// it for want of a pod cgroup in the path.
+func (s Shape) kubepods() bool {
+	return strings.Contains(s.CgroupPath, "kubepods")
+}
+
+// limitedScope is the scope that judges only this job's sockets, with the
+// job's subtree: the pod's cgroup in kubelet's tree, our own cgroup
+// outside it.
+func (s Shape) limitedScope(kubepods bool) (Scope, error) {
+	if kubepods {
+		pod := podCgroup(s.CgroupPath)
+		if pod == "" {
+			return Scope{}, fmt.Errorf("in a Kubernetes pod whose cgroup is not in %s: the cgroup hook "+
+				"would not judge the pod's other containers", s.CgroupPath)
+		}
+		return Scope{Subtree: pod}, nil
+	}
+	if CgroupLevel(s.CgroupPath) == 0 {
+		return Scope{}, errors.New("in the root cgroup outside the host pid namespace: no cgroup of this job's own " +
+			"holds its tasks, and the root holds every task on the machine")
+	}
+	return Scope{Subtree: s.CgroupPath}, nil
 }
 
 // machineFirewall reports whether the hook would attach at the machine's
@@ -792,7 +837,8 @@ func probeDockerd(socket string) Dockerd {
 		return unknown(err)
 	}
 	if ours != theirs {
-		return Dockerd{Kind: DockerdForeign, Reason: fmt.Sprintf("pid %d has another mount namespace", pid)}
+		cgroup, _ := ReadCgroupPath("/proc/" + strconv.Itoa(int(pid)) + "/cgroup")
+		return Dockerd{Kind: DockerdForeign, Reason: fmt.Sprintf("pid %d has another mount namespace", pid), Cgroup: cgroup}
 	}
 	return Dockerd{Kind: DockerdLocal}
 }

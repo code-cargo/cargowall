@@ -60,6 +60,7 @@ const volatile __u64 subtree_cgroup = 0;
 
 #include "pidns.h"
 
+#define ENOENT 2
 #define E2BIG 7
 #define EEXIST 17
 
@@ -86,8 +87,8 @@ struct {
 // entries, so a cgroup entered twice that could not be recorded counts
 // twice. Mirrored by Go constants and pinned by test.
 #define SCOPE_STAT_FULL 0    // map_scope_cgroups was full
-#define SCOPE_STAT_ROOT 1    // a task of ours entered, or was in, the root cgroup
-#define SCOPE_STAT_FAILED 2  // any other update failure, such as a busy bucket
+#define SCOPE_STAT_ROOT 1    // a task of ours entered the root cgroup
+#define SCOPE_STAT_FAILED 2  // any other update or delete failure, such as a busy bucket
 #define SCOPE_STAT_SHARED 3  // a task outside our pid namespace entered a recorded cgroup
 #define SCOPE_STATS_MAX 4
 
@@ -167,14 +168,19 @@ static __always_inline void scope_enter(struct cgroup *cg)
 
 // scope_leave takes cg out of the scope, if it is in it, when a task
 // outside our pid namespace enters it: judging the cgroup would judge that
-// task. The job's own tasks there now pass, so it is counted.
+// task. The job's own tasks there now pass, so it is counted, and so is a
+// delete that fails other than to a concurrent one, which leaves the
+// cgroup judged until pkg/origin's next walk.
 static __always_inline void scope_leave(struct cgroup *cg)
 {
     __u64 id = scope_id(cg);
     if (!id || !bpf_map_lookup_elem(&map_scope_cgroups, &id))
         return;
-    if (!bpf_map_delete_elem(&map_scope_cgroups, &id))
+    long err = bpf_map_delete_elem(&map_scope_cgroups, &id);
+    if (!err)
         scope_count(SCOPE_STAT_SHARED);
+    else if (err != -ENOENT)
+        scope_count(SCOPE_STAT_FAILED);
 }
 
 // A task created by clone3 in the cgroup CLONE_INTO_CGROUP named, before
@@ -238,9 +244,10 @@ int BPF_PROG(scope_release, struct cgroup *cg, const char *path)
 // id in our namespace and its cgroup's level, three u64s, and pkg/origin
 // records each cgroup that no task outside our pid namespace is in. The
 // level is the kernel's, which userspace cannot read from a path in a
-// cgroup namespace rooted below the machine's. pkg/origin runs the walk at
-// startup and again on every report tick. The kernel scopes the walk to
-// the opener's pid namespace.
+// cgroup namespace rooted below the machine's; level 0 is the root, which
+// pkg/origin reports rather than records. pkg/origin runs the walk at
+// startup and again on every report tick, so it counts nothing here. The
+// kernel scopes the walk to the opener's pid namespace.
 SEC("iter/task")
 int scope_task_iter(struct bpf_iter__task *ctx)
 {
@@ -251,11 +258,10 @@ int scope_task_iter(struct bpf_iter__task *ctx)
     if (!tgid)
         return 0;
     struct cgroup *cg = dfl_cgroup(t);
-    __u64 rec[3] = {scope_id(cg), tgid, cg ? BPF_CORE_READ(cg, level) : 0};
-    if (rec[0])
-        bpf_seq_write(ctx->meta->seq, rec, sizeof(rec));
-    else if (cg && BPF_CORE_READ(t, pid) == BPF_CORE_READ(t, tgid))
-        scope_count(SCOPE_STAT_ROOT);  // once a process, not once a thread
+    if (!cg)
+        return 0;
+    __u64 rec[3] = {BPF_CORE_READ(cg, kn, id), tgid, BPF_CORE_READ(cg, level)};
+    bpf_seq_write(ctx->meta->seq, rec, sizeof(rec));
     return 0;
 }
 

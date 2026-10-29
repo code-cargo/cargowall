@@ -57,6 +57,8 @@ func TestHookScope(t *testing.T) {
 	local := Dockerd{Kind: DockerdLocal}
 	foreign := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace"}
 	hidden := Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
+	foreignUnder := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind"}
+	foreignAbove := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/../../dind"}
 	unknownD := Dockerd{Kind: DockerdUnknown, Reason: "dial: timeout"}
 	// Both helpers have the mount proven on a kernel that keeps socket
 	// cgroups, so each case is decided by the fact it names.
@@ -74,7 +76,7 @@ func TestHookScope(t *testing.T) {
 	remoteDaemon := func(s *Shape) { s.DockerHost, s.DockerHostSetting = "tcp://localhost:2376", "DOCKER_HOST" }
 	unreadContext := func(s *Shape) { s.DockerHostReason = `docker context "ci" (from DOCKER_CONTEXT): no such file` }
 	all := Scope{}
-	inPod := Scope{Limited: true, Subtree: podCg}
+	inPod := Scope{Subtree: podCg}
 	cases := []struct {
 		name  string
 		shape Shape
@@ -93,7 +95,7 @@ func TestHookScope(t *testing.T) {
 		// a runtime's exec into it enters from outside our pid namespace.
 		{
 			"privileged container outside Kubernetes", host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true,
-			Scope{Limited: true, Subtree: "/system.slice/docker-a.scope"},
+			Scope{Subtree: "/system.slice/docker-a.scope"},
 		},
 		{"own pid namespace in the root cgroup", host("/", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), false, all},
 		// A private cgroup namespace rooted above our cgroup is a tree others
@@ -102,19 +104,32 @@ func TestHookScope(t *testing.T) {
 		// own when we sit below its root (dind's /init).
 		{
 			"nested node: privileged pod in the node's cgroup namespace", nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true,
-			Scope{Limited: true, Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
+			Scope{Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
 		},
 		{"nested node: hostPID pod", nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSHost, local), false, all},
-		{"private cgroupns below its root, own pid namespace", nested("/init", PidNSPrivate, local), true, Scope{Limited: true, Subtree: "/init"}},
-		{"private cgroupns below its root, beside another container's dockerd", nested("/init", PidNSPrivate, foreign), true, Scope{Limited: true, Subtree: "/init"}},
+		{"private cgroupns below its root, own pid namespace", nested("/init", PidNSPrivate, local), true, Scope{Subtree: "/init"}},
+		// In a private cgroup namespace the hook sees only what is under its
+		// root, whatever the scope, so a daemon whose containers could live
+		// outside it refuses, whatever our path and pid namespace, unless its
+		// own cgroup shows it is under the root.
+		{"private cgroupns below its root, another container's dockerd, cgroup unread", nested("/init", PidNSPrivate, foreign), false, all},
+		{"private cgroupns below its root, another container's dockerd under the root", nested("/init", PidNSPrivate, foreignUnder), true, Scope{Subtree: "/init"}},
+		{"private cgroupns below its root, another container's dockerd above the root", nested("/init", PidNSPrivate, foreignAbove), false, all},
 		{"private cgroupns below its root, host pid namespace", nested("/init", PidNSHost, local), true, all},
+		{"private cgroupns below its root, host pid namespace, the host's dockerd", nested("/init", PidNSHost, foreign), false, all},
+		{"private cgroupns below its root, host pid namespace, hidden dockerd", nested("/init", PidNSHost, hidden), false, all},
+		{
+			"nested node: ARC pod with a dind sidecar sharing its pid namespace", nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate,
+				Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/4567ef01"}), true,
+			Scope{Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
+		},
 		{"private cgroupns below its root, host pid namespace, socket cgroups shared", with(nested("/init", PidNSHost, local), sockets(SocketCgroupsShared)), false, all},
 		// The pod's other containers are judged by its cgroup, so a pod
 		// whose cgroup cannot be found would leave them out.
 		{"privileged pod, no pod cgroup in the path", host("/kubepods.slice/cri-containerd-a.scope", PidNSPrivate, foreign), false, all},
 		{
 			"privileged pod, cgroupfs driver", host("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate, foreign), true,
-			Scope{Limited: true, Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
+			Scope{Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
 		},
 		// A socket's cgroup must be whose it is wherever the hook is
 		// attached below the machine's root or judges only our cgroups,
@@ -140,6 +155,7 @@ func TestHookScope(t *testing.T) {
 		{"private cgroupns, docker context unread", with(private(local), unreadContext), false, all},
 		{"hosted runner, docker context unread", with(host(runner, PidNSHost, local), unreadContext), true, all},
 		{"private cgroupns, foreign dockerd", private(foreign), false, all},
+		{"private cgroupns, foreign dockerd under our root", private(foreignUnder), true, all},
 		{"private cgroupns, hidden dockerd", private(hidden), false, all},
 		{"private cgroupns, unidentified dockerd", private(unknownD), false, all},
 		{"private cgroupns, no dockerd", private(Dockerd{Kind: DockerdAbsent}), true, all},

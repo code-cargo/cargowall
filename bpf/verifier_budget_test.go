@@ -103,18 +103,15 @@ func TestVerifierBudget(t *testing.T) {
 			return spec.Variables[ScopeBpfVarPidnsIno].Set(pidnsInode(t))
 		}},
 		{"originbpf", LoadOriginBpf, nil},
-		// scoped is a load-time constant, so a privileged pod runs a
+		// The scope is a load-time constant, so a privileged pod runs a
 		// different program from a runner VM's. Measure both, the scoped one
-		// with the job's subtree set, as in every scoped shape: at zero the
-		// verifier prunes the subtree check as dead.
+		// with the job's subtree set: at zero the verifier prunes the scope
+		// check as dead.
 		{"originbpf_scoped", LoadOriginBpf, func(spec *ebpf.CollectionSpec) error {
 			if err := spec.Variables[OriginBpfVarScopeSubtreeCgroup].Set(uint64(1)); err != nil {
 				return err
 			}
-			if err := spec.Variables[OriginBpfVarScopeSubtreeLevel].Set(uint32(3)); err != nil {
-				return err
-			}
-			return spec.Variables[OriginBpfVarScoped].Set(uint8(1))
+			return spec.Variables[OriginBpfVarScopeSubtreeLevel].Set(uint32(3))
 		}},
 	}
 

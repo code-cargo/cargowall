@@ -328,7 +328,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		"map_default_action": tcObjs.MapDefaultAction,
 		"map_audit_mode":     tcObjs.MapAuditMode,
 	}
-	if scope.Limited {
+	if scope.Limited() {
 		// Set before load, with the map it reads: the program never judges,
 		// even briefly, a socket that is not this job's. The stand-in takes
 		// the scope map's size.

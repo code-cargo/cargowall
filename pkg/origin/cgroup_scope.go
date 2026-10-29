@@ -64,9 +64,25 @@ type cgroupScope struct {
 	stop     chan struct{}
 	done     chan struct{}
 	reported [bpf.ScopeStatsMax]uint64 // last counts logged, owned by watch
-	// Cgroups the walk last found shared, or could not record: each is
-	// logged when it becomes so, not on every walk. Owned by the walk.
-	shared, unrecorded map[uint64]bool
+	// What the last walk found and logged, so the next logs only what is
+	// new, and keeps only what it finds again. Owned by the walk.
+	last walkFindings
+}
+
+// walkFindings is what one walk found that it logs: cgroups shared with a
+// task outside our pid namespace, cgroups it could not record or read,
+// and processes of ours in the root cgroup or outside our cgroup
+// namespace's root, where the hook never sees their sockets.
+type walkFindings struct {
+	shared, unrecorded, unreadable map[uint64]bool
+	inRoot, outside                map[uint32]bool
+}
+
+func newWalkFindings() walkFindings {
+	return walkFindings{
+		shared: make(map[uint64]bool), unrecorded: make(map[uint64]bool), unreadable: make(map[uint64]bool),
+		inRoot: make(map[uint32]bool), outside: make(map[uint32]bool),
+	}
 }
 
 // subtree is the cgroup whose whole subtree a scoped hook judges, as both
@@ -93,16 +109,12 @@ func subtreeLevel(sub, own string, ownLevel uint32) (uint32, error) {
 	return ownLevel - below, nil
 }
 
-// setCgroupScope sets the scoped hook's load-time constants: scoped, and
-// the job's subtree, once the walk has read its level.
+// setCgroupScope sets the scoped hook's load-time constants, the job's
+// subtree, once the walk has read its level.
 func setCgroupScope(spec *ebpf.CollectionSpec, sub subtree) error {
-	scoped := spec.Variables[bpf.OriginBpfVarScoped]
 	id, level := spec.Variables[bpf.OriginBpfVarScopeSubtreeCgroup], spec.Variables[bpf.OriginBpfVarScopeSubtreeLevel]
-	if scoped == nil || id == nil || level == nil || spec.Maps[bpf.OriginBpfMapMapScopeCgroups] == nil {
+	if id == nil || level == nil || spec.Maps[bpf.OriginBpfMapMapScopeCgroups] == nil {
 		return errors.New("origin BPF spec has no scope variables or scope map (stale generated code)")
-	}
-	if err := scoped.Set(uint8(1)); err != nil {
-		return fmt.Errorf("failed to set scoped: %w", err)
 	}
 	if err := id.Set(sub.id); err != nil {
 		return fmt.Errorf("failed to set the job's cgroup: %w", err)
@@ -147,7 +159,7 @@ func startCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, er
 	}
 	s := &cgroupScope{
 		logger: logger, sub: sub, stop: make(chan struct{}), done: make(chan struct{}),
-		shared: make(map[uint64]bool), unrecorded: make(map[uint64]bool),
+		last: newWalkFindings(),
 	}
 	if err := cargowallEbpf.LoadObjects(logger, "scopebpf", spec, ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
@@ -162,7 +174,7 @@ func startCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, er
 		}
 		s.links = append(s.links, l)
 	}
-	if err := s.walk(); err != nil {
+	if err := s.walk(true); err != nil {
 		s.release()
 		return nil, fmt.Errorf("cgroup scope: task walk: %w", err)
 	}
@@ -184,15 +196,72 @@ func (s *cgroupScope) cgroups() *ebpf.Map { return s.objs.MapScopeCgroups }
 // out, and the task's sockets pass; once the other task has gone, a later
 // walk records it again. The check reads cgroup.threads, which numbers
 // each task as our pid namespace does, so a task outside it reads as 0.
-// The walk must list this process's own cgroup, which is in the subtree:
-// one that lists none of ours would leave the scope empty while the hook
-// reports it attached. The first walk also reads the subtree's level from
-// it.
-func (s *cgroupScope) walk() error {
+// A cgroup that cannot be read is reported and passed over, and the rest
+// are still reconciled.
+//
+// The first walk, at startup, must list this process's own cgroup, which
+// is in the subtree: one that lists none of ours would leave the scope
+// empty while the hook reports it attached. It reads the subtree's level
+// from it too. Later walks only reconcile.
+func (s *cgroupScope) walk(first bool) error {
 	tasks, err := s.walkTasks()
 	if err != nil {
 		return err
 	}
+	if first {
+		if err := s.checkOwn(tasks); err != nil {
+			return err
+		}
+	}
+	found := newWalkFindings()
+	for id, l := range tasks {
+		if l.level == 0 {
+			for tgid := range l.tgids {
+				found.inRoot[tgid] = true
+				if !s.last.inRoot[tgid] {
+					s.logger.Warn("A task of this job is in the root cgroup, where its sockets pass the cgroup hook",
+						"pid", tgid)
+				}
+			}
+			continue
+		}
+		path, where := cgroupPathOf(id, l.tgids)
+		if where == cgroupOutside {
+			for tgid := range l.tgids {
+				found.outside[tgid] = true
+				if !s.last.outside[tgid] {
+					s.logger.Warn("A task of this job is in a cgroup outside our cgroup namespace's root, "+
+						"which the cgroup hook never sees", "pid", tgid, "cgroup", path)
+				}
+			}
+			continue
+		}
+		if where == cgroupGoneAway || under(path, s.sub.path) {
+			continue // its tasks have gone (a move was recorded), or the subtree covers it
+		}
+		existed := s.recorded(id)
+		shared, err := sharedCgroup(filepath.Join(podenv.CgroupRoot, path))
+		switch {
+		case cgroupGone(err):
+		case err != nil:
+			found.unreadable[id] = true
+			if !s.last.unreadable[id] {
+				s.logger.Warn("Container egress cgroup scope cannot read a cgroup this job is in, and leaves it as it is",
+					"cgroup", path, "error", err)
+			}
+		case shared:
+			s.leave(id, path, &found)
+		case !existed:
+			s.record(id, path, &found)
+		}
+	}
+	s.last = found
+	return nil
+}
+
+// checkOwn requires the task walk to have listed this process's own
+// cgroup, and reads the subtree's level from it.
+func (s *cgroupScope) checkOwn(tasks map[uint64]*listed) error {
 	own, err := podenv.ReadCgroupPath("/proc/self/cgroup")
 	if err != nil {
 		return err
@@ -205,72 +274,52 @@ func (s *cgroupScope) walk() error {
 	if !ok {
 		return fmt.Errorf("the task walk did not list this process's cgroup %s", own)
 	}
-	if s.sub.id != 0 && s.sub.level == 0 {
+	if s.sub.id != 0 {
 		if s.sub.level, err = subtreeLevel(s.sub.path, own, ours.level); err != nil {
 			return err
 		}
 	}
-	shared := make(map[uint64]bool)
-	for id, listed := range tasks {
-		path, ok := cgroupPathOf(id, listed.tgids)
-		if !ok || under(path, s.sub.path) {
-			continue // its tasks have gone (a move was recorded), or the subtree covers it
-		}
-		found, err := sharedCgroup(filepath.Join(podenv.CgroupRoot, path))
-		if cgroupGone(err) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		if found {
-			s.leave(id, path)
-			shared[id] = true
-			continue
-		}
-		if s.record(id, path) {
-			shared[id] = true
-		}
-	}
-	s.shared = shared
 	return nil
 }
 
-// record puts a cgroup the walk found ours alone in the scope, then looks
-// again: a task outside our pid namespace that entered it after the first
-// look was not seen by the tracepoints, which take a cgroup out of the
-// scope when such a task enters it, unless the entry existed by then. The
-// second look runs whether the walk or a tracepoint made the entry, and
-// reports whether it found the cgroup shared after all. As in the kernel,
-// a cgroup the map cannot take costs its own sockets, not the scope. One
-// released since the walk listed it stays, a dead id: ids are never
-// reused.
-func (s *cgroupScope) record(id uint64, path string) bool {
+func (s *cgroupScope) recorded(id uint64) bool {
+	var v uint8
+	return s.objs.MapScopeCgroups.Lookup(id, &v) == nil
+}
+
+// record puts a cgroup the walk found ours alone, and not yet in the
+// scope, in the scope, then looks again: a task outside our pid namespace
+// that entered it after the first look was not seen by the tracepoints,
+// which take a cgroup out as such a task enters, because the entry did not
+// exist yet. A tracepoint may have made it since, which changes nothing. A
+// cgroup already in the scope before the first look needs neither: the
+// tracepoints have seen every entry since. As in the kernel, a cgroup the
+// map cannot take costs its own sockets, not the scope. One released since
+// the walk listed it stays, a dead id: ids are never reused.
+func (s *cgroupScope) record(id uint64, path string, found *walkFindings) {
 	err := s.objs.MapScopeCgroups.Update(id, uint8(1), ebpf.UpdateNoExist)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
-		if !s.unrecorded[id] {
-			s.unrecorded[id] = true
+		found.unrecorded[id] = true
+		if !s.last.unrecorded[id] {
 			s.logger.Warn("Container egress cgroup scope could not record a cgroup this job is in, "+
 				"and its sockets pass the cgroup hook", "cgroup", path, "error", err,
 				"capacity", s.objs.MapScopeCgroups.MaxEntries())
 		}
-		return false
+		return
 	}
-	delete(s.unrecorded, id)
 	if shared, err := sharedCgroup(filepath.Join(podenv.CgroupRoot, path)); err == nil && shared {
-		s.leave(id, path)
-		return true
+		s.leave(id, path, found)
 	}
-	return false
 }
 
 // leave takes a cgroup the walk found shared out of the scope, should a
 // tracepoint or an earlier walk have recorded it: a task outside our pid
-// namespace is in it, which the hook must not judge. Logged when the
-// cgroup was not found shared by the walk before.
-func (s *cgroupScope) leave(id uint64, path string) {
+// namespace is in it, which the hook must not judge. Logged when the last
+// walk did not find it shared.
+func (s *cgroupScope) leave(id uint64, path string, found *walkFindings) {
 	_ = s.objs.MapScopeCgroups.Delete(id)
-	if !s.shared[id] {
+	found.shared[id] = true
+	if !s.last.shared[id] {
 		s.logger.Warn("A task of this job is in a cgroup shared with tasks outside it, "+
 			"where its sockets pass the cgroup hook", "cgroup", path)
 	}
@@ -315,35 +364,49 @@ func (s *cgroupScope) walkTasks() (map[uint64]*listed, error) {
 	return tasks, nil
 }
 
+// Where cgroupPathOf found a cgroup.
+const (
+	cgroupFound    = iota
+	cgroupGoneAway // none of the processes listed in it is there now
+	cgroupOutside  // outside our cgroup namespace's root: "/.." in its path
+)
+
 // cgroupPathOf finds the path of cgroup id through a process the walk
 // listed in it: the process's own cgroup or, when that is no longer id
 // (the process has moved, or the task was a thread in a cgroup of its
-// own), one of its threads'. False when none of them is there now.
-func cgroupPathOf(id uint64, tgids map[uint32]bool) (string, bool) {
+// own), one of its threads'. A path outside our cgroup namespace's root,
+// above /sys/fs/cgroup, cannot be read and is reported as such.
+func cgroupPathOf(id uint64, tgids map[uint32]bool) (string, int) {
 	for tgid := range tgids {
 		proc := fmt.Sprintf("/proc/%d", tgid)
-		if path, ok := cgroupIn(proc+"/cgroup", id); ok {
-			return path, true
+		if path, where := cgroupIn(proc+"/cgroup", id); where != cgroupGoneAway {
+			return path, where
 		}
 		threads, _ := filepath.Glob(proc + "/task/*/cgroup")
 		for _, f := range threads {
-			if path, ok := cgroupIn(f, id); ok {
-				return path, true
+			if path, where := cgroupIn(f, id); where != cgroupGoneAway {
+				return path, where
 			}
 		}
 	}
-	return "", false
+	return "", cgroupGoneAway
 }
 
-// cgroupIn returns the cgroup path a /proc cgroup file gives, when that
-// cgroup is id.
-func cgroupIn(file string, id uint64) (string, bool) {
+// cgroupIn is where a /proc cgroup file puts cgroup id: found, outside our
+// cgroup namespace's root, or neither, when the file names another cgroup
+// or cannot be read.
+func cgroupIn(file string, id uint64) (string, int) {
 	path, err := podenv.ReadCgroupPath(file)
-	if err != nil {
-		return "", false
+	switch {
+	case err != nil:
+		return "", cgroupGoneAway
+	case strings.HasPrefix(path, "/.."):
+		return path, cgroupOutside
 	}
-	got, err := podenv.CgroupID(path)
-	return path, err == nil && got == id
+	if got, err := podenv.CgroupID(path); err == nil && got == id {
+		return path, cgroupFound
+	}
+	return "", cgroupGoneAway
 }
 
 // under reports whether the cgroup at path is sub or below it, by path:
@@ -359,10 +422,13 @@ func cgroupGone(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENODEV)
 }
 
+// readThreads reads a cgroup.threads file; a test stands in for it.
+var readThreads = os.ReadFile
+
 // sharedCgroup reports whether the cgroup at dir holds a task outside our
 // pid namespace: one cgroup.threads lists as 0.
 func sharedCgroup(dir string) (bool, error) {
-	data, err := os.ReadFile(filepath.Join(dir, "cgroup.threads"))
+	data, err := readThreads(filepath.Join(dir, "cgroup.threads"))
 	if err != nil {
 		return false, err
 	}
@@ -388,7 +454,7 @@ func (s *cgroupScope) watch() {
 			s.report()
 			return
 		case <-t.C:
-			if err := s.walk(); err != nil {
+			if err := s.walk(false); err != nil {
 				s.logger.Warn("Container egress cgroup scope: task walk failed", "error", err)
 			}
 			s.report()
@@ -398,9 +464,10 @@ func (s *cgroupScope) watch() {
 
 func (s *cgroupScope) report() {
 	for slot, msg := range [bpf.ScopeStatsMax]string{
-		bpf.ScopeStatFull:   "Container egress cgroup scope full: cgroups this job entered were not recorded, and their sockets pass the cgroup hook",
-		bpf.ScopeStatRoot:   "A task of this job is in the root cgroup, where its sockets pass the cgroup hook",
-		bpf.ScopeStatFailed: "Container egress cgroup scope failed to record cgroups this job entered, and their sockets pass the cgroup hook",
+		bpf.ScopeStatFull: "Container egress cgroup scope full: cgroups this job entered were not recorded, and their sockets pass the cgroup hook",
+		bpf.ScopeStatRoot: "Tasks of this job entered the root cgroup, where their sockets pass the cgroup hook",
+		bpf.ScopeStatFailed: "Container egress cgroup scope failed to record or take out cgroups as tasks entered them, " +
+			"which stay as they were until the next walk",
 		bpf.ScopeStatShared: "Cgroups this job entered were entered by tasks outside it and left the scope: " +
 			"sockets there pass the cgroup hook",
 	} {

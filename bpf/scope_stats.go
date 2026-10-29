@@ -21,8 +21,8 @@ package bpf
 // pins to the C source.
 const (
 	ScopeStatFull   = iota // map_scope_cgroups was full
-	ScopeStatRoot          // a task of ours entered, or was in, the root cgroup
-	ScopeStatFailed        // any other update failure
+	ScopeStatRoot          // a task of ours entered the root cgroup
+	ScopeStatFailed        // any other update or delete failure
 	ScopeStatShared        // a task outside our pid namespace entered a recorded cgroup
 	ScopeStatsMax
 )

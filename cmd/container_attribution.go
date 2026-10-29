@@ -143,7 +143,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 	}
 	a.observer = obs
 	logger.Info("Container egress hook attached", "target_mode", mode.String(),
-		"scoped", scope.Limited, "subtree", scope.Subtree)
+		"scoped", scope.Limited(), "subtree", scope.Subtree)
 	return a, nil
 }
 

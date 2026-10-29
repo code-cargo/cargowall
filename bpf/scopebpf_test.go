@@ -36,6 +36,8 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // TestScopeStatSlotsMatchSource pins the ScopeStat* slots to SCOPE_STAT_*
@@ -178,16 +180,7 @@ func heldPidNamespace(t *testing.T) (uint32, func(command ...string) int) {
 		pid := childOf(t, cmd.Process.Pid)
 		// Killing nsenter leaves its child behind, which would keep the
 		// cgroups it moved into from being removed.
-		t.Cleanup(func() {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-			for i := 0; i < 250; i++ {
-				stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-				if err != nil || strings.Contains(string(stat), ") Z ") {
-					return
-				}
-				time.Sleep(20 * time.Millisecond)
-			}
-		})
+		t.Cleanup(func() { killAndWait(pid) })
 		return pid
 	}
 	return ino, enter
@@ -201,7 +194,24 @@ func heldPidNamespaceInit(t *testing.T) (uint32, int) {
 	nsInit := childOf(t, holder.Process.Pid)
 	fi, err := os.Stat(fmt.Sprintf("/proc/%d/ns/pid", nsInit))
 	require.NoError(t, err)
+	// The init dies with the holder, on a signal that may still be on its
+	// way when the holder has been reaped: wait for it, or a cgroup it was
+	// forked into is still busy when the test removes it.
+	t.Cleanup(func() { killAndWait(nsInit) })
 	return uint32(fi.Sys().(*syscall.Stat_t).Ino), nsInit
+}
+
+// killAndWait kills pid and waits for it to exit, which is when it leaves
+// its cgroup: it is gone from /proc, or a zombie its parent has not reaped.
+func killAndWait(pid int) {
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	for i := 0; i < 250; i++ {
+		stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil || strings.Contains(string(stat), ") Z ") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // A move records its destination, for our pid namespace only, and never
@@ -479,7 +489,9 @@ func TestScopeReleaseForgetsCgroups(t *testing.T) {
 	v1 := filepath.Join(mnt, "v1")
 	require.NoError(t, os.Mkdir(v1, 0o755))
 	t.Cleanup(func() { _ = os.Remove(v1) })
-	v1ID := cgroupID(t, v1)
+	fi, err := os.Stat(v1)
+	require.NoError(t, err)
+	v1ID := fi.Sys().(*syscall.Stat_t).Ino
 	require.NoError(t, objs.MapScopeCgroups.Put(v1ID, uint8(1)))
 	v2, v2ID := made("v2")
 	require.NoError(t, os.Remove(v1))
@@ -523,6 +535,47 @@ func TestScopeLeavesCgroupsOthersEnter(t *testing.T) {
 	require.NoError(t, child.Run())
 	require.False(t, scopeRecorded(t, objs, cloned), "a clone3 child of a task outside our pid namespace")
 	require.Equal(t, uint64(2), scopeStat(t, objs, ScopeStatShared))
+}
+
+// The job's subtree is the hook's whole: nothing in it is recorded, by a
+// task of ours entering, or taken out, by any other, so an exec into our
+// container from outside our pid namespace (runc 1.4 makes its first stage
+// there with clone3) counts nothing. A cgroup outside it is recorded.
+func TestScopeLeavesTheSubtreeAlone(t *testing.T) {
+	requireBPF(t)
+	sub := siblingCgroup(t, "subtree")
+	inside := filepath.Join(sub, "container")
+	require.NoError(t, os.Mkdir(inside, 0o755))
+	t.Cleanup(func() { _ = os.Remove(inside) })
+	outside := siblingCgroup(t, "outside")
+	ino, enter := heldPidNamespace(t)
+	spec, err := LoadScopeBpf()
+	require.NoError(t, err)
+	require.NoError(t, spec.Variables[ScopeBpfVarPidnsIno].Set(ino))
+	require.NoError(t, spec.Variables[ScopeBpfVarSubtreeCgroup].Set(cgroupID(t, sub)))
+	require.NoError(t, spec.Variables[ScopeBpfVarSubtreeLevel].Set(podenv.CgroupLevel(strings.TrimPrefix(sub, podenv.CgroupRoot))))
+	objs := &ScopeBpfObjects{}
+	require.NoError(t, spec.LoadAndAssign(objs, nil))
+	t.Cleanup(func() { objs.Close() })
+	attachScopeTracing(t, objs.ScopeAttach)
+	attachScopeTracing(t, objs.ScopeFork)
+
+	ours := enter()
+	moveInto(t, inside, ours)
+	moveInto(t, sub, ours)
+	require.False(t, scopeRecorded(t, objs, inside), "a cgroup below the subtree's")
+	require.False(t, scopeRecorded(t, objs, sub), "the subtree's own")
+	dir, err := os.Open(inside)
+	require.NoError(t, err)
+	defer dir.Close()
+	child := exec.Command("/bin/true")
+	child.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(dir.Fd())}
+	require.NoError(t, child.Run())
+	moveInto(t, sub, startPinned(t, exec.Command("sleep", "60")).Process.Pid)
+	require.Zero(t, scopeStat(t, objs, ScopeStatShared), "tasks outside our pid namespace entering it count nothing")
+
+	moveInto(t, outside, ours)
+	require.True(t, scopeRecorded(t, objs, outside), "a cgroup outside the subtree")
 }
 
 // A cgroup that finds the map full is counted, not recorded.

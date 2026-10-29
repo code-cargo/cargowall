@@ -94,20 +94,27 @@ func TestVerifierBudget(t *testing.T) {
 		{"stepbpf", LoadStepBpf, func(spec *ebpf.CollectionSpec) error {
 			return spec.Variables[StepBpfVarPidnsIno].Set(pidnsInode(t))
 		}},
-		// Loaded only in a privileged pod, with pidns_ino set as for stepbpf.
+		// Loaded only in a privileged pod, with pidns_ino set as for stepbpf
+		// and a subtree, as there: at zero the subtree check is pruned.
 		{"scopebpf", LoadScopeBpf, func(spec *ebpf.CollectionSpec) error {
+			if err := spec.Variables[ScopeBpfVarSubtreeCgroup].Set(uint64(1)); err != nil {
+				return err
+			}
+			if err := spec.Variables[ScopeBpfVarSubtreeLevel].Set(uint32(3)); err != nil {
+				return err
+			}
 			return spec.Variables[ScopeBpfVarPidnsIno].Set(pidnsInode(t))
 		}},
 		{"originbpf", LoadOriginBpf, nil},
 		// scoped is a load-time constant, so a privileged pod runs a
 		// different program from a runner VM's. Measure both, the scoped one
-		// with a pod's cgroup set, as in a Kubernetes pod: at zero the
-		// verifier prunes the pod check as dead.
+		// with the job's subtree set, as in every scoped shape: at zero the
+		// verifier prunes the subtree check as dead.
 		{"originbpf_scoped", LoadOriginBpf, func(spec *ebpf.CollectionSpec) error {
-			if err := spec.Variables[OriginBpfVarScopePodCgroup].Set(uint64(1)); err != nil {
+			if err := spec.Variables[OriginBpfVarScopeSubtreeCgroup].Set(uint64(1)); err != nil {
 				return err
 			}
-			if err := spec.Variables[OriginBpfVarScopePodLevel].Set(uint32(3)); err != nil {
+			if err := spec.Variables[OriginBpfVarScopeSubtreeLevel].Set(uint32(3)); err != nil {
 				return err
 			}
 			return spec.Variables[OriginBpfVarScoped].Set(uint8(1))

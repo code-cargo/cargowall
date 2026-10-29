@@ -16,9 +16,10 @@
 
 // The pod scope of the cgroup egress hook. In a privileged pod the hook sits
 // at the node's root cgroup and must judge only this job's sockets: those in
-// our pod's cgroup subtree, which the hook checks itself, and those in the
-// cgroups this job's tasks, the tasks of the daemon's pid namespace, have
-// entered outside it, such as dind's containers at the node-root
+// the job's subtree (our pod's cgroup, or outside Kubernetes our own
+// container's), which the hook checks itself and these programs leave
+// alone, and those in the cgroups this job's tasks, the tasks of the
+// daemon's pid namespace, have entered outside it, such as dind's containers at the node-root
 // /docker/<id>. Every socket a job gives rise to lives in one, whether a
 // thread of the job made it (an io_uring worker included), the kernel made
 // it for the job (an MPTCP subflow takes its parent's cgroup, an SMC
@@ -51,6 +52,12 @@
 
 // Inode of the daemon's pid namespace, written by userspace before load.
 const volatile __u32 pidns_ino = 0;
+
+// The cgroup whose whole subtree the hook judges (scope_subtree_cgroup in
+// originbpf.c) and its level, written by userspace before load. Nothing in
+// it is recorded or taken out: it is the job's whatever enters it.
+const volatile __u64 subtree_cgroup = 0;
+const volatile __u32 subtree_level = 0;
 
 #include "pidns.h"
 
@@ -115,6 +122,23 @@ static __always_inline __u64 scope_id(struct cgroup *cg)
     return BPF_CORE_READ(cg, kn, id);
 }
 
+// How far below the job's subtree cgroup in_subtree looks.
+#define SUBTREE_MAX_DEPTH 32
+
+// in_subtree reports whether cg is the job's subtree cgroup or below it,
+// by its parents: a cgroup's self is its first member, so a parent css is
+// the parent cgroup. A cgroup deeper than SUBTREE_MAX_DEPTH below it reads
+// as outside it, which only records a cgroup the hook judges anyway.
+static __always_inline bool in_subtree(struct cgroup *cg)
+{
+    if (!subtree_cgroup)
+        return false;
+    int level = BPF_CORE_READ(cg, level);
+    for (int i = 0; i < SUBTREE_MAX_DEPTH && level > (int)subtree_level; i++, level--)
+        cg = (struct cgroup *)BPF_CORE_READ(cg, self.parent);
+    return cg && level == (int)subtree_level && BPF_CORE_READ(cg, kn, id) == subtree_cgroup;
+}
+
 // scope_enter records cg, which a task of ours has entered. The lookup
 // first keeps an existing cgroup from costing a write.
 static __always_inline void scope_enter(struct cgroup *cg)
@@ -125,6 +149,8 @@ static __always_inline void scope_enter(struct cgroup *cg)
             scope_count(SCOPE_STAT_ROOT);
         return;
     }
+    if (in_subtree(cg))
+        return;
     if (bpf_map_lookup_elem(&map_scope_cgroups, &id))
         return;
     __u8 one = 1;

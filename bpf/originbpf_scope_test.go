@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -50,8 +51,8 @@ func loadOriginObjectsScoped(t *testing.T, pod string) *OriginBpfObjects {
 	require.NoError(t, err)
 	require.NoError(t, spec.Variables[OriginBpfVarScoped].Set(uint8(1)))
 	if pod != "" {
-		require.NoError(t, spec.Variables[OriginBpfVarScopePodCgroup].Set(cgroupID(t, pod)))
-		require.NoError(t, spec.Variables[OriginBpfVarScopePodLevel].Set(
+		require.NoError(t, spec.Variables[OriginBpfVarScopeSubtreeCgroup].Set(cgroupID(t, pod)))
+		require.NoError(t, spec.Variables[OriginBpfVarScopeSubtreeLevel].Set(
 			podenv.CgroupLevel(strings.TrimPrefix(pod, podenv.CgroupRoot))))
 	}
 	var objs OriginBpfObjects
@@ -128,8 +129,11 @@ func TestOriginScopedPassesOtherCgroups(t *testing.T) {
 // process back to where it was and removes the cgroup.
 func enterTestCgroup(t *testing.T) string {
 	t.Helper()
-	cgPath := filepath.Join("/sys/fs/cgroup", fmt.Sprintf("cargowall-bpf-test-%d", os.Getpid()))
-	if err := os.Mkdir(cgPath, 0o755); err != nil {
+	cgPath := filepath.Join(podenv.CgroupRoot, fmt.Sprintf("cargowall-bpf-test-%d", os.Getpid()))
+	if err := os.Mkdir(cgPath, 0o755); errors.Is(err, fs.ErrExist) {
+		// An earlier test left it behind: its cleanup could not remove it.
+		t.Fatalf("test cgroup %s is left over from an earlier test", cgPath)
+	} else if err != nil {
 		t.Skipf("cannot create test cgroup: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(cgPath) })
@@ -149,20 +153,13 @@ func moveSelf(t *testing.T, path string) {
 
 func moveSelfOrErr(t *testing.T, path string) error {
 	t.Helper()
-	data, err := os.ReadFile("/proc/self/cgroup")
+	home, err := podenv.ReadCgroupPath("/proc/self/cgroup")
 	require.NoError(t, err)
-	var home string
-	for _, line := range strings.Split(string(data), "\n") {
-		if p, ok := strings.CutPrefix(line, "0::"); ok {
-			home = p
-		}
-	}
-	require.NotEmpty(t, home, "no cgroup v2 entry in /proc/self/cgroup")
 	self := []byte(strconv.Itoa(os.Getpid()))
 	if err := os.WriteFile(filepath.Join(path, "cgroup.procs"), self, 0); err != nil {
 		return err
 	}
-	t.Cleanup(func() { _ = os.WriteFile(filepath.Join("/sys/fs/cgroup", home, "cgroup.procs"), self, 0) })
+	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(podenv.CgroupRoot, home, "cgroup.procs"), self, 0) })
 	return nil
 }
 
@@ -170,9 +167,11 @@ func moveSelfOrErr(t *testing.T, path string) error {
 // cgroupfs inode, on 64-bit kernels.
 func cgroupID(t *testing.T, path string) uint64 {
 	t.Helper()
-	fi, err := os.Stat(path)
+	rel, ok := strings.CutPrefix(path, podenv.CgroupRoot)
+	require.True(t, ok, "%s is not under %s", path, podenv.CgroupRoot)
+	id, err := podenv.CgroupID(rel)
 	require.NoError(t, err)
-	return fi.Sys().(*syscall.Stat_t).Ino
+	return id
 }
 
 // TestOriginScopeRealSocket covers the recorded half, which PROG_TEST_RUN

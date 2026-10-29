@@ -69,7 +69,7 @@ func TestHookScope(t *testing.T) {
 	remoteDaemon := func(s *Shape) { s.DockerHost, s.DockerHostSetting = "tcp://localhost:2376", "DOCKER_HOST" }
 	unreadContext := func(s *Shape) { s.DockerHostReason = `docker context "ci" (from DOCKER_CONTEXT): no such file` }
 	all := Scope{}
-	inPod := Scope{Limited: true, PodCgroup: podCg}
+	inPod := Scope{Limited: true, Subtree: podCg}
 	cases := []struct {
 		name  string
 		shape Shape
@@ -84,13 +84,19 @@ func TestHookScope(t *testing.T) {
 		{"privileged pod running its own dockerd", host(pod, PidNSPrivate, local), true, inPod},
 		{"privileged pod, dind not sharing the pid namespace", host(pod, PidNSPrivate, hidden), false, all},
 		{"privileged pod, daemon unidentified", host(pod, PidNSPrivate, unknownD), false, all},
-		{"privileged container outside Kubernetes", host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true, Scope{Limited: true}},
+		// Outside Kubernetes our own container's cgroup is the job's whole:
+		// a runtime's exec into it enters from outside our pid namespace.
+		{
+			"privileged container outside Kubernetes", host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), true,
+			Scope{Limited: true, Subtree: "/system.slice/docker-a.scope"},
+		},
+		{"own pid namespace in the root cgroup", host("/", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), false, all},
 		// The pod's other containers are judged by its cgroup, so a pod
 		// whose cgroup cannot be found would leave them out.
 		{"privileged pod, no pod cgroup in the path", host("/kubepods.slice/cri-containerd-a.scope", PidNSPrivate, foreign), false, all},
 		{
 			"privileged pod, cgroupfs driver", host("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate, foreign), true,
-			Scope{Limited: true, PodCgroup: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
+			Scope{Limited: true, Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
 		},
 		// A socket's cgroup must be whose it is wherever the hook is
 		// attached below the machine's root or judges only our cgroups,
@@ -180,7 +186,7 @@ func TestPodCgroup(t *testing.T) {
 // The test process's own namespaces are known, whichever they are, and
 // /sys/fs/cgroup is the tree it is in.
 func TestDetect_Namespaces(t *testing.T) {
-	s := Detect(filepath.Join(t.TempDir(), "docker.sock"), "6.17.0-1022-azure")
+	s := Detect(filepath.Join(t.TempDir(), "docker.sock"), "6.17.0-1022-azure", true)
 	if s.CgroupNS == CgroupNSUnknown || s.PidNS == PidNSUnknown {
 		t.Fatalf("Detect() = %+v, want both namespaces identified", s)
 	}
@@ -199,6 +205,15 @@ func TestDetect_Namespaces(t *testing.T) {
 	}
 	if s.CgroupMount != CgroupMountOurs {
 		t.Fatalf("Detect() cgroup mount = %v (%s), want ours", s.CgroupMount, s.CgroupMountReason)
+	}
+}
+
+// With the egress hook off nothing reads the socket cgroups, so the BTF
+// read is skipped wherever the process runs.
+func TestDetect_NoHookNoProbe(t *testing.T) {
+	s := Detect(filepath.Join(t.TempDir(), "docker.sock"), "6.17.0-1022-azure", false)
+	if s.SocketCgroups != SocketCgroupsUnknown || !strings.Contains(s.SocketCgroupsReason, "hook is off") {
+		t.Fatalf("Detect() socket cgroups %v (%s), want not probed", s.SocketCgroups, s.SocketCgroupsReason)
 	}
 }
 
@@ -413,6 +428,19 @@ func TestDockerCLIHost(t *testing.T) {
 	check("an unreadable config", env(), "", true)
 	home := func(k string) string { return map[string]string{"HOME": filepath.Dir(dir)}[k] }
 	check("a HOME with no .docker", home, "", false)
+
+	// Without HOME the CLI reads the passwd entry's home, as here.
+	passwd := t.TempDir()
+	if err := os.Mkdir(filepath.Join(passwd, ".docker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir = filepath.Join(passwd, ".docker")
+	context("remote", "tcp://builder:2376")
+	config(`{"currentContext":"remote"}`)
+	saved := passwdHome
+	passwdHome = func() string { return passwd }
+	t.Cleanup(func() { passwdHome = saved })
+	check("no HOME: the passwd home's config", func(string) string { return "" }, "tcp://builder:2376", false)
 }
 
 func TestProbeDockerd_NoSocket(t *testing.T) {

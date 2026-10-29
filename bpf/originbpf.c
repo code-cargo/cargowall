@@ -108,8 +108,8 @@
 #define ORIGIN_CFG_KEY_MODE 0         // ORIGIN_MODE_*
 #define ORIGIN_CFG_KEY_LO_CARVEOUT 1  // 1 = carve out skb->ifindex == lo (see below)
 
-// Nonzero: judge only sockets under our pod's cgroup (scope_pod_cgroup) or
-// in a cgroup recorded in map_scope_cgroups, and pass every other one. Set
+// Nonzero: judge only sockets under the job's cgroup (scope_subtree_cgroup)
+// or in a cgroup recorded in map_scope_cgroups, and pass every other one. Set
 // by userspace before load, in the same step that loads the scope
 // collection's map in place of the stand-in below, because it never changes
 // after attach. A load-time constant rather than a config byte, so the
@@ -118,11 +118,12 @@
 // gets past it (a privileged pod at a shared cgroup root).
 const volatile __u8 scoped = 0;
 
-// Scoped in a Kubernetes pod: the id of the pod's cgroup and its depth below
-// the root, so a socket in any cgroup under it is ours, whichever container
-// it is in and whoever started that. Zero outside a pod.
-const volatile __u64 scope_pod_cgroup = 0;
-const volatile __u32 scope_pod_level = 0;
+// Scoped: the id of the cgroup whose whole subtree is the job's, and its
+// depth below the root. In a Kubernetes pod it is the pod's cgroup, so a
+// socket in any of the pod's containers is ours, whoever started it;
+// outside one it is our own container's.
+const volatile __u64 scope_subtree_cgroup = 0;
+const volatile __u32 scope_subtree_level = 0;
 
 // One record per observed flow origin. 8-byte fields first so the packed C
 // layout equals Go's natural layout (72 bytes, no hidden padding); addresses
@@ -775,7 +776,7 @@ int cg_origin_egress(struct __sk_buff *skb) {
         return 1;
 
     // At a cgroup root other pods share, judge only this job's sockets:
-    // those under our pod's cgroup, and those in a cgroup one of this job's
+    // those under the job's cgroup, and those in a cgroup one of this job's
     // tasks has entered outside it. Another pod's traffic is not ours to
     // drop or report. Anything else passes with no verdict, no record and
     // no L7 inspection, and TC on our own interface still polices what
@@ -786,8 +787,8 @@ int cg_origin_egress(struct __sk_buff *skb) {
     if (scoped) {
         __u64 cgroup = bpf_skb_cgroup_id(skb);
         if (!bpf_map_lookup_elem(&map_scope_cgroups, &cgroup) &&
-            !(scope_pod_cgroup &&
-              bpf_skb_ancestor_cgroup_id(skb, scope_pod_level) == scope_pod_cgroup))
+            !(scope_subtree_cgroup &&
+              bpf_skb_ancestor_cgroup_id(skb, scope_subtree_level) == scope_subtree_cgroup))
             return 1;
     }
 

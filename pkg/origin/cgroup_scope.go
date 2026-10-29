@@ -39,16 +39,17 @@ import (
 	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
-// scopeStatsInterval is how often podScope checks what it could not record.
+// scopeStatsInterval is how often cgroupScope checks what it could not record.
 const scopeStatsInterval = 10 * time.Second
 
-// podScope owns the scope collection (bpf/scopebpf.c): the cgroups that
+// cgroupScope owns the scope collection (bpf/scopebpf.c): the cgroups that
 // tasks in our pid namespace have entered, which a scoped hook judges
-// beside our pod's cgroup subtree. Started before the hook attaches, so the
+// beside the job's subtree (podenv.Scope.Subtree). Unrelated to the L7
+// scope maps, which say which destinations get L7 checks. Started before the hook attaches, so the
 // hook never judges an empty scope, and closed after it detaches. A
 // failure anywhere here costs the scoped hook only: the step tracker and TC
 // never depend on it.
-type podScope struct {
+type cgroupScope struct {
 	objs     bpf.ScopeBpfObjects
 	links    []link.Link
 	logger   *slog.Logger
@@ -57,81 +58,100 @@ type podScope struct {
 	reported [bpf.ScopeStatsMax]uint64 // last counts logged, owned by watch
 }
 
-// setScope sets the scoped hook's load-time constants: scoped, and our
-// pod's cgroup when there is one.
-func setScope(spec *ebpf.CollectionSpec, podCgroup string) error {
+// subtree is the cgroup whose whole subtree a scoped hook judges, as both
+// collections take it: id 0 when there is none.
+type subtree struct {
+	path  string
+	id    uint64
+	level uint32
+}
+
+func subtreeOf(path string) (subtree, error) {
+	if path == "" {
+		return subtree{}, nil
+	}
+	id, err := podenv.CgroupID(path)
+	if err != nil {
+		return subtree{}, fmt.Errorf("the job's cgroup: %w", err)
+	}
+	return subtree{path: path, id: id, level: podenv.CgroupLevel(path)}, nil
+}
+
+// setCgroupScope sets the scoped hook's load-time constants: scoped, and
+// the job's subtree.
+func setCgroupScope(spec *ebpf.CollectionSpec, sub subtree) error {
 	scoped := spec.Variables[bpf.OriginBpfVarScoped]
-	podID, podLevel := spec.Variables[bpf.OriginBpfVarScopePodCgroup], spec.Variables[bpf.OriginBpfVarScopePodLevel]
-	if scoped == nil || podID == nil || podLevel == nil || spec.Maps[bpf.OriginBpfMapMapScopeCgroups] == nil {
+	id, level := spec.Variables[bpf.OriginBpfVarScopeSubtreeCgroup], spec.Variables[bpf.OriginBpfVarScopeSubtreeLevel]
+	if scoped == nil || id == nil || level == nil || spec.Maps[bpf.OriginBpfMapMapScopeCgroups] == nil {
 		return errors.New("origin BPF spec has no scope variables or scope map (stale generated code)")
 	}
 	if err := scoped.Set(uint8(1)); err != nil {
 		return fmt.Errorf("failed to set scoped: %w", err)
 	}
-	if podCgroup == "" {
-		return nil
+	if err := id.Set(sub.id); err != nil {
+		return fmt.Errorf("failed to set the job's cgroup: %w", err)
 	}
-	id, err := podenv.CgroupID(podCgroup)
-	if err != nil {
-		return fmt.Errorf("pod cgroup: %w", err)
-	}
-	if err := podID.Set(id); err != nil {
-		return fmt.Errorf("failed to set the pod cgroup: %w", err)
-	}
-	if err := podLevel.Set(podenv.CgroupLevel(podCgroup)); err != nil {
-		return fmt.Errorf("failed to set the pod cgroup's level: %w", err)
+	if err := level.Set(sub.level); err != nil {
+		return fmt.Errorf("failed to set the job's cgroup level: %w", err)
 	}
 	return nil
 }
 
-// startPodScope loads the scope collection for our pid namespace, attaches
+// startCgroupScope loads the scope collection for our pid namespace, attaches
 // its tracepoints, then walks the tasks that predate them, so a task that
 // enters a cgroup while the walk runs is recorded by one or the other.
-// podCgroup is our pod's cgroup, which the hook judges whole, or "".
+// sub is the job's subtree, which the hook judges whole: the programs
+// leave it alone and the walk skips it.
 // The verifier logs only its statistics, as for the origin collection: a
 // branch-level log of each program would be kept for the life of the
 // process.
-func startPodScope(logger *slog.Logger, podCgroup string) (*podScope, error) {
+func startCgroupScope(logger *slog.Logger, sub subtree) (*cgroupScope, error) {
 	ino, err := podenv.PidNamespaceInode()
 	if err != nil {
-		return nil, fmt.Errorf("pod scope: %w", err)
+		return nil, fmt.Errorf("cgroup scope: %w", err)
 	}
 	spec, err := bpf.LoadScopeBpf()
 	if err != nil {
-		return nil, fmt.Errorf("pod scope: failed to load BPF spec: %w", err)
+		return nil, fmt.Errorf("cgroup scope: failed to load BPF spec: %w", err)
 	}
-	if v := spec.Variables[bpf.ScopeBpfVarPidnsIno]; v == nil {
-		return nil, errors.New("pod scope: BPF spec has no pidns_ino variable (stale generated code)")
-	} else if err := v.Set(ino); err != nil {
-		return nil, fmt.Errorf("pod scope: failed to set pidns_ino: %w", err)
+	for name, value := range map[string]any{
+		bpf.ScopeBpfVarPidnsIno:      ino,
+		bpf.ScopeBpfVarSubtreeCgroup: sub.id,
+		bpf.ScopeBpfVarSubtreeLevel:  sub.level,
+	} {
+		if v := spec.Variables[name]; v == nil {
+			return nil, fmt.Errorf("cgroup scope: BPF spec has no %s variable (stale generated code)", name)
+		} else if err := v.Set(value); err != nil {
+			return nil, fmt.Errorf("cgroup scope: failed to set %s: %w", name, err)
+		}
 	}
-	s := &podScope{logger: logger, stop: make(chan struct{}), done: make(chan struct{})}
+	s := &cgroupScope{logger: logger, stop: make(chan struct{}), done: make(chan struct{})}
 	if err := cargowallEbpf.LoadObjects(logger, "scopebpf", spec, ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
 	}, &s.objs); err != nil {
-		return nil, fmt.Errorf("pod scope: failed to load BPF objects: %w", err)
+		return nil, fmt.Errorf("cgroup scope: failed to load BPF objects: %w", err)
 	}
 	for _, p := range []*ebpf.Program{s.objs.ScopeFork, s.objs.ScopeAttach, s.objs.ScopeRelease} {
 		l, err := link.AttachTracing(link.TracingOptions{Program: p, AttachType: ebpf.AttachTraceRawTp})
 		if err != nil {
 			s.release()
-			return nil, fmt.Errorf("pod scope: failed to attach %s: %w", p, err)
+			return nil, fmt.Errorf("cgroup scope: failed to attach %s: %w", p, err)
 		}
 		s.links = append(s.links, l)
 	}
-	if err := s.walk(podCgroup); err != nil {
+	if err := s.walk(sub.path); err != nil {
 		s.release()
-		return nil, fmt.Errorf("pod scope: task walk: %w", err)
+		return nil, fmt.Errorf("cgroup scope: task walk: %w", err)
 	}
 	go s.watch()
 	return s, nil
 }
 
 // cgroups is the map the scoped hook loads in place of its stand-in.
-func (s *podScope) cgroups() *ebpf.Map { return s.objs.MapScopeCgroups }
+func (s *cgroupScope) cgroups() *ebpf.Map { return s.objs.MapScopeCgroups }
 
 // walk records the cgroups the startup walk lists, our tasks' cgroups,
-// that are this job's alone: outside our pod's cgroup, which the hook
+// that are this job's alone: outside the job's subtree, which the hook
 // judges whole, and holding no task outside our pid namespace. A task's
 // cgroup does not say it entered it. A task of ours in the same cgroup as
 // a node daemon or another pod's task was left there (a job an nsenter'd
@@ -141,8 +161,9 @@ func (s *podScope) cgroups() *ebpf.Map { return s.objs.MapScopeCgroups }
 // cgroup.threads, which numbers each task as our pid namespace does, so a
 // task outside it reads as 0. The walk must list this process's own
 // cgroup: one that lists none of ours would leave the scope empty while
-// the hook reports it attached.
-func (s *podScope) walk(podCgroup string) error {
+// the hook reports it attached. Our own cgroup is always in the subtree,
+// so it is never left out.
+func (s *cgroupScope) walk(subtree string) error {
 	tasks, err := s.walkTasks()
 	if err != nil {
 		return err
@@ -160,8 +181,8 @@ func (s *podScope) walk(podCgroup string) error {
 	}
 	for id, tgids := range tasks {
 		path, ok := cgroupPathOf(id, tgids)
-		if !ok || under(path, podCgroup) {
-			continue // its tasks have gone (a move was recorded), or the pod's cgroup covers it
+		if !ok || under(path, subtree) {
+			continue // its tasks have gone (a move was recorded), or the subtree covers it
 		}
 		shared, err := sharedCgroup(filepath.Join(podenv.CgroupRoot, path))
 		if cgroupGone(err) {
@@ -171,8 +192,7 @@ func (s *podScope) walk(podCgroup string) error {
 			return err
 		}
 		if shared {
-			s.logger.Warn("A task of this job is in a cgroup shared with tasks outside it, "+
-				"where its sockets pass the cgroup hook", "cgroup", path)
+			s.leave(id, path)
 			continue
 		}
 		s.record(id, path)
@@ -182,30 +202,37 @@ func (s *podScope) walk(podCgroup string) error {
 
 // record puts a cgroup the walk found ours alone in the scope, then looks
 // again: a task outside our pid namespace that entered it after the first
-// look but before the entry existed was not seen by the tracepoints, which
-// take a cgroup out of the scope when such a task enters it. As in the
-// kernel, a cgroup the map cannot take costs its own sockets, not the
+// look was not seen by the tracepoints, which take a cgroup out of the
+// scope when such a task enters it, unless the entry existed by then. The
+// second look runs whether the walk or a tracepoint made the entry. As in
+// the kernel, a cgroup the map cannot take costs its own sockets, not the
 // scope. One released since the walk listed it stays, a dead id: ids are
 // never reused.
-func (s *podScope) record(id uint64, path string) {
-	if err := s.objs.MapScopeCgroups.Update(id, uint8(1), ebpf.UpdateNoExist); err != nil {
-		if !errors.Is(err, ebpf.ErrKeyExist) {
-			s.logger.Warn("Container egress scope could not record a cgroup this job is in, "+
-				"and its sockets pass the cgroup hook", "cgroup", path, "error", err,
-				"capacity", s.objs.MapScopeCgroups.MaxEntries())
-		}
+func (s *cgroupScope) record(id uint64, path string) {
+	err := s.objs.MapScopeCgroups.Update(id, uint8(1), ebpf.UpdateNoExist)
+	if err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
+		s.logger.Warn("Container egress cgroup scope could not record a cgroup this job is in, "+
+			"and its sockets pass the cgroup hook", "cgroup", path, "error", err,
+			"capacity", s.objs.MapScopeCgroups.MaxEntries())
 		return
 	}
 	if shared, err := sharedCgroup(filepath.Join(podenv.CgroupRoot, path)); err == nil && shared {
-		_ = s.objs.MapScopeCgroups.Delete(id)
-		s.logger.Warn("A task of this job is in a cgroup shared with tasks outside it, "+
-			"where its sockets pass the cgroup hook", "cgroup", path)
+		s.leave(id, path)
 	}
+}
+
+// leave takes a cgroup the walk found shared out of the scope, should a
+// tracepoint have recorded it as a task of ours entered: a task outside our
+// pid namespace is in it, which the hook must not judge.
+func (s *cgroupScope) leave(id uint64, path string) {
+	_ = s.objs.MapScopeCgroups.Delete(id)
+	s.logger.Warn("A task of this job is in a cgroup shared with tasks outside it, "+
+		"where its sockets pass the cgroup hook", "cgroup", path)
 }
 
 // walkTasks runs the task walk and returns, for each cgroup id it listed,
 // the processes (as numbered in our pid namespace) it listed there.
-func (s *podScope) walkTasks() (map[uint64]map[uint32]bool, error) {
+func (s *cgroupScope) walkTasks() (map[uint64]map[uint32]bool, error) {
 	it, err := link.AttachIter(link.IterOptions{Program: s.objs.ScopeTaskIter})
 	if err != nil {
 		return nil, err
@@ -294,7 +321,7 @@ func sharedCgroup(dir string) (bool, error) {
 
 // watch reports, until close, what the scope could not record. Each leaves
 // a task of ours whose sockets the hook passes, so each is a warning.
-func (s *podScope) watch() {
+func (s *cgroupScope) watch() {
 	defer close(s.done)
 	t := time.NewTicker(scopeStatsInterval)
 	defer t.Stop()
@@ -309,13 +336,13 @@ func (s *podScope) watch() {
 	}
 }
 
-func (s *podScope) report() {
+func (s *cgroupScope) report() {
 	for slot, msg := range [bpf.ScopeStatsMax]string{
-		bpf.ScopeStatFull:   "Container egress scope full: cgroups this job entered were not recorded, and their sockets pass the cgroup hook",
+		bpf.ScopeStatFull:   "Container egress cgroup scope full: cgroups this job entered were not recorded, and their sockets pass the cgroup hook",
 		bpf.ScopeStatRoot:   "A task of this job is in the root cgroup, where its sockets pass the cgroup hook",
-		bpf.ScopeStatFailed: "Container egress scope failed to record cgroups this job entered, and their sockets pass the cgroup hook",
+		bpf.ScopeStatFailed: "Container egress cgroup scope failed to record cgroups this job entered, and their sockets pass the cgroup hook",
 		bpf.ScopeStatShared: "Cgroups this job entered were entered by tasks outside it and left the scope: " +
-			"sockets there pass the cgroup hook unless they are under the pod's cgroup",
+			"sockets there pass the cgroup hook",
 	} {
 		var n uint64
 		if err := s.objs.MapScopeStats.Lookup(uint32(slot), &n); err != nil || n <= s.reported[slot] {
@@ -329,13 +356,13 @@ func (s *podScope) report() {
 // close stops recording. The hook's collection holds its own reference to
 // the map, so closing the scope first would leave the hook judging a scope
 // nothing updates; Observer.Close detaches the hook before calling this.
-func (s *podScope) close() {
+func (s *cgroupScope) close() {
 	close(s.stop)
 	<-s.done
 	s.release()
 }
 
-func (s *podScope) release() {
+func (s *cgroupScope) release() {
 	for _, l := range s.links {
 		_ = l.Close()
 	}

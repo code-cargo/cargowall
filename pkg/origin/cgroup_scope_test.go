@@ -145,7 +145,9 @@ func TestPodScopeWalkInner(t *testing.T) {
 	}
 
 	var log bytes.Buffer
-	s, err := startPodScope(slog.New(slog.NewTextHandler(&log, nil)), strings.TrimPrefix(pod, podenv.CgroupRoot))
+	sub, err := subtreeOf(strings.TrimPrefix(pod, podenv.CgroupRoot))
+	require.NoError(t, err)
+	s, err := startCgroupScope(slog.New(slog.NewTextHandler(&log, nil)), sub)
 	require.NoError(t, err)
 	t.Cleanup(s.close)
 	idOf := func(path string) uint64 {
@@ -165,14 +167,25 @@ func TestPodScopeWalkInner(t *testing.T) {
 		"and is not reported: its sockets do not pass")
 
 	// A cgroup a task outside the namespace entered between the walk's look
-	// and the record is taken out again by the second look.
-	s.record(idOf(shared), strings.TrimPrefix(shared, podenv.CgroupRoot))
+	// and the record is taken out again by the second look, also when a
+	// tracepoint had already made the entry.
+	sharedRel := strings.TrimPrefix(shared, podenv.CgroupRoot)
+	s.record(idOf(shared), sharedRel)
 	require.False(t, recorded(shared), "a cgroup found shared once recorded is taken out")
+	require.NoError(t, s.cgroups().Put(idOf(shared), uint8(1)))
+	s.record(idOf(shared), sharedRel)
+	require.False(t, recorded(shared), "and one a tracepoint recorded first")
+
+	// A walk that finds a cgroup shared takes out an entry a tracepoint made
+	// for it while the walk ran.
+	require.NoError(t, s.cgroups().Put(idOf(shared), uint8(1)))
+	require.NoError(t, s.walk(sub.path))
+	require.False(t, recorded(shared), "the walk takes a shared cgroup out")
 }
 
 // loadWalkScope loads the scope collection for the pid namespace ino with a
 // map of maxEntries, unattached, for the walk alone.
-func loadWalkScope(t *testing.T, ino, maxEntries uint32) *podScope {
+func loadWalkScope(t *testing.T, ino, maxEntries uint32) *cgroupScope {
 	t.Helper()
 	requireBPFOrigin(t)
 	spec, err := bpf.LoadScopeBpf()
@@ -180,7 +193,7 @@ func loadWalkScope(t *testing.T, ino, maxEntries uint32) *podScope {
 	require.NoError(t, spec.Variables[bpf.ScopeBpfVarPidnsIno].Set(ino))
 	spec.Maps[bpf.ScopeBpfMapMapScopeCgroups].MaxEntries = maxEntries
 	var log bytes.Buffer
-	s := &podScope{logger: slog.New(slog.NewTextHandler(&log, nil))}
+	s := &cgroupScope{logger: slog.New(slog.NewTextHandler(&log, nil))}
 	require.NoError(t, spec.LoadAndAssign(&s.objs, nil))
 	t.Cleanup(s.release)
 	return s

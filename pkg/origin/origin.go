@@ -187,7 +187,7 @@ const (
 // ringbuf reader, the verdict-reporting worker, and the join store.
 type Observer struct {
 	objs     bpf.OriginBpfObjects
-	scope    *podScope // the cgroups a scoped hook judges; nil unscoped
+	cgroups  *cgroupScope // the cgroups a scoped hook judges; nil unscoped
 	link     link.Link
 	reader   *ringbuf.Reader
 	sockPid  *ebpf.Map
@@ -266,8 +266,8 @@ func (o *Observer) EnableL7(opts L7Options) (*L7, error) {
 // error means the caller runs without container attribution.
 //
 // scope is podenv.Shape.HookScope's answer. Limited, the hook judges only
-// sockets under scope.PodCgroup and those in the cgroups tasks in our pid
-// namespace have entered, which Start records first (podScope), and every
+// sockets under scope.Subtree and those in the cgroups tasks in our pid
+// namespace have entered, which Start records first (cgroupScope), and every
 // other socket under the root cgroup passes the hook untouched. Otherwise
 // it judges every socket.
 func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*Observer, error) {
@@ -303,8 +303,8 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 			_ = o.link.Close()
 		}
 		o.objs.Close()
-		if o.scope != nil {
-			o.scope.close()
+		if o.cgroups != nil {
+			o.cgroups.close()
 		}
 	}()
 
@@ -332,14 +332,18 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		// Set before load, with the map it reads: the program never judges,
 		// even briefly, a socket that is not this job's. The stand-in takes
 		// the scope map's size.
-		if err := setScope(spec, scope.PodCgroup); err != nil {
-			return nil, err
-		}
-		s, err := startPodScope(logger, scope.PodCgroup)
+		sub, err := subtreeOf(scope.Subtree)
 		if err != nil {
 			return nil, err
 		}
-		o.scope = s
+		if err := setCgroupScope(spec, sub); err != nil {
+			return nil, err
+		}
+		s, err := startCgroupScope(logger, sub)
+		if err != nil {
+			return nil, err
+		}
+		o.cgroups = s
 		spec.Maps[bpf.OriginBpfMapMapScopeCgroups].MaxEntries = s.cgroups().MaxEntries()
 		replacements[bpf.OriginBpfMapMapScopeCgroups] = s.cgroups()
 	}
@@ -473,8 +477,8 @@ func (o *Observer) Close() {
 	o.objs.Close()
 	// Only once the hook is detached, so it never judges a scope nothing
 	// updates.
-	if o.scope != nil {
-		o.scope.close()
+	if o.cgroups != nil {
+		o.cgroups.close()
 	}
 	// The shutdown accounting for this hook's verdicts. The three report
 	// counters answer distinct questions: dropped — the pipeline SATURATED

@@ -98,8 +98,9 @@ func resolveMode(containerEgress string) origin.Mode {
 // when set, is why a hook at /sys/fs/cgroup would not judge exactly this
 // job's traffic, or why that could not be shown: the hook is then never
 // loaded, the same loss as a load failure. A Limited scope means the hook
-// may judge only this job's sockets, under our pod's cgroup or in the
-// cgroups our pid namespace's tasks have entered, which origin.Start
+// may judge only this job's sockets, under the job's cgroup (its pod's, or
+// its own container's) or in the cgroups our pid namespace's tasks have
+// entered, which origin.Start
 // records before it attaches; a failure to record them is the same loss,
 // never a hook that judges every socket under a shared root. A non-nil
 // error means a requested enforce posture was lost and startup must fail.
@@ -142,7 +143,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 	}
 	a.observer = obs
 	logger.Info("Container egress hook attached", "target_mode", mode.String(),
-		"scoped", scope.Limited, "pod_cgroup", scope.PodCgroup)
+		"scoped", scope.Limited, "subtree", scope.Subtree)
 	return a, nil
 }
 

@@ -162,8 +162,8 @@ const (
 	OriginBpfProgCgOriginEgress      = "cg_origin_egress"
 	OriginBpfVarBtfAnchorL7Event     = "btf_anchor_l7_event"
 	OriginBpfVarBtfAnchorOriginEvent = "btf_anchor_origin_event"
-	OriginBpfVarScopePodCgroup       = "scope_pod_cgroup"
-	OriginBpfVarScopePodLevel        = "scope_pod_level"
+	OriginBpfVarScopeSubtreeCgroup   = "scope_subtree_cgroup"
+	OriginBpfVarScopeSubtreeLevel    = "scope_subtree_level"
 	OriginBpfVarScoped               = "scoped"
 )
 
@@ -243,8 +243,8 @@ type OriginBpfMapSpecs struct {
 type OriginBpfVariableSpecs struct {
 	BtfAnchorL7Event     *ebpf.VariableSpec `ebpf:"btf_anchor_l7_event"`
 	BtfAnchorOriginEvent *ebpf.VariableSpec `ebpf:"btf_anchor_origin_event"`
-	ScopePodCgroup       *ebpf.VariableSpec `ebpf:"scope_pod_cgroup"`
-	ScopePodLevel        *ebpf.VariableSpec `ebpf:"scope_pod_level"`
+	ScopeSubtreeCgroup   *ebpf.VariableSpec `ebpf:"scope_subtree_cgroup"`
+	ScopeSubtreeLevel    *ebpf.VariableSpec `ebpf:"scope_subtree_level"`
 	Scoped               *ebpf.VariableSpec `ebpf:"scoped"`
 }
 
@@ -319,8 +319,8 @@ func (m *OriginBpfMaps) Close() error {
 type OriginBpfVariables struct {
 	BtfAnchorL7Event     *ebpf.Variable `ebpf:"btf_anchor_l7_event"`
 	BtfAnchorOriginEvent *ebpf.Variable `ebpf:"btf_anchor_origin_event"`
-	ScopePodCgroup       *ebpf.Variable `ebpf:"scope_pod_cgroup"`
-	ScopePodLevel        *ebpf.Variable `ebpf:"scope_pod_level"`
+	ScopeSubtreeCgroup   *ebpf.Variable `ebpf:"scope_subtree_cgroup"`
+	ScopeSubtreeLevel    *ebpf.Variable `ebpf:"scope_subtree_level"`
 	Scoped               *ebpf.Variable `ebpf:"scoped"`
 }
 

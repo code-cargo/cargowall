@@ -253,7 +253,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// What container this runs in decides whether the daemon's config is
 	// ours to rewrite and whether the cgroup hook would judge only this
 	// job (see podenv.Shape.HookScope).
-	shape := podenv.Detect(dockerSocket, caps.KernelVersion)
+	shape := podenv.Detect(dockerSocket, caps.KernelVersion, cmd.ContainerEgress != ContainerEgressOff)
 	logger.Info("Runtime environment", shape.LogArgs()...)
 
 	var dnsServer *dns.Server

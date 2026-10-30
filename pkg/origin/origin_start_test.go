@@ -25,7 +25,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -46,16 +45,13 @@ func TestStartScoped(t *testing.T) {
 	requireBPFOrigin(t)
 	cg := filepath.Join(podenv.CgroupRoot, fmt.Sprintf("cargowall-origin-start-%d", os.Getpid()))
 	require.NoError(t, os.Mkdir(cg, 0o755))
+	t.Cleanup(func() { removeTestCgroup(t, cg) })
 	home, err := podenv.ReadCgroupPath("/proc/self/cgroup")
 	require.NoError(t, err)
 	self := []byte(strconv.Itoa(os.Getpid()))
+	// Back home before the cgroup goes: cleanups run last first.
+	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(podenv.CgroupRoot, home, "cgroup.procs"), self, 0) })
 	require.NoError(t, os.WriteFile(filepath.Join(cg, "cgroup.procs"), self, 0))
-	t.Cleanup(func() {
-		_ = os.WriteFile(filepath.Join(podenv.CgroupRoot, home, "cgroup.procs"), self, 0)
-		for i := 0; i < 50 && os.Remove(cg) != nil; i++ {
-			time.Sleep(20 * time.Millisecond)
-		}
-	})
 	own := strings.TrimPrefix(cg, podenv.CgroupRoot)
 	swap(t, &cgroupAttachPath, cg)
 	spec, err := bpf.LoadTcBpf()

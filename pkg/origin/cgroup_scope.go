@@ -78,32 +78,53 @@ type cgroupScope struct {
 	stale map[uint64]bool
 }
 
-// walkFindings is what one walk found that it logs: cgroups shared with a
-// task outside our pid namespace, cgroups it could not record, mark or read,
-// processes of ours in the root cgroup or outside our cgroup namespace's
-// root, where the hook never sees their sockets, and whether it could not
-// read the whole scope.
+// finding is what a walk logs: a cgroup, by id, shared with a task outside
+// our pid namespace, or one it could not take out, record, read or mark;
+// or a process of ours, by its pid in our namespace, in the root cgroup or
+// outside our cgroup namespace's root, where the hook never sees its
+// sockets.
+type finding struct {
+	kind findingKind
+	id   uint64
+}
+
+type findingKind uint8
+
+const (
+	findShared findingKind = iota
+	findUnremoved
+	findUnrecorded
+	findUnreadable
+	findUnmarked
+	findInRoot
+	findOutside
+)
+
+// walkFindings is what one walk found that it logs, and whether it could
+// not read the whole scope.
 type walkFindings struct {
-	shared, unremoved, unrecorded, unreadable, unmarked map[uint64]bool
-	inRoot, outside                                     map[uint32]bool
-	unlisted                                            bool
+	made     map[finding]bool
+	unlisted bool
 }
 
-// walkMemory is what the walks found and logged lately, as walkFindings
-// has it, with how many whole walks have gone by since one last found each
-// (remember).
+// walkMemory is what the walks found and logged lately, each finding with
+// how many whole walks have gone by since one last made it (remember).
 type walkMemory struct {
-	shared, unremoved, unrecorded, unreadable, unmarked map[uint64]int
-	inRoot, outside                                     map[uint32]int
-	unlisted                                            bool
+	seen     map[finding]int
+	unlisted bool
 }
 
-// firstTime notes k as found by this walk, and reports whether neither
-// this walk nor a recent one had found it: the time to log it.
-func firstTime[K comparable](found map[K]bool, last map[K]int, k K) bool {
-	_, recent := last[k]
-	first := !found[k] && !recent
-	found[k] = true
+func newWalkFindings() walkFindings { return walkFindings{made: make(map[finding]bool)} }
+
+func newWalkMemory() walkMemory { return walkMemory{seen: make(map[finding]int)} }
+
+// noteFirst notes a finding as made by this walk, and reports whether
+// neither this walk nor a recent one had made it: the time to log it.
+func (f *walkFindings) noteFirst(last *walkMemory, kind findingKind, id uint64) bool {
+	k := finding{kind, id}
+	_, recent := last.seen[k]
+	first := !f.made[k] && !recent
+	f.made[k] = true
 	return first
 }
 
@@ -119,45 +140,17 @@ const forgetAfter = 30
 // the scope could not be read whole is the last walk's alone, logged again
 // once a walk has read it whole.
 func (m *walkMemory) remember(found walkFindings) {
-	age(m.shared, found.shared)
-	age(m.unremoved, found.unremoved)
-	age(m.unrecorded, found.unrecorded)
-	age(m.unreadable, found.unreadable)
-	age(m.unmarked, found.unmarked)
-	age(m.inRoot, found.inRoot)
-	age(m.outside, found.outside)
-	m.unlisted = found.unlisted
-}
-
-// age counts one more walk since each finding in last, forgets those past
-// forgetAfter, and notes those found as found by this one.
-func age[K comparable](last map[K]int, found map[K]bool) {
-	for k, n := range last {
+	for k, n := range m.seen {
 		if n++; n > forgetAfter {
-			delete(last, k)
+			delete(m.seen, k)
 		} else {
-			last[k] = n
+			m.seen[k] = n
 		}
 	}
-	for k := range found {
-		last[k] = 0
+	for k := range found.made {
+		m.seen[k] = 0
 	}
-}
-
-func newWalkMemory() walkMemory {
-	return walkMemory{
-		shared: make(map[uint64]int), unremoved: make(map[uint64]int),
-		unrecorded: make(map[uint64]int), unreadable: make(map[uint64]int), unmarked: make(map[uint64]int),
-		inRoot: make(map[uint32]int), outside: make(map[uint32]int),
-	}
-}
-
-func newWalkFindings() walkFindings {
-	return walkFindings{
-		shared: make(map[uint64]bool), unremoved: make(map[uint64]bool),
-		unrecorded: make(map[uint64]bool), unreadable: make(map[uint64]bool), unmarked: make(map[uint64]bool),
-		inRoot: make(map[uint32]bool), outside: make(map[uint32]bool),
-	}
+	m.unlisted = found.unlisted
 }
 
 // subtree is the cgroup whose whole subtree a scoped hook judges, as both
@@ -316,7 +309,7 @@ func (s *cgroupScope) walk() error {
 		}
 		if l.level == 0 {
 			for tgid := range l.tgids {
-				if firstTime(found.inRoot, s.last.inRoot, tgid) {
+				if found.noteFirst(&s.last, findInRoot, uint64(tgid)) {
 					s.logger.Warn("A task of this job is in the root cgroup, where its sockets pass the cgroup hook",
 						"pid", tgid)
 				}
@@ -380,7 +373,8 @@ func (s *cgroupScope) reconcileMarked(tasks map[uint64]*listed, marked map[uint6
 // should a task of ours have entered since and recorded it (leave). A task
 // of ours alone that entered while the mark was up, which scope_enter
 // passed over, is recorded; record's own second look covers a task outside
-// entering after that.
+// entering after that. A second look that cannot read the cgroup puts the
+// mark back, and reports it.
 func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside bool, found *walkFindings) {
 	m, err := cgroupMembers(dir)
 	switch {
@@ -397,7 +391,12 @@ func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside boo
 		s.unmark(id)
 		again, err := cgroupMembers(dir)
 		switch {
+		case cgroupGone(err):
 		case err != nil:
+			// Whether a task outside entered since is unknown: the mark
+			// goes back, and the cgroup is reported.
+			s.mark(id, path, found)
+			s.unreadable(id, path, err, found)
 		case again.theirs:
 			s.leave(id, path, again.ours, found)
 		case again.ours && inside:
@@ -421,7 +420,7 @@ func (s *cgroupScope) cutShort(err error, found *walkFindings) {
 // each entry of ours records the cgroup again until the next walk takes it
 // out.
 func (s *cgroupScope) mark(id uint64, path string, found *walkFindings) {
-	if err := s.objs.MapScopeShared.Put(id, uint8(1)); err != nil && firstTime(found.unmarked, s.last.unmarked, id) {
+	if err := s.objs.MapScopeShared.Put(id, uint8(1)); err != nil && found.noteFirst(&s.last, findUnmarked, id) {
 		s.logger.Warn("Container egress cgroup scope could not mark a cgroup shared with tasks outside this job, "+
 			"which a task of this job entering it records again until the next walk", "cgroup", path, "cgroup_id", id, "error", err,
 			"capacity", s.objs.MapScopeShared.MaxEntries())
@@ -457,7 +456,7 @@ func (s *cgroupScope) reconcileListed(id uint64, l *listed, marked bool, found *
 	if !inside {
 		s.outsideRoot(id)
 		for tgid := range l.tgids {
-			if firstTime(found.outside, s.last.outside, tgid) {
+			if found.noteFirst(&s.last, findOutside, uint64(tgid)) {
 				p, _ := podenv.ReadCgroupPath(fmt.Sprintf("/proc/%d/cgroup", tgid))
 				s.logger.Warn("A task of this job is in a cgroup outside our cgroup namespace's root, "+
 					"which the cgroup hook never sees", "pid", tgid, "cgroup", p)
@@ -515,7 +514,7 @@ func (s *cgroupScope) unreadable(id uint64, path string, err error, found *walkF
 	if cgroupGone(err) {
 		return
 	}
-	if firstTime(found.unreadable, s.last.unreadable, id) {
+	if found.noteFirst(&s.last, findUnreadable, id) {
 		s.logger.Warn("Container egress cgroup scope cannot read a cgroup of this job's, and leaves it as it is",
 			"cgroup", path, "cgroup_id", id, "error", err)
 	}
@@ -687,11 +686,12 @@ func (s *cgroupScope) recorded(id uint64) bool {
 // look finds removed may have been released before the entry was made, and
 // release is all that takes an entry out, so the walk takes out its own:
 // any socket of ours that outlives the cgroup passes, as it would had the
-// walk come a moment later.
+// walk come a moment later. One the second look cannot read is taken out
+// and marked, as one found shared is, and reported.
 func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFindings) {
 	err := s.objs.MapScopeCgroups.Update(id, uint8(1), ebpf.UpdateNoExist)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
-		if firstTime(found.unrecorded, s.last.unrecorded, id) {
+		if found.noteFirst(&s.last, findUnrecorded, id) {
 			s.logger.Warn("Container egress cgroup scope could not record a cgroup this job is in, "+
 				"and its sockets pass the cgroup hook", "cgroup", path, "cgroup_id", id, "error", err,
 				"capacity", s.objs.MapScopeCgroups.MaxEntries())
@@ -701,9 +701,18 @@ func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFi
 	made := err == nil
 	m, err := cgroupMembers(dir)
 	switch {
-	case cgroupGone(err) && made:
+	case cgroupGone(err):
+		if made {
+			_ = s.objs.MapScopeCgroups.Delete(id)
+		}
+	case err != nil:
+		// Whether a task outside entered since is unknown, so the entry is
+		// not left to judge one: the cgroup is marked and taken out, and
+		// reported, for a walk that reads it to record it again.
+		s.mark(id, path, found)
 		_ = s.objs.MapScopeCgroups.Delete(id)
-	case err == nil && m.theirs:
+		s.unreadable(id, path, err, found)
+	case m.theirs:
 		s.leave(id, path, m.ours, found)
 	}
 }
@@ -720,7 +729,7 @@ func (s *cgroupScope) leave(id uint64, path string, ours bool, found *walkFindin
 	s.mark(id, path, found)
 	err := s.objs.MapScopeCgroups.Delete(id)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-		if firstTime(found.unremoved, s.last.unremoved, id) {
+		if found.noteFirst(&s.last, findUnremoved, id) {
 			s.logger.Warn("Container egress cgroup scope could not take out a cgroup it shares with tasks outside "+
 				"this job, whose sockets the hook still judges", "cgroup", path, "cgroup_id", id, "error", err)
 		}
@@ -732,7 +741,7 @@ func (s *cgroupScope) leave(id uint64, path string, ours bool, found *walkFindin
 		// later is told.
 		return
 	}
-	if !firstTime(found.shared, s.last.shared, id) {
+	if !found.noteFirst(&s.last, findShared, id) {
 		return
 	}
 	switch {

@@ -18,6 +18,7 @@ package origin
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -109,9 +110,7 @@ func TestCgroupScopeWalkLeavesSharedCgroups(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		for i := len(cgroups) - 1; i >= 0; i-- {
-			for j := 0; j < 50 && os.Remove(cgroups[i]) != nil; j++ {
-				time.Sleep(20 * time.Millisecond)
-			}
+			removeTestCgroup(t, cgroups[i])
 		}
 	})
 	for _, cg := range []string{filepath.Join(dir, "shared"), filepath.Join(dir, "theirs"), filepath.Join(pod, "shared")} {
@@ -396,6 +395,21 @@ func loadWalkScope(t *testing.T, ino, maxEntries uint32) *cgroupScope {
 	return s
 }
 
+// removeTestCgroup removes a test cgroup at cleanup, waiting out a task
+// still leaving it, and fails the test that leaked it if it stays: a later
+// run with the same pid would otherwise fail to make it.
+func removeTestCgroup(t *testing.T, path string) {
+	t.Helper()
+	var err error
+	for i := 0; i < 250; i++ {
+		if err = os.Remove(path); err == nil || errors.Is(err, fs.ErrNotExist) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("test cgroup %s left behind: %v", path, err)
+}
+
 // ownCgroupBelowRoot is the test process's cgroup, and skips the test
 // where that is the root, as in a VM with no cgroups of its own: the walk
 // reports the root's tasks and records nothing, so a test of recording has
@@ -523,9 +537,7 @@ func TestCgroupScopeWalkTakesOutCgroupsOutsideTheRoot(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		for i := len(cgroups) - 1; i >= 0; i-- {
-			for j := 0; j < 50 && os.Remove(cgroups[i]) != nil; j++ {
-				time.Sleep(20 * time.Millisecond)
-			}
+			removeTestCgroup(t, cgroups[i])
 		}
 	})
 	task := exec.Command("sleep", "60")
@@ -590,7 +602,7 @@ func TestWalkFindingsRemembered(t *testing.T) {
 	walk := func(unlisted bool, ids ...uint64) (logged []uint64) {
 		found := newWalkFindings()
 		for _, id := range ids {
-			if firstTime(found.shared, last.shared, id) {
+			if found.noteFirst(&last, findShared, id) {
 				logged = append(logged, id)
 			}
 		}
@@ -607,12 +619,12 @@ func TestWalkFindingsRemembered(t *testing.T) {
 	for range forgetAfter {
 		walk(false, 2)
 	}
-	require.Equal(t, 0, last.shared[2], "one every walk finds stays fresh")
+	require.Equal(t, 0, last.seen[finding{findShared, 2}], "one every walk finds stays fresh")
 	require.Empty(t, walk(false, 1), "found again within forgetAfter walks")
 	for range forgetAfter + 1 {
 		walk(false)
 	}
-	require.Empty(t, last.shared, "forgotten after forgetAfter walks without it")
+	require.Empty(t, last.seen, "forgotten after forgetAfter walks without it")
 	require.Equal(t, []uint64{1, 2}, walk(false, 1, 2), "and logged again")
 }
 
@@ -635,14 +647,18 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	marked := func() bool { return s.objs.MapScopeShared.Lookup(ownID, &v) == nil }
 	recorded := func() bool { return s.cgroups().Lookup(ownID, &v) == nil }
 	found := newWalkFindings()
-	// looksRead stands in for cgroup.threads, a reading per look.
-	looksRead := func(reads ...string) {
+	// looksRead stands in for cgroup.threads, a reading per look: its
+	// contents, or the error reading it.
+	looksRead := func(reads ...any) {
 		t.Helper()
 		looks := 0
 		swap(t, &readThreads, func(*os.File) ([]byte, error) {
 			r := reads[min(looks, len(reads)-1)]
 			looks++
-			return []byte(r), nil
+			if err, ok := r.(error); ok {
+				return nil, err
+			}
+			return []byte(r.(string)), nil
 		})
 	}
 
@@ -677,13 +693,13 @@ func TestCgroupScopeClearMark(t *testing.T) {
 
 	// A cgroup still shared keeps its mark, and what an earlier walk logged
 	// of it stands, so it is not reported again.
-	s.last.shared[ownID] = 0
+	s.last.seen[finding{findShared, ownID}] = 0
 	found = newWalkFindings()
 	looksRead("0\n")
 	s.clearMark(ownID, dir, path, true, &found)
 	require.True(t, marked(), "a still-shared cgroup keeps its mark")
 	s.last.remember(found)
-	require.Contains(t, s.last.shared, ownID, "and stays logged")
+	require.Contains(t, s.last.seen, finding{findShared, ownID}, "and stays logged")
 
 	looksRead("7\n")
 	s.clearMark(ownID, dir, path, false, &found)
@@ -691,6 +707,23 @@ func TestCgroupScopeClearMark(t *testing.T) {
 
 	var log bytes.Buffer
 	s.logger = slog.New(slog.NewTextHandler(&log, nil))
+
+	// A second look that cannot read the cgroup leaves it as it was, which
+	// judges no task outside: clearMark puts the mark back, and record
+	// takes out the entry it made and marks it. Both are reported.
+	s.mark(ownID, path, &found)
+	looksRead("", syscall.EIO)
+	s.clearMark(ownID, dir, path, true, &found)
+	require.True(t, marked() && !recorded(), "clearMark's unread second look puts the mark back")
+	require.Contains(t, log.String(), "cannot read a cgroup", "and reports it")
+	s.unmark(ownID)
+	found = newWalkFindings()
+	log.Reset()
+	looksRead(syscall.EIO)
+	s.record(ownID, dir, path, &found)
+	require.True(t, marked() && !recorded(), "record's unread second look takes the entry out and marks it")
+	require.Contains(t, log.String(), "cannot read a cgroup", "and reports it")
+
 	require.NoError(t, s.objs.MapScopeShared.Put(ownID, uint8(1)))
 	s.mark(ownID+1, "/full", &found)
 	s.mark(ownID+1, "/full", &found)
@@ -712,7 +745,7 @@ func TestCgroupScopeRemembersRemovedCgroups(t *testing.T) {
 	found := newWalkFindings()
 	require.True(t, s.reconcileRecorded(map[uint64]*listed{}, &found))
 	require.True(t, s.stale[ownID], "a cgroup whose read finds it removed is remembered")
-	require.False(t, found.unreadable[ownID], "and not reported")
+	require.False(t, found.made[finding{findUnreadable, ownID}], "and not reported")
 }
 
 // A map too small for every cgroup the walk records costs those cgroups,
@@ -725,8 +758,8 @@ func TestCgroupScopeWalkFullMapWarns(t *testing.T) {
 	s := loadWalkScope(t, ino, 1)
 	var log bytes.Buffer
 	s.logger = slog.New(slog.NewTextHandler(&log, nil))
-	s.last.shared[1<<62] = 0
+	s.last.seen[finding{findShared, 1 << 62}] = 0
 	require.NoError(t, s.walk())
 	require.Contains(t, log.String(), "could not record a cgroup")
-	require.Equal(t, 1, s.last.shared[1<<62], "what an earlier walk found is remembered by a walk without it")
+	require.Equal(t, 1, s.last.seen[finding{findShared, 1 << 62}], "what an earlier walk found is remembered by a walk without it")
 }

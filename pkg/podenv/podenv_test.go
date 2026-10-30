@@ -270,6 +270,34 @@ func TestProbeKubeletHosts(t *testing.T) {
 	}
 }
 
+// HookScope reads the daemon's runtime below the machine's root or
+// scoped, and only past the refusals that need nothing of the daemon's,
+// so Detect looks for it only there.
+func TestReadsRuntime(t *testing.T) {
+	scoped := Shape{
+		CgroupNS: CgroupNSHost, CgroupPath: "/kubepods/pod1/a", CgroupMount: CgroupMountOurs,
+		PidNS: PidNSPrivate, SocketCgroups: SocketCgroupsKept,
+	}
+	with := func(f func(*Shape)) Shape { s := scoped; f(&s); return s }
+	for name, c := range map[string]struct {
+		shape      Shape
+		hook, want bool
+	}{
+		"scoped":                               {scoped, true, true},
+		"the hook off":                         {scoped, false, false},
+		"private cgroupns, host pid namespace": {with(func(s *Shape) { s.CgroupNS, s.PidNS = CgroupNSPrivate, PidNSHost }), true, true},
+		"runner VM":                            {with(func(s *Shape) { s.PidNS = PidNSHost }), true, false},
+		"cgroup namespace unknown":             {with(func(s *Shape) { s.CgroupNS = CgroupNSUnknown }), true, false},
+		"mount unproven":                       {with(func(s *Shape) { s.CgroupMount = CgroupMountUnknown }), true, false},
+		"socket cgroups shared":                {with(func(s *Shape) { s.SocketCgroups = SocketCgroupsShared }), true, false},
+		"DOCKER_HOST elsewhere":                {with(func(s *Shape) { s.DockerHost = "tcp://a:2375" }), true, false},
+	} {
+		if got := c.shape.readsRuntime(c.hook); got != c.want {
+			t.Errorf("%s: readsRuntime = %v, want %v", name, got, c.want)
+		}
+	}
+}
+
 // The pod's cgroup is the deepest component of kubelet's tree that names a
 // pod, under either driver; nothing else that merely says "pod" counts.
 func TestPodCgroup(t *testing.T) {

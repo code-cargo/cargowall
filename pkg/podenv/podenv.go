@@ -501,6 +501,18 @@ func (s Shape) initRefusal(sub string) error {
 	return nil
 }
 
+// readsRuntime reports whether HookScope reads the daemon's runtime: where
+// the hook may load (egressHook) below the machine's root, in a private
+// cgroup namespace, or scoped, outside the host pid namespace in the
+// host's, and past the refusals that come first there and need nothing of
+// the daemon's: an attach point not shown to be our tree, a docker CLI set
+// to use another daemon, a kernel that can lose sockets' cgroups. Detect
+// looks for the daemon's server, runtime and containers' tree only then.
+func (s Shape) readsRuntime(egressHook bool) bool {
+	return egressHook && (s.CgroupNS == CgroupNSPrivate || s.CgroupNS == CgroupNSHost && s.PidNS == PidNSPrivate) &&
+		s.attachPointRefusal() == nil && s.partialRefusal() == nil
+}
+
 // machineFirewall reports whether the hook would attach at the machine's
 // root in the host pid namespace: a runner VM, where it judges every socket
 // and reads neither the daemon nor the kernel's socket cgroups. Detect
@@ -709,13 +721,31 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 	} else {
 		s.KubeletHosts = hosts
 	}
-	// Only a hook below the machine's root, or scoped, reads the daemon's
-	// runtime: a private cgroup namespace's root bounds the hook, and the
-	// scope judges a private pid namespace. A private cgroup namespace
-	// also reads where the daemon makes its containers, and who else is in
-	// the tree.
-	readsRuntime := egressHook && (s.CgroupNS == CgroupNSPrivate || s.PidNS == PidNSPrivate)
-	private := egressHook && s.CgroupNS == CgroupNSPrivate
+	// The docker CLI's daemon matters only to a hook that judges part of
+	// the machine (partialRefusal), not to one at a runner VM's root.
+	if egressHook && !s.machineFirewall() {
+		if env, uid, err := dockerEnv(); err != nil {
+			s.DockerHostReason = err.Error()
+		} else if host, setting, err := dockerCLIHost(env, uid); err != nil {
+			s.DockerHostReason = err.Error()
+		} else if host != "" && dockerHostElsewhere(host, dockerSocket) {
+			s.DockerHost, s.DockerHostSetting = host, setting
+		}
+	}
+	// The probe parses the kernel's BTF, and nothing reads its answer
+	// without the hook, or on a runner VM (machineFirewall).
+	if !egressHook {
+		s.SocketCgroupsReason = "not probed: the cgroup egress hook is off"
+	} else if s.machineFirewall() {
+		s.SocketCgroupsReason = "not probed: the hook is at the machine's root and judges every socket"
+	} else {
+		s.SocketCgroups, s.SocketCgroupsReason = probeSocketCgroups(kernel)
+	}
+	// The daemon's server and runtime are looked for only where HookScope
+	// reads them (readsRuntime), and a private cgroup namespace also reads
+	// where the daemon makes its containers, and who else is in the tree.
+	readsRuntime := s.readsRuntime(egressHook)
+	private := readsRuntime && s.CgroupNS == CgroupNSPrivate
 	s.Dockerd = probeDockerd(dockerSocket, readsRuntime)
 	visible := s.Dockerd.Kind == DockerdLocal || s.Dockerd.Kind == DockerdForeign
 	if readsRuntime && visible {
@@ -738,26 +768,6 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 		}
 	} else {
 		s.InitCgroupReason = "not probed: read only in a private pid namespace"
-	}
-	// The docker CLI's daemon matters only to a hook that judges part of
-	// the machine (partialRefusal), not to one at a runner VM's root.
-	if egressHook && !s.machineFirewall() {
-		if env, uid, err := dockerEnv(); err != nil {
-			s.DockerHostReason = err.Error()
-		} else if host, setting, err := dockerCLIHost(env, uid); err != nil {
-			s.DockerHostReason = err.Error()
-		} else if host != "" && dockerHostElsewhere(host, dockerSocket) {
-			s.DockerHost, s.DockerHostSetting = host, setting
-		}
-	}
-	// The probe parses the kernel's BTF, and nothing reads its answer
-	// without the hook, or on a runner VM (machineFirewall).
-	if !egressHook {
-		s.SocketCgroupsReason = "not probed: the cgroup egress hook is off"
-	} else if s.machineFirewall() {
-		s.SocketCgroupsReason = "not probed: the hook is at the machine's root and judges every socket"
-	} else {
-		s.SocketCgroups, s.SocketCgroupsReason = probeSocketCgroups(kernel)
 	}
 	return s
 }

@@ -735,19 +735,31 @@ func (s *cgroupScope) watch() {
 			s.report()
 			return
 		case <-t.C:
-			if err := s.walk(false); err != nil {
-				if err.Error() != failing {
-					failing = err.Error()
-					s.logger.Warn("Container egress cgroup scope: task walk failed, and the scope stands as it was",
-						"error", err)
-				}
-			} else if failing != "" {
-				failing = ""
-				s.logger.Info("Container egress cgroup scope: task walk recovered")
-			}
+			failing = s.rewalk(failing)
 			s.report()
 		}
 	}
+}
+
+// rewalk walks the tasks again for watch, and logs a change in how the
+// walk fares: failing is the last walk's error, "" for none, and the new
+// one is returned. A walk close cut short reconciled nothing, so it shows
+// no recovery.
+func (s *cgroupScope) rewalk(failing string) string {
+	if err := s.walk(false); err != nil {
+		if err.Error() != failing {
+			s.logger.Warn("Container egress cgroup scope: task walk failed, and the scope stands as it was",
+				"error", err)
+		}
+		return err.Error()
+	}
+	if s.stopping() {
+		return failing
+	}
+	if failing != "" {
+		s.logger.Info("Container egress cgroup scope: task walk recovered")
+	}
+	return ""
 }
 
 func (s *cgroupScope) report() {

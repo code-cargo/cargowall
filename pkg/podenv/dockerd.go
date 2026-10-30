@@ -114,13 +114,14 @@ func (d *Dockerd) note(fact string, err error) {
 	d.Reason += fact + ": " + err.Error()
 }
 
-// probeDockerd identifies the daemon through SO_PEERCRED on a connection
-// to its socket: the kernel reports the listener's pid translated into our
-// pid namespace, 0 when it is not visible there. A visible pid can still
-// be another container's process once the pod shares one pid namespace, so
-// the mount namespace is the decisive comparison. A socket-activated
-// daemon reports the activating service manager, systemd, whose dockerd
-// child is taken for the daemon (activatedDaemon).
+// probeDockerd identifies the daemon as the process serving a connection
+// to its socket (servingPid). SO_PEERCRED on the connection first gives
+// the listener's pid translated into our pid namespace, 0 when it is not
+// visible there, and then neither is what it serves. The listener need not
+// be the server: a socket-activated daemon's was made by its service
+// manager (systemd, for docker.socket and dockerd -H fd://). A visible
+// server can still be another container's process once the pod shares one
+// pid namespace, so the mount namespace is the decisive comparison.
 func probeDockerd(socket string) Dockerd {
 	unknown := func(err error) Dockerd { return Dockerd{Kind: DockerdUnknown, Reason: err.Error()} }
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -152,7 +153,7 @@ func probeDockerd(socket string) Dockerd {
 	if pid == 0 {
 		return Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
 	}
-	if pid, err = activatedDaemon(socket, pid); err != nil {
+	if pid, err = servingPid(conn.(*net.UnixConn)); err != nil {
 		return unknown(err)
 	}
 	ours, err := nsInode("/proc/self/ns/mnt")
@@ -171,10 +172,11 @@ func probeDockerd(socket string) Dockerd {
 	return Dockerd{Kind: DockerdLocal, pid: pid}
 }
 
-// probeRuntime finds the daemon's runtime (runtimePid). Only a daemon
-// whose pid we see has one to find.
-func (d *Dockerd) probeRuntime() {
-	runtime, err := runtimePid(d.pid)
+// probeRuntime finds the daemon's runtime (runtimePid), asking the daemon
+// at socket the address of its containerd should no connection show one.
+// Only a daemon whose pid we see has one to find.
+func (d *Dockerd) probeRuntime(socket string) {
+	runtime, err := runtimePid(d.pid, func() (string, error) { return containerdAddress(socket) })
 	if err != nil {
 		d.note("its runtime", err)
 		return
@@ -217,130 +219,114 @@ func (d *Dockerd) probeContainerTree(socket string) {
 	d.ContainerTree = tree
 }
 
-// containerdDefaults are where dockerd looks for containerd when it is not
-// given an address: the machine's, whose socket it takes whenever the file
-// is there, else the one it runs itself. A test stands in for them.
-var containerdDefaults = []string{"/run/containerd/containerd.sock", "/var/run/docker/containerd/containerd.sock"}
-
-// defaultDaemonConfig is where dockerd reads its daemon.json without
-// --config-file.
-const defaultDaemonConfig = "/etc/docker/daemon.json"
-
 // runtimePid is the process whose view of the machine decides where the
 // daemon at pid makes its containers' cgroups: containerd, whose shims run
 // runc, which makes them in its cgroup mount (cgroupfs) or asks the
 // systemd its environment's bus leads to (systemd), both containerd's. It
-// is the peer at the socket dockerd uses, as dockerd chooses it: the
-// address it was given (--containerd, or "containerd" in its daemon.json),
-// else the first default whose file is there, resolved in the daemon's
-// root. That socket must answer, from a containerd in our pid namespace.
-// With no address given and no default there, the daemon runs its
-// containers itself (a runtime that is not containerd's), and its own view
-// is taken.
-func runtimePid(pid int32) (int32, error) {
+// is the containerd the daemon is connected to, as the connections show
+// it rather than as its flags, daemon.json and the sockets there now
+// would pick it: the holder of the other end of each connection the
+// daemon made, by inode, which unix_diag gives in the daemon's network
+// namespace. A connection whose other end no process we see holds may be
+// to a containerd outside our pid namespace, and refuses. A daemon
+// connected to no containerd runs one in its own process (ownContainerd).
+func runtimePid(pid int32, containerdAddr func() (string, error)) (int32, error) {
 	proc := "/proc/" + strconv.Itoa(int(pid))
-	root, err := unix.Open(proc+"/root", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	inodes, err := procfs.Sockets(int(pid))
+	if err != nil {
+		return 0, fmt.Errorf("its sockets: %w", err)
+	}
+	netns := proc + "/ns/net"
+	ours, err := nsInode("/proc/self/ns/net")
 	if err != nil {
 		return 0, err
+	}
+	if theirs, err := nsInode(netns); err != nil {
+		return 0, err
+	} else if theirs == ours {
+		netns = ""
+	}
+	socks, err := unixDiag(netns, 0)
+	if err != nil {
+		return 0, fmt.Errorf("its connections: %w", err)
+	}
+	held := make(map[uint64]bool, len(inodes))
+	for _, ino := range inodes {
+		held[ino] = true
+	}
+	peers := map[uint64]bool{}
+	for _, s := range socks {
+		// A connection it made is an unbound stream socket of its, still
+		// open at the other end: one it accepted carries its listener's
+		// address.
+		if held[s.ino] && s.stream && !s.named && !s.closed && s.peer != 0 {
+			peers[s.peer] = true
+		}
+	}
+	holders, err := procfs.SocketHolders(peers)
+	if err != nil {
+		return 0, fmt.Errorf("its connections' other ends: %w", err)
+	}
+	var containerd []int
+	for peer := range peers {
+		if len(holders[peer]) == 0 {
+			return 0, fmt.Errorf("no process we see holds the other end of a connection it made (socket %d), "+
+				"which may be a containerd outside our pid namespace", peer)
+		}
+		for _, p := range holders[peer] {
+			if procfs.Comm(p) == "containerd" && !slices.Contains(containerd, p) {
+				containerd = append(containerd, p)
+			}
+		}
+	}
+	switch {
+	case len(containerd) == 1 && containerd[0] > 0 && containerd[0] <= math.MaxInt32:
+		return int32(containerd[0]), nil
+	case len(containerd) > 1:
+		return 0, fmt.Errorf("it is connected to more than one containerd (pids %v)", containerd)
+	}
+	if err := ownContainerd(pid, containerdAddr); err != nil {
+		return 0, fmt.Errorf("it is connected to no containerd, and %w", err)
+	}
+	return pid, nil
+}
+
+// ownContainerd says why the daemon at pid, connected to no containerd,
+// cannot be shown to run its containers itself, or nil. A dockerd with no
+// containerd binary embeds one, and serves the address it names in GET
+// /info itself, which its shims connect back to; a podman service names
+// none, and runs them through conmon. A daemon that names one another
+// process serves has yet to reach it, and one that names none is shown to
+// run them itself only when not a dockerd, which before embedding one
+// (API 1.46, which names it) always reached one of its own.
+func ownContainerd(pid int32, containerdAddr func() (string, error)) error {
+	addr, err := containerdAddr()
+	switch {
+	case err != nil:
+		return fmt.Errorf("the one it names is unread: %w", err)
+	case addr == "" && procfs.Comm(int(pid)) == "dockerd":
+		return errors.New("names none, though a dockerd running one itself names it")
+	case addr == "":
+		return nil
+	case !filepath.IsAbs(addr):
+		return fmt.Errorf("the one it names at %q is relative to a working directory this probe does not follow", addr)
+	}
+	root, err := unix.Open("/proc/"+strconv.Itoa(int(pid))+"/root", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
 	}
 	defer unix.Close(root)
-	cmdline, err := os.ReadFile(proc + "/cmdline")
+	server, err := socketPeerIn(root, addr)
 	if err != nil {
-		return 0, err
+		return fmt.Errorf("the one it names: %w", err)
 	}
-	addr, config := dockerdFlags(cmdline)
-	// dockerd resolves a relative path against its working directory,
-	// which a probe from another mount namespace cannot follow inside its
-	// root.
-	for _, p := range []string{addr, config} {
-		if p != "" && !filepath.IsAbs(p) {
-			return 0, fmt.Errorf("its containerd address or daemon.json %q is relative to a working directory "+
-				"this probe does not follow", p)
-		}
+	switch server {
+	case pid:
+		return nil
+	case 0:
+		return fmt.Errorf("the one it names at %s is outside our pid namespace", addr)
 	}
-	if addr == "" {
-		if addr, err = configuredContainerd(root, config); err != nil {
-			return 0, err
-		}
-	}
-	if addr == "" {
-		for _, path := range containerdDefaults {
-			if fd, err := openInRoot(root, path, unix.O_PATH); err == nil {
-				unix.Close(fd)
-				addr = path
-				break
-			}
-		}
-	}
-	if addr == "" {
-		return pid, nil
-	}
-	peer, err := socketPeerIn(root, addr)
-	if err != nil {
-		return 0, fmt.Errorf("the containerd it uses: %w", err)
-	}
-	if peer == 0 {
-		return 0, fmt.Errorf("the containerd it uses at %s is outside our pid namespace", addr)
-	}
-	return peer, nil
-}
-
-// dockerdFlags reads the containerd address and the daemon.json path a
-// dockerd command line gives (--containerd, --config-file, either as
-// --flag=value or --flag value); the config defaults to
-// defaultDaemonConfig. An address may carry the unix:// scheme.
-func dockerdFlags(cmdline []byte) (containerd, config string) {
-	config = defaultDaemonConfig
-	args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
-	for i := 1; i < len(args); i++ {
-		for _, flag := range []string{"--containerd", "--config-file"} {
-			v, ok := strings.CutPrefix(args[i], flag+"=")
-			if !ok && args[i] == flag && i+1 < len(args) {
-				v, ok = args[i+1], true
-				i++
-			}
-			if !ok {
-				continue
-			}
-			if flag == "--containerd" {
-				containerd = strings.TrimPrefix(v, "unix://")
-			} else {
-				config = v
-			}
-		}
-	}
-	return containerd, config
-}
-
-// configuredContainerd is the "containerd" address in the daemon.json at
-// path, read in the daemon's root; "" when there is no such file or key.
-func configuredContainerd(root int, path string) (string, error) {
-	fd, err := openInRoot(root, path, unix.O_RDONLY)
-	if errors.Is(err, fs.ErrNotExist) {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("its daemon.json %s: %w", path, err)
-	}
-	f := os.NewFile(uintptr(fd), path)
-	defer f.Close()
-	var config struct {
-		Containerd string `json:"containerd"`
-	}
-	if err := json.NewDecoder(io.LimitReader(f, 1<<20)).Decode(&config); err != nil {
-		return "", fmt.Errorf("its daemon.json %s: %w", path, err)
-	}
-	return strings.TrimPrefix(config.Containerd, "unix://"), nil
-}
-
-// openInRoot opens path inside root as a chroot would resolve it, with
-// flags (O_RDONLY to read it, O_PATH to find it, a socket included).
-func openInRoot(root int, path string, flags int) (int, error) {
-	fd, err := unix.Openat2(root, path, &unix.OpenHow{Flags: uint64(flags) | unix.O_CLOEXEC, Resolve: unix.RESOLVE_IN_ROOT})
-	if err != nil {
-		return -1, &fs.PathError{Op: "open", Path: path, Err: err}
-	}
-	return fd, nil
+	return fmt.Errorf("the one it names at %s is served by pid %d, not by itself", addr, server)
 }
 
 // unaskedTree is the tree a daemon whose cgroup driver is unknown makes
@@ -364,6 +350,19 @@ func unaskedTree(pid int32) (string, error) {
 		return sys, nil
 	}
 	return own, nil
+}
+
+// containerdAddress asks the daemon at socket for the address of its
+// containerd (GET /info), "" for none named.
+func containerdAddress(socket string) (string, error) {
+	var info struct{ Containerd *struct{ Address string } }
+	if err := dockerGet(socket, "/info", &info); err != nil {
+		return "", err
+	}
+	if info.Containerd == nil {
+		return "", nil
+	}
+	return strings.TrimPrefix(info.Containerd.Address, "unix://"), nil
 }
 
 // cgroupDriver asks the daemon at socket for its cgroup driver (GET /info).
@@ -404,24 +403,46 @@ func dockerGet(socket, path string, out any) error {
 	return nil
 }
 
-// activatedDaemon is the daemon serving the socket whose listener is pid:
-// pid itself, unless pid is systemd, which made the socket and activated
-// the daemon on it (docker.socket, dockerd -H fd://). Then the daemon is
-// systemd's child named dockerd, asked first over the socket (GET /_ping)
-// so that one activated on demand is up; without exactly one such child it
-// is unidentified. Any other listener is the daemon, whatever its name: a
-// podman service, or a stand-in.
-func activatedDaemon(socket string, pid int32) (int32, error) {
-	if procfs.Comm(int(pid)) != "systemd" {
-		return pid, nil
+// servingPid is the process serving the socket conn is connected to: the
+// one holding the connection its listener accepted, found by the inode
+// unix_diag gives as conn's peer, among every process's descriptors. Only
+// a server that has accepted holds it, which its answer shows (GET
+// /_ping), and a socket-activated daemon may be starting, so it is given a
+// while. Whatever serves is the daemon, whatever its name: a podman
+// service, or a stand-in.
+func servingPid(conn *net.UnixConn) (int32, error) {
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return 0, err
 	}
-	_ = dockerGet(socket, "/_ping", nil)
-	children := procfs.ChildrenByComm(int(pid), "dockerd")
-	if len(children) != 1 || children[0] <= 0 || children[0] > math.MaxInt32 {
-		return 0, fmt.Errorf("the socket's listener is systemd (pid %d), with %d dockerd children we see, "+
-			"not the one that would be the daemon", pid, len(children))
+	req, err := http.NewRequest(http.MethodGet, "http://docker/_ping", nil)
+	if err != nil {
+		return 0, err
 	}
-	return int32(children[0]), nil
+	if err := req.Write(conn); err != nil {
+		return 0, fmt.Errorf("GET /_ping: %w", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		return 0, fmt.Errorf("GET /_ping: %w", err)
+	}
+	resp.Body.Close()
+	peer, err := connPeer(conn)
+	if err != nil {
+		return 0, err
+	}
+	holders, err := procfs.SocketHolders(map[uint64]bool{peer: true})
+	if err != nil {
+		return 0, err
+	}
+	switch pids := holders[peer]; {
+	case len(pids) == 1 && pids[0] > 0 && pids[0] <= math.MaxInt32:
+		return int32(pids[0]), nil
+	case len(pids) == 0:
+		return 0, errors.New("no process we see holds the connection its socket accepted from us: " +
+			"its server is outside our pid namespace, or closed it once it answered")
+	default:
+		return 0, fmt.Errorf("the connection its socket accepted from us is held by more than one process (pids %v)", pids)
+	}
 }
 
 // mountRootOf is the root of pid's cgroup v2 mount at CgroupRoot, as our
@@ -452,12 +473,14 @@ const (
 // as the host's over a bind-mounted bus, is not shown to share ours.
 func systemdTree(pid int32) (string, error) {
 	proc := "/proc/" + strconv.Itoa(int(pid))
+	env, err := os.ReadFile(proc + "/environ")
+	if err != nil {
+		return "", fmt.Errorf("its environment, which may name its system bus: %w", err)
+	}
 	buses, unfollowed := []string{systemBusSocket}, ""
-	if env, err := os.ReadFile(proc + "/environ"); err == nil {
-		if addr := parseEnviron(env)["DBUS_SYSTEM_BUS_ADDRESS"]; addr != "" {
-			if buses, unfollowed, err = busSocketPaths(addr); err != nil {
-				return "", err
-			}
+	if addr := parseEnviron(env)["DBUS_SYSTEM_BUS_ADDRESS"]; addr != "" {
+		if buses, unfollowed, err = busSocketPaths(addr); err != nil {
+			return "", err
 		}
 	}
 	root, err := unix.Open(proc+"/root", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)

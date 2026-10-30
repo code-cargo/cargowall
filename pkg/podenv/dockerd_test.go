@@ -17,6 +17,7 @@
 package podenv
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -25,16 +26,15 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
-// fakeDaemon serves an /info answer on a unix socket of its own, and
-// returns the socket's path.
+// fakeDaemon serves an /info answer, and /_ping, on a unix socket of its
+// own, and returns the socket's path.
 func fakeDaemon(t *testing.T, status int, body string) string {
 	t.Helper()
 	sock := filepath.Join(t.TempDir(), "docker.sock")
@@ -43,12 +43,15 @@ func fakeDaemon(t *testing.T, status int, body string) string {
 		t.Fatal(err)
 	}
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/info" {
+		switch r.URL.Path {
+		case "/_ping":
+			fmt.Fprint(w, "OK")
+		case "/info":
+			w.WriteHeader(status)
+			fmt.Fprint(w, body)
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		w.WriteHeader(status)
-		fmt.Fprint(w, body)
 	})}
 	go func() { _ = srv.Serve(l) }()
 	t.Cleanup(func() { _ = srv.Close() })
@@ -79,12 +82,10 @@ func TestProbeContainerTree(t *testing.T) {
 	if err != nil {
 		t.Skipf("no cgroup v2 mount at %s: %v", CgroupRoot, err)
 	}
-	// No containerd to find: the daemon's own view decides.
-	saved := containerdDefaults
-	containerdDefaults = nil
-	t.Cleanup(func() { containerdDefaults = saved })
+	// The daemon stands in for one connected to no containerd: its own
+	// view decides.
 	probe := func(d Dockerd, socket string) Dockerd {
-		d.probeRuntime()
+		d.probeRuntime(socket)
 		d.probeContainerTree(socket)
 		return d
 	}
@@ -97,25 +98,45 @@ func TestProbeContainerTree(t *testing.T) {
 		t.Errorf("unknown driver: got %+v, want no tree, with the reason", d)
 	}
 	// A daemon that does not say, as a busy one may not in time, is judged
-	// by both drivers' trees: its own mount, and that of any systemd it
-	// could reach, here on a bus this process listens on, so ours too.
-	d = probe(Dockerd{Kind: DockerdLocal, pid: busDaemon(t, "unix:path="+busListener(t))}, fakeDaemon(t, http.StatusServiceUnavailable, `{}`))
-	if d.CgroupDriver != "" || d.ContainerTree != ours || !strings.Contains(d.Reason, "its cgroup driver") {
-		t.Errorf("unasked: got %+v, want our own mount's root %q, noting the driver unread", d, ours)
+	// by both drivers' trees as its runtime sees them, a containerd it is
+	// connected to: its own mount, and that of any systemd it could reach,
+	// here on a bus this process listens on, so ours too.
+	sock := filepath.Join(t.TempDir(), "containerd.sock")
+	runtime := standIn(t, "containerd", "listen", []string{"CARGOWALL_TEST_SOCK=" + sock, "DBUS_SYSTEM_BUS_ADDRESS=unix:path=" + busListener(t)})
+	d = probe(Dockerd{Kind: DockerdLocal, pid: standInDaemon(t, "dockerd", sock)}, fakeDaemon(t, http.StatusServiceUnavailable, `{}`))
+	if d.Runtime != runtime || d.CgroupDriver != "" || d.ContainerTree != ours || !strings.Contains(d.Reason, "its cgroup driver") {
+		t.Errorf("unasked: got %+v, want containerd %d's view, our own mount's root %q, noting the driver unread", d, runtime, ours)
 	}
 }
 
-// The runtime whose view decides is the containerd at the socket dockerd
-// uses, as dockerd picks it: the address it was given, by flag or in its
-// daemon.json, else the first default that is there; with none of those,
-// the daemon itself. A socket that is there but does not answer refuses.
-// A child of the test, listening, stands in for containerd, and shells
-// whose command lines carry dockerd's flags for dockerd.
-func TestRuntimePid(t *testing.T) {
+// standIn starts the test binary as a process named name, playing role
+// (TestStandIn), with env added and files from descriptor 3, and returns
+// its pid once it has created its ready file.
+func standIn(t *testing.T, name, role string, env []string, files ...*os.File) int32 {
+	t.Helper()
+	return standInWith(t, nil, name, role, env, files...)
+}
+
+// standInDaemon starts a stand-in named name holding a connection to each
+// of socks.
+func standInDaemon(t *testing.T, name string, socks ...string) int32 {
+	t.Helper()
+	return standIn(t, name, "connect", []string{"CARGOWALL_TEST_SOCK=" + strings.Join(socks, string(filepath.ListSeparator))})
+}
+
+// standInWith is standIn in the namespaces attr gives.
+func standInWith(t *testing.T, attr *syscall.SysProcAttr, name, role string, env []string, files ...*os.File) int32 {
+	t.Helper()
 	dir := t.TempDir()
-	sock := filepath.Join(dir, "containerd.sock")
-	cmd := exec.Command(os.Args[0], "-test.run", "^TestRuntimeListener$")
-	cmd.Env = append(os.Environ(), "CARGOWALL_TEST_LISTEN="+sock)
+	bin := filepath.Join(dir, name)
+	if err := os.Symlink(os.Args[0], bin); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(dir, "ready")
+	cmd := exec.Command(bin, "-test.run", "^TestStandIn$")
+	cmd.Env = append(os.Environ(), append(env, "CARGOWALL_TEST_ROLE="+role, "CARGOWALL_TEST_READY="+ready)...)
+	cmd.ExtraFiles = files
+	cmd.SysProcAttr = attr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -124,157 +145,243 @@ func TestRuntimePid(t *testing.T) {
 		_ = cmd.Wait()
 	})
 	for i := 0; i < 250; i++ {
-		if _, err := os.Stat(sock); err == nil {
-			break
+		if _, err := os.Stat(ready); err == nil {
+			return int32(cmd.Process.Pid)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	containerd := int32(cmd.Process.Pid)
-	// dockerd stands in for a dockerd started with these flags; the
-	// trailing command keeps the shell from exec'ing sleep in its place.
-	dockerd := func(flags ...string) int32 {
-		d := exec.Command("sh", append([]string{"-c", "sleep 60; :", "dockerd"}, flags...)...)
-		if err := d.Start(); err != nil {
+	t.Fatalf("stand-in %s (%s) never got ready", name, role)
+	return 0
+}
+
+// standInHeld keeps a stand-in's connections from being collected, and
+// closed.
+var standInHeld []net.Conn
+
+// TestStandIn is the process standIn starts; on its own it skips. As
+// "listen" it accepts connections at $CARGOWALL_TEST_SOCK and holds them
+// open; as "drop" it closes each; as "hide" it holds none of them, each
+// parked in flight in a message to itself, so no process holds a
+// descriptor for it; as "serve" it answers HTTP on the listener it was
+// handed; as "connect" it holds a connection to each socket in the list
+// $CARGOWALL_TEST_SOCK, once each has answered, and holds those it
+// accepts at $CARGOWALL_TEST_LISTEN, if set. Each connection it accepts is
+// answered with a byte.
+func TestStandIn(t *testing.T) {
+	role, sock, ready := os.Getenv("CARGOWALL_TEST_ROLE"), os.Getenv("CARGOWALL_TEST_SOCK"), os.Getenv("CARGOWALL_TEST_READY")
+	if role == "" {
+		t.Skip("run by standIn")
+	}
+	switch role {
+	case "listen", "drop", "hide":
+		standInAccept(t, sock, role)
+	case "serve":
+		l, err := net.FileListener(os.NewFile(3, "listener"))
+		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() {
-			_ = d.Process.Kill()
-			_ = d.Wait()
-		})
-		for i := 0; i < 250; i++ {
-			if data, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", d.Process.Pid)); strings.Contains(string(data), "sleep 60") {
-				break
+		go func() {
+			_ = http.Serve(l, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "OK") }))
+		}()
+	case "connect":
+		for _, path := range filepath.SplitList(sock) {
+			c, err := net.Dial("unix", path)
+			if err != nil {
+				t.Fatal(err)
 			}
-			time.Sleep(20 * time.Millisecond)
+			if _, err := c.Read(make([]byte, 1)); err != nil {
+				t.Fatal(err)
+			}
+			standInHeld = append(standInHeld, c)
 		}
-		return int32(d.Process.Pid)
+		if l := os.Getenv("CARGOWALL_TEST_LISTEN"); l != "" {
+			standInAccept(t, l, "listen")
+		}
+	default:
+		t.Fatalf("no role %q", role)
 	}
-	saved := containerdDefaults
-	t.Cleanup(func() { containerdDefaults = saved })
-	absent := filepath.Join(dir, "absent.sock")
-	dead := filepath.Join(dir, "dead.sock")
-	if err := os.WriteFile(dead, nil, 0o644); err != nil {
+	if err := os.WriteFile(ready, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	config := filepath.Join(dir, "daemon.json")
-	if err := os.WriteFile(config, []byte(`{"containerd":"unix://`+sock+`"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	noConfig := "--config-file=" + filepath.Join(dir, "none.json")
-	for _, c := range []struct {
-		name     string
-		defaults []string
-		flags    []string
-		want     int32 // 0 wants an error; -1 the stand-in dockerd itself
-	}{
-		{"a default that is there", []string{absent, sock}, []string{noConfig}, containerd},
-		{"--containerd, over the defaults", []string{dead}, []string{noConfig, "--containerd", sock}, containerd},
-		{"the daemon.json's containerd", []string{dead}, []string{"--config-file=" + config}, containerd},
-		{"a default that is there and does not answer", []string{dead, sock}, []string{noConfig}, 0},
-		{"a given address that does not answer", nil, []string{noConfig, "--containerd=" + absent}, 0},
-		{"none there", []string{absent}, []string{noConfig}, -1},
-		{"a relative daemon.json, against a working directory not followed", []string{sock}, []string{"--config-file=daemon.json"}, 0},
-		{"a relative containerd address", []string{sock}, []string{noConfig, "--containerd=run/containerd.sock"}, 0},
-	} {
-		containerdDefaults = c.defaults
-		pid := dockerd(c.flags...)
-		got, err := runtimePid(pid)
-		switch {
-		case c.want == 0 && err == nil:
-			t.Errorf("%s: runtimePid = %d, want an error", c.name, got)
-		case c.want == -1 && (err != nil || got != pid):
-			t.Errorf("%s: runtimePid = %d, %v; want the daemon's own %d", c.name, got, err, pid)
-		case c.want > 0 && (err != nil || got != c.want):
-			t.Errorf("%s: runtimePid = %d, %v; want containerd's %d", c.name, got, err, c.want)
-		}
-	}
+	select {}
 }
 
-// A dockerd command line gives the containerd address and daemon.json
-// path, as --flag=value or --flag value.
-func TestDockerdFlags(t *testing.T) {
-	for in, want := range map[string][2]string{
-		"dockerd\x00--host=unix:///var/run/docker.sock\x00":                      {"", defaultDaemonConfig},
-		"dockerd\x00--containerd=/run/k3s/containerd/containerd.sock\x00":        {"/run/k3s/containerd/containerd.sock", defaultDaemonConfig},
-		"dockerd\x00--containerd\x00unix:///x.sock\x00--config-file=/c.json\x00": {"/x.sock", "/c.json"},
-		"dockerd\x00--config-file\x00/d.json\x00":                                {"", "/d.json"},
-	} {
-		addr, config := dockerdFlags([]byte(in))
-		if addr != want[0] || config != want[1] {
-			t.Errorf("dockerdFlags(%q) = %q, %q; want %q, %q", in, addr, config, want[0], want[1])
-		}
-	}
-}
-
-// A socket systemd listens on was handed to the daemon it activated: its
-// child named dockerd. Any other listener is the daemon itself. Copies of
-// sh named systemd and dockerd stand in for both.
-func TestActivatedDaemon(t *testing.T) {
-	sh, err := exec.LookPath("sh")
-	if err != nil {
-		t.Skip("no sh")
-	}
-	data, err := os.ReadFile(sh)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	standIn := func(name string) string {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, data, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		return path
-	}
-	systemd, dockerd := standIn("systemd"), standIn("dockerd")
-	start := func(script string, args ...string) int32 {
-		cmd := exec.Command(systemd, append([]string{"-c", script + "; :", "systemd"}, args...)...)
-		if err := cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		})
-		return int32(cmd.Process.Pid)
-	}
-	activator := start(`"$1" -c 'sleep 60; :' & sleep 60`, dockerd)
-	var got int32
-	for i := 0; i < 250; i++ {
-		if got, err = activatedDaemon(filepath.Join(dir, "no.sock"), activator); err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err != nil || procfs.Comm(int(got)) != "dockerd" {
-		t.Errorf("activatedDaemon(systemd with a dockerd child) = %d, %v; want the child", got, err)
-	}
-	if got, err := activatedDaemon("", start("sleep 60")); err == nil {
-		t.Errorf("activatedDaemon(systemd with no dockerd child) = %d, want an error", got)
-	}
-	if got, err := activatedDaemon("", int32(os.Getpid())); err != nil || got != int32(os.Getpid()) {
-		t.Errorf("activatedDaemon(another listener) = %d, %v; want itself", got, err)
-	}
-}
-
-// TestRuntimeListener is TestRuntimePid's stand-in containerd; on its own
-// it skips.
-func TestRuntimeListener(t *testing.T) {
-	sock := os.Getenv("CARGOWALL_TEST_LISTEN")
-	if sock == "" {
-		t.Skip("run by TestRuntimePid")
-	}
+// standInAccept accepts connections at sock for TestStandIn, as role.
+func standInAccept(t *testing.T, sock, role string) {
 	l, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
-	for {
-		c, err := l.Accept()
-		if err != nil {
-			return
+	park, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			if _, err := c.Write([]byte("x")); err != nil {
+				t.Error(err)
+			}
+			switch role {
+			case "listen":
+				standInHeld = append(standInHeld, c)
+				continue
+			case "hide":
+				if err := parkConn(park[0], c); err != nil {
+					t.Error(err)
+				}
+			}
+			c.Close()
 		}
-		c.Close()
+	}()
+}
+
+// parkConn sends a descriptor for c in a message on sock, where it stays
+// in flight, unreceived: c's socket stays open, held by no process.
+func parkConn(sock int, c net.Conn) error {
+	f, err := c.(*net.UnixConn).File()
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return unix.Sendmsg(sock, []byte("x"), unix.UnixRights(int(f.Fd())), nil, 0)
+}
+
+// The daemon is whoever serves the socket, not whoever made its listener:
+// a socket-activated one was handed the listener by its service manager,
+// which keeps it but never accepts. Here this process makes the listener
+// and keeps it, and a stand-in, handed it, serves.
+func TestServingPid(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "docker.sock")
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: sock, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	f, err := l.File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := standIn(t, "anyname", "serve", nil, f)
+	f.Close()
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if listener, err := peerPid(conn.(*net.UnixConn)); err != nil || listener != int32(os.Getpid()) {
+		t.Fatalf("peerPid = %d, %v; want the listener's maker, this process %d", listener, err, os.Getpid())
+	}
+	if got, err := servingPid(conn.(*net.UnixConn)); err != nil || got != server {
+		t.Errorf("servingPid = %d, %v; want the stand-in serving it, %d", got, err, server)
+	}
+	if d := probeDockerd(sock); d.Kind != DockerdLocal || d.pid != server {
+		t.Errorf("probeDockerd = %+v, want the stand-in %d, local", d, server)
+	}
+}
+
+// The runtime is the containerd at the other end of a connection the
+// daemon made, whatever its flags or the sockets there would pick, and,
+// with the daemon in a network namespace of its own, the connection is
+// read in that one. Two refuse, and so does a connection whose other end
+// no process we see holds. A daemon connected to none runs one itself
+// where it serves the address it names (dockerd's embedded containerd);
+// one of another name that names none is its own runtime, and a dockerd
+// that names none, or names one another process serves, refuses.
+func TestRuntimePid(t *testing.T) {
+	listen := func(name, role string) (int32, string) {
+		sock := filepath.Join(t.TempDir(), name+".sock")
+		return standIn(t, name, role, []string{"CARGOWALL_TEST_SOCK=" + sock}), sock
+	}
+	daemon := func(name string, socks ...string) int32 { return standInDaemon(t, name, socks...) }
+	containerd, sock := listen("containerd", "listen")
+	_, otherSock := listen("containerd", "listen")
+	_, plugin := listen("plugin", "listen")
+	_, hidden := listen("containerd", "hide")
+	_, dropped := listen("containerd", "drop")
+	// A client of the daemon's own socket whose end no process holds is
+	// not a connection it made.
+	api := filepath.Join(t.TempDir(), "docker.sock")
+	serving := standIn(t, "dockerd", "connect", []string{"CARGOWALL_TEST_SOCK=" + sock, "CARGOWALL_TEST_LISTEN=" + api})
+	client, err := net.Dial("unix", api)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	park, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(park[0])
+	defer unix.Close(park[1])
+	if err := parkConn(park[0], client); err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+	// A dockerd connected to none, serving a containerd of its own.
+	embedded := filepath.Join(t.TempDir(), "containerd.sock")
+	embedding := standIn(t, "dockerd", "connect", []string{"CARGOWALL_TEST_SOCK=" + plugin, "CARGOWALL_TEST_LISTEN=" + embedded})
+	names := func(addr string) func() (string, error) { return func() (string, error) { return addr, nil } }
+	unread := func() (string, error) { return "", errors.New("GET /info: 503 Service Unavailable") }
+	for _, c := range []struct {
+		name  string
+		pid   int32
+		named func() (string, error)
+		want  int32 // 0 wants an error; -1 the daemon itself
+	}{
+		{"connected to containerd, and a plugin", daemon("dockerd", plugin, sock), unread, containerd},
+		{"connected to containerd, and to one that closed its end", daemon("dockerd", sock, dropped), unread, containerd},
+		{"connected to containerd, with a client no process holds", serving, unread, containerd},
+		{"connected to two", daemon("dockerd", sock, otherSock), names(""), 0},
+		{"connected to one whose end no process holds", daemon("dockerd", sock, hidden), names(""), 0},
+		{"connected to none, serving the one it names", embedding, names(embedded), -1},
+		{"connected to none, naming one it does not serve", daemon("dockerd", plugin), names(sock), 0},
+		{"connected to none, naming none", daemon("dockerd", plugin), names(""), 0},
+		{"connected to none, naming one unread", daemon("podman", plugin), unread, 0},
+		// From the daemon's working directory, which the probe does not
+		// follow; from its root it is the one it serves.
+		{"connected to none, naming one relative", embedding, names(strings.TrimPrefix(embedded, "/")), 0},
+		{"another name, connected to none, naming none", daemon("podman", plugin), names(""), -1},
+	} {
+		got, err := runtimePid(c.pid, c.named)
+		switch {
+		case c.want == 0 && err == nil:
+			t.Errorf("%s: runtimePid = %d, want an error", c.name, got)
+		case c.want == -1 && (err != nil || got != c.pid):
+			t.Errorf("%s: runtimePid = %d, %v; want the daemon itself, %d", c.name, got, err, c.pid)
+		case c.want > 0 && (err != nil || got != c.want):
+			t.Errorf("%s: runtimePid = %d, %v; want containerd's %d", c.name, got, err, c.want)
+		}
+	}
+	if os.Geteuid() != 0 {
+		return
+	}
+	netns := &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNET}
+	apart := standInWith(t, netns, "dockerd", "connect", []string{"CARGOWALL_TEST_SOCK=" + sock})
+	if got, err := runtimePid(apart, unread); err != nil || got != containerd {
+		t.Errorf("in a network namespace of its own: runtimePid = %d, %v; want containerd's %d", got, err, containerd)
+	}
+}
+
+// A daemon names its containerd's address in /info, without the scheme,
+// or none.
+func TestContainerdAddress(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"Containerd":{"Address":"/var/run/docker/containerd/containerd.sock","Namespaces":{"Containers":"moby"}}}`: "/var/run/docker/containerd/containerd.sock",
+		`{"Containerd":{"Address":"unix:///run/containerd/containerd.sock"}}`:                                        "/run/containerd/containerd.sock",
+		`{"CgroupDriver":"cgroupfs"}`: "",
+	} {
+		if got, err := containerdAddress(fakeDaemon(t, http.StatusOK, body)); err != nil || got != want {
+			t.Errorf("containerdAddress(%s) = %q, %v; want %q", body, got, err, want)
+		}
+	}
+	if got, err := containerdAddress(fakeDaemon(t, http.StatusInternalServerError, `{}`)); err == nil {
+		t.Errorf("containerdAddress(500) = %q, want an error", got)
 	}
 }
 

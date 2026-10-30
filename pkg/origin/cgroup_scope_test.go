@@ -461,6 +461,24 @@ func TestCgroupScopeWalkStopsOnClose(t *testing.T) {
 	require.Empty(t, ids, "a walk asked to stop records nothing")
 }
 
+// A failed walk recovers only once a walk reconciles again: one close cut
+// short does not.
+func TestCgroupScopeRewalkRecoversOnlyWhole(t *testing.T) {
+	ownCgroupBelowRoot(t)
+	ino, err := podenv.PidNamespaceInode()
+	require.NoError(t, err)
+	s := loadWalkScope(t, ino, 65536)
+	var log bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&log, nil))
+	s.stop = make(chan struct{})
+	close(s.stop)
+	require.Equal(t, "earlier", s.rewalk("earlier"))
+	require.NotContains(t, log.String(), "recovered", "a walk cut short shows no recovery")
+	s.stop = make(chan struct{})
+	require.Empty(t, s.rewalk("earlier"))
+	require.Contains(t, log.String(), "recovered", "a whole walk does")
+}
+
 // In a cgroup namespace rooted below the machine's, a cgroup outside the
 // root is beyond the hook, so the walk takes out any entry for it, whether
 // it lists the cgroup or only finds it in the scope. The outer test makes

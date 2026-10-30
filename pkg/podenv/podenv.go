@@ -32,6 +32,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -215,7 +216,12 @@ type Shape struct {
 	// InitCgroupReason why it is empty.
 	InitCgroup       string
 	InitCgroupReason string
-	Dockerd          Dockerd
+	// KubeletHosts is whether /etc/hosts is the one kubelet writes into
+	// every container of a pod, and KubeletHostsReason why it could not be
+	// read, which counts as kubelet's (inPod).
+	KubeletHosts       bool
+	KubeletHostsReason string
+	Dockerd            Dockerd
 	// DockerHost is the daemon the docker CLI is set to use, when it is not
 	// the probed socket, and DockerHostSetting what set it (DOCKER_HOST, or
 	// a docker context). The job's containers then belong to a daemon
@@ -280,14 +286,14 @@ func (s Shape) HookScope() (Scope, error) {
 	}
 	// /sys/fs/cgroup is the machine's root, which every pod and daemon on
 	// it shares.
-	kubepods := s.kubepods()
-	if scope, done, err := s.sharedPidNS(kubepods, "the host cgroup namespace", "the host"); done {
-		return scope, err // the host pid namespace outside kubelet's tree is machineFirewall
+	pod := s.inPod()
+	if scope, done, err := s.sharedPidNS(pod, "the host cgroup namespace", "the host"); done {
+		return scope, err // the host pid namespace outside a pod is machineFirewall
 	}
 	if err := s.partialRefusal(); err != nil {
 		return Scope{}, err
 	}
-	scope, err := s.limitedScope(kubepods)
+	scope, err := s.limitedScope(pod)
 	if err != nil {
 		return Scope{}, err
 	}
@@ -369,8 +375,8 @@ func (s Shape) privateScope() (Scope, error) {
 	if s.CgroupPath == "/" {
 		return Scope{}, nil
 	}
-	kubepods := s.kubepods()
-	if scope, done, err := s.sharedPidNS(kubepods, "a cgroup namespace rooted above our cgroup", "the node's"); done {
+	pod := s.inPod()
+	if scope, done, err := s.sharedPidNS(pod, "a cgroup namespace rooted above our cgroup", "the node's"); done {
 		return scope, err
 	}
 	// A tree with no task outside our pid namespace anywhere in it is our
@@ -378,24 +384,24 @@ func (s Shape) privateScope() (Scope, error) {
 	// entrypoint making room for nested cgroups, or systemd as its init),
 	// and the hook judges all of it, as at "/". A nested node always has
 	// some: its kubelet and runtime are outside every pod's pid namespace.
-	if !kubepods && s.CgroupTree == CgroupTreeOurs {
+	if !pod && s.CgroupTree == CgroupTreeOurs {
 		return Scope{}, nil
 	}
-	return s.limitedScope(kubepods)
+	return s.limitedScope(pod)
 }
 
 // sharedPidNS decides for every pid namespace but a private one, the same
 // wherever the hook sits: an unknown one refuses, and the host one judges
-// every socket under the attach point, unless in kubelet's tree, where
-// that is every pod on the node. done is false for a private one, which
+// every socket under the attach point, unless in a pod, where that is
+// every pod on the node. done is false for a private one, which
 // the caller decides. For the errors, in names the cgroup namespace we are
 // in, and whose the machine whose cgroup and pid namespaces we share.
-func (s Shape) sharedPidNS(kubepods bool, in, whose string) (scope Scope, done bool, err error) {
+func (s Shape) sharedPidNS(pod bool, in, whose string) (scope Scope, done bool, err error) {
 	switch s.PidNS {
 	case PidNSUnknown:
 		return Scope{}, true, fmt.Errorf("pid namespace unknown in %s (%s)", in, s.PidNSReason)
 	case PidNSHost:
-		if kubepods {
+		if pod {
 			return Scope{}, true, fmt.Errorf("running in a Kubernetes pod in %s cgroup and pid namespaces: "+
 				"the cgroup hook would attach at the node root and judge every pod on the node", whose)
 		}
@@ -423,6 +429,15 @@ func underRoot(path string) bool {
 	return path != "" && path != "/.." && !strings.HasPrefix(path, "/../")
 }
 
+// inPod reports whether we are in a Kubernetes pod: our cgroup is in
+// kubelet's tree (kubepods), or /etc/hosts is kubelet's, the one sign a
+// kubelet that makes no pod cgroups (cgroupsPerQOS=false) leaves. A pod is
+// judged whole, by its cgroup, which outside kubelet's tree no path shows,
+// so the hosts file alone, or one that could not be read, only refuses.
+func (s Shape) inPod() bool {
+	return s.kubepods() || s.KubeletHosts || s.KubeletHostsReason != ""
+}
+
 // kubepods reports whether our cgroup is in kubelet's tree, by a whole
 // path segment anywhere in the path: kubepods under the cgroupfs driver,
 // kubepods.slice under the systemd driver, or <root>-kubepods.slice with a
@@ -440,14 +455,14 @@ func (s Shape) kubepods() bool {
 }
 
 // limitedScope is the scope that judges only this job's sockets, with the
-// job's subtree: the pod's cgroup in kubelet's tree, our own cgroup
-// outside it.
-func (s Shape) limitedScope(kubepods bool) (Scope, error) {
+// job's subtree: the pod's cgroup in a pod, our own cgroup outside one.
+func (s Shape) limitedScope(pod bool) (Scope, error) {
 	sub := s.CgroupPath
-	if kubepods {
+	if pod {
 		if sub = podCgroup(s.CgroupPath); sub == "" {
-			return Scope{}, fmt.Errorf("in a Kubernetes pod whose cgroup is not in %s: the cgroup hook "+
-				"would not judge the pod's other containers", s.CgroupPath)
+			return Scope{}, fmt.Errorf("in a Kubernetes pod whose cgroup %s is in no pod cgroup of kubelet's "+
+				"(kubelet's /etc/hosts %v, %q): the cgroup hook would not judge the pod's other containers",
+				s.CgroupPath, s.KubeletHosts, s.KubeletHostsReason)
 		}
 	} else if CgroupLevel(s.CgroupPath) == 0 {
 		return Scope{}, errors.New("in the root cgroup outside the host pid namespace: no cgroup of this job's own " +
@@ -584,6 +599,33 @@ func socketCgroupsOf(st *btf.Struct) SocketCgroups {
 	return SocketCgroupsShared
 }
 
+// hostsFile is where kubelet puts the hosts file it writes for a pod, and
+// kubeletHosts how that file starts, on the pod's network or the node's.
+const (
+	hostsFile    = "/etc/hosts"
+	kubeletHosts = "# Kubernetes-managed hosts file"
+)
+
+// probeKubeletHosts reports whether the hosts file at path is kubelet's.
+// No file is not kubelet's, which writes one into every container.
+func probeKubeletHosts(path string) (bool, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	head := make([]byte, len(kubeletHosts))
+	if _, err := io.ReadFull(f, head); errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	return string(head) == kubeletHosts, nil
+}
+
 // podCgroupName matches the pod level of kubelet's tree: pod<uid> under the
 // cgroupfs driver, <parent>-pod<uid>.slice under the systemd driver, which
 // writes the uid's dashes as underscores. A uid is a UUID, or 32 hex
@@ -611,6 +653,7 @@ func (s Shape) LogArgs() []any {
 		"cgroup_mount", s.CgroupMount.String(), "cgroup_mount_reason", s.CgroupMountReason,
 		"pidns", s.PidNS.String(), "pidns_reason", s.PidNSReason,
 		"init_cgroup", s.InitCgroup, "init_cgroup_reason", s.InitCgroupReason,
+		"kubelet_hosts", s.KubeletHosts, "kubelet_hosts_reason", s.KubeletHostsReason,
 		"cgroup_tree", s.CgroupTree.String(), "cgroup_tree_reason", s.CgroupTreeReason,
 		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
 		"dockerd_cgroup", s.Dockerd.Cgroup, "dockerd_cgroup_driver", s.Dockerd.CgroupDriver,
@@ -653,22 +696,27 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 	} else {
 		s.PidNS = PidNSPrivate
 	}
+	if hosts, err := probeKubeletHosts(hostsFile); err != nil {
+		s.KubeletHostsReason = err.Error()
+	} else {
+		s.KubeletHosts = hosts
+	}
 	s.Dockerd = probeDockerd(dockerSocket)
 	// A private cgroup namespace's root bounds the hook, so where a daemon
 	// makes its containers, and who else is in the tree, matter there only.
 	private := egressHook && s.CgroupNS == CgroupNSPrivate
 	visible := s.Dockerd.Kind == DockerdLocal || s.Dockerd.Kind == DockerdForeign
 	if visible && (private || egressHook && s.PidNS == PidNSPrivate) {
-		s.Dockerd.probeRuntime()
+		s.Dockerd.probeRuntime(dockerSocket)
 	}
 	if private && visible {
 		s.Dockerd.probeContainerTree(dockerSocket)
 	}
-	if private && s.CgroupPath != "" && s.CgroupPath != "/" && s.PidNS == PidNSPrivate && !s.kubepods() {
+	if private && s.CgroupPath != "" && s.CgroupPath != "/" && s.PidNS == PidNSPrivate && !s.inPod() {
 		s.CgroupTree, s.CgroupTreeReason = probeCgroupTree(CgroupRoot)
 	} else {
 		s.CgroupTreeReason = "not probed: read only in a private cgroup namespace below its root, " +
-			"outside kubelet's tree, in a pid namespace of our own"
+			"outside a pod, in a pid namespace of our own"
 	}
 	if egressHook && s.PidNS == PidNSPrivate {
 		if path, err := ReadCgroupPath("/proc/1/cgroup"); err != nil {

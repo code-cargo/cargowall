@@ -19,6 +19,7 @@ package podenv
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -87,6 +88,8 @@ func TestHookScope(t *testing.T) {
 	nested := func(path string, pidns PidNS, d Dockerd) Shape {
 		return with(host(path, pidns, d), func(s *Shape) { s.CgroupNS = CgroupNSPrivate })
 	}
+	kubeletHosts := func(s *Shape) { s.KubeletHosts = true }
+	hostsUnread := func(s *Shape) { s.KubeletHostsReason = "open /etc/hosts: permission denied" }
 	remoteDaemon := func(s *Shape) { s.DockerHost, s.DockerHostSetting = "tcp://localhost:2376", "DOCKER_HOST" }
 	unreadContext := func(s *Shape) { s.DockerHostReason = `docker context "ci" (from DOCKER_CONTEXT): no such file` }
 	all := Scope{}
@@ -112,6 +115,15 @@ func TestHookScope(t *testing.T) {
 			Scope{Subtree: "/system.slice/docker-a.scope"},
 		},
 		{"own pid namespace in the root cgroup", host("/", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), false, all},
+		// A pod is judged whole, by its cgroup: one whose kubelet makes no
+		// pod cgroups (cgroupsPerQOS=false) shows only by its hosts file,
+		// and one whose hosts file could not be read cannot be shown not
+		// to be one.
+		{"privileged pod without pod cgroups", with(host("/system.slice/cri-containerd-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), kubeletHosts), false, all},
+		{"privileged container, hosts file unread", with(host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), hostsUnread), false, all},
+		{"hostPID pod without pod cgroups", with(host("/system.slice/cri-containerd-a.scope", PidNSHost, local), kubeletHosts), false, all},
+		{"nested node, pod without pod cgroups", with(with(nested("/system.slice/cri-containerd-a.scope", PidNSPrivate, local), tree(CgroupTreeOurs)), kubeletHosts), false, all},
+		{"ARC runner pod, kubelet's hosts file", with(host(pod, PidNSPrivate, foreign), kubeletHosts), true, inPod},
 		// A private cgroup namespace rooted above our cgroup is a tree others
 		// share: a nested node's (kind, minikube's docker driver), whose
 		// privileged pods share the node's namespace, or our container's
@@ -223,6 +235,33 @@ func TestHookScope(t *testing.T) {
 	_, err := Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied"}.HookScope()
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("unread cgroup path: HookScope() = %v, want the read error in it", err)
+	}
+}
+
+// kubelet's hosts file is told by how it starts, on the pod's network or
+// the node's; Docker's, or none, is not kubelet's.
+func TestProbeKubeletHosts(t *testing.T) {
+	dir := t.TempDir()
+	for content, want := range map[string]bool{
+		"# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n":               true,
+		"# Kubernetes-managed hosts file (host network).\n127.0.0.1 localhost\n": true,
+		"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n":      false,
+		"# Kubernetes": false,
+		"":             false,
+	} {
+		path := filepath.Join(dir, "hosts")
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := probeKubeletHosts(path); err != nil || got != want {
+			t.Errorf("probeKubeletHosts(%q) = %v, %v; want %v", content, got, err, want)
+		}
+	}
+	if got, err := probeKubeletHosts(filepath.Join(dir, "none")); err != nil || got {
+		t.Errorf("probeKubeletHosts(no file) = %v, %v; want false", got, err)
+	}
+	if _, err := probeKubeletHosts(dir); err == nil {
+		t.Errorf("probeKubeletHosts(a directory): want an error")
 	}
 }
 
@@ -572,8 +611,13 @@ func TestProbeDockerd_NotASocket(t *testing.T) {
 	}
 }
 
-// A listener in our own process shares our mount namespace: local.
+// A daemon in our own process shares our mount namespace: local. A
+// listener that accepts and does not answer serves nothing, and is
+// unidentified.
 func TestProbeDockerd_Local(t *testing.T) {
+	if d := probeDockerd(fakeDaemon(t, http.StatusOK, `{}`)); d.Kind != DockerdLocal || d.pid != int32(os.Getpid()) {
+		t.Errorf("local daemon: got %+v, want local, this process", d)
+	}
 	sock := filepath.Join(t.TempDir(), "docker.sock")
 	l, err := net.Listen("unix", sock)
 	if err != nil {
@@ -585,7 +629,7 @@ func TestProbeDockerd_Local(t *testing.T) {
 			c.Close()
 		}
 	}()
-	if d := probeDockerd(sock); d.Kind != DockerdLocal {
-		t.Fatalf("local listener: got %+v, want local", d)
+	if d := probeDockerd(sock); d.Kind != DockerdUnknown || !strings.Contains(d.Reason, "_ping") {
+		t.Errorf("silent listener: got %+v, want unknown, unanswered", d)
 	}
 }

@@ -18,10 +18,10 @@ package procfs
 
 import (
 	"os"
-	"os/exec"
 	"slices"
 	"testing"
-	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Note: none of these assume a process name is absent from the test's
@@ -80,26 +80,25 @@ func TestAncestorByComm(t *testing.T) {
 	}
 }
 
-func TestChildrenByComm(t *testing.T) {
-	cmd := exec.Command("sleep", "60")
-	if err := cmd.Start(); err != nil {
+// A socket is found by its inode among its holder's descriptors, and
+// among every process's, where both ends of a pair are ours.
+func TestSocketHolders(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
-	found := false
-	for i := 0; i < 250 && !found; i++ {
-		found = slices.Contains(ChildrenByComm(os.Getpid(), "sleep"), cmd.Process.Pid)
-		if !found {
-			time.Sleep(20 * time.Millisecond)
-		}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	var st unix.Stat_t
+	if err := unix.Fstat(fds[0], &st); err != nil {
+		t.Fatal(err)
 	}
-	if !found {
-		t.Errorf("ChildrenByComm(self, sleep) does not list our sleep %d", cmd.Process.Pid)
+	ours, err := Sockets(os.Getpid())
+	if err != nil || !slices.Contains(ours, st.Ino) {
+		t.Errorf("Sockets(self) = %v, %v; want it to hold %d", ours, err, st.Ino)
 	}
-	if got := ChildrenByComm(os.Getpid(), "no-such-comm-xx"); len(got) != 0 {
-		t.Errorf("ChildrenByComm(self, no-such-comm-xx) = %v", got)
+	holders, err := SocketHolders(map[uint64]bool{st.Ino: true, 1<<40 + 7: true})
+	if err != nil || !slices.Equal(holders[st.Ino], []int{os.Getpid()}) || len(holders) != 1 {
+		t.Errorf("SocketHolders = %v, %v; want only %d holding %d", holders, err, os.Getpid(), st.Ino)
 	}
 }

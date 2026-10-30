@@ -14,13 +14,15 @@
 
 //go:build linux
 
-// Package procfs reads a process's name and parents from /proc, for the
-// packages that walk or name processes: podenv, pkg/steps, pkg/containers
-// and cmd.
+// Package procfs reads a process's name, parents and sockets from /proc,
+// for the packages that walk or name processes: podenv, pkg/steps,
+// pkg/containers and cmd.
 package procfs
 
 import (
 	"bytes"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -95,14 +97,43 @@ func AncestorByComm(fromPid int, comms ...string) (pid int, comm string, ok bool
 	return 0, "", false
 }
 
-// ChildrenByComm is the processes whose parent is pid and whose comm is
-// comm, by a look over /proc.
-func ChildrenByComm(pid int, comm string) []int {
+// Sockets is the inodes of the sockets pid holds descriptors for, from
+// the links in /proc/<pid>/fd ("socket:[<inode>]"). A descriptor closed
+// during the look is passed over.
+func Sockets(pid int) ([]uint64, error) {
+	dir := "/proc/" + strconv.Itoa(pid) + "/fd"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var inodes []uint64
+	for _, e := range entries {
+		link, err := os.Readlink(dir + "/" + e.Name())
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if s, ok := strings.CutPrefix(link, "socket:["); ok {
+			if ino, err := strconv.ParseUint(strings.TrimSuffix(s, "]"), 10, 64); err == nil {
+				inodes = append(inodes, ino)
+			}
+		}
+	}
+	return inodes, nil
+}
+
+// SocketHolders is, for each socket inode in want, the processes holding a
+// descriptor for it, by a look over every process's descriptors. A process
+// gone during the look, or whose descriptors cannot be read, is passed
+// over, and a socket only it holds has no holder.
+func SocketHolders(want map[uint64]bool) (map[uint64][]int, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	var children []int
+	holders := map[uint64][]int{}
 	for _, e := range entries {
 		// A pid fits 32 bits (pid_max is at most 2^22), as callers that
 		// narrow it rely on.
@@ -110,11 +141,16 @@ func ChildrenByComm(pid int, comm string) []int {
 		if err != nil {
 			continue
 		}
-		if child := int(n); Comm(child) == comm {
-			if ppid, ok := ParentPid(child); ok && ppid == pid {
-				children = append(children, child)
+		pid := int(n)
+		inodes, err := Sockets(pid)
+		if err != nil {
+			continue
+		}
+		for _, ino := range inodes {
+			if want[ino] && !slices.Contains(holders[ino], pid) {
+				holders[ino] = append(holders[ino], pid)
 			}
 		}
 	}
-	return children
+	return holders, nil
 }

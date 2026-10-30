@@ -54,12 +54,10 @@ type redirectChain struct {
 
 // nftMsg is one nf_tables request on the redirect table's family. Every
 // request asks for an ack, which is how transact learns each one's fate.
-func nftMsg(msgType uint16, flags netlink.HeaderFlags, attrs func(ae *netlink.AttributeEncoder) error) (netlink.Message, error) {
+func nftMsg(msgType uint16, flags netlink.HeaderFlags, attrs func(ae *netlink.AttributeEncoder)) (netlink.Message, error) {
 	ae := netlink.NewAttributeEncoder()
 	ae.ByteOrder = binary.BigEndian // nf_tables attributes are network order
-	if err := attrs(ae); err != nil {
-		return netlink.Message{}, err
-	}
+	attrs(ae)
 	data, err := ae.Encode()
 	if err != nil {
 		return netlink.Message{}, err
@@ -74,23 +72,21 @@ func nftMsg(msgType uint16, flags netlink.HeaderFlags, attrs func(ae *netlink.At
 }
 
 func newTableMsg(flags uint32) (netlink.Message, error) {
-	return nftMsg(unix.NFT_MSG_NEWTABLE, netlink.Create, func(ae *netlink.AttributeEncoder) error {
+	return nftMsg(unix.NFT_MSG_NEWTABLE, netlink.Create, func(ae *netlink.AttributeEncoder) {
 		ae.String(unix.NFTA_TABLE_NAME, RedirectTable)
 		ae.Uint32(unix.NFTA_TABLE_FLAGS, flags)
-		return nil
 	})
 }
 
 func delTableMsg() (netlink.Message, error) {
-	return nftMsg(unix.NFT_MSG_DELTABLE, 0, func(ae *netlink.AttributeEncoder) error {
+	return nftMsg(unix.NFT_MSG_DELTABLE, 0, func(ae *netlink.AttributeEncoder) {
 		ae.String(unix.NFTA_TABLE_NAME, RedirectTable)
-		return nil
 	})
 }
 
 // chainMsgs is the chain followed by its rules, appended in order.
 func chainMsgs(c redirectChain) ([]netlink.Message, error) {
-	chain, err := nftMsg(unix.NFT_MSG_NEWCHAIN, netlink.Create, func(ae *netlink.AttributeEncoder) error {
+	chain, err := nftMsg(unix.NFT_MSG_NEWCHAIN, netlink.Create, func(ae *netlink.AttributeEncoder) {
 		ae.String(unix.NFTA_CHAIN_TABLE, RedirectTable)
 		ae.String(unix.NFTA_CHAIN_NAME, c.name)
 		ae.Nested(unix.NFTA_CHAIN_HOOK, func(hook *netlink.AttributeEncoder) error {
@@ -99,14 +95,13 @@ func chainMsgs(c redirectChain) ([]netlink.Message, error) {
 			return nil
 		})
 		ae.String(unix.NFTA_CHAIN_TYPE, c.kind)
-		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("chain %s: %w", c.name, err)
 	}
 	msgs := []netlink.Message{chain}
 	for i, exprs := range c.rules {
-		rule, err := nftMsg(unix.NFT_MSG_NEWRULE, netlink.Create|netlink.Append, func(ae *netlink.AttributeEncoder) error {
+		rule, err := nftMsg(unix.NFT_MSG_NEWRULE, netlink.Create|netlink.Append, func(ae *netlink.AttributeEncoder) {
 			ae.String(unix.NFTA_RULE_TABLE, RedirectTable)
 			ae.String(unix.NFTA_RULE_CHAIN, c.name)
 			ae.Nested(unix.NFTA_RULE_EXPRESSIONS, func(list *netlink.AttributeEncoder) error {
@@ -119,7 +114,6 @@ func chainMsgs(c redirectChain) ([]netlink.Message, error) {
 				}
 				return nil
 			})
-			return nil
 		})
 		if err != nil {
 			return nil, fmt.Errorf("chain %s rule %d: %w", c.name, i, err)

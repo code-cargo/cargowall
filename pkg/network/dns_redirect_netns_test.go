@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -284,6 +285,58 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 	require.NoError(t, err)
 	got, _ := received(t, l, absent)
 	require.Empty(t, got, "DNS arriving off a docker bridge must not be redirected")
+}
+
+// TestDNSRedirect_AheadOfHostNAT: DNS meets the redirect before the DNAT a
+// host nat table applies at dstnat, where Docker's published-port and
+// kube-proxy's service DNAT sit, whichever table registered first; the
+// proxy's own marked queries still get the host's DNAT.
+func TestDNSRedirect_AheadOfHostNAT(t *testing.T) {
+	enterNetns(t)
+	addTun(t, "cw0", net.IPv4(10, 53, 0, 1))
+	proxy := listenUDP(t, "127.0.0.1:53")
+	service := listenUDP(t, "127.0.0.2:53") // where the host's DNAT sends DNS
+	hostNAT := func() func() {
+		conn, err := nftables.New()
+		require.NoError(t, err)
+		table := conn.AddTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: "hostnat"})
+		chain := conn.AddChain(&nftables.Chain{
+			Name: "output", Table: table, Type: nftables.ChainTypeNAT,
+			Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityNATDest,
+		})
+		conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: slices.Concat(
+			l4proto(unix.IPPROTO_UDP), port(dstPort, 53), dnat(net.IPv4(127, 0, 0, 2).To4(), 53))})
+		require.NoError(t, conn.Flush())
+		return func() {
+			conn.DelTable(table)
+			require.NoError(t, conn.Flush())
+		}
+	}
+
+	for _, hostFirst := range []bool{true, false} {
+		var dropHost func()
+		if hostFirst {
+			dropHost = hostNAT()
+		}
+		r := NewDNSRedirect(discardLogger())
+		require.NoError(t, r.Install(""))
+		if !hostFirst {
+			dropHost = hostNAT()
+		}
+
+		query(t, "10.53.0.2:53", "job", false)
+		got, _ := received(t, proxy, arrives)
+		require.Equal(t, "job", got, "host table first: %v: the job's DNS must reach the proxy", hostFirst)
+		got, _ = received(t, service, absent)
+		require.Empty(t, got, "host table first: %v: the host's DNAT must not win", hostFirst)
+
+		query(t, "10.53.0.2:53", "upstream", true)
+		got, _ = received(t, service, arrives)
+		require.Equal(t, "upstream", got, "host table first: %v: the proxy's own query must get the host's DNAT", hostFirst)
+
+		require.NoError(t, r.Teardown())
+		dropHost()
+	}
 }
 
 // TestDNSRedirect_Ownership: the table belongs to the socket that made it.

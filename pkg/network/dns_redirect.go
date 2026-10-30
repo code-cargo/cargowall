@@ -65,13 +65,17 @@ func MarkDNSProxySocket(_, _ string, c syscall.RawConn) error {
 // socket that created it (see DNSRedirect).
 const RedirectTable = "cargowall"
 
-// Chain priorities, nft's dstnat and filter (NF_IP_PRI_NAT_DST and
-// NF_IP_PRI_FILTER), where iptables' nat and filter tables sit too. The
-// container redirect runs one ahead of dstnat, so ahead of Docker's own
-// PREROUTING DNAT for published ports: the first NAT binding a flow gets is
-// the one it keeps.
+// Chain priorities. Both nat chains run one ahead of dstnat
+// (NF_IP_PRI_NAT_DST), where iptables' nat table, and with it Docker's and
+// kube-proxy's DNAT, sit. The first NAT binding a flow gets is the one it
+// keeps, so DNS bound for a published container port or a service address
+// still reaches the proxy, and the proxy's own marked queries, which the
+// chain returns unbound, still get the host's DNAT after it. At the same
+// priority the order would hang on which table registered first, which
+// the kernel resolves newest first. The input guard filters at
+// NF_IP_PRI_FILTER; a drop anywhere is a drop, so its order is moot.
 const (
-	dstNATPriority = -100
+	natPriority    = -100 - 1
 	filterPriority = 0
 )
 
@@ -126,7 +130,7 @@ func redirectChains(bridgeIP net.IP) []redirectChain {
 		return slices.Concat(proto, iifname(expr.CmpOpNeq, "lo"), port(srcPort, 53), ctStateNew(), verdict(expr.VerdictDrop))
 	})
 	chains := []redirectChain{
-		{name: "output", kind: "nat", hook: unix.NF_INET_LOCAL_OUT, priority: dstNATPriority, rules: output},
+		{name: "output", kind: "nat", hook: unix.NF_INET_LOCAL_OUT, priority: natPriority, rules: output},
 		{name: "input", kind: "filter", hook: unix.NF_INET_LOCAL_IN, priority: filterPriority, rules: input},
 	}
 	if bridgeIP == nil {
@@ -139,7 +143,7 @@ func redirectChains(bridgeIP net.IP) []redirectChain {
 		})...)
 	}
 	return append(chains, redirectChain{
-		name: "prerouting", kind: "nat", hook: unix.NF_INET_PRE_ROUTING, priority: dstNATPriority - 1, rules: prerouting,
+		name: "prerouting", kind: "nat", hook: unix.NF_INET_PRE_ROUTING, priority: natPriority, rules: prerouting,
 	})
 }
 
@@ -326,19 +330,33 @@ func (r *DNSRedirect) commit(msgs []netlink.Message) error {
 	}
 	conn, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
 	if err != nil {
-		return fmt.Errorf("nftables: %w", err)
+		return fmt.Errorf("nftables: %w%s", err, installHint(err))
 	}
 	if err := transact(conn, msgs); err != nil {
 		_ = conn.Close()
-		if errors.Is(err, unix.EPERM) {
-			return fmt.Errorf("nftables: installing table ip %s: %w (another process owns the table, "+
-				"such as a cargowall already running in this network namespace, or CAP_NET_ADMIN is missing)",
-				RedirectTable, err)
-		}
-		return fmt.Errorf("nftables: installing table ip %s: %w", RedirectTable, err)
+		return fmt.Errorf("nftables: installing table ip %s: %w%s", RedirectTable, err, installHint(err))
 	}
 	r.conn = conn
 	return nil
+}
+
+// installHint names what an install error most likely means, since under
+// an enforcing policy it becomes the reason startup failed, and the bare
+// errno does not say which part of the kernel is missing.
+func installHint(err error) string {
+	switch {
+	case errors.Is(err, unix.EPERM):
+		return " (another process owns the table, such as a cargowall already running in this " +
+			"network namespace, or CAP_NET_ADMIN is missing)"
+	case errors.Is(err, unix.EPROTONOSUPPORT):
+		return " (the kernel has no nfnetlink: CONFIG_NETFILTER_NETLINK)"
+	case errors.Is(err, unix.EOPNOTSUPP):
+		return " (the kernel has no nf_tables, CONFIG_NF_TABLES, or cannot load it)"
+	case errors.Is(err, unix.ENOENT):
+		return " (the kernel lacks a part of nf_tables the redirect uses and cannot load it: " +
+			"the nat chain type, nft_chain_nat, or the nat, ct or meta expressions)"
+	}
+	return ""
 }
 
 // resolvedRuntimeDir exists only while systemd-resolved is running. Its

@@ -36,8 +36,7 @@ import (
 // redirect must already be up, so setup records the failure and settle
 // reports it.
 type dnsRedirect struct {
-	active bool
-	err    error // why setup failed
+	err error // why setup failed; nil when the redirect is in place
 }
 
 // startDNSRedirect installs the redirect for the proxy, and for its
@@ -52,7 +51,7 @@ type dnsRedirect struct {
 // meanwhile, and its teardown waits for the install to finish.
 func startDNSRedirect(bridgeIP, kernel string, teardowns *teardownList, logger *slog.Logger) (*dnsRedirect, func()) {
 	if ok, err := cargowallEbpf.KernelAtLeast(kernel, 5, 12); err != nil || !ok {
-		return &dnsRedirect{err: fmt.Errorf("kernel %s is older than 5.12, which the redirect's owned nftables table needs", kernel)}, func() {}
+		return notInstalled(fmt.Errorf("kernel %s is older than 5.12, which the redirect's owned nftables table needs", kernel), logger), func() {}
 	}
 	redirect := network.NewDNSRedirect(logger)
 	undo := teardowns.add(func() {
@@ -61,14 +60,23 @@ func startDNSRedirect(bridgeIP, kernel string, teardowns *teardownList, logger *
 		}
 	})
 	if err := redirect.Install(bridgeIP); err != nil {
-		return &dnsRedirect{err: err}, undo
+		return notInstalled(err, logger), undo
 	}
-	return &dnsRedirect{active: true}, undo
+	return &dnsRedirect{}, undo
+}
+
+// notInstalled records a redirect that did not come up, and says so in the
+// log where it happened. The posture line follows once the policy's mode
+// decides what the loss costs; logging only then would leave it out of a
+// startup that ends before, and out of order with the proxy's start.
+func notInstalled(err error, logger *slog.Logger) *dnsRedirect {
+	logger.Info("DNS redirect not installed; the policy's mode decides what that costs once it loads", "error", err)
+	return &dnsRedirect{err: err}
 }
 
 // isActive reports whether the redirect is in place. Nil-safe: nil is the
 // redirect not requested.
-func (r *dnsRedirect) isActive() bool { return r != nil && r.active }
+func (r *dnsRedirect) isActive() bool { return r != nil && r.err == nil }
 
 // settle hands a failed setup to the ledger, which owns the log line and
 // decides whether startup fails. Nil-safe.

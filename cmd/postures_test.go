@@ -188,7 +188,7 @@ func TestPostures_DNSRedirect(t *testing.T) {
 	assert.Empty(t, p.layers)
 
 	p, _ = ledger(&StartCmd{DNSRedirect: true}, true)
-	require.NoError(t, (&dnsRedirect{active: true}).settle(p))
+	require.NoError(t, (&dnsRedirect{}).settle(p))
 	require.NoError(t, (*dnsRedirect)(nil).settle(p), "nil is the redirect not requested")
 	assert.False(t, (*dnsRedirect)(nil).isActive())
 	assert.False(t, p.layers[0].degraded())

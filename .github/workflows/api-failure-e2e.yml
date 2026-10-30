@@ -41,6 +41,10 @@ on:
       # the legacy-clsact teardown these jobs protect lives in pkg/tc
       - "pkg/tc/**"
       - "bpf/**"
+      # the redirect's teardown proof, and the modules it is built on
+      - "scripts/ci/dns-redirect-gone.sh"
+      - "go.mod"
+      - "go.sum"
       - ".github/workflows/api-failure-e2e.yml"
   workflow_dispatch:
 

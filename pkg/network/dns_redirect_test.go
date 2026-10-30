@@ -19,11 +19,13 @@ package network
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -152,5 +154,23 @@ func TestFlushResolvedCache_Timeout(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("FlushResolvedCache did not honor its timeout")
+	}
+}
+
+// TestInstallHint: under an enforcing policy an install error is the reason
+// startup failed, so the errnos nf_tables answers with name what is missing.
+func TestInstallHint(t *testing.T) {
+	for errno, want := range map[unix.Errno]string{
+		unix.EPERM:           "another process owns the table",
+		unix.EPROTONOSUPPORT: "CONFIG_NETFILTER_NETLINK",
+		unix.EOPNOTSUPP:      "CONFIG_NF_TABLES",
+		unix.ENOENT:          "nft_chain_nat",
+	} {
+		if got := installHint(fmt.Errorf("netlink receive: %w", errno)); !strings.Contains(got, want) {
+			t.Errorf("installHint(%v) = %q, want it to name %q", errno, got, want)
+		}
+	}
+	if got := installHint(errors.New("other")); got != "" {
+		t.Errorf("installHint(other) = %q, want none", got)
 	}
 }

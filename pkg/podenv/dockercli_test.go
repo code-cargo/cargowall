@@ -104,31 +104,36 @@ func TestStartedBySudo(t *testing.T) {
 		return 0
 	}
 
-	env, err := startedBySudo(start(sudo, "sleep 60"), "1001")
+	env, err := startedBySudo(start(sudo, "sleep 60"), "1001", "")
 	if err != nil || env["DOCKER_HOST"] != "tcp://dind:2375" {
 		t.Errorf("under sudo: got %v, %v; want the stand-in sudo's environment", env, err)
 	}
-	env, err = startedBySudo(start(sudoRs, "sleep 60"), "1001")
+	env, err = startedBySudo(start(sudoRs, "sleep 60"), "1001", "")
 	if err != nil || env["DOCKER_HOST"] != "tcp://dind:2375" {
 		t.Errorf("under sudo-rs by its own name: got %v, %v; want its environment", env, err)
 	}
 	// A worker carrying our SUDO_UID was started under the runner's sudo,
 	// from which we inherited ours: our own environment is the job's.
-	underRunnerSudo := start(sudo, worker+" -c 'sleep 60; :'", "SUDO_UID=1001")
-	env, err = startedBySudo(underRunnerSudo, "1001")
+	underRunnerSudo := start(sudo, worker+" -c 'sleep 60; :'", "SUDO_UID=1001", "SUDO_COMMAND=/home/runner/run.sh")
+	env, err = startedBySudo(underRunnerSudo, "1001", "/home/runner/run.sh")
 	if err != nil || env != nil {
 		t.Errorf("under a worker a sudo started: got %v, %v; want our own environment (nil)", env, err)
 	}
+	// The same user's sudo between, exec'd in our place, leaves our
+	// SUDO_UID the worker's, but not our SUDO_COMMAND.
+	if _, err := startedBySudo(underRunnerSudo, "1001", "/usr/local/bin/cargowall start"); err == nil {
+		t.Errorf("under a worker, a sudo of the same user's between: want an error")
+	}
 	// A worker without it: a sudo between gave us ours and exec'd us in its
 	// place, leaving our environment its scrubbed one.
-	if _, err := startedBySudo(underRunnerSudo, "1002"); err == nil {
+	if _, err := startedBySudo(underRunnerSudo, "1002", "/home/runner/run.sh"); err == nil {
 		t.Errorf("under a worker with another SUDO_UID: want an error")
 	}
-	if _, err := startedBySudo(start(worker, "sleep 60"), "1001"); err == nil {
+	if _, err := startedBySudo(start(worker, "sleep 60"), "1001", ""); err == nil {
 		t.Errorf("under a worker with no SUDO_UID: want an error")
 	}
 	// Init has no parent, and is not sudo.
-	if _, err := startedBySudo(1, "1001"); err == nil {
+	if _, err := startedBySudo(1, "1001", ""); err == nil {
 		t.Errorf("startedBySudo(1): want an error, from no sudo among its parents")
 	}
 }

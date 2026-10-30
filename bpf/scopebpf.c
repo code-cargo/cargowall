@@ -92,12 +92,12 @@ struct {
 // entry by a task of ours does not record: it would judge that task until
 // the next walk took the cgroup out again, and an exec or a healthcheck
 // entering every few seconds would keep it judged. scope_leave marks a
-// recorded cgroup as it takes it out, and pkg/origin's walk marks each it
-// finds shared. The walk clears a mark once no task outside our pid
-// namespace is in the cgroup, recording it where a task of ours is, and
-// release forgets it. It holds only cgroups a task of ours met another in,
-// far fewer than the scope: a mark the map cannot take is counted, and
-// costs a recording the next walk takes out again.
+// recorded cgroup as it takes it out (1, held); pkg/origin's walk marks one
+// it finds shared, 2 if the scope never held it, which it forgets once no
+// task of ours is left. It clears a mark once no task outside our pid
+// namespace is in the cgroup, and release forgets it. It holds only
+// cgroups a task of ours met another in, far fewer than the scope: a mark
+// the map cannot take is counted, and costs a recording the walk undoes.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u64);

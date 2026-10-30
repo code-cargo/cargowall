@@ -236,15 +236,19 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	// A recorded cgroup that holds no task of ours, only another's, is
 	// taken out too, though the walk lists it nowhere: as one a task of
 	// ours entered beside the other and has since left. Every walk checks
-	// it: one that cannot read it leaves it, and the next takes it out.
+	// it, and one that cannot read it takes it out and marks it, as whether
+	// a task outside is in it is unknown.
 	theirs := filepath.Join(dir, "theirs")
 	theirsRel := strings.TrimPrefix(theirs, podenv.CgroupRoot)
 	require.NoError(t, s.cgroups().Put(idOf(theirs), uint8(1)))
 	restore = swap(t, &readThreads, failReading(idOf(theirs), syscall.EIO))
 	require.NoError(t, s.walk())
 	restore()
-	require.True(t, recorded(theirs), "a cgroup the walk cannot read stays as it was")
+	require.False(t, recorded(theirs), "a recorded cgroup the walk cannot read is taken out")
+	require.True(t, marked(theirs), "and marked")
 	require.Contains(t, log.String(), "cannot read a cgroup")
+	require.NoError(t, s.objs.MapScopeShared.Delete(idOf(theirs)))
+	require.NoError(t, s.cgroups().Put(idOf(theirs), uint8(1)))
 	require.NoError(t, s.walk())
 	require.False(t, recorded(theirs), "a recorded cgroup only another task is in")
 	var theirsLine string
@@ -272,7 +276,8 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	require.Error(t, s.objs.MapScopeShared.Lookup(idOf(theirs), &v), "a marked cgroup no task outside is in loses its mark")
 
 	// A read of the scope cut short still checks the cgroups it read, and
-	// is reported once, however many walks it fails.
+	// is reported once for each map it fails (both, here), however many
+	// walks it fails.
 	restore = swap(t, &scopeCgroups, func(*ebpf.Map) ([]uint64, error) {
 		return []uint64{idOf(theirs)}, ebpf.ErrIterationAborted
 	})
@@ -281,7 +286,7 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	require.NoError(t, s.walk())
 	restore()
 	require.False(t, recorded(theirs), "a cgroup the cut-short read reached")
-	require.Equal(t, 1, strings.Count(log.String(), "could not read all its cgroups"), "reported once")
+	require.Equal(t, 2, strings.Count(log.String(), "could not read all its cgroups"), "reported once a map")
 
 	// A recorded cgroup since removed needs nothing: its release takes it
 	// out, and the walk passes it over without a warning, and stops
@@ -641,13 +646,13 @@ func TestCgroupScopeClearMark(t *testing.T) {
 		})
 	}
 
-	s.mark(ownID, path)
+	s.mark(ownID, path, true)
 	looksRead("7\n")
 	s.clearMark(ownID, dir, path, true)
 	require.True(t, !marked() && recorded(), "a cgroup ours alone loses its mark and is recorded")
 
 	require.NoError(t, s.cgroups().Delete(ownID))
-	s.mark(ownID, path)
+	s.mark(ownID, path, true)
 	looksRead("7\n", "7\n0\n")
 	s.clearMark(ownID, dir, path, true)
 	require.True(t, marked() && !recorded(), "a task outside entering before record's second look takes it out and marks it")
@@ -661,7 +666,7 @@ func TestCgroupScopeClearMark(t *testing.T) {
 
 	// One a task of ours recorded meanwhile, beside it, is taken out and
 	// marked.
-	s.mark(ownID, path)
+	s.mark(ownID, path, true)
 	require.NoError(t, s.cgroups().Put(ownID, uint8(1)))
 	looksRead("", "7\n0\n")
 	s.clearMark(ownID, dir, path, true)
@@ -672,7 +677,7 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	// task outside entering between the look and the clearing marks it
 	// again and takes it out.
 	require.NoError(t, s.cgroups().Put(ownID, uint8(1)))
-	s.mark(ownID, path)
+	s.mark(ownID, path, true)
 	looksRead("7\n", "7\n0\n")
 	s.reconcileListed(ownID, &listed{tgids: map[uint32]bool{7: true}}, true)
 	require.True(t, marked() && !recorded(), "a listed cgroup unmarked while a task outside entered is marked again")
@@ -683,17 +688,27 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	s.clearMark(ownID, dir, path, true)
 	require.True(t, !marked() && recorded(), "a task of ours entering between the looks is recorded")
 	require.NoError(t, s.cgroups().Delete(ownID))
-	s.mark(ownID, path)
+	s.mark(ownID, path, true)
 
-	// A cgroup still shared with a task of ours there keeps its mark; one
-	// shared with none of ours loses it, which would otherwise never clear.
+	// A cgroup still shared with a task of ours there keeps its mark. One
+	// shared with none of ours keeps it too where the scope held it, so a
+	// task of ours entering again is not recorded beside the tasks outside;
+	// one marked by the walk but never held loses it, which would otherwise
+	// never clear. An unheld mark overwrites no held one.
 	looksRead("7\n0\n")
 	s.clearMark(ownID, dir, path, true)
 	require.True(t, marked(), "a cgroup still shared with ours keeps its mark")
 	looksRead("0\n")
 	s.clearMark(ownID, dir, path, true)
-	require.True(t, !marked() && !recorded(), "one shared with none of ours loses it")
-	s.mark(ownID, path)
+	require.True(t, marked() && !recorded(), "a held one shared with none of ours keeps it")
+	s.mark(ownID, path, false)
+	require.True(t, s.heldMark(ownID), "an unheld mark does not overwrite a held one")
+	s.forgetMark(ownID)
+	s.mark(ownID, path, false)
+	require.False(t, s.heldMark(ownID))
+	s.clearMark(ownID, dir, path, true)
+	require.True(t, !marked() && !recorded(), "an unheld one shared with none of ours loses it")
+	s.mark(ownID, path, true)
 
 	looksRead("7\n")
 	s.clearMark(ownID, dir, path, false)
@@ -707,7 +722,7 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	looksRead("0\n")
 	require.True(t, s.reconcileRecorded(map[uint64]*listed{}))
 	require.True(t, recorded() && !marked(), "a recorded cgroup under the subtree is not taken out")
-	s.mark(ownID, path)
+	s.mark(ownID, path, true)
 	looksRead("7\n")
 	s.reconcileMarked(map[uint64]*listed{}, map[uint64]bool{ownID: true})
 	require.True(t, marked(), "nor is a marked one's mark cleared")
@@ -735,7 +750,7 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	// A second look that cannot read the cgroup leaves it as it was, which
 	// judges no task outside: clearMark puts the mark back, and record
 	// takes out the entry it made and marks it. Both are reported.
-	s.mark(ownID, path)
+	s.mark(ownID, path, true)
 	looksRead("", syscall.EIO)
 	s.clearMark(ownID, dir, path, true)
 	require.True(t, marked() && !recorded(), "clearMark's unread second look puts the mark back")
@@ -748,9 +763,16 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	require.True(t, marked() && !recorded(), "record's unread second look takes the entry out and marks it")
 	require.Contains(t, log.String(), "cannot read a cgroup", "and reports it")
 
+	// A read of either map cut short is reported apart from the other's.
+	for range 2 {
+		s.cutShort(s.objs.MapScopeShared, syscall.EINTR)
+		s.cutShort(s.objs.MapScopeCgroups, syscall.EINTR)
+	}
+	require.Equal(t, 2, strings.Count(log.String(), "could not read all its cgroups"), "once for each map")
+
 	require.NoError(t, s.objs.MapScopeShared.Put(ownID, uint8(1)))
-	s.mark(ownID+1, "/full")
-	s.mark(ownID+1, "/full")
+	s.mark(ownID+1, "/full", true)
+	s.mark(ownID+1, "/full", true)
 	require.Equal(t, 1, strings.Count(log.String(), "could not mark a cgroup shared"), "a full mark map is reported once")
 }
 

@@ -306,7 +306,7 @@ func (s *cgroupScope) walk() error {
 func (s *cgroupScope) readMarks() map[uint64]bool {
 	ids, err := scopeCgroups(s.objs.MapScopeShared)
 	if err != nil {
-		s.cutShort(err)
+		s.cutShort(s.objs.MapScopeShared, err)
 	}
 	marked := make(map[uint64]bool, len(ids))
 	for _, id := range ids {
@@ -343,8 +343,8 @@ func (s *cgroupScope) reconcileMarked(tasks map[uint64]*listed, marked map[uint6
 }
 
 // clearMark clears the mark of the cgroup open at dir, id, if no task
-// outside our pid namespace is in it, and settles it (unmark), or if no
-// task of ours is (forgetMark): one a task
+// outside our pid namespace is in it, and settles it (unmark), or forgets
+// an unheld one no task of ours is in (forgetMark): one a task
 // of ours alone has entered since the listing, which scope_enter left out
 // for the mark, is recorded, as the listing would have, where the hook can
 // see it (inside).
@@ -358,35 +358,65 @@ func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside boo
 	case m.theirs && m.ours:
 		// Still shared, with a task of ours there: the mark stays.
 	case m.theirs:
-		// Shared with none of ours: the mark goes, as scope_leave marks
-		// only what the scope holds, and the mark of a cgroup that stays
-		// shared would never clear. A task of ours entering it is judged
-		// with it until a walk takes it out, as for any cgroup another task
-		// is already in.
-		s.forgetMark(id)
+		// Shared with none of ours: a mark the walk made of a cgroup the
+		// scope never held goes, or it would never clear (markUnheld); a
+		// held one stays, so that a task of ours entering again (an exec, a
+		// healthcheck) is not recorded beside the tasks outside.
+		if !s.heldMark(id) {
+			s.forgetMark(id)
+		}
 	default:
 		s.unmark(id, dir, path, inside)
 	}
 }
 
-// cutShort reports a read of the scope's maps that stopped early.
-func (s *cgroupScope) cutShort(err error) {
-	if s.warn(findUnlisted, 0) {
+// cutShort reports a read of one of the scope's maps, m, that stopped
+// early, each map's apart.
+func (s *cgroupScope) cutShort(m *ebpf.Map, err error) {
+	var id uint64
+	if m == s.objs.MapScopeShared {
+		id = 1
+	}
+	if s.warn(findUnlisted, id) {
 		s.logger.Warn("Container egress cgroup scope could not read all its cgroups, "+
-			"and those it missed stay as they are until a later walk", "error", err)
+			"and those it missed stay as they are until a later walk", "map", m.String(), "error", err)
 	}
 }
 
+// A shared mark's value (map_scope_shared): markHeld, as scope_leave
+// writes it, for a cgroup the scope held when it was found shared, which
+// stays marked for as long as a task outside is in it; markUnheld for one
+// the walk found shared with a task of ours in it, never in the scope,
+// which loses the mark once none of ours is left (clearMark). Such marks,
+// of node cgroups a runtime's exec stage has passed through, would
+// otherwise pile up, while held ones are only of cgroups this job entered.
+const (
+	markHeld   uint8 = 1
+	markUnheld uint8 = 2
+)
+
 // mark marks a cgroup shared, so that a task of ours entering it is not
-// recorded (scope_enter). A mark the map cannot take is reported (warn):
-// each entry of ours records the cgroup again until the next walk takes it
-// out.
-func (s *cgroupScope) mark(id uint64, path string) {
-	if err := s.objs.MapScopeShared.Put(id, uint8(1)); err != nil && s.warn(findUnmarked, id) {
+// recorded (scope_enter): held, if the scope held it, which no unheld mark
+// overwrites. A mark the map cannot take is reported (warn): each entry of
+// ours records the cgroup again until the next walk takes it out.
+func (s *cgroupScope) mark(id uint64, path string, held bool) {
+	value, flags := markUnheld, ebpf.UpdateNoExist
+	if held {
+		value, flags = markHeld, ebpf.UpdateAny
+	}
+	err := s.objs.MapScopeShared.Update(id, value, flags)
+	if err != nil && !errors.Is(err, ebpf.ErrKeyExist) && s.warn(findUnmarked, id) {
 		s.logger.Warn("Container egress cgroup scope could not mark a cgroup shared with tasks outside this job, "+
 			"which a task of this job entering it records again until the next walk", "cgroup", path, "cgroup_id", id, "error", err,
 			"capacity", s.objs.MapScopeShared.MaxEntries())
 	}
+}
+
+// heldMark reports whether a cgroup's shared mark stood for a cgroup the
+// scope held (markHeld), as every mark scope_leave makes does.
+func (s *cgroupScope) heldMark(id uint64) bool {
+	var v uint8
+	return s.objs.MapScopeShared.Lookup(id, &v) == nil && v != markUnheld
 }
 
 // unmark clears the shared mark of the cgroup open at dir, and settles it.
@@ -452,7 +482,7 @@ func (s *cgroupScope) reconcileListed(id uint64, l *listed, marked bool) {
 // and takes it out of the scope if a task outside our pid namespace is in
 // it (leave). ok is whether none is, and m then says whether a task of
 // ours is; gone, whether the cgroup has been removed. One that cannot be
-// read is reported.
+// read is kept out of the scope (unreadable).
 func (s *cgroupScope) look(id uint64, dir *os.File, path string) (m members, ok, gone bool) {
 	m, err := cgroupMembers(dir)
 	switch {
@@ -466,8 +496,9 @@ func (s *cgroupScope) look(id uint64, dir *os.File, path string) (m members, ok,
 	return m, true, false
 }
 
-// open opens cgroup id for a pass of the walk, reporting one it cannot
-// open; gone says the cgroup has been removed, which needs no report.
+// open opens cgroup id for a pass of the walk; one it cannot open is kept
+// out of the scope (unreadable). gone says the cgroup has been removed,
+// which needs nothing.
 func (s *cgroupScope) open(id uint64) (dir *os.File, path string, inside, gone bool) {
 	dir, path, inside, err := s.openCgroup(id)
 	if err != nil {
@@ -477,15 +508,22 @@ func (s *cgroupScope) open(id uint64) (dir *os.File, path string, inside, gone b
 	return dir, path, inside, false
 }
 
-// unreadable reports a cgroup the walk could not open or read, which stays
-// as it was, unless it has been removed, which needs nothing: no task can
-// enter it again, and its release takes it out of the scope.
+// unreadable keeps a cgroup the walk could not open or read out of the
+// scope, as settle does, since whether a task outside is in it is unknown:
+// one recorded is marked and taken out, and one marked keeps its mark. It
+// is reported. One removed needs nothing: no task can enter it again, and
+// its release takes it out of the scope.
 func (s *cgroupScope) unreadable(id uint64, path string, err error) {
 	if cgroupGone(err) {
 		return
 	}
+	if s.recorded(id) {
+		s.mark(id, path, true)
+		_ = s.objs.MapScopeCgroups.Delete(id)
+	}
 	if s.warn(findUnreadable, id) {
-		s.logger.Warn("Container egress cgroup scope cannot read a cgroup of this job's, and leaves it as it is",
+		s.logger.Warn("Container egress cgroup scope cannot read a cgroup of this job's, and keeps it out of "+
+			"the scope until a walk can: sockets of this job there pass the cgroup hook",
 			"cgroup", path, "cgroup_id", id, "error", err)
 	}
 }
@@ -503,7 +541,7 @@ func (s *cgroupScope) unreadable(id uint64, path string, err error) {
 func (s *cgroupScope) reconcileRecorded(tasks map[uint64]*listed) bool {
 	ids, err := scopeCgroups(s.objs.MapScopeCgroups)
 	if err != nil {
-		s.cutShort(err)
+		s.cutShort(s.objs.MapScopeCgroups, err)
 	} else {
 		inMap := make(map[uint64]bool, len(ids))
 		for _, id := range ids {
@@ -714,8 +752,7 @@ func (s *cgroupScope) settle(id uint64, dir *os.File, path string, inside, made 
 			}
 			return
 		case err != nil:
-			s.mark(id, path)
-			_ = s.objs.MapScopeCgroups.Delete(id)
+			s.mark(id, path, true)
 			s.unreadable(id, path, err)
 			return
 		case m.theirs:
@@ -728,7 +765,7 @@ func (s *cgroupScope) settle(id uint64, dir *os.File, path string, inside, made 
 			// keeps entering between the put and the look. The mark keeps
 			// the cgroup out, judging no task outside, until a walk finds
 			// it settled.
-			s.mark(id, path)
+			s.mark(id, path, true)
 			return
 		}
 		var ok bool
@@ -751,10 +788,11 @@ const settleLooks = 3
 // runtime's exec stage listed in the runtime's cgroup has moved on). Logged
 // at most once in warnEvery (warn) for as long as it stays shared.
 func (s *cgroupScope) leave(id uint64, path string, ours bool) {
-	if !ours && !s.recorded(id) {
+	held := s.recorded(id)
+	if !ours && !held {
 		return
 	}
-	s.mark(id, path)
+	s.mark(id, path, held)
 	err := s.objs.MapScopeCgroups.Delete(id)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		if s.warn(findUnremoved, id) {

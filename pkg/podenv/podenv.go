@@ -816,12 +816,15 @@ func (c CgroupTree) String() string {
 
 // ThreadsMembers reads a cgroup.threads, which numbers each task as the
 // reader's pid namespace does, for whether it lists tasks of that
-// namespace (by their ids) and tasks outside it (as 0).
+// namespace (by their ids) and tasks outside it (as 0), stopping once it
+// has found both.
 func ThreadsMembers(data []byte) (ours, theirs bool) {
-	for _, line := range strings.Split(string(data), "\n") {
-		switch line {
-		case "":
-		case "0":
+	for len(data) > 0 && !(ours && theirs) {
+		var line []byte
+		line, data, _ = bytes.Cut(data, []byte{'\n'})
+		switch {
+		case len(line) == 0:
+		case len(line) == 1 && line[0] == '0':
 			theirs = true
 		default:
 			ours = true

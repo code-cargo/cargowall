@@ -55,7 +55,7 @@ func dockerEnv() (getenv func(string) string, uid string, err error) {
 	if uid == "" {
 		return os.Getenv, "", nil
 	}
-	env, err := startedBySudo(os.Getppid(), uid)
+	env, err := startedBySudo(os.Getppid(), uid, os.Getenv("SUDO_COMMAND"))
 	if err != nil {
 		return nil, "", fmt.Errorf("started under sudo, whose environment, the job's, cannot be read: %w", err)
 	}
@@ -65,22 +65,25 @@ func dockerEnv() (getenv func(string) string, uid string, err error) {
 	return func(k string) string { return env[k] }, uid, nil
 }
 
-// startedBySudo reads the environment of the sudo that started us, whose
-// SUDO_UID, uid, we carry: the nearest process named sudo (sudoComms) from
-// pid up, through any process between, as a shell sudo ran. The walk stops at the
-// runner's worker, whose step started us. Carrying our SUDO_UID itself,
-// the worker was started under a sudo above it, the runner's (sudo
-// ./run.sh), from which we inherited ours, and our environment is the
-// job's: that is nil, no error. Without it, a sudo between gave us ours
-// and has gone from the chain, having exec'd us in its own place, and our
-// environment is the one it scrubbed: unknown. So is one with neither to
-// find, as for a process started detached (by setsid, or in the
-// background of a shell that has since exited), which init has adopted.
 // sudoComms are the names sudo runs under: its own, and sudo-rs's, which
 // Ubuntu installs as sudo and which may be run by its own name too.
 var sudoComms = []string{"sudo", "sudo-rs"}
 
-func startedBySudo(pid int, uid string) (map[string]string, error) {
+// startedBySudo reads the environment of the sudo that started us, whose
+// SUDO_UID and SUDO_COMMAND, uid and command, we carry: the nearest process
+// named sudo (sudoComms) from pid up, through any process between, as a
+// shell sudo ran. The walk stops at the runner's worker, whose step
+// started us. Carrying our SUDO_UID and SUDO_COMMAND itself, the worker was
+// started under a sudo above it, the runner's (sudo ./run.sh), from which
+// we inherited both, and our environment is the job's: that is nil, no
+// error. Without them, a sudo between gave us ours and has gone from the
+// chain, having exec'd us in its own place, and our environment is the one
+// it scrubbed: unknown. The command tells such a sudo from the runner's
+// even when one user ran both, which the uid cannot. A process with
+// neither to find is unknown too, as one started detached (by setsid, or
+// in the background of a shell that has since exited), which init has
+// adopted.
+func startedBySudo(pid int, uid, command string) (map[string]string, error) {
 	found, comm, ok := procfs.AncestorByComm(pid, append([]string{procfs.RunnerWorkerComm}, sudoComms...)...)
 	if !ok {
 		return nil, errors.New("no sudo among cargowall's parents")
@@ -91,9 +94,9 @@ func startedBySudo(pid int, uid string) (map[string]string, error) {
 	}
 	env := parseEnviron(data)
 	if comm == procfs.RunnerWorkerComm {
-		if env["SUDO_UID"] != uid {
-			return nil, fmt.Errorf("no sudo between the runner's worker (pid %d), which has no SUDO_UID %s, and us: "+
-				"one exec'd us in its place", found, uid)
+		if env["SUDO_UID"] != uid || env["SUDO_COMMAND"] != command {
+			return nil, fmt.Errorf("no sudo between the runner's worker (pid %d), whose SUDO_UID and SUDO_COMMAND "+
+				"are not our %s and %q, and us: one exec'd us in its place", found, uid, command)
 		}
 		return nil, nil
 	}

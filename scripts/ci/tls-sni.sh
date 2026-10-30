@@ -87,17 +87,29 @@ verify_http() {
   echo "✅ Host $DENIED to $ip:80 dropped"
 }
 
+# container_probe presents a name to the edge address from a container
+# (--add-host, so no lookup of it) and prints REACHED when any HTTP response
+# came back, BLOCKED when none did. wget exits non-zero on an error status
+# too, so its exit code cannot tell a drop from a 4xx; -S prints the status
+# line whenever there is one.
+container_probe() {
+  local name=$1 ip=$2
+  docker run --rm --add-host "$name:$ip" alpine:latest sh -c \
+    "if wget -S -O /dev/null --timeout=8 --no-check-certificate https://$name/ 2>&1 | grep -q 'HTTP/'; then echo REACHED; else echo BLOCKED; fi" 2>&1 || true
+}
+
 # Container traffic meets the same hook in its own netns, before NAT.
-# --add-host makes the container present $DENIED to the edge address
-# without any lookup of it.
 verify_container() {
   step "Container: an unlisted SNI to an allowed address is dropped"
-  local ip result
+  local ip
   ip=$(edge_ip)
   docker pull -q alpine:latest > /dev/null
-  result=$(docker run --rm --add-host "$DENIED:$ip" alpine:latest sh -c \
-    "wget -q -O /dev/null --timeout=8 --no-check-certificate https://$DENIED/ && echo REACHED || echo BLOCKED" 2>&1) || true
-  if echo "$result" | grep -q REACHED; then
+  if ! container_probe "$ALLOWED" "$ip" | grep -q REACHED; then
+    echo "❌ Container got no response from $ip presenting $ALLOWED; the control must pass"
+    return 1
+  fi
+  echo "✅ Container's SNI $ALLOWED to $ip answered"
+  if ! container_probe "$DENIED" "$ip" | grep -q BLOCKED; then
     echo "❌ Container reached $ip presenting $DENIED"
     return 1
   fi
@@ -119,11 +131,24 @@ verify_events() {
     fi
   done
 
-  # Enforce reports drops, never would-blocks, and never refuses the allowed
-  # name it was handed.
-  n=$(jq -s '[.[] | select(.event_type == "l7_would_block")] | length' "$AUDIT_LOG")
-  echo "l7_would_block (expected 0 in enforce): $n"
+  # The container's drop must be its own record, carrying its identity — the
+  # host probe's record alone satisfies the count above.
+  n=$(jq -s --arg name "$DENIED" \
+    '[.[] | select(.event_type == "l7_blocked" and .l7_name == $name and .l7_protocol == "tls" and (.container_id // "") != "")] | length' "$AUDIT_LOG")
+  echo "container-attributed l7_blocked tls $DENIED: $n"
+  if [ "$n" -eq 0 ]; then
+    echo "❌ The container's drop produced no container-attributed l7_blocked record"
+    valid=false
+  fi
+
+  # The refused name is dropped, never merely reported. (Other would-blocks
+  # are legitimate under enforce: an allowed name at an address it was not
+  # seen resolving to passes and is reported as one.)
+  n=$(jq -s --arg name "$DENIED" '[.[] | select(.event_type == "l7_would_block" and .l7_name == $name)] | length' "$AUDIT_LOG")
+  echo "l7_would_block $DENIED (expected 0 in enforce): $n"
   [ "$n" -eq 0 ] || valid=false
+
+  # Enforce never drops an allowed name.
   n=$(jq -s '[.[] | select((.event_type == "l7_blocked") and ((.l7_name // "") | test("githubusercontent|github\\.com")))] | length' "$AUDIT_LOG")
   echo "l7_blocked on allowed names (expected 0): $n"
   [ "$n" -eq 0 ] || valid=false

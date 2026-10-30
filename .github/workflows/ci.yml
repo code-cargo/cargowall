@@ -51,7 +51,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+      - uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           mode: audit
           offline: ${{ env.CW_OFFLINE }}
@@ -93,7 +93,7 @@ jobs:
       id-token: write
       checks: write
     steps:
-      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+      - uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           mode: audit
           offline: ${{ env.CW_OFFLINE }}
@@ -141,7 +141,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+      - uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           mode: audit
           offline: ${{ env.CW_OFFLINE }}
@@ -195,7 +195,7 @@ jobs:
         run: bash scripts/ci/enforce.sh warm-resolver
 
       - name: Start CargoWall via Action
-        uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+        uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         env:
           # 3a telemetry: per-program overhead numbers (cg_origin_egress vs
           # the tc_egress baseline) land in the daemon's shutdown log during
@@ -283,15 +283,14 @@ jobs:
         run: bash scripts/ci/cgroup-enforce.sh pre
 
       - name: Start CargoWall with cgroup enforcement (issue #106 phase 3b)
-        uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
-        env:
+        uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
+        with:
+          mode: enforce
           # The whole point of this job: the root-cgroup hook is
           # authoritative for traffic with a local socket (pre-NAT, socket
           # context), with TC egress still attached as the fail-closed
           # backstop for everything else.
-          CARGOWALL_CONTAINER_EGRESS: 'enforce'
-        with:
-          mode: enforce
+          container-egress: enforce
           offline: 'true'
           allowed-hosts: |
              docker.io
@@ -302,6 +301,49 @@ jobs:
 
       - name: Verify cgroup enforcement
         run: bash scripts/ci/cgroup-enforce.sh verify
+
+  test-cargowall-tls-sni:
+    name: Integration Test (TLS SNI Enforce)
+    needs: build-binary
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
+
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
+
+      - name: Start CargoWall with L7 (SNI/Host) enforcement
+        uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
+        with:
+          mode: enforce
+          # L7 rides the cgroup hook, and its enforce rungs require the hook
+          # itself to enforce.
+          container-egress: enforce
+          tls-sni: enforce
+          offline: 'true'
+          allowed-hosts: |
+             docker.io
+             docker.com
+             **.githubusercontent.com
+          binary-path: ./bin/cargowall
+          debug: true
+
+      # The job body lives in scripts/ci/tls-sni.sh; this YAML is wiring.
+      - name: Verify L7 enforcement
+        run: bash scripts/ci/tls-sni.sh verify
 
   test-cargowall-audit:
     name: Integration Test (Audit Mode)
@@ -327,7 +369,7 @@ jobs:
         run: chmod +x bin/cargowall
 
       - name: Start CargoWall via Action
-        uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+        uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           mode: audit
           offline: 'true'
@@ -613,6 +655,6 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
-      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+      - uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           binary-path: ./bin/cargowall

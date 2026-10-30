@@ -726,6 +726,21 @@ func TestVerdictParityWithTcEgress(t *testing.T) {
 		TcBpfPortKey{Ip: ipToU32("10.1.2.3"), Port: 8443, Proto: ipprotoTCP},
 		TcBpfPortVal{Action: 1},
 	))
+	// Port-specific subnets, keyed as the firewall writes them: the verdict
+	// masks the destination down to the matched rule's network address.
+	require.NoError(t, tcObjs.MapCidrs.Put(
+		TcBpfLpmKey{Prefixlen: 16, Ip: ipToU32("10.2.0.0")},
+		TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 16},
+	))
+	require.NoError(t, tcObjs.MapPorts.Put(
+		TcBpfPortKey{Ip: ipToU32("10.2.0.0"), Port: 8443, Proto: ipprotoTCP, HostBits: 16},
+		TcBpfPortVal{Action: 1},
+	))
+	subnet6 := TcBpfLpmKeyV6{Prefixlen: 48}
+	copy(subnet6.Ip[:], net.ParseIP("2001:db8:5::").To16())
+	require.NoError(t, tcObjs.MapCidrsV6.Put(subnet6, TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 80}))
+	port6 := TcBpfPortKeyV6{Ip: subnet6.Ip, Port: 8443, Proto: ipprotoTCP, HostBits: 80}
+	require.NoError(t, tcObjs.MapPortsV6.Put(port6, TcBpfPortVal{Action: 1}))
 	require.NoError(t, originObjs.MapOriginConfig.Put(uint32(0), uint8(originModeEnforce)))
 
 	cases := []struct {
@@ -737,6 +752,10 @@ func TestVerdictParityWithTcEgress(t *testing.T) {
 		{"outside the /24", craftIPv4TCP(t, "140.82.115.3", 443)},
 		{"port-specific allowed port", craftIPv4TCP(t, "10.1.2.3", 8443)},
 		{"port-specific other port", craftIPv4TCP(t, "10.1.2.3", 443)},
+		{"port-specific subnet member, allowed port", craftIPv4TCP(t, "10.2.200.7", 8443)},
+		{"port-specific subnet member, other port", craftIPv4TCP(t, "10.2.200.7", 443)},
+		{"IPv6 port-specific subnet member, allowed port", craftIPv6TCP(t, "2001:db8:5:1::7", 8443)},
+		{"IPv6 port-specific subnet member, other port", craftIPv6TCP(t, "2001:db8:5:1::7", 443)},
 		{"unmatched, default deny", craftIPv4TCP(t, "93.184.216.34", 80)},
 
 		// Parse coverage: the two hooks keep SEPARATE parsers (TC starts at

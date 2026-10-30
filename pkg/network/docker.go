@@ -17,20 +17,52 @@
 package network
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
 
-const (
-	dockerDaemonConfigPath   = "/etc/docker/daemon.json"
-	dockerDaemonConfigBackup = "/etc/docker/daemon.json.cargowall.bak"
-)
+// daemonConfig is the daemon.json rewrite and its undo. The paths and the
+// reload are fields so the crash and failure paths can be driven against a
+// temp dir.
+//
+// Three records sit beside daemon.json while it is rewritten: the original
+// (backup) or the fact there was none (absent), and the exact bytes the
+// rewrite wrote (rewrite). A record is acted on only while daemon.json still
+// holds those bytes: anything else is the original (a crash before the
+// rewrite landed) or a file someone has changed since, and is not ours to
+// replace or delete.
+type daemonConfig struct {
+	path    string // daemon.json
+	backup  string // the original, when there was one
+	absent  string // marker recording that there was no original
+	rewrite string // the bytes the rewrite wrote
+	reload  func(*slog.Logger) error
+
+	// mu serializes configure and restore: the undo is registered before
+	// configure, and a second signal runs it on another goroutine.
+	mu sync.Mutex
+	// restored is set by the first restore, so a configure the undo has
+	// already overtaken does not rewrite what nothing will then undo.
+	restored bool
+}
+
+var dockerDaemonConfig = &daemonConfig{
+	path:    "/etc/docker/daemon.json",
+	backup:  "/etc/docker/daemon.json.cargowall.bak",
+	absent:  "/etc/docker/daemon.json.cargowall.absent",
+	rewrite: "/etc/docker/daemon.json.cargowall.rewrite",
+	reload:  reloadDockerDaemon,
+}
 
 // GetDockerBridgeIP returns the IP address of the docker0 bridge interface.
 // This is typically 172.17.0.1 and is used as the gateway for Docker containers.
@@ -84,40 +116,74 @@ func dockerBridgeIPNet() (*net.IPNet, error) {
 // This modifies /etc/docker/daemon.json. A full Docker restart via
 // RestartDockerDaemon is required for the changes to take effect.
 func ConfigureDockerDNS(dnsIP string, logger *slog.Logger) error {
+	return dockerDaemonConfig.configure(dnsIP, logger)
+}
+
+// RestoreDockerDNS restores the original Docker daemon configuration. It is
+// safe whether or not ConfigureDockerDNS ran or got as far as the rewrite:
+// with nothing recorded, daemon.json is left alone.
+func RestoreDockerDNS(logger *slog.Logger) error {
+	return dockerDaemonConfig.restore(logger)
+}
+
+// configure records the original before touching it — the backup, or the
+// absent marker when there was no daemon.json — then the bytes it is about
+// to write, and refuses to rewrite without those records, since restore can
+// put back only what was recorded. Records a run left without restoring are
+// settled first: they hold the real original, and recording over them would
+// save that run's rewrite as the original instead.
+func (c *daemonConfig) configure(dnsIP string, logger *slog.Logger) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.restored {
+		return errors.New("daemon.json already restored; teardown has begun")
+	}
 	logger.Info("Configuring Docker DNS", "dns", dnsIP)
 
-	// Read existing config if it exists
-	var existingConfig map[string]interface{}
-	if data, err := os.ReadFile(dockerDaemonConfigPath); err == nil {
+	recovered, err := c.restoreFiles(logger)
+	if err != nil {
+		return fmt.Errorf("undo the daemon.json rewrite a previous run left: %w", err)
+	}
+	if recovered {
+		logger.Warn("Restored daemon.json left rewritten by a previous run that did not shut down cleanly")
+	}
+
+	existingConfig := make(map[string]any)
+	data, err := os.ReadFile(c.path)
+	switch {
+	case err == nil:
+		if err := writeFileReplace(c.backup, data, 0o600); err != nil {
+			return fmt.Errorf("failed to back up daemon.json: %w", err)
+		}
+		logger.Debug("Backed up existing daemon.json", "path", c.backup)
 		if err := json.Unmarshal(data, &existingConfig); err != nil {
 			logger.Warn("Failed to parse existing daemon.json, will overwrite", "error", err)
-			existingConfig = make(map[string]interface{})
+			existingConfig = make(map[string]any)
+		} else if existingConfig == nil {
+			existingConfig = make(map[string]any) // the body was JSON null
 		}
-
-		// Backup existing config
-		if err := os.WriteFile(dockerDaemonConfigBackup, data, 0o644); err != nil {
-			logger.Warn("Failed to backup daemon.json", "error", err)
-		} else {
-			logger.Debug("Backed up existing daemon.json", "path", dockerDaemonConfigBackup)
+	case errors.Is(err, os.ErrNotExist):
+		if err := writeFileReplace(c.absent, nil, 0o600); err != nil {
+			return fmt.Errorf("failed to record that daemon.json did not exist: %w", err)
 		}
-	} else {
-		existingConfig = make(map[string]interface{})
+	default:
+		return fmt.Errorf("failed to read daemon.json: %w", err)
 	}
 
 	// Set DNS to point to cargowall
 	existingConfig["dns"] = []string{dnsIP}
 
-	// Write updated config
-	data, err := json.MarshalIndent(existingConfig, "", "  ")
+	data, err = json.MarshalIndent(existingConfig, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal daemon.json: %w", err)
 	}
-
-	if err := os.WriteFile(dockerDaemonConfigPath, data, 0o644); err != nil {
+	if err := writeFileReplace(c.rewrite, data, 0o600); err != nil {
+		return fmt.Errorf("failed to record the daemon.json rewrite: %w", err)
+	}
+	if err := writeFileReplace(c.path, data, 0o644); err != nil {
 		return fmt.Errorf("failed to write daemon.json: %w", err)
 	}
-
-	logger.Debug("Wrote Docker daemon config", "path", dockerDaemonConfigPath)
+	logger.Debug("Wrote Docker daemon config", "path", c.path)
 
 	// NOTE: Docker's SIGHUP handler does NOT reload DNS settings.
 	// A full Docker restart is required for DNS changes to take effect.
@@ -128,38 +194,155 @@ func ConfigureDockerDNS(dnsIP string, logger *slog.Logger) error {
 	return nil
 }
 
-// RestoreDockerDNS restores the original Docker daemon configuration.
-func RestoreDockerDNS(logger *slog.Logger) error {
+func (c *daemonConfig) restore(logger *slog.Logger) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.restored = true
 	logger.Info("Restoring Docker DNS configuration")
-
-	// Check if backup exists
-	if _, err := os.Stat(dockerDaemonConfigBackup); os.IsNotExist(err) {
-		// No backup - remove our config
-		if err := os.Remove(dockerDaemonConfigPath); err != nil && !os.IsNotExist(err) {
-			logger.Warn("Failed to remove daemon.json", "error", err)
-		}
-	} else {
-		// Restore from backup
-		data, err := os.ReadFile(dockerDaemonConfigBackup)
-		if err != nil {
-			return fmt.Errorf("failed to read backup: %w", err)
-		}
-
-		if err := os.WriteFile(dockerDaemonConfigPath, data, 0o644); err != nil {
-			return fmt.Errorf("failed to restore daemon.json: %w", err)
-		}
-
-		// Remove backup
-		os.Remove(dockerDaemonConfigBackup)
+	restored, err := c.restoreFiles(logger)
+	if err != nil {
+		return err
 	}
-
-	// Reload Docker daemon
-	if err := reloadDockerDaemon(logger); err != nil {
+	if !restored {
+		logger.Debug("daemon.json holds no rewrite of ours; nothing to restore")
+		return nil
+	}
+	if err := c.reload(logger); err != nil {
 		logger.Warn("Failed to reload Docker daemon during restore", "error", err)
 	}
-
 	logger.Info("Docker DNS configuration restored")
 	return nil
+}
+
+// restoreFiles puts back what configure recorded — the backup over
+// daemon.json, or, when there was no original, removes the rewrite — and
+// reports whether it did. It acts only while daemon.json still holds the
+// recorded rewrite; otherwise it clears the records and leaves daemon.json
+// alone, setting an unverifiable backup aside rather than deleting it. The
+// rewrite record goes last, so a crash partway leaves the next run to finish.
+func (c *daemonConfig) restoreFiles(logger *slog.Logger) (bool, error) {
+	original, err := os.ReadFile(c.backup)
+	hasBackup := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("failed to read daemon.json backup: %w", err)
+	}
+	hasAbsent, err := exists(c.absent)
+	if err != nil {
+		return false, fmt.Errorf("failed to check daemon.json absent marker: %w", err)
+	}
+	ours, err := os.ReadFile(c.rewrite)
+	hasOurs := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("failed to read daemon.json rewrite record: %w", err)
+	}
+	if !hasBackup && !hasAbsent {
+		return false, removeIfExists(c.rewrite)
+	}
+
+	current, err := os.ReadFile(c.path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("failed to read daemon.json: %w", err)
+	}
+	present := err == nil
+	if !present || !hasOurs || !bytes.Equal(current, ours) {
+		// Not the rewrite: the original (the rewrite never landed) or a file
+		// changed since. Either way it stays.
+		if hasOurs {
+			logger.Warn("daemon.json changed since cargowall rewrote it; leaving it as it is", "path", c.path)
+		}
+		if hasBackup && present && bytes.Equal(original, current) {
+			if err := removeIfExists(c.backup); err != nil {
+				return false, err
+			}
+		} else if hasBackup {
+			aside := fmt.Sprintf("%s.unrestored-%d", c.backup, time.Now().Unix())
+			if err := os.Rename(c.backup, aside); err != nil {
+				return false, fmt.Errorf("failed to set aside daemon.json backup: %w", err)
+			}
+			logger.Warn("Kept a pre-cargowall daemon.json that no longer matches for manual recovery", "path", aside)
+		}
+		if err := removeIfExists(c.absent); err != nil {
+			return false, err
+		}
+		return false, removeIfExists(c.rewrite)
+	}
+
+	if hasBackup {
+		if err := writeFileReplace(c.path, original, 0o644); err != nil {
+			return true, fmt.Errorf("failed to restore daemon.json: %w", err)
+		}
+		if err := removeIfExists(c.backup); err != nil {
+			return true, err
+		}
+	} else if err := removeIfExists(c.path); err != nil {
+		return true, err
+	}
+	if err := removeIfExists(c.absent); err != nil {
+		return true, err
+	}
+	return true, removeIfExists(c.rewrite)
+}
+
+func exists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func removeIfExists(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to remove %s: %w", path, err)
+	}
+	return nil
+}
+
+// writeFileReplace writes data to path through a rename, so a crash leaves
+// the old file or the new one, never a torn daemon.json. The rename lands on
+// a symlink's target, and an existing file keeps its mode and owner: a
+// daemon.json linked into managed config, or kept 0600, stays that way.
+// perm applies only to a file that does not exist yet.
+func writeFileReplace(path string, data []byte, perm os.FileMode) error {
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		target = path
+	}
+	uid, gid := -1, -1
+	if fi, err := os.Stat(target); err == nil {
+		perm = fi.Mode().Perm()
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			uid, gid = int(st.Uid), int(st.Gid)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	f, err := os.CreateTemp(filepath.Dir(target), filepath.Base(target)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Chmod(perm)
+	}
+	if err == nil && uid >= 0 {
+		err = f.Chown(uid, gid)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, target)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
 }
 
 // RestartDockerDaemon performs a full Docker daemon restart and waits for it

@@ -46,8 +46,10 @@ type dockerDNS struct {
 // local, rewrites daemon.json: a foreign or unidentified one is left alone,
 // and the redirect covers its containers. The returned undo restores
 // daemon.json; the caller defers it. It is registered before the rewrite,
-// so a signal landing mid-write still has one, and restoring a file that
-// was never written is safe.
+// so a signal landing mid-write still has one: the second-signal path runs
+// it on another goroutine, and pkg/network serializes the two, so it either
+// undoes a finished rewrite or stops one from starting. Restoring a file
+// that was never written leaves it alone.
 func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, teardowns *teardownList,
 	logger *slog.Logger,
 ) (*dockerDNS, func()) {

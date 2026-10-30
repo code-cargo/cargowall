@@ -148,19 +148,28 @@ func newStatefulTestFirewall() (*FirewallImpl, map[string]*mockMap) {
 	return fw, mocks
 }
 
-// bpfDecideV4 mirrors the IPv4 decision in bpf/tcbpf.c against the final state
-// of the stateful mocks: LPM lookup, then (when port-specific) the per-IP and
-// wildcard port maps, falling back to the default action. It lets tests assert
-// the real allow/deny outcome a packet would get rather than inspecting raw
-// map writes.
+// bpfDecideV4 mirrors the IPv4 decision in bpf/verdict.h against the final
+// state of the stateful mocks: the longest-prefix LPM match, then (when
+// port-specific) the port entry under the matched rule's network address and
+// host bits, then the wildcard port, falling back to the default action. It
+// lets tests assert the real allow/deny outcome a packet would get rather
+// than inspecting raw map writes; TestUpdateAllowlistTC_Verdict checks the
+// same against the real program.
 func bpfDecideV4(cidrs, ports *mockMap, ip net.IP, port uint16, proto uint8, defaultAllow bool) bool {
-	ipU := binary.NativeEndian.Uint32(ip.To4())
-	if rv, ok := cidrs.store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: ipU}]; ok {
+	ip4 := ip.To4()
+	for plen := 32; plen >= 0; plen-- {
+		network := binary.NativeEndian.Uint32(ip4.Mask(net.CIDRMask(plen, 32)))
+		rv, ok := cidrs.store[bpf.TcBpfLpmKey{Prefixlen: uint32(plen), Ip: network}]
+		if !ok {
+			continue
+		}
 		rule := rv.(bpf.TcBpfLpmVal)
 		if rule.PortSpecific == 0 {
 			return rule.Action == 1
 		}
-		if pv, ok := ports.store[bpf.TcBpfPortKey{Ip: ipU, Port: port, Proto: proto}]; ok {
+		// The kernel masks by the value's host_bits, not the key it matched.
+		ruleNet := binary.NativeEndian.Uint32(ip4.Mask(net.CIDRMask(max(32-int(rule.HostBits), 0), 32)))
+		if pv, ok := ports.store[bpf.TcBpfPortKey{Ip: ruleNet, Port: port, Proto: proto, HostBits: rule.HostBits}]; ok {
 			return pv.(bpf.TcBpfPortVal).Action == 1
 		}
 		if pv, ok := ports.store[bpf.TcBpfPortKey{Ip: 0, Port: port, Proto: proto}]; ok {
@@ -177,14 +186,22 @@ func bpfDecideV4(cidrs, ports *mockMap, ip net.IP, port uint16, proto uint8, def
 // bpfDecideV6 mirrors bpfDecideV4 for the IPv6 data path (TCP/UDP; ICMPv6 is
 // unconditionally allowed by BPF before the maps are consulted).
 func bpfDecideV6(cidrs, ports *mockMap, ip net.IP, port uint16, proto uint8, defaultAllow bool) bool {
-	var ipArr [16]byte
-	copy(ipArr[:], ip.To16())
-	if rv, ok := cidrs.store[bpf.TcBpfLpmKeyV6{Prefixlen: 128, Ip: ipArr}]; ok {
+	ip16 := ip.To16()
+	masked := func(ones int) (out [16]byte) {
+		copy(out[:], ip16.Mask(net.CIDRMask(ones, 128)))
+		return out
+	}
+	for plen := 128; plen >= 0; plen-- {
+		rv, ok := cidrs.store[bpf.TcBpfLpmKeyV6{Prefixlen: uint32(plen), Ip: masked(plen)}]
+		if !ok {
+			continue
+		}
 		rule := rv.(bpf.TcBpfLpmVal)
 		if rule.PortSpecific == 0 {
 			return rule.Action == 1
 		}
-		if pv, ok := ports.store[bpf.TcBpfPortKeyV6{Ip: ipArr, Port: port, Proto: proto}]; ok {
+		ruleNet := masked(max(128-int(rule.HostBits), 0))
+		if pv, ok := ports.store[bpf.TcBpfPortKeyV6{Ip: ruleNet, Port: port, Proto: proto, HostBits: rule.HostBits}]; ok {
 			return pv.(bpf.TcBpfPortVal).Action == 1
 		}
 		if pv, ok := ports.store[bpf.TcBpfPortKeyV6{Port: port, Proto: proto}]; ok {
@@ -591,6 +608,28 @@ func TestUpdateAllowlistTC_Hostname_CreatesPerIPEntries(t *testing.T) {
 	// (ProtocolAll expands to ICMP+TCP+UDP → 3 protocols × 1 port × 2 IPs = 6).
 	assert.Len(t, mocks["cidrs"].updates, 2, "should add /32 LPM entry per resolved IP")
 	assert.Len(t, mocks["ports"].updates, 6, "should add port+protocol entry per resolved IP")
+}
+
+// A port-specific subnet's ports cover every address in it. The real-map
+// version is TestUpdateAllowlistTC_Verdict; this keeps the mock model honest
+// in the unprivileged lane, where that one skips.
+func TestUpdateAllowlistTC_PortSpecificSubnet(t *testing.T) {
+	fw, mocks := newStatefulTestFirewall()
+	tcp443 := []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeCIDR, Value: "10.0.0.0/24", Ports: tcp443, Action: config.ActionAllow},
+		{Type: config.RuleTypeCIDR, Value: "2001:db8:1::/48", Ports: tcp443, Action: config.ActionAllow},
+	}, config.ActionDeny))
+	require.NoError(t, fw.UpdateAllowlistTC(cm))
+
+	for _, ip := range []string{"10.0.0.0", "10.0.0.5", "10.0.0.255"} {
+		assert.True(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], net.ParseIP(ip), 443, protoTCP, false), ip)
+		assert.False(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], net.ParseIP(ip), 22, protoTCP, false), ip)
+	}
+	assert.False(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], net.ParseIP("10.0.1.5"), 443, protoTCP, false))
+	assert.True(t, bpfDecideV6(mocks["cidrsV6"], mocks["portsV6"], net.ParseIP("2001:db8:1:ffff::5"), 443, protoTCP, false))
+	assert.False(t, bpfDecideV6(mocks["cidrsV6"], mocks["portsV6"], net.ParseIP("2001:db8:1:ffff::5"), 22, protoTCP, false))
 }
 
 // --- expandPorts protocol translation ---

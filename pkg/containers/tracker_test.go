@@ -114,10 +114,10 @@ func (s *recordingSink) attributions() []events.AuditEvent {
 	return out
 }
 
-// fakeDaemon serves the four Docker Engine endpoints the tracker consumes,
-// over a unix socket. Events pushed via push stream to the connected
-// client; the stream handler unblocks on request-context done so tracker
-// Close (which cancels the client request) never hangs on a live stream.
+// fakeDaemon serves the Docker Engine endpoints the tracker consumes, over
+// a unix socket. Events pushed via push stream to the connected client; the
+// stream handler unblocks on request-context done so tracker Close (which
+// cancels the client request) never hangs on a live stream.
 type fakeDaemon struct {
 	sock string
 
@@ -129,6 +129,10 @@ type fakeDaemon struct {
 	// the pid from containerd (the publish race the tracker retries over).
 	execPidDelay map[string]int
 	list         []containerSummary
+	networks     map[string]networkInspect
+	// networkInspects counts /networks/{name} requests, so tests can tell a
+	// driver-cache hit from a fresh inspect.
+	networkInspects int
 
 	eventCh chan dockerEvent
 }
@@ -139,6 +143,7 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		containers:   make(map[string]containerInspect),
 		execs:        make(map[string]execInspect),
 		execPidDelay: make(map[string]int),
+		networks:     make(map[string]networkInspect),
 		eventCh:      make(chan dockerEvent, 16),
 	}
 	mux := http.NewServeMux()
@@ -177,8 +182,48 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		}
 		_ = json.NewEncoder(w).Encode(insp)
 	})
+	mux.HandleFunc("/networks", func(w http.ResponseWriter, _ *http.Request) {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		list := []networkInspect{}
+		for _, nw := range d.networks {
+			list = append(list, nw)
+		}
+		_ = json.NewEncoder(w).Encode(list)
+	})
+	mux.HandleFunc("/networks/{name}", func(w http.ResponseWriter, r *http.Request) {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		d.networkInspects++
+		nw, ok := d.networks[r.PathValue("name")]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(nw)
+	})
 	d.sock = startUnixServer(t, mux)
 	return d
+}
+
+// setNetwork creates or replaces a network with the given driver and IPAM
+// subnets.
+func (d *fakeDaemon) setNetwork(name, driver string, subnets ...string) {
+	nw := networkInspect{Name: name, Driver: driver}
+	for _, s := range subnets {
+		nw.IPAM.Config = append(nw.IPAM.Config, struct {
+			Subnet string `json:"Subnet"`
+		}{Subnet: s})
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.networks[name] = nw
+}
+
+func (d *fakeDaemon) networkInspectCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.networkInspects
 }
 
 func (d *fakeDaemon) serveEvents(w http.ResponseWriter, r *http.Request) {
@@ -276,6 +321,8 @@ type fixture struct {
 	tracker    *Tracker
 	procRoot   string
 	cgroupRoot string
+	// allowLocal, when set before start, becomes Options.AllowLocalSubnet.
+	allowLocal func(netip.Prefix) error
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -298,9 +345,10 @@ func (f *fixture) start(t *testing.T) {
 	require.NoError(t, err)
 	auditLogger.AddSink(f.sink)
 	tr, err := Start(context.Background(), Options{
-		Socket:     f.daemon.sock,
-		ProcRoot:   f.procRoot,
-		CgroupRoot: f.cgroupRoot,
+		Socket:           f.daemon.sock,
+		ProcRoot:         f.procRoot,
+		CgroupRoot:       f.cgroupRoot,
+		AllowLocalSubnet: f.allowLocal,
 	}, f.tagger, nil, auditLogger, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.NoError(t, err)
 	f.tracker = tr

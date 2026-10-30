@@ -240,7 +240,7 @@ static __always_inline int midstream_should_emit(__u32 dst_ip_nbo, __u16 dst_por
         .ip = dst_ip_nbo,
         .port = dst_port,
         .proto = proto,
-        .pad = 0
+        .host_bits = 0  // one exact destination, keyed like a host route
     };
     __u64 now = bpf_ktime_get_ns();
     __u64 *last = bpf_map_lookup_elem(&map_midstream_seen, &key);

@@ -114,7 +114,7 @@ type StartCmd struct {
 
 	// Orthogonal CI plumbing flags — usable on any CI system (or standalone).
 	// Each is also implied by a CI preset above.
-	DNSRedirectIptables    bool `help:"Redirect outbound DNS (UDP+TCP/53) to the local proxy at 127.0.0.1:53, and, with the Docker bridge listener, container DNS arriving on a docker bridge to that listener. Installed as the nftables table ip cargowall, with no iptables or nft binary needed; under an enforcing policy, failing to install it fails startup" default:"false" env:"CARGOWALL_DNS_REDIRECT_IPTABLES"`
+	DNSRedirect            bool `help:"Redirect outbound DNS (UDP+TCP/53) to the local proxy at 127.0.0.1:53, and, with the Docker bridge listener, container DNS arriving on a docker bridge to that listener. Installed as the nftables table ip cargowall, with no iptables or nft binary needed; under an enforcing policy, failing to install it fails startup. Formerly --dns-redirect-iptables, still accepted" default:"false" aliases:"dns-redirect-iptables" env:"CARGOWALL_DNS_REDIRECT,CARGOWALL_DNS_REDIRECT_IPTABLES"`
 	DockerDNSInterception  bool `help:"Listen on the Docker bridge IP for DNS, rewrite /etc/docker/daemon.json so containers use the proxy, and restart the Docker daemon (the rewrite and restart are skipped for a daemon in another container)" default:"false" env:"CARGOWALL_DOCKER_DNS_INTERCEPTION"`
 	DNSQueryFiltering      bool `help:"Filter DNS queries against the firewall policy (blocks DNS tunneling)" default:"false" env:"CARGOWALL_DNS_QUERY_FILTERING"`
 	PrepopulateDNSCache    bool `help:"Pre-populate the BPF allowlist from the systemd-resolved cache and reverse-DNS existing connections at startup" default:"false" env:"CARGOWALL_PREPOPULATE_DNS_CACHE"`
@@ -235,8 +235,8 @@ func (c *StartCmd) AfterApply() error {
 	// into the proxy, which forwards them to the loopback resolver again
 	// until it runs out of concurrent queries and DNS for the whole job is
 	// wedged. Refused here rather than discovered as a readiness timeout.
-	if c.DNSRedirectIptables && !c.DisableDNSTracking && loopbackUpstream(c.DNSUpstream) {
-		return fmt.Errorf("--dns-upstream %s is a loopback resolver, which --dns-redirect-iptables would loop "+
+	if c.DNSRedirect && !c.DisableDNSTracking && loopbackUpstream(c.DNSUpstream) {
+		return fmt.Errorf("--dns-upstream %s is a loopback resolver, which --dns-redirect would loop "+
 			"(its own upstream queries are redirected back into the proxy); pass the resolver it forwards to instead",
 			c.DNSUpstream)
 	}
@@ -360,7 +360,7 @@ const (
 // applyCIPreset turns on the plumbing flags shared by both CI presets, then
 // sets the host auto-allow flag specific to the named CI.
 func (c *StartCmd) applyCIPreset(mode CIMode) {
-	c.DNSRedirectIptables = true
+	c.DNSRedirect = true
 	c.DockerDNSInterception = true
 	c.DNSQueryFiltering = true
 	c.PrepopulateDNSCache = true

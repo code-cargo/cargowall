@@ -28,9 +28,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
+	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -60,20 +60,19 @@ func MarkDNSProxySocket(_, _ string, c syscall.RawConn) error {
 // is built in one transaction and deleted in one, so no packet meets half
 // of it, and it never touches rules Docker or the host own. It needs only
 // the kernel's nf_tables, not an iptables or nft binary, which container
-// runner images such as ARC's do not carry.
+// runner images such as ARC's do not carry. The table is owned by the
+// socket that created it (see DNSRedirect).
 const RedirectTable = "cargowall"
 
-// bridgeDNATPriority puts the container redirect ahead of Docker's own
-// PREROUTING DNAT for published ports, which sits at the standard dstnat
-// priority (-100). The first NAT binding a flow gets is the one it keeps.
-const bridgeDNATPriority = -101
-
-// redirectChain is one base chain of the redirect table and its rules, in
-// order.
-type redirectChain struct {
-	chain *nftables.Chain
-	rules [][]expr.Any
-}
+// Chain priorities, nft's dstnat and filter (NF_IP_PRI_NAT_DST and
+// NF_IP_PRI_FILTER), where iptables' nat and filter tables sit too. The
+// container redirect runs one ahead of dstnat, so ahead of Docker's own
+// PREROUTING DNAT for published ports: the first NAT binding a flow gets is
+// the one it keeps.
+const (
+	dstNATPriority = -100
+	filterPriority = 0
+)
 
 // redirectChains is the redirect for traffic this netns originates, plus,
 // with a docker bridge IP, for DNS that containers send through a docker
@@ -106,7 +105,7 @@ type redirectChain struct {
 // daemon.json cargowall cannot rewrite) would otherwise resolve around the
 // proxy. DNAT keeps the source address, so the proxy still attributes the
 // query by container IP.
-func redirectChains(table *nftables.Table, bridgeIP net.IP) []redirectChain {
+func redirectChains(bridgeIP net.IP) []redirectChain {
 	proxy := net.IPv4(127, 0, 0, 1).To4()
 	stub := net.IPv4(127, 0, 0, 53).To4()
 	output := slices.Concat(
@@ -126,14 +125,8 @@ func redirectChains(table *nftables.Table, bridgeIP net.IP) []redirectChain {
 		return concat(proto, iifname(expr.CmpOpNeq, "lo"), port(srcPort, 53), ctStateNew(), verdict(expr.VerdictDrop))
 	})
 	chains := []redirectChain{
-		{chain: &nftables.Chain{
-			Name: "output", Table: table, Type: nftables.ChainTypeNAT,
-			Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityNATDest,
-		}, rules: output},
-		{chain: &nftables.Chain{
-			Name: "input", Table: table, Type: nftables.ChainTypeFilter,
-			Hooknum: nftables.ChainHookInput, Priority: nftables.ChainPriorityFilter,
-		}, rules: input},
+		{name: "output", kind: "nat", hook: unix.NF_INET_LOCAL_OUT, priority: dstNATPriority, rules: output},
+		{name: "input", kind: "filter", hook: unix.NF_INET_LOCAL_IN, priority: filterPriority, rules: input},
 	}
 	if bridgeIP == nil {
 		return chains
@@ -144,10 +137,9 @@ func redirectChains(table *nftables.Table, bridgeIP net.IP) []redirectChain {
 			return concat(bridge, proto, port(dstPort, 53), dnat(bridgeIP, 53))
 		})...)
 	}
-	return append(chains, redirectChain{chain: &nftables.Chain{
-		Name: "prerouting", Table: table, Type: nftables.ChainTypeNAT,
-		Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityRef(bridgeDNATPriority),
-	}, rules: prerouting})
+	return append(chains, redirectChain{
+		name: "prerouting", kind: "nat", hook: unix.NF_INET_PRE_ROUTING, priority: dstNATPriority - 1, rules: prerouting,
+	})
 }
 
 // Expression helpers. A match loads into register 1 and compares it; dnat
@@ -245,6 +237,18 @@ func verdict(kind expr.VerdictKind) []expr.Any {
 	return []expr.Any{&expr.Verdict{Kind: kind}}
 }
 
+// DNSRedirect is the installed redirect. It keeps the netlink socket that
+// created the table, and that socket owns it: no other socket can change or
+// delete the table, and the kernel deletes it when the socket closes, which
+// the process's exit does however it ends. A cargowall killed outright
+// therefore takes the redirect with it rather than leaving the host's DNS
+// DNAT'd to a proxy that is gone. The socket is close-on-exec, so no child
+// keeps the table alive.
+type DNSRedirect struct {
+	conn   *netlink.Conn
+	logger *slog.Logger
+}
+
 // SetupDNSRedirect installs the redirect table (see redirectChains):
 // outbound DNS (UDP+TCP port 53) goes to the local proxy at 127.0.0.1:53,
 // except the proxy's own marked queries, and the input guard keeps flushed
@@ -252,32 +256,45 @@ func verdict(kind expr.VerdictKind) []expr.Any {
 // proxy has a container listener, also redirects container DNS crossing a
 // docker bridge.
 //
-// One transaction replaces any table a crashed earlier run left behind
-// (add, delete, add: the first add makes the delete safe when there is
-// none) and builds the new one, so a failure leaves the host as it was.
-func SetupDNSRedirect(logger *slog.Logger, bridgeIP string) error {
+// One transaction builds the table, so a failure leaves the host as it
+// was. It first replaces a table of the same name that no socket owns (add,
+// delete, add: the first add makes the delete safe when there is none). A
+// table another live socket owns, such as a cargowall already running in
+// this network namespace, refuses the first add, and setup fails.
+func SetupDNSRedirect(logger *slog.Logger, bridgeIP string) (*DNSRedirect, error) {
 	var bridge net.IP
 	if bridgeIP != "" {
 		if bridge = net.ParseIP(bridgeIP).To4(); bridge == nil {
-			return fmt.Errorf("docker bridge IP %q is not an IPv4 address", bridgeIP)
+			return nil, fmt.Errorf("docker bridge IP %q is not an IPv4 address", bridgeIP)
 		}
 	}
-	conn, err := nftables.New()
+	create, errCreate := newTableMsg(0)
+	del, errDel := delTableMsg()
+	owned, errOwned := newTableMsg(nftTableFOwner)
+	if err := errors.Join(errCreate, errDel, errOwned); err != nil {
+		return nil, fmt.Errorf("nftables: %w", err)
+	}
+	msgs := []netlink.Message{create, del, owned}
+	for _, c := range redirectChains(bridge) {
+		chain, err := chainMsgs(c)
+		if err != nil {
+			return nil, fmt.Errorf("nftables: %w", err)
+		}
+		msgs = append(msgs, chain...)
+	}
+
+	conn, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
 	if err != nil {
-		return fmt.Errorf("nftables: %w", err)
+		return nil, fmt.Errorf("nftables: %w", err)
 	}
-	table := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: RedirectTable}
-	conn.AddTable(table)
-	conn.DelTable(table)
-	conn.AddTable(table)
-	for _, c := range redirectChains(table, bridge) {
-		conn.AddChain(c.chain)
-		for _, exprs := range c.rules {
-			conn.AddRule(&nftables.Rule{Table: table, Chain: c.chain, Exprs: exprs})
+	if err := transact(conn, msgs); err != nil {
+		_ = conn.Close()
+		if errors.Is(err, unix.EPERM) {
+			return nil, fmt.Errorf("nftables: installing table ip %s: %w (another process owns the table, "+
+				"such as a cargowall already running in this network namespace, or CAP_NET_ADMIN is missing)",
+				RedirectTable, err)
 		}
-	}
-	if err := conn.Flush(); err != nil {
-		return fmt.Errorf("nftables: installing table ip %s: %w", RedirectTable, err)
+		return nil, fmt.Errorf("nftables: installing table ip %s: %w", RedirectTable, err)
 	}
 	logger.Info("DNS redirect installed", "nftables_table", "ip "+RedirectTable, "container_bridge_redirect", bridge != nil)
 
@@ -289,7 +306,7 @@ func SetupDNSRedirect(logger *slog.Logger, bridgeIP string) error {
 		logger.Warn("Failed to flush DNS conntrack entries; pre-existing DNS flows may bypass the proxy until they expire",
 			"error", err)
 	}
-	return nil
+	return &DNSRedirect{conn: conn, logger: logger}, nil
 }
 
 // resolvedRuntimeDir exists only while systemd-resolved is running. Its
@@ -362,29 +379,32 @@ func FlushResolvedCache(ctx context.Context, logger *slog.Logger) error {
 	return nil
 }
 
-// TeardownDNSRedirect deletes the redirect table, every chain of it in one
-// transaction. A table that is not there means nothing was installed
-// (teardown registers before a setup that may fail or never run): there is
-// no flow state of ours to flush, so the host's DNS state is left alone.
-func TeardownDNSRedirect(logger *slog.Logger) error {
-	conn, err := nftables.New()
+// Teardown deletes the redirect table and closes the socket that owns it,
+// then flushes the DNS flows still DNAT'd to the proxy. Closing the socket
+// alone would delete the table too; deleting it first reports a failure,
+// and either way the table is gone before the flush. Call it once. Nil-safe.
+func (r *DNSRedirect) Teardown() error {
+	if r == nil {
+		return nil
+	}
+	msg, err := delTableMsg()
+	if err == nil {
+		err = transact(r.conn, []netlink.Message{msg})
+	}
+	if closeErr := r.conn.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
-		return fmt.Errorf("nftables: %w", err)
+		err = fmt.Errorf("nftables: deleting table ip %s: %w", RedirectTable, err)
+	} else {
+		r.logger.Info("DNS redirect removed")
 	}
-	conn.DelTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: RedirectTable})
-	if err := conn.Flush(); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return nil
-		}
-		return fmt.Errorf("nftables: deleting table ip %s: %w", RedirectTable, err)
-	}
-	logger.Info("DNS redirect removed")
 
 	// Purge flows still DNAT'd to the now-dead proxy, so client DNS recovers
 	// immediately instead of at conntrack expiry (see FlushDNSConntrack).
-	if err := FlushDNSConntrack(logger); err != nil {
-		logger.Warn("Failed to flush DNS conntrack entries on teardown; client DNS may stall until entries expire",
+	if err := FlushDNSConntrack(r.logger); err != nil {
+		r.logger.Warn("Failed to flush DNS conntrack entries on teardown; client DNS may stall until entries expire",
 			"error", err)
 	}
-	return nil
+	return err
 }

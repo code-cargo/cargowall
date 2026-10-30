@@ -393,7 +393,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 
 	// Coexistence with other root-cgroup egress programs (Docker's,
 	// systemd's) needs no explicit BPF_F_ALLOW_MULTI here: AttachCgroup
-	// attaches via bpf_link (kernel >= 5.7, under our 5.8 floor), and cgroup
+	// attaches via bpf_link (kernel >= 5.7, under our 5.12 floor), and cgroup
 	// bpf_links always attach with allow-multi semantics; its legacy
 	// PROG_ATTACH fallback — reachable only below the floor — tries
 	// ALLOW_MULTI before anything else. The pre/post program query logged

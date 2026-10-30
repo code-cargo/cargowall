@@ -133,10 +133,10 @@ abstract arguments and callers pay only for the call. Measured with
 that shape and must stay true:
 
 - Its arguments are the skb context and scalars (the scratch slot index),
-  which global functions have accepted since kernel 5.6, under the 5.8 floor.
-  A pointer-to-struct argument would have needed kernel 5.12 and dropped 5.8
-  and 5.10 hosts off the hook, so the scratch is looked up inside the function
-  by index instead.
+  which global functions have accepted since kernel 5.6. A pointer-to-struct
+  argument needs kernel 5.12, above the 5.8 floor this was written under, so
+  the scratch is looked up inside the function by index instead; the floor is
+  5.12 now, but nothing is gained by changing the signature.
 - Its return is an unknown scalar to the caller, so `l7_with_scratch` compares
   it to zero; a cgroup_skb program has to prove its exit value is in [0, 3].
 - A global function's frame adds to its caller's against the 512-byte BPF

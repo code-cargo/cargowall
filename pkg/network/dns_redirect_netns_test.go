@@ -17,10 +17,13 @@
 package network
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"runtime"
 	"testing"
 	"time"
@@ -177,8 +180,7 @@ func TestDNSRedirect_Output(t *testing.T) {
 	got, _ := received(t, proxy, absent)
 	require.Empty(t, got, "the query reached the proxy with no redirect installed")
 
-	require.NoError(t, SetupDNSRedirect(discardLogger(), ""))
-	t.Cleanup(func() { _ = TeardownDNSRedirect(discardLogger()) })
+	install(t, "")
 
 	query(t, "10.53.0.2:53", "outside", false)
 	got, _ = received(t, proxy, arrives)
@@ -222,8 +224,7 @@ func TestDNSRedirect_InputGuard(t *testing.T) {
 	got, _ := received(t, l, arrives)
 	require.Equal(t, "before", got)
 
-	require.NoError(t, SetupDNSRedirect(discardLogger(), ""))
-	t.Cleanup(func() { _ = TeardownDNSRedirect(discardLogger()) })
+	install(t, "")
 
 	_, err = wire.Write(udp4(net.IPv4(10, 53, 0, 3), local, 53, 40000, "unsolicited"))
 	require.NoError(t, err)
@@ -266,8 +267,7 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 	other := addTun(t, "cw0", net.IPv4(10, 56, 0, 1))
 	l := listenUDP(t, "10.54.0.1:53")
 
-	require.NoError(t, SetupDNSRedirect(discardLogger(), bridgeIP.String()))
-	t.Cleanup(func() { _ = TeardownDNSRedirect(discardLogger()) })
+	install(t, bridgeIP.String())
 
 	for _, c := range []struct {
 		wire *os.File
@@ -286,46 +286,112 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 	require.Empty(t, got, "DNS arriving off a docker bridge must not be redirected")
 }
 
-// TestDNSRedirect_ReplaceAndTeardown: setup replaces whatever table an
-// earlier run left rather than adding to it, and teardown removes the table
-// and is a quiet no-op when there is none.
-func TestDNSRedirect_ReplaceAndTeardown(t *testing.T) {
+// TestDNSRedirect_Ownership: the table belongs to the socket that made it.
+// No other socket can delete it, a second cargowall in the namespace cannot
+// take it over, and closing the socket deletes it as surely as teardown.
+func TestDNSRedirect_Ownership(t *testing.T) {
 	enterNetns(t)
 	logger := discardLogger()
-	require.NoError(t, TeardownDNSRedirect(logger), "teardown with nothing installed")
+	require.NoError(t, (*DNSRedirect)(nil).Teardown(), "nil is no redirect")
 
-	chainRules := func() map[string]int {
-		conn, err := nftables.New()
-		require.NoError(t, err)
-		table := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: RedirectTable}
-		chains, err := conn.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
-		require.NoError(t, err)
-		out := map[string]int{}
-		for _, c := range chains {
-			if c.Table.Name != RedirectTable {
-				continue
-			}
-			rules, err := conn.GetRules(table, c)
-			require.NoError(t, err)
-			out[c.Name] = len(rules)
-		}
-		return out
+	// A table of this name that no socket owns is replaced, chains and all.
+	other, err := nftables.New()
+	require.NoError(t, err)
+	stale := other.AddTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: RedirectTable})
+	other.AddChain(&nftables.Chain{Name: "leftover", Table: stale})
+	require.NoError(t, other.Flush())
+	r, err := SetupDNSRedirect(logger, "10.54.0.1")
+	require.NoError(t, err)
+	want := map[string]int{"output": 6, "input": 2, "prerouting": 4}
+	require.Equal(t, want, redirectRules(t), "setup must replace an unowned table, not add to it")
+
+	_, err = SetupDNSRedirect(logger, "")
+	require.ErrorIs(t, err, unix.EPERM, "a second setup must not take over a live redirect")
+	require.ErrorContains(t, err, "another process owns the table")
+	other.DelTable(stale)
+	require.ErrorIs(t, other.Flush(), unix.EPERM, "another socket must not delete the table")
+	other.FlushRuleset()
+	_ = other.Flush()
+	require.Equal(t, want, redirectRules(t), "nothing another socket did may touch the table")
+
+	_, err = SetupDNSRedirect(logger, "fd00::1")
+	require.Error(t, err, "an IPv6 bridge IP is refused")
+
+	require.NoError(t, r.Teardown())
+	require.Empty(t, redirectRules(t), "teardown must remove the table")
+
+	// The socket closing without a teardown, as when the process dies.
+	r, err = SetupDNSRedirect(logger, "")
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{"output": 6, "input": 2}, redirectRules(t))
+	require.NoError(t, r.conn.Close())
+	require.Empty(t, redirectRules(t), "the kernel must delete the table with the socket that owns it")
+}
+
+// holderEnv makes the test binary, run by TestDNSRedirect_DiesWithProcess,
+// a process that installs the redirect and waits to be killed.
+const holderEnv = "CARGOWALL_TEST_REDIRECT_HOLDER"
+
+func TestDNSRedirect_Holder(t *testing.T) {
+	if os.Getenv(holderEnv) != "1" {
+		t.Skip("the redirect-holding child of TestDNSRedirect_DiesWithProcess")
 	}
+	if _, err := SetupDNSRedirect(discardLogger(), ""); err != nil {
+		fmt.Println("setup:", err)
+		os.Exit(1)
+	}
+	fmt.Println("installed")
+	time.Sleep(time.Minute)
+}
 
-	require.NoError(t, SetupDNSRedirect(logger, "10.54.0.1"))
-	require.NoError(t, SetupDNSRedirect(logger, "10.54.0.1"))
-	require.Equal(t, map[string]int{"output": 6, "input": 2, "prerouting": 4}, chainRules(),
-		"a second setup must replace the table, not add to it")
+// TestDNSRedirect_DiesWithProcess: a process killed outright, with no
+// chance to tear anything down, takes its redirect with it.
+func TestDNSRedirect_DiesWithProcess(t *testing.T) {
+	enterNetns(t)
+	// Started from this goroutine's thread, so in its namespace.
+	child := exec.Command(os.Args[0], "-test.run=^TestDNSRedirect_Holder$")
+	child.Env = append(os.Environ(), holderEnv+"=1")
+	out, err := child.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, child.Start())
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+	})
+	line, err := bufio.NewReader(out).ReadString('\n')
+	require.NoError(t, err)
+	require.Equal(t, "installed\n", line)
+	require.NotEmpty(t, redirectRules(t))
 
-	require.NoError(t, SetupDNSRedirect(logger, ""))
-	require.Equal(t, map[string]int{"output": 6, "input": 2}, chainRules(),
-		"setup without a bridge must not keep an earlier run's bridge chain")
+	require.NoError(t, child.Process.Signal(unix.SIGKILL))
+	_ = child.Wait()
+	require.Empty(t, redirectRules(t), "the redirect must not outlive its process")
+}
 
-	require.Error(t, SetupDNSRedirect(logger, "fd00::1"), "an IPv6 bridge IP is refused")
-	require.Equal(t, map[string]int{"output": 6, "input": 2}, chainRules(),
-		"a refused setup leaves the table as it was")
+// install sets up the redirect for the rest of the test.
+func install(t *testing.T, bridgeIP string) {
+	t.Helper()
+	r, err := SetupDNSRedirect(discardLogger(), bridgeIP)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Teardown() })
+}
 
-	require.NoError(t, TeardownDNSRedirect(logger))
-	require.Empty(t, chainRules(), "teardown must remove the table")
-	require.NoError(t, TeardownDNSRedirect(logger), "a second teardown is a no-op")
+// redirectRules counts the redirect table's rules per chain, read back by
+// google/nftables rather than by the code that wrote them.
+func redirectRules(t *testing.T) map[string]int {
+	t.Helper()
+	conn, err := nftables.New()
+	require.NoError(t, err)
+	chains, err := conn.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
+	require.NoError(t, err)
+	out := map[string]int{}
+	for _, c := range chains {
+		if c.Table.Name != RedirectTable {
+			continue
+		}
+		rules, err := conn.GetRules(c.Table, c)
+		require.NoError(t, err)
+		out[c.Name] = len(rules)
+	}
+	return out
 }

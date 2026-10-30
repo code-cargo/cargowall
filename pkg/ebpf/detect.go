@@ -76,7 +76,7 @@ func Detect() *Capabilities {
 	}
 	caps.KernelVersion = int8ArrayToString(uname.Release[:])
 
-	// Check kernel version (need 5.8+ for the event ring buffer; the TC attach
+	// Check kernel version (need 5.12+, see isKernelSupported; the TC attach
 	// path itself falls back to clsact below 6.6)
 	caps.KernelSupported = isKernelSupported(caps.KernelVersion)
 
@@ -95,12 +95,15 @@ func Detect() *Capabilities {
 
 // isKernelSupported reports whether the running kernel meets cargowall's floor.
 //
-// The hard floor is 5.8: bpf/tcbpf.c declares map_events as BPF_MAP_TYPE_RINGBUF
-// and the ring buffer landed in 5.8. The TC attach mechanism is NOT the
-// constraint — TCX (6.6+) is preferred, but pkg/tc transparently falls back to
-// the legacy clsact qdisc (4.5+), so kernels 5.8–6.5 are fully supported.
+// The floor is 5.12. The DNS redirect's nftables table is owned by
+// cargowall's netlink socket (NFT_TABLE_F_OWNER, 5.12), which is what removes
+// it when the process dies however it dies, and the step collection's
+// fetch-and-add atomics need 5.12's BPF atomics too. The event ring buffer
+// (5.8) is under it. The TC attach mechanism is NOT the constraint — TCX
+// (6.6+) is preferred, but pkg/tc transparently falls back to the legacy
+// clsact qdisc (4.5+), so kernels 5.12–6.5 are fully supported.
 func isKernelSupported(version string) bool {
-	ok, err := KernelAtLeast(version, 5, 8)
+	ok, err := KernelAtLeast(version, 5, 12)
 	return err == nil && ok
 }
 
@@ -201,7 +204,7 @@ func RequireCapabilities() error {
 	var reasons []string
 
 	if !caps.KernelSupported {
-		reasons = append(reasons, fmt.Sprintf("kernel %s is not supported (need 5.8+)", caps.KernelVersion))
+		reasons = append(reasons, fmt.Sprintf("kernel %s is not supported (need 5.12+)", caps.KernelVersion))
 	}
 
 	if !caps.BPFSyscall {

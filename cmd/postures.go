@@ -43,7 +43,7 @@ var posturesFile = "/tmp/cargowall-postures"
 const (
 	postureContainerEgress = "container-egress"
 	postureTLSSNI          = "tls-sni"
-	postureDNSRedirect     = "dns-redirect-iptables"
+	postureDNSRedirect     = "dns-redirect"
 )
 
 // The redirect's flag is a bool; these are its values in the record.
@@ -100,7 +100,7 @@ func newPostures(cmd *StartCmd, kernel string, enforcing bool, logger *slog.Logg
 	p.register(postureTLSSNI, cmd.TLSSNI, TLSSNIOff,
 		cmd.TLSSNI == TLSSNIEnforce || cmd.TLSSNI == TLSSNIEnforcePinned)
 	redirect := dnsRedirectOff
-	if cmd.DNSRedirectIptables && !cmd.DisableDNSTracking {
+	if cmd.DNSRedirect && !cmd.DisableDNSTracking {
 		redirect = dnsRedirectOn
 	}
 	p.register(postureDNSRedirect, redirect, dnsRedirectOff, enforcing)

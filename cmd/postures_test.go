@@ -37,6 +37,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/network"
 	"github.com/code-cargo/cargowall/pkg/origin"
 	"github.com/code-cargo/cargowall/pkg/podenv"
 	"github.com/code-cargo/cargowall/pkg/steps"
@@ -164,14 +165,14 @@ func TestPostures_DNSRedirect(t *testing.T) {
 		return newPostures(cmd, "6.6.141", enforcing, slog.New(slog.NewTextHandler(&buf, nil))), &buf
 	}
 
-	p, buf := ledger(&StartCmd{DNSRedirectIptables: true}, true)
+	p, buf := ledger(&StartCmd{DNSRedirect: true}, true)
 	require.EqualError(t, failed.settle(p),
-		"--dns-redirect-iptables=on requested but could not be applied: "+
+		"--dns-redirect=on requested but could not be applied: "+
 			"nftables: installing table ip cargowall: operation not supported")
 	assert.Contains(t, buf.String(), "level=ERROR")
 
 	redirectStateFiles(t)
-	p, buf = ledger(&StartCmd{DNSRedirectIptables: true}, false)
+	p, buf = ledger(&StartCmd{DNSRedirect: true}, false)
 	require.NoError(t, failed.settle(p), "an auditing policy blocks nothing, so the loss is not fatal")
 	assert.Contains(t, buf.String(), "level=WARN")
 	want := []postureLine{{
@@ -182,13 +183,13 @@ func TestPostures_DNSRedirect(t *testing.T) {
 	p.write()
 	assert.Equal(t, want, readPostures(), "the summary lists the lost redirect")
 
-	p, _ = ledger(&StartCmd{DNSRedirectIptables: true, DisableDNSTracking: true}, true)
+	p, _ = ledger(&StartCmd{DNSRedirect: true, DisableDNSTracking: true}, true)
 	assert.Empty(t, p.layers, "no DNS tracking, no redirect to promise")
 	p, _ = ledger(&StartCmd{}, true)
 	assert.Empty(t, p.layers)
 
-	p, _ = ledger(&StartCmd{DNSRedirectIptables: true}, true)
-	require.NoError(t, (&dnsRedirect{active: true}).settle(p))
+	p, _ = ledger(&StartCmd{DNSRedirect: true}, true)
+	require.NoError(t, (&dnsRedirect{installed: &network.DNSRedirect{}}).settle(p))
 	require.NoError(t, (*dnsRedirect)(nil).settle(p), "nil is the redirect not requested")
 	assert.False(t, (*dnsRedirect)(nil).isActive())
 	assert.False(t, p.layers[0].degraded())

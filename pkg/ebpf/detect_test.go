@@ -26,9 +26,10 @@ func TestIsKernelSupported(t *testing.T) {
 	}{
 		{"4.19 too old", "4.19.0", false},
 		{"5.4 LTS pre-ringbuf", "5.4.0-100-generic", false},
-		{"5.7 just below floor", "5.7.0", false},
-		{"5.8 exact floor", "5.8.0", true},
-		{"5.10 LTS", "5.10.0", true},
+		{"5.8 ring buffer, no owned nftables tables", "5.8.0", false},
+		{"5.10 LTS", "5.10.0", false},
+		{"5.11 just below floor", "5.11.22", false},
+		{"5.12 exact floor", "5.12.0", true},
 		{"5.15 GitLab SaaS aws", "5.15.0-1234-aws", true},
 		{"5.15 azure", "5.15.0-1019-azure", true},
 		{"6.0", "6.0.0", true},

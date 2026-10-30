@@ -317,7 +317,7 @@ func TestStartCmd_AfterApply_GithubActionExpandsOrthogonalFlags(t *testing.T) {
 	cmd := &StartCmd{GithubAction: true}
 	require.NoError(t, cmd.AfterApply())
 
-	assert.True(t, cmd.DNSRedirectIptables, "github-action should enable --dns-redirect-iptables")
+	assert.True(t, cmd.DNSRedirect, "github-action should enable --dns-redirect")
 	assert.True(t, cmd.DockerDNSInterception, "github-action should enable --docker-dns-interception")
 	assert.True(t, cmd.DNSQueryFiltering, "github-action should enable --dns-query-filtering")
 	assert.True(t, cmd.PrepopulateDNSCache, "github-action should enable --prepopulate-dns-cache")
@@ -331,7 +331,7 @@ func TestStartCmd_AfterApply_GitlabCIExpandsOrthogonalFlags(t *testing.T) {
 	cmd := &StartCmd{GitlabCI: true}
 	require.NoError(t, cmd.AfterApply())
 
-	assert.True(t, cmd.DNSRedirectIptables, "gitlab-ci should enable --dns-redirect-iptables")
+	assert.True(t, cmd.DNSRedirect, "gitlab-ci should enable --dns-redirect")
 	assert.True(t, cmd.DockerDNSInterception, "gitlab-ci should enable --docker-dns-interception")
 	assert.True(t, cmd.DNSQueryFiltering, "gitlab-ci should enable --dns-query-filtering")
 	assert.True(t, cmd.PrepopulateDNSCache, "gitlab-ci should enable --prepopulate-dns-cache")
@@ -345,7 +345,7 @@ func TestStartCmd_AfterApply_NoPresetLeavesFlagsUnset(t *testing.T) {
 	cmd := &StartCmd{}
 	require.NoError(t, cmd.AfterApply())
 
-	assert.False(t, cmd.DNSRedirectIptables)
+	assert.False(t, cmd.DNSRedirect)
 	assert.False(t, cmd.DockerDNSInterception)
 	assert.False(t, cmd.DNSQueryFiltering)
 	assert.False(t, cmd.PrepopulateDNSCache)
@@ -356,12 +356,12 @@ func TestStartCmd_AfterApply_NoPresetLeavesFlagsUnset(t *testing.T) {
 }
 
 func TestStartCmd_AfterApply_OrthogonalFlagsPreservedWhenSetExplicitly(t *testing.T) {
-	// User sets --dns-redirect-iptables alone (no preset). The flag should
+	// User sets --dns-redirect alone (no preset). The flag should
 	// stay set after AfterApply runs.
-	cmd := &StartCmd{DNSRedirectIptables: true}
+	cmd := &StartCmd{DNSRedirect: true}
 	require.NoError(t, cmd.AfterApply())
 
-	assert.True(t, cmd.DNSRedirectIptables, "explicitly-set orthogonal flag should not be cleared")
+	assert.True(t, cmd.DNSRedirect, "explicitly-set orthogonal flag should not be cleared")
 	assert.False(t, cmd.DockerDNSInterception, "other flags should remain false without a preset")
 	assert.Equal(t, CIModeNone, cmd.CIMode())
 }
@@ -372,18 +372,18 @@ func TestStartCmd_AfterApply_OrthogonalFlagsPreservedWhenSetExplicitly(t *testin
 // loopback upstream is fine, and a real resolver is fine either way.
 func TestStartCmd_AfterApply_LoopbackUpstreamRefusedUnderRedirect(t *testing.T) {
 	for _, upstream := range []string{"127.0.0.100:53", "127.0.0.53:53", "127.0.0.1:53", "[::1]:53", "[::ffff:127.0.0.1]:53", "localhost:53", "127.0.0.100"} {
-		cmd := &StartCmd{DNSRedirectIptables: true, DNSUpstream: upstream}
+		cmd := &StartCmd{DNSRedirect: true, DNSUpstream: upstream}
 		require.ErrorContains(t, cmd.AfterApply(), "is a loopback resolver", upstream)
 	}
 	cmd := &StartCmd{GithubAction: true, DNSUpstream: "127.0.0.100:53"}
 	require.ErrorContains(t, cmd.AfterApply(), "is a loopback resolver", "the preset turns the redirect on")
 
 	for _, cmd := range []*StartCmd{
-		{DNSRedirectIptables: true, DNSUpstream: "168.63.129.16:53"},
-		{DNSRedirectIptables: true, DNSUpstream: "[2001:4860:4860::8888]:53"},
-		{DNSRedirectIptables: true, DNSUpstream: "kube-dns.kube-system.svc:53"},
+		{DNSRedirect: true, DNSUpstream: "168.63.129.16:53"},
+		{DNSRedirect: true, DNSUpstream: "[2001:4860:4860::8888]:53"},
+		{DNSRedirect: true, DNSUpstream: "kube-dns.kube-system.svc:53"},
 		{DNSUpstream: "127.0.0.100:53"},
-		{DNSRedirectIptables: true, DisableDNSTracking: true, DNSUpstream: "127.0.0.100:53"},
+		{DNSRedirect: true, DisableDNSTracking: true, DNSUpstream: "127.0.0.100:53"},
 	} {
 		require.NoError(t, cmd.AfterApply(), "%+v", *cmd)
 	}
@@ -500,6 +500,29 @@ func TestStartCmd_ApiFailureModeFlag(t *testing.T) {
 
 	_, err = parse("start", "--dns-upstream", "8.8.8.8:53", "--api-failure-mode", "abort")
 	require.Error(t, err, "kong enum must reject unknown failure modes")
+}
+
+// --dns-redirect was --dns-redirect-iptables until the redirect stopped
+// using iptables; configs and workflows written against the old name, flag
+// or env var, keep working.
+func TestStartCmd_DNSRedirectOldNames(t *testing.T) {
+	parse := func(args ...string) *CLI {
+		cli := &CLI{}
+		parser, err := kong.New(cli, kong.Vars{"version": "test"})
+		require.NoError(t, err)
+		_, err = parser.Parse(append([]string{"start", "--dns-upstream", "8.8.8.8:53"}, args...))
+		require.NoError(t, err)
+		return cli
+	}
+	assert.False(t, parse().Start.DNSRedirect)
+	assert.True(t, parse("--dns-redirect").Start.DNSRedirect)
+	assert.True(t, parse("--dns-redirect-iptables").Start.DNSRedirect)
+
+	t.Setenv("CARGOWALL_DNS_REDIRECT_IPTABLES", "true")
+	assert.True(t, parse().Start.DNSRedirect)
+	t.Setenv("CARGOWALL_DNS_REDIRECT_IPTABLES", "")
+	t.Setenv("CARGOWALL_DNS_REDIRECT", "true")
+	assert.True(t, parse().Start.DNSRedirect)
 }
 
 // An env var that is SET BUT EMPTY (the `env: X: ${{ inputs.y }}` shape with

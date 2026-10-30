@@ -22,52 +22,44 @@ import (
 	"github.com/code-cargo/cargowall/pkg/network"
 )
 
-// dnsRedirect owns --dns-redirect-iptables: the redirect that sends every
-// resolver this netns and its docker bridges use through the proxy. It is
-// the only thing that does: without it the proxy sees just the clients that
-// pick it by choice, and any other resolver's answers never reach the
-// firewall. Under an enforcing policy the job's allowed hostnames are then
-// blocked on their bare IPs, which reads as a policy gap and pushes the
-// operator to allow CDN addresses instead of fixing the capture. So a
-// redirect that does not come up is a lost posture, and what that costs
-// depends on the policy's mode, which is known only after the policy loads:
-// by then the redirect must already be up, so setup records the failure and
-// settle reports it.
+// dnsRedirect owns --dns-redirect: the redirect that sends every resolver
+// this netns and its docker bridges use through the proxy. It is the only
+// thing that does: without it the proxy sees just the clients that pick it
+// by choice, and any other resolver's answers never reach the firewall.
+// Under an enforcing policy the job's allowed hostnames are then blocked on
+// their bare IPs, which reads as a policy gap and pushes the operator to
+// allow CDN addresses instead of fixing the capture. So a redirect that does
+// not come up is a lost posture, and what that costs depends on the
+// policy's mode, which is known only after the policy loads: by then the
+// redirect must already be up, so setup records the failure and settle
+// reports it.
 type dnsRedirect struct {
-	active bool
-	err    error // why setup failed
+	installed *network.DNSRedirect
+	err       error // why setup failed
 }
 
 // startDNSRedirect installs the redirect for the proxy, and for its
 // container listener at bridgeIP when there is one. The returned undo
-// removes it; the caller defers it. It is registered before setup so a
-// signal landing mid-setup still has one, and removing a redirect that was
-// never installed is a quiet no-op. After a failed setup the undo still
-// runs, for a table a crashed earlier run left, but its failure is the
-// setup's failure again and settle already reports that.
+// removes it; the caller defers it. Unlike the other host mutations it is
+// registered after setup: the kernel deletes the table with its owning
+// socket however the process ends, so a signal landing mid-setup leaves
+// nothing behind.
 func startDNSRedirect(bridgeIP string, teardowns *teardownList, logger *slog.Logger) (*dnsRedirect, func()) {
-	r := &dnsRedirect{}
+	installed, err := network.SetupDNSRedirect(logger, bridgeIP)
+	if err != nil {
+		return &dnsRedirect{err: err}, func() {}
+	}
 	undo := teardowns.add(func() {
-		err := network.TeardownDNSRedirect(logger)
-		switch {
-		case err == nil:
-		case r.err != nil:
-			logger.Debug("DNS redirect teardown after a failed setup", "error", err)
-		default:
+		if err := installed.Teardown(); err != nil {
 			logger.Warn("Failed to tear down DNS redirect", "error", err)
 		}
 	})
-	if err := network.SetupDNSRedirect(logger, bridgeIP); err != nil {
-		r.err = err
-		return r, undo
-	}
-	r.active = true
-	return r, undo
+	return &dnsRedirect{installed: installed}, undo
 }
 
 // isActive reports whether the redirect is in place. Nil-safe: nil is the
 // redirect not requested.
-func (r *dnsRedirect) isActive() bool { return r != nil && r.active }
+func (r *dnsRedirect) isActive() bool { return r != nil && r.installed != nil }
 
 // settle hands a failed setup to the ledger, which owns the log line and
 // decides whether startup fails. Nil-safe.

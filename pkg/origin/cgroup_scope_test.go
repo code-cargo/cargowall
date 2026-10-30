@@ -683,6 +683,16 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	s.clearMark(ownID, dir, path, true, &found)
 	require.True(t, marked() && !recorded(), "an entry made between the looks is taken out, the mark kept")
 
+	// A listed cgroup ours alone, recorded and marked at once (as
+	// scope_leave leaves it for an instant), loses its mark and settles: a
+	// task outside entering between the look and the clearing marks it
+	// again and takes it out.
+	require.NoError(t, s.cgroups().Put(ownID, uint8(1)))
+	s.mark(ownID, path, &found)
+	looksRead("7\n", "7\n0\n")
+	s.reconcileListed(ownID, &listed{tgids: map[uint32]bool{7: true}}, true, &found)
+	require.True(t, marked() && !recorded(), "a listed cgroup unmarked while a task outside entered is marked again")
+
 	// A task of ours alone entering an empty cgroup between the looks,
 	// which scope_enter passed over for the mark, is recorded.
 	looksRead("", "7\n")
@@ -716,7 +726,7 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	s.clearMark(ownID, dir, path, true, &found)
 	require.True(t, marked() && !recorded(), "clearMark's unread second look puts the mark back")
 	require.Contains(t, log.String(), "cannot read a cgroup", "and reports it")
-	s.unmark(ownID)
+	s.forgetMark(ownID)
 	found = newWalkFindings()
 	log.Reset()
 	looksRead(syscall.EIO)

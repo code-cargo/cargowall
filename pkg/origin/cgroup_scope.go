@@ -352,7 +352,7 @@ func (s *cgroupScope) reconcileMarked(tasks map[uint64]*listed, marked map[uint6
 		}
 		dir, path, inside, gone := s.open(id, found)
 		if gone {
-			s.unmark(id)
+			s.forgetMark(id)
 		}
 		if dir == nil {
 			continue
@@ -364,44 +364,21 @@ func (s *cgroupScope) reconcileMarked(tasks map[uint64]*listed, marked map[uint6
 }
 
 // clearMark clears the mark of the cgroup open at dir, id, if no task
-// outside our pid namespace is in it. One a task of ours has entered since
-// the listing, which scope_enter left out for the mark, is recorded, as
-// the listing would have, where the hook can see it (inside). One with no
-// task of ours is looked at again: a task outside that entered between the
-// look and the clearing was not seen by scope_leave, which marks only
-// cgroups the scope holds, so the cgroup is marked again, and taken out
-// should a task of ours have entered since and recorded it (leave). A task
-// of ours alone that entered while the mark was up, which scope_enter
-// passed over, is recorded; record's own second look covers a task outside
-// entering after that. A second look that cannot read the cgroup puts the
-// mark back, and reports it.
+// outside our pid namespace is in it, and settles it (unmark): one a task
+// of ours alone has entered since the listing, which scope_enter left out
+// for the mark, is recorded, as the listing would have, where the hook can
+// see it (inside).
 func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside bool, found *walkFindings) {
 	m, err := cgroupMembers(dir)
 	switch {
 	case cgroupGone(err):
-		s.unmark(id)
+		s.forgetMark(id)
 	case err != nil:
 		s.unreadable(id, path, err, found)
 	case m.theirs:
 		// Still shared: the mark stays.
-	case m.ours && inside:
-		s.unmark(id)
-		s.record(id, dir, path, found)
 	default:
-		s.unmark(id)
-		again, err := cgroupMembers(dir)
-		switch {
-		case cgroupGone(err):
-		case err != nil:
-			// Whether a task outside entered since is unknown: the mark
-			// goes back, and the cgroup is reported.
-			s.mark(id, path, found)
-			s.unreadable(id, path, err, found)
-		case again.theirs:
-			s.leave(id, path, again.ours, found)
-		case again.ours && inside:
-			s.record(id, dir, path, found)
-		}
+		s.unmark(id, dir, path, inside, found)
 	}
 }
 
@@ -427,8 +404,15 @@ func (s *cgroupScope) mark(id uint64, path string, found *walkFindings) {
 	}
 }
 
-// unmark clears a cgroup's shared mark.
-func (s *cgroupScope) unmark(id uint64) {
+// unmark clears the shared mark of the cgroup open at dir, and settles it.
+func (s *cgroupScope) unmark(id uint64, dir *os.File, path string, inside bool, found *walkFindings) {
+	_ = s.objs.MapScopeShared.Delete(id)
+	s.settle(id, dir, path, inside, false, found)
+}
+
+// forgetMark clears the shared mark of a cgroup that has been removed,
+// which no task can enter again.
+func (s *cgroupScope) forgetMark(id uint64) {
 	_ = s.objs.MapScopeShared.Delete(id)
 }
 
@@ -444,7 +428,7 @@ func (s *cgroupScope) stopping() bool {
 
 // reconcileListed reconciles cgroup id, which the task walk listed: one
 // that holds a task of ours and no other is recorded, its shared mark
-// cleared first. One outside our cgroup namespace's root is beyond the
+// cleared first (unmark, which records it once it has settled). One outside our cgroup namespace's root is beyond the
 // hook whatever it holds: an entry a tracepoint made for it is taken out
 // (outsideRoot), and each process of ours there is reported.
 func (s *cgroupScope) reconcileListed(id uint64, l *listed, marked bool, found *walkFindings) {
@@ -469,10 +453,10 @@ func (s *cgroupScope) reconcileListed(id uint64, l *listed, marked bool, found *
 	}
 	existed := s.recorded(id)
 	s.reconcile(id, dir, path, found, func() {
-		if marked {
-			s.unmark(id)
-		}
-		if !existed {
+		switch {
+		case marked:
+			s.unmark(id, dir, path, true, found)
+		case !existed:
 			s.record(id, dir, path, found)
 		}
 	})
@@ -676,18 +660,11 @@ func (s *cgroupScope) recorded(id uint64) bool {
 }
 
 // record puts a cgroup the walk found ours alone, and not yet in the
-// scope, in the scope, then looks again: a task outside our pid namespace
-// that entered it after the first look was not seen by the tracepoints,
-// which take a cgroup out as such a task enters, because the entry did not
-// exist yet. A tracepoint may have made it since, which changes nothing. A
-// cgroup already in the scope before the first look needs neither: the
-// tracepoints have seen every entry since. As in the kernel, a cgroup the
-// map cannot take costs its own sockets, not the scope. One the second
-// look finds removed may have been released before the entry was made, and
-// release is all that takes an entry out, so the walk takes out its own:
-// any socket of ours that outlives the cgroup passes, as it would had the
-// walk come a moment later. One the second look cannot read is taken out
-// and marked, as one found shared is, and reported.
+// scope, in the scope, and settles it. A tracepoint may have made the
+// entry since the look, which changes nothing. A cgroup already in the
+// scope before the look needs neither: the tracepoints have seen every
+// entry since. As in the kernel, a cgroup the map cannot take costs its
+// own sockets, not the scope.
 func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFindings) {
 	err := s.objs.MapScopeCgroups.Update(id, uint8(1), ebpf.UpdateNoExist)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
@@ -698,7 +675,32 @@ func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFi
 		}
 		return
 	}
-	made := err == nil
+	s.settle(id, dir, path, true, err == nil, found)
+}
+
+// The scope holds two entries per cgroup that the tracepoints and the walk
+// both write, recorded (map_scope_cgroups) and marked shared
+// (map_scope_shared), and the walk decides from a look at the cgroup's
+// members: a task entering between the look and the walk's write meets the
+// state before the write. Two writes can lose such an entry, and settle
+// looks again after each, which record and unmark, the only ways the walk
+// makes them, always do. Recording a cgroup: a task outside our pid
+// namespace entering just before found it unrecorded, which scope_leave
+// does not mark. Clearing its mark: a task of ours alone entering just
+// before found it marked, which scope_enter does not record, and a task
+// outside found it marked already. Marking and taking out judge no task
+// outside, and need no second look.
+
+// settle looks again at a cgroup the walk has just recorded (made, when
+// this walk made the entry) or cleared the mark of. A task outside our pid
+// namespace in it now marks it and takes it out (leave); a task of ours
+// alone, inside the root, records it. One removed since loses the entry
+// this walk made: release, all that takes one out, may have passed before
+// it, and any socket of ours that outlives the cgroup passes, as it would
+// had the walk come a moment later. One the look cannot read is marked and
+// taken out, which judges no task outside, and reported, for a walk that
+// reads it to record it again.
+func (s *cgroupScope) settle(id uint64, dir *os.File, path string, inside, made bool, found *walkFindings) {
 	m, err := cgroupMembers(dir)
 	switch {
 	case cgroupGone(err):
@@ -706,14 +708,13 @@ func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFi
 			_ = s.objs.MapScopeCgroups.Delete(id)
 		}
 	case err != nil:
-		// Whether a task outside entered since is unknown, so the entry is
-		// not left to judge one: the cgroup is marked and taken out, and
-		// reported, for a walk that reads it to record it again.
 		s.mark(id, path, found)
 		_ = s.objs.MapScopeCgroups.Delete(id)
 		s.unreadable(id, path, err, found)
 	case m.theirs:
 		s.leave(id, path, m.ours, found)
+	case m.ours && inside && !s.recorded(id):
+		s.record(id, dir, path, found)
 	}
 }
 

@@ -216,6 +216,17 @@ static __always_inline void scope_leave(struct cgroup *cg)
         scope_count(SCOPE_STAT_FAILED);
 }
 
+// scope_entered judges cg, which task has just entered: a task of ours
+// records it (scope_enter), any other takes it out (scope_leave). Each way
+// a task enters a cgroup comes here.
+static __always_inline void scope_entered(struct task_struct *task, struct cgroup *cg)
+{
+    if (ns_tgid_of(task))
+        scope_enter(cg);
+    else
+        scope_leave(cg);
+}
+
 // A task created by clone3 in the cgroup CLONE_INTO_CGROUP named, before
 // it runs: a task of ours enters it, any other leaves it out of the scope.
 // The flag, not a comparison with the parent's cgroup: this fires
@@ -227,10 +238,7 @@ int BPF_PROG(scope_fork, struct task_struct *task, __u64 clone_flags)
 {
     if (!(clone_flags & CLONE_INTO_CGROUP))
         return 0;
-    if (ns_tgid_of(task))
-        scope_enter(dfl_cgroup(task));
-    else
-        scope_leave(dfl_cgroup(task));
+    scope_entered(task, dfl_cgroup(task));
     return 0;
 }
 
@@ -246,10 +254,7 @@ int BPF_PROG(scope_attach, struct cgroup *dst, const char *path,
 {
     if (BPF_CORE_READ(dst, root, hierarchy_id) != 0)
         return 0;
-    if (ns_tgid_of(task))
-        scope_enter(dst);
-    else
-        scope_leave(dst);
+    scope_entered(task, dst);
     return 0;
 }
 

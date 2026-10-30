@@ -91,11 +91,14 @@ verify_http() {
 # (--add-host, so no lookup of it) and prints REACHED when any HTTP response
 # came back, BLOCKED when none did. wget exits non-zero on an error status
 # too, so its exit code cannot tell a drop from a 4xx; -S prints the status
-# line whenever there is one.
+# line whenever there is one. The output goes to a file, never a pipe: when
+# wget times out, its TLS helper (ssl_client) stays blocked in the dropped
+# handshake holding whatever pipe it inherited, and a reader of that pipe
+# waits until the server gives up — minutes. The container's exit kills it.
 container_probe() {
   local name=$1 ip=$2
   docker run --rm --add-host "$name:$ip" alpine:latest sh -c \
-    "if wget -S -O /dev/null --timeout=8 --no-check-certificate https://$name/ 2>&1 | grep -q 'HTTP/'; then echo REACHED; else echo BLOCKED; fi" 2>&1 || true
+    "timeout 20 wget -S -O /dev/null --timeout=8 --no-check-certificate https://$name/ > /tmp/probe 2>&1; if grep -q 'HTTP/' /tmp/probe; then echo REACHED; else echo BLOCKED; fi" 2>&1 || true
 }
 
 # Container traffic meets the same hook in its own netns, before NAT.

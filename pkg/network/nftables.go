@@ -35,7 +35,8 @@ import (
 // nftTableFOwner is NFT_TABLE_F_OWNER (include/uapi/linux/netfilter/
 // nf_tables.h, kernel 5.12; x/sys/unix does not carry it). An owned table
 // can be changed or deleted only from the netlink socket that created it,
-// and the kernel deletes it when that socket closes.
+// and the kernel deletes it when that socket closes. An older kernel
+// refuses the flag.
 const nftTableFOwner = 0x2
 
 // nftTimeout bounds each transaction's wait for the kernel's answers, so a

@@ -243,13 +243,18 @@ func verdict(kind expr.VerdictKind) []expr.Any {
 }
 
 // DNSRedirect is the redirect. Once installed it keeps the netlink socket
-// that created the table, and that socket owns it: no other socket can
-// change or delete the table, and the kernel deletes it when the socket
-// closes, which the process's exit does however it ends. A cargowall killed
-// outright therefore takes the redirect with it rather than leaving the
-// host's DNS DNAT'd to a proxy that is gone; only the conntrack flush
-// Teardown would have run is lost. The socket is close-on-exec, so no child
-// keeps the table alive.
+// that created the table, and on kernel 5.12 and later that socket owns it:
+// no other socket can change or delete the table, and the kernel deletes it
+// when the socket closes, which the process's exit does however it ends. A
+// cargowall killed outright therefore takes the redirect with it rather
+// than leaving the host's DNS DNAT'd to a proxy that is gone; only the
+// conntrack flush Teardown would have run is lost. The socket is
+// close-on-exec, so no child keeps the table alive.
+//
+// An older kernel refuses the ownership flag, so there the table is
+// installed unowned: the same redirect, but one that outlives a process
+// that dies without Teardown, until the next Install replaces it, and one
+// another process can delete.
 //
 // Install and Teardown may run concurrently: a forced shutdown tears down
 // from another goroutine while startup is still installing. Teardown then
@@ -257,16 +262,18 @@ func verdict(kind expr.VerdictKind) []expr.Any {
 // after Teardown refuses.
 type DNSRedirect struct {
 	logger *slog.Logger
+	owned  bool // the table is the socket's own (NFT_TABLE_F_OWNER)
 
 	mu   sync.Mutex
-	conn *netlink.Conn // the owning socket while installed
+	conn *netlink.Conn // the socket that made the table, while installed
 	done bool          // torn down
 }
 
 // NewDNSRedirect returns a redirect to Install. Register its Teardown
-// first.
-func NewDNSRedirect(logger *slog.Logger) *DNSRedirect {
-	return &DNSRedirect{logger: logger}
+// first. owned asks for a table owned by the redirect's socket, which needs
+// kernel 5.12: pass false on an older kernel.
+func NewDNSRedirect(logger *slog.Logger, owned bool) *DNSRedirect {
+	return &DNSRedirect{logger: logger, owned: owned}
 }
 
 // Install installs the redirect table (see redirectChains): outbound DNS
@@ -290,11 +297,15 @@ func (r *DNSRedirect) Install(bridgeIP string) error {
 	}
 	create, errCreate := newTableMsg(0)
 	del, errDel := delTableMsg()
-	owned, errOwned := newTableMsg(nftTableFOwner)
-	if err := errors.Join(errCreate, errDel, errOwned); err != nil {
+	var flags uint32
+	if r.owned {
+		flags = nftTableFOwner
+	}
+	table, errTable := newTableMsg(flags)
+	if err := errors.Join(errCreate, errDel, errTable); err != nil {
 		return fmt.Errorf("nftables: %w", err)
 	}
-	msgs := []netlink.Message{create, del, owned}
+	msgs := []netlink.Message{create, del, table}
 	for _, c := range redirectChains(bridge) {
 		chain, err := chainMsgs(c)
 		if err != nil {
@@ -320,7 +331,8 @@ func (r *DNSRedirect) Install(bridgeIP string) error {
 		return fmt.Errorf("nftables: installing table ip %s: %w%s", RedirectTable, err, installHint(err))
 	}
 	r.conn = conn
-	r.logger.Info("DNS redirect installed", "nftables_table", "ip "+RedirectTable, "container_bridge_redirect", bridge != nil)
+	r.logger.Info("DNS redirect installed", "nftables_table", "ip "+RedirectTable, "owned", r.owned,
+		"container_bridge_redirect", bridge != nil)
 
 	// Purge DNS flow state predating the redirect — nat verdicts are
 	// per-flow, so those flows would keep bypassing the proxy (see
@@ -424,10 +436,12 @@ func FlushResolvedCache(ctx context.Context, logger *slog.Logger) error {
 	return nil
 }
 
-// Teardown deletes the redirect table and closes the socket that owns it,
-// then flushes the DNS flows still DNAT'd to the proxy. Closing the socket
-// alone would delete the table too; deleting it first reports a failure,
-// and either way the table is gone before the flush. A redirect never
+// Teardown deletes the redirect table and closes the socket that made it,
+// then flushes the DNS flows still DNAT'd to the proxy. For an owned table,
+// closing the socket alone would delete it too, so a failed delete only
+// warns and the table is gone before the flush either way. An unowned table
+// stays unless the delete succeeds, so there a failed delete is the error;
+// one another process already deleted only warns. A redirect never
 // installed has nothing to remove. Safe to call more than once, and
 // nil-safe.
 func (r *DNSRedirect) Teardown() error {
@@ -440,19 +454,27 @@ func (r *DNSRedirect) Teardown() error {
 	if r.conn == nil {
 		return nil
 	}
-	msg, err := delTableMsg()
-	if err == nil {
-		err = transact(r.conn, []netlink.Message{msg})
+	msg, delErr := delTableMsg()
+	if delErr == nil {
+		delErr = transact(r.conn, []netlink.Message{msg})
 	}
-	if err != nil {
-		r.logger.Warn("Deleting the DNS redirect table failed; closing the socket that owns it removes it",
-			"error", err)
-	}
-	err = r.conn.Close()
+	closeErr := r.conn.Close()
 	r.conn = nil
-	if err != nil {
-		err = fmt.Errorf("nftables: closing the socket that owns table ip %s: %w", RedirectTable, err)
-	} else {
+	var err error
+	switch {
+	case delErr == nil:
+	case errors.Is(delErr, unix.ENOENT):
+		r.logger.Warn("The DNS redirect table was already gone: another process deleted it")
+	case r.owned:
+		r.logger.Warn("Deleting the DNS redirect table failed; closing the socket that owns it removes it",
+			"error", delErr)
+		if closeErr != nil {
+			err = fmt.Errorf("nftables: closing the socket that owns table ip %s: %w", RedirectTable, closeErr)
+		}
+	default:
+		err = fmt.Errorf("nftables: deleting table ip %s: %w", RedirectTable, delErr)
+	}
+	if err == nil {
 		r.logger.Info("DNS redirect removed")
 	}
 

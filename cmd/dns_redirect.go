@@ -17,7 +17,6 @@
 package cmd
 
 import (
-	"fmt"
 	"log/slog"
 
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
@@ -41,22 +40,15 @@ type dnsRedirect struct {
 
 // startDNSRedirect installs the redirect for the proxy, and for its
 // container listener at bridgeIP when there is one. kernel is the uname
-// release: the redirect's owned table needs 5.12, above the 5.8 the rest of
-// cargowall needs, and an older kernel would refuse the table's flags with
-// a bare EINVAL, so it is refused here by name instead. The returned undo
+// release, which decides whether the table can be owned (see ownedTable).
+// The returned undo
 // removes it; the caller defers it. It is registered before the install,
-// like every host mutation's: the kernel deletes the table with its owning
-// socket however the process ends, but a forced shutdown landing
-// mid-install still owes the flush of the flows DNAT'd to the proxy
-// meanwhile, and its teardown waits for the install to finish.
+// like every host mutation's: a forced shutdown landing mid-install waits
+// for it, then removes the table, which an unowned one needs, and flushes
+// the flows DNAT'd to the proxy meanwhile, which even an owned one dying
+// with the process does not do.
 func startDNSRedirect(bridgeIP, kernel string, teardowns *teardownList, logger *slog.Logger) (*dnsRedirect, func()) {
-	switch ok, err := cargowallEbpf.KernelAtLeast(kernel, 5, 12); {
-	case err != nil:
-		return notInstalled(fmt.Errorf("the redirect's owned nftables table needs kernel 5.12: %w", err), logger), func() {}
-	case !ok:
-		return notInstalled(fmt.Errorf("kernel %s is older than 5.12, which the redirect's owned nftables table needs", kernel), logger), func() {}
-	}
-	redirect := network.NewDNSRedirect(logger)
+	redirect := network.NewDNSRedirect(logger, ownedTable(kernel, logger))
 	undo := teardowns.add(func() {
 		if err := redirect.Teardown(); err != nil {
 			logger.Warn("Failed to tear down DNS redirect", "error", err)
@@ -66,6 +58,24 @@ func startDNSRedirect(bridgeIP, kernel string, teardowns *teardownList, logger *
 		return notInstalled(err, logger), undo
 	}
 	return &dnsRedirect{}, undo
+}
+
+// ownedTable reports whether the kernel can make the redirect's table the
+// process's own (NFT_TABLE_F_OWNER, 5.12), so that it dies with cargowall.
+// The rest of cargowall runs from 5.8, and below 5.12 the table goes in
+// unowned instead: the same redirect, except that a cargowall dying
+// without tearing it down leaves it in place until the next run replaces
+// it, as the iptables rules it replaced did.
+func ownedTable(kernel string, logger *slog.Logger) bool {
+	ok, err := cargowallEbpf.KernelAtLeast(kernel, 5, 12)
+	switch {
+	case err != nil:
+		logger.Warn("Kernel release unreadable; installing the DNS redirect table unowned", "error", err)
+	case !ok:
+		logger.Info("Kernel predates 5.12, so the DNS redirect table is installed unowned: "+
+			"if cargowall dies without tearing it down, it stays until the next run replaces it", "kernel", kernel)
+	}
+	return err == nil && ok
 }
 
 // notInstalled records a redirect that did not come up, and says so in the

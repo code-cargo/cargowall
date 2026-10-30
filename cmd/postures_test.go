@@ -194,21 +194,25 @@ func TestPostures_DNSRedirect(t *testing.T) {
 	assert.False(t, p.layers[0].degraded())
 }
 
-// The redirect's owned table needs 5.12 while the rest of cargowall runs
-// from 5.8: on an older kernel the redirect is lost, by name, and nothing is
-// installed or left to undo.
-func TestStartDNSRedirect_KernelOlderThan512(t *testing.T) {
-	teardowns := &teardownList{}
-	for _, kernel := range []string{"5.8.0", "5.10.0-1234-aws", "5.11.22"} {
-		r, undo := startDNSRedirect("", kernel, teardowns, slog.New(slog.DiscardHandler))
-		undo()
-		assert.False(t, r.isActive(), kernel)
-		require.EqualError(t, r.err, "kernel "+kernel+" is older than 5.12, which the redirect's owned nftables table needs")
+// The redirect's table can be cargowall's own, dying with it, from 5.12;
+// the rest of cargowall runs from 5.8, and there the table goes in unowned
+// rather than not at all.
+func TestOwnedTable(t *testing.T) {
+	for kernel, want := range map[string]bool{
+		"5.8.0":             false,
+		"5.10.0-1234-aws":   false,
+		"5.11.22":           false,
+		"5.12.0":            true,
+		"5.15.0-1019-azure": true,
+		"6.17.0-1022-azure": true,
+		"notakernel":        false,
+	} {
+		var buf bytes.Buffer
+		assert.Equal(t, want, ownedTable(kernel, slog.New(slog.NewTextHandler(&buf, nil))), kernel)
+		if !want {
+			assert.Contains(t, buf.String(), "unowned", "%s: an unowned table is said so", kernel)
+		}
 	}
-	r, _ := startDNSRedirect("", "notakernel", teardowns, slog.New(slog.DiscardHandler))
-	require.ErrorContains(t, r.err, "needs kernel 5.12: kernel release \"notakernel\"",
-		"an unreadable release is reported as such, not as an old kernel")
-	assert.Empty(t, teardowns.fns, "nothing installed, nothing to undo")
 }
 
 // Policy lockdown stays up deny-all until the job ends, and the job has

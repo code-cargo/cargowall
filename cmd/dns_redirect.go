@@ -50,7 +50,10 @@ type dnsRedirect struct {
 // mid-install still owes the flush of the flows DNAT'd to the proxy
 // meanwhile, and its teardown waits for the install to finish.
 func startDNSRedirect(bridgeIP, kernel string, teardowns *teardownList, logger *slog.Logger) (*dnsRedirect, func()) {
-	if ok, err := cargowallEbpf.KernelAtLeast(kernel, 5, 12); err != nil || !ok {
+	switch ok, err := cargowallEbpf.KernelAtLeast(kernel, 5, 12); {
+	case err != nil:
+		return notInstalled(fmt.Errorf("the redirect's owned nftables table needs kernel 5.12: %w", err), logger), func() {}
+	case !ok:
 		return notInstalled(fmt.Errorf("kernel %s is older than 5.12, which the redirect's owned nftables table needs", kernel), logger), func() {}
 	}
 	redirect := network.NewDNSRedirect(logger)

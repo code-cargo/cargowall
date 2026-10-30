@@ -86,10 +86,11 @@ const (
 // output, the nat hook for locally generated packets:
 //   - the DNS proxy's own sockets (DNSProxyFWMark: its upstream client, its
 //     listeners, the startup stub peeks) return first, before any DNAT;
-//   - the systemd-resolved stub is DNAT'd too: a stub-following client
-//     otherwise reaches resolved, which re-queries upstream from its OWN
-//     socket, laundering the querying process away from the sockdiag join
-//     and serving warm cache hits the proxy never sees;
+//   - systemd-resolved's stubs are DNAT'd too, 127.0.0.53 and the proxy-mode
+//     127.0.0.54 (systemd 247 and later): a stub-following client otherwise
+//     reaches resolved, which re-queries upstream from its OWN socket,
+//     laundering the querying process away from the sockdiag join and
+//     serving warm cache hits the proxy never sees;
 //   - every other DNS leaving for a non-loopback address goes to the proxy.
 //     127.0.0.1, the proxy's listen address, is never DNAT'd.
 //
@@ -112,14 +113,15 @@ const (
 // query by container IP.
 func redirectChains(bridgeIP net.IP) []redirectChain {
 	proxy := net.IPv4(127, 0, 0, 1).To4()
-	stub := net.IPv4(127, 0, 0, 53).To4()
-	output := slices.Concat(
-		udpAndTCP(func(proto []expr.Any) []expr.Any {
-			return slices.Concat(proto, port(dstPort, 53), markIs(DNSProxyFWMark), verdict(expr.VerdictReturn))
-		}),
-		udpAndTCP(func(proto []expr.Any) []expr.Any {
+	output := udpAndTCP(func(proto []expr.Any) []expr.Any {
+		return slices.Concat(proto, port(dstPort, 53), markIs(DNSProxyFWMark), verdict(expr.VerdictReturn))
+	})
+	for _, stub := range []net.IP{net.IPv4(127, 0, 0, 53).To4(), net.IPv4(127, 0, 0, 54).To4()} {
+		output = append(output, udpAndTCP(func(proto []expr.Any) []expr.Any {
 			return slices.Concat(proto, daddr(expr.CmpOpEq, stub), port(dstPort, 53), dnat(proxy, 53))
-		}),
+		})...)
+	}
+	output = slices.Concat(output,
 		// One byte of the address is the /8: 127.0.0.0/8 is every address
 		// whose first byte is 127.
 		udpAndTCP(func(proto []expr.Any) []expr.Any {
@@ -301,25 +303,6 @@ func (r *DNSRedirect) Install(bridgeIP string) error {
 		msgs = append(msgs, chain...)
 	}
 
-	if err := r.commit(msgs); err != nil {
-		return err
-	}
-	r.logger.Info("DNS redirect installed", "nftables_table", "ip "+RedirectTable, "container_bridge_redirect", bridge != nil)
-
-	// Purge DNS flow state predating the redirect — nat verdicts are
-	// per-flow, so those flows would keep bypassing the proxy (see
-	// FlushDNSConntrack). The input guard is already in place, so a reply in
-	// flight across this flush cannot resurrect a deleted flow in reverse.
-	if err := FlushDNSConntrack(r.logger); err != nil {
-		r.logger.Warn("Failed to flush DNS conntrack entries; pre-existing DNS flows may bypass the proxy until they expire",
-			"error", err)
-	}
-	return nil
-}
-
-// commit runs the install transaction on a new socket and keeps it as the
-// table's owner, under the lock Teardown takes.
-func (r *DNSRedirect) commit(msgs []netlink.Message) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch {
@@ -337,6 +320,18 @@ func (r *DNSRedirect) commit(msgs []netlink.Message) error {
 		return fmt.Errorf("nftables: installing table ip %s: %w%s", RedirectTable, err, installHint(err))
 	}
 	r.conn = conn
+	r.logger.Info("DNS redirect installed", "nftables_table", "ip "+RedirectTable, "container_bridge_redirect", bridge != nil)
+
+	// Purge DNS flow state predating the redirect — nat verdicts are
+	// per-flow, so those flows would keep bypassing the proxy (see
+	// FlushDNSConntrack). The input guard is already in place, so a reply in
+	// flight across this flush cannot resurrect a deleted flow in reverse.
+	// Still under the lock, so a Teardown racing the install runs after it
+	// whole, never between the table going in and its flush.
+	if err := FlushDNSConntrack(r.logger); err != nil {
+		r.logger.Warn("Failed to flush DNS conntrack entries; pre-existing DNS flows may bypass the proxy until they expire",
+			"error", err)
+	}
 	return nil
 }
 
@@ -449,12 +444,14 @@ func (r *DNSRedirect) Teardown() error {
 	if err == nil {
 		err = transact(r.conn, []netlink.Message{msg})
 	}
-	if closeErr := r.conn.Close(); err == nil {
-		err = closeErr
+	if err != nil {
+		r.logger.Warn("Deleting the DNS redirect table failed; closing the socket that owns it removes it",
+			"error", err)
 	}
+	err = r.conn.Close()
 	r.conn = nil
 	if err != nil {
-		err = fmt.Errorf("nftables: deleting table ip %s: %w", RedirectTable, err)
+		err = fmt.Errorf("nftables: closing the socket that owns table ip %s: %w", RedirectTable, err)
 	} else {
 		r.logger.Info("DNS redirect removed")
 	}

@@ -205,6 +205,9 @@ func TestStartDNSRedirect_KernelOlderThan512(t *testing.T) {
 		assert.False(t, r.isActive(), kernel)
 		require.EqualError(t, r.err, "kernel "+kernel+" is older than 5.12, which the redirect's owned nftables table needs")
 	}
+	r, _ := startDNSRedirect("", "notakernel", teardowns, slog.New(slog.DiscardHandler))
+	require.ErrorContains(t, r.err, "needs kernel 5.12: kernel release \"notakernel\"",
+		"an unreadable release is reported as such, not as an old kernel")
 	assert.Empty(t, teardowns.fns, "nothing installed, nothing to undo")
 }
 

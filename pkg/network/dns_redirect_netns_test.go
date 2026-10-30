@@ -187,11 +187,13 @@ func TestDNSRedirect_Output(t *testing.T) {
 	got, _ = received(t, proxy, arrives)
 	require.Equal(t, "outside", got, "UDP DNS for an outside resolver must reach the proxy")
 
-	query(t, "127.0.0.53:53", "stub", false)
-	got, _ = received(t, proxy, arrives)
-	require.Equal(t, "stub", got, "UDP DNS for the resolved stub must reach the proxy")
+	for _, stub := range []string{"127.0.0.53:53", "127.0.0.54:53"} {
+		query(t, stub, "stub", false)
+		got, _ = received(t, proxy, arrives)
+		require.Equal(t, "stub", got, "UDP DNS for the resolved stub at %s must reach the proxy", stub)
+	}
 
-	for _, dst := range []string{"10.53.0.2:53", "127.0.0.53:53"} {
+	for _, dst := range []string{"10.53.0.2:53", "127.0.0.53:53", "127.0.0.54:53"} {
 		c, err := net.DialTimeout("tcp4", dst, arrives)
 		require.NoError(t, err, "TCP DNS for %s must reach the proxy", dst)
 		c.Close()
@@ -355,7 +357,7 @@ func TestDNSRedirect_Ownership(t *testing.T) {
 	require.NoError(t, other.Flush())
 	r := NewDNSRedirect(logger)
 	require.NoError(t, r.Install("10.54.0.1"))
-	want := map[string]int{"output": 6, "input": 2, "prerouting": 4}
+	want := map[string]int{"output": 8, "input": 2, "prerouting": 4}
 	require.Equal(t, want, redirectRules(t), "setup must replace an unowned table, not add to it")
 
 	err = NewDNSRedirect(logger).Install("")
@@ -387,7 +389,7 @@ func TestDNSRedirect_Ownership(t *testing.T) {
 	// The socket closing without a teardown, as when the process dies.
 	r = NewDNSRedirect(logger)
 	require.NoError(t, r.Install(""))
-	require.Equal(t, map[string]int{"output": 6, "input": 2}, redirectRules(t))
+	require.Equal(t, map[string]int{"output": 8, "input": 2}, redirectRules(t))
 	require.NoError(t, r.conn.Close())
 	require.Empty(t, redirectRules(t), "the kernel must delete the table with the socket that owns it")
 }

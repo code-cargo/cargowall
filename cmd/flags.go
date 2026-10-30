@@ -360,6 +360,11 @@ const (
 // applyCIPreset turns on the plumbing flags shared by both CI presets, then
 // sets the host auto-allow flag specific to the named CI.
 func (c *StartCmd) applyCIPreset(mode CIMode) {
+	// Implied although losing it fails startup under an enforcing policy,
+	// unlike the optional enforce rungs below: the redirect is not a layer
+	// on top of the policy but what lets its hostname rules work at all.
+	// Without it an enforcing run blocks the hostnames it allows, on bare
+	// IPs, and that reads as a policy gap rather than a broken capture.
 	c.DNSRedirect = true
 	c.DockerDNSInterception = true
 	c.DNSQueryFiltering = true

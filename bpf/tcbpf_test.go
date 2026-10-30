@@ -874,6 +874,25 @@ func TestTcEgressProtocolEnforcement(t *testing.T) {
 	err = objs.MapPortsV6.Update(&portKey6, &portVal, ebpf.UpdateAny)
 	require.NoError(t, err)
 
+	// The same discrimination for port-specific subnets, keyed as the
+	// firewall writes them: by network address and host bits, so the proto
+	// byte is looked up under the masked destination. 10.1.0.0/24 allows TCP
+	// 443, UDP 53 and ICMP; 2001:db8:2::/48 allows TCP 443.
+	subnet4 := TcBpfLpmKey{Prefixlen: 24, Ip: ipToU32("10.1.0.0")}
+	require.NoError(t, objs.MapCidrs.Update(&subnet4, &TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 8}, ebpf.UpdateAny))
+	for _, pk := range []TcBpfPortKey{
+		{Ip: ipToU32("10.1.0.0"), Port: 443, Proto: ipprotoTCP, HostBits: 8},
+		{Ip: ipToU32("10.1.0.0"), Port: 53, Proto: ipprotoUDP, HostBits: 8},
+		{Ip: ipToU32("10.1.0.0"), Port: 0, Proto: ipprotoICMP, HostBits: 8},
+	} {
+		require.NoError(t, objs.MapPorts.Update(&pk, &portVal, ebpf.UpdateAny))
+	}
+	subnet6 := TcBpfLpmKeyV6{Prefixlen: 48}
+	copy(subnet6.Ip[:], net.ParseIP("2001:db8:2::").To16())
+	require.NoError(t, objs.MapCidrsV6.Update(&subnet6, &TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 80}, ebpf.UpdateAny))
+	subnetPort6 := TcBpfPortKeyV6{Ip: subnet6.Ip, Port: 443, Proto: ipprotoTCP, HostBits: 80}
+	require.NoError(t, objs.MapPortsV6.Update(&subnetPort6, &portVal, ebpf.UpdateAny))
+
 	tests := []struct {
 		name    string
 		packet  []byte
@@ -892,6 +911,15 @@ func TestTcEgressProtocolEnforcement(t *testing.T) {
 		// IPv6 TCP-only port
 		{"IPv6 TCP to TCP-only port allowed", craftIPv6TCP(t, "2001:db8:1::1", 443), tcActOK},
 		{"IPv6 UDP to TCP-only port blocked", craftIPv6UDP(t, "2001:db8:1::1", 443), tcActShot},
+		// Port-specific subnets: any member, discriminated by proto
+		{"IPv4 subnet TCP to TCP-only port allowed", craftIPv4TCP(t, "10.1.0.77", 443), tcActOK},
+		{"IPv4 subnet UDP to TCP-only port blocked", craftIPv4UDP(t, "10.1.0.77", 443), tcActShot},
+		{"IPv4 subnet UDP to UDP-only port allowed", craftIPv4UDP(t, "10.1.0.77", 53), tcActOK},
+		{"IPv4 subnet TCP to UDP-only port blocked", craftIPv4TCP(t, "10.1.0.77", 53), tcActShot},
+		{"IPv4 subnet ICMP allowed", craftIPv4ICMP(t, "10.1.0.77"), tcActOK},
+		{"IPv4 subnet TCP to unlisted port blocked", craftIPv4TCP(t, "10.1.0.77", 80), tcActShot},
+		{"IPv6 subnet TCP to TCP-only port allowed", craftIPv6TCP(t, "2001:db8:2:ffff::77", 443), tcActOK},
+		{"IPv6 subnet UDP to TCP-only port blocked", craftIPv6UDP(t, "2001:db8:2:ffff::77", 443), tcActShot},
 	}
 
 	for _, tt := range tests {

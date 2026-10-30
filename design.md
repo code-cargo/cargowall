@@ -127,7 +127,7 @@ flowchart TD
     HasRule{Found<br/>Matching<br/>CIDR?}
 
     IsPortSpecific{port_specific<br/>flag set?}
-    CheckPort["Check Port Map<br/>map_ports (ip:port)"]
+    CheckPort["Check Port Map<br/>map_ports (rule's network,<br/>host_bits, port, proto)"]
     HasPortRule{Found<br/>Port Rule?}
 
     CheckWildcard["Check Wildcard<br/>map_ports (0.0.0.0:port)"]
@@ -193,7 +193,7 @@ flowchart TD
     HasRule{Found<br/>Matching<br/>CIDR?}
 
     IsPortSpecific{port_specific<br/>flag set?}
-    CheckPort["Check Port Map<br/>map_ports_v6 (ip6:port)"]
+    CheckPort["Check Port Map<br/>map_ports_v6 (rule's network,<br/>host_bits, port, proto)"]
     HasPortRule{Found<br/>Port Rule?}
 
     CheckWildcard["Check Wildcard<br/>map_ports_v6 (:::port)"]
@@ -246,19 +246,22 @@ classDiagram
     class LPM_Val {
         +uint8 action
         +uint8 port_specific
-        +uint16 pad
+        +uint8 host_bits
+        +uint8 pad
     }
 
     class Port_Key {
         +uint32 ip
         +uint16 port
-        +uint16 pad
+        +uint8 proto
+        +uint8 host_bits
     }
 
     class Port_Key_V6 {
         +uint8 ip[16]
         +uint16 port
-        +uint16 pad
+        +uint8 proto
+        +uint8 host_bits
     }
 
     class Port_Val {
@@ -280,6 +283,7 @@ classDiagram
         +uint32 pid
         +uint32 _pad2
     }
+    note for LPM_Val "host_bits: 32 (128 for v6) minus the prefix length, 0 = host route\na port-specific rule's port entries are keyed by its network address + host_bits\nthe verdict masks dst by the matched rule's host_bits to find them\nwildcard-port entries: ip 0, host_bits 0"
     note for Blocked_Event "64 bytes total\nip_version: 4 or 6\nallowed: 0=blocked, 1=allowed\ntimestamp: bpf_ktime_get_ns()\npid: from map_sock_pid via socket cookie"
 
     class Default_Action {

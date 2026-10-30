@@ -424,14 +424,15 @@ func TestDNSRedirect_Unowned(t *testing.T) {
 	require.NoError(t, next.Teardown())
 	require.Empty(t, redirectRules(t))
 
-	// Deleted by another process: teardown has nothing left to remove.
+	// Deleted by another process: DNS went around the proxy from then on,
+	// and teardown says so rather than reporting a clean removal.
 	r = refusedOwner(logger)
 	require.NoError(t, r.Install(""))
 	other, err := nftables.New()
 	require.NoError(t, err)
 	other.DelTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: RedirectTable})
 	require.NoError(t, other.Flush(), "an unowned table is anyone's to delete")
-	require.NoError(t, r.Teardown())
+	require.ErrorContains(t, r.Teardown(), "another process deleted it during the run")
 	require.Empty(t, redirectRules(t))
 }
 

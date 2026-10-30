@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/nftables/expr"
 	"golang.org/x/sys/unix"
 )
 
@@ -172,5 +173,65 @@ func TestInstallHint(t *testing.T) {
 	}
 	if got := installHint(errors.New("other")); got != "" {
 		t.Errorf("installHint(other) = %q, want none", got)
+	}
+}
+
+// TestRedirectChains_Order pins, without root, what the rules' order and
+// shape carry; the netns tests prove what they do. In output the proxy's
+// marked sockets return before any DNAT could catch them, or its own
+// upstream queries would loop back into it; every DNAT sends to the proxy;
+// the input guard drops; the nat chains run ahead of dstnat; and the
+// prerouting chain exists only with a bridge listener, sending to it.
+func TestRedirectChains_Order(t *testing.T) {
+	kinds := func(rules [][]expr.Any) (returns, dnats, drops int, order string) {
+		for _, rule := range rules {
+			switch last := rule[len(rule)-1].(type) {
+			case *expr.Verdict:
+				if last.Kind == expr.VerdictReturn {
+					returns++
+					order += "R"
+				} else if last.Kind == expr.VerdictDrop {
+					drops++
+					order += "D"
+				}
+			case *expr.NAT:
+				dnats++
+				order += "N"
+			}
+		}
+		return returns, dnats, drops, order
+	}
+
+	chains := redirectChains(nil)
+	if len(chains) != 2 || chains[0].name != "output" || chains[1].name != "input" {
+		t.Fatalf("without a bridge want output and input chains, got %+v", chains)
+	}
+	if returns, dnats, _, order := kinds(chains[0].rules); returns != 2 || dnats != 6 || order != "RRNNNNNN" {
+		t.Errorf("output rules = %q, want the 2 mark returns ahead of the 6 DNATs", order)
+	}
+	if _, _, drops, order := kinds(chains[1].rules); drops != 2 || order != "DD" {
+		t.Errorf("input rules = %q, want 2 drops", order)
+	}
+	if chains[0].priority != -101 || chains[1].priority != 0 {
+		t.Errorf("priorities output %d input %d, want -101 (ahead of dstnat) and 0", chains[0].priority, chains[1].priority)
+	}
+	for _, rule := range chains[0].rules[2:] {
+		if imm, ok := rule[len(rule)-3].(*expr.Immediate); !ok || !net.IP(imm.Data).Equal(net.IPv4(127, 0, 0, 1)) {
+			t.Errorf("an output DNAT does not send to the proxy at 127.0.0.1: %+v", rule[len(rule)-3])
+		}
+	}
+
+	bridge := net.IPv4(172, 17, 0, 1).To4()
+	chains = redirectChains(bridge)
+	if len(chains) != 3 || chains[2].name != "prerouting" || chains[2].priority != -101 {
+		t.Fatalf("with a bridge want a prerouting chain at -101 third, got %+v", chains)
+	}
+	if _, dnats, _, _ := kinds(chains[2].rules); dnats != 4 {
+		t.Errorf("prerouting has %d DNATs, want 4 (docker0 and br-*, UDP and TCP)", dnats)
+	}
+	for _, rule := range chains[2].rules {
+		if imm, ok := rule[len(rule)-3].(*expr.Immediate); !ok || !net.IP(imm.Data).Equal(bridge) {
+			t.Errorf("a prerouting DNAT does not send to the bridge listener: %+v", rule[len(rule)-3])
+		}
 	}
 }

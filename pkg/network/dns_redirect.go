@@ -323,9 +323,11 @@ func (r *DNSRedirect) Install(bridgeIP string) error {
 	conn, err := installTable(r.ownerFlag, chains)
 	owned := err == nil && r.ownerFlag != 0
 	if r.ownerFlag != 0 && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP)) {
-		r.logger.Info("The kernel refused an owned DNS redirect table (owned tables need 5.12), so it is installed unowned: "+
-			"if cargowall dies without tearing it down, it stays until the next run replaces it", "error", err)
-		conn, err = installTable(0, chains)
+		refused := err
+		if conn, err = installTable(0, chains); err == nil {
+			r.logger.Info("The kernel refused an owned DNS redirect table (owned tables need 5.12), so it went in unowned: "+
+				"if cargowall dies without tearing it down, it stays until the next run replaces it", "refusal", refused)
+		}
 	}
 	if err != nil {
 		return err
@@ -475,8 +477,9 @@ func FlushResolvedCache(ctx context.Context, logger *slog.Logger) error {
 // then flushes the DNS flows still DNAT'd to the proxy. For an owned table,
 // closing the socket alone would delete it too, so a failed delete only
 // warns and the table is gone before the flush either way. An unowned table
-// stays unless the delete succeeds, so there a failed delete is the error;
-// one another process already deleted only warns. A redirect never
+// stays unless the delete succeeds, so there a failed delete is the error,
+// and so is finding it already gone: another process deleted it during the
+// run, and DNS went around the proxy from then on. A redirect never
 // installed has nothing to remove. Safe to call more than once, and
 // nil-safe.
 func (r *DNSRedirect) Teardown() error {
@@ -499,7 +502,10 @@ func (r *DNSRedirect) Teardown() error {
 	switch {
 	case delErr == nil:
 	case errors.Is(delErr, unix.ENOENT):
-		r.logger.Warn("The DNS redirect table was already gone: another process deleted it")
+		// Only an unowned table can be deleted by another process, and
+		// whenever that happened, DNS went around the proxy from then on.
+		err = fmt.Errorf("table ip %s was already gone at teardown: another process deleted it during the run, "+
+			"and DNS went around the proxy from then on", RedirectTable)
 	case r.owned:
 		r.logger.Warn("Deleting the DNS redirect table failed; closing the socket that owns it removes it",
 			"error", delErr)
@@ -508,8 +514,9 @@ func (r *DNSRedirect) Teardown() error {
 		}
 	default:
 		// Nothing else removes an unowned table: one more try on a new
-		// socket, in case the first died with a lost reply.
-		if delErr = deleteTable(); delErr != nil {
+		// socket, in case the first died with a lost reply. Gone by then
+		// means the first try deleted it.
+		if delErr = deleteTable(); delErr != nil && !errors.Is(delErr, unix.ENOENT) {
 			err = fmt.Errorf("nftables: deleting table ip %s: %w; host DNS stays redirected to the stopped proxy "+
 				"until it is removed (nft delete table ip %s)", RedirectTable, delErr, RedirectTable)
 		}

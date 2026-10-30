@@ -130,10 +130,14 @@ func chainMsgs(c redirectChain) ([]netlink.Message, error) {
 // CAP_NET_ADMIN or of nf_tables, is answered with one error and no acks.
 // The caller closes the socket after an error, dropping whatever answers
 // are still queued.
+//
+// The kernel runs the whole transaction inside the send, module loads for
+// the nat chain type and expressions included, which on a cold host can
+// take seconds; by the time the send returns, every answer is queued. So
+// the deadline bounds only the wait for them, set once the send is done: a
+// deadline running from before it could expire during a transaction that
+// committed and refuse to read its answers.
 func transact(conn *netlink.Conn, msgs []netlink.Message) error {
-	if err := conn.SetDeadline(time.Now().Add(nftTimeout)); err != nil {
-		return err
-	}
 	// The batch markers carry the subsystem the transaction is for in
 	// nfgenmsg's resource id.
 	marker := func(t netlink.HeaderType) netlink.Message {
@@ -147,6 +151,9 @@ func transact(conn *netlink.Conn, msgs []netlink.Message) error {
 	batch = append(batch, msgs...)
 	batch = append(batch, marker(unix.NFNL_MSG_BATCH_END))
 	if _, err := conn.SendMessages(batch); err != nil {
+		return err
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(nftTimeout)); err != nil {
 		return err
 	}
 	for acked := 0; acked < len(msgs); {

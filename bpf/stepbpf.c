@@ -121,7 +121,6 @@ static __always_inline struct step_state *step_state(void) {
     return bpf_map_lookup_elem(&map_step_state, &key);
 }
 
-
 // Tag propagation. Runs synchronously inside fork(), in the parent's
 // context, so the child's tag exists before its first instruction — step
 // attribution has no detection race for host processes.

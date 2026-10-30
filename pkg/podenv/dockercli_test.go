@@ -28,6 +28,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // /proc/<pid>/environ is NUL-separated KEY=value, values free to hold "=",
@@ -66,7 +68,7 @@ func TestStartedBySudo(t *testing.T) {
 		}
 		return path
 	}
-	sudo, worker := standIn("sudo"), standIn(RunnerWorkerComm)
+	sudo, worker := standIn("sudo"), standIn(procfs.RunnerWorkerComm)
 	// start runs script under the stand-in top, with DOCKER_HOST and env in
 	// its environment, and returns the sleep at the bottom of the chain.
 	// The trailing commands keep each shell from exec'ing the next in its
@@ -88,7 +90,7 @@ func TestStartedBySudo(t *testing.T) {
 				pid, _ = strconv.Atoi(f[0])
 				continue
 			}
-			if Comm(pid) == "sleep" {
+			if procfs.Comm(pid) == "sleep" {
 				t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
 				return pid
 			}

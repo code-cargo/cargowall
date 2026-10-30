@@ -28,7 +28,7 @@ import (
 
 	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/origin"
-	"github.com/code-cargo/cargowall/pkg/podenv"
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // joinKind is what a set of origin candidates supports claiming.
@@ -172,7 +172,7 @@ func (t *Tracker) applyJoin(audit *events.AuditEvent, res joinResult) {
 	if res.rec.PID != 0 {
 		audit.PID = res.rec.PID
 		if audit.Process == "" {
-			audit.Process = podenv.CommIn(t.opts.ProcRoot, int(res.rec.PID))
+			audit.Process = procfs.CommIn(t.opts.ProcRoot, int(res.rec.PID))
 		}
 	}
 	switch {

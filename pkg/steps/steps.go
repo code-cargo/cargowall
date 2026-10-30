@@ -56,11 +56,12 @@ import (
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/podenv"
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // workerComm is the /proc/<pid>/comm value of the GitHub Actions runner's
 // per-job worker process (13 chars, fits TASK_COMM_LEN untruncated).
-const workerComm = podenv.RunnerWorkerComm
+const workerComm = procfs.RunnerWorkerComm
 
 // stepChildEvent mirrors struct step_child_event in bpf/stepbpf.c.
 type stepChildEvent struct {
@@ -688,7 +689,7 @@ func (t *Tracker) stepCmdline(pid int) string {
 // lines into our audit stream. The scan survives only as a fallback for
 // standalone starts, and then only when it is unambiguous.
 func findWorkerPID() (int, error) {
-	if pid, _, ok := podenv.AncestorByComm(os.Getpid(), workerComm); ok {
+	if pid, _, ok := procfs.AncestorByComm(os.Getpid(), workerComm); ok {
 		return pid, nil
 	}
 	pid, count := scanUniqueByComm(workerComm)
@@ -714,7 +715,7 @@ func scanUniqueByComm(comm string) (first, count int) {
 		if err != nil {
 			continue
 		}
-		if podenv.Comm(pid) == comm {
+		if procfs.Comm(pid) == comm {
 			if count == 0 {
 				first = pid
 			}
@@ -751,5 +752,5 @@ func readCmdline(pid int) string {
 			return s
 		}
 	}
-	return podenv.Comm(pid)
+	return procfs.Comm(pid)
 }

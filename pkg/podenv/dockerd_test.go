@@ -78,9 +78,9 @@ func TestProbeContainerTree(t *testing.T) {
 		t.Skipf("no cgroup v2 mount at %s: %v", CgroupRoot, err)
 	}
 	// No containerd to find: the daemon's own view decides.
-	saved := containerdSockets
-	containerdSockets = nil
-	t.Cleanup(func() { containerdSockets = saved })
+	saved := containerdDefaults
+	containerdDefaults = nil
+	t.Cleanup(func() { containerdDefaults = saved })
 	probe := func(d Dockerd, socket string) Dockerd {
 		d.probeRuntime()
 		d.probeContainerTree(socket)
@@ -103,11 +103,15 @@ func TestProbeContainerTree(t *testing.T) {
 	}
 }
 
-// The runtime whose view decides is the containerd answering at the first
-// of dockerd's sockets for it, found in dockerd's root; with none, dockerd
-// itself. A child of the test, listening, stands in for containerd.
+// The runtime whose view decides is the containerd at the socket dockerd
+// uses, as dockerd picks it: the address it was given, by flag or in its
+// daemon.json, else the first default that is there; with none of those,
+// the daemon itself. A socket that is there but does not answer refuses.
+// A child of the test, listening, stands in for containerd, and shells
+// whose command lines carry dockerd's flags for dockerd.
 func TestRuntimePid(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "containerd.sock")
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "containerd.sock")
 	cmd := exec.Command(os.Args[0], "-test.run", "^TestRuntimeListener$")
 	cmd.Env = append(os.Environ(), "CARGOWALL_TEST_LISTEN="+sock)
 	if err := cmd.Start(); err != nil {
@@ -123,15 +127,78 @@ func TestRuntimePid(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	saved := containerdSockets
-	t.Cleanup(func() { containerdSockets = saved })
-	containerdSockets = []string{filepath.Join(t.TempDir(), "absent.sock"), sock}
-	if got, err := runtimePid(int32(os.Getpid())); err != nil || got != int32(cmd.Process.Pid) {
-		t.Errorf("runtimePid = %d, %v; want the listener's pid %d", got, err, cmd.Process.Pid)
+	containerd := int32(cmd.Process.Pid)
+	// dockerd stands in for a dockerd started with these flags; the
+	// trailing command keeps the shell from exec'ing sleep in its place.
+	dockerd := func(flags ...string) int32 {
+		d := exec.Command("sh", append([]string{"-c", "sleep 60; :", "dockerd"}, flags...)...)
+		if err := d.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = d.Process.Kill()
+			_ = d.Wait()
+		})
+		for i := 0; i < 250; i++ {
+			if data, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", d.Process.Pid)); strings.Contains(string(data), "sleep 60") {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return int32(d.Process.Pid)
 	}
-	containerdSockets = []string{filepath.Join(t.TempDir(), "absent.sock")}
-	if got, err := runtimePid(int32(os.Getpid())); err != nil || got != int32(os.Getpid()) {
-		t.Errorf("runtimePid with no containerd = %d, %v; want the daemon's own %d", got, err, os.Getpid())
+	saved := containerdDefaults
+	t.Cleanup(func() { containerdDefaults = saved })
+	absent := filepath.Join(dir, "absent.sock")
+	dead := filepath.Join(dir, "dead.sock")
+	if err := os.WriteFile(dead, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(dir, "daemon.json")
+	if err := os.WriteFile(config, []byte(`{"containerd":"unix://`+sock+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	noConfig := "--config-file=" + filepath.Join(dir, "none.json")
+	for _, c := range []struct {
+		name     string
+		defaults []string
+		flags    []string
+		want     int32 // 0 wants an error; -1 the stand-in dockerd itself
+	}{
+		{"a default that is there", []string{absent, sock}, []string{noConfig}, containerd},
+		{"--containerd, over the defaults", []string{dead}, []string{noConfig, "--containerd", sock}, containerd},
+		{"the daemon.json's containerd", []string{dead}, []string{"--config-file=" + config}, containerd},
+		{"a default that is there and does not answer", []string{dead, sock}, []string{noConfig}, 0},
+		{"a given address that does not answer", nil, []string{noConfig, "--containerd=" + absent}, 0},
+		{"none there", []string{absent}, []string{noConfig}, -1},
+	} {
+		containerdDefaults = c.defaults
+		pid := dockerd(c.flags...)
+		got, err := runtimePid(pid)
+		switch {
+		case c.want == 0 && err == nil:
+			t.Errorf("%s: runtimePid = %d, want an error", c.name, got)
+		case c.want == -1 && (err != nil || got != pid):
+			t.Errorf("%s: runtimePid = %d, %v; want the daemon's own %d", c.name, got, err, pid)
+		case c.want > 0 && (err != nil || got != c.want):
+			t.Errorf("%s: runtimePid = %d, %v; want containerd's %d", c.name, got, err, c.want)
+		}
+	}
+}
+
+// A dockerd command line gives the containerd address and daemon.json
+// path, as --flag=value or --flag value.
+func TestDockerdFlags(t *testing.T) {
+	for in, want := range map[string][2]string{
+		"dockerd\x00--host=unix:///var/run/docker.sock\x00":                      {"", defaultDaemonConfig},
+		"dockerd\x00--containerd=/run/k3s/containerd/containerd.sock\x00":        {"/run/k3s/containerd/containerd.sock", defaultDaemonConfig},
+		"dockerd\x00--containerd\x00unix:///x.sock\x00--config-file=/c.json\x00": {"/x.sock", "/c.json"},
+		"dockerd\x00--config-file\x00/d.json\x00":                                {"", "/d.json"},
+	} {
+		addr, config := dockerdFlags([]byte(in))
+		if addr != want[0] || config != want[1] {
+			t.Errorf("dockerdFlags(%q) = %q, %q; want %q, %q", in, addr, config, want[0], want[1])
+		}
 	}
 }
 

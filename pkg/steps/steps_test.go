@@ -35,7 +35,7 @@ import (
 
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/events"
-	"github.com/code-cargo/cargowall/pkg/podenv"
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // Note: none of these tests assume Runner.Worker is absent — in CI the
@@ -101,7 +101,7 @@ func TestProcSnapshot_SubtreeTerminatesOnCycle(t *testing.T) {
 }
 
 func TestScanUniqueByComm_FindsSelf(t *testing.T) {
-	selfComm := podenv.Comm(os.Getpid())
+	selfComm := procfs.Comm(os.Getpid())
 	first, count := scanUniqueByComm(selfComm)
 	require.GreaterOrEqual(t, count, 1)
 	if count == 1 {

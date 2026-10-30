@@ -308,7 +308,8 @@ func (s *cgroupScope) reconcileMarked(listed map[uint64]*listed, marked map[uint
 // the listing would have, where the hook can see it (inside). One with no
 // task of ours is looked at again: a task outside that entered between the
 // look and the clearing was not seen by scope_leave, which marks only
-// cgroups the scope holds, and would have the job's next entry record it;
+// cgroups the scope holds, so the cgroup is marked again, and taken out
+// should a task of ours have entered since and recorded it (leave);
 // record's own second look covers the other.
 func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside bool, found *walkFindings) {
 	m, err := cgroupMembers(dir)
@@ -318,13 +319,15 @@ func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside boo
 	case err != nil:
 		s.unreadable(id, path, err, found)
 	case m.theirs:
+		// Still shared: what the last walk logged of it stands.
+		found.shared[id] = s.last.shared[id]
 	case m.ours && inside:
 		s.unmark(id)
 		s.record(id, dir, path, found)
 	default:
 		s.unmark(id)
 		if again, err := cgroupMembers(dir); err == nil && again.theirs {
-			s.mark(id, path, found)
+			s.leave(id, path, again.ours, found)
 		}
 	}
 }
@@ -409,18 +412,20 @@ func (s *cgroupScope) reconcileListed(id uint64, l *listed, marked bool, found *
 
 // reconcile reads who is in the cgroup open at dir, id, and takes it out
 // of the scope if a task outside our pid namespace is in it, or else, if a
-// task of ours is, runs ours. A cgroup removed meanwhile is neither; one
-// that cannot be read is reported.
-func (s *cgroupScope) reconcile(id uint64, dir *os.File, path string, found *walkFindings, ours func()) {
+// task of ours is, runs ours. A cgroup removed meanwhile is neither, and
+// gone says so; one that cannot be read is reported.
+func (s *cgroupScope) reconcile(id uint64, dir *os.File, path string, found *walkFindings, ours func()) (gone bool) {
 	m, err := cgroupMembers(dir)
 	switch {
 	case err != nil:
 		s.unreadable(id, path, err, found)
+		return cgroupGone(err)
 	case m.theirs:
 		s.leave(id, path, m.ours, found)
 	case m.ours && ours != nil:
 		ours()
 	}
+	return false
 }
 
 // unreadable reports a cgroup the walk could not open or read, which stays
@@ -468,7 +473,7 @@ func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFi
 			continue
 		}
 		dir, path, inside, err := s.openCgroup(id)
-		if errors.Is(err, syscall.ESTALE) {
+		if cgroupGone(err) {
 			s.stale[id] = true
 			continue
 		}
@@ -476,10 +481,10 @@ func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFi
 			s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
 			continue
 		}
-		if inside {
-			s.reconcile(id, dir, path, found, nil)
-		} else {
+		if !inside {
 			s.outsideRoot(id)
+		} else if s.reconcile(id, dir, path, found, nil) {
+			s.stale[id] = true
 		}
 		dir.Close()
 	}
@@ -568,12 +573,8 @@ func (s *cgroupScope) checkOwn(tasks map[uint64]*listed) error {
 		return fmt.Errorf("the walk cannot open this process's cgroup %s by its id: %w", own, err)
 	}
 	dir.Close()
-	if s.sub.id != 0 {
-		if s.sub.level, err = subtreeLevel(s.sub.path, own, ours.level); err != nil {
-			return err
-		}
-	}
-	return nil
+	s.sub.level, err = subtreeLevel(s.sub.path, own, ours.level)
+	return err
 }
 
 func (s *cgroupScope) recorded(id uint64) bool {

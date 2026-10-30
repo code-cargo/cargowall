@@ -95,12 +95,14 @@ struct {
 // recorded cgroup as it takes it out, and pkg/origin's walk marks each it
 // finds shared. The walk clears a mark once no task outside our pid
 // namespace is in the cgroup, recording it where a task of ours is, and
-// release forgets it.
+// release forgets it. It holds only cgroups a task of ours met another in,
+// far fewer than the scope: a mark the map cannot take is counted, and
+// costs a recording the next walk takes out again.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u64);
     __type(value, __u8);
-    __uint(max_entries, 65536);
+    __uint(max_entries, 4096);
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } map_scope_shared SEC(".maps");
 

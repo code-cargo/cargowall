@@ -26,7 +26,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/code-cargo/cargowall/pkg/podenv"
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // WaitReadyCmd blocks until cargowall writes its ready sentinel, fails fast
@@ -138,14 +138,14 @@ func processAlive(pid int) bool {
 		return false
 	}
 	// comm is the executable's name, which the kernel cuts to 15 bytes.
-	comm := podenv.Comm(pid)
+	comm := procfs.Comm(pid)
 	if comm == "" {
 		return false
 	}
 	// wait-ready IS the cargowall binary, so its own comm is the expected
 	// value. That keeps this correct for a renamed or vendored binary, and
 	// under `go test`, where both sides are the test binary.
-	if self := podenv.Comm(os.Getpid()); self != "" && comm == self {
+	if self := procfs.Comm(os.Getpid()); self != "" && comm == self {
 		return true
 	}
 	return comm == "cargowall"

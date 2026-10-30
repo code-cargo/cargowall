@@ -31,6 +31,8 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // defaultDockerHost is the docker CLI's default socket, which an empty
@@ -72,11 +74,11 @@ func dockerEnv() (getenv func(string) string, uid string, err error) {
 // find, as for a process started detached (by setsid, or in the
 // background of a shell that has since exited), which init has adopted.
 func startedBySudo(pid int, uid string) (map[string]string, error) {
-	found, comm, ok := AncestorByComm(pid, "sudo", RunnerWorkerComm)
+	found, comm, ok := procfs.AncestorByComm(pid, "sudo", procfs.RunnerWorkerComm)
 	if !ok {
 		return nil, errors.New("no sudo among cargowall's parents")
 	}
-	if comm == RunnerWorkerComm {
+	if comm == procfs.RunnerWorkerComm {
 		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", found))
 		if err != nil {
 			return nil, err

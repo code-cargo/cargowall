@@ -14,7 +14,7 @@
 
 //go:build linux
 
-package podenv
+package procfs
 
 import (
 	"os"

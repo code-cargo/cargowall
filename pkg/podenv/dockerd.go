@@ -210,36 +210,121 @@ func (d *Dockerd) probeContainerTree(socket string) {
 	d.ContainerTree = tree
 }
 
-// containerdSockets are where dockerd reaches containerd, in its order: a
-// containerd of the machine's that answers, else the one it runs itself. A
-// test stands in for them.
-var containerdSockets = []string{"/run/containerd/containerd.sock", "/var/run/docker/containerd/containerd.sock"}
+// containerdDefaults are where dockerd looks for containerd when it is not
+// given an address: the machine's, whose socket it takes whenever the file
+// is there, else the one it runs itself. A test stands in for them.
+var containerdDefaults = []string{"/run/containerd/containerd.sock", "/var/run/docker/containerd/containerd.sock"}
+
+// defaultDaemonConfig is where dockerd reads its daemon.json without
+// --config-file.
+const defaultDaemonConfig = "/etc/docker/daemon.json"
 
 // runtimePid is the process whose view of the machine decides where the
 // daemon at pid makes its containers' cgroups: containerd, whose shims run
 // runc, which makes them in its cgroup mount (cgroupfs) or asks the
-// systemd its environment's bus leads to (systemd), both containerd's.
-// containerd is found as the peer at the first of its sockets that takes
-// a connection, resolved in the daemon's root, and one outside our pid
-// namespace cannot be shown. With none answering, the daemon's own view is
-// taken, which a containerd it runs as its child shares.
+// systemd its environment's bus leads to (systemd), both containerd's. It
+// is the peer at the socket dockerd uses, as dockerd chooses it: the
+// address it was given (--containerd, or "containerd" in its daemon.json),
+// else the first default whose file is there, resolved in the daemon's
+// root. That socket must answer, from a containerd in our pid namespace.
+// With no address given and no default there, the daemon runs its
+// containers itself (a runtime that is not containerd's), and its own view
+// is taken.
 func runtimePid(pid int32) (int32, error) {
-	root, err := unix.Open("/proc/"+strconv.Itoa(int(pid))+"/root", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	proc := "/proc/" + strconv.Itoa(int(pid))
+	root, err := unix.Open(proc+"/root", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return 0, err
 	}
 	defer unix.Close(root)
-	for _, path := range containerdSockets {
-		peer, err := socketPeerIn(root, path)
-		if err != nil {
-			continue
-		}
-		if peer == 0 {
-			return 0, fmt.Errorf("the containerd it reaches at %s is outside our pid namespace", path)
-		}
-		return peer, nil
+	cmdline, err := os.ReadFile(proc + "/cmdline")
+	if err != nil {
+		return 0, err
 	}
-	return pid, nil
+	addr, config := dockerdFlags(cmdline)
+	if addr == "" {
+		if addr, err = configuredContainerd(root, config); err != nil {
+			return 0, err
+		}
+	}
+	if addr == "" {
+		for _, path := range containerdDefaults {
+			if fd, err := openInRoot(root, path, unix.O_PATH); err == nil {
+				unix.Close(fd)
+				addr = path
+				break
+			}
+		}
+	}
+	if addr == "" {
+		return pid, nil
+	}
+	peer, err := socketPeerIn(root, addr)
+	if err != nil {
+		return 0, fmt.Errorf("the containerd it uses: %w", err)
+	}
+	if peer == 0 {
+		return 0, fmt.Errorf("the containerd it uses at %s is outside our pid namespace", addr)
+	}
+	return peer, nil
+}
+
+// dockerdFlags reads the containerd address and the daemon.json path a
+// dockerd command line gives (--containerd, --config-file, either as
+// --flag=value or --flag value); the config defaults to
+// defaultDaemonConfig. An address may carry the unix:// scheme.
+func dockerdFlags(cmdline []byte) (containerd, config string) {
+	config = defaultDaemonConfig
+	args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+	for i := 1; i < len(args); i++ {
+		for _, flag := range []string{"--containerd", "--config-file"} {
+			v, ok := strings.CutPrefix(args[i], flag+"=")
+			if !ok && args[i] == flag && i+1 < len(args) {
+				v, ok = args[i+1], true
+				i++
+			}
+			if !ok {
+				continue
+			}
+			if flag == "--containerd" {
+				containerd = strings.TrimPrefix(v, "unix://")
+			} else {
+				config = v
+			}
+		}
+	}
+	return containerd, config
+}
+
+// configuredContainerd is the "containerd" address in the daemon.json at
+// path, read in the daemon's root; "" when there is no such file or key.
+func configuredContainerd(root int, path string) (string, error) {
+	fd, err := openInRoot(root, path, unix.O_RDONLY)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("its daemon.json %s: %w", path, err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	var config struct {
+		Containerd string `json:"containerd"`
+	}
+	if err := json.NewDecoder(io.LimitReader(f, 1<<20)).Decode(&config); err != nil {
+		return "", fmt.Errorf("its daemon.json %s: %w", path, err)
+	}
+	return strings.TrimPrefix(config.Containerd, "unix://"), nil
+}
+
+// openInRoot opens path inside root as a chroot would resolve it, with
+// flags (O_RDONLY to read it, O_PATH to find it, a socket included).
+func openInRoot(root int, path string, flags int) (int, error) {
+	fd, err := unix.Openat2(root, path, &unix.OpenHow{Flags: uint64(flags) | unix.O_CLOEXEC, Resolve: unix.RESOLVE_IN_ROOT})
+	if err != nil {
+		return -1, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	return fd, nil
 }
 
 // unaskedTree is the tree a daemon whose cgroup driver is unknown makes

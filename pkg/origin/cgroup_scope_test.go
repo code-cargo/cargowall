@@ -578,6 +578,20 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	s.clearMark(ownID, dir, path, true, &found)
 	require.True(t, marked(), "a task outside entering between the looks at an empty cgroup keeps the mark")
 
+	// One a task of ours recorded meanwhile, beside it, is taken out too.
+	require.NoError(t, s.cgroups().Put(ownID, uint8(1)))
+	looksRead("", "7\n0\n")
+	s.clearMark(ownID, dir, path, true, &found)
+	require.True(t, marked() && !recorded(), "an entry made between the looks is taken out, the mark kept")
+
+	// A cgroup still shared keeps what the last walk logged of it, so it is
+	// not reported again when the walk next lists it.
+	s.last.shared[ownID] = true
+	found = newWalkFindings()
+	looksRead("0\n")
+	s.clearMark(ownID, dir, path, true, &found)
+	require.True(t, found.shared[ownID], "a still-shared cgroup stays logged")
+
 	looksRead("7\n")
 	s.clearMark(ownID, dir, path, false, &found)
 	require.True(t, !marked() && !recorded(), "one outside our cgroup namespace's root is unmarked, never recorded")
@@ -588,6 +602,24 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	s.mark(ownID+1, "/full", &found)
 	s.mark(ownID+1, "/full", &found)
 	require.Equal(t, 1, strings.Count(log.String(), "could not mark a cgroup shared"), "a full mark map is reported once a walk")
+}
+
+// A recorded cgroup found removed is not opened again until its release,
+// whether its handle is stale or, opened before the removal, its read
+// finds it gone.
+func TestCgroupScopeRemembersRemovedCgroups(t *testing.T) {
+	own := ownCgroupBelowRoot(t)
+	ino, err := podenv.PidNamespaceInode()
+	require.NoError(t, err)
+	s := loadWalkScope(t, ino, 64)
+	ownID, err := podenv.CgroupID(own)
+	require.NoError(t, err)
+	require.NoError(t, s.cgroups().Put(ownID, uint8(1)))
+	swap(t, &readThreads, failReading(ownID, syscall.ENODEV))
+	found := newWalkFindings()
+	require.True(t, s.reconcileRecorded(map[uint64]*listed{}, &found))
+	require.True(t, s.stale[ownID], "a cgroup whose read finds it removed is remembered")
+	require.False(t, found.unreadable[ownID], "and not reported")
 }
 
 // A map too small for every cgroup the walk records costs those cgroups,

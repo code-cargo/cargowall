@@ -14,10 +14,10 @@
 
 //go:build linux
 
-package podenv
-
-// A process's name and parents from /proc, as podenv and pkg/steps read
-// them.
+// Package procfs reads a process's name and parents from /proc, for the
+// packages that walk or name processes: podenv, pkg/steps, pkg/containers
+// and cmd.
+package procfs
 
 import (
 	"bytes"

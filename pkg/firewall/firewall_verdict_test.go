@@ -23,6 +23,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/stretchr/testify/require"
 
@@ -166,6 +167,59 @@ func TestUpdateAllowlistTC_Verdict(t *testing.T) {
 				ret, _, err := objs.TcEgress.Test(tcpSYN(t, p.dst, p.port))
 				require.NoError(t, err)
 				require.Equal(t, p.want, ret, "%s port %d", p.dst, p.port)
+			}
+		})
+	}
+}
+
+// TestRemoveIP_Verdict: when a resolved address expires, RemoveIP must take
+// back exactly what AddIP opened. A delete keyed differently from the write
+// leaves a stale allow that no mock-map test can see, so this reads the
+// verdict before and after from the real program.
+func TestRemoveIP_Verdict(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to load BPF programs")
+	}
+	require.NoError(t, rlimit.RemoveMemlock())
+
+	tcp443 := []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}
+	for _, tt := range []struct {
+		name  string
+		ip    string
+		ports []config.Port
+	}{
+		{"IPv4 on one port", "93.184.216.34", tcp443},
+		{"IPv4 on all ports", "93.184.216.34", nil},
+		{"IPv6 on one port", "2606:2800:220:1::1", tcp443},
+		{"IPv6 on all ports", "2606:2800:220:1::1", nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var objs bpf.TcBpfObjects
+			require.NoError(t, bpf.LoadTcBpfObjects(&objs, nil))
+			t.Cleanup(func() { objs.Close() })
+			fw := NewFirewall(objs.MapCidrs, objs.MapPorts, objs.MapCidrsV6, objs.MapPortsV6,
+				objs.MapDefaultAction, objs.MapAuditMode, slog.New(slog.DiscardHandler))
+			require.NoError(t, fw.SetDefaultAction(config.ActionDeny))
+
+			ip := net.ParseIP(tt.ip)
+			_, err := fw.AddIP(ip, config.ActionAllow, tt.ports)
+			require.NoError(t, err)
+			ret, _, err := objs.TcEgress.Test(tcpSYN(t, tt.ip, 443))
+			require.NoError(t, err)
+			require.Equal(t, uint32(verdictPass), ret, "allowed once added")
+
+			require.NoError(t, fw.RemoveIP(ip))
+			ret, _, err = objs.TcEgress.Test(tcpSYN(t, tt.ip, 443))
+			require.NoError(t, err)
+			require.Equal(t, uint32(verdictDrop), ret, "nothing left allowing it once removed")
+
+			for name, m := range map[string]*ebpf.Map{
+				"cidrs": objs.MapCidrs, "ports": objs.MapPorts, "cidrs_v6": objs.MapCidrsV6, "ports_v6": objs.MapPortsV6,
+			} {
+				var k, v []byte
+				it := m.Iterate()
+				require.False(t, it.Next(&k, &v), "map_%s keeps an entry after RemoveIP", name)
+				require.NoError(t, it.Err())
 			}
 		})
 	}

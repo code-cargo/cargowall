@@ -153,12 +153,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		switch cmd.CIMode() {
 		case CIModeGithubAction:
 			logger.Error("eBPF is not supported on this runner. " +
-				"Self-hosted runners may need kernel 5.12+ and CAP_BPF/CAP_NET_ADMIN capabilities. " +
+				"Self-hosted runners may need kernel 5.8+ and CAP_BPF/CAP_NET_ADMIN capabilities. " +
 				"GitHub-hosted runners require sudo privileges.")
 		case CIModeGitlabCI:
 			logger.Error("eBPF is not supported in this GitLab CI environment. " +
 				"GitLab SaaS runners run in privileged Docker containers and attach fine on the 5.15 SaaS kernel " +
-				"(cargowall falls back to legacy clsact below kernel 6.6), so this usually means a kernel older than 5.12 " +
+				"(cargowall falls back to legacy clsact below kernel 6.6), so this usually means a kernel older than 5.8 " +
 				"or missing CAP_BPF/CAP_NET_ADMIN. Check your runner image's kernel version with `uname -r`.")
 		}
 
@@ -316,7 +316,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		// including across error-return paths below.
 		if cmd.DNSRedirect {
 			var teardownRedirect func()
-			redirect, teardownRedirect = startDNSRedirect(dockerBridgeIP, teardowns, logger)
+			redirect, teardownRedirect = startDNSRedirect(dockerBridgeIP, caps.KernelVersion, teardowns, logger)
 			defer teardownRedirect()
 		}
 	}

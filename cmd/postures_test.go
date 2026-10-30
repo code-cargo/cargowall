@@ -194,6 +194,20 @@ func TestPostures_DNSRedirect(t *testing.T) {
 	assert.False(t, p.layers[0].degraded())
 }
 
+// The redirect's owned table needs 5.12 while the rest of cargowall runs
+// from 5.8: on an older kernel the redirect is lost, by name, and nothing is
+// installed or left to undo.
+func TestStartDNSRedirect_KernelOlderThan512(t *testing.T) {
+	teardowns := &teardownList{}
+	for _, kernel := range []string{"5.8.0", "5.10.0-1234-aws", "5.11.22"} {
+		r, undo := startDNSRedirect("", kernel, teardowns, slog.New(slog.DiscardHandler))
+		undo()
+		assert.False(t, r.isActive(), kernel)
+		require.EqualError(t, r.err, "kernel "+kernel+" is older than 5.12, which the redirect's owned nftables table needs")
+	}
+	assert.Empty(t, teardowns.fns, "nothing installed, nothing to undo")
+}
+
 // Policy lockdown stays up deny-all until the job ends, and the job has
 // already failed: a lost fail-closed layer is logged and recorded, never a
 // startup error, which would take the whole firewall down with it.

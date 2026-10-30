@@ -658,8 +658,8 @@ static __always_inline int l7_identity_gate(struct __sk_buff *skb, struct l7_ctx
 // 2.7x the v4 path for identical code; 6.17 stopped at 657k instructions
 // and kernel 6.6, whose verifier prunes fewer states, ran past the 1M
 // limit. The arguments are the context and scalars only, which global
-// functions have accepted since kernel 5.6. A pointer-to-struct argument
-// needs 5.12, above the floor this was written under, so the scratch slot
+// functions have accepted since kernel 5.6, under the 5.8 floor: a
+// pointer-to-struct argument would have needed 5.12, so the scratch slot
 // is passed by index and looked up here. The caller holds the same slot.
 __noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, __u32 slot) {
     if (slot >= L7_SCRATCH_SLOTS)

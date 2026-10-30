@@ -17,8 +17,10 @@
 package cmd
 
 import (
+	"fmt"
 	"log/slog"
 
+	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 	"github.com/code-cargo/cargowall/pkg/network"
 )
 
@@ -39,13 +41,19 @@ type dnsRedirect struct {
 }
 
 // startDNSRedirect installs the redirect for the proxy, and for its
-// container listener at bridgeIP when there is one. The returned undo
+// container listener at bridgeIP when there is one. kernel is the uname
+// release: the redirect's owned table needs 5.12, above the 5.8 the rest of
+// cargowall needs, and an older kernel would refuse the table's flags with
+// a bare EINVAL, so it is refused here by name instead. The returned undo
 // removes it; the caller defers it. It is registered before the install,
 // like every host mutation's: the kernel deletes the table with its owning
 // socket however the process ends, but a forced shutdown landing
 // mid-install still owes the flush of the flows DNAT'd to the proxy
 // meanwhile, and its teardown waits for the install to finish.
-func startDNSRedirect(bridgeIP string, teardowns *teardownList, logger *slog.Logger) (*dnsRedirect, func()) {
+func startDNSRedirect(bridgeIP, kernel string, teardowns *teardownList, logger *slog.Logger) (*dnsRedirect, func()) {
+	if ok, err := cargowallEbpf.KernelAtLeast(kernel, 5, 12); err != nil || !ok {
+		return &dnsRedirect{err: fmt.Errorf("kernel %s is older than 5.12, which the redirect's owned nftables table needs", kernel)}, func() {}
+	}
 	redirect := network.NewDNSRedirect(logger)
 	undo := teardowns.add(func() {
 		if err := redirect.Teardown(); err != nil {

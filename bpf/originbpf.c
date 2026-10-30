@@ -43,7 +43,7 @@
 // instead by the mode gate and by TC staying attached.
 //
 // Helpers used (bpf_get_socket_cookie 4.12, bpf_skb_cgroup_id 5.7, ringbuf
-// 5.8) are all within the 5.12 kernel floor. Unlike TC, skb data here starts
+// 5.8) are all within the 5.8 kernel floor. Unlike TC, skb data here starts
 // at the IP header: no Ethernet header, no VLAN tags, l3 offset is always 0.
 // Dispatch is on the IP version nibble, not skb->protocol, because
 // PROG_TEST_RUN cannot set skb->protocol for cgroup_skb programs and the

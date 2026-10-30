@@ -773,10 +773,14 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 		s.CgroupTreeReason = "not probed: read only in a private cgroup namespace below its root, " +
 			"outside a pod, in a pid namespace of our own"
 	}
-	if egressHook && s.PidNS == PidNSPrivate && !s.inPod() && s.CgroupMount == CgroupMountOurs && CgroupLevel(s.CgroupPath) > 0 {
+	// Read only by limitedScope outside a pod, past the refusals that come
+	// first and need nothing of it.
+	if egressHook && s.PidNS == PidNSPrivate && !s.inPod() && CgroupLevel(s.CgroupPath) > 0 &&
+		s.attachPointRefusal() == nil && s.partialRefusal() == nil {
 		s.OwnTree, s.OwnTreeReason = probeOwnTree(filepath.Join(CgroupRoot, s.CgroupPath))
 	} else {
-		s.OwnTreeReason = "not probed: read only outside a pod, below the root, in a pid namespace of our own"
+		s.OwnTreeReason = "not probed: read only outside a pod, below the root, in a pid namespace of our own, " +
+			"where nothing refuses first"
 	}
 	if egressHook && s.PidNS == PidNSPrivate {
 		if path, err := ReadCgroupPath("/proc/1/cgroup"); err != nil {

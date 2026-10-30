@@ -62,7 +62,7 @@ func Request(netns string, req []byte, dump bool, timeout time.Duration) ([]netl
 		Data:   req,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("sock_diag: %w", err)
+		return nil, err
 	}
 	return msgs, nil
 }

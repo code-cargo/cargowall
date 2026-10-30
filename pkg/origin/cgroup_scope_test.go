@@ -652,11 +652,16 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	s.clearMark(ownID, dir, path, true)
 	require.True(t, marked() && !recorded(), "a task outside entering before record's second look takes it out and marks it")
 
+	// A task outside entering an empty cgroup between the looks, with
+	// none of ours there and none in the scope, leaves it unmarked, as
+	// scope_leave leaves what the scope does not hold.
 	looksRead("", "0\n")
 	s.clearMark(ownID, dir, path, true)
-	require.True(t, marked(), "a task outside entering between the looks at an empty cgroup keeps the mark")
+	require.True(t, !marked() && !recorded(), "an empty cgroup a task outside enters between the looks stays unmarked")
 
-	// One a task of ours recorded meanwhile, beside it, is taken out too.
+	// One a task of ours recorded meanwhile, beside it, is taken out and
+	// marked.
+	s.mark(ownID, path)
 	require.NoError(t, s.cgroups().Put(ownID, uint8(1)))
 	looksRead("", "7\n0\n")
 	s.clearMark(ownID, dir, path, true)
@@ -680,10 +685,15 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	require.NoError(t, s.cgroups().Delete(ownID))
 	s.mark(ownID, path)
 
-	// A cgroup still shared keeps its mark.
+	// A cgroup still shared with a task of ours there keeps its mark; one
+	// shared with none of ours loses it, which would otherwise never clear.
+	looksRead("7\n0\n")
+	s.clearMark(ownID, dir, path, true)
+	require.True(t, marked(), "a cgroup still shared with ours keeps its mark")
 	looksRead("0\n")
 	s.clearMark(ownID, dir, path, true)
-	require.True(t, marked(), "a still-shared cgroup keeps its mark")
+	require.True(t, !marked() && !recorded(), "one shared with none of ours loses it")
+	s.mark(ownID, path)
 
 	looksRead("7\n")
 	s.clearMark(ownID, dir, path, false)

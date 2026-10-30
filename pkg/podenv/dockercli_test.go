@@ -256,6 +256,37 @@ func TestDockerCLIHost(t *testing.T) {
 	}
 	fifo(filepath.Join(dir, "config.json"))
 	unblocked("a FIFO for the config", env())
+	// A symlink is followed to a config, and to a FIFO is refused without
+	// opening it.
+	elsewhere := t.TempDir()
+	if err := os.WriteFile(filepath.Join(elsewhere, "real.json"), []byte(`{"currentContext":"remote"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fifo(filepath.Join(elsewhere, "fifo"))
+	for _, c := range []struct {
+		target string
+		host   string
+		err    bool
+	}{{"real.json", "tcp://builder:2376", false}, {"fifo", "", true}} {
+		link := filepath.Join(dir, "config.json")
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(elsewhere, c.target), link); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			check("a config symlinked to "+c.target, env(), c.host, c.err)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("a config symlinked to %s: the probe waits", c.target)
+		}
+	}
+	fifo(filepath.Join(dir, "config.json"))
 	sum := sha256.Sum256([]byte("remote"))
 	meta := filepath.Join(dir, "contexts", "meta", hex.EncodeToString(sum[:]), "meta.json")
 	fifo(meta)

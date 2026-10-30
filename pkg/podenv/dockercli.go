@@ -131,22 +131,30 @@ var passwdHome = func(uid string) string {
 }
 
 // readConfig reads a docker config file, at a path the job's environment
-// picks, as root reads it: opened without waiting, and read only if it is a
-// regular file, since a FIFO or a device there would hold the probe, and
-// Detect with it, for good. At most 1 MiB is read.
+// picks, as root reads it: found first with O_PATH, which opens nothing (a
+// device's open, a FIFO's wait for a writer), and read through that handle
+// only if it is a regular file, so whatever is there, or a symlink leads
+// to, is never opened otherwise. At most 1 MiB is read.
 func readConfig(path string) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, err
+		return nil, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return nil, &fs.PathError{Op: "stat", Path: path, Err: err}
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, fmt.Errorf("%s is not a regular file (mode %#o)", path, st.Mode&unix.S_IFMT)
+	}
+	// The handle, not the path, is reopened: the file checked is the one
+	// read.
+	f, err := os.Open(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		return nil, &fs.PathError{Op: "open", Path: path, Err: err}
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file (%v)", path, fi.Mode().Type())
-	}
 	return io.ReadAll(io.LimitReader(f, 1<<20))
 }
 

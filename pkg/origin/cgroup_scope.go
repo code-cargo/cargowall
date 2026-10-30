@@ -343,7 +343,8 @@ func (s *cgroupScope) reconcileMarked(tasks map[uint64]*listed, marked map[uint6
 }
 
 // clearMark clears the mark of the cgroup open at dir, id, if no task
-// outside our pid namespace is in it, and settles it (unmark): one a task
+// outside our pid namespace is in it, and settles it (unmark), or if no
+// task of ours is (forgetMark): one a task
 // of ours alone has entered since the listing, which scope_enter left out
 // for the mark, is recorded, as the listing would have, where the hook can
 // see it (inside).
@@ -354,8 +355,15 @@ func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside boo
 		s.forgetMark(id)
 	case err != nil:
 		s.unreadable(id, path, err)
+	case m.theirs && m.ours:
+		// Still shared, with a task of ours there: the mark stays.
 	case m.theirs:
-		// Still shared: the mark stays.
+		// Shared with none of ours: the mark goes, as scope_leave marks
+		// only what the scope holds, and the mark of a cgroup that stays
+		// shared would never clear. A task of ours entering it is judged
+		// with it until a walk takes it out, as for any cgroup another task
+		// is already in.
+		s.forgetMark(id)
 	default:
 		s.unmark(id, dir, path, inside)
 	}
@@ -370,7 +378,7 @@ func (s *cgroupScope) cutShort(err error) {
 }
 
 // mark marks a cgroup shared, so that a task of ours entering it is not
-// recorded (scope_enter). A mark the map cannot take is reported, once:
+// recorded (scope_enter). A mark the map cannot take is reported (warn):
 // each entry of ours records the cgroup again until the next walk takes it
 // out.
 func (s *cgroupScope) mark(id uint64, path string) {
@@ -405,9 +413,10 @@ func (s *cgroupScope) stopping() bool {
 
 // reconcileListed reconciles cgroup id, which the task walk listed: one
 // that holds a task of ours and no other is recorded, its shared mark
-// cleared first (unmark, which records it once it has settled). One outside our cgroup namespace's root is beyond the
-// hook whatever it holds: an entry a tracepoint made for it is taken out
-// (outsideRoot), and each process of ours there is reported.
+// cleared first (unmark, which records it once it has settled). One
+// outside our cgroup namespace's root is beyond the hook whatever it
+// holds: an entry a tracepoint made for it is taken out (outsideRoot), and
+// each process of ours there is reported.
 func (s *cgroupScope) reconcileListed(id uint64, l *listed, marked bool) {
 	dir, path, inside, _ := s.open(id)
 	if dir == nil {
@@ -429,32 +438,32 @@ func (s *cgroupScope) reconcileListed(id uint64, l *listed, marked bool) {
 		return
 	}
 	existed := s.recorded(id)
-	s.reconcile(id, dir, path, func() {
+	if m, ok, _ := s.look(id, dir, path); ok && m.ours {
 		switch {
 		case marked:
 			s.unmark(id, dir, path, true)
 		case !existed:
 			s.record(id, dir, path)
 		}
-	})
+	}
 }
 
-// reconcile reads who is in the cgroup open at dir, id, and takes it out
-// of the scope if a task outside our pid namespace is in it, or else, if a
-// task of ours is, runs ours. A cgroup removed meanwhile is neither, and
-// gone says so; one that cannot be read is reported.
-func (s *cgroupScope) reconcile(id uint64, dir *os.File, path string, ours func()) (gone bool) {
+// look reads who is in the cgroup open at dir, id, for a pass over it,
+// and takes it out of the scope if a task outside our pid namespace is in
+// it (leave). ok is whether none is, and m then says whether a task of
+// ours is; gone, whether the cgroup has been removed. One that cannot be
+// read is reported.
+func (s *cgroupScope) look(id uint64, dir *os.File, path string) (m members, ok, gone bool) {
 	m, err := cgroupMembers(dir)
 	switch {
 	case err != nil:
 		s.unreadable(id, path, err)
-		return cgroupGone(err)
+		return m, false, cgroupGone(err)
 	case m.theirs:
 		s.leave(id, path, m.ours)
-	case m.ours && ours != nil:
-		ours()
+		return m, false, false
 	}
-	return false
+	return m, true, false
 }
 
 // open opens cgroup id for a pass of the walk, reporting one it cannot
@@ -526,8 +535,10 @@ func (s *cgroupScope) reconcileRecorded(tasks map[uint64]*listed) bool {
 		case podenv.Under(path, s.sub.path):
 			// The hook judges it whole whoever enters it, as the listing
 			// leaves it.
-		case s.reconcile(id, dir, path, nil):
-			s.stale[id] = true
+		default:
+			if _, _, gone := s.look(id, dir, path); gone {
+				s.stale[id] = true
+			}
 		}
 		dir.Close()
 	}
@@ -734,11 +745,15 @@ const settleLooks = 3
 // tracepoint or an earlier walk have recorded it, and marks it shared, so
 // that a task of ours entering it again is not recorded: a task outside our
 // pid namespace is in it, which the hook must not judge. ours says whether a
-// task of ours is in it too. Logged when the last walk did not find it
-// shared, and not at all when neither holds: a cgroup never in the scope
-// that no task of ours is in now changes nothing (a runtime's exec stage
-// listed in the runtime's cgroup has moved on).
+// task of ours is in it too. One the scope does not hold is marked only
+// then, as scope_leave marks only what the scope holds, and one with none
+// of ours either changes nothing, and is neither marked nor logged (a
+// runtime's exec stage listed in the runtime's cgroup has moved on). Logged
+// at most once in warnEvery (warn) for as long as it stays shared.
 func (s *cgroupScope) leave(id uint64, path string, ours bool) {
+	if !ours && !s.recorded(id) {
+		return
+	}
 	s.mark(id, path)
 	err := s.objs.MapScopeCgroups.Delete(id)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -746,12 +761,6 @@ func (s *cgroupScope) leave(id uint64, path string, ours bool) {
 			s.logger.Warn("Container egress cgroup scope could not take out a cgroup it shares with tasks outside "+
 				"this job, whose sockets the hook still judges", "cgroup", path, "cgroup_id", id, "error", err)
 		}
-		return
-	}
-	if errors.Is(err, ebpf.ErrKeyNotExist) && !ours {
-		// Never recorded, and with none of ours in it: nothing of this
-		// job's leaves, and nothing is noted, so a task of ours entering
-		// later is told.
 		return
 	}
 	if !s.warn(findShared, id) {

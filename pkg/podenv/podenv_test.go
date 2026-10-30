@@ -52,16 +52,22 @@ func TestHookScope(t *testing.T) {
 	const podCg = "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod0e4b1f2a_7c3d_4e5f_8a9b_0c1d2e3f4a5b.slice"
 	pod := podCg + "/cri-containerd-a.scope"
 	runner := "/system.slice/runner.service"
-	local := Dockerd{Kind: DockerdLocal}
+	// Our own container's daemon, on the cgroupfs driver, so in our mount;
+	// on the systemd driver with our container's systemd; and with the
+	// host's systemd, over a bus bound in, or one it could not be asked.
+	local := Dockerd{Kind: DockerdLocal, CgroupDriver: "cgroupfs", ContainerTree: "/"}
+	localSystemd := Dockerd{Kind: DockerdLocal, CgroupDriver: "systemd", ContainerTree: "/"}
+	localHostSystemd := Dockerd{Kind: DockerdLocal, CgroupDriver: "systemd", ContainerTree: "/../.."}
+	localUnasked := Dockerd{Kind: DockerdLocal, Reason: "its cgroup driver: GET /info: 500 Internal Server Error"}
 	foreign := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace"}
 	hidden := Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
 	// A foreign daemon in our cgroup namespace (a dind sidecar in the
 	// node's), one in a namespace of its own below our root, one above it,
 	// and one under our root that makes its containers in the host's tree.
-	foreignUnder := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", CgroupMount: "/"}
-	foreignOwnNS := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", CgroupMount: "/dind"}
-	foreignAbove := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/../../dind", CgroupMount: "/../.."}
-	foreignHostTree := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", CgroupMount: "/../.."}
+	foreignUnder := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", ContainerTree: "/"}
+	foreignOwnNS := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", ContainerTree: "/dind"}
+	foreignAbove := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/../../dind", ContainerTree: "/../.."}
+	foreignHostTree := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", ContainerTree: "/../.."}
 	foreignMountUnread := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace; its cgroup mount: nothing is mounted", Cgroup: "/dind"}
 	unknownD := Dockerd{Kind: DockerdUnknown, Reason: "dial: timeout"}
 	// Both helpers have the mount proven on a kernel that keeps socket
@@ -73,6 +79,7 @@ func TestHookScope(t *testing.T) {
 		return Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", CgroupMount: CgroupMountOurs, PidNS: PidNSPrivate, Dockerd: d, SocketCgroups: SocketCgroupsKept}
 	}
 	sockets := func(c SocketCgroups) func(*Shape) { return func(s *Shape) { s.SocketCgroups = c } }
+	tree := func(c CgroupTree) func(*Shape) { return func(s *Shape) { s.CgroupTree = c } }
 	with := func(s Shape, f func(*Shape)) Shape { f(&s); return s }
 	nested := func(path string, pidns PidNS, d Dockerd) Shape {
 		return with(host(path, pidns, d), func(s *Shape) { s.CgroupNS = CgroupNSPrivate })
@@ -112,6 +119,9 @@ func TestHookScope(t *testing.T) {
 		},
 		{"nested node: hostPID pod", nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSHost, local), false, all},
 		{"private cgroupns below its root, own pid namespace", nested("/init", PidNSPrivate, local), true, Scope{Subtree: "/init"}},
+		{"private cgroupns below its root, own pid namespace, tree shared", with(nested("/init", PidNSPrivate, local), tree(CgroupTreeShared)), true, Scope{Subtree: "/init"}},
+		{"private cgroupns below its root, own pid namespace, tree ours alone", with(nested("/init", PidNSPrivate, local), tree(CgroupTreeOurs)), true, all},
+		{"nested node, tree read as ours alone", with(nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate, local), tree(CgroupTreeOurs)), true, Scope{Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"}},
 		// In a private cgroup namespace the hook sees only what is under its
 		// root, whatever the scope, so a daemon whose containers could live
 		// outside it refuses, whatever our path and pid namespace, unless its
@@ -124,7 +134,7 @@ func TestHookScope(t *testing.T) {
 		{"private cgroupns below its root, host pid namespace, hidden dockerd", nested("/init", PidNSHost, hidden), false, all},
 		{
 			"nested node: ARC pod with a dind sidecar sharing its pid namespace", nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate,
-				Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/4567ef01", CgroupMount: "/"}), true,
+				Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/4567ef01", CgroupDriver: "cgroupfs", ContainerTree: "/"}), true,
 			Scope{Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
 		},
 		{"private cgroupns below its root, host pid namespace, socket cgroups shared", with(nested("/init", PidNSHost, local), sockets(SocketCgroupsShared)), false, all},
@@ -167,6 +177,10 @@ func TestHookScope(t *testing.T) {
 		{"private cgroupns, unidentified dockerd", private(unknownD), false, all},
 		{"private cgroupns, no dockerd", private(Dockerd{Kind: DockerdAbsent}), true, all},
 		{"private cgroupns, own dockerd", private(local), true, all},
+		{"private cgroupns, own dockerd on our systemd", private(localSystemd), true, all},
+		{"private cgroupns, own dockerd on the host's systemd", private(localHostSystemd), false, all},
+		{"private cgroupns, own dockerd that could not be asked its driver", private(localUnasked), false, all},
+		{"host cgroupns, own dockerd not asked its driver", host(pod, PidNSPrivate, localUnasked), true, inPod},
 		{"host cgroupfs bound into a private cgroupns", with(private(local), func(s *Shape) { s.CgroupMount = CgroupMountOther }), false, all},
 		{"private cgroupns, path unread", with(private(local), func(s *Shape) { s.CgroupPath = "" }), false, all},
 		{"private cgroupns, DOCKER_HOST names another daemon", with(private(local), remoteDaemon), false, all},
@@ -305,20 +319,25 @@ func TestProbeCgroupMount_Threaded(t *testing.T) {
 	}
 	domain := filepath.Join(CgroupRoot, fmt.Sprintf("cargowall-podenv-test-%d", os.Getpid()))
 	threaded := filepath.Join(domain, "t")
+	self := []byte(strconv.Itoa(os.Getpid()))
+	// Registered before either is made, so a skip after the first leaves
+	// nothing behind; removing one never made is a no-op.
+	t.Cleanup(func() {
+		_ = os.WriteFile(filepath.Join(CgroupRoot, home, "cgroup.procs"), self, 0)
+		for _, d := range []string{threaded, domain} {
+			for i := 0; i < 50; i++ {
+				if err := os.Remove(d); err == nil || os.IsNotExist(err) {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	})
 	for _, d := range []string{domain, threaded} {
 		if err := os.Mkdir(d, 0o755); err != nil {
 			t.Skipf("cannot make test cgroup: %v", err)
 		}
 	}
-	self := []byte(strconv.Itoa(os.Getpid()))
-	t.Cleanup(func() {
-		_ = os.WriteFile(filepath.Join(CgroupRoot, home, "cgroup.procs"), self, 0)
-		for _, d := range []string{threaded, domain} {
-			for i := 0; i < 50 && os.Remove(d) != nil; i++ {
-				time.Sleep(20 * time.Millisecond)
-			}
-		}
-	})
 	write := func(file, data string) {
 		t.Helper()
 		if err := os.WriteFile(file, []byte(data), 0); err != nil {

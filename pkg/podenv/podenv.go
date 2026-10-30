@@ -30,17 +30,15 @@ package podenv
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
-	"net"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cilium/ebpf/btf"
 	"golang.org/x/sys/unix"
@@ -185,55 +183,6 @@ func (c SocketCgroups) String() string {
 	return "unknown"
 }
 
-// DockerdKind is what is behind the Docker socket.
-type DockerdKind int
-
-const (
-	DockerdUnknown DockerdKind = iota // the probe failed
-	DockerdAbsent                     // no socket
-	// DockerdLocal: the daemon shares our mount namespace, so its
-	// daemon.json is ours and our service manager can restart it.
-	DockerdLocal
-	// DockerdForeign: the daemon's pid is visible but its mount namespace is
-	// not ours: another container sharing our pid namespace, or the host's
-	// own daemon when we share the host's.
-	DockerdForeign
-	// DockerdHidden: the daemon's pid is outside our pid namespace, so
-	// neither it nor any container it starts is visible to us.
-	DockerdHidden
-)
-
-func (k DockerdKind) String() string {
-	switch k {
-	case DockerdAbsent:
-		return "absent"
-	case DockerdLocal:
-		return "local"
-	case DockerdForeign:
-		return "foreign"
-	case DockerdHidden:
-		return "hidden"
-	}
-	return "unknown"
-}
-
-// Dockerd describes the daemon behind the Docker socket.
-type Dockerd struct {
-	Kind DockerdKind
-	// Reason is the evidence for Foreign or Hidden, or the probe error for
-	// Unknown.
-	Reason string
-	// Cgroup is a Foreign daemon's cgroup v2 path as /proc/<pid>/cgroup
-	// gives it in our cgroup namespace, "" when it could not be read. A
-	// path under our namespace's root does not start with "/..".
-	Cgroup string
-	// CgroupMount is the root of a Foreign daemon's cgroup v2 mount at
-	// CgroupRoot, where it makes its containers' cgroups, as its mountinfo
-	// gives it in our cgroup namespace: "/" for our own root, "/../x" for
-	// another beside it. "" when it could not be read, and Reason says why.
-	CgroupMount string
-}
-
 // Shape is what Detect found.
 type Shape struct {
 	CgroupNS CgroupNS
@@ -251,7 +200,12 @@ type Shape struct {
 	// CgroupMountReason is the evidence for Other, or the probe error for
 	// Unknown.
 	CgroupMountReason string
-	PidNS             PidNS
+	// CgroupTree is who holds the tasks in the tree under /sys/fs/cgroup,
+	// probed only in a private cgroup namespace below its root, and
+	// CgroupTreeReason the evidence, or why it is unknown.
+	CgroupTree       CgroupTree
+	CgroupTreeReason string
+	PidNS            PidNS
 	// PidNSReason is the probe error when PidNS is unknown.
 	PidNSReason string
 	Dockerd     Dockerd
@@ -370,16 +324,17 @@ func (s Shape) privateScope() (Scope, error) {
 		return Scope{}, err
 	}
 	switch s.Dockerd.Kind {
-	case DockerdAbsent, DockerdLocal:
-	case DockerdForeign:
-		// Its containers are made in its cgroup mount, which is its cgroup
-		// namespace's root unless it was given another tree, such as the
-		// host's: when that and its own cgroup are under our root, so are
-		// its containers.
-		if !underRoot(s.Dockerd.Cgroup) || !underRoot(s.Dockerd.CgroupMount) {
-			return Scope{}, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd outside this container, "+
-				"another container's or the host's own (%s; its cgroup %q, its cgroup mount's root %q)",
-				s.Dockerd.Reason, s.Dockerd.Cgroup, s.Dockerd.CgroupMount)
+	case DockerdAbsent:
+	case DockerdLocal, DockerdForeign:
+		// Its containers are made in the tree its cgroup driver uses: its
+		// own cgroup mount, or the one of the systemd it reaches, which is
+		// that one's cgroup namespace's root unless it was given another
+		// tree, such as the host's. When that root is under ours, and a
+		// foreign daemon's own cgroup too, so are its containers.
+		if !underRoot(s.Dockerd.ContainerTree) || (s.Dockerd.Kind == DockerdForeign && !underRoot(s.Dockerd.Cgroup)) {
+			return Scope{}, fmt.Errorf("the cgroup hook cannot be shown to reach the containers of a %s dockerd, "+
+				"which may be outside this container (%s; its cgroup %q, cgroup driver %q, containers' cgroup tree %q)",
+				s.Dockerd.Kind, s.Dockerd.Reason, s.Dockerd.Cgroup, s.Dockerd.CgroupDriver, s.Dockerd.ContainerTree)
 		}
 	case DockerdHidden:
 		return Scope{}, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd we cannot see, "+
@@ -403,6 +358,15 @@ func (s Shape) privateScope() (Scope, error) {
 		}
 		return Scope{}, nil
 	case PidNSPrivate:
+		// A tree with no task outside our pid namespace anywhere in it is
+		// our container's alone, below whose root it moved its own tasks
+		// (an entrypoint making room for nested cgroups, or systemd as its
+		// init), and the hook judges all of it, as at "/". A nested node
+		// always has some: its kubelet and runtime are outside every pod's
+		// pid namespace.
+		if !kubepods && s.CgroupTree == CgroupTreeOurs {
+			return Scope{}, nil
+		}
 		return s.limitedScope(kubepods)
 	default:
 		return Scope{}, fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
@@ -576,7 +540,10 @@ func (s Shape) LogArgs() []any {
 		"cgroup", s.CgroupPath, "cgroup_reason", s.CgroupPathReason,
 		"cgroup_mount", s.CgroupMount.String(), "cgroup_mount_reason", s.CgroupMountReason,
 		"pidns", s.PidNS.String(), "pidns_reason", s.PidNSReason,
+		"cgroup_tree", s.CgroupTree.String(), "cgroup_tree_reason", s.CgroupTreeReason,
 		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
+		"dockerd_cgroup", s.Dockerd.Cgroup, "dockerd_cgroup_driver", s.Dockerd.CgroupDriver,
+		"dockerd_container_tree", s.Dockerd.ContainerTree,
 		"docker_host", s.DockerHost, "docker_host_setting", s.DockerHostSetting,
 		"docker_host_reason", s.DockerHostReason, "kernel", s.Kernel,
 		"socket_cgroups", s.SocketCgroups.String(), "socket_cgroups_reason", s.SocketCgroupsReason,
@@ -616,9 +583,20 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 		s.PidNS = PidNSPrivate
 	}
 	s.Dockerd = probeDockerd(dockerSocket)
-	if env, err := dockerEnv(); err != nil {
+	// A private cgroup namespace's root bounds the hook, so where a daemon
+	// makes its containers, and who else is in the tree, matter there only.
+	private := egressHook && s.CgroupNS == CgroupNSPrivate
+	if private && (s.Dockerd.Kind == DockerdLocal || s.Dockerd.Kind == DockerdForeign) {
+		s.Dockerd.probeContainerTree(dockerSocket)
+	}
+	if private && s.CgroupPath != "" && s.CgroupPath != "/" {
+		s.CgroupTree, s.CgroupTreeReason = probeCgroupTree(CgroupRoot)
+	} else {
+		s.CgroupTreeReason = "not probed: read only in a private cgroup namespace below its root"
+	}
+	if env, uid, err := dockerEnv(); err != nil {
 		s.DockerHostReason = err.Error()
-	} else if host, setting, err := dockerCLIHost(env); err != nil {
+	} else if host, setting, err := dockerCLIHost(env, uid); err != nil {
 		s.DockerHostReason = err.Error()
 	} else if host != "" && dockerHostElsewhere(host, dockerSocket) {
 		s.DockerHost, s.DockerHostSetting = host, setting
@@ -633,6 +611,61 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 		s.SocketCgroups, s.SocketCgroupsReason = probeSocketCgroups(kernel)
 	}
 	return s
+}
+
+// CgroupTree is who holds the tasks in the cgroup tree under
+// /sys/fs/cgroup.
+type CgroupTree int
+
+const (
+	CgroupTreeUnknown CgroupTree = iota // the probe failed, or was not made
+	CgroupTreeOurs                      // every task in it is in our pid namespace
+	CgroupTreeShared                    // a task in it is outside our pid namespace
+)
+
+func (c CgroupTree) String() string {
+	switch c {
+	case CgroupTreeOurs:
+		return "ours"
+	case CgroupTreeShared:
+		return "shared"
+	}
+	return "unknown"
+}
+
+// probeCgroupTree looks over every cgroup under root for a task outside
+// our pid namespace, which its cgroup.threads lists as 0, as the reader's
+// pid namespace numbers it. A cgroup removed during the look is passed
+// over; one that cannot be read leaves the answer unknown.
+func probeCgroupTree(root string) (CgroupTree, string) {
+	tree, why := CgroupTreeOurs, ""
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		data, err := os.ReadFile(filepath.Join(path, "cgroup.threads"))
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ENODEV) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if slices.Contains(strings.Split(string(data), "\n"), "0") {
+			tree, why = CgroupTreeShared, "a task outside our pid namespace is in "+path
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return CgroupTreeUnknown, err.Error()
+	}
+	return tree, why
 }
 
 // probeCgroupMount reports whether root is the cgroup tree path is in,
@@ -688,133 +721,6 @@ func parseCgroupV2Path(data []byte) string {
 		}
 	}
 	return ""
-}
-
-// probeDockerd identifies the daemon through SO_PEERCRED on a connection
-// to its socket: the kernel reports the listener's pid translated into our
-// pid namespace, 0 when it is not visible there. A visible pid can still
-// be another container's process once the pod shares one pid namespace, so
-// the mount namespace is the decisive comparison. A socket-activated
-// daemon reports the activating service manager, which shares ours on a
-// host.
-func probeDockerd(socket string) Dockerd {
-	unknown := func(err error) Dockerd { return Dockerd{Kind: DockerdUnknown, Reason: err.Error()} }
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", socket)
-	if err != nil {
-		// A missing socket is absent, and so is anything at its path that
-		// is not a socket, which refuses too: a directory a bind mount
-		// made where no socket existed holds no daemon. A socket that
-		// refuses was made by a daemon that is not listening: still
-		// starting, or gone and perhaps coming back, which this one probe
-		// cannot tell apart.
-		if errors.Is(err, os.ErrNotExist) {
-			return Dockerd{Kind: DockerdAbsent}
-		}
-		if errors.Is(err, unix.ECONNREFUSED) {
-			if fi, serr := os.Stat(socket); serr == nil && fi.Mode().Type() != os.ModeSocket {
-				return Dockerd{Kind: DockerdAbsent}
-			}
-		}
-		return unknown(fmt.Errorf("dial %s: %w", socket, err))
-	}
-	defer conn.Close()
-	pid, err := peerPid(conn.(*net.UnixConn))
-	if err != nil {
-		return unknown(err)
-	}
-	if pid == 0 {
-		return Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
-	}
-	ours, err := nsInode("/proc/self/ns/mnt")
-	if err != nil {
-		return unknown(err)
-	}
-	theirs, err := nsInode("/proc/" + strconv.Itoa(int(pid)) + "/ns/mnt")
-	if err != nil {
-		return unknown(err)
-	}
-	if ours != theirs {
-		proc := "/proc/" + strconv.Itoa(int(pid))
-		d := Dockerd{Kind: DockerdForeign, Reason: fmt.Sprintf("pid %d has another mount namespace", pid)}
-		d.Cgroup, _ = ReadCgroupPath(proc + "/cgroup")
-		if data, err := os.ReadFile(proc + "/mountinfo"); err != nil {
-			d.Reason += fmt.Sprintf("; its cgroup mount: %v", err)
-		} else if d.CgroupMount, err = cgroupMountRoot(data); err != nil {
-			d.Reason += fmt.Sprintf("; its cgroup mount: %v", err)
-		}
-		return d
-	}
-	return Dockerd{Kind: DockerdLocal}
-}
-
-// cgroupMountRoot is the root of the cgroup v2 mount at CgroupRoot in a
-// mountinfo, the last mounted there, which is the one in sight. The kernel
-// gives a cgroup2 mount's root as the reader's cgroup namespace sees it,
-// so its path compares with ours.
-func cgroupMountRoot(mountinfo []byte) (string, error) {
-	var root, fstype string
-	sc := bufio.NewScanner(bytes.NewReader(mountinfo))
-	for sc.Scan() {
-		// id parent major:minor root mountpoint options [optional...] - fstype source super-options
-		f := strings.Fields(sc.Text())
-		sep := slices.Index(f, "-")
-		if sep < 6 || sep+1 >= len(f) || unescapeMountinfo(f[4]) != CgroupRoot {
-			continue
-		}
-		root, fstype = unescapeMountinfo(f[3]), f[sep+1]
-	}
-	if err := sc.Err(); err != nil {
-		return "", err
-	}
-	switch fstype {
-	case "":
-		return "", fmt.Errorf("nothing is mounted at %s", CgroupRoot)
-	case "cgroup2":
-		return root, nil
-	default:
-		return "", fmt.Errorf("%s is %s, not cgroup v2", CgroupRoot, fstype)
-	}
-}
-
-// unescapeMountinfo undoes mountinfo's escapes: a space, tab, newline or
-// backslash in a path is written as a backslash and three octal digits.
-func unescapeMountinfo(s string) string {
-	if !strings.Contains(s, `\`) {
-		return s
-	}
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+4 <= len(s) {
-			if n, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
-				b.WriteByte(byte(n))
-				i += 3
-				continue
-			}
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
-}
-
-func peerPid(conn *net.UnixConn) (int32, error) {
-	raw, err := conn.SyscallConn()
-	if err != nil {
-		return 0, err
-	}
-	var cred *unix.Ucred
-	var credErr error
-	if err := raw.Control(func(fd uintptr) {
-		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
-	}); err != nil {
-		return 0, err
-	}
-	if credErr != nil {
-		return 0, fmt.Errorf("SO_PEERCRED: %w", credErr)
-	}
-	return cred.Pid, nil
 }
 
 func nsInode(path string) (uint64, error) {

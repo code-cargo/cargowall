@@ -29,6 +29,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/events"
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // sockdiag resolves a local socket's kernel cookie from its source address,
@@ -492,7 +493,7 @@ func (r *clientResolver) stepForClient(addr net.Addr) events.StepAttribution {
 		var pid uint32
 		if r.pidMap != nil && r.pidMap.Lookup(cookie, &pid) == nil && pid != 0 {
 			attr.PID = pid
-			attr.Process = readComm(int(pid))
+			attr.Process = podenv.Comm(int(pid))
 		}
 	default:
 		// A status this switch does not know is a programming error: log it

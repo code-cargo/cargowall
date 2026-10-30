@@ -91,11 +91,12 @@ struct {
 // What the scope could not record, for pkg/origin to report: each counts
 // entries, so a cgroup entered twice that could not be recorded counts
 // twice. Mirrored by Go constants and pinned by test.
-#define SCOPE_STAT_FULL 0    // map_scope_cgroups was full
-#define SCOPE_STAT_ROOT 1    // a task of ours entered the root cgroup
-#define SCOPE_STAT_FAILED 2  // any other update or delete failure, such as a busy bucket
-#define SCOPE_STAT_SHARED 3  // a task outside our pid namespace entered a recorded cgroup
-#define SCOPE_STATS_MAX 4
+#define SCOPE_STAT_FULL 0        // map_scope_cgroups was full
+#define SCOPE_STAT_ROOT 1        // a task of ours entered the root cgroup
+#define SCOPE_STAT_FAILED 2      // any other update or delete failure as tasks enter, such as a busy bucket
+#define SCOPE_STAT_SHARED 3      // a task outside our pid namespace entered a recorded cgroup
+#define SCOPE_STAT_UNRELEASED 4  // a released cgroup's entry could not be deleted
+#define SCOPE_STATS_MAX 5
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -228,14 +229,18 @@ int BPF_PROG(scope_attach, struct cgroup *dst, const char *path,
 // A cgroup being freed: its last task and its last socket are gone, so
 // no packet can carry its id again, and cgroup ids are never reused. Fires
 // for every hierarchy, and v1 ids can repeat v2 ones, so only the default
-// hierarchy's are ours to delete.
+// hierarchy's are ours to delete. Nothing else ever deletes a released
+// cgroup's entry, so a delete that fails other than for want of one is
+// counted: the entry keeps its place in the map for good.
 SEC("tp_btf/cgroup_release")
 int BPF_PROG(scope_release, struct cgroup *cg, const char *path)
 {
     if (BPF_CORE_READ(cg, root, hierarchy_id) != 0)
         return 0;
     __u64 id = BPF_CORE_READ(cg, kn, id);
-    bpf_map_delete_elem(&map_scope_cgroups, &id);
+    long err = bpf_map_delete_elem(&map_scope_cgroups, &id);
+    if (err && err != -ENOENT)
+        scope_count(SCOPE_STAT_UNRELEASED);
     return 0;
 }
 

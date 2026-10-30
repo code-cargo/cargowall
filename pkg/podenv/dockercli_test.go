@@ -29,9 +29,10 @@ import (
 	"time"
 )
 
-// /proc/<pid>/environ is NUL-separated KEY=value, values free to hold "=".
+// /proc/<pid>/environ is NUL-separated KEY=value, values free to hold "=",
+// and a key set twice reads as its first value, as getenv reads it.
 func TestParseEnviron(t *testing.T) {
-	env := parseEnviron([]byte("HOME=/home/runner\x00DOCKER_HOST=tcp://a:2376\x00X=a=b\x00\x00junk\x00"))
+	env := parseEnviron([]byte("HOME=/home/runner\x00DOCKER_HOST=tcp://a:2376\x00X=a=b\x00\x00junk\x00DOCKER_HOST=unix://\x00"))
 	want := map[string]string{"HOME": "/home/runner", "DOCKER_HOST": "tcp://a:2376", "X": "a=b"}
 	if len(env) != len(want) {
 		t.Fatalf("parseEnviron = %v, want %v", env, want)
@@ -91,29 +92,6 @@ func TestSudoEnv(t *testing.T) {
 	// Init has no parent, and is not sudo.
 	if _, err := sudoEnv(1); err == nil {
 		t.Errorf("sudoEnv(1): want an error, from no sudo among its parents")
-	}
-}
-
-// /proc/<pid>/stat names the process in parentheses, a name that may hold
-// spaces and parentheses of its own, then its state and parent.
-func TestParseStat(t *testing.T) {
-	for in, want := range map[string]struct {
-		comm string
-		ppid int
-	}{
-		"4242 (sudo) S 4100 4242 4100 0 -1":        {"sudo", 4100},
-		"4243 (a b) (c)) R 1 4243 4243 0 -1":       {"a b) (c)", 1},
-		"1 (systemd) S 0 1 1 0 -1 4194560 75 7 0 ": {"systemd", 0},
-	} {
-		comm, ppid, err := parseStat([]byte(in))
-		if err != nil || comm != want.comm || ppid != want.ppid {
-			t.Errorf("parseStat(%q) = %q, %d, %v; want %q, %d", in, comm, ppid, err, want.comm, want.ppid)
-		}
-	}
-	for _, in := range []string{"", "4242 sudo S 1", "4242 (sudo)", "4242 (sudo) S x"} {
-		if _, _, err := parseStat([]byte(in)); err == nil {
-			t.Errorf("parseStat(%q): want an error", in)
-		}
 	}
 }
 
@@ -191,7 +169,7 @@ func TestDockerCLIHost(t *testing.T) {
 	}
 	check := func(name string, getenv func(string) string, wantHost string, wantErr bool) {
 		t.Helper()
-		host, setting, err := dockerCLIHost(getenv)
+		host, setting, err := dockerCLIHost(getenv, "")
 		if (err != nil) != wantErr || host != wantHost {
 			t.Errorf("%s: got %q (%s), %v; want %q, error %v", name, host, setting, err, wantHost, wantErr)
 		}
@@ -215,7 +193,8 @@ func TestDockerCLIHost(t *testing.T) {
 	home := func(k string) string { return map[string]string{"HOME": filepath.Dir(dir)}[k] }
 	check("a HOME with no .docker", home, "", false)
 
-	// Without HOME the CLI reads the passwd entry's home, as here.
+	// Without HOME the CLI reads its user's passwd entry's home: under
+	// sudo, the job user's (SUDO_UID), not ours.
 	passwd := t.TempDir()
 	if err := os.Mkdir(filepath.Join(passwd, ".docker"), 0o755); err != nil {
 		t.Fatal(err)
@@ -224,7 +203,18 @@ func TestDockerCLIHost(t *testing.T) {
 	context("remote", "tcp://builder:2376")
 	config(`{"currentContext":"remote"}`)
 	saved := passwdHome
-	passwdHome = func() string { return passwd }
+	passwdHome = func(uid string) string {
+		if uid == "1001" {
+			return passwd
+		}
+		return ""
+	}
 	t.Cleanup(func() { passwdHome = saved })
-	check("no HOME: the passwd home's config", func(string) string { return "" }, "tcp://builder:2376", false)
+	noHome := func(string) string { return "" }
+	if host, _, err := dockerCLIHost(noHome, "1001"); err != nil || host != "tcp://builder:2376" {
+		t.Errorf("no HOME, under sudo: got %q, %v; want the job user's context", host, err)
+	}
+	if host, _, err := dockerCLIHost(noHome, ""); err != nil || host != "" {
+		t.Errorf("no HOME, our own user with no config: got %q, %v; want the default", host, err)
+	}
 }

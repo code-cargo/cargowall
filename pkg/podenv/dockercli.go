@@ -30,7 +30,6 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -39,101 +38,83 @@ import (
 const defaultDockerHost = "/var/run/docker.sock"
 
 // dockerEnv is the environment the job's docker CLI runs in, which says
-// which daemon it uses: under sudo, the one sudo was given, the job's,
-// since a plain sudo strips DOCKER_HOST and hands us root's HOME;
-// otherwise ours. Under sudo our own says nothing of the job's, so a sudo
-// that cannot be read leaves the daemon unidentified (sudoEnv).
-func dockerEnv() (func(string) string, error) {
-	if os.Getenv("SUDO_UID") == "" {
-		return os.Getenv, nil
+// which daemon it uses, and the user it runs as, whose passwd entry gives
+// the CLI a home without HOME: under sudo, the environment sudo was given
+// and SUDO_UID, the job's, since a plain sudo strips DOCKER_HOST and hands
+// us root's HOME; otherwise ours, and "" for our own user. Under sudo our
+// own environment says nothing of the job's, so a sudo that cannot be read
+// leaves the daemon unidentified (sudoEnv).
+func dockerEnv() (getenv func(string) string, uid string, err error) {
+	uid = os.Getenv("SUDO_UID")
+	if uid == "" {
+		return os.Getenv, "", nil
 	}
 	env, err := sudoEnv(os.Getppid())
 	if err != nil {
-		return nil, fmt.Errorf("started under sudo, whose environment, the job's, cannot be read: %w", err)
+		return nil, "", fmt.Errorf("started under sudo, whose environment, the job's, cannot be read: %w", err)
 	}
-	return func(k string) string { return env[k] }, nil
+	return func(k string) string { return env[k] }, uid, nil
 }
-
-// maxSudoDepth is how many processes up sudoEnv looks for sudo.
-const maxSudoDepth = 16
 
 // sudoEnv reads the environment of the nearest process named sudo from
 // pid up, through any shell sudo ran in between. There is none to find
 // for a process started detached (by setsid, or in the background of a
 // shell that has since exited), which init has adopted.
 func sudoEnv(pid int) (map[string]string, error) {
-	for i := 0; i < maxSudoDepth && pid > 0; i++ {
-		stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-		if err != nil {
-			return nil, err
-		}
-		comm, ppid, err := parseStat(stat)
-		if err != nil {
-			return nil, fmt.Errorf("/proc/%d/stat: %w", pid, err)
-		}
-		if comm == "sudo" {
-			data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
-			if err != nil {
-				return nil, err
-			}
-			return parseEnviron(data), nil
-		}
-		pid = ppid
+	sudo, ok := AncestorByComm(pid, "sudo")
+	if !ok {
+		return nil, errors.New("no sudo among cargowall's parents")
 	}
-	return nil, errors.New("no sudo among cargowall's parents")
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", sudo))
+	if err != nil {
+		return nil, err
+	}
+	return parseEnviron(data), nil
 }
 
-// parseStat reads a process's name and parent from its /proc/<pid>/stat:
-// "pid (comm) state ppid ...", where comm may hold spaces and parentheses.
-func parseStat(stat []byte) (comm string, ppid int, err error) {
-	open, end := bytes.IndexByte(stat, '('), bytes.LastIndexByte(stat, ')')
-	if open < 0 || end < open {
-		return "", 0, errors.New("no process name")
-	}
-	fields := strings.Fields(string(stat[end+1:]))
-	if len(fields) < 2 {
-		return "", 0, errors.New("no parent")
-	}
-	ppid, err = strconv.Atoi(fields[1])
-	return string(stat[open+1 : end]), ppid, err
-}
-
-// parseEnviron parses a /proc/<pid>/environ: NUL-separated KEY=value.
+// parseEnviron parses a /proc/<pid>/environ: NUL-separated KEY=value. A
+// key set twice keeps its first value, as getenv reads it, Go's and C's.
 func parseEnviron(data []byte) map[string]string {
 	env := make(map[string]string)
 	for _, kv := range bytes.Split(data, []byte{0}) {
 		if k, v, ok := strings.Cut(string(kv), "="); ok && k != "" {
-			env[k] = v
+			if _, set := env[k]; !set {
+				env[k] = v
+			}
 		}
 	}
 	return env
 }
 
-// passwdHome is the current user's home directory from the passwd
-// database, or "".
-var passwdHome = func() string {
-	if u, err := user.Current(); err == nil {
+// passwdHome is the home directory of the user with uid in the passwd
+// database, or of the current user for "", or "".
+var passwdHome = func(uid string) string {
+	u, err := user.Current()
+	if uid != "" {
+		u, err = user.LookupId(uid)
+	}
+	if err == nil {
 		return u.HomeDir
 	}
 	return ""
 }
 
 // dockerCLIHost is the daemon address the docker CLI would use in the
-// environment getenv reads, resolved as the CLI resolves it: DOCKER_HOST;
-// else the context DOCKER_CONTEXT names, else the config file's current
-// context, through that context's stored endpoint. setting says which; ""
-// is the default context, the default socket. A context that cannot be
-// read is an error, as it is to the CLI.
-func dockerCLIHost(getenv func(string) string) (host, setting string, err error) {
+// environment getenv reads, run as uid ("" for our own user), resolved as
+// the CLI resolves it: DOCKER_HOST; else the context DOCKER_CONTEXT names,
+// else the config file's current context, through that context's stored
+// endpoint. setting says which; "" is the default context, the default
+// socket. A context that cannot be read is an error, as it is to the CLI.
+func dockerCLIHost(getenv func(string) string, uid string) (host, setting string, err error) {
 	if h := getenv("DOCKER_HOST"); h != "" {
 		return h, "DOCKER_HOST", nil
 	}
 	dir := getenv("DOCKER_CONFIG")
 	if dir == "" {
-		// The CLI falls back on the user's passwd entry without HOME.
+		// The CLI falls back on its user's passwd entry without HOME.
 		home := getenv("HOME")
 		if home == "" {
-			home = passwdHome()
+			home = passwdHome(uid)
 		}
 		if home != "" {
 			dir = filepath.Join(home, ".docker")

@@ -71,6 +71,10 @@ type cgroupScope struct {
 	// What the last walk found and logged, so the next logs only what is
 	// new, and keeps only what it finds again. Owned by the walk.
 	last walkFindings
+	// Recorded cgroups the walk found removed, which it no longer opens:
+	// ids are never reused, and release takes their entries out. It keeps
+	// only ids still in the map. Owned by the walk.
+	stale map[uint64]bool
 }
 
 // walkFindings is what one walk found that it logs: cgroups shared with a
@@ -167,7 +171,7 @@ func startCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, er
 	}
 	s := &cgroupScope{
 		logger: logger, sub: sub, stop: make(chan struct{}), done: make(chan struct{}),
-		last: newWalkFindings(),
+		last: newWalkFindings(), stale: make(map[uint64]bool),
 	}
 	if err := cargowallEbpf.LoadObjects(logger, "scopebpf", spec, ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
@@ -314,9 +318,9 @@ func (s *cgroupScope) unreadable(id uint64, path string, err error, found *walkF
 // reconcileRecorded checks the cgroups in the scope that the listing did
 // not reach, which held no task of ours when it ran: one a task of ours
 // entered beside another task, or at the same moment as one, and has since
-// left, or one a failed delete left in. The scope can change while it is
-// read, which may cut the read short: the cgroups it did read are still
-// checked, and the rest wait for a later walk.
+// left, or one a failed delete left in. One found removed is not opened
+// again (stale). A read of the scope cut short still has the cgroups it
+// read checked, and the rest wait for a later walk.
 func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFindings) {
 	ids, err := scopeCgroups(s.objs.MapScopeCgroups)
 	if err != nil {
@@ -325,12 +329,26 @@ func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFi
 			s.logger.Warn("Container egress cgroup scope could not read all its cgroups, "+
 				"and those it missed stay as they are until a later walk", "error", err)
 		}
+	} else {
+		inMap := make(map[uint64]bool, len(ids))
+		for _, id := range ids {
+			inMap[id] = true
+		}
+		for id := range s.stale {
+			if !inMap[id] {
+				delete(s.stale, id)
+			}
+		}
 	}
 	for _, id := range ids {
-		if listed[id] != nil {
+		if listed[id] != nil || s.stale[id] {
 			continue
 		}
 		dir, path, inside, err := s.openCgroup(id)
+		if errors.Is(err, syscall.ESTALE) {
+			s.stale[id] = true
+			continue
+		}
 		if err != nil {
 			s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
 			continue
@@ -343,22 +361,26 @@ func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFi
 	}
 }
 
-// scopeCgroups reads the cgroup ids in the scope map, and those it read
-// before an error. A delete meanwhile restarts the read, which meets some
-// twice, and enough of them abort it. A test stands in for it.
+// scopeBatch is how many entries scopeCgroups reads per call.
+const scopeBatch = 4096
+
+// scopeCgroups reads the cgroup ids in the scope map in batches, bucket by
+// bucket, which a concurrent delete does not restart, and returns those it
+// read before an error. A test stands in for it.
 var scopeCgroups = func(m *ebpf.Map) ([]uint64, error) {
 	var ids []uint64
-	seen := make(map[uint64]bool)
-	var id uint64
-	var v uint8
-	it := m.Iterate()
-	for it.Next(&id, &v) {
-		if !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
+	var cursor ebpf.MapBatchCursor
+	keys, values := make([]uint64, scopeBatch), make([]uint8, scopeBatch)
+	for {
+		n, err := m.BatchLookup(&cursor, keys, values, nil)
+		ids = append(ids, keys[:n]...)
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return ids, nil
+		}
+		if err != nil {
+			return ids, err
 		}
 	}
-	return ids, it.Err()
 }
 
 // fileIDKernfs is the file handle type of a kernfs node (FILEID_KERNFS),
@@ -380,15 +402,15 @@ func (s *cgroupScope) openCgroup(id uint64) (dir *os.File, path string, inside b
 		return nil, "", false, fmt.Errorf("open cgroup %d by its id: %w", id, err)
 	}
 	dir = os.NewFile(uintptr(fd), fmt.Sprintf("cgroup %d", id))
-	link, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+	target, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
 	if err != nil {
 		dir.Close()
 		return nil, "", false, err
 	}
-	if link == podenv.CgroupRoot {
+	if target == podenv.CgroupRoot {
 		return dir, "/", true, nil
 	}
-	rel, inside := strings.CutPrefix(link, podenv.CgroupRoot+"/")
+	rel, inside := strings.CutPrefix(target, podenv.CgroupRoot+"/")
 	return dir, "/" + rel, inside, nil
 }
 
@@ -432,8 +454,11 @@ func (s *cgroupScope) recorded(id uint64) bool {
 // exist yet. A tracepoint may have made it since, which changes nothing. A
 // cgroup already in the scope before the first look needs neither: the
 // tracepoints have seen every entry since. As in the kernel, a cgroup the
-// map cannot take costs its own sockets, not the scope. One released since
-// the walk listed it stays, a dead id: ids are never reused.
+// map cannot take costs its own sockets, not the scope. One the second
+// look finds removed may have been released before the entry was made, and
+// release is all that takes an entry out, so the walk takes out its own:
+// any socket of ours that outlives the cgroup passes, as it would had the
+// walk come a moment later.
 func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFindings) {
 	err := s.objs.MapScopeCgroups.Update(id, uint8(1), ebpf.UpdateNoExist)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
@@ -445,7 +470,12 @@ func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFi
 		}
 		return
 	}
-	if m, err := cgroupMembers(dir); err == nil && m.theirs {
+	made := err == nil
+	m, err := cgroupMembers(dir)
+	switch {
+	case cgroupGone(err) && made:
+		_ = s.objs.MapScopeCgroups.Delete(id)
+	case err == nil && m.theirs:
 		s.leave(id, path, m.ours, found)
 	}
 }
@@ -454,14 +484,20 @@ func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFi
 // tracepoint or an earlier walk have recorded it: a task outside our pid
 // namespace is in it, which the hook must not judge. ours says whether a
 // task of ours is in it too. Logged when the last walk did not find it
-// shared.
+// shared, and not at all when neither holds: a cgroup never in the scope
+// that no task of ours is in now changes nothing (a runtime's exec stage
+// listed in the runtime's cgroup has moved on).
 func (s *cgroupScope) leave(id uint64, path string, ours bool, found *walkFindings) {
-	if err := s.objs.MapScopeCgroups.Delete(id); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+	err := s.objs.MapScopeCgroups.Delete(id)
+	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		found.unremoved[id] = true
 		if !s.last.unremoved[id] {
 			s.logger.Warn("Container egress cgroup scope could not take out a cgroup it shares with tasks outside "+
 				"this job, whose sockets the hook still judges", "cgroup", path, "error", err)
 		}
+		return
+	}
+	if err != nil && !ours {
 		return
 	}
 	found.shared[id] = true
@@ -596,6 +632,8 @@ func (s *cgroupScope) report() {
 			"which stay as they were until the next walk",
 		bpf.ScopeStatShared: "Cgroups this job entered were entered by tasks outside it and left the scope: " +
 			"sockets there pass the cgroup hook",
+		bpf.ScopeStatUnreleased: "Container egress cgroup scope failed to forget released cgroups, " +
+			"whose entries keep their places in it for good",
 	} {
 		var n uint64
 		if err := s.objs.MapScopeStats.Lookup(uint32(slot), &n); err != nil || n <= s.reported[slot] {

@@ -35,6 +35,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/events"
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // dumpAndMatch is one table dump plus one pure match. A dump failure fails
@@ -546,5 +547,5 @@ func TestStepForClient_SeededMaps(t *testing.T) {
 	assert.Equal(t, events.StepAttrOK, attr.Outcome)
 	assert.Equal(t, uint32(7), attr.Ordinal)
 	assert.Equal(t, uint32(os.Getpid()), attr.PID)
-	assert.Equal(t, readComm(os.Getpid()), attr.Process)
+	assert.Equal(t, podenv.Comm(os.Getpid()), attr.Process)
 }

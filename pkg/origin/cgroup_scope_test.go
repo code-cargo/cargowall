@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -109,7 +110,7 @@ func TestCgroupScopeWalkLeavesSharedCgroups(t *testing.T) {
 	pod := filepath.Join(dir, "pod")
 	cgroups := []string{
 		dir, filepath.Join(dir, "shared"), filepath.Join(dir, ".own"), filepath.Join(dir, "theirs"),
-		filepath.Join(dir, "gone"), pod, filepath.Join(pod, "shared"), filepath.Join(pod, "runner"),
+		filepath.Join(dir, "gone"), filepath.Join(dir, "late"), pod, filepath.Join(pod, "shared"), filepath.Join(pod, "runner"),
 	}
 	for _, d := range cgroups {
 		require.NoError(t, os.Mkdir(d, 0o755))
@@ -167,9 +168,7 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	var log bytes.Buffer
 	podRel := strings.TrimPrefix(pod, podenv.CgroupRoot)
 	// The test walks by hand; the tick would race it.
-	saved := scopeStatsInterval
-	scopeStatsInterval = time.Hour
-	t.Cleanup(func() { scopeStatsInterval = saved })
+	swap(t, &scopeStatsInterval, time.Hour)
 	s, err := startCgroupScope(slog.New(slog.NewTextHandler(&log, nil)), podRel)
 	require.NoError(t, err)
 	t.Cleanup(s.close)
@@ -224,16 +223,9 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	theirs := filepath.Join(dir, "theirs")
 	theirsRel := strings.TrimPrefix(theirs, podenv.CgroupRoot)
 	require.NoError(t, s.cgroups().Put(idOf(theirs), uint8(1)))
-	readAll := readThreads
-	readThreads = func(dir *os.File) ([]byte, error) {
-		var st unix.Stat_t
-		if unix.Fstat(int(dir.Fd()), &st) == nil && st.Ino == idOf(theirs) {
-			return nil, syscall.EIO
-		}
-		return readAll(dir)
-	}
+	restore := swap(t, &readThreads, failReading(idOf(theirs), syscall.EIO))
 	require.NoError(t, s.walk(false))
-	readThreads = readAll
+	restore()
 	require.True(t, recorded(theirs), "a cgroup the walk cannot read stays as it was")
 	require.Contains(t, log.String(), "cannot read a cgroup")
 	require.NoError(t, s.walk(false))
@@ -249,29 +241,82 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 
 	// A read of the scope cut short still checks the cgroups it read, and
 	// is reported once, however many walks it fails.
-	readScope := scopeCgroups
-	scopeCgroups = func(*ebpf.Map) ([]uint64, error) { return []uint64{idOf(theirs)}, ebpf.ErrIterationAborted }
+	restore = swap(t, &scopeCgroups, func(*ebpf.Map) ([]uint64, error) {
+		return []uint64{idOf(theirs)}, ebpf.ErrIterationAborted
+	})
 	require.NoError(t, s.cgroups().Put(idOf(theirs), uint8(1)))
 	require.NoError(t, s.walk(false))
 	require.NoError(t, s.walk(false))
-	scopeCgroups = readScope
+	restore()
 	require.False(t, recorded(theirs), "a cgroup the cut-short read reached")
 	require.Equal(t, 1, strings.Count(log.String(), "could not read all its cgroups"), "reported once")
 
 	// A recorded cgroup since removed needs nothing: its release takes it
-	// out, and the walk passes it over without a warning.
+	// out, and the walk passes it over without a warning, and stops
+	// opening it until release has.
 	gone := filepath.Join(dir, "gone")
-	require.NoError(t, s.cgroups().Put(idOf(gone), uint8(1)))
+	goneID := idOf(gone)
+	require.NoError(t, s.cgroups().Put(goneID, uint8(1)))
 	require.NoError(t, os.Remove(gone))
 	before := strings.Count(log.String(), "level=WARN")
 	require.NoError(t, s.walk(false))
 	require.Equal(t, before, strings.Count(log.String(), "level=WARN"), "a removed cgroup is not reported:\n%s", log.String())
+	require.True(t, s.stale[goneID], "and it is not opened again")
+	require.NoError(t, s.cgroups().Delete(goneID))
+	require.NoError(t, s.walk(false))
+	require.False(t, s.stale[goneID], "until its release has taken it out")
+
+	// A cgroup recorded and then found removed by the second look may
+	// have been released already, before the entry: the walk takes out
+	// its own entry, which nothing else would.
+	late := filepath.Join(dir, "late")
+	lateRel := strings.TrimPrefix(late, podenv.CgroupRoot)
+	lateDir, latePath, _, err := s.openCgroup(idOf(late))
+	require.NoError(t, err)
+	defer lateDir.Close()
+	restore = swap(t, &readThreads, failReading(idOf(late), syscall.ENOENT))
+	s.record(idOf(late), lateDir, latePath, &found)
+	restore()
+	require.False(t, recorded(late), "an entry for a cgroup removed since the first look")
+
+	// Taking out a cgroup that was never in the scope, with no task of
+	// ours left in it, changes nothing and is not reported; one with a
+	// task of ours in it is.
+	found = newWalkFindings()
+	s.leave(idOf(late), lateRel, false, &found)
+	require.NotContains(t, log.String(), lateRel, "nothing changed")
+	s.leave(idOf(late), lateRel, true, &found)
+	require.Contains(t, log.String(), lateRel, "a task of ours passes the hook there")
 
 	// A task of ours in the root cgroup is reported once, however many
 	// walks find it there.
 	require.Equal(t, 1, strings.Count(log.String(), "in the root cgroup"), "reported by the first walk")
 	require.NoError(t, s.walk(false))
 	require.Equal(t, 1, strings.Count(log.String(), "in the root cgroup"), "and not again")
+}
+
+// swap sets *v to stub until restore, which cleanup runs too, should the
+// test stop first.
+func swap[T any](t *testing.T, v *T, stub T) (restore func()) {
+	saved := *v
+	*v = stub
+	var once sync.Once
+	restore = func() { once.Do(func() { *v = saved }) }
+	t.Cleanup(restore)
+	return restore
+}
+
+// failReading is a readThreads that fails with err for the cgroup id and
+// reads every other.
+func failReading(id uint64, err error) func(*os.File) ([]byte, error) {
+	read := readThreads
+	return func(dir *os.File) ([]byte, error) {
+		var st unix.Stat_t
+		if unix.Fstat(int(dir.Fd()), &st) == nil && st.Ino == id {
+			return nil, err
+		}
+		return read(dir)
+	}
 }
 
 // The subtree's kernel level is our own cgroup's, less how far below the
@@ -302,7 +347,7 @@ func loadWalkScope(t *testing.T, ino, maxEntries uint32) *cgroupScope {
 	spec.Maps[bpf.ScopeBpfMapMapScopeCgroups].MaxEntries = maxEntries
 	require.NoError(t, spec.Variables[bpf.ScopeBpfVarSelfTgid].Set(uint32(os.Getpid())))
 	var log bytes.Buffer
-	s := &cgroupScope{logger: slog.New(slog.NewTextHandler(&log, nil)), last: newWalkFindings()}
+	s := &cgroupScope{logger: slog.New(slog.NewTextHandler(&log, nil)), last: newWalkFindings(), stale: make(map[uint64]bool)}
 	require.NoError(t, spec.LoadAndAssign(&s.objs, nil))
 	t.Cleanup(s.release)
 	s.mount, err = os.Open(podenv.CgroupRoot)
@@ -311,6 +356,20 @@ func loadWalkScope(t *testing.T, ino, maxEntries uint32) *cgroupScope {
 	require.NoError(t, err)
 	s.links = append(s.links, s.iter)
 	return s
+}
+
+// ownCgroupBelowRoot is the test process's cgroup, and skips the test
+// where that is the root, as in a VM with no cgroups of its own: the walk
+// reports the root's tasks and records nothing, so a test of recording has
+// nothing to look at.
+func ownCgroupBelowRoot(t *testing.T) string {
+	t.Helper()
+	own, err := podenv.ReadCgroupPath("/proc/self/cgroup")
+	require.NoError(t, err)
+	if own == "/" {
+		t.Skip("the test process is in the root cgroup, which the walk never records")
+	}
+	return own
 }
 
 // A walk that lists no task of ours (here, of a pid namespace no task is
@@ -333,19 +392,10 @@ func TestCgroupScopeWalkSkipsUnreadableCgroups(t *testing.T) {
 	s := loadWalkScope(t, ino, 65536)
 	var log bytes.Buffer
 	s.logger = slog.New(slog.NewTextHandler(&log, nil))
-	own, err := podenv.ReadCgroupPath("/proc/self/cgroup")
-	require.NoError(t, err)
+	own := ownCgroupBelowRoot(t)
 	ownID, err := podenv.CgroupID(own)
 	require.NoError(t, err)
-	saved := readThreads
-	readThreads = func(dir *os.File) ([]byte, error) {
-		var st unix.Stat_t
-		if unix.Fstat(int(dir.Fd()), &st) == nil && st.Ino == ownID {
-			return nil, syscall.EIO
-		}
-		return saved(dir)
-	}
-	t.Cleanup(func() { readThreads = saved })
+	swap(t, &readThreads, failReading(ownID, syscall.EIO))
 	require.NoError(t, s.walk(false))
 	require.NoError(t, s.walk(false))
 	require.Equal(t, 1, strings.Count(log.String(), "cannot read a cgroup"), "reported once")
@@ -363,6 +413,7 @@ func TestCgroupScopeWalkSkipsUnreadableCgroups(t *testing.T) {
 // with a warning, as in the kernel, and not the scope. From the host pid
 // namespace every task on the machine is ours, so the walk finds plenty.
 func TestCgroupScopeWalkFullMapWarns(t *testing.T) {
+	ownCgroupBelowRoot(t)
 	ino, err := podenv.PidNamespaceInode()
 	require.NoError(t, err)
 	s := loadWalkScope(t, ino, 1)

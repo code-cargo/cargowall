@@ -20,9 +20,10 @@ package bpf
 // Go copy, which pkg/origin reports from and TestScopeStatSlotsMatchSource
 // pins to the C source.
 const (
-	ScopeStatFull   = iota // map_scope_cgroups was full
-	ScopeStatRoot          // a task of ours entered the root cgroup
-	ScopeStatFailed        // any other update or delete failure
-	ScopeStatShared        // a task outside our pid namespace entered a recorded cgroup
+	ScopeStatFull       = iota // map_scope_cgroups was full
+	ScopeStatRoot              // a task of ours entered the root cgroup
+	ScopeStatFailed            // any other update or delete failure as tasks enter
+	ScopeStatShared            // a task outside our pid namespace entered a recorded cgroup
+	ScopeStatUnreleased        // a released cgroup's entry could not be deleted
 	ScopeStatsMax
 )

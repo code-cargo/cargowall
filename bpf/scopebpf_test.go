@@ -47,11 +47,12 @@ func TestScopeStatSlotsMatchSource(t *testing.T) {
 	src, err := os.ReadFile("scopebpf.c")
 	require.NoError(t, err)
 	for name, want := range map[string]uint64{
-		"SCOPE_STAT_FULL":   ScopeStatFull,
-		"SCOPE_STAT_ROOT":   ScopeStatRoot,
-		"SCOPE_STAT_FAILED": ScopeStatFailed,
-		"SCOPE_STAT_SHARED": ScopeStatShared,
-		"SCOPE_STATS_MAX":   ScopeStatsMax,
+		"SCOPE_STAT_FULL":       ScopeStatFull,
+		"SCOPE_STAT_ROOT":       ScopeStatRoot,
+		"SCOPE_STAT_FAILED":     ScopeStatFailed,
+		"SCOPE_STAT_SHARED":     ScopeStatShared,
+		"SCOPE_STAT_UNRELEASED": ScopeStatUnreleased,
+		"SCOPE_STATS_MAX":       ScopeStatsMax,
 	} {
 		m := regexp.MustCompile(`(?m)^#define ` + name + `\s+(\d+)\b`).FindSubmatch(src)
 		require.NotNil(t, m, "scopebpf.c must #define %s", name)

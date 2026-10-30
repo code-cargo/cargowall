@@ -688,7 +688,7 @@ func (t *Tracker) stepCmdline(pid int) string {
 // lines into our audit stream. The scan survives only as a fallback for
 // standalone starts, and then only when it is unambiguous.
 func findWorkerPID() (int, error) {
-	if pid, ok := findAncestorByComm(os.Getpid(), workerComm); ok {
+	if pid, ok := podenv.AncestorByComm(os.Getpid(), workerComm); ok {
 		return pid, nil
 	}
 	pid, count := scanUniqueByComm(workerComm)
@@ -700,27 +700,6 @@ func findWorkerPID() (int, error) {
 	default:
 		return 0, fmt.Errorf("%d %s processes found and none is an ancestor — refusing to guess (use --runner-worker-pid)", count, workerComm)
 	}
-}
-
-// findAncestorByComm walks the parent chain from fromPid looking for a
-// process whose comm matches. Bounded to defend against a cyclic/corrupt
-// /proc snapshot; real chains reach pid 1 in far fewer hops.
-func findAncestorByComm(fromPid int, comm string) (int, bool) {
-	pid := fromPid
-	for range 64 {
-		if pid <= 1 {
-			return 0, false
-		}
-		if readComm(pid) == comm {
-			return pid, true
-		}
-		ppid, ok := readPPid(pid)
-		if !ok {
-			return 0, false
-		}
-		pid = ppid
-	}
-	return 0, false
 }
 
 // scanUniqueByComm returns the first /proc process with the given comm and
@@ -735,7 +714,7 @@ func scanUniqueByComm(comm string) (first, count int) {
 		if err != nil {
 			continue
 		}
-		if readComm(pid) == comm {
+		if podenv.Comm(pid) == comm {
 			if count == 0 {
 				first = pid
 			}
@@ -743,38 +722,6 @@ func scanUniqueByComm(comm string) (first, count int) {
 		}
 	}
 	return first, count
-}
-
-// readComm returns the trimmed /proc/<pid>/comm, or "" when unreadable.
-func readComm(pid int) string {
-	comm, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(comm))
-}
-
-// readPPid extracts the parent pid from /proc/<pid>/stat. The comm field
-// (2) can contain spaces and parentheses, so parse from the last ')' —
-// state is the field after it, ppid the one after that.
-func readPPid(pid int) (int, bool) {
-	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if err != nil {
-		return 0, false
-	}
-	i := strings.LastIndexByte(string(data), ')')
-	if i < 0 {
-		return 0, false
-	}
-	fields := strings.Fields(string(data[i+1:]))
-	if len(fields) < 2 {
-		return 0, false
-	}
-	ppid, err := strconv.Atoi(fields[1])
-	if err != nil {
-		return 0, false
-	}
-	return ppid, true
 }
 
 // readCmdline returns a space-joined, length-capped /proc/<pid>/cmdline,

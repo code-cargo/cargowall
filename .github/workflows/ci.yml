@@ -39,7 +39,7 @@ env:
 
 
 # Jobs whose behavior depends on the runner's kernel or distro (BPF test
-# runs, iptables, sudo, the resolver setup) run on a matrix of the current
+# runs, nftables, sudo, the resolver setup) run on a matrix of the current
 # Ubuntu LTS and the one before it, so a new runner image shows up as one
 # failing leg instead of a broken main.
 jobs:

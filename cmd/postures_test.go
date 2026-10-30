@@ -54,7 +54,7 @@ func ledgerWithLog(t *testing.T, egress, sni string) (*postureLedger, *bytes.Buf
 	t.Helper()
 	var buf bytes.Buffer
 	cmd := &StartCmd{ContainerEgress: egress, TLSSNI: sni}
-	return newPostures(cmd, "6.6.141", slog.New(slog.NewTextHandler(&buf, nil))), &buf
+	return newPostures(cmd, "6.6.141", true, slog.New(slog.NewTextHandler(&buf, nil))), &buf
 }
 
 func TestPostures_OffLayersAreNotTracked(t *testing.T) {
@@ -151,6 +151,63 @@ func TestPostures_UnrequestedLayerLossIsNoop(t *testing.T) {
 	p, buf := ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
 	require.NoError(t, p.lose(postureTLSSNI, "x"))
 	assert.Empty(t, buf.String())
+}
+
+// A redirect that did not come up fails startup under an enforcing policy,
+// where the job's allowed hostnames would be blocked on bare IPs, and is
+// recorded for the summary under an auditing one. It is tracked only while
+// DNS tracking runs: otherwise there is no proxy for it to redirect to.
+func TestPostures_DNSRedirect(t *testing.T) {
+	failed := &dnsRedirect{err: errors.New("nftables: installing table ip cargowall: operation not supported\nsecond line")}
+	ledger := func(cmd *StartCmd, enforcing bool) (*postureLedger, *bytes.Buffer) {
+		var buf bytes.Buffer
+		return newPostures(cmd, "6.6.141", enforcing, slog.New(slog.NewTextHandler(&buf, nil))), &buf
+	}
+
+	p, buf := ledger(&StartCmd{DNSRedirect: true}, true)
+	require.EqualError(t, failed.settle(p),
+		"--dns-redirect=true requested but could not be applied: "+
+			"nftables: installing table ip cargowall: operation not supported")
+	assert.Contains(t, buf.String(), "level=ERROR")
+
+	redirectStateFiles(t)
+	p, buf = ledger(&StartCmd{DNSRedirect: true}, false)
+	require.NoError(t, failed.settle(p), "an auditing policy blocks nothing, so the loss is not fatal")
+	assert.Contains(t, buf.String(), "level=WARN")
+	want := []postureLine{{
+		Posture: postureDNSRedirect, Requested: "true", Applied: "false",
+		Reason: "nftables: installing table ip cargowall: operation not supported",
+	}}
+	assert.Equal(t, want, p.lines())
+	p.write()
+	assert.Equal(t, want, readPostures(), "the summary lists the lost redirect")
+
+	p, _ = ledger(&StartCmd{DNSRedirect: true, DisableDNSTracking: true}, true)
+	assert.Empty(t, p.layers, "no DNS tracking, no redirect to promise")
+	p, _ = ledger(&StartCmd{}, true)
+	assert.Empty(t, p.layers)
+
+	p, _ = ledger(&StartCmd{DNSRedirect: true}, true)
+	require.NoError(t, (&dnsRedirect{}).settle(p))
+	require.NoError(t, (*dnsRedirect)(nil).settle(p), "nil is the redirect not requested")
+	assert.False(t, (*dnsRedirect)(nil).isActive())
+	assert.False(t, p.layers[0].degraded())
+}
+
+// Policy lockdown stays up deny-all until the job ends, and the job has
+// already failed: a lost fail-closed layer is logged and recorded, never a
+// startup error, which would take the whole firewall down with it.
+func TestPostures_LockdownLossIsNotFatal(t *testing.T) {
+	var buf bytes.Buffer
+	cmd := &StartCmd{ContainerEgress: ContainerEgressEnforce, DNSRedirect: true, policyLockdown: true}
+	p := newPostures(cmd, "6.6.141", true, slog.New(slog.NewTextHandler(&buf, nil)))
+	require.NoError(t, p.lose(postureContainerEgress, "hook refused"))
+	require.NoError(t, (&dnsRedirect{err: errors.New("nftables: EPERM")}).settle(p))
+	assert.Equal(t, 2, strings.Count(buf.String(), "level=ERROR"), "still logged as the error it is")
+	assert.Contains(t, buf.String(), "staying up in policy lockdown")
+	for _, l := range p.lines() {
+		assert.True(t, l.degraded(), "%s is recorded as lost", l.Posture)
+	}
 }
 
 // Without step attribution the hook never starts: fatal under enforce, a

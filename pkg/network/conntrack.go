@@ -88,7 +88,7 @@ func ctMsgType(subtype uint16) netlink.HeaderType {
 }
 
 // nfgenmsgV4 returns the nfgenmsg header for AF_INET — the redirect is
-// v4-only (iptables rules, udp4/tcp4 proxy listeners), so v4 is the only
+// v4-only (an ip-family table, udp4/tcp4 proxy listeners), so v4 is the only
 // table with entries to flush.
 func nfgenmsgV4() []byte {
 	return []byte{unix.AF_INET, unix.NFNETLINK_V0, 0, 0}
@@ -343,7 +343,7 @@ func flushAttempt(logger *slog.Logger) error {
 // DNS flow state predating the redirect bypasses the proxy — and state
 // surviving teardown keeps DNAT'ing to the dead proxy — until deleted.
 // Scoped to port 53 (a full flush would churn unrelated NAT state) and
-// best-effort: the iptables rules stand regardless, and a returned error
+// best-effort: the redirect stands regardless, and a returned error
 // names how far the flush got. Mechanics, collateral analysis, and
 // measurements: design.md.
 func FlushDNSConntrack(logger *slog.Logger) error {

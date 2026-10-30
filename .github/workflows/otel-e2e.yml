@@ -124,7 +124,7 @@ jobs:
             ./bin/cargowall start \
             --config /etc/cargowall/config.json \
             --dns-upstream 8.8.8.8:53 \
-            --dns-redirect-iptables \
+            --dns-redirect \
             --dns-query-filtering \
             --audit-mode \
             --audit-log /tmp/cargowall.ndjson \
@@ -259,7 +259,7 @@ jobs:
             ./bin/cargowall start \
             --config /etc/cargowall/config.json \
             --dns-upstream 8.8.8.8:53 \
-            --dns-redirect-iptables \
+            --dns-redirect \
             --dns-query-filtering \
             --audit-mode \
             --pidfile /tmp/cargowall.pid &

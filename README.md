@@ -178,6 +178,7 @@ CargoWall's runtime is a self-contained Linux binary — the GitHub Actions inte
 ## Requirements
 
 * Linux kernel **5.8 or newer** (eBPF TC + cgroup hooks). CargoWall attaches its egress filter via the modern TCX hook on kernel 6.6+ and automatically falls back to the legacy `clsact` qdisc on 5.8–6.5, so older LTS kernels are supported. (5.8 is the floor because the in-kernel event ring buffer requires it.)
+* On kernel **5.12 or newer**, `--dns-redirect` (which the `--github-action` and `--gitlab-ci` presets turn on) installs its nftables table owned by cargowall's process, so the kernel removes it when cargowall exits however it exits. On 5.8–5.11 the table is installed unowned: the same redirect, but a cargowall that dies without tearing it down leaves it in place until the next run replaces it, and other processes can delete it.
 * `CAP_BPF` and `CAP_NET_ADMIN` (typically run as root, or via capabilities/systemd)
 * An upstream DNS server CargoWall can forward queries to
 * Ports `53/udp` and `53/tcp` available on `127.0.0.1` for the local DNS proxy (the proxy starts listeners on both)
@@ -220,15 +221,15 @@ sudo cargowall start \
   --dns-upstream 8.8.8.8:53
 ```
 
-By default, standalone mode does **not** install the iptables DNS redirect or rewrite Docker's DNS config. You need to route DNS traffic through the local proxy yourself, otherwise hostname rules will never populate (e.g. the `github.com` allow rule above will stay empty and traffic will be blocked under a deny-by-default policy). Three options:
+By default, standalone mode does **not** install the DNS redirect or rewrite Docker's DNS config. You need to route DNS traffic through the local proxy yourself, otherwise hostname rules will never populate (e.g. the `github.com` allow rule above will stay empty and traffic will be blocked under a deny-by-default policy). Three options:
 
 1. **Pass the orthogonal flags** to let cargowall do the wiring (recommended on CI runners):
    ```bash
    sudo cargowall start --config /etc/cargowall/config.json --dns-upstream 8.8.8.8:53 \
-     --dns-redirect-iptables --docker-dns-interception --dns-query-filtering
+     --dns-redirect --docker-dns-interception --dns-query-filtering
    ```
 2. **Use a CI preset** (`--github-action` or `--gitlab-ci`) — bundles all of the above plus cache pre-population and CI-specific host auto-allow.
-3. **Wire it manually**: point `/etc/resolv.conf` at `nameserver 127.0.0.1`, pass `--dns 127.0.0.1` to `docker run`, add your own `iptables -t nat -A OUTPUT -p udp --dport 53 ! -d 127.0.0.0/8 -j DNAT --to-destination 127.0.0.1:53`. If you add the DNAT rule yourself, also flush pre-existing DNS flow state afterwards (`conntrack -D -p udp --dport 53; conntrack -D -p tcp --dport 53`) — NAT verdicts are stamped per flow at its first packet, so DNS flows that predate the rule (a resolver retransmit, an open DNS-over-TCP stream) keep bypassing the proxy until they expire — and pair it with `iptables -A INPUT -p udp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP` (plus the `-p tcp` twin), or a reply in flight across the flush re-creates the flow in the reverse direction and bypasses the DNAT for as long as the socket lives. `--dns-redirect-iptables` does all of this for you.
+3. **Wire it manually**: point `/etc/resolv.conf` at `nameserver 127.0.0.1`, pass `--dns 127.0.0.1` to `docker run`, add your own `iptables -t nat -A OUTPUT -p udp --dport 53 ! -d 127.0.0.0/8 -j DNAT --to-destination 127.0.0.1:53`. If you add the DNAT rule yourself, also flush pre-existing DNS flow state afterwards (`conntrack -D -p udp --dport 53; conntrack -D -p tcp --dport 53`) — NAT verdicts are stamped per flow at its first packet, so DNS flows that predate the rule (a resolver retransmit, an open DNS-over-TCP stream) keep bypassing the proxy until they expire — and pair it with `iptables -A INPUT -p udp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP` (plus the `-p tcp` twin), or a reply in flight across the flush re-creates the flow in the reverse direction and bypasses the DNAT for as long as the socket lives. `--dns-redirect` does all of this for you.
 
 Useful flags (most available as env vars — see `cargowall start --help`):
 
@@ -236,7 +237,7 @@ Useful flags (most available as env vars — see `cargowall start --help`):
 |---|---|---|
 | `--config` | `CARGOWALL_CONFIG` | Path to the policy JSON file |
 | `--interface` | `CARGOWALL_INTERFACE` | Network interface to attach to (auto-detected if empty) |
-| `--dns-upstream` | `CARGOWALL_DNS_UPSTREAM` | Upstream DNS server (required). With `--dns-redirect-iptables` it must not be a loopback resolver (`127.0.0.0/8`, `::1`): its own upstream queries would be redirected back into the proxy |
+| `--dns-upstream` | `CARGOWALL_DNS_UPSTREAM` | Upstream DNS server (required). With `--dns-redirect` it must not be a loopback resolver (`127.0.0.0/8`, `::1`): its own upstream queries would be redirected back into the proxy |
 | `--audit-mode` | `CARGOWALL_AUDIT_MODE` | Log only — don't block (recommended for rollout) |
 | `--audit-log` | `CARGOWALL_AUDIT_LOG` | NDJSON audit log path |
 | `--api-failure-mode` | `CARGOWALL_API_FAILURE_MODE` | Posture when the CodeCargo policy can't be retrieved: `local` (default — use env/file config), `audit` (downgrade to audit mode), `fail` (deny-all lockdown: ready sentinel withheld, failure sentinel written, process stays up). Only genuine retrieval failures trigger it — a 404/401/400 always falls back to local config |
@@ -245,7 +246,7 @@ Useful flags (most available as env vars — see `cargowall start --help`):
 | `--debug` | — | Verbose logging |
 | `--github-action` | `CARGOWALL_GITHUB_ACTION` | GitHub Actions preset (expands the orthogonal flags below) |
 | `--gitlab-ci` | `CARGOWALL_GITLAB_CI` | GitLab CI preset (same plumbing, GitLab service host auto-allow instead) |
-| `--dns-redirect-iptables` | `CARGOWALL_DNS_REDIRECT_IPTABLES` | iptables DNAT outbound :53 → `127.0.0.1:53`; with `--docker-dns-interception`, also container :53 arriving on a docker bridge → the bridge listener |
+| `--dns-redirect` | `CARGOWALL_DNS_REDIRECT` | DNAT outbound :53 → `127.0.0.1:53`; with `--docker-dns-interception`, also container :53 arriving on a docker bridge → the bridge listener. Installed as the nftables table `ip cargowall` over netlink, so no iptables or nft binary is needed. On kernel 5.12+ the table belongs to cargowall's process: nothing else can change or delete it, and the kernel removes it when cargowall exits, however it exits (below 5.12 it is installed unowned, see Requirements). If it cannot be installed, startup fails under an enforcing policy; under audit the job summary lists it. Formerly `--dns-redirect-iptables` / `CARGOWALL_DNS_REDIRECT_IPTABLES`, both still accepted |
 | `--docker-dns-interception` | `CARGOWALL_DOCKER_DNS_INTERCEPTION` | Listen on the Docker bridge IP and rewrite `/etc/docker/daemon.json` (skipped for a daemon in another container, such as a dind sidecar) |
 | `--dns-query-filtering` | `CARGOWALL_DNS_QUERY_FILTERING` | Filter DNS queries against the policy (blocks DNS tunneling). CNAME targets of allowed hosts are auto-permitted, so CNAME-chasing clients aren't refused |
 | `--prepopulate-dns-cache` | `CARGOWALL_PREPOPULATE_DNS_CACHE` | Seed the BPF allowlist from systemd-resolved + existing TCP connections |
@@ -310,7 +311,7 @@ build:
       - /tmp/cargowall.ndjson
 ```
 
-`--gitlab-ci` bundles the iptables DNS redirect, Docker DNS interception, query filtering, cache pre-population, cloud metadata auto-allow, and GitLab host auto-allow. To use just a subset, pass the orthogonal flags individually (see the flag table above).
+`--gitlab-ci` bundles the DNS redirect, Docker DNS interception, query filtering, cache pre-population, cloud metadata auto-allow, and GitLab host auto-allow. To use just a subset, pass the orthogonal flags individually (see the flag table above).
 
 **Tip**: `CARGOWALL_PIDFILE` is read by both `start` and `stop`. Setting it once as a CI variable lets both invocations agree on the path without repeating `--pidfile` in every step.
 

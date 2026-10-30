@@ -19,6 +19,7 @@ package network
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -28,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/nftables/expr"
 	"golang.org/x/sys/unix"
 )
 
@@ -98,54 +100,6 @@ func TestFlushResolvedCache_Success(t *testing.T) {
 	}
 }
 
-// TestDNSRedirectRules_Shape pins the rule slice: mark RETURN exemptions
-// first (the proxy's upstream client and startup stub peeks), then the
-// systemd-resolved stub DNAT (makes the querying process's own
-// socket visible to the proxy instead of resolved's), then the generic
-// DNAT that still excludes the rest of 127.0.0.0/8 (the proxy listen must
-// never be DNAT'd), then the INPUT anti-resurrection guards. Order is
-// load-bearing: install order is slice order and teardown reverses it, so
-// the exemptions outlive every DNAT they exempt from.
-func TestDNSRedirectRules_Shape(t *testing.T) {
-	want := []string{
-		"OUTPUT -t nat -p udp --dport 53 -m mark --mark 0xCA12 -j RETURN",
-		"OUTPUT -t nat -p tcp --dport 53 -m mark --mark 0xCA12 -j RETURN",
-		"OUTPUT -t nat -p udp -d 127.0.0.53 --dport 53 -j DNAT --to-destination 127.0.0.1:53",
-		"OUTPUT -t nat -p tcp -d 127.0.0.53 --dport 53 -j DNAT --to-destination 127.0.0.1:53",
-		"OUTPUT -t nat -p udp --dport 53 ! -d 127.0.0.0/8 -j DNAT --to-destination 127.0.0.1:53",
-		"OUTPUT -t nat -p tcp --dport 53 ! -d 127.0.0.0/8 -j DNAT --to-destination 127.0.0.1:53",
-		"INPUT -p udp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP",
-		"INPUT -p tcp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP",
-	}
-	assertRules(t, dnsRedirectRules(""), want)
-
-	// With a bridge listener, the container rules follow every host rule,
-	// so teardown removes them first and the host redirect outlives them.
-	want = append(want,
-		"-I PREROUTING -t nat -i docker0 -p udp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
-		"-I PREROUTING -t nat -i docker0 -p tcp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
-		"-I PREROUTING -t nat -i br-+ -p udp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
-		"-I PREROUTING -t nat -i br-+ -p tcp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
-	)
-	assertRules(t, dnsRedirectRules("172.17.0.1"), want)
-}
-
-func assertRules(t *testing.T, rules []dnsRedirectRule, want []string) {
-	t.Helper()
-	if len(rules) != len(want) {
-		t.Fatalf("got %d rules, want %d", len(rules), len(want))
-	}
-	for i, r := range rules {
-		got := r.chain + " " + strings.Join(r.args, " ")
-		if r.insert {
-			got = "-I " + got
-		}
-		if got != want[i] {
-			t.Errorf("rule %d:\n  got  %q\n  want %q", i, got, want[i])
-		}
-	}
-}
-
 // TestMarkDNSProxySocket_SetsMark: a dialer using MarkDNSProxySocket must
 // carry DNSProxyFWMark, or the stub DNAT would loop cargowall's own stub
 // peeks (cacheResolver) back into the proxy. Root-only: SO_MARK needs
@@ -201,5 +155,83 @@ func TestFlushResolvedCache_Timeout(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("FlushResolvedCache did not honor its timeout")
+	}
+}
+
+// TestInstallHint: under an enforcing policy an install error is the reason
+// startup failed, so the errnos nf_tables answers with name what is missing.
+func TestInstallHint(t *testing.T) {
+	for errno, want := range map[unix.Errno]string{
+		unix.EPERM:           "another process owns the table",
+		unix.EPROTONOSUPPORT: "CONFIG_NETFILTER_NETLINK",
+		unix.EOPNOTSUPP:      "CONFIG_NF_TABLES",
+		unix.ENOENT:          "nft_chain_nat",
+	} {
+		if got := installHint(fmt.Errorf("netlink receive: %w", errno)); !strings.Contains(got, want) {
+			t.Errorf("installHint(%v) = %q, want it to name %q", errno, got, want)
+		}
+	}
+	if got := installHint(errors.New("other")); got != "" {
+		t.Errorf("installHint(other) = %q, want none", got)
+	}
+}
+
+// TestRedirectChains_Order pins, without root, what the rules' order and
+// shape carry; the netns tests prove what they do. In output the proxy's
+// marked sockets return before any DNAT could catch them, or its own
+// upstream queries would loop back into it; every DNAT sends to the proxy;
+// the input guard drops; the nat chains run ahead of dstnat; and the
+// prerouting chain exists only with a bridge listener, sending to it.
+func TestRedirectChains_Order(t *testing.T) {
+	kinds := func(rules [][]expr.Any) (returns, dnats, drops int, order string) {
+		for _, rule := range rules {
+			switch last := rule[len(rule)-1].(type) {
+			case *expr.Verdict:
+				if last.Kind == expr.VerdictReturn {
+					returns++
+					order += "R"
+				} else if last.Kind == expr.VerdictDrop {
+					drops++
+					order += "D"
+				}
+			case *expr.NAT:
+				dnats++
+				order += "N"
+			}
+		}
+		return returns, dnats, drops, order
+	}
+
+	chains := redirectChains(nil)
+	if len(chains) != 2 || chains[0].name != "output" || chains[1].name != "input" {
+		t.Fatalf("without a bridge want output and input chains, got %+v", chains)
+	}
+	if returns, dnats, _, order := kinds(chains[0].rules); returns != 2 || dnats != 6 || order != "RRNNNNNN" {
+		t.Errorf("output rules = %q, want the 2 mark returns ahead of the 6 DNATs", order)
+	}
+	if _, _, drops, order := kinds(chains[1].rules); drops != 2 || order != "DD" {
+		t.Errorf("input rules = %q, want 2 drops", order)
+	}
+	if chains[0].priority != -101 || chains[1].priority != 0 {
+		t.Errorf("priorities output %d input %d, want -101 (ahead of dstnat) and 0", chains[0].priority, chains[1].priority)
+	}
+	for _, rule := range chains[0].rules[2:] {
+		if imm, ok := rule[len(rule)-3].(*expr.Immediate); !ok || !net.IP(imm.Data).Equal(net.IPv4(127, 0, 0, 1)) {
+			t.Errorf("an output DNAT does not send to the proxy at 127.0.0.1: %+v", rule[len(rule)-3])
+		}
+	}
+
+	bridge := net.IPv4(172, 17, 0, 1).To4()
+	chains = redirectChains(bridge)
+	if len(chains) != 3 || chains[2].name != "prerouting" || chains[2].priority != -101 {
+		t.Fatalf("with a bridge want a prerouting chain at -101 third, got %+v", chains)
+	}
+	if _, dnats, _, _ := kinds(chains[2].rules); dnats != 4 {
+		t.Errorf("prerouting has %d DNATs, want 4 (docker0 and br-*, UDP and TCP)", dnats)
+	}
+	for _, rule := range chains[2].rules {
+		if imm, ok := rule[len(rule)-3].(*expr.Immediate); !ok || !net.IP(imm.Data).Equal(bridge) {
+			t.Errorf("a prerouting DNAT does not send to the bridge listener: %+v", rule[len(rule)-3])
+		}
 	}
 }

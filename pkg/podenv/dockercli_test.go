@@ -72,7 +72,7 @@ func TestStartedBySudo(t *testing.T) {
 		}
 		return path
 	}
-	sudo, worker := standIn("sudo"), standIn(procfs.RunnerWorkerComm)
+	sudo, sudoRs, worker := standIn("sudo"), standIn("sudo-rs"), standIn(procfs.RunnerWorkerComm)
 	// start runs script under the stand-in top, with DOCKER_HOST and env in
 	// its environment, and returns the sleep at the bottom of the chain.
 	// The trailing commands keep each shell from exec'ing the next in its
@@ -107,6 +107,10 @@ func TestStartedBySudo(t *testing.T) {
 	env, err := startedBySudo(start(sudo, "sleep 60"), "1001")
 	if err != nil || env["DOCKER_HOST"] != "tcp://dind:2375" {
 		t.Errorf("under sudo: got %v, %v; want the stand-in sudo's environment", env, err)
+	}
+	env, err = startedBySudo(start(sudoRs, "sleep 60"), "1001")
+	if err != nil || env["DOCKER_HOST"] != "tcp://dind:2375" {
+		t.Errorf("under sudo-rs by its own name: got %v, %v; want its environment", env, err)
 	}
 	// A worker carrying our SUDO_UID was started under the runner's sudo,
 	// from which we inherited ours: our own environment is the job's.

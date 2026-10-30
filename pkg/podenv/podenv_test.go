@@ -76,7 +76,7 @@ func TestHookScope(t *testing.T) {
 	// Our pid namespace's init is in our own cgroup, as a pod's or our
 	// container's is.
 	host := func(path string, pidns PidNS, d Dockerd) Shape {
-		return Shape{CgroupNS: CgroupNSHost, CgroupPath: path, CgroupMount: CgroupMountOurs, PidNS: pidns, InitCgroup: path, Dockerd: d, SocketCgroups: SocketCgroupsKept}
+		return Shape{CgroupNS: CgroupNSHost, CgroupPath: path, CgroupMount: CgroupMountOurs, PidNS: pidns, InitCgroup: path, OwnTree: CgroupTreeOurs, Dockerd: d, SocketCgroups: SocketCgroupsKept}
 	}
 	initIn := func(path string) func(*Shape) { return func(s *Shape) { s.InitCgroup = path } }
 	private := func(d Dockerd) Shape {
@@ -84,6 +84,7 @@ func TestHookScope(t *testing.T) {
 	}
 	sockets := func(c SocketCgroups) func(*Shape) { return func(s *Shape) { s.SocketCgroups = c } }
 	tree := func(c CgroupTree) func(*Shape) { return func(s *Shape) { s.CgroupTree = c } }
+	ownTree := func(c CgroupTree) func(*Shape) { return func(s *Shape) { s.OwnTree = c } }
 	with := func(s Shape, f func(*Shape)) Shape { f(&s); return s }
 	nested := func(path string, pidns PidNS, d Dockerd) Shape {
 		return with(host(path, pidns, d), func(s *Shape) { s.CgroupNS = CgroupNSPrivate })
@@ -115,6 +116,13 @@ func TestHookScope(t *testing.T) {
 			Scope{Subtree: "/system.slice/docker-a.scope"},
 		},
 		{"own pid namespace in the root cgroup", host("/", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), false, all},
+		// Outside a pod our cgroup is judged whole, so it must hold only
+		// our pid namespace's tasks: a pid namespace made in a service or a
+		// session (unshare -pf) is beside its other tasks.
+		{"own pid namespace in a shared service cgroup", with(host("/system.slice/ci.service", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), ownTree(CgroupTreeShared)), false, all},
+		{"own pid namespace, our cgroup unread", with(host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), ownTree(CgroupTreeUnknown)), false, all},
+		{"private cgroupns below its root, our cgroup shared", with(nested("/init", PidNSPrivate, local), ownTree(CgroupTreeShared)), false, all},
+		{"privileged pod, its container's cgroup not looked at", with(host(pod, PidNSPrivate, foreign), ownTree(CgroupTreeUnknown)), true, inPod},
 		// A pod is judged whole, by its cgroup: one whose kubelet makes no
 		// pod cgroups (cgroupsPerQOS=false) shows only by its hosts file,
 		// and one whose hosts file could not be read cannot be shown not
@@ -267,6 +275,34 @@ func TestProbeKubeletHosts(t *testing.T) {
 	}
 	if _, err := probeKubeletHosts(dir); err == nil {
 		t.Errorf("probeKubeletHosts(a directory): want an error")
+	}
+}
+
+// Our own cgroup is looked at twice before it reads as shared: a task
+// outside that has left by the second look, as a runtime's exec stage
+// does, leaves it ours.
+func TestProbeOwnTree(t *testing.T) {
+	dir := t.TempDir()
+	threads := filepath.Join(dir, "cgroup.threads")
+	if err := os.WriteFile(threads, []byte("7\n0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	saved := ownTreeRetry
+	t.Cleanup(func() { ownTreeRetry = saved })
+	ownTreeRetry = func() {
+		if err := os.WriteFile(threads, []byte("7\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, why := probeOwnTree(dir); got != CgroupTreeOurs {
+		t.Errorf("a task outside gone by the second look: got %v (%s), want ours", got, why)
+	}
+	ownTreeRetry = func() {}
+	if err := os.WriteFile(threads, []byte("7\n0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, why := probeOwnTree(dir); got != CgroupTreeShared {
+		t.Errorf("a task outside that stays: got %v (%s), want shared", got, why)
 	}
 }
 

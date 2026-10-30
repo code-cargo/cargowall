@@ -129,11 +129,14 @@ func Sockets(pid int) ([]uint64, error) {
 // gone during the look, or whose descriptors cannot be read, is passed
 // over, and a socket only it holds has no holder.
 func SocketHolders(want map[uint64]bool) (map[uint64][]int, error) {
+	holders := map[uint64][]int{}
+	if len(want) == 0 {
+		return holders, nil
+	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, err
 	}
-	holders := map[uint64][]int{}
 	for _, e := range entries {
 		// A pid fits 32 bits (pid_max is at most 2^22), as callers that
 		// narrow it rely on.

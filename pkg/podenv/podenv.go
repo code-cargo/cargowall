@@ -39,6 +39,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cilium/ebpf/btf"
 	"golang.org/x/sys/unix"
@@ -208,7 +209,12 @@ type Shape struct {
 	// CgroupTreeReason the evidence, or why it is unknown.
 	CgroupTree       CgroupTree
 	CgroupTreeReason string
-	PidNS            PidNS
+	// OwnTree is who holds the tasks in our own cgroup and below it, which
+	// outside a pod the hook judges whole (limitedScope), probed only
+	// there, and OwnTreeReason the evidence, or why it is unknown.
+	OwnTree       CgroupTree
+	OwnTreeReason string
+	PidNS         PidNS
 	// PidNSReason is the probe error when PidNS is unknown.
 	PidNSReason string
 	// InitCgroup is the cgroup of our pid namespace's init, pid 1, as
@@ -459,7 +465,10 @@ func (s Shape) kubepods() bool {
 }
 
 // limitedScope is the scope that judges only this job's sockets, with the
-// job's subtree: the pod's cgroup in a pod, our own cgroup outside one.
+// job's subtree: the pod's cgroup in a pod, our own cgroup outside one,
+// which must hold only our pid namespace's tasks: a container's does, but
+// a pid namespace of our own made in a systemd service or a session (unshare
+// -pf) is beside every other task there, which the subtree would judge.
 func (s Shape) limitedScope(pod bool) (Scope, error) {
 	if !pod && s.KubeletHostsReason != "" {
 		return Scope{}, fmt.Errorf("whether this is a Kubernetes pod, whose other containers the cgroup hook "+
@@ -475,6 +484,9 @@ func (s Shape) limitedScope(pod bool) (Scope, error) {
 	} else if CgroupLevel(s.CgroupPath) == 0 {
 		return Scope{}, errors.New("in the root cgroup outside the host pid namespace: no cgroup of this job's own " +
 			"holds its tasks, and the root holds every task on the machine")
+	} else if s.OwnTree != CgroupTreeOurs {
+		return Scope{}, fmt.Errorf("outside a pod the cgroup hook would judge our cgroup %s whole, whoever enters it, "+
+			"and it cannot be shown to hold only our pid namespace's tasks (%s: %s)", s.CgroupPath, s.OwnTree, s.OwnTreeReason)
 	}
 	if err := s.initRefusal(sub); err != nil {
 		return Scope{}, err
@@ -675,6 +687,7 @@ func (s Shape) LogArgs() []any {
 		"init_cgroup", s.InitCgroup, "init_cgroup_reason", s.InitCgroupReason,
 		"kubelet_hosts", s.KubeletHosts, "kubelet_hosts_reason", s.KubeletHostsReason,
 		"cgroup_tree", s.CgroupTree.String(), "cgroup_tree_reason", s.CgroupTreeReason,
+		"own_tree", s.OwnTree.String(), "own_tree_reason", s.OwnTreeReason,
 		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
 		"dockerd_cgroup", s.Dockerd.Cgroup, "dockerd_cgroup_driver", s.Dockerd.CgroupDriver,
 		"dockerd_container_tree", s.Dockerd.ContainerTree, "dockerd_runtime", s.Dockerd.Runtime,
@@ -760,6 +773,11 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 		s.CgroupTreeReason = "not probed: read only in a private cgroup namespace below its root, " +
 			"outside a pod, in a pid namespace of our own"
 	}
+	if egressHook && s.PidNS == PidNSPrivate && !s.inPod() && s.CgroupMount == CgroupMountOurs && CgroupLevel(s.CgroupPath) > 0 {
+		s.OwnTree, s.OwnTreeReason = probeOwnTree(filepath.Join(CgroupRoot, s.CgroupPath))
+	} else {
+		s.OwnTreeReason = "not probed: read only outside a pod, below the root, in a pid namespace of our own"
+	}
 	if egressHook && s.PidNS == PidNSPrivate {
 		if path, err := ReadCgroupPath("/proc/1/cgroup"); err != nil {
 			s.InitCgroupReason = err.Error()
@@ -842,6 +860,23 @@ func probeCgroupTree(root string) (CgroupTree, string) {
 	}
 	return tree, why
 }
+
+// probeOwnTree looks over our own cgroup and those below it (dir) as
+// probeCgroupTree does, and once more a moment later if a task outside our
+// pid namespace is there: a runtime's exec stage (a health check's docker
+// exec) passes through a container's cgroup from outside its namespace in
+// moments, while a service's or a session's other tasks stay.
+func probeOwnTree(dir string) (CgroupTree, string) {
+	tree, why := probeCgroupTree(dir)
+	if tree == CgroupTreeShared {
+		ownTreeRetry()
+		tree, why = probeCgroupTree(dir)
+	}
+	return tree, why
+}
+
+// ownTreeRetry waits before probeOwnTree looks again. A test stands in.
+var ownTreeRetry = func() { time.Sleep(100 * time.Millisecond) }
 
 // probeCgroupMount reports whether root is the cgroup tree path is in,
 // by looking for pid in that cgroup's member list. cgroup.procs lists pids

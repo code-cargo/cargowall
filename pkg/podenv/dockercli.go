@@ -66,8 +66,8 @@ func dockerEnv() (getenv func(string) string, uid string, err error) {
 }
 
 // startedBySudo reads the environment of the sudo that started us, whose
-// SUDO_UID, uid, we carry: the nearest process named sudo from pid up,
-// through any process between, as a shell sudo ran. The walk stops at the
+// SUDO_UID, uid, we carry: the nearest process named sudo (sudoComms) from
+// pid up, through any process between, as a shell sudo ran. The walk stops at the
 // runner's worker, whose step started us. Carrying our SUDO_UID itself,
 // the worker was started under a sudo above it, the runner's (sudo
 // ./run.sh), from which we inherited ours, and our environment is the
@@ -76,8 +76,12 @@ func dockerEnv() (getenv func(string) string, uid string, err error) {
 // environment is the one it scrubbed: unknown. So is one with neither to
 // find, as for a process started detached (by setsid, or in the
 // background of a shell that has since exited), which init has adopted.
+// sudoComms are the names sudo runs under: its own, and sudo-rs's, which
+// Ubuntu installs as sudo and which may be run by its own name too.
+var sudoComms = []string{"sudo", "sudo-rs"}
+
 func startedBySudo(pid int, uid string) (map[string]string, error) {
-	found, comm, ok := procfs.AncestorByComm(pid, "sudo", procfs.RunnerWorkerComm)
+	found, comm, ok := procfs.AncestorByComm(pid, append([]string{procfs.RunnerWorkerComm}, sudoComms...)...)
 	if !ok {
 		return nil, errors.New("no sudo among cargowall's parents")
 	}

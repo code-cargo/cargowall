@@ -9,6 +9,7 @@ This file lists the dependencies used in this repository.
 | Go                                        | BSD-3-Clause | The Go Authors                              |
 | github.com/alecthomas/kong                | MIT          | Alec Thomas                                 |
 | github.com/cilium/ebpf                    | MIT          | Nathan Sweet, Cloudflare, Authors of Cilium |
+| github.com/google/nftables                | Apache-2.0   | Google                                      |
 | github.com/mdlayher/netlink               | MIT          | Matt Layher                                 |
 | github.com/miekg/dns                      | BSD-3-Clause | The Go Authors, Miek Gieben                 |
 | github.com/stretchr/testify               | MIT          | Mat Ryer, Tyler Bunnell and contributors    |

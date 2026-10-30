@@ -609,7 +609,10 @@ would still police post-NAT traffic, but not the pre-NAT, loopback, and
 bridge egress the operator asked to have enforced, and reporting that after
 the job ran is the fail-open direction. `--tls-sni` follows the same rule
 for its enforce rungs, and the DNS redirect for an enforcing policy (see
-GitHub Actions Integration). The policy lives in one place, `postureLedger`
+GitHub Actions Integration). Under `--api-failure-mode=fail` lockdown none
+of these losses fails startup: the job has already failed, and lockdown
+stays up deny-all on purpose, where exiting would take TC's deny-all down
+with it. The loss is logged as an error and recorded instead. The policy lives in one place, `postureLedger`
 (`cmd/postures.go`).
 
 **One post-verdict pipeline.** Both hooks feed the same steps in

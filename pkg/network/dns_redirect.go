@@ -29,7 +29,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
@@ -149,99 +148,6 @@ func redirectChains(bridgeIP net.IP) []redirectChain {
 	})
 }
 
-// Expression helpers. A match loads into register 1 and compares it; dnat
-// loads its address into register 1 and its port into register 2.
-
-// udpAndTCP is rule twice, given the UDP match and then the TCP one: DNS
-// rides both.
-func udpAndTCP(rule func(proto []expr.Any) []expr.Any) [][]expr.Any {
-	return [][]expr.Any{rule(l4proto(unix.IPPROTO_UDP)), rule(l4proto(unix.IPPROTO_TCP))}
-}
-
-func l4proto(proto byte) []expr.Any {
-	return []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}},
-	}
-}
-
-// Offsets of the source and destination ports, which TCP and UDP place
-// alike at the head of their headers.
-const (
-	srcPort = 0
-	dstPort = 2
-)
-
-func port(offset uint32, p uint16) []expr.Any {
-	return []expr.Any{
-		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: offset, Len: 2},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(p)},
-	}
-}
-
-// daddr compares the leading len(addr) bytes of the IPv4 destination, which
-// sits 16 bytes into the header, so a byte-aligned prefix is its own bytes.
-func daddr(op expr.CmpOp, addr []byte) []expr.Any {
-	return []expr.Any{
-		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: uint32(len(addr))},
-		&expr.Cmp{Op: op, Register: 1, Data: addr},
-	}
-}
-
-func markIs(mark uint32) []expr.Any {
-	return []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(mark)},
-	}
-}
-
-// iifname compares the whole interface name, NUL padding included, so
-// "lo" does not also match "lo0".
-func iifname(op expr.CmpOp, name string) []expr.Any {
-	padded := make([]byte, unix.IFNAMSIZ)
-	copy(padded, name)
-	return []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-		&expr.Cmp{Op: op, Register: 1, Data: padded},
-	}
-}
-
-// iifnamePrefix compares only the prefix's bytes: nft's "br-*", iptables'
-// "br-+".
-func iifnamePrefix(prefix string) []expr.Any {
-	return []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(prefix)},
-	}
-}
-
-func ctStateNew() []expr.Any {
-	zero := binaryutil.NativeEndian.PutUint32(0)
-	return []expr.Any{
-		&expr.Ct{Register: 1, Key: expr.CtKeySTATE},
-		&expr.Bitwise{
-			SourceRegister: 1, DestRegister: 1, Len: 4,
-			Mask: binaryutil.NativeEndian.PutUint32(expr.CtStateBitNEW), Xor: zero,
-		},
-		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: zero},
-	}
-}
-
-func dnat(addr net.IP, p uint16) []expr.Any {
-	return []expr.Any{
-		&expr.Immediate{Register: 1, Data: addr},
-		&expr.Immediate{Register: 2, Data: binaryutil.BigEndian.PutUint16(p)},
-		&expr.NAT{
-			Type: expr.NATTypeDestNAT, Family: unix.NFPROTO_IPV4,
-			RegAddrMin: 1, RegProtoMin: 2, Specified: true,
-		},
-	}
-}
-
-func verdict(kind expr.VerdictKind) []expr.Any {
-	return []expr.Any{&expr.Verdict{Kind: kind}}
-}
-
 // DNSRedirect is the redirect. Once installed it keeps the netlink socket
 // that created the table, and where the kernel allows (5.12 and later) that
 // socket owns it:
@@ -313,11 +219,12 @@ func (r *DNSRedirect) Install(bridgeIP string) error {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	switch {
 	case r.done:
+		r.mu.Unlock()
 		return errors.New("DNS redirect already torn down")
 	case r.conn != nil:
+		r.mu.Unlock()
 		return errors.New("DNS redirect already installed")
 	}
 	conn, err := installTable(r.ownerFlag, chains)
@@ -330,18 +237,21 @@ func (r *DNSRedirect) Install(bridgeIP string) error {
 		}
 	}
 	if err != nil {
+		r.mu.Unlock()
 		return err
 	}
 	r.conn, r.owned = conn, owned
 	r.logger.Info("DNS redirect installed", "nftables_table", "ip "+RedirectTable, "owned", r.owned,
 		"container_bridge_redirect", bridge != nil)
+	r.mu.Unlock()
 
 	// Purge DNS flow state predating the redirect — nat verdicts are
 	// per-flow, so those flows would keep bypassing the proxy (see
 	// FlushDNSConntrack). The input guard is already in place, so a reply in
 	// flight across this flush cannot resurrect a deleted flow in reverse.
-	// Still under the lock, so a Teardown racing the install runs after it
-	// whole, never between the table going in and its flush.
+	// Outside the lock, so a forced Teardown does not wait out a slow flush;
+	// one that runs first deletes the table and flushes itself, and this
+	// flush then only repeats it.
 	if err := FlushDNSConntrack(r.logger); err != nil {
 		r.logger.Warn("Failed to flush DNS conntrack entries; pre-existing DNS flows may bypass the proxy until they expire",
 			"error", err)
@@ -501,7 +411,7 @@ func (r *DNSRedirect) Teardown() error {
 	var err error
 	switch {
 	case delErr == nil:
-	case errors.Is(delErr, unix.ENOENT):
+	case !r.owned && errors.Is(delErr, unix.ENOENT):
 		// Only an unowned table can be deleted by another process, and
 		// whenever that happened, DNS went around the proxy from then on.
 		err = fmt.Errorf("table ip %s was already gone at teardown: another process deleted it during the run, "+

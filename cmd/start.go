@@ -316,7 +316,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		// including across error-return paths below.
 		if cmd.DNSRedirect {
 			var teardownRedirect func()
-			redirect, teardownRedirect = startDNSRedirect(dockerBridgeIP, caps.KernelVersion, teardowns, logger)
+			redirect, teardownRedirect = startDNSRedirect(dockerBridgeIP, teardowns, logger)
 			defer teardownRedirect()
 		}
 	}

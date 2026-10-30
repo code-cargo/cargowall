@@ -243,7 +243,8 @@ func verdict(kind expr.VerdictKind) []expr.Any {
 }
 
 // DNSRedirect is the redirect. Once installed it keeps the netlink socket
-// that created the table, and on kernel 5.12 and later that socket owns it:
+// that created the table, and where the kernel allows (5.12 and later) that
+// socket owns it:
 // no other socket can change or delete the table, and the kernel deletes it
 // when the socket closes, which the process's exit does however it ends. A
 // cargowall killed outright therefore takes the redirect with it rather
@@ -251,10 +252,9 @@ func verdict(kind expr.VerdictKind) []expr.Any {
 // conntrack flush Teardown would have run is lost. The socket is
 // close-on-exec, so no child keeps the table alive.
 //
-// An older kernel refuses the ownership flag, so there the table is
-// installed unowned: the same redirect, but one that outlives a process
-// that dies without Teardown, until the next Install replaces it, and one
-// another process can delete.
+// A kernel that refuses the ownership flag gets the table unowned: the same
+// redirect, but one that outlives a process that dies without Teardown,
+// until the next Install replaces it, and one another process can delete.
 //
 // Install and Teardown may run concurrently: a forced shutdown tears down
 // from another goroutine while startup is still installing. Teardown then
@@ -262,18 +262,21 @@ func verdict(kind expr.VerdictKind) []expr.Any {
 // after Teardown refuses.
 type DNSRedirect struct {
 	logger *slog.Logger
-	owned  bool // the table is the socket's own (NFT_TABLE_F_OWNER)
+	// ownerFlag is the table flag Install asks for first: NFT_TABLE_F_OWNER,
+	// or a flag the kernel refuses when a test stands in for a kernel
+	// without owned tables. Zero asks for an unowned table outright.
+	ownerFlag uint32
 
-	mu   sync.Mutex
-	conn *netlink.Conn // the socket that made the table, while installed
-	done bool          // torn down
+	mu    sync.Mutex
+	conn  *netlink.Conn // the socket that made the table, while installed
+	owned bool          // the kernel took the owner flag
+	done  bool          // torn down
 }
 
 // NewDNSRedirect returns a redirect to Install. Register its Teardown
-// first. owned asks for a table owned by the redirect's socket, which needs
-// kernel 5.12: pass false on an older kernel.
-func NewDNSRedirect(logger *slog.Logger, owned bool) *DNSRedirect {
-	return &DNSRedirect{logger: logger, owned: owned}
+// first.
+func NewDNSRedirect(logger *slog.Logger) *DNSRedirect {
+	return &DNSRedirect{logger: logger, ownerFlag: nftTableFOwner}
 }
 
 // Install installs the redirect table (see redirectChains): outbound DNS
@@ -288,6 +291,11 @@ func NewDNSRedirect(logger *slog.Logger, owned bool) *DNSRedirect {
 // delete, add: the first add makes the delete safe when there is none). A
 // table another live socket owns, such as a cargowall already running in
 // this network namespace, refuses the first add, and Install fails.
+//
+// The table is asked for owned, and the kernel's answer decides rather
+// than its version: one that refuses the flag, as kernels before 5.12 do
+// (EINVAL there, EOPNOTSUPP for a flag a later kernel does not know), gets
+// the same transaction again with the table unowned.
 func (r *DNSRedirect) Install(bridgeIP string) error {
 	var bridge net.IP
 	if bridgeIP != "" {
@@ -295,23 +303,13 @@ func (r *DNSRedirect) Install(bridgeIP string) error {
 			return fmt.Errorf("docker bridge IP %q is not an IPv4 address", bridgeIP)
 		}
 	}
-	create, errCreate := newTableMsg(0)
-	del, errDel := delTableMsg()
-	var flags uint32
-	if r.owned {
-		flags = nftTableFOwner
-	}
-	table, errTable := newTableMsg(flags)
-	if err := errors.Join(errCreate, errDel, errTable); err != nil {
-		return fmt.Errorf("nftables: %w", err)
-	}
-	msgs := []netlink.Message{create, del, table}
+	var chains []netlink.Message
 	for _, c := range redirectChains(bridge) {
-		chain, err := chainMsgs(c)
+		msgs, err := chainMsgs(c)
 		if err != nil {
 			return fmt.Errorf("nftables: %w", err)
 		}
-		msgs = append(msgs, chain...)
+		chains = append(chains, msgs...)
 	}
 
 	r.mu.Lock()
@@ -322,15 +320,17 @@ func (r *DNSRedirect) Install(bridgeIP string) error {
 	case r.conn != nil:
 		return errors.New("DNS redirect already installed")
 	}
-	conn, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
+	conn, err := installTable(r.ownerFlag, chains)
+	owned := err == nil && r.ownerFlag != 0
+	if r.ownerFlag != 0 && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP)) {
+		r.logger.Info("The kernel refused an owned DNS redirect table (owned tables need 5.12), so it is installed unowned: "+
+			"if cargowall dies without tearing it down, it stays until the next run replaces it", "error", err)
+		conn, err = installTable(0, chains)
+	}
 	if err != nil {
-		return fmt.Errorf("nftables: %w%s", err, installHint(err))
+		return err
 	}
-	if err := transact(conn, msgs); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("nftables: installing table ip %s: %w%s", RedirectTable, err, installHint(err))
-	}
-	r.conn = conn
+	r.conn, r.owned = conn, owned
 	r.logger.Info("DNS redirect installed", "nftables_table", "ip "+RedirectTable, "owned", r.owned,
 		"container_bridge_redirect", bridge != nil)
 
@@ -347,6 +347,41 @@ func (r *DNSRedirect) Install(bridgeIP string) error {
 	return nil
 }
 
+// installTable runs one install transaction, the table with the given flags
+// and then chains, on a new socket, and returns the socket that made it.
+func installTable(flags uint32, chains []netlink.Message) (*netlink.Conn, error) {
+	create, errCreate := newTableMsg(0)
+	del, errDel := delTableMsg()
+	table, errTable := newTableMsg(flags)
+	if err := errors.Join(errCreate, errDel, errTable); err != nil {
+		return nil, fmt.Errorf("nftables: %w", err)
+	}
+	conn, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
+	if err != nil {
+		return nil, fmt.Errorf("nftables: %w%s", err, installHint(err))
+	}
+	if err := transact(conn, slices.Concat([]netlink.Message{create, del, table}, chains)); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("nftables: installing table ip %s: %w%s", RedirectTable, err, installHint(err))
+	}
+	return conn, nil
+}
+
+// deleteTable deletes the table from a new socket: an unowned table is
+// anyone's to delete.
+func deleteTable() error {
+	msg, err := delTableMsg()
+	if err != nil {
+		return err
+	}
+	conn, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return transact(conn, []netlink.Message{msg})
+}
+
 // installHint names what an install error most likely means, since under
 // an enforcing policy it becomes the reason startup failed, and the bare
 // errno does not say which part of the kernel is missing.
@@ -358,7 +393,7 @@ func installHint(err error) string {
 	case errors.Is(err, unix.EPROTONOSUPPORT):
 		return " (the kernel has no nfnetlink: CONFIG_NETFILTER_NETLINK)"
 	case errors.Is(err, unix.EOPNOTSUPP):
-		return " (the kernel has no nf_tables, CONFIG_NF_TABLES, or cannot load it)"
+		return " (nf_tables refused the operation: the kernel may have no nf_tables, CONFIG_NF_TABLES, or be unable to load it)"
 	case errors.Is(err, unix.ENOENT):
 		return " (the kernel lacks a part of nf_tables the redirect uses and cannot load it: " +
 			"the nat chain type, nft_chain_nat, or the nat, ct or meta expressions)"
@@ -472,7 +507,12 @@ func (r *DNSRedirect) Teardown() error {
 			err = fmt.Errorf("nftables: closing the socket that owns table ip %s: %w", RedirectTable, closeErr)
 		}
 	default:
-		err = fmt.Errorf("nftables: deleting table ip %s: %w", RedirectTable, delErr)
+		// Nothing else removes an unowned table: one more try on a new
+		// socket, in case the first died with a lost reply.
+		if delErr = deleteTable(); delErr != nil {
+			err = fmt.Errorf("nftables: deleting table ip %s: %w; host DNS stays redirected to the stopped proxy "+
+				"until it is removed (nft delete table ip %s)", RedirectTable, delErr, RedirectTable)
+		}
 	}
 	if err == nil {
 		r.logger.Info("DNS redirect removed")

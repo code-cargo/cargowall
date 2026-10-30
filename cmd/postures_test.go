@@ -194,27 +194,6 @@ func TestPostures_DNSRedirect(t *testing.T) {
 	assert.False(t, p.layers[0].degraded())
 }
 
-// The redirect's table can be cargowall's own, dying with it, from 5.12;
-// the rest of cargowall runs from 5.8, and there the table goes in unowned
-// rather than not at all.
-func TestOwnedTable(t *testing.T) {
-	for kernel, want := range map[string]bool{
-		"5.8.0":             false,
-		"5.10.0-1234-aws":   false,
-		"5.11.22":           false,
-		"5.12.0":            true,
-		"5.15.0-1019-azure": true,
-		"6.17.0-1022-azure": true,
-		"notakernel":        false,
-	} {
-		var buf bytes.Buffer
-		assert.Equal(t, want, ownedTable(kernel, slog.New(slog.NewTextHandler(&buf, nil))), kernel)
-		if !want {
-			assert.Contains(t, buf.String(), "unowned", "%s: an unowned table is said so", kernel)
-		}
-	}
-}
-
 // Policy lockdown stays up deny-all until the job ends, and the job has
 // already failed: a lost fail-closed layer is logged and recorded, never a
 // startup error, which would take the whole firewall down with it.

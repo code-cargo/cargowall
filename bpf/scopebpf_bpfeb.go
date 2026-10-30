@@ -23,6 +23,7 @@ const (
 	ScopeBpfProgScopeRelease   = "scope_release"
 	ScopeBpfProgScopeTaskIter  = "scope_task_iter"
 	ScopeBpfVarPidnsIno        = "pidns_ino"
+	ScopeBpfVarSelfTgid        = "self_tgid"
 	ScopeBpfVarSubtreeCgroup   = "subtree_cgroup"
 )
 
@@ -87,6 +88,7 @@ type ScopeBpfMapSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type ScopeBpfVariableSpecs struct {
 	PidnsIno      *ebpf.VariableSpec `ebpf:"pidns_ino"`
+	SelfTgid      *ebpf.VariableSpec `ebpf:"self_tgid"`
 	SubtreeCgroup *ebpf.VariableSpec `ebpf:"subtree_cgroup"`
 }
 
@@ -126,6 +128,7 @@ func (m *ScopeBpfMaps) Close() error {
 // It can be passed to LoadScopeBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type ScopeBpfVariables struct {
 	PidnsIno      *ebpf.Variable `ebpf:"pidns_ino"`
+	SelfTgid      *ebpf.Variable `ebpf:"self_tgid"`
 	SubtreeCgroup *ebpf.Variable `ebpf:"subtree_cgroup"`
 }
 

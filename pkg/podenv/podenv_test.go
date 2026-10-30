@@ -17,8 +17,6 @@
 package podenv
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -57,8 +55,14 @@ func TestHookScope(t *testing.T) {
 	local := Dockerd{Kind: DockerdLocal}
 	foreign := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace"}
 	hidden := Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
-	foreignUnder := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind"}
-	foreignAbove := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/../../dind"}
+	// A foreign daemon in our cgroup namespace (a dind sidecar in the
+	// node's), one in a namespace of its own below our root, one above it,
+	// and one under our root that makes its containers in the host's tree.
+	foreignUnder := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", CgroupMount: "/"}
+	foreignOwnNS := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", CgroupMount: "/dind"}
+	foreignAbove := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/../../dind", CgroupMount: "/../.."}
+	foreignHostTree := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", CgroupMount: "/../.."}
+	foreignMountUnread := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace; its cgroup mount: nothing is mounted", Cgroup: "/dind"}
 	unknownD := Dockerd{Kind: DockerdUnknown, Reason: "dial: timeout"}
 	// Both helpers have the mount proven on a kernel that keeps socket
 	// cgroups, so each case is decided by the fact it names.
@@ -120,7 +124,7 @@ func TestHookScope(t *testing.T) {
 		{"private cgroupns below its root, host pid namespace, hidden dockerd", nested("/init", PidNSHost, hidden), false, all},
 		{
 			"nested node: ARC pod with a dind sidecar sharing its pid namespace", nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate,
-				Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/4567ef01"}), true,
+				Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/4567ef01", CgroupMount: "/"}), true,
 			Scope{Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
 		},
 		{"private cgroupns below its root, host pid namespace, socket cgroups shared", with(nested("/init", PidNSHost, local), sockets(SocketCgroupsShared)), false, all},
@@ -156,6 +160,9 @@ func TestHookScope(t *testing.T) {
 		{"hosted runner, docker context unread", with(host(runner, PidNSHost, local), unreadContext), true, all},
 		{"private cgroupns, foreign dockerd", private(foreign), false, all},
 		{"private cgroupns, foreign dockerd under our root", private(foreignUnder), true, all},
+		{"private cgroupns, foreign dockerd in a cgroup namespace below our root", private(foreignOwnNS), true, all},
+		{"private cgroupns, foreign dockerd under our root making containers in the host's tree", private(foreignHostTree), false, all},
+		{"private cgroupns, foreign dockerd whose cgroup mount is unread", private(foreignMountUnread), false, all},
 		{"private cgroupns, hidden dockerd", private(hidden), false, all},
 		{"private cgroupns, unidentified dockerd", private(unknownD), false, all},
 		{"private cgroupns, no dockerd", private(Dockerd{Kind: DockerdAbsent}), true, all},
@@ -242,16 +249,45 @@ func TestDetect_Namespaces(t *testing.T) {
 	}
 }
 
-// /proc/<pid>/environ is NUL-separated KEY=value, values free to hold "=".
-func TestParseEnviron(t *testing.T) {
-	env := parseEnviron([]byte("HOME=/home/runner\x00DOCKER_HOST=tcp://a:2376\x00X=a=b\x00\x00junk\x00"))
-	want := map[string]string{"HOME": "/home/runner", "DOCKER_HOST": "tcp://a:2376", "X": "a=b"}
-	if len(env) != len(want) {
-		t.Fatalf("parseEnviron = %v, want %v", env, want)
+// A cgroup2 mount's root in mountinfo is the reader's view of it, and the
+// last mount at /sys/fs/cgroup is the one in sight.
+func TestCgroupMountRoot(t *testing.T) {
+	const (
+		proc   = "22 1 0:21 / /proc rw,nosuid - proc proc rw\n"
+		host   = "77 74 0:32 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:9 - cgroup2 cgroup2 rw\n"
+		above  = "78 77 0:32 /../.. /sys/fs/cgroup rw,relatime - cgroup2 cgroup2 rw\n"
+		spaced = "79 77 0:32 /dind\\040one /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n"
+		tmpfs  = "80 74 0:40 / /sys/fs/cgroup ro,nosuid - tmpfs tmpfs ro,mode=755\n"
+		v1     = "81 80 0:41 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n"
+		elsewh = "82 74 0:32 / /mnt/cgroup rw - cgroup2 cgroup2 rw\n"
+	)
+	for in, want := range map[string]string{
+		proc + host:          "/",
+		host + above:         "/../..",
+		host + spaced:        "/dind one",
+		proc + elsewh + host: "/",
+	} {
+		got, err := cgroupMountRoot([]byte(in))
+		if err != nil || got != want {
+			t.Errorf("cgroupMountRoot(%q) = %q, %v; want %q", in, got, err, want)
+		}
 	}
-	for k, v := range want {
-		if env[k] != v {
-			t.Errorf("parseEnviron[%q] = %q, want %q", k, env[k], v)
+	for _, in := range []string{proc, proc + elsewh, host + tmpfs + v1} {
+		if got, err := cgroupMountRoot([]byte(in)); err == nil {
+			t.Errorf("cgroupMountRoot(%q) = %q, want an error", in, got)
+		}
+	}
+}
+
+// The kernel starts a path outside the reader's cgroup namespace's root
+// with "/.."; a cgroup may be named "..x" under it.
+func TestUnderRoot(t *testing.T) {
+	for in, want := range map[string]bool{
+		"/": true, "/dind": true, "/..x": true,
+		"/..": false, "/../..": false, "/../dind": false, "": false,
+	} {
+		if got := underRoot(in); got != want {
+			t.Errorf("underRoot(%q) = %v, want %v", in, got, want)
 		}
 	}
 }
@@ -423,118 +459,6 @@ func TestProbeCgroupMount(t *testing.T) {
 	if m, why := probeCgroupMount(root, "/system.slice/runner.service", 4242); m != CgroupMountUnknown || why == "" {
 		t.Errorf("unreadable cgroup.procs: got %v (%q), want unknown with a reason", m, why)
 	}
-}
-
-func TestDockerHostElsewhere(t *testing.T) {
-	const sock = "/var/run/docker.sock"
-	for in, want := range map[string]bool{
-		"unix:///var/run/docker.sock":       false,
-		"unix:///var/run//docker.sock":      false,
-		"unix://":                           false, // the CLI's default socket
-		"unix:///run/user/1000/docker.sock": true,
-		"tcp://localhost:2376":              true,
-		"ssh://builder@remote.example.com":  true,
-	} {
-		if got := dockerHostElsewhere(in, sock); got != want {
-			t.Errorf("dockerHostElsewhere(%q) = %v, want %v", in, got, want)
-		}
-	}
-
-	// Another spelling of the same socket, as /var/run is of /run.
-	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, "run"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "run", "docker.sock"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(filepath.Join(root, "var"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("../run", filepath.Join(root, "var", "run")); err != nil {
-		t.Fatal(err)
-	}
-	probed := filepath.Join(root, "run", "docker.sock")
-	if dockerHostElsewhere("unix://"+filepath.Join(root, "var", "run", "docker.sock"), probed) {
-		t.Errorf("symlinked spelling of the socket: want the same daemon")
-	}
-	if !dockerHostElsewhere("unix://"+filepath.Join(root, "var", "run", "other.sock"), probed) {
-		t.Errorf("a socket that does not exist is not the probed one")
-	}
-	// Before the daemon has made its socket, the spellings still match.
-	notYet := filepath.Join(root, "run", "later.sock")
-	if dockerHostElsewhere("unix://"+filepath.Join(root, "var", "run", "later.sock"), notYet) {
-		t.Errorf("symlinked spelling of a socket not yet made: want the same daemon")
-	}
-}
-
-// The CLI's daemon comes from DOCKER_HOST, else the context DOCKER_CONTEXT
-// or the config's currentContext names, through the context's stored
-// endpoint, as the docker CLI resolves it.
-func TestDockerCLIHost(t *testing.T) {
-	dir := t.TempDir()
-	context := func(name, host string) {
-		sum := sha256.Sum256([]byte(name))
-		meta := filepath.Join(dir, "contexts", "meta", hex.EncodeToString(sum[:]))
-		if err := os.MkdirAll(meta, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		data := `{"Name":"` + name + `","Metadata":{},"Endpoints":{"docker":{"Host":"` + host + `","SkipTLSVerify":false}}}`
-		if err := os.WriteFile(filepath.Join(meta, "meta.json"), []byte(data), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	config := func(data string) {
-		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(data), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	context("remote", "tcp://builder:2376")
-	env := func(kv ...string) func(string) string {
-		m := map[string]string{"DOCKER_CONFIG": dir}
-		for i := 0; i+1 < len(kv); i += 2 {
-			m[kv[i]] = kv[i+1]
-		}
-		return func(k string) string { return m[k] }
-	}
-	check := func(name string, getenv func(string) string, wantHost string, wantErr bool) {
-		t.Helper()
-		host, setting, err := dockerCLIHost(getenv)
-		if (err != nil) != wantErr || host != wantHost {
-			t.Errorf("%s: got %q (%s), %v; want %q, error %v", name, host, setting, err, wantHost, wantErr)
-		}
-	}
-	check("no config at all", env(), "", false)
-	check("DOCKER_HOST", env("DOCKER_HOST", "tcp://a:2375", "DOCKER_CONTEXT", "remote"), "tcp://a:2375", false)
-	check("DOCKER_CONTEXT", env("DOCKER_CONTEXT", "remote"), "tcp://builder:2376", false)
-	check("DOCKER_CONTEXT naming the default", env("DOCKER_CONTEXT", "default"), "", false)
-	check("DOCKER_CONTEXT naming no stored context", env("DOCKER_CONTEXT", "gone"), "", true)
-	config(`{"auths":{},"currentContext":"remote"}`)
-	check("the config's currentContext", env(), "tcp://builder:2376", false)
-	check("DOCKER_CONTEXT over the config", env("DOCKER_CONTEXT", "default"), "", false)
-	config(`{"auths":{}}`)
-	check("a config with no current context", env(), "", false)
-	// As the CLI reads it: an empty config is none, and one it cannot
-	// parse is ignored for the default context.
-	config(``)
-	check("an empty config", env(), "", false)
-	config(`{not json`)
-	check("a config the CLI cannot parse either", env(), "", false)
-	home := func(k string) string { return map[string]string{"HOME": filepath.Dir(dir)}[k] }
-	check("a HOME with no .docker", home, "", false)
-
-	// Without HOME the CLI reads the passwd entry's home, as here.
-	passwd := t.TempDir()
-	if err := os.Mkdir(filepath.Join(passwd, ".docker"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	dir = filepath.Join(passwd, ".docker")
-	context("remote", "tcp://builder:2376")
-	config(`{"currentContext":"remote"}`)
-	saved := passwdHome
-	passwdHome = func() string { return passwd }
-	t.Cleanup(func() { passwdHome = saved })
-	check("no HOME: the passwd home's config", func(string) string { return "" }, "tcp://builder:2376", false)
 }
 
 func TestProbeDockerd_NoSocket(t *testing.T) {

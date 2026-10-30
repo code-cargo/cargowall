@@ -31,17 +31,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net"
 	"os"
-	"os/user"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -231,6 +227,11 @@ type Dockerd struct {
 	// gives it in our cgroup namespace, "" when it could not be read. A
 	// path under our namespace's root does not start with "/..".
 	Cgroup string
+	// CgroupMount is the root of a Foreign daemon's cgroup v2 mount at
+	// CgroupRoot, where it makes its containers' cgroups, as its mountinfo
+	// gives it in our cgroup namespace: "/" for our own root, "/../x" for
+	// another beside it. "" when it could not be read, and Reason says why.
+	CgroupMount string
 }
 
 // Shape is what Detect found.
@@ -371,11 +372,14 @@ func (s Shape) privateScope() (Scope, error) {
 	switch s.Dockerd.Kind {
 	case DockerdAbsent, DockerdLocal:
 	case DockerdForeign:
-		// Its containers are where it puts them, under its own cgroup's
-		// view; when that cgroup is under our root, so are they.
-		if s.Dockerd.Cgroup == "" || strings.HasPrefix(s.Dockerd.Cgroup, "/..") {
+		// Its containers are made in its cgroup mount, which is its cgroup
+		// namespace's root unless it was given another tree, such as the
+		// host's: when that and its own cgroup are under our root, so are
+		// its containers.
+		if !underRoot(s.Dockerd.Cgroup) || !underRoot(s.Dockerd.CgroupMount) {
 			return Scope{}, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd outside this container, "+
-				"another container's or the host's own (%s)", s.Dockerd.Reason)
+				"another container's or the host's own (%s; its cgroup %q, its cgroup mount's root %q)",
+				s.Dockerd.Reason, s.Dockerd.Cgroup, s.Dockerd.CgroupMount)
 		}
 	case DockerdHidden:
 		return Scope{}, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd we cannot see, "+
@@ -403,6 +407,13 @@ func (s Shape) privateScope() (Scope, error) {
 	default:
 		return Scope{}, fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
 	}
+}
+
+// underRoot reports whether a cgroup path, as our cgroup namespace gives
+// it, is under the namespace's root: the kernel starts one outside it with
+// "/..". "" is unknown, and not under it.
+func underRoot(path string) bool {
+	return path != "" && path != "/.." && !strings.HasPrefix(path, "/../")
 }
 
 // kubepods reports whether our cgroup is in kubelet's tree: kubepods under
@@ -605,7 +616,9 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 		s.PidNS = PidNSPrivate
 	}
 	s.Dockerd = probeDockerd(dockerSocket)
-	if host, setting, err := dockerCLIHost(dockerEnv()); err != nil {
+	if env, err := dockerEnv(); err != nil {
+		s.DockerHostReason = err.Error()
+	} else if host, setting, err := dockerCLIHost(env); err != nil {
 		s.DockerHostReason = err.Error()
 	} else if host != "" && dockerHostElsewhere(host, dockerSocket) {
 		s.DockerHost, s.DockerHostSetting = host, setting
@@ -647,151 +660,6 @@ func probeCgroupMount(root, path string, pid int) (CgroupMount, string) {
 		}
 	}
 	return CgroupMountOther, fmt.Sprintf("pid %d is not in %s", pid, procs)
-}
-
-// defaultDockerHost is the docker CLI's default socket, which an empty
-// unix:// address means too.
-const defaultDockerHost = "/var/run/docker.sock"
-
-// dockerEnv is the environment the job's docker CLI runs in, which says
-// which daemon it uses: under sudo, sudo's own, which is our parent's and
-// the job's, since a plain sudo strips DOCKER_HOST and hands us root's
-// HOME; otherwise ours.
-func dockerEnv() func(string) string {
-	if os.Getenv("SUDO_UID") == "" {
-		return os.Getenv
-	}
-	ppid := os.Getppid()
-	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", ppid))
-	if err != nil || strings.TrimSpace(string(comm)) != "sudo" {
-		return os.Getenv
-	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", ppid))
-	if err != nil {
-		return os.Getenv
-	}
-	env := parseEnviron(data)
-	return func(k string) string { return env[k] }
-}
-
-// parseEnviron parses a /proc/<pid>/environ: NUL-separated KEY=value.
-func parseEnviron(data []byte) map[string]string {
-	env := make(map[string]string)
-	for _, kv := range bytes.Split(data, []byte{0}) {
-		if k, v, ok := strings.Cut(string(kv), "="); ok && k != "" {
-			env[k] = v
-		}
-	}
-	return env
-}
-
-// passwdHome is the current user's home directory from the passwd
-// database, or "".
-var passwdHome = func() string {
-	if u, err := user.Current(); err == nil {
-		return u.HomeDir
-	}
-	return ""
-}
-
-// dockerCLIHost is the daemon address the docker CLI would use in the
-// environment getenv reads, resolved as the CLI resolves it: DOCKER_HOST;
-// else the context DOCKER_CONTEXT names, else the config file's current
-// context, through that context's stored endpoint. setting says which; ""
-// is the default context, the default socket. A context that cannot be
-// read is an error, as it is to the CLI.
-func dockerCLIHost(getenv func(string) string) (host, setting string, err error) {
-	if h := getenv("DOCKER_HOST"); h != "" {
-		return h, "DOCKER_HOST", nil
-	}
-	dir := getenv("DOCKER_CONFIG")
-	if dir == "" {
-		// The CLI falls back on the user's passwd entry without HOME.
-		home := getenv("HOME")
-		if home == "" {
-			home = passwdHome()
-		}
-		if home != "" {
-			dir = filepath.Join(home, ".docker")
-		}
-	}
-	name, setting := getenv("DOCKER_CONTEXT"), "DOCKER_CONTEXT"
-	if name == "" && dir != "" {
-		config := filepath.Join(dir, "config.json")
-		data, err := os.ReadFile(config)
-		if errors.Is(err, fs.ErrNotExist) {
-			return "", "", nil
-		}
-		if err != nil {
-			return "", "", err
-		}
-		// As the CLI reads it: an empty file is no config, and one it
-		// cannot parse is warned about and then ignored, for the default
-		// context.
-		var cfg struct {
-			CurrentContext string `json:"currentContext"`
-		}
-		if len(bytes.TrimSpace(data)) == 0 || json.Unmarshal(data, &cfg) != nil {
-			return "", "", nil
-		}
-		name, setting = cfg.CurrentContext, config+"'s currentContext"
-	}
-	if name == "" || name == "default" {
-		return "", "", nil
-	}
-	setting = fmt.Sprintf("docker context %q (from %s)", name, setting)
-	if dir == "" {
-		return "", "", fmt.Errorf("%s: no docker config directory", setting)
-	}
-	sum := sha256.Sum256([]byte(name))
-	data, err := os.ReadFile(filepath.Join(dir, "contexts", "meta", hex.EncodeToString(sum[:]), "meta.json"))
-	if err != nil {
-		return "", "", fmt.Errorf("%s: %w", setting, err)
-	}
-	var meta struct {
-		Endpoints map[string]struct{ Host string }
-	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return "", "", fmt.Errorf("%s: %w", setting, err)
-	}
-	if host = meta.Endpoints["docker"].Host; host == "" {
-		return "", "", fmt.Errorf("%s names no docker endpoint", setting)
-	}
-	return host, setting, nil
-}
-
-// dockerHostElsewhere reports whether a docker daemon address names a
-// daemon other than the one on socket. Two spellings of one socket are the
-// same daemon: /var/run is a symlink to /run on most distributions. They
-// are compared with their directories' symlinks resolved, so the spellings
-// match before the daemon has made its socket too.
-func dockerHostElsewhere(host, socket string) bool {
-	p, ok := strings.CutPrefix(host, "unix://")
-	if !ok {
-		return true
-	}
-	if p == "" {
-		p = defaultDockerHost
-	}
-	if resolveDir(p) == resolveDir(socket) {
-		return false
-	}
-	if a, err := os.Stat(p); err == nil {
-		if b, err := os.Stat(socket); err == nil && os.SameFile(a, b) {
-			return false
-		}
-	}
-	return true
-}
-
-// resolveDir is path with the symlinks in its directory resolved, or just
-// cleaned when that directory cannot be resolved.
-func resolveDir(path string) string {
-	path = filepath.Clean(path)
-	if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
-		return filepath.Join(dir, filepath.Base(path))
-	}
-	return path
 }
 
 // ReadCgroupPath returns the cgroup v2 path a /proc cgroup file gives
@@ -869,10 +737,66 @@ func probeDockerd(socket string) Dockerd {
 		return unknown(err)
 	}
 	if ours != theirs {
-		cgroup, _ := ReadCgroupPath("/proc/" + strconv.Itoa(int(pid)) + "/cgroup")
-		return Dockerd{Kind: DockerdForeign, Reason: fmt.Sprintf("pid %d has another mount namespace", pid), Cgroup: cgroup}
+		proc := "/proc/" + strconv.Itoa(int(pid))
+		d := Dockerd{Kind: DockerdForeign, Reason: fmt.Sprintf("pid %d has another mount namespace", pid)}
+		d.Cgroup, _ = ReadCgroupPath(proc + "/cgroup")
+		if data, err := os.ReadFile(proc + "/mountinfo"); err != nil {
+			d.Reason += fmt.Sprintf("; its cgroup mount: %v", err)
+		} else if d.CgroupMount, err = cgroupMountRoot(data); err != nil {
+			d.Reason += fmt.Sprintf("; its cgroup mount: %v", err)
+		}
+		return d
 	}
 	return Dockerd{Kind: DockerdLocal}
+}
+
+// cgroupMountRoot is the root of the cgroup v2 mount at CgroupRoot in a
+// mountinfo, the last mounted there, which is the one in sight. The kernel
+// gives a cgroup2 mount's root as the reader's cgroup namespace sees it,
+// so its path compares with ours.
+func cgroupMountRoot(mountinfo []byte) (string, error) {
+	var root, fstype string
+	sc := bufio.NewScanner(bytes.NewReader(mountinfo))
+	for sc.Scan() {
+		// id parent major:minor root mountpoint options [optional...] - fstype source super-options
+		f := strings.Fields(sc.Text())
+		sep := slices.Index(f, "-")
+		if sep < 6 || sep+1 >= len(f) || unescapeMountinfo(f[4]) != CgroupRoot {
+			continue
+		}
+		root, fstype = unescapeMountinfo(f[3]), f[sep+1]
+	}
+	if err := sc.Err(); err != nil {
+		return "", err
+	}
+	switch fstype {
+	case "":
+		return "", fmt.Errorf("nothing is mounted at %s", CgroupRoot)
+	case "cgroup2":
+		return root, nil
+	default:
+		return "", fmt.Errorf("%s is %s, not cgroup v2", CgroupRoot, fstype)
+	}
+}
+
+// unescapeMountinfo undoes mountinfo's escapes: a space, tab, newline or
+// backslash in a path is written as a backslash and three octal digits.
+func unescapeMountinfo(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+4 <= len(s) {
+			if n, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 func peerPid(conn *net.UnixConn) (int32, error) {

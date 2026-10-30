@@ -58,6 +58,11 @@ const volatile __u32 pidns_ino = 0;
 // recorded or taken out: it is the job's whatever enters it.
 const volatile __u64 subtree_cgroup = 0;
 
+// cargowall's own process id in the daemon's pid namespace, written by
+// userspace before load: the one process in the subtree that the walk
+// lists (scope_task_iter).
+const volatile __u32 self_tgid = 0;
+
 #include "pidns.h"
 
 #define ENOENT 2
@@ -130,8 +135,8 @@ static __always_inline __u64 scope_id(struct cgroup *cg)
 // a parent css is the parent cgroup. By id, not by level: in a cgroup
 // namespace rooted below the machine's (a nested node's) userspace sees a
 // path, not a level. A cgroup more than SUBTREE_MAX_DEPTH below it reads as
-// outside it, which only records a cgroup the hook judges anyway; pkg/origin
-// matches by path, with no bound.
+// outside it, which only records a cgroup the hook judges anyway, and lists
+// it in the walk, where pkg/origin matches by path, with no bound.
 static __always_inline bool in_subtree(struct cgroup *cg)
 {
     if (!subtree_cgroup)
@@ -246,8 +251,12 @@ int BPF_PROG(scope_release, struct cgroup *cg, const char *path)
 // level is the kernel's, which userspace cannot read from a path in a
 // cgroup namespace rooted below the machine's; level 0 is the root, which
 // pkg/origin reports rather than records. pkg/origin runs the walk at
-// startup and again on every report tick, so it counts nothing here. The
-// kernel scopes the walk to the opener's pid namespace.
+// startup and again on every report tick, so it counts nothing here, and
+// writes only what it acts on: a thread in its process's cgroup adds
+// nothing to the process's own record, and a task in the subtree nothing
+// at all, except cargowall itself, whose record gives pkg/origin the
+// subtree's level. The kernel scopes the walk to the opener's pid
+// namespace.
 SEC("iter/task")
 int scope_task_iter(struct bpf_iter__task *ctx)
 {
@@ -260,7 +269,18 @@ int scope_task_iter(struct bpf_iter__task *ctx)
     struct cgroup *cg = dfl_cgroup(t);
     if (!cg)
         return 0;
-    __u64 rec[3] = {BPF_CORE_READ(cg, kn, id), tgid, BPF_CORE_READ(cg, level)};
+    __u64 id = BPF_CORE_READ(cg, kn, id);
+    // The leader, even one that has exited, stays in its cgroup until its
+    // process is reaped, and the walk writes its record there.
+    struct task_struct *leader = BPF_CORE_READ(t, group_leader);
+    if (leader && leader != t) {
+        struct cgroup *lcg = dfl_cgroup(leader);
+        if (lcg && BPF_CORE_READ(lcg, kn, id) == id)
+            return 0;
+    }
+    if (tgid != self_tgid && in_subtree(cg))
+        return 0;
+    __u64 rec[3] = {id, tgid, BPF_CORE_READ(cg, level)};
     bpf_seq_write(ctx->meta->seq, rec, sizeof(rec));
     return 0;
 }

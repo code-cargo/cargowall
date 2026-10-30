@@ -87,10 +87,16 @@ func attachScopeTracing(t *testing.T, p *ebpf.Program) {
 	t.Cleanup(func() { l.Close() })
 }
 
-// runScopeWalk runs the startup walk and returns the cgroups it lists, by
-// id, with the level it wrote for each, from records of a cgroup id, a
-// process id and the cgroup's level.
-func runScopeWalk(t *testing.T, objs *ScopeBpfObjects) map[uint64]uint32 {
+// scopeRecord is one record of the startup walk.
+type scopeRecord struct {
+	cgroup uint64
+	tgid   uint32
+	level  uint32
+}
+
+// scopeWalk runs the startup walk and returns its records, each a cgroup
+// id, a process id and the cgroup's level.
+func scopeWalk(t *testing.T, objs *ScopeBpfObjects) []scopeRecord {
 	t.Helper()
 	it, err := link.AttachIter(link.IterOptions{Program: objs.ScopeTaskIter})
 	require.NoError(t, err)
@@ -101,12 +107,45 @@ func runScopeWalk(t *testing.T, objs *ScopeBpfObjects) map[uint64]uint32 {
 	out, err := io.ReadAll(rd)
 	require.NoError(t, err)
 	require.Zero(t, len(out)%24, "the walk writes whole records")
-	levels := make(map[uint64]uint32)
+	var recs []scopeRecord
 	for i := 0; i < len(out); i += 24 {
-		require.NotZero(t, binary.NativeEndian.Uint64(out[i+8:]), "each record names its process")
-		levels[binary.NativeEndian.Uint64(out[i:])] = uint32(binary.NativeEndian.Uint64(out[i+16:]))
+		r := scopeRecord{
+			cgroup: binary.NativeEndian.Uint64(out[i:]),
+			tgid:   uint32(binary.NativeEndian.Uint64(out[i+8:])),
+			level:  uint32(binary.NativeEndian.Uint64(out[i+16:])),
+		}
+		require.NotZero(t, r.tgid, "each record names its process")
+		recs = append(recs, r)
+	}
+	return recs
+}
+
+// runScopeWalk runs the startup walk and returns the cgroups it lists, by
+// id, with the level it wrote for each.
+func runScopeWalk(t *testing.T, objs *ScopeBpfObjects) map[uint64]uint32 {
+	t.Helper()
+	levels := make(map[uint64]uint32)
+	for _, r := range scopeWalk(t, objs) {
+		levels[r.cgroup] = r.level
 	}
 	return levels
+}
+
+// nsPid is pid's process id in its own pid namespace, the innermost.
+func nsPid(t *testing.T, pid int) uint32 {
+	t.Helper()
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	require.NoError(t, err)
+	for _, line := range strings.Split(string(status), "\n") {
+		if ids, ok := strings.CutPrefix(line, "NSpid:"); ok {
+			f := strings.Fields(ids)
+			n, err := strconv.ParseUint(f[len(f)-1], 10, 32)
+			require.NoError(t, err)
+			return uint32(n)
+		}
+	}
+	t.Fatalf("no NSpid in /proc/%d/status", pid)
+	return 0
 }
 
 func scopeRecorded(t *testing.T, objs *ScopeBpfObjects, path string) bool {
@@ -248,9 +287,10 @@ static void *park(void *a) { (void)a; for (;;) pause(); return 0; }
 int main(void) { pthread_t t; pthread_create(&t, 0, park, 0); pthread_exit(0); }
 `
 
-// A move records where the live threads went, not where the leader is: a
-// leader that has exited is skipped by the migration and stays put.
-func TestScopeAttachRecordsDestinationPastAZombieLeader(t *testing.T) {
+// zombieLeader builds and starts the zombieLeaderSrc helper, and returns
+// its pid once its leader has exited.
+func zombieLeader(t *testing.T) int {
+	t.Helper()
 	cc, err := exec.LookPath("cc")
 	if err != nil {
 		t.Skip("no C compiler for the zombie-leader helper")
@@ -260,15 +300,20 @@ func TestScopeAttachRecordsDestinationPastAZombieLeader(t *testing.T) {
 	bin := filepath.Join(dir, "zl")
 	out, err := exec.Command(cc, "-o", bin, filepath.Join(dir, "zl.c"), "-pthread").CombinedOutput()
 	require.NoError(t, err, "compile helper: %s", out)
-
-	objs := loadScope(t, pidnsInode(t), 0)
-	dst := siblingCgroup(t, "dst")
-	helper := startPinned(t, exec.Command(bin))
-	pid := helper.Process.Pid
+	pid := startPinned(t, exec.Command(bin)).Process.Pid
 	require.Eventually(t, func() bool {
 		status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 		return err == nil && strings.Contains(string(status), "State:\tZ")
 	}, 5*time.Second, 20*time.Millisecond, "helper leader must exit")
+	return pid
+}
+
+// A move records where the live threads went, not where the leader is: a
+// leader that has exited is skipped by the migration and stays put.
+func TestScopeAttachRecordsDestinationPastAZombieLeader(t *testing.T) {
+	objs := loadScope(t, pidnsInode(t), 0)
+	dst := siblingCgroup(t, "dst")
+	pid := zombieLeader(t)
 
 	attachScopeTracing(t, objs.ScopeAttach)
 	moveInto(t, dst, pid)
@@ -408,6 +453,57 @@ func TestScopeWalkListsOurCgroups(t *testing.T) {
 		require.True(t, listed, "the root cgroup is listed, for pkg/origin to report")
 		require.Zero(t, level)
 		require.Zero(t, scopeStat(t, objs, ScopeStatRoot), "the walk counts nothing: it runs on every tick")
+	})
+}
+
+// The walk writes only what pkg/origin acts on: a record for a process in
+// its leader's cgroup, one more for each of its threads elsewhere, and
+// nothing for a task in the subtree, which the hook judges whole, except
+// cargowall itself, whose record gives the subtree's level.
+func TestScopeWalkWritesWhatTheWalkActsOn(t *testing.T) {
+	requireBPF(t)
+	t.Run("threads", func(t *testing.T) {
+		objs := loadScope(t, pidnsInode(t), 0)
+		cg := enterTestCgroup(t)
+		dst := siblingCgroup(t, "threads")
+		pid := zombieLeader(t)
+		moveInto(t, dst, pid)
+		var self, leader, thread int
+		for _, r := range scopeWalk(t, objs) {
+			switch {
+			case r.tgid == uint32(os.Getpid()):
+				self++
+			case r.tgid == uint32(pid) && r.cgroup == cgroupID(t, cg):
+				leader++
+			case r.tgid == uint32(pid) && r.cgroup == cgroupID(t, dst):
+				thread++
+			}
+		}
+		require.Equal(t, 1, self, "the test process, whose threads share one cgroup")
+		require.Equal(t, 1, leader, "the helper's exited leader, where it stayed")
+		require.Equal(t, 1, thread, "and its live thread, where it moved")
+	})
+	t.Run("the subtree", func(t *testing.T) {
+		sub := siblingCgroup(t, "walk-subtree")
+		ino, enter := heldPidNamespace(t)
+		self, other := enter(), enter()
+		moveInto(t, sub, self)
+		moveInto(t, sub, other)
+		spec, err := LoadScopeBpf()
+		require.NoError(t, err)
+		require.NoError(t, spec.Variables[ScopeBpfVarPidnsIno].Set(ino))
+		require.NoError(t, spec.Variables[ScopeBpfVarSubtreeCgroup].Set(cgroupID(t, sub)))
+		require.NoError(t, spec.Variables[ScopeBpfVarSelfTgid].Set(nsPid(t, self)))
+		objs := &ScopeBpfObjects{}
+		require.NoError(t, spec.LoadAndAssign(objs, nil))
+		t.Cleanup(func() { objs.Close() })
+		listed := make(map[uint32]bool)
+		for _, r := range scopeWalk(t, objs) {
+			if r.cgroup == cgroupID(t, sub) {
+				listed[r.tgid] = true
+			}
+		}
+		require.Equal(t, map[uint32]bool{nsPid(t, self): true}, listed, "only cargowall's own process")
 	})
 }
 

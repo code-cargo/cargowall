@@ -17,12 +17,17 @@
 package origin
 
 import (
+	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/code-cargo/cargowall/bpf"
 )
 
 // The subnet-validation policy, pure over synthetic interfaces: this is the
@@ -64,4 +69,49 @@ func TestValidateLocalSubnet(t *testing.T) {
 			}
 		})
 	}
+}
+
+// AllowLocalNetwork writes the entry the hook reads: cg_origin_egress looks
+// up map_local_nets with {prefixlen 32 (128), destination}, so an address
+// inside a carved subnet must hit and one outside must not — which also
+// pins the key's byte order. A refused prefix must write nothing.
+func TestAllowLocalNetwork_WritesWhatTheHookLooksUp(t *testing.T) {
+	o := newTestObserver()
+	o.objs = *loadL7Objects(t)
+
+	hit4 := func(addr string) bool {
+		a4 := netip.MustParseAddr(addr).As4()
+		var v uint8
+		err := o.objs.MapLocalNets.Lookup(bpf.OriginBpfLpmKey{Prefixlen: 32, Ip: binary.NativeEndian.Uint32(a4[:])}, &v)
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false
+		}
+		require.NoError(t, err)
+		return true
+	}
+	hit6 := func(addr string) bool {
+		key := bpf.OriginBpfLpmKeyV6{Prefixlen: 128, Ip: netip.MustParseAddr(addr).As16()}
+		var v uint8
+		err := o.objs.MapLocalNetsV6.Lookup(key, &v)
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false
+		}
+		require.NoError(t, err)
+		return true
+	}
+
+	// Address space no test host has an interface in, so validation passes.
+	require.NoError(t, o.AllowLocalNetwork(netip.MustParsePrefix("10.254.3.9/16")))
+	assert.True(t, hit4("10.254.0.1"))
+	assert.True(t, hit4("10.254.255.254"))
+	assert.False(t, hit4("10.253.0.1"))
+	assert.False(t, hit4("0.0.254.10"), "a byte-swapped key would carve 0.0.0.0/16 instead")
+
+	require.NoError(t, o.AllowLocalNetwork(netip.MustParsePrefix("fd00:cafe:1::/64")))
+	assert.True(t, hit6("fd00:cafe:1::7"))
+	assert.False(t, hit6("fd00:cafe:2::7"))
+
+	err := o.AllowLocalNetwork(netip.MustParsePrefix("172.0.0.0/8"))
+	require.ErrorIs(t, err, ErrLocalNetworkRefused, "wider than /16 is refused")
+	assert.False(t, hit4("172.1.2.3"), "a refused prefix writes nothing")
 }

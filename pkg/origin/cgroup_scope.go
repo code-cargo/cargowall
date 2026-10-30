@@ -318,10 +318,16 @@ func (s *cgroupScope) cutShort(err error, found *walkFindings) {
 }
 
 // mark marks a cgroup shared, so that a task of ours entering it is not
-// recorded (scope_enter); unmark clears that. A mark the map cannot take
-// costs a recording that the next walk takes out again.
-func (s *cgroupScope) mark(id uint64)   { _ = s.objs.MapScopeShared.Put(id, uint8(1)) }
-func (s *cgroupScope) unmark(id uint64) { _ = s.objs.MapScopeShared.Delete(id) }
+// recorded (scope_enter). A mark the map cannot take costs a recording
+// that the next walk takes out again.
+func (s *cgroupScope) mark(id uint64) {
+	_ = s.objs.MapScopeShared.Put(id, uint8(1))
+}
+
+// unmark clears a cgroup's shared mark.
+func (s *cgroupScope) unmark(id uint64) {
+	_ = s.objs.MapScopeShared.Delete(id)
+}
 
 // stopping reports whether close has asked the walk to stop.
 func (s *cgroupScope) stopping() bool {

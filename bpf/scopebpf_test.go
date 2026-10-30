@@ -541,7 +541,8 @@ func TestScopeReleaseForgetsCgroups(t *testing.T) {
 		return objs.MapScopeCgroups.Lookup(id, &v) == nil
 	}
 	root := enterTestCgroup(t)
-	made := func(name string) (string, uint64) {
+	made := func(t *testing.T, name string) (string, uint64) {
+		t.Helper()
 		dir := filepath.Join(root, name)
 		require.NoError(t, os.Mkdir(dir, 0o755))
 		t.Cleanup(func() { removeCgroup(t, dir) })
@@ -550,7 +551,7 @@ func TestScopeReleaseForgetsCgroups(t *testing.T) {
 		return dir, id
 	}
 
-	empty, emptyID := made("empty")
+	empty, emptyID := made(t, "empty")
 	require.NoError(t, objs.MapScopeShared.Put(emptyID, uint8(1)))
 	require.NoError(t, os.Remove(empty))
 	require.Eventually(t, func() bool { return !recorded(emptyID) }, 5*time.Second, 20*time.Millisecond,
@@ -558,7 +559,7 @@ func TestScopeReleaseForgetsCgroups(t *testing.T) {
 	var v uint8
 	require.Error(t, objs.MapScopeShared.Lookup(emptyID, &v), "and so is its shared mark")
 
-	held, heldID := made("held")
+	held, heldID := made(t, "held")
 	moveSelf(t, held)
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	require.NoError(t, err)
@@ -588,7 +589,7 @@ func TestScopeReleaseForgetsCgroups(t *testing.T) {
 		require.NoError(t, err)
 		v1ID := fi.Sys().(*syscall.Stat_t).Ino
 		require.NoError(t, objs.MapScopeCgroups.Put(v1ID, uint8(1)))
-		v2, v2ID := made("v2")
+		v2, v2ID := made(t, "v2")
 		require.NoError(t, os.Remove(v1))
 		require.NoError(t, os.Remove(v2))
 		require.Eventually(t, func() bool { return !recorded(v2ID) }, 5*time.Second, 20*time.Millisecond)

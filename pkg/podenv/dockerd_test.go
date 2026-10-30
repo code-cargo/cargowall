@@ -87,6 +87,72 @@ func TestProbeContainerTree(t *testing.T) {
 	if d.ContainerTree != "" || !strings.Contains(d.Reason, "no rule") {
 		t.Errorf("unknown driver: got %+v, want no tree, with the reason", d)
 	}
+	// A daemon that does not say, as a busy one may not in time, is judged
+	// by both drivers' trees: its own mount, and that of any systemd it
+	// could reach, here on a bus this process listens on, so ours too.
+	d = Dockerd{Kind: DockerdLocal, pid: busDaemon(t, "unix:path="+busListener(t))}
+	d.probeContainerTree(fakeDaemon(t, http.StatusServiceUnavailable, `{}`))
+	if d.CgroupDriver != "" || d.ContainerTree != ours || !strings.Contains(d.Reason, "its cgroup driver") {
+		t.Errorf("unasked: got %+v, want our own mount's root %q, noting the driver unread", d, ours)
+	}
+}
+
+// Unasked, a daemon whose systemd cannot be shown (here, on a tcp bus) has
+// no tree; one with no systemd to reach has its own mount's.
+func TestUnaskedTree(t *testing.T) {
+	ours, err := mountRootOf(int32(os.Getpid()))
+	if err != nil {
+		t.Skipf("no cgroup v2 mount at %s: %v", CgroupRoot, err)
+	}
+	if got, err := unaskedTree(busDaemon(t, "tcp:host=localhost,port=4242")); err == nil {
+		t.Errorf("unaskedTree, tcp bus = %q, want an error", got)
+	}
+	// A bus where nothing listens leaves systemd's own socket, which only
+	// root may reach: the machine's systemd, whose tree is ours.
+	if os.Geteuid() == 0 {
+		if got, err := unaskedTree(busDaemon(t, "unix:path="+filepath.Join(t.TempDir(), "nothing"))); err != nil || got != ours {
+			t.Errorf("unaskedTree, no bus = %q, %v; want our own mount's root %q", got, err, ours)
+		}
+	}
+}
+
+// busListener listens on a unix socket of its own, standing in for a
+// system bus, and returns its path.
+func busListener(t *testing.T) string {
+	t.Helper()
+	bus := filepath.Join(t.TempDir(), "bus")
+	l, err := net.Listen("unix", bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	return bus
+}
+
+// busDaemon starts a process standing in for a daemon whose environment
+// names the system bus at addr, and returns its pid.
+func busDaemon(t *testing.T, addr string) int32 {
+	t.Helper()
+	cmd := exec.Command("sleep", "60")
+	cmd.Env = []string{"DBUS_SYSTEM_BUS_ADDRESS=" + addr}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	waitEnviron(t, cmd.Process.Pid)
+	return int32(cmd.Process.Pid)
 }
 
 // The socket is found as a chroot would find it, so an absolute symlink
@@ -128,6 +194,23 @@ func TestSocketPeerIn(t *testing.T) {
 	if _, err := socketPeerIn(fd, systemdPrivateSocket); err == nil {
 		t.Errorf("socketPeerIn(%s): want an error, nothing listens there", systemdPrivateSocket)
 	}
+	// A symlink at the socket's own name, to an absolute path, is followed
+	// inside the root too: here the target exists only in ours.
+	ours := filepath.Join(t.TempDir(), "ours.sock")
+	lo, err := net.Listen("unix", ours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lo.Close()
+	if err := os.MkdirAll(filepath.Join(root, "run", "systemd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ours, filepath.Join(root, "run", "systemd", "private")); err != nil {
+		t.Fatal(err)
+	}
+	if pid, err := socketPeerIn(fd, systemdPrivateSocket); err == nil {
+		t.Errorf("socketPeerIn through a symlink out of the root = %d, want an error", pid)
+	}
 }
 
 // Under the systemd driver the tree is that of the systemd the daemon
@@ -139,50 +222,28 @@ func TestSystemdTree(t *testing.T) {
 	if err != nil {
 		t.Skipf("no cgroup v2 mount at %s: %v", CgroupRoot, err)
 	}
-	bus := filepath.Join(t.TempDir(), "bus")
-	l, err := net.Listen("unix", bus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	go func() {
-		for {
-			c, err := l.Accept()
-			if err != nil {
-				return
-			}
-			c.Close()
-		}
-	}()
-	daemon := func(addr string) int32 {
-		cmd := exec.Command("sleep", "60")
-		cmd.Env = []string{"DBUS_SYSTEM_BUS_ADDRESS=" + addr}
-		if err := cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		})
-		// Start returns once exec has closed the child's descriptors,
-		// before the kernel has laid out its new environment, which reads
-		// empty until then.
-		environ := fmt.Sprintf("/proc/%d/environ", cmd.Process.Pid)
-		for i := 0; i < 250; i++ {
-			if data, _ := os.ReadFile(environ); len(data) > 0 {
-				return int32(cmd.Process.Pid)
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		t.Fatalf("%s stayed empty", environ)
-		return 0
-	}
-	if got, err := systemdTree(daemon("unix:path=" + bus + ",guid=0123")); err != nil || got != ours {
+	bus := busListener(t)
+	if got, err := systemdTree(busDaemon(t, "unix:path="+bus+",guid=0123")); err != nil || got != ours {
 		t.Errorf("systemdTree = %q, %v; want our mount's root %q", got, err, ours)
 	}
-	if got, err := systemdTree(daemon("tcp:host=localhost,port=4242")); err == nil {
+	if got, err := systemdTree(busDaemon(t, "tcp:host=localhost,port=4242")); err == nil {
 		t.Errorf("systemdTree over tcp = %q, want an error", got)
 	}
+}
+
+// waitEnviron waits for a child just started to have its environment:
+// Start returns once exec has closed the child's descriptors, before the
+// kernel has laid out its new environment, which reads empty until then.
+func waitEnviron(t *testing.T, pid int) {
+	t.Helper()
+	environ := fmt.Sprintf("/proc/%d/environ", pid)
+	for i := 0; i < 250; i++ {
+		if data, _ := os.ReadFile(environ); len(data) > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s stayed empty", environ)
 }
 
 // A D-Bus address is a ";" list of transports with "," parameters, tried

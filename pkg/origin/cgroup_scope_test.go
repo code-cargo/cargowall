@@ -389,6 +389,7 @@ func loadWalkScope(t *testing.T, ino, maxEntries uint32) *cgroupScope {
 	require.NoError(t, err)
 	require.NoError(t, spec.Variables[bpf.ScopeBpfVarPidnsIno].Set(ino))
 	spec.Maps[bpf.ScopeBpfMapMapScopeCgroups].MaxEntries = maxEntries
+	spec.Maps[bpf.ScopeBpfMapMapScopeShared].MaxEntries = maxEntries
 	require.NoError(t, spec.Variables[bpf.ScopeBpfVarSelfTgid].Set(uint32(os.Getpid())))
 	var log bytes.Buffer
 	s := &cgroupScope{logger: slog.New(slog.NewTextHandler(&log, nil)), last: newWalkFindings(), stale: make(map[uint64]bool)}
@@ -539,6 +540,44 @@ func TestCgroupScopeOutsideInner(t *testing.T) {
 	var v uint8
 	require.Error(t, s.cgroups().Lookup(listed, &v), "a listed cgroup outside the root is taken out")
 	require.Error(t, s.cgroups().Lookup(empty, &v), "and so is one the scope holds that nothing listed")
+}
+
+// Clearing a mark looks twice: a task outside our pid namespace that enters
+// between the first look and the clearing leaves the cgroup marked. A mark
+// the map cannot take is reported, once.
+func TestCgroupScopeClearMarkLooksTwice(t *testing.T) {
+	own := ownCgroupBelowRoot(t)
+	ino, err := podenv.PidNamespaceInode()
+	require.NoError(t, err)
+	s := loadWalkScope(t, ino, 1)
+	ownID, err := podenv.CgroupID(own)
+	require.NoError(t, err)
+	dir, path, _, err := s.openCgroup(ownID)
+	require.NoError(t, err)
+	defer dir.Close()
+	marked := func() bool {
+		var v uint8
+		return s.objs.MapScopeShared.Lookup(ownID, &v) == nil
+	}
+	found := newWalkFindings()
+	s.mark(ownID, path, &found)
+	require.True(t, marked())
+	looks := 0
+	swap(t, &readThreads, func(*os.File) ([]byte, error) {
+		looks++
+		if looks == 1 {
+			return []byte("7\n"), nil
+		}
+		return []byte("7\n0\n"), nil
+	})
+	s.clearMark(ownID, dir, path, &found)
+	require.True(t, marked(), "a task outside that entered between the looks keeps the mark")
+
+	var log bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&log, nil))
+	s.mark(ownID+1, "/full", &found)
+	s.mark(ownID+1, "/full", &found)
+	require.Equal(t, 1, strings.Count(log.String(), "could not mark a cgroup shared"), "a full mark map is reported once a walk")
 }
 
 // A map too small for every cgroup the walk records costs those cgroups,

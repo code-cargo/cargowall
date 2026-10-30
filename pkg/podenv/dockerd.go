@@ -27,10 +27,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -160,10 +160,15 @@ func probeDockerd(socket string) Dockerd {
 // probeContainerTree reads where the daemon makes its containers' cgroups:
 // it asks the daemon for its cgroup driver over the socket, and finds the
 // tree that driver uses. Only a daemon whose pid we see has one to find.
+// One that does not answer in time, as a busy one may not, is judged by
+// both drivers' trees (unaskedTree).
 func (d *Dockerd) probeContainerTree(socket string) {
 	driver, err := cgroupDriver(socket)
 	if err != nil {
 		d.note("its cgroup driver", err)
+		if d.ContainerTree, err = unaskedTree(d.pid); err != nil {
+			d.note("its containers' cgroup tree", err)
+		}
 		return
 	}
 	d.CgroupDriver = driver
@@ -181,6 +186,29 @@ func (d *Dockerd) probeContainerTree(socket string) {
 		return
 	}
 	d.ContainerTree = tree
+}
+
+// unaskedTree is the tree a daemon whose cgroup driver is unknown makes
+// its containers in, as far as either driver allows: its own cgroup
+// mount, or, should a systemd answer at a socket the systemd driver would
+// reach it by, that systemd's tree. Both under our root put its
+// containers under it whichever it uses, and the tree returned is one
+// outside, if either is, for privateScope to refuse.
+func unaskedTree(pid int32) (string, error) {
+	own, err := mountRootOf(pid)
+	if err != nil {
+		return "", err
+	}
+	sys, err := systemdTree(pid)
+	switch {
+	case errors.Is(err, errNoSystemd):
+		return own, nil
+	case err != nil:
+		return "", err
+	case !underRoot(sys):
+		return sys, nil
+	}
+	return own, nil
 }
 
 // cgroupDriver asks the daemon at socket for its cgroup driver (GET /info).
@@ -266,8 +294,17 @@ func systemdTree(pid int32) (string, error) {
 		}
 		return mountRootOf(peer)
 	}
-	return "", fmt.Errorf("no systemd to reach: %w", errors.Join(errs...))
+	for _, err := range errs {
+		if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, unix.ECONNREFUSED) {
+			return "", fmt.Errorf("no systemd it reaches answers: %w", errors.Join(errs...))
+		}
+	}
+	return "", fmt.Errorf("%w: %w", errNoSystemd, errors.Join(errs...))
 }
+
+// errNoSystemd is systemdTree's error when nothing listens at any socket
+// the systemd driver would reach systemd by.
+var errNoSystemd = errors.New("no systemd to reach")
 
 // busSocketPaths is the socket paths a D-Bus address names, in the order
 // a client tries them, up to the first entry that is not one (an abstract
@@ -300,19 +337,21 @@ func busSocketPaths(addr string) (paths []string, unfollowed string, err error) 
 
 // socketPeerIn connects to the unix socket at path, resolved inside root
 // as a chroot would resolve it, and returns its listener's pid in our pid
-// namespace.
+// namespace. The socket itself is opened there, to its last component, and
+// connected through its descriptor: a symlink at the socket's own name is
+// followed inside root too, not in ours.
 func socketPeerIn(root int, path string) (int32, error) {
-	dir, err := unix.Openat2(root, filepath.Dir(path), &unix.OpenHow{
-		Flags: unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_IN_ROOT,
+	sock, err := unix.Openat2(root, path, &unix.OpenHow{
+		Flags: unix.O_PATH | unix.O_CLOEXEC, Resolve: unix.RESOLVE_IN_ROOT,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", path, err)
 	}
-	defer unix.Close(dir)
+	defer unix.Close(sock)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", fmt.Sprintf("/proc/self/fd/%d/%s", dir, filepath.Base(path)))
+	conn, err := d.DialContext(ctx, "unix", fmt.Sprintf("/proc/self/fd/%d", sock))
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", path, err)
 	}

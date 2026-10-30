@@ -78,20 +78,20 @@ type cgroupScope struct {
 }
 
 // walkFindings is what one walk found that it logs: cgroups shared with a
-// task outside our pid namespace, cgroups it could not record or read,
+// task outside our pid namespace, cgroups it could not record, mark or read,
 // processes of ours in the root cgroup or outside our cgroup namespace's
 // root, where the hook never sees their sockets, and whether it could not
 // read the whole scope.
 type walkFindings struct {
-	shared, unremoved, unrecorded, unreadable map[uint64]bool
-	inRoot, outside                           map[uint32]bool
-	unlisted                                  bool
+	shared, unremoved, unrecorded, unreadable, unmarked map[uint64]bool
+	inRoot, outside                                     map[uint32]bool
+	unlisted                                            bool
 }
 
 func newWalkFindings() walkFindings {
 	return walkFindings{
 		shared: make(map[uint64]bool), unremoved: make(map[uint64]bool),
-		unrecorded: make(map[uint64]bool), unreadable: make(map[uint64]bool),
+		unrecorded: make(map[uint64]bool), unreadable: make(map[uint64]bool), unmarked: make(map[uint64]bool),
 		inRoot: make(map[uint32]bool), outside: make(map[uint32]bool),
 	}
 }
@@ -293,18 +293,30 @@ func (s *cgroupScope) reconcileMarked(listed map[uint64]*listed, marked map[uint
 			s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
 			continue
 		}
-		m, err := cgroupMembers(dir)
+		s.clearMark(id, dir, path, found)
 		dir.Close()
-		switch {
-		case cgroupGone(err):
-			s.unmark(id)
-		case err != nil:
-			s.unreadable(id, path, err, found)
-		case !m.theirs:
-			s.unmark(id)
-		}
 	}
 	return true
+}
+
+// clearMark clears the mark of the cgroup open at dir, id, if no task
+// outside our pid namespace is in it, then looks again: one that entered
+// between the look and the clearing was not seen by scope_leave, which
+// marks only cgroups the scope holds, and would have the job's next entry
+// record it.
+func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, found *walkFindings) {
+	m, err := cgroupMembers(dir)
+	switch {
+	case cgroupGone(err):
+		s.unmark(id)
+	case err != nil:
+		s.unreadable(id, path, err, found)
+	case !m.theirs:
+		s.unmark(id)
+		if again, err := cgroupMembers(dir); err == nil && again.theirs {
+			s.mark(id, path, found)
+		}
+	}
 }
 
 // cutShort reports a read of the scope's maps that stopped early, once a
@@ -318,10 +330,18 @@ func (s *cgroupScope) cutShort(err error, found *walkFindings) {
 }
 
 // mark marks a cgroup shared, so that a task of ours entering it is not
-// recorded (scope_enter). A mark the map cannot take costs a recording
-// that the next walk takes out again.
-func (s *cgroupScope) mark(id uint64) {
-	_ = s.objs.MapScopeShared.Put(id, uint8(1))
+// recorded (scope_enter). A mark the map cannot take is reported, once:
+// each entry of ours records the cgroup again until the next walk takes it
+// out.
+func (s *cgroupScope) mark(id uint64, path string, found *walkFindings) {
+	if err := s.objs.MapScopeShared.Put(id, uint8(1)); err != nil {
+		if !found.unmarked[id] && !s.last.unmarked[id] {
+			s.logger.Warn("Container egress cgroup scope could not mark a cgroup shared with tasks outside this job, "+
+				"which a task of this job entering it records again until the next walk", "cgroup", path, "error", err,
+				"capacity", s.objs.MapScopeShared.MaxEntries())
+		}
+		found.unmarked[id] = true
+	}
 }
 
 // unmark clears a cgroup's shared mark.
@@ -593,7 +613,7 @@ func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFi
 // that no task of ours is in now changes nothing (a runtime's exec stage
 // listed in the runtime's cgroup has moved on).
 func (s *cgroupScope) leave(id uint64, path string, ours bool, found *walkFindings) {
-	s.mark(id)
+	s.mark(id, path, found)
 	err := s.objs.MapScopeCgroups.Delete(id)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		found.unremoved[id] = true

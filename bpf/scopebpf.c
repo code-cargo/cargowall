@@ -194,8 +194,9 @@ static __always_inline void scope_enter(struct cgroup *cg)
 // job's next entry does not record it again: judging the cgroup would
 // judge that task. The job's own tasks there now pass, so it is counted,
 // and so is a delete that fails other than to a concurrent one, which
-// leaves the cgroup judged until pkg/origin's next walk. A cgroup the
-// scope does not hold is left unmarked, so that a task outside entering a
+// leaves the cgroup judged until pkg/origin's next walk, or a mark the
+// map cannot take, which leaves the job's next entry to record it again
+// until then. A cgroup the scope does not hold is left unmarked, so that a task outside entering a
 // cgroup of its own costs one lookup; should a task of ours then enter it,
 // the walk finds it shared and marks it.
 static __always_inline void scope_leave(struct cgroup *cg)
@@ -204,7 +205,8 @@ static __always_inline void scope_leave(struct cgroup *cg)
     if (!id || !bpf_map_lookup_elem(&map_scope_cgroups, &id))
         return;
     __u8 one = 1;
-    bpf_map_update_elem(&map_scope_shared, &id, &one, BPF_ANY);
+    if (bpf_map_update_elem(&map_scope_shared, &id, &one, BPF_ANY))
+        scope_count(SCOPE_STAT_FAILED);
     long err = bpf_map_delete_elem(&map_scope_cgroups, &id);
     if (!err)
         scope_count(SCOPE_STAT_SHARED);

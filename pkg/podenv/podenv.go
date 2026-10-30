@@ -278,18 +278,8 @@ func (s Shape) HookScope() (Scope, error) {
 	// /sys/fs/cgroup is the machine's root, which every pod and daemon on
 	// it shares.
 	kubepods := s.kubepods()
-	switch s.PidNS {
-	case PidNSUnknown:
-		return Scope{}, fmt.Errorf("pid namespace unknown in the host cgroup namespace (%s)", s.PidNSReason)
-	case PidNSHost:
-		if kubepods {
-			return Scope{}, errors.New("running in a Kubernetes pod in the host cgroup and pid namespaces: " +
-				"the cgroup hook would attach at the node root and judge every pod on the node")
-		}
-		return Scope{}, nil // machineFirewall
-	case PidNSPrivate:
-	default:
-		return Scope{}, fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
+	if scope, done, err := s.sharedPidNS(kubepods, "the host cgroup namespace", "the host"); done {
+		return scope, err // the host pid namespace outside kubelet's tree is machineFirewall
 	}
 	if err := s.partialRefusal(); err != nil {
 		return Scope{}, err
@@ -352,28 +342,40 @@ func (s Shape) privateScope() (Scope, error) {
 		return Scope{}, nil
 	}
 	kubepods := s.kubepods()
+	if scope, done, err := s.sharedPidNS(kubepods, "a cgroup namespace rooted above our cgroup", "the node's"); done {
+		return scope, err
+	}
+	// A tree with no task outside our pid namespace anywhere in it is our
+	// container's alone, below whose root it moved its own tasks (an
+	// entrypoint making room for nested cgroups, or systemd as its init),
+	// and the hook judges all of it, as at "/". A nested node always has
+	// some: its kubelet and runtime are outside every pod's pid namespace.
+	if !kubepods && s.CgroupTree == CgroupTreeOurs {
+		return Scope{}, nil
+	}
+	return s.limitedScope(kubepods)
+}
+
+// sharedPidNS decides for every pid namespace but a private one, the same
+// wherever the hook sits: an unknown one refuses, and the host one judges
+// every socket under the attach point, unless in kubelet's tree, where
+// that is every pod on the node. done is false for a private one, which
+// the caller decides. For the errors, in names the cgroup namespace we are
+// in, and whose the machine whose cgroup and pid namespaces we share.
+func (s Shape) sharedPidNS(kubepods bool, in, whose string) (scope Scope, done bool, err error) {
 	switch s.PidNS {
 	case PidNSUnknown:
-		return Scope{}, fmt.Errorf("pid namespace unknown in a cgroup namespace rooted above our cgroup (%s)", s.PidNSReason)
+		return Scope{}, true, fmt.Errorf("pid namespace unknown in %s (%s)", in, s.PidNSReason)
 	case PidNSHost:
 		if kubepods {
-			return Scope{}, errors.New("running in a Kubernetes pod in the node's cgroup and pid namespaces: " +
-				"the cgroup hook would attach at the node root and judge every pod on the node")
+			return Scope{}, true, fmt.Errorf("running in a Kubernetes pod in %s cgroup and pid namespaces: "+
+				"the cgroup hook would attach at the node root and judge every pod on the node", whose)
 		}
-		return Scope{}, nil
+		return Scope{}, true, nil
 	case PidNSPrivate:
-		// A tree with no task outside our pid namespace anywhere in it is
-		// our container's alone, below whose root it moved its own tasks
-		// (an entrypoint making room for nested cgroups, or systemd as its
-		// init), and the hook judges all of it, as at "/". A nested node
-		// always has some: its kubelet and runtime are outside every pod's
-		// pid namespace.
-		if !kubepods && s.CgroupTree == CgroupTreeOurs {
-			return Scope{}, nil
-		}
-		return s.limitedScope(kubepods)
+		return Scope{}, false, nil
 	default:
-		return Scope{}, fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
+		return Scope{}, true, fmt.Errorf("pid namespace kind %d has no hook-scope rule", s.PidNS)
 	}
 }
 

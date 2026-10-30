@@ -50,7 +50,7 @@ func dockerEnv() (getenv func(string) string, uid string, err error) {
 	if uid == "" {
 		return os.Getenv, "", nil
 	}
-	env, err := startedBySudo(os.Getppid())
+	env, err := startedBySudo(os.Getppid(), uid)
 	if err != nil {
 		return nil, "", fmt.Errorf("started under sudo, whose environment, the job's, cannot be read: %w", err)
 	}
@@ -60,20 +60,31 @@ func dockerEnv() (getenv func(string) string, uid string, err error) {
 	return func(k string) string { return env[k] }, uid, nil
 }
 
-// startedBySudo reads the environment of the sudo that started us: the
-// nearest process named sudo from pid up, through any process between,
-// as a shell sudo ran. The walk stops at the runner's worker, whose step
-// started us: a sudo above it started the runner itself, so the SUDO_UID
-// we carry is the runner's, inherited, and our environment is the job's;
-// that is nil, no error. With neither to find, as for a process started
-// detached (by setsid, or in the background of a shell that has since
-// exited), which init has adopted, the environment is unknown.
-func startedBySudo(pid int) (map[string]string, error) {
+// startedBySudo reads the environment of the sudo that started us, whose
+// SUDO_UID, uid, we carry: the nearest process named sudo from pid up,
+// through any process between, as a shell sudo ran. The walk stops at the
+// runner's worker, whose step started us. Carrying our SUDO_UID itself,
+// the worker was started under a sudo above it, the runner's (sudo
+// ./run.sh), from which we inherited ours, and our environment is the
+// job's: that is nil, no error. Without it, a sudo between gave us ours
+// and has gone from the chain, having exec'd us in its own place, and our
+// environment is the one it scrubbed: unknown. So is one with neither to
+// find, as for a process started detached (by setsid, or in the
+// background of a shell that has since exited), which init has adopted.
+func startedBySudo(pid int, uid string) (map[string]string, error) {
 	found, comm, ok := AncestorByComm(pid, "sudo", RunnerWorkerComm)
 	if !ok {
 		return nil, errors.New("no sudo among cargowall's parents")
 	}
 	if comm == RunnerWorkerComm {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", found))
+		if err != nil {
+			return nil, err
+		}
+		if parseEnviron(data)["SUDO_UID"] != uid {
+			return nil, fmt.Errorf("no sudo between the runner's worker (pid %d), which has no SUDO_UID %s, and us: "+
+				"one exec'd us in its place", found, uid)
+		}
 		return nil, nil
 	}
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", found))

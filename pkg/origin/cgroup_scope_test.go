@@ -209,6 +209,32 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	require.False(t, recorded(shared), "the walk takes a shared cgroup out")
 	require.Equal(t, 1, strings.Count(log.String(), sharedRel), "and reports it once, not on every walk")
 
+	// A cgroup found shared is marked, so that a task of ours entering it
+	// again, however often, is not recorded; once only tasks of ours are in
+	// it (here, as the stand-in reads it), the walk clears the mark and
+	// records it, and once another is back, takes it out and marks it.
+	marked := func(path string) bool {
+		var v uint8
+		return s.objs.MapScopeShared.Lookup(idOf(path), &v) == nil
+	}
+	require.True(t, marked(shared), "a cgroup the walk found shared is marked")
+	self := []byte(strconv.Itoa(os.Getpid()))
+	require.NoError(t, os.WriteFile(filepath.Join(shared, "cgroup.procs"), self, 0))
+	require.NoError(t, os.WriteFile(filepath.Join(pod, "runner", "cgroup.procs"), self, 0))
+	require.False(t, recorded(shared), "a task of ours entering a marked cgroup does not record it")
+	restore := swap(t, &readThreads, func(dir *os.File) ([]byte, error) {
+		var st unix.Stat_t
+		if unix.Fstat(int(dir.Fd()), &st) == nil && st.Ino == idOf(shared) {
+			return []byte("5\n"), nil
+		}
+		return readThreadsFile(dir)
+	})
+	require.NoError(t, s.walk(false))
+	restore()
+	require.True(t, recorded(shared) && !marked(shared), "a cgroup ours alone again is unmarked and recorded")
+	require.NoError(t, s.walk(false))
+	require.True(t, !recorded(shared) && marked(shared), "and shared again, taken out and marked")
+
 	// A cgroup taken out while a task outside the namespace was in it, as a
 	// tracepoint does, is recorded again by the next walk once it holds
 	// only ours.
@@ -223,7 +249,7 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	theirs := filepath.Join(dir, "theirs")
 	theirsRel := strings.TrimPrefix(theirs, podenv.CgroupRoot)
 	require.NoError(t, s.cgroups().Put(idOf(theirs), uint8(1)))
-	restore := swap(t, &readThreads, failReading(idOf(theirs), syscall.EIO))
+	restore = swap(t, &readThreads, failReading(idOf(theirs), syscall.EIO))
 	require.NoError(t, s.walk(false))
 	restore()
 	require.True(t, recorded(theirs), "a cgroup the walk cannot read stays as it was")
@@ -238,6 +264,21 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	}
 	require.Contains(t, theirsLine, "no longer one of this job's", "and it is reported, as holding none of ours")
 	require.NotContains(t, theirsLine, "A task of this job is in")
+	var v uint8
+	require.NoError(t, s.objs.MapScopeShared.Lookup(idOf(theirs), &v), "and marked shared")
+	// Its mark is cleared once no task outside is in it (here, as the
+	// stand-in reads it), though the walk lists it nowhere: a task of ours
+	// entering it then is recorded as it enters.
+	restore = swap(t, &readThreads, func(dir *os.File) ([]byte, error) {
+		var st unix.Stat_t
+		if unix.Fstat(int(dir.Fd()), &st) == nil && st.Ino == idOf(theirs) {
+			return nil, nil
+		}
+		return readThreadsFile(dir)
+	})
+	require.NoError(t, s.walk(false))
+	restore()
+	require.Error(t, s.objs.MapScopeShared.Lookup(idOf(theirs), &v), "a marked cgroup no task outside is in loses its mark")
 
 	// A read of the scope cut short still checks the cgroups it read, and
 	// is reported once, however many walks it fails.
@@ -294,6 +335,9 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	require.NoError(t, s.walk(false))
 	require.Equal(t, 1, strings.Count(log.String(), "in the root cgroup"), "and not again")
 }
+
+// readThreadsFile is the real readThreads, for stubs that read through it.
+var readThreadsFile = readThreads
 
 // swap sets *v to stub until restore, which cleanup runs too, should the
 // test stop first.

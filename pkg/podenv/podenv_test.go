@@ -72,9 +72,12 @@ func TestHookScope(t *testing.T) {
 	unknownD := Dockerd{Kind: DockerdUnknown, Reason: "dial: timeout"}
 	// Both helpers have the mount proven on a kernel that keeps socket
 	// cgroups, so each case is decided by the fact it names.
+	// Our pid namespace's init is in our own cgroup, as a pod's or our
+	// container's is.
 	host := func(path string, pidns PidNS, d Dockerd) Shape {
-		return Shape{CgroupNS: CgroupNSHost, CgroupPath: path, CgroupMount: CgroupMountOurs, PidNS: pidns, Dockerd: d, SocketCgroups: SocketCgroupsKept}
+		return Shape{CgroupNS: CgroupNSHost, CgroupPath: path, CgroupMount: CgroupMountOurs, PidNS: pidns, InitCgroup: path, Dockerd: d, SocketCgroups: SocketCgroupsKept}
 	}
+	initIn := func(path string) func(*Shape) { return func(s *Shape) { s.InitCgroup = path } }
 	private := func(d Dockerd) Shape {
 		return Shape{CgroupNS: CgroupNSPrivate, CgroupPath: "/", CgroupMount: CgroupMountOurs, PidNS: PidNSPrivate, Dockerd: d, SocketCgroups: SocketCgroupsKept}
 	}
@@ -119,6 +122,11 @@ func TestHookScope(t *testing.T) {
 		},
 		{"nested node: hostPID pod", nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSHost, local), false, all},
 		{"private cgroupns below its root, own pid namespace", nested("/init", PidNSPrivate, local), true, Scope{Subtree: "/init"}},
+		{"nested node: hostPID pod, in the node container's pid namespace", with(nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), initIn("/init.scope")), false, all},
+		{"privileged pod sharing its pid namespace with the pause container", with(host(pod, PidNSPrivate, local), initIn(podCg+"/cri-containerd-pause.scope")), true, inPod},
+		{"privileged pod in a pid namespace whose init is another pod's", with(host(pod, PidNSPrivate, local), initIn("/kubepods.slice/kubepods-pod1.slice/x.scope")), false, all},
+		{"privileged pod, our pid namespace's init unread", with(host(pod, PidNSPrivate, local), func(s *Shape) { s.InitCgroup, s.InitCgroupReason = "", "permission denied" }), false, all},
+		{"outside Kubernetes, a pid namespace whose init is a sibling's", with(host(runner, PidNSPrivate, local), initIn("/system.slice/runner.service2")), false, all},
 		{"private cgroupns below its root, own pid namespace, tree shared", with(nested("/init", PidNSPrivate, local), tree(CgroupTreeShared)), true, Scope{Subtree: "/init"}},
 		{"private cgroupns below its root, own pid namespace, tree ours alone", with(nested("/init", PidNSPrivate, local), tree(CgroupTreeOurs)), true, all},
 		{"nested node, tree read as ours alone", with(nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate, local), tree(CgroupTreeOurs)), true, Scope{Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"}},

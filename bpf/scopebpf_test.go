@@ -551,9 +551,12 @@ func TestScopeReleaseForgetsCgroups(t *testing.T) {
 	}
 
 	empty, emptyID := made("empty")
+	require.NoError(t, objs.MapScopeShared.Put(emptyID, uint8(1)))
 	require.NoError(t, os.Remove(empty))
 	require.Eventually(t, func() bool { return !recorded(emptyID) }, 5*time.Second, 20*time.Millisecond,
 		"a removed cgroup with nothing in it is released and forgotten")
+	var v uint8
+	require.Error(t, objs.MapScopeShared.Lookup(emptyID, &v), "and so is its shared mark")
 
 	held, heldID := made("held")
 	moveSelf(t, held)
@@ -619,6 +622,15 @@ func TestScopeLeavesCgroupsOthersEnter(t *testing.T) {
 	moveInto(t, moved, foreign)
 	require.False(t, scopeRecorded(t, objs, moved), "a move into it by a task outside our pid namespace")
 	require.Equal(t, uint64(1), scopeStat(t, objs, ScopeStatShared))
+	var v uint8
+	require.NoError(t, objs.MapScopeShared.Lookup(cgroupID(t, moved), &v), "and it is marked shared")
+	require.Error(t, objs.MapScopeShared.Lookup(cgroupID(t, other), &v), "a cgroup the scope never held is left unmarked")
+	// A task of ours entering it again does not record it while it is
+	// marked, however often it enters: the walk clears the mark once the
+	// other task has gone.
+	moveInto(t, other, ours)
+	moveInto(t, moved, ours)
+	require.False(t, scopeRecorded(t, objs, moved), "a cgroup marked shared, entered again by a task of ours")
 
 	dir, err := os.Open(cloned)
 	require.NoError(t, err)

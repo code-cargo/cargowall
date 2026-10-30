@@ -67,12 +67,13 @@ func TestStartedBySudo(t *testing.T) {
 		return path
 	}
 	sudo, worker := standIn("sudo"), standIn(RunnerWorkerComm)
-	// start runs script under the stand-in sudo, with DOCKER_HOST in its
-	// environment, and returns the sleep at the bottom of the chain. The
-	// trailing commands keep each shell from exec'ing the next in its place.
-	start := func(script string) int {
-		cmd := exec.Command(sudo, "-c", script+"; :")
-		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "DOCKER_HOST=tcp://dind:2375"}
+	// start runs script under the stand-in top, with DOCKER_HOST and env in
+	// its environment, and returns the sleep at the bottom of the chain.
+	// The trailing commands keep each shell from exec'ing the next in its
+	// place.
+	start := func(top, script string, env ...string) int {
+		cmd := exec.Command(top, "-c", script+"; :")
+		cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "DOCKER_HOST=tcp://dind:2375"}, env...)
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -97,16 +98,27 @@ func TestStartedBySudo(t *testing.T) {
 		return 0
 	}
 
-	env, err := startedBySudo(start("sleep 60"))
+	env, err := startedBySudo(start(sudo, "sleep 60"), "1001")
 	if err != nil || env["DOCKER_HOST"] != "tcp://dind:2375" {
 		t.Errorf("under sudo: got %v, %v; want the stand-in sudo's environment", env, err)
 	}
-	env, err = startedBySudo(start(worker + " -c 'sleep 60; :'"))
+	// A worker carrying our SUDO_UID was started under the runner's sudo,
+	// from which we inherited ours: our own environment is the job's.
+	underRunnerSudo := start(sudo, worker+" -c 'sleep 60; :'", "SUDO_UID=1001")
+	env, err = startedBySudo(underRunnerSudo, "1001")
 	if err != nil || env != nil {
 		t.Errorf("under a worker a sudo started: got %v, %v; want our own environment (nil)", env, err)
 	}
+	// A worker without it: a sudo between gave us ours and exec'd us in its
+	// place, leaving our environment its scrubbed one.
+	if _, err := startedBySudo(underRunnerSudo, "1002"); err == nil {
+		t.Errorf("under a worker with another SUDO_UID: want an error")
+	}
+	if _, err := startedBySudo(start(worker, "sleep 60"), "1001"); err == nil {
+		t.Errorf("under a worker with no SUDO_UID: want an error")
+	}
 	// Init has no parent, and is not sudo.
-	if _, err := startedBySudo(1); err == nil {
+	if _, err := startedBySudo(1, "1001"); err == nil {
 		t.Errorf("startedBySudo(1): want an error, from no sudo among its parents")
 	}
 }

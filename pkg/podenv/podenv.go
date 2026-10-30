@@ -36,7 +36,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -208,7 +207,12 @@ type Shape struct {
 	PidNS            PidNS
 	// PidNSReason is the probe error when PidNS is unknown.
 	PidNSReason string
-	Dockerd     Dockerd
+	// InitCgroup is the cgroup of our pid namespace's init, pid 1, as
+	// /proc/1/cgroup gives it, read only in a private pid namespace, and
+	// InitCgroupReason why it is empty.
+	InitCgroup       string
+	InitCgroupReason string
+	Dockerd          Dockerd
 	// DockerHost is the daemon the docker CLI is set to use, when it is not
 	// the probed socket, and DockerHostSetting what set it (DOCKER_HOST, or
 	// a docker context). The job's containers then belong to a daemon
@@ -400,19 +404,39 @@ func (s Shape) kubepods() bool {
 // job's subtree: the pod's cgroup in kubelet's tree, our own cgroup
 // outside it.
 func (s Shape) limitedScope(kubepods bool) (Scope, error) {
+	sub := s.CgroupPath
 	if kubepods {
-		pod := podCgroup(s.CgroupPath)
-		if pod == "" {
+		if sub = podCgroup(s.CgroupPath); sub == "" {
 			return Scope{}, fmt.Errorf("in a Kubernetes pod whose cgroup is not in %s: the cgroup hook "+
 				"would not judge the pod's other containers", s.CgroupPath)
 		}
-		return Scope{Subtree: pod}, nil
-	}
-	if CgroupLevel(s.CgroupPath) == 0 {
+	} else if CgroupLevel(s.CgroupPath) == 0 {
 		return Scope{}, errors.New("in the root cgroup outside the host pid namespace: no cgroup of this job's own " +
 			"holds its tasks, and the root holds every task on the machine")
 	}
-	return Scope{Subtree: s.CgroupPath}, nil
+	if err := s.initRefusal(sub); err != nil {
+		return Scope{}, err
+	}
+	return Scope{Subtree: sub}, nil
+}
+
+// initRefusal says why our pid namespace may hold more than the job whose
+// cgroup is sub: every task in it counts as the job's. A pod's own
+// namespace has its init, pid 1, under the pod's cgroup (the pause
+// container, or our own container's init), and so does our container's
+// outside Kubernetes. One whose init is elsewhere is a node's or a
+// machine's that only reads as private from below: a hostPID pod on a
+// nested node (kind, k3d) is in the node container's namespace, beside
+// kubelet, the runtime and every pod's tasks.
+func (s Shape) initRefusal(sub string) error {
+	if s.InitCgroup == "" {
+		return fmt.Errorf("the cgroup of our pid namespace's init is unknown (%s)", s.InitCgroupReason)
+	}
+	if s.InitCgroup != sub && !strings.HasPrefix(s.InitCgroup, strings.TrimSuffix(sub, "/")+"/") {
+		return fmt.Errorf("our pid namespace's init, pid 1, is in %s, outside this job's cgroup %s: the namespace "+
+			"is a node's or a machine's, and every task in it would count as this job's", s.InitCgroup, sub)
+	}
+	return nil
 }
 
 // machineFirewall reports whether the hook would attach at the machine's
@@ -547,6 +571,7 @@ func (s Shape) LogArgs() []any {
 		"cgroup", s.CgroupPath, "cgroup_reason", s.CgroupPathReason,
 		"cgroup_mount", s.CgroupMount.String(), "cgroup_mount_reason", s.CgroupMountReason,
 		"pidns", s.PidNS.String(), "pidns_reason", s.PidNSReason,
+		"init_cgroup", s.InitCgroup, "init_cgroup_reason", s.InitCgroupReason,
 		"cgroup_tree", s.CgroupTree.String(), "cgroup_tree_reason", s.CgroupTreeReason,
 		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
 		"dockerd_cgroup", s.Dockerd.Cgroup, "dockerd_cgroup_driver", s.Dockerd.CgroupDriver,
@@ -602,12 +627,25 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 		s.CgroupTreeReason = "not probed: read only in a private cgroup namespace below its root, " +
 			"outside kubelet's tree, in a pid namespace of our own"
 	}
-	if env, uid, err := dockerEnv(); err != nil {
-		s.DockerHostReason = err.Error()
-	} else if host, setting, err := dockerCLIHost(env, uid); err != nil {
-		s.DockerHostReason = err.Error()
-	} else if host != "" && dockerHostElsewhere(host, dockerSocket) {
-		s.DockerHost, s.DockerHostSetting = host, setting
+	if egressHook && s.PidNS == PidNSPrivate {
+		if path, err := ReadCgroupPath("/proc/1/cgroup"); err != nil {
+			s.InitCgroupReason = err.Error()
+		} else {
+			s.InitCgroup = path
+		}
+	} else {
+		s.InitCgroupReason = "not probed: read only in a private pid namespace"
+	}
+	// The docker CLI's daemon matters only to a hook that judges part of
+	// the machine (partialRefusal), not to one at a runner VM's root.
+	if egressHook && !s.machineFirewall() {
+		if env, uid, err := dockerEnv(); err != nil {
+			s.DockerHostReason = err.Error()
+		} else if host, setting, err := dockerCLIHost(env, uid); err != nil {
+			s.DockerHostReason = err.Error()
+		} else if host != "" && dockerHostElsewhere(host, dockerSocket) {
+			s.DockerHost, s.DockerHostSetting = host, setting
+		}
 	}
 	// The probe parses the kernel's BTF, and nothing reads its answer
 	// without the hook, or on a runner VM (machineFirewall).
@@ -641,6 +679,22 @@ func (c CgroupTree) String() string {
 	return "unknown"
 }
 
+// ThreadsMembers reads a cgroup.threads, which numbers each task as the
+// reader's pid namespace does, for whether it lists tasks of that
+// namespace (by their ids) and tasks outside it (as 0).
+func ThreadsMembers(data []byte) (ours, theirs bool) {
+	for _, line := range strings.Split(string(data), "\n") {
+		switch line {
+		case "":
+		case "0":
+			theirs = true
+		default:
+			ours = true
+		}
+	}
+	return ours, theirs
+}
+
 // probeCgroupTree looks over every cgroup under root for a task outside
 // our pid namespace, which its cgroup.threads lists as 0, as the reader's
 // pid namespace numbers it. A cgroup removed during the look is passed
@@ -664,7 +718,7 @@ func probeCgroupTree(root string) (CgroupTree, string) {
 		if err != nil {
 			return err
 		}
-		if slices.Contains(strings.Split(string(data), "\n"), "0") {
+		if _, theirs := ThreadsMembers(data); theirs {
 			tree, why = CgroupTreeShared, "a task outside our pid namespace is in "+path
 			return fs.SkipAll
 		}

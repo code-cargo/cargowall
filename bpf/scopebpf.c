@@ -88,6 +88,22 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } map_scope_cgroups SEC(".maps");
 
+// Cgroups found shared with a task outside our pid namespace, which an
+// entry by a task of ours does not record: it would judge that task until
+// the next walk took the cgroup out again, and an exec or a healthcheck
+// entering every few seconds would keep it judged. scope_leave marks a
+// recorded cgroup as it takes it out, and pkg/origin's walk marks each it
+// finds shared. The walk clears a mark once no task outside our pid
+// namespace is in the cgroup, recording it where a task of ours is, and
+// release forgets it.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u64);
+    __type(value, __u8);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} map_scope_shared SEC(".maps");
+
 // What the scope could not record, for pkg/origin to report: each counts
 // entries, so a cgroup entered twice that could not be recorded counts
 // twice. Mirrored by Go constants and pinned by test.
@@ -150,8 +166,9 @@ static __always_inline bool in_subtree(struct cgroup *cg)
     return false;
 }
 
-// scope_enter records cg, which a task of ours has entered. The lookup
-// first keeps an existing cgroup from costing a write.
+// scope_enter records cg, which a task of ours has entered, unless it is
+// marked shared (map_scope_shared). The lookup first keeps an existing
+// cgroup from costing a write.
 static __always_inline void scope_enter(struct cgroup *cg)
 {
     __u64 id = scope_id(cg);
@@ -162,7 +179,7 @@ static __always_inline void scope_enter(struct cgroup *cg)
     }
     if (in_subtree(cg))
         return;
-    if (bpf_map_lookup_elem(&map_scope_cgroups, &id))
+    if (bpf_map_lookup_elem(&map_scope_cgroups, &id) || bpf_map_lookup_elem(&map_scope_shared, &id))
         return;
     __u8 one = 1;
     long err = bpf_map_update_elem(&map_scope_cgroups, &id, &one, BPF_NOEXIST);
@@ -173,15 +190,21 @@ static __always_inline void scope_enter(struct cgroup *cg)
 }
 
 // scope_leave takes cg out of the scope, if it is in it, when a task
-// outside our pid namespace enters it: judging the cgroup would judge that
-// task. The job's own tasks there now pass, so it is counted, and so is a
-// delete that fails other than to a concurrent one, which leaves the
-// cgroup judged until pkg/origin's next walk.
+// outside our pid namespace enters it, and marks it shared, so that the
+// job's next entry does not record it again: judging the cgroup would
+// judge that task. The job's own tasks there now pass, so it is counted,
+// and so is a delete that fails other than to a concurrent one, which
+// leaves the cgroup judged until pkg/origin's next walk. A cgroup the
+// scope does not hold is left unmarked, so that a task outside entering a
+// cgroup of its own costs one lookup; should a task of ours then enter it,
+// the walk finds it shared and marks it.
 static __always_inline void scope_leave(struct cgroup *cg)
 {
     __u64 id = scope_id(cg);
     if (!id || !bpf_map_lookup_elem(&map_scope_cgroups, &id))
         return;
+    __u8 one = 1;
+    bpf_map_update_elem(&map_scope_shared, &id, &one, BPF_ANY);
     long err = bpf_map_delete_elem(&map_scope_cgroups, &id);
     if (!err)
         scope_count(SCOPE_STAT_SHARED);
@@ -229,15 +252,17 @@ int BPF_PROG(scope_attach, struct cgroup *dst, const char *path,
 // A cgroup being freed: its last task and its last socket are gone, so
 // no packet can carry its id again, and cgroup ids are never reused. Fires
 // for every hierarchy, and v1 ids can repeat v2 ones, so only the default
-// hierarchy's are ours to delete. Nothing else ever deletes a released
-// cgroup's entry, so a delete that fails other than for want of one is
-// counted: the entry keeps its place in the map for good.
+// hierarchy's are ours to delete, from the scope and from the shared
+// marks. Nothing else ever deletes a released cgroup's entry, so a delete
+// that fails other than for want of one is counted: the entry keeps its
+// place in the map for good.
 SEC("tp_btf/cgroup_release")
 int BPF_PROG(scope_release, struct cgroup *cg, const char *path)
 {
     if (BPF_CORE_READ(cg, root, hierarchy_id) != 0)
         return 0;
     __u64 id = BPF_CORE_READ(cg, kn, id);
+    bpf_map_delete_elem(&map_scope_shared, &id);
     long err = bpf_map_delete_elem(&map_scope_cgroups, &id);
     if (err && err != -ENOENT)
         scope_count(SCOPE_STAT_UNRELEASED);

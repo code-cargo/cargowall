@@ -17,6 +17,7 @@ import (
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	ScopeBpfMapMapScopeCgroups = "map_scope_cgroups"
+	ScopeBpfMapMapScopeShared  = "map_scope_shared"
 	ScopeBpfMapMapScopeStats   = "map_scope_stats"
 	ScopeBpfProgScopeAttach    = "scope_attach"
 	ScopeBpfProgScopeFork      = "scope_fork"
@@ -80,6 +81,7 @@ type ScopeBpfProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type ScopeBpfMapSpecs struct {
 	MapScopeCgroups *ebpf.MapSpec `ebpf:"map_scope_cgroups"`
+	MapScopeShared  *ebpf.MapSpec `ebpf:"map_scope_shared"`
 	MapScopeStats   *ebpf.MapSpec `ebpf:"map_scope_stats"`
 }
 
@@ -113,12 +115,14 @@ func (o *ScopeBpfObjects) Close() error {
 // It can be passed to LoadScopeBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type ScopeBpfMaps struct {
 	MapScopeCgroups *ebpf.Map `ebpf:"map_scope_cgroups"`
+	MapScopeShared  *ebpf.Map `ebpf:"map_scope_shared"`
 	MapScopeStats   *ebpf.Map `ebpf:"map_scope_stats"`
 }
 
 func (m *ScopeBpfMaps) Close() error {
 	return _ScopeBpfClose(
 		m.MapScopeCgroups,
+		m.MapScopeShared,
 		m.MapScopeStats,
 	)
 }

@@ -17,8 +17,6 @@
 package origin
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -52,10 +50,12 @@ var scopeStatsInterval = 10 * time.Second
 // the step tracker and TC never depend on it.
 //
 // The programs record a cgroup as a task of ours enters it and take it
-// out as another task enters it, which is immediate but sees only those
+// out as another task enters it, marking it shared so that the job's next
+// entry does not record it again, which is immediate but sees only those
 // events. The walk is the ground truth: at startup and on every tick it
-// records each cgroup that holds a task of ours and no other, and takes
-// out each one that holds another too, whatever the programs saw. It
+// records each cgroup that holds a task of ours and no other, clearing its
+// mark, takes out and marks each one that holds another too, and clears
+// the mark of one no other is in any more, whatever the programs saw. It
 // opens each cgroup by its id (openCgroup), so it needs no path to find
 // one, and reads who is in it there.
 type cgroupScope struct {
@@ -235,6 +235,7 @@ func (s *cgroupScope) walk(first bool) error {
 		}
 	}
 	found := newWalkFindings()
+	marked := s.readMarks(&found)
 	for id, l := range tasks {
 		if s.stopping() {
 			return nil
@@ -249,13 +250,78 @@ func (s *cgroupScope) walk(first bool) error {
 			}
 			continue
 		}
-		s.reconcileListed(id, l, &found)
+		s.reconcileListed(id, l, marked[id], &found)
 	}
-	if s.reconcileRecorded(tasks, &found) {
+	if s.reconcileRecorded(tasks, &found) && s.reconcileMarked(tasks, marked, &found) {
 		s.last = found
 	}
 	return nil
 }
+
+// readMarks reads the cgroups marked shared (map_scope_shared). A read cut
+// short is reported as the scope's is, and what it read still counts.
+func (s *cgroupScope) readMarks(found *walkFindings) map[uint64]bool {
+	ids, err := scopeCgroups(s.objs.MapScopeShared)
+	if err != nil {
+		s.cutShort(err, found)
+	}
+	marked := make(map[uint64]bool, len(ids))
+	for _, id := range ids {
+		marked[id] = true
+	}
+	return marked
+}
+
+// reconcileMarked clears the mark of each cgroup marked shared that the
+// listing did not reach and that no task outside our pid namespace is in
+// any more, so that a task of ours entering it is recorded again as it
+// enters. One removed loses its mark. False when close cut it short.
+func (s *cgroupScope) reconcileMarked(listed map[uint64]*listed, marked map[uint64]bool, found *walkFindings) bool {
+	for id := range marked {
+		if s.stopping() {
+			return false
+		}
+		if listed[id] != nil {
+			continue
+		}
+		dir, path, _, err := s.openCgroup(id)
+		if cgroupGone(err) {
+			s.unmark(id)
+			continue
+		}
+		if err != nil {
+			s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
+			continue
+		}
+		m, err := cgroupMembers(dir)
+		dir.Close()
+		switch {
+		case cgroupGone(err):
+			s.unmark(id)
+		case err != nil:
+			s.unreadable(id, path, err, found)
+		case !m.theirs:
+			s.unmark(id)
+		}
+	}
+	return true
+}
+
+// cutShort reports a read of the scope's maps that stopped early, once a
+// walk and not again until a walk reads them whole.
+func (s *cgroupScope) cutShort(err error, found *walkFindings) {
+	if !found.unlisted && !s.last.unlisted {
+		s.logger.Warn("Container egress cgroup scope could not read all its cgroups, "+
+			"and those it missed stay as they are until a later walk", "error", err)
+	}
+	found.unlisted = true
+}
+
+// mark marks a cgroup shared, so that a task of ours entering it is not
+// recorded (scope_enter); unmark clears that. A mark the map cannot take
+// costs a recording that the next walk takes out again.
+func (s *cgroupScope) mark(id uint64)   { _ = s.objs.MapScopeShared.Put(id, uint8(1)) }
+func (s *cgroupScope) unmark(id uint64) { _ = s.objs.MapScopeShared.Delete(id) }
 
 // stopping reports whether close has asked the walk to stop.
 func (s *cgroupScope) stopping() bool {
@@ -268,11 +334,11 @@ func (s *cgroupScope) stopping() bool {
 }
 
 // reconcileListed reconciles cgroup id, which the task walk listed: one
-// that holds a task of ours and no other is recorded. One outside our
-// cgroup namespace's root is beyond the hook whatever it holds: an entry
-// a tracepoint made for it is taken out (outsideRoot), and each process
-// of ours there is reported.
-func (s *cgroupScope) reconcileListed(id uint64, l *listed, found *walkFindings) {
+// that holds a task of ours and no other is recorded, its shared mark
+// cleared first. One outside our cgroup namespace's root is beyond the
+// hook whatever it holds: an entry a tracepoint made for it is taken out
+// (outsideRoot), and each process of ours there is reported.
+func (s *cgroupScope) reconcileListed(id uint64, l *listed, marked bool, found *walkFindings) {
 	dir, path, inside, err := s.openCgroup(id)
 	if err != nil {
 		s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
@@ -296,6 +362,9 @@ func (s *cgroupScope) reconcileListed(id uint64, l *listed, found *walkFindings)
 	}
 	existed := s.recorded(id)
 	s.reconcile(id, dir, path, found, func() {
+		if marked {
+			s.unmark(id)
+		}
 		if !existed {
 			s.record(id, dir, path, found)
 		}
@@ -343,11 +412,7 @@ func (s *cgroupScope) unreadable(id uint64, path string, err error, found *walkF
 func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFindings) bool {
 	ids, err := scopeCgroups(s.objs.MapScopeCgroups)
 	if err != nil {
-		found.unlisted = true
-		if !s.last.unlisted {
-			s.logger.Warn("Container egress cgroup scope could not read all its cgroups, "+
-				"and those it missed stay as they are until a later walk", "error", err)
-		}
+		s.cutShort(err, found)
 	} else {
 		inMap := make(map[uint64]bool, len(ids))
 		for _, id := range ids {
@@ -514,13 +579,15 @@ func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFi
 }
 
 // leave takes a cgroup the walk found shared out of the scope, should a
-// tracepoint or an earlier walk have recorded it: a task outside our pid
-// namespace is in it, which the hook must not judge. ours says whether a
+// tracepoint or an earlier walk have recorded it, and marks it shared, so
+// that a task of ours entering it again is not recorded: a task outside our
+// pid namespace is in it, which the hook must not judge. ours says whether a
 // task of ours is in it too. Logged when the last walk did not find it
 // shared, and not at all when neither holds: a cgroup never in the scope
 // that no task of ours is in now changes nothing (a runtime's exec stage
 // listed in the runtime's cgroup has moved on).
 func (s *cgroupScope) leave(id uint64, path string, ours bool, found *walkFindings) {
+	s.mark(id)
 	err := s.objs.MapScopeCgroups.Delete(id)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		found.unremoved[id] = true
@@ -606,8 +673,7 @@ var readThreads = func(dir *os.File) ([]byte, error) {
 }
 
 // members is who a cgroup holds: tasks of our pid namespace, and tasks
-// outside it, which its cgroup.threads lists as 0. It numbers each task as
-// the reader's pid namespace does, which is ours.
+// outside it (podenv.ThreadsMembers).
 type members struct{ ours, theirs bool }
 
 // cgroupMembers reads who the cgroup open at dir holds.
@@ -617,15 +683,8 @@ func cgroupMembers(dir *os.File) (members, error) {
 		return members{}, err
 	}
 	var m members
-	sc := bufio.NewScanner(bytes.NewReader(data))
-	for sc.Scan() {
-		if sc.Text() == "0" {
-			m.theirs = true
-		} else if sc.Text() != "" {
-			m.ours = true
-		}
-	}
-	return m, sc.Err()
+	m.ours, m.theirs = podenv.ThreadsMembers(data)
+	return m, nil
 }
 
 // watch walks the tasks again and reports what the scope could not record,

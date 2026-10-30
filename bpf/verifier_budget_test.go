@@ -94,7 +94,25 @@ func TestVerifierBudget(t *testing.T) {
 		{"stepbpf", LoadStepBpf, func(spec *ebpf.CollectionSpec) error {
 			return spec.Variables[StepBpfVarPidnsIno].Set(pidnsInode(t))
 		}},
+		// Loaded only in a privileged pod, with pidns_ino set as for stepbpf
+		// and a subtree, as there: at zero the subtree check is pruned.
+		{"scopebpf", LoadScopeBpf, func(spec *ebpf.CollectionSpec) error {
+			if err := spec.Variables[ScopeBpfVarSubtreeCgroup].Set(uint64(1)); err != nil {
+				return err
+			}
+			return spec.Variables[ScopeBpfVarPidnsIno].Set(pidnsInode(t))
+		}},
 		{"originbpf", LoadOriginBpf, nil},
+		// The scope is a load-time constant, so a privileged pod runs a
+		// different program from a runner VM's. Measure both, the scoped one
+		// with the job's subtree set: at zero the verifier prunes the scope
+		// check as dead.
+		{"originbpf_scoped", LoadOriginBpf, func(spec *ebpf.CollectionSpec) error {
+			if err := spec.Variables[OriginBpfVarScopeSubtreeCgroup].Set(uint64(1)); err != nil {
+				return err
+			}
+			return spec.Variables[OriginBpfVarScopeSubtreeLevel].Set(uint32(3))
+		}},
 	}
 
 	for _, c := range collections {

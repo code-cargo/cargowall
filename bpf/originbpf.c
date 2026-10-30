@@ -108,6 +108,21 @@
 #define ORIGIN_CFG_KEY_MODE 0         // ORIGIN_MODE_*
 #define ORIGIN_CFG_KEY_LO_CARVEOUT 1  // 1 = carve out skb->ifindex == lo (see below)
 
+// Nonzero: judge only this job's sockets, those under the cgroup with this
+// id, whose whole subtree is the job's, and those in a cgroup recorded in
+// map_scope_cgroups, and pass every other one. In a Kubernetes pod it is
+// the pod's cgroup, so a socket in any of the pod's containers is ours,
+// whoever started it; outside one it is our own container's. Its level is
+// the kernel's depth of it below the root. Set by userspace before load,
+// in the same step that loads the scope collection's map in place of the
+// stand-in below, because they never change after attach. Load-time
+// constants rather than config bytes, so the program has one way into the
+// rest of the hook either way: at zero the verifier drops the check (a
+// runner VM), and set, only a socket of ours gets past it (a privileged
+// pod at a shared cgroup root).
+const volatile __u64 scope_subtree_cgroup = 0;
+const volatile __u32 scope_subtree_level = 0;
+
 // One record per observed flow origin. 8-byte fields first so the packed C
 // layout equals Go's natural layout (72 bytes, no hidden padding); addresses
 // follow blocked_event's convention (v4 host byte order, v6 raw bytes). Go
@@ -157,6 +172,19 @@ static __always_inline __u8 origin_mode(void) {
     __u8 *mode = bpf_map_lookup_elem(&map_origin_config, &key);
     return mode ? *mode : ORIGIN_MODE_OBSERVE;  // absent = inert
 }
+
+// Cgroups a task in the daemon's pid namespace has entered, recorded by
+// scopebpf.c. Owned there: this declaration is replaced by the scope
+// collection's map, at that map's size, when the hook is scoped, and is an
+// empty stand-in otherwise. Shape must match scopebpf.c (pinned by
+// TestScopeCgroupsMapSpecsMatch).
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u64);
+    __type(value, __u8);
+    __uint(max_entries, 64);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} map_scope_cgroups SEC(".maps");
 
 // Local-only networks (docker bridge subnets), carved out of adjudication
 // the way loopback is. OWNED by this collection and deliberately NOT in
@@ -744,6 +772,24 @@ int cg_origin_egress(struct __sk_buff *skb) {
     //     TestDNSProxyFWMarkMatchesGoConstant.
     if (skb->mark == DNS_PROXY_FW_MARK)
         return 1;
+
+    // At a cgroup root other pods share, judge only this job's sockets:
+    // those under the job's cgroup, and those in a cgroup one of this job's
+    // tasks has entered outside it. Another pod's traffic is not ours to
+    // drop or report. Anything else passes with no verdict, no record and
+    // no L7 inspection, and TC on our own interface still polices what
+    // leaves through it. A 1 never overrides another attached program (see
+    // the end of this function). The lookup comes first, and the subtree
+    // constant is tested again inside: in the other order, or without the
+    // repeated test, clang lays the check out so that 6.18's verifier walks
+    // the rest of the hook twice over, 112k instructions against 75k.
+    if (scope_subtree_cgroup) {
+        __u64 cgroup = bpf_skb_cgroup_id(skb);
+        if (!bpf_map_lookup_elem(&map_scope_cgroups, &cgroup) &&
+            !(scope_subtree_cgroup &&
+              bpf_skb_ancestor_cgroup_id(skb, scope_subtree_level) == scope_subtree_cgroup))
+            return 1;
+    }
 
     __u8 mode = origin_mode();
 

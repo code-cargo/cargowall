@@ -54,7 +54,13 @@ import (
 
 	"github.com/code-cargo/cargowall/bpf"
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
+
+// cgroupAttachPath is where Start attaches the hook: the tree
+// podenv.Shape.HookScope showed this process is in. A test attaches below
+// it, where only its own sockets reach the program.
+var cgroupAttachPath = podenv.CgroupRoot
 
 // The ringbuf wire layout is bpf.OriginEvent (bpf/origin_event.go) — the one
 // Go mirror of struct origin_event, shared with the BTF layout test so the
@@ -186,6 +192,7 @@ const (
 // ringbuf reader, the verdict-reporting worker, and the join store.
 type Observer struct {
 	objs     bpf.OriginBpfObjects
+	cgroups  *cgroupScope // the cgroups a scoped hook judges; nil unscoped
 	link     link.Link
 	reader   *ringbuf.Reader
 	sockPid  *ebpf.Map
@@ -262,7 +269,13 @@ func (o *Observer) EnableL7(opts L7Options) (*L7, error) {
 // Start loads the origin collection, attaches the observer at the root
 // cgroup, and starts the reader. Nothing here can affect enforcement; any
 // error means the caller runs without container attribution.
-func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
+//
+// scope is podenv.Shape.HookScope's answer. Limited, the hook judges only
+// sockets under scope.Subtree and those in the cgroups tasks in our pid
+// namespace have entered, which Start records first (cgroupScope), and every
+// other socket under the root cgroup passes the hook untouched. Otherwise
+// it judges every socket.
+func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*Observer, error) {
 	if tcObjs == nil {
 		return nil, errors.New("nil TC BPF objects")
 	}
@@ -283,6 +296,23 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 		degradedDone: make(chan struct{}),
 	}
 
+	// Until Start returns the Observer, a failure releases what it built, in
+	// the order Close does: the link, the collection, then the scope. Each
+	// is nil or empty until built, and closing it then does nothing.
+	started := false
+	defer func() {
+		if started {
+			return
+		}
+		if o.link != nil {
+			_ = o.link.Close()
+		}
+		o.objs.Close()
+		if o.cgroups != nil {
+			o.cgroups.close()
+		}
+	}()
+
 	// The rule/config maps are owned by the tcbpf collection; replacing them
 	// here makes both hooks read one set of kernel maps, so the enforcing
 	// hook and its TC backstop can never disagree about policy. This is a
@@ -295,15 +325,31 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load origin BPF spec: %w", err)
 	}
+	replacements := map[string]*ebpf.Map{
+		"map_cidrs":          tcObjs.MapCidrs,
+		"map_ports":          tcObjs.MapPorts,
+		"map_cidrs_v6":       tcObjs.MapCidrsV6,
+		"map_ports_v6":       tcObjs.MapPortsV6,
+		"map_default_action": tcObjs.MapDefaultAction,
+		"map_audit_mode":     tcObjs.MapAuditMode,
+	}
+	if scope.Limited() {
+		// Set before load, with the map it reads: the program never judges,
+		// even briefly, a socket that is not this job's. The stand-in takes
+		// the scope map's size.
+		s, err := loadCgroupScope(logger, scope.Subtree)
+		if err != nil {
+			return nil, err
+		}
+		o.cgroups = s
+		if err := setCgroupScope(spec, s.sub); err != nil {
+			return nil, err
+		}
+		spec.Maps[bpf.OriginBpfMapMapScopeCgroups].MaxEntries = s.cgroups().MaxEntries()
+		replacements[bpf.OriginBpfMapMapScopeCgroups] = s.cgroups()
+	}
 	if err := cargowallEbpf.LoadObjects(logger, "originbpf", spec, ebpf.CollectionOptions{
-		MapReplacements: map[string]*ebpf.Map{
-			"map_cidrs":          tcObjs.MapCidrs,
-			"map_ports":          tcObjs.MapPorts,
-			"map_cidrs_v6":       tcObjs.MapCidrsV6,
-			"map_ports_v6":       tcObjs.MapPortsV6,
-			"map_default_action": tcObjs.MapDefaultAction,
-			"map_audit_mode":     tcObjs.MapAuditMode,
-		},
+		MapReplacements: replacements,
 		// Stats ONLY, unlike the TC and step collections: the count is the
 		// one number that predicts whether this program loads on an older
 		// verifier, and the daemon's own log is the only place to read it on
@@ -326,8 +372,15 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	// rather than hardwired only because PROG_TEST_RUN pins every test skb
 	// to the loopback device — see origin_lo_carveout in originbpf.c.
 	if err := o.objs.MapOriginConfig.Put(cfgKeyLoCarveout, uint8(1)); err != nil {
-		o.objs.Close()
 		return nil, fmt.Errorf("failed to arm loopback carve-out: %w", err)
+	}
+
+	// The hook verified, the scope starts recording, before the hook can
+	// judge a socket by it.
+	if o.cgroups != nil {
+		if err := o.cgroups.start(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Telemetry: what else is attached at the root cgroup (Docker's or
@@ -346,14 +399,19 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	// ALLOW_MULTI before anything else. The pre/post program query logged
 	// below is the observational check that nobody was displaced.
 	l, err := link.AttachCgroup(link.CgroupOptions{
-		// Root cgroup, same rationale as the connect/sendmsg hooks: observe
-		// every process on the machine, containers included.
-		Path:    "/sys/fs/cgroup",
+		// The tree podenv.Shape.HookScope showed this process is in: the
+		// machine's root in the host cgroup namespace, our container's
+		// subtree in a private one. Every socket under it reaches the
+		// program. Unscoped it judges all of them (a runner VM, or our own
+		// container). Scoped it judges only this job's, under our pod's
+		// cgroup or in a cgroup this job's tasks have entered, and passes
+		// the rest, a neighbour pod's included, with no verdict and no
+		// record.
+		Path:    cgroupAttachPath,
 		Attach:  ebpf.AttachCGroupInetEgress,
 		Program: o.objs.CgOriginEgress,
 	})
 	if err != nil {
-		o.objs.Close()
 		return nil, fmt.Errorf("failed to attach cgroup_skb/egress observer: %w", err)
 	}
 	o.link = l
@@ -361,8 +419,6 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 
 	rd, err := ringbuf.NewReader(o.objs.MapOriginEvents)
 	if err != nil {
-		_ = l.Close()
-		o.objs.Close()
 		return nil, fmt.Errorf("failed to create origin event reader: %w", err)
 	}
 	o.reader = rd
@@ -370,6 +426,7 @@ func Start(tcObjs *bpf.TcBpfObjects, logger *slog.Logger) (*Observer, error) {
 	go o.reportLoop()
 	go o.degradedLoop()
 
+	started = true
 	return o, nil
 }
 
@@ -427,6 +484,11 @@ func (o *Observer) Close() {
 		_ = o.link.Close()
 	}
 	o.objs.Close()
+	// Only once the hook is detached, so it never judges a scope nothing
+	// updates.
+	if o.cgroups != nil {
+		o.cgroups.close()
+	}
 	// The shutdown accounting for this hook's verdicts. The three report
 	// counters answer distinct questions: dropped — the pipeline SATURATED
 	// mid-run and reports (with their audit events) were lost; degraded —
@@ -512,7 +574,7 @@ func (o *Observer) Blocked() uint64 { return o.blocked.Load() }
 func (o *Observer) Records() uint64 { return o.records.Load() }
 
 func (o *Observer) logAttachedEgressPrograms(when string) {
-	cg, err := os.Open("/sys/fs/cgroup")
+	cg, err := os.Open(cgroupAttachPath)
 	if err != nil {
 		o.logger.Debug("Cannot open root cgroup for program query", "error", err)
 		return

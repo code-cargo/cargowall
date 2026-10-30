@@ -23,7 +23,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -36,24 +35,13 @@ import (
 
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/events"
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // Note: none of these tests assume Runner.Worker is absent — in CI the
 // suite runs ON a GitHub-hosted runner, where the test binary's own
 // ancestry contains a real Runner.Worker. Assertions are therefore made
 // against processes the test controls (itself and its parent).
-
-func TestReadPPid_Self(t *testing.T) {
-	ppid, ok := readPPid(os.Getpid())
-	require.True(t, ok)
-	assert.Equal(t, os.Getppid(), ppid)
-}
-
-func TestReadPPid_Gone(t *testing.T) {
-	// PID 0 has no /proc entry.
-	_, ok := readPPid(0)
-	assert.False(t, ok)
-}
 
 func TestReadCmdline_Self(t *testing.T) {
 	cmdline := readCmdline(os.Getpid())
@@ -64,13 +52,6 @@ func TestReadCmdline_Self(t *testing.T) {
 
 func TestReadCmdline_GoneFallsBackEmpty(t *testing.T) {
 	assert.Empty(t, readCmdline(0))
-}
-
-func TestReadComm_Self(t *testing.T) {
-	comm := readComm(os.Getpid())
-	require.NotEmpty(t, comm)
-	// comm is the executable basename truncated to 15 chars.
-	assert.LessOrEqual(t, len(comm), 15)
 }
 
 // rec encodes one task_iter_rec as the step_task_iter iterator streams it.
@@ -119,31 +100,8 @@ func TestProcSnapshot_SubtreeTerminatesOnCycle(t *testing.T) {
 	assert.Equal(t, []uint32{1, 2}, snap.subtree(1))
 }
 
-func TestPidNamespaceInode_MatchesProcLink(t *testing.T) {
-	got, err := pidNamespaceInode()
-	require.NoError(t, err)
-	link, err := os.Readlink("/proc/self/ns/pid")
-	require.NoError(t, err)
-	want, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(link, "pid:["), "]"), 10, 32)
-	require.NoError(t, err)
-	assert.Equal(t, uint32(want), got)
-}
-
-func TestFindAncestorByComm_FindsParent(t *testing.T) {
-	parentComm := readComm(os.Getppid())
-	require.NotEmpty(t, parentComm)
-	pid, ok := findAncestorByComm(os.Getpid(), parentComm)
-	require.True(t, ok)
-	assert.Equal(t, os.Getppid(), pid)
-}
-
-func TestFindAncestorByComm_NoMatch(t *testing.T) {
-	_, ok := findAncestorByComm(os.Getpid(), "no-such-comm-xx")
-	assert.False(t, ok)
-}
-
 func TestScanUniqueByComm_FindsSelf(t *testing.T) {
-	selfComm := readComm(os.Getpid())
+	selfComm := procfs.Comm(os.Getpid())
 	first, count := scanUniqueByComm(selfComm)
 	require.GreaterOrEqual(t, count, 1)
 	if count == 1 {

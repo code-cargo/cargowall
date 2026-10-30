@@ -22,7 +22,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -32,6 +31,8 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/stretchr/testify/require"
+
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // stepChildEventT mirrors struct step_child_event in stepbpf.c.
@@ -44,9 +45,9 @@ type stepChildEventT struct {
 // inode of this process's pid namespace, as pkg/steps passes it in.
 func pidnsInode(t *testing.T) uint32 {
 	t.Helper()
-	fi, err := os.Stat("/proc/self/ns/pid")
+	ino, err := podenv.PidNamespaceInode()
 	require.NoError(t, err)
-	return uint32(fi.Sys().(*syscall.Stat_t).Ino)
+	return ino
 }
 
 // globalTgid runs the task iterator and returns the global tgid of the

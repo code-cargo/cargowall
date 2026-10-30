@@ -44,7 +44,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode/utf8"
 	"unsafe"
@@ -56,11 +55,13 @@ import (
 	"github.com/code-cargo/cargowall/bpf"
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 	"github.com/code-cargo/cargowall/pkg/events"
+	"github.com/code-cargo/cargowall/pkg/podenv"
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // workerComm is the /proc/<pid>/comm value of the GitHub Actions runner's
 // per-job worker process (13 chars, fits TASK_COMM_LEN untruncated).
-const workerComm = "Runner.Worker"
+const workerComm = procfs.RunnerWorkerComm
 
 // stepChildEvent mirrors struct step_child_event in bpf/stepbpf.c.
 type stepChildEvent struct {
@@ -154,7 +155,7 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 	// this package (the worker pid above, seeding, container leaders) is
 	// numbered in it; the kernel numbers tasks globally. Identical on a
 	// plain VM, different inside a container (ARC runners).
-	pidnsIno, err := pidNamespaceInode()
+	pidnsIno, err := podenv.PidNamespaceInode()
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +223,7 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		return nil, fmt.Errorf("%s pid %d is not visible to the task iterator", workerComm, workerPID)
 	}
 	t.workerTgid = workerTgid
-	if pidnsIno != initPidNamespaceInode {
+	if pidnsIno != podenv.InitPidNamespace {
 		logger.Info("Running inside a pid namespace; translating task ids",
 			"pidns_ino", pidnsIno, "worker_pid", workerPID, "worker_tgid", workerTgid)
 	}
@@ -331,7 +332,7 @@ func (t *Tracker) attach() error {
 	// Same root-cgroup attachment rationale as the connect/sendmsg hooks in
 	// StartCargoWall: tag socket creation for every process on the machine.
 	sockLink, err := link.AttachCgroup(link.CgroupOptions{
-		Path:    "/sys/fs/cgroup",
+		Path:    podenv.CgroupRoot,
 		Attach:  ebpf.AttachCGroupInetSockCreate,
 		Program: t.objs.CgSockCreate,
 	})
@@ -464,25 +465,6 @@ func (t *Tracker) resolve(pid int) (*procSnapshot, uint32, bool) {
 		return nil, 0, false // exited mid-flight, or not numbered in our namespace
 	}
 	return snap, leader, true
-}
-
-// initPidNamespaceInode is PROC_PID_INIT_INO, the fixed nsfs inode of the
-// initial pid namespace — what a plain VM sees; anything else means the
-// daemon is inside a container.
-const initPidNamespaceInode uint32 = 0xEFFFFFFC
-
-// pidNamespaceInode identifies the daemon's pid namespace the way the
-// kernel does (ns_common.inum), for the step_task_iter/step_fork walk.
-func pidNamespaceInode() (uint32, error) {
-	fi, err := os.Stat("/proc/self/ns/pid")
-	if err != nil {
-		return 0, fmt.Errorf("failed to stat pid namespace: %w", err)
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, errors.New("pid namespace stat has no inode")
-	}
-	return uint32(st.Ino), nil
 }
 
 // procSnapshot is one pass of the step_task_iter walk: every task in the
@@ -707,7 +689,7 @@ func (t *Tracker) stepCmdline(pid int) string {
 // lines into our audit stream. The scan survives only as a fallback for
 // standalone starts, and then only when it is unambiguous.
 func findWorkerPID() (int, error) {
-	if pid, ok := findAncestorByComm(os.Getpid(), workerComm); ok {
+	if pid, _, ok := procfs.AncestorByComm(os.Getpid(), workerComm); ok {
 		return pid, nil
 	}
 	pid, count := scanUniqueByComm(workerComm)
@@ -719,27 +701,6 @@ func findWorkerPID() (int, error) {
 	default:
 		return 0, fmt.Errorf("%d %s processes found and none is an ancestor — refusing to guess (use --runner-worker-pid)", count, workerComm)
 	}
-}
-
-// findAncestorByComm walks the parent chain from fromPid looking for a
-// process whose comm matches. Bounded to defend against a cyclic/corrupt
-// /proc snapshot; real chains reach pid 1 in far fewer hops.
-func findAncestorByComm(fromPid int, comm string) (int, bool) {
-	pid := fromPid
-	for range 64 {
-		if pid <= 1 {
-			return 0, false
-		}
-		if readComm(pid) == comm {
-			return pid, true
-		}
-		ppid, ok := readPPid(pid)
-		if !ok {
-			return 0, false
-		}
-		pid = ppid
-	}
-	return 0, false
 }
 
 // scanUniqueByComm returns the first /proc process with the given comm and
@@ -754,7 +715,7 @@ func scanUniqueByComm(comm string) (first, count int) {
 		if err != nil {
 			continue
 		}
-		if readComm(pid) == comm {
+		if procfs.Comm(pid) == comm {
 			if count == 0 {
 				first = pid
 			}
@@ -762,38 +723,6 @@ func scanUniqueByComm(comm string) (first, count int) {
 		}
 	}
 	return first, count
-}
-
-// readComm returns the trimmed /proc/<pid>/comm, or "" when unreadable.
-func readComm(pid int) string {
-	comm, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(comm))
-}
-
-// readPPid extracts the parent pid from /proc/<pid>/stat. The comm field
-// (2) can contain spaces and parentheses, so parse from the last ')' —
-// state is the field after it, ppid the one after that.
-func readPPid(pid int) (int, bool) {
-	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if err != nil {
-		return 0, false
-	}
-	i := strings.LastIndexByte(string(data), ')')
-	if i < 0 {
-		return 0, false
-	}
-	fields := strings.Fields(string(data[i+1:]))
-	if len(fields) < 2 {
-		return 0, false
-	}
-	ppid, err := strconv.Atoi(fields[1])
-	if err != nil {
-		return 0, false
-	}
-	return ppid, true
 }
 
 // readCmdline returns a space-joined, length-capped /proc/<pid>/cmdline,
@@ -823,9 +752,5 @@ func readCmdline(pid int) string {
 			return s
 		}
 	}
-	comm, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(comm))
+	return procfs.Comm(pid)
 }

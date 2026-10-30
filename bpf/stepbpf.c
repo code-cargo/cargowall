@@ -45,6 +45,8 @@
 // rather than matching garbage.
 const volatile __u32 pidns_ino = 0;
 
+#include "pidns.h"
+
 // ---- Shared with tcbpf.c (replaced at load time; shapes must match) ----
 
 struct step_state {
@@ -114,41 +116,9 @@ struct task_iter_rec {
 
 const struct task_iter_rec *btf_anchor_task_iter_rec __attribute__((unused));
 
-// MAX_PID_NS_LEVEL: a task's upid chain is at most this deep.
-#define PIDNS_MAX_LEVEL 32
-
 static __always_inline struct step_state *step_state(void) {
     __u32 key = 0;
     return bpf_map_lookup_elem(&map_step_state, &key);
-}
-
-// ns_tgid_of returns t's process id as numbered in the daemon's pid
-// namespace, or 0 when t lives outside that namespace's subtree (another
-// pod, the host) or translation is disabled. Walks the group leader's upid
-// chain — numbers[0] is the init namespace, numbers[level] the task's own —
-// looking for the namespace whose inode userspace passed in. The daemon's
-// namespace appears at most once in a chain, so order is irrelevant; a
-// plain bounded index keeps the flexible-array access simple.
-static __always_inline __u32 ns_tgid_of(struct task_struct *t)
-{
-    if (!pidns_ino)
-        return 0;
-    struct pid *p = BPF_CORE_READ(t, group_leader, thread_pid);
-    if (!p)
-        return 0;
-    unsigned int level = BPF_CORE_READ(p, level);
-    if (level >= PIDNS_MAX_LEVEL)
-        level = PIDNS_MAX_LEVEL - 1;
-    for (unsigned int i = 0; i < PIDNS_MAX_LEVEL; i++) {
-        if (i > level)
-            break;
-        struct upid up;
-        if (bpf_core_read(&up, sizeof(up), &p->numbers[i]))
-            break;
-        if (BPF_CORE_READ(up.ns, ns.inum) == pidns_ino)
-            return up.nr;
-    }
-    return 0;
 }
 
 // Tag propagation. Runs synchronously inside fork(), in the parent's

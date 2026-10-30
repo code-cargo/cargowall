@@ -22,8 +22,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
-	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -31,6 +29,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // FirewallUpdater allows the event processor to dynamically add IPs to the firewall
@@ -45,11 +44,7 @@ func lookupProcessName(pid uint32) string {
 	if pid == 0 {
 		return ""
 	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
+	return procfs.Comm(int(pid))
 }
 
 // StateMachineClient interface for sending notifications to state machines

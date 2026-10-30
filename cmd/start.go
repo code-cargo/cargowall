@@ -253,10 +253,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// What container this runs in decides whether the daemon's config is
 	// ours to rewrite and whether the cgroup hook would judge only this
 	// job (see podenv.Shape.HookScope).
-	shape := podenv.Detect(dockerSocket)
-	logger.Info("Runtime environment", "cgroupns", shape.CgroupNS.String(), "cgroupns_reason", shape.CgroupNSReason,
-		"cgroup", shape.CgroupPath, "cgroup_reason", shape.CgroupPathReason,
-		"dockerd", shape.Dockerd.Kind.String(), "dockerd_reason", shape.Dockerd.Reason)
+	shape := podenv.Detect(dockerSocket, caps.KernelVersion, cmd.ContainerEgress != ContainerEgressOff)
+	logger.Info("Runtime environment", shape.LogArgs()...)
 
 	var dnsServer *dns.Server
 	var containerDNS *dockerDNS
@@ -543,7 +541,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		l, err := link.AttachCgroup(link.CgroupOptions{
 			// Root cgroup: cargowall is a host-level firewall, so we attach to the
 			// root cgroup to capture PID info for all processes on the machine.
-			Path:    "/sys/fs/cgroup",
+			Path:    podenv.CgroupRoot,
 			Attach:  cp.attach,
 			Program: cp.prog,
 		})
@@ -591,8 +589,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// postures decides what losing a requested layer means: a lost enforce
 	// rung fails startup, a lost observe rung is recorded for the summary.
 	postures := newPostures(cmd, caps.KernelVersion, logger)
+	hookScope, hookScopeErr := shape.HookScope()
 	attribution, err := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
-		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, shape.HookScope(), &objs, postures, logger)
+		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, hookScope, hookScopeErr, &objs, postures, logger)
 	if err != nil {
 		return err
 	}

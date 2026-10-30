@@ -25,10 +25,11 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
-	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/events"
+	"github.com/code-cargo/cargowall/pkg/procfs"
+	"github.com/code-cargo/cargowall/pkg/sockdiag"
 )
 
 // sockdiag resolves a local socket's kernel cookie from its source address,
@@ -88,22 +89,13 @@ func wantBytes(family uint8, srcIP net.IP) [16]byte {
 }
 
 // dumpSocketTable dumps the kernel's socket table for (family, proto) into
-// rows, on the same mdlayher/netlink contract as the conntrack flush
-// (Execute aggregates the multipart dump and surfaces NLMSG_ERROR). A
-// non-nil error means the dump itself failed (netlink unavailable — e.g. a
+// rows, through sockdiag.Request, on the same mdlayher/netlink contract as
+// the conntrack flush (Execute aggregates the multipart dump and surfaces
+// NLMSG_ERROR). A non-nil error means the dump itself failed (netlink unavailable — e.g. a
 // kernel without CONFIG_INET_DIAG — or the deadline fired), as opposed to a
 // clean dump, so callers can surface systemic breakage instead of
 // conflating it with "socket not found".
 func dumpSocketTable(family, proto uint8) ([]sockRow, error) {
-	conn, err := netlink.Dial(unix.NETLINK_SOCK_DIAG, nil)
-	if err != nil {
-		return nil, fmt.Errorf("dial sock_diag netlink: %w", err)
-	}
-	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(diagDumpTimeout)); err != nil {
-		return nil, fmt.Errorf("set netlink deadline: %w", err)
-	}
-
 	req := inetDiagReqV2{
 		Family:   family,
 		Protocol: proto,
@@ -114,13 +106,7 @@ func dumpSocketTable(family, proto uint8) ([]sockRow, error) {
 	binary.NativeEndian.PutUint32(data[4:8], req.States)
 	// req.ID stays zero for a dump.
 
-	msgs, err := conn.Execute(netlink.Message{
-		Header: netlink.Header{
-			Type:  netlink.HeaderType(unix.SOCK_DIAG_BY_FAMILY),
-			Flags: netlink.Request | netlink.Dump,
-		},
-		Data: data,
-	})
+	msgs, err := sockdiag.Request("", data, true, diagDumpTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("sock_diag dump: %w", err)
 	}
@@ -492,7 +478,7 @@ func (r *clientResolver) stepForClient(addr net.Addr) events.StepAttribution {
 		var pid uint32
 		if r.pidMap != nil && r.pidMap.Lookup(cookie, &pid) == nil && pid != 0 {
 			attr.PID = pid
-			attr.Process = readComm(int(pid))
+			attr.Process = procfs.Comm(int(pid))
 		}
 	default:
 		// A status this switch does not know is a programming error: log it

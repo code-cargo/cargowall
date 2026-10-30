@@ -158,9 +158,12 @@ const (
 	OriginBpfMapMapOriginSeen        = "map_origin_seen"
 	OriginBpfMapMapPorts             = "map_ports"
 	OriginBpfMapMapPortsV6           = "map_ports_v6"
+	OriginBpfMapMapScopeCgroups      = "map_scope_cgroups"
 	OriginBpfProgCgOriginEgress      = "cg_origin_egress"
 	OriginBpfVarBtfAnchorL7Event     = "btf_anchor_l7_event"
 	OriginBpfVarBtfAnchorOriginEvent = "btf_anchor_origin_event"
+	OriginBpfVarScopeSubtreeCgroup   = "scope_subtree_cgroup"
+	OriginBpfVarScopeSubtreeLevel    = "scope_subtree_level"
 )
 
 // LoadOriginBpf returns the embedded CollectionSpec for OriginBpf.
@@ -230,6 +233,7 @@ type OriginBpfMapSpecs struct {
 	MapOriginSeen    *ebpf.MapSpec `ebpf:"map_origin_seen"`
 	MapPorts         *ebpf.MapSpec `ebpf:"map_ports"`
 	MapPortsV6       *ebpf.MapSpec `ebpf:"map_ports_v6"`
+	MapScopeCgroups  *ebpf.MapSpec `ebpf:"map_scope_cgroups"`
 }
 
 // OriginBpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -238,6 +242,8 @@ type OriginBpfMapSpecs struct {
 type OriginBpfVariableSpecs struct {
 	BtfAnchorL7Event     *ebpf.VariableSpec `ebpf:"btf_anchor_l7_event"`
 	BtfAnchorOriginEvent *ebpf.VariableSpec `ebpf:"btf_anchor_origin_event"`
+	ScopeSubtreeCgroup   *ebpf.VariableSpec `ebpf:"scope_subtree_cgroup"`
+	ScopeSubtreeLevel    *ebpf.VariableSpec `ebpf:"scope_subtree_level"`
 }
 
 // OriginBpfObjects contains all objects after they have been loaded into the kernel.
@@ -278,6 +284,7 @@ type OriginBpfMaps struct {
 	MapOriginSeen    *ebpf.Map `ebpf:"map_origin_seen"`
 	MapPorts         *ebpf.Map `ebpf:"map_ports"`
 	MapPortsV6       *ebpf.Map `ebpf:"map_ports_v6"`
+	MapScopeCgroups  *ebpf.Map `ebpf:"map_scope_cgroups"`
 }
 
 func (m *OriginBpfMaps) Close() error {
@@ -300,6 +307,7 @@ func (m *OriginBpfMaps) Close() error {
 		m.MapOriginSeen,
 		m.MapPorts,
 		m.MapPortsV6,
+		m.MapScopeCgroups,
 	)
 }
 
@@ -309,6 +317,8 @@ func (m *OriginBpfMaps) Close() error {
 type OriginBpfVariables struct {
 	BtfAnchorL7Event     *ebpf.Variable `ebpf:"btf_anchor_l7_event"`
 	BtfAnchorOriginEvent *ebpf.Variable `ebpf:"btf_anchor_origin_event"`
+	ScopeSubtreeCgroup   *ebpf.Variable `ebpf:"scope_subtree_cgroup"`
+	ScopeSubtreeLevel    *ebpf.Variable `ebpf:"scope_subtree_level"`
 }
 
 // OriginBpfPrograms contains all programs after they have been loaded into the kernel.

@@ -21,8 +21,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 	"unsafe"
@@ -516,18 +514,7 @@ func TestOriginVerdictChangeReemitsWithinInterval(t *testing.T) {
 	seedOriginRules(t, objs)
 	setOriginMode(t, objs, originModeObserve)
 
-	cgRoot := "/sys/fs/cgroup"
-	cgPath := filepath.Join(cgRoot, fmt.Sprintf("cargowall-origin-test-%d", os.Getpid()))
-	if err := os.Mkdir(cgPath, 0o755); err != nil {
-		t.Skipf("cannot create test cgroup: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Remove(cgPath) })
-	self := []byte(strconv.Itoa(os.Getpid()))
-	if err := os.WriteFile(filepath.Join(cgPath, "cgroup.procs"), self, 0); err != nil {
-		t.Skipf("cannot enter test cgroup: %v", err)
-	}
-	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(cgRoot, "cgroup.procs"), self, 0) })
-
+	cgPath := enterTestCgroup(t)
 	l, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    cgPath,
 		Attach:  ebpf.AttachCGroupInetEgress,

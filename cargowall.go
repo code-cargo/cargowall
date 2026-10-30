@@ -28,6 +28,8 @@ import (
 // default -mcpu=v1 anyway; clang 21 enforces the CPU level and refuses.
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -cflags -mcpu=v3 -output-dir bpf -type task_iter_rec StepBpf bpf/stepbpf.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -output-dir bpf OriginBpf bpf/originbpf.c
+// ScopeBpf counts with an atomic add, built for v3 like StepBpf.
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -cflags -mcpu=v3 -output-dir bpf ScopeBpf bpf/scopebpf.c
 
 var version = "dev"
 

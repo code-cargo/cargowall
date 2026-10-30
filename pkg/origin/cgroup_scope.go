@@ -93,9 +93,11 @@ type findingKind uint8
 
 const (
 	findShared findingKind = iota
+	findLeft
 	findUnremoved
 	findUnrecorded
 	findUnreadable
+	findUnreadableOwn
 	findUnmarked
 	findInRoot
 	findOutside
@@ -449,7 +451,11 @@ func (s *cgroupScope) unreadable(id uint64, path string, err error) {
 		s.mark(id, path, true)
 		_ = s.objs.MapScopeCgroups.Delete(id)
 	}
-	if !s.warn(findUnreadable, id) {
+	kind := findUnreadable
+	if own {
+		kind = findUnreadableOwn
+	}
+	if !s.warn(kind, id) {
 		return
 	}
 	if own {

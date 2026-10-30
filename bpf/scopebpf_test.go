@@ -563,10 +563,17 @@ func TestScopeReleaseForgetsCgroups(t *testing.T) {
 	moveSelf(t, held)
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	require.NoError(t, err)
+	open := true
+	t.Cleanup(func() {
+		if open {
+			_ = unix.Close(fd)
+		}
+	})
 	require.NoError(t, os.WriteFile(filepath.Join(root, "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0))
 	require.NoError(t, os.Remove(held))
 	time.Sleep(500 * time.Millisecond)
 	require.True(t, recorded(heldID), "a removed cgroup a socket was made in stays while the socket is open")
+	open = false
 	require.NoError(t, unix.Close(fd))
 	require.Eventually(t, func() bool { return !recorded(heldID) }, 5*time.Second, 20*time.Millisecond,
 		"and is forgotten once the socket is gone")

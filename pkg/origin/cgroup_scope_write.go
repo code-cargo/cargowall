@@ -19,6 +19,7 @@ package origin
 import (
 	"errors"
 	"os"
+	"time"
 
 	"github.com/cilium/ebpf"
 )
@@ -113,8 +114,11 @@ func (s *cgroupScope) unmark(id uint64, dir *os.File, path string, inside bool) 
 	s.settle(id, dir, path, inside, false, prev)
 }
 
-// forgetMark clears the shared mark of a cgroup that has been removed,
-// which no task can enter again.
+// forgetMark clears a cgroup's shared mark outright, with no look after:
+// the mark of a cgroup that has been removed, which no task can enter
+// again, or the unheld mark clearMark drops while tasks outside are in the
+// cgroup and none of ours, which nothing keeps from re-recording but the
+// next walk.
 func (s *cgroupScope) forgetMark(id uint64) {
 	_ = s.objs.MapScopeShared.Delete(id)
 }
@@ -163,12 +167,12 @@ func (s *cgroupScope) put(id uint64, path string) (made, ok bool) {
 // walk come a moment later. One the look cannot read is marked, as it was
 // or as the scope holds it, and taken out, which judges no task outside,
 // and reported, for a walk that reads it to record it again; when the
-// fault is the walk's own (unreadable's ownFault), the write is undone
-// instead. Each recording is looked at again, up to settleLooks looks in
-// all.
+// fault is the walk's own (unreadable's ownFault) and lasts (lookAgain),
+// the write is undone instead. Each recording is looked at again, up to
+// settleLooks looks in all.
 func (s *cgroupScope) settle(id uint64, dir *os.File, path string, inside, made bool, prev uint8) {
 	for look := 1; ; look++ {
-		m, err := cgroupMembers(dir)
+		m, err := lookAgain(dir)
 		switch {
 		case cgroupGone(err):
 			if made {
@@ -211,6 +215,28 @@ func (s *cgroupScope) settle(id uint64, dir *os.File, path string, inside, made 
 // settleLooks bounds settle's looks at a cgroup that tasks keep entering.
 const settleLooks = 3
 
+// lookAgain reads the members of a cgroup the walk has just written, and
+// reads them again, a moment apart, while the walk's own fault fails the
+// read (ownFault). Undoing the write for such a fault judges no task
+// outside, but leaves a task of ours that entered since, relying on the
+// write, unjudged until a walk can read the cgroup: so only a fault that
+// outlasts ownFaultRetries reads comes to that.
+func lookAgain(dir *os.File) (members, error) {
+	m, err := cgroupMembers(dir)
+	for i := 0; i < ownFaultRetries && err != nil && ownFault(err); i++ {
+		ownFaultWait()
+		m, err = cgroupMembers(dir)
+	}
+	return m, err
+}
+
+// ownFaultRetries and ownFaultWait bound lookAgain: three reads more, 20ms
+// apart, which a blip of descriptors or memory does not outlast. A test
+// stands in for the wait.
+const ownFaultRetries = 3
+
+var ownFaultWait = func() { time.Sleep(20 * time.Millisecond) }
+
 // leave takes a cgroup the walk found shared out of the scope, should a
 // tracepoint or an earlier walk have recorded it, and marks it shared, so
 // that a task of ours entering it again is not recorded: a task outside our
@@ -236,7 +262,11 @@ func (s *cgroupScope) leave(id uint64, path string, ours, wasHeld bool) {
 		}
 		return
 	}
-	if !s.warn(findShared, id) {
+	kind := findLeft
+	if ours {
+		kind = findShared
+	}
+	if !s.warn(kind, id) {
 		return
 	}
 	switch {

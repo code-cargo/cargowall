@@ -761,13 +761,20 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	require.True(t, marked() && !recorded(), "and past them the cgroup is marked and left out")
 	s.forgetMark(ownID)
 
-	// A second look the walk's own fault fails (EMFILE) says nothing of the
-	// cgroup: the write is undone, the entry it made taken out and the mark
-	// it cleared put back, without a mark the cgroup did not have.
+	// A second look the walk's own fault fails (EMFILE) is read again: a
+	// blip passes, and the recording stands, so a task of ours that entered
+	// relying on it is judged. One that outlasts the reads says nothing of
+	// the cgroup: the write is undone, the entry it made taken out and the
+	// mark it cleared put back, without a mark the cgroup did not have.
+	swap(t, &ownFaultWait, func() {})
 	s.forgetMark(ownID)
+	looksRead(syscall.EMFILE, syscall.EMFILE, "7\n")
+	s.record(ownID, dir, path)
+	require.True(t, recorded() && !marked(), "a recording whose look ran short of descriptors for a moment stands")
+	require.NoError(t, s.cgroups().Delete(ownID))
 	looksRead(syscall.EMFILE)
 	s.record(ownID, dir, path)
-	require.True(t, !marked() && !recorded(), "a recording whose look ran short of descriptors is undone")
+	require.True(t, !marked() && !recorded(), "one whose look stays short of descriptors is undone")
 	require.Contains(t, log.String(), "for want of its own", "and reported as the walk's own")
 	s.warned = make(map[finding]time.Time)
 	log.Reset()
@@ -778,7 +785,23 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	require.True(t, s.reconcileRecorded(map[uint64]*listed{}))
 	restoreOwn()
 	require.True(t, recorded() && !marked(), "a recorded cgroup read short of descriptors stays recorded")
-	require.NoError(t, s.cgroups().Delete(ownID))
+	// The read failing for the cgroup's own sake right after takes it out,
+	// and says so, though the walk's own fault was just logged for it.
+	restoreOwn = swap(t, &readThreads, failReading(ownID, syscall.EIO))
+	require.True(t, s.reconcileRecorded(map[uint64]*listed{}))
+	restoreOwn()
+	require.True(t, !recorded() && marked(), "a recorded cgroup that cannot be read is taken out")
+	require.Contains(t, log.String(), "keeps it out of the scope", "and that is logged apart from the walk's own fault")
+	s.forgetMark(ownID)
+	// leave's two messages are logged apart too.
+	require.NoError(t, s.cgroups().Put(ownID, uint8(1)))
+	s.leave(ownID, path, false, false)
+	require.Contains(t, log.String(), "no longer one of this job's")
+	require.NoError(t, s.cgroups().Put(ownID, uint8(1)))
+	s.leave(ownID, path, true, false)
+	require.Contains(t, log.String(), "A task of this job is in a cgroup shared", "logged though the other was just now")
+	s.forgetMark(ownID)
+	_ = s.cgroups().Delete(ownID)
 	s.warned = make(map[finding]time.Time)
 	log.Reset()
 

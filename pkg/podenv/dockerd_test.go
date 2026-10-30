@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -162,7 +163,18 @@ func TestSystemdTree(t *testing.T) {
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 		})
-		return int32(cmd.Process.Pid)
+		// Start returns once exec has closed the child's descriptors,
+		// before the kernel has laid out its new environment, which reads
+		// empty until then.
+		environ := fmt.Sprintf("/proc/%d/environ", cmd.Process.Pid)
+		for i := 0; i < 250; i++ {
+			if data, _ := os.ReadFile(environ); len(data) > 0 {
+				return int32(cmd.Process.Pid)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("%s stayed empty", environ)
+		return 0
 	}
 	if got, err := systemdTree(daemon("unix:path=" + bus + ",guid=0123")); err != nil || got != ours {
 		t.Errorf("systemdTree = %q, %v; want our mount's root %q", got, err, ours)

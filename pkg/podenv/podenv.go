@@ -76,7 +76,7 @@ func CgroupID(path string) (uint64, error) {
 // CgroupLevel is the depth of the cgroup at an absolute path below the
 // root, which is level 0.
 func CgroupLevel(path string) uint32 {
-	path = strings.Trim(filepath.Clean(path), "/")
+	path = strings.Trim(filepath.Clean("/"+path), "/")
 	if path == "" {
 		return 0
 	}
@@ -91,7 +91,10 @@ const (
 	// CgroupNSHost: the initial namespace, so /sys/fs/cgroup, where every
 	// cgroup program attaches, is the root of the whole machine's tree.
 	CgroupNSHost
-	// CgroupNSPrivate: a namespace of our own, rooted at our container.
+	// CgroupNSPrivate: a namespace below the machine's root. It is our own
+	// container's only where our path in it is "/"; one rooted above us is
+	// a tree others may share, such as a nested node's, whose privileged
+	// pods share the node container's namespace (privateScope).
 	CgroupNSPrivate
 )
 
@@ -289,9 +292,15 @@ func (s Shape) HookScope() (Scope, error) {
 		return Scope{}, err
 	}
 	// Under the machine's root every daemon's containers reach the hook,
-	// and those of one in our pid namespace are recorded as they start.
+	// and those of one whose runtime is in our pid namespace are recorded
+	// as they start.
 	switch s.Dockerd.Kind {
-	case DockerdAbsent, DockerdLocal, DockerdForeign:
+	case DockerdAbsent:
+		return scope, nil
+	case DockerdLocal, DockerdForeign:
+		if err := s.runtimeRefusal(); err != nil {
+			return Scope{}, err
+		}
 		return scope, nil
 	case DockerdHidden:
 		return Scope{}, fmt.Errorf("the cgroup hook judges only our pid namespace, and the docker daemon's "+
@@ -302,6 +311,19 @@ func (s Shape) HookScope() (Scope, error) {
 	default:
 		return Scope{}, fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
 	}
+}
+
+// runtimeRefusal says why a daemon whose pid we see may make containers
+// the scope never reaches: their tasks are children of its runtime
+// (containerd, or the daemon itself), and one outside our pid namespace,
+// such as the machine's containerd a daemon of ours was given the socket
+// of, makes them outside it, where no entry of theirs is recorded.
+func (s Shape) runtimeRefusal() error {
+	if s.Dockerd.Runtime == 0 {
+		return fmt.Errorf("the cgroup hook judges only our pid namespace, and the docker daemon's runtime, "+
+			"whose children its containers' tasks are, cannot be shown to be in it (%s)", s.Dockerd.Reason)
+	}
+	return nil
 }
 
 // privateScope decides for a private cgroup namespace, where
@@ -320,6 +342,9 @@ func (s Shape) privateScope() (Scope, error) {
 	switch s.Dockerd.Kind {
 	case DockerdAbsent:
 	case DockerdLocal, DockerdForeign:
+		if err := s.runtimeRefusal(); err != nil {
+			return Scope{}, err
+		}
 		// Its containers are made in the tree its cgroup driver uses: its
 		// own cgroup mount, or the one of the systemd it reaches, which is
 		// that one's cgroup namespace's root unless it was given another
@@ -586,7 +611,7 @@ func (s Shape) LogArgs() []any {
 		"cgroup_tree", s.CgroupTree.String(), "cgroup_tree_reason", s.CgroupTreeReason,
 		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
 		"dockerd_cgroup", s.Dockerd.Cgroup, "dockerd_cgroup_driver", s.Dockerd.CgroupDriver,
-		"dockerd_container_tree", s.Dockerd.ContainerTree,
+		"dockerd_container_tree", s.Dockerd.ContainerTree, "dockerd_runtime", s.Dockerd.Runtime,
 		"docker_host", s.DockerHost, "docker_host_setting", s.DockerHostSetting,
 		"docker_host_reason", s.DockerHostReason, "kernel", s.Kernel,
 		"socket_cgroups", s.SocketCgroups.String(), "socket_cgroups_reason", s.SocketCgroupsReason,
@@ -629,7 +654,11 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 	// A private cgroup namespace's root bounds the hook, so where a daemon
 	// makes its containers, and who else is in the tree, matter there only.
 	private := egressHook && s.CgroupNS == CgroupNSPrivate
-	if private && (s.Dockerd.Kind == DockerdLocal || s.Dockerd.Kind == DockerdForeign) {
+	visible := s.Dockerd.Kind == DockerdLocal || s.Dockerd.Kind == DockerdForeign
+	if visible && (private || egressHook && s.PidNS == PidNSPrivate) {
+		s.Dockerd.probeRuntime()
+	}
+	if private && visible {
 		s.Dockerd.probeContainerTree(dockerSocket)
 	}
 	if private && s.CgroupPath != "" && s.CgroupPath != "/" && s.PidNS == PidNSPrivate && !s.kubepods() {

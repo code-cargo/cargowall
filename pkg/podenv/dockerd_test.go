@@ -81,21 +81,23 @@ func TestProbeContainerTree(t *testing.T) {
 	saved := containerdSockets
 	containerdSockets = nil
 	t.Cleanup(func() { containerdSockets = saved })
-	d := Dockerd{Kind: DockerdLocal, pid: int32(os.Getpid())}
-	d.probeContainerTree(fakeDaemon(t, http.StatusOK, `{"CgroupDriver":"cgroupfs"}`))
+	probe := func(d Dockerd, socket string) Dockerd {
+		d.probeRuntime()
+		d.probeContainerTree(socket)
+		return d
+	}
+	d := probe(Dockerd{Kind: DockerdLocal, pid: int32(os.Getpid())}, fakeDaemon(t, http.StatusOK, `{"CgroupDriver":"cgroupfs"}`))
 	if d.CgroupDriver != "cgroupfs" || d.ContainerTree != ours {
 		t.Errorf("cgroupfs: got %+v, want our own mount's root %q", d, ours)
 	}
-	d = Dockerd{Kind: DockerdLocal, pid: int32(os.Getpid())}
-	d.probeContainerTree(fakeDaemon(t, http.StatusOK, `{"CgroupDriver":"none"}`))
+	d = probe(Dockerd{Kind: DockerdLocal, pid: int32(os.Getpid())}, fakeDaemon(t, http.StatusOK, `{"CgroupDriver":"none"}`))
 	if d.ContainerTree != "" || !strings.Contains(d.Reason, "no rule") {
 		t.Errorf("unknown driver: got %+v, want no tree, with the reason", d)
 	}
 	// A daemon that does not say, as a busy one may not in time, is judged
 	// by both drivers' trees: its own mount, and that of any systemd it
 	// could reach, here on a bus this process listens on, so ours too.
-	d = Dockerd{Kind: DockerdLocal, pid: busDaemon(t, "unix:path="+busListener(t))}
-	d.probeContainerTree(fakeDaemon(t, http.StatusServiceUnavailable, `{}`))
+	d = probe(Dockerd{Kind: DockerdLocal, pid: busDaemon(t, "unix:path="+busListener(t))}, fakeDaemon(t, http.StatusServiceUnavailable, `{}`))
 	if d.CgroupDriver != "" || d.ContainerTree != ours || !strings.Contains(d.Reason, "its cgroup driver") {
 		t.Errorf("unasked: got %+v, want our own mount's root %q, noting the driver unread", d, ours)
 	}

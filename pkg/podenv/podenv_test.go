@@ -55,20 +55,20 @@ func TestHookScope(t *testing.T) {
 	// Our own container's daemon, on the cgroupfs driver, so in our mount;
 	// on the systemd driver with our container's systemd; and with the
 	// host's systemd, over a bus bound in, or one it could not be asked.
-	local := Dockerd{Kind: DockerdLocal, CgroupDriver: "cgroupfs", ContainerTree: "/"}
-	localSystemd := Dockerd{Kind: DockerdLocal, CgroupDriver: "systemd", ContainerTree: "/"}
-	localHostSystemd := Dockerd{Kind: DockerdLocal, CgroupDriver: "systemd", ContainerTree: "/../.."}
-	localUnasked := Dockerd{Kind: DockerdLocal, Reason: "its cgroup driver: GET /info: 500 Internal Server Error"}
-	foreign := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace"}
+	local := Dockerd{Kind: DockerdLocal, Runtime: 7, CgroupDriver: "cgroupfs", ContainerTree: "/"}
+	localSystemd := Dockerd{Kind: DockerdLocal, Runtime: 7, CgroupDriver: "systemd", ContainerTree: "/"}
+	localHostSystemd := Dockerd{Kind: DockerdLocal, Runtime: 7, CgroupDriver: "systemd", ContainerTree: "/../.."}
+	localUnasked := Dockerd{Kind: DockerdLocal, Runtime: 7, Reason: "its cgroup driver: GET /info: 500 Internal Server Error"}
+	foreign := Dockerd{Kind: DockerdForeign, Runtime: 7, Reason: "pid 7 has another mount namespace"}
 	hidden := Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
 	// A foreign daemon in our cgroup namespace (a dind sidecar in the
 	// node's), one in a namespace of its own below our root, one above it,
 	// and one under our root that makes its containers in the host's tree.
-	foreignUnder := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", ContainerTree: "/"}
-	foreignOwnNS := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", ContainerTree: "/dind"}
-	foreignAbove := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/../../dind", ContainerTree: "/../.."}
-	foreignHostTree := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", ContainerTree: "/../.."}
-	foreignMountUnread := Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace; its cgroup mount: nothing is mounted", Cgroup: "/dind"}
+	foreignUnder := Dockerd{Kind: DockerdForeign, Runtime: 7, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", ContainerTree: "/"}
+	foreignOwnNS := Dockerd{Kind: DockerdForeign, Runtime: 7, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", ContainerTree: "/dind"}
+	foreignAbove := Dockerd{Kind: DockerdForeign, Runtime: 7, Reason: "pid 7 has another mount namespace", Cgroup: "/../../dind", ContainerTree: "/../.."}
+	foreignHostTree := Dockerd{Kind: DockerdForeign, Runtime: 7, Reason: "pid 7 has another mount namespace", Cgroup: "/dind", ContainerTree: "/../.."}
+	foreignMountUnread := Dockerd{Kind: DockerdForeign, Runtime: 7, Reason: "pid 7 has another mount namespace; its cgroup mount: nothing is mounted", Cgroup: "/dind"}
 	unknownD := Dockerd{Kind: DockerdUnknown, Reason: "dial: timeout"}
 	// Both helpers have the mount proven on a kernel that keeps socket
 	// cgroups, so each case is decided by the fact it names.
@@ -142,7 +142,7 @@ func TestHookScope(t *testing.T) {
 		{"private cgroupns below its root, host pid namespace, hidden dockerd", nested("/init", PidNSHost, hidden), false, all},
 		{
 			"nested node: ARC pod with a dind sidecar sharing its pid namespace", nested("/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd", PidNSPrivate,
-				Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace", Cgroup: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/4567ef01", CgroupDriver: "cgroupfs", ContainerTree: "/"}), true,
+				Dockerd{Kind: DockerdForeign, Runtime: 7, Reason: "pid 7 has another mount namespace", Cgroup: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/4567ef01", CgroupDriver: "cgroupfs", ContainerTree: "/"}), true,
 			Scope{Subtree: "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b"},
 		},
 		{"private cgroupns below its root, host pid namespace, socket cgroups shared", with(nested("/init", PidNSHost, local), sockets(SocketCgroupsShared)), false, all},
@@ -191,6 +191,9 @@ func TestHookScope(t *testing.T) {
 		{"private cgroupns, own dockerd on the host's systemd", private(localHostSystemd), false, all},
 		{"private cgroupns, own dockerd that could not be asked its driver", private(localUnasked), false, all},
 		{"host cgroupns, own dockerd not asked its driver", host(pod, PidNSPrivate, localUnasked), true, inPod},
+		{"privileged pod, a dockerd whose runtime is the node's containerd", host(pod, PidNSPrivate, Dockerd{Kind: DockerdLocal, Reason: "its runtime: the containerd it reaches at /run/containerd/containerd.sock is outside our pid namespace"}), false, all},
+		{"privileged pod, another container's dockerd whose runtime is unseen", host(pod, PidNSPrivate, Dockerd{Kind: DockerdForeign, Reason: "pid 7 has another mount namespace; its runtime: no such file"}), false, all},
+		{"private cgroupns, own dockerd whose runtime is outside", private(Dockerd{Kind: DockerdLocal, CgroupDriver: "cgroupfs", ContainerTree: "/"}), false, all},
 		{"host cgroupfs bound into a private cgroupns", with(private(local), func(s *Shape) { s.CgroupMount = CgroupMountOther }), false, all},
 		{"private cgroupns, path unread", with(private(local), func(s *Shape) { s.CgroupPath = "" }), false, all},
 		{"private cgroupns, DOCKER_HOST names another daemon", with(private(local), remoteDaemon), false, all},
@@ -299,6 +302,15 @@ func TestCgroupMountRoot(t *testing.T) {
 	for _, in := range []string{proc, proc + elsewh, host + tmpfs + v1} {
 		if got, err := cgroupMountRoot([]byte(in)); err == nil {
 			t.Errorf("cgroupMountRoot(%q) = %q, want an error", in, got)
+		}
+	}
+}
+
+// A path's depth is its level, and an empty or root path is the root's.
+func TestCgroupLevel(t *testing.T) {
+	for path, want := range map[string]uint32{"": 0, "/": 0, "/a": 1, "/a/b/": 2, "a/b": 2, "/a//b": 2} {
+		if got := CgroupLevel(path); got != want {
+			t.Errorf("CgroupLevel(%q) = %d, want %d", path, got, want)
 		}
 	}
 }

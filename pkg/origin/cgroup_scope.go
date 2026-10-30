@@ -148,11 +148,14 @@ func startCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, er
 	if err != nil {
 		return nil, fmt.Errorf("cgroup scope: %w", err)
 	}
+	// A scope always has its subtree (podenv.Scope.Limited); the programs'
+	// subtree-less mode serves their tests alone.
+	if subtreePath == "" {
+		return nil, errors.New("cgroup scope: no job cgroup to scope to")
+	}
 	sub := subtree{path: subtreePath}
-	if subtreePath != "" {
-		if sub.id, err = podenv.CgroupID(subtreePath); err != nil {
-			return nil, fmt.Errorf("cgroup scope: the job's cgroup: %w", err)
-		}
+	if sub.id, err = podenv.CgroupID(subtreePath); err != nil {
+		return nil, fmt.Errorf("cgroup scope: the job's cgroup: %w", err)
 	}
 	spec, err := bpf.LoadScopeBpf()
 	if err != nil {

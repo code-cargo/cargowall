@@ -92,6 +92,12 @@ type Dockerd struct {
 	// cgroupfs its own mount at CgroupRoot, under systemd that systemd's.
 	// "/" is our own root, "/../x" another beside it, and "" unread.
 	ContainerTree string
+	// Runtime is the pid, in our pid namespace, of the process whose
+	// children its containers' tasks are, and whose view of the machine
+	// decides where their cgroups are made: containerd, or the daemon
+	// itself (runtimePid). 0 when it could not be shown, and Reason says
+	// why. Read only where the scope depends on it.
+	Runtime int32
 	// pid is the daemon's pid in our pid namespace, 0 when not visible.
 	pid int32
 }
@@ -158,16 +164,25 @@ func probeDockerd(socket string) Dockerd {
 	return Dockerd{Kind: DockerdLocal, pid: pid}
 }
 
-// probeContainerTree reads where the daemon makes its containers' cgroups:
-// it asks the daemon for its cgroup driver over the socket, and finds the
-// tree that driver uses, as its runtime sees the machine (runtimePid).
-// Only a daemon whose pid we see has one to find. One that does not answer
-// in time, as a busy one may not, is judged by both drivers' trees
-// (unaskedTree).
-func (d *Dockerd) probeContainerTree(socket string) {
+// probeRuntime finds the daemon's runtime (runtimePid). Only a daemon
+// whose pid we see has one to find.
+func (d *Dockerd) probeRuntime() {
 	runtime, err := runtimePid(d.pid)
 	if err != nil {
 		d.note("its runtime", err)
+		return
+	}
+	d.Runtime = runtime
+}
+
+// probeContainerTree reads where the daemon makes its containers' cgroups:
+// it asks the daemon for its cgroup driver over the socket, and finds the
+// tree that driver uses, as its runtime sees the machine (probeRuntime
+// first). One that does not answer in time, as a busy one may not, is
+// judged by both drivers' trees (unaskedTree).
+func (d *Dockerd) probeContainerTree(socket string) {
+	runtime := d.Runtime
+	if runtime == 0 {
 		return
 	}
 	driver, err := cgroupDriver(socket)

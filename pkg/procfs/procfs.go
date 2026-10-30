@@ -104,12 +104,16 @@ func ChildrenByComm(pid int, comm string) []int {
 	}
 	var children []int
 	for _, e := range entries {
-		child, err := strconv.Atoi(e.Name())
+		// A pid fits 32 bits (pid_max is at most 2^22), as callers that
+		// narrow it rely on.
+		n, err := strconv.ParseInt(e.Name(), 10, 32)
 		if err != nil {
 			continue
 		}
-		if ppid, ok := ParentPid(child); ok && ppid == pid && Comm(child) == comm {
-			children = append(children, child)
+		if child := int(n); Comm(child) == comm {
+			if ppid, ok := ParentPid(child); ok && ppid == pid {
+				children = append(children, child)
+			}
 		}
 	}
 	return children

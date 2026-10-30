@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -416,7 +417,7 @@ func activatedDaemon(socket string, pid int32) (int32, error) {
 	}
 	_ = dockerGet(socket, "/_ping", nil)
 	children := procfs.ChildrenByComm(int(pid), "dockerd")
-	if len(children) != 1 {
+	if len(children) != 1 || children[0] <= 0 || children[0] > math.MaxInt32 {
 		return 0, fmt.Errorf("the socket's listener is systemd (pid %d), with %d dockerd children we see, "+
 			"not the one that would be the daemon", pid, len(children))
 	}

@@ -22,13 +22,22 @@ package podenv
 import (
 	"bytes"
 	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
 
+// RunnerWorkerComm is the comm of the GitHub Actions runner's per-job
+// process, whose children are the job's steps.
+const RunnerWorkerComm = "Runner.Worker"
+
 // Comm is the trimmed /proc/<pid>/comm, or "" when unreadable.
-func Comm(pid int) string {
-	comm, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
+func Comm(pid int) string { return CommIn("/proc", pid) }
+
+// CommIn is Comm under procRoot, which a test stands in for /proc.
+func CommIn(procRoot string, pid int) string {
+	comm, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "comm"))
 	if err != nil {
 		return ""
 	}
@@ -64,23 +73,24 @@ func parseStatPPid(stat []byte) (int, bool) {
 }
 
 // AncestorByComm walks the parent chain from fromPid, itself included,
-// for a process whose comm matches, stopping short of init. Bounded to
-// defend against a cyclic or corrupt /proc snapshot; real chains reach pid
-// 1 in far fewer hops.
-func AncestorByComm(fromPid int, comm string) (int, bool) {
-	pid := fromPid
+// for the nearest process whose comm is one of comms, stopping short of
+// init, and returns it and which name it has. Bounded to defend against a
+// cyclic or corrupt /proc snapshot; real chains reach pid 1 in far fewer
+// hops.
+func AncestorByComm(fromPid int, comms ...string) (pid int, comm string, ok bool) {
+	pid = fromPid
 	for range 64 {
 		if pid <= 1 {
-			return 0, false
+			return 0, "", false
 		}
-		if Comm(pid) == comm {
-			return pid, true
+		if c := Comm(pid); slices.Contains(comms, c) {
+			return pid, c, true
 		}
 		ppid, ok := ParentPid(pid)
 		if !ok {
-			return 0, false
+			return 0, "", false
 		}
 		pid = ppid
 	}
-	return 0, false
+	return 0, "", false
 }

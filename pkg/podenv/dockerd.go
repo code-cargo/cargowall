@@ -237,14 +237,12 @@ const (
 // as the host's over a bind-mounted bus, is not shown to share ours.
 func systemdTree(pid int32) (string, error) {
 	proc := "/proc/" + strconv.Itoa(int(pid))
-	bus := systemBusSocket
+	buses, unfollowed := []string{systemBusSocket}, ""
 	if env, err := os.ReadFile(proc + "/environ"); err == nil {
 		if addr := parseEnviron(env)["DBUS_SYSTEM_BUS_ADDRESS"]; addr != "" {
-			p, ok := strings.CutPrefix(addr, "unix:path=")
-			if !ok {
-				return "", fmt.Errorf("its system bus is at %q, not a socket path", addr)
+			if buses, unfollowed, err = busSocketPaths(addr); err != nil {
+				return "", err
 			}
-			bus, _, _ = strings.Cut(p, ",")
 		}
 	}
 	root, err := unix.Open(proc+"/root", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
@@ -253,7 +251,11 @@ func systemdTree(pid int32) (string, error) {
 	}
 	defer unix.Close(root)
 	var errs []error
-	for _, path := range []string{bus, systemdPrivateSocket} {
+	for i, path := range append(buses, systemdPrivateSocket) {
+		if i == len(buses) && unfollowed != "" {
+			return "", fmt.Errorf("its D-Bus client would try %q next, which is not a socket path (%w)",
+				unfollowed, errors.Join(errs...))
+		}
 		peer, err := socketPeerIn(root, path)
 		if err != nil {
 			errs = append(errs, err)
@@ -265,6 +267,35 @@ func systemdTree(pid int32) (string, error) {
 		return mountRootOf(peer)
 	}
 	return "", fmt.Errorf("no systemd to reach: %w", errors.Join(errs...))
+}
+
+// busSocketPaths is the socket paths a D-Bus address names, in the order
+// a client tries them, up to the first entry that is not one (an abstract
+// socket, tcp), which this probe cannot follow and which it returns as
+// unfollowed: the client reaches it only if every path before it fails.
+// The address is a list of entries separated by ";", each a transport and
+// its "key=value" parameters separated by ",".
+func busSocketPaths(addr string) (paths []string, unfollowed string, err error) {
+	for _, entry := range strings.Split(addr, ";") {
+		if entry == "" {
+			continue
+		}
+		transport, params, _ := strings.Cut(entry, ":")
+		path := ""
+		for _, kv := range strings.Split(params, ",") {
+			if v, ok := strings.CutPrefix(kv, "path="); ok && transport == "unix" {
+				path = v
+			}
+		}
+		if path == "" {
+			return paths, entry, nil
+		}
+		paths = append(paths, path)
+	}
+	if len(paths) == 0 {
+		return nil, "", fmt.Errorf("its system bus address %q names no bus", addr)
+	}
+	return paths, "", nil
 }
 
 // socketPeerIn connects to the unix socket at path, resolved inside root

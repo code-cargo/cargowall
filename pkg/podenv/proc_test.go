@@ -69,10 +69,10 @@ func TestAncestorByComm(t *testing.T) {
 	if parent == "" {
 		t.Fatal("no name for our parent")
 	}
-	if pid, ok := AncestorByComm(os.Getpid(), parent); !ok || pid != os.Getppid() {
-		t.Errorf("AncestorByComm(self, %q) = %d, %v; want %d", parent, pid, ok, os.Getppid())
+	if pid, comm, ok := AncestorByComm(os.Getpid(), "no-such-comm-xx", parent); !ok || pid != os.Getppid() || comm != parent {
+		t.Errorf("AncestorByComm(self, ..., %q) = %d, %q, %v; want %d", parent, pid, comm, ok, os.Getppid())
 	}
-	if _, ok := AncestorByComm(os.Getpid(), "no-such-comm-xx"); ok {
+	if _, _, ok := AncestorByComm(os.Getpid(), "no-such-comm-xx"); ok {
 		t.Errorf("AncestorByComm(self, no-such-comm-xx): want false")
 	}
 }

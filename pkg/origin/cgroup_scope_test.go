@@ -409,6 +409,94 @@ func TestCgroupScopeWalkSkipsUnreadableCgroups(t *testing.T) {
 	require.Positive(t, n, "and the rest are recorded")
 }
 
+// A walk stops between cgroups once close has asked, rather than make a
+// close wait out the whole walk. From the host pid namespace every task on
+// the machine is ours, so there is plenty it would otherwise record.
+func TestCgroupScopeWalkStopsOnClose(t *testing.T) {
+	ownCgroupBelowRoot(t)
+	ino, err := podenv.PidNamespaceInode()
+	require.NoError(t, err)
+	s := loadWalkScope(t, ino, 65536)
+	s.stop = make(chan struct{})
+	close(s.stop)
+	require.NoError(t, s.walk(false))
+	ids, err := scopeCgroups(s.cgroups())
+	require.NoError(t, err)
+	require.Empty(t, ids, "a walk asked to stop records nothing")
+}
+
+// In a cgroup namespace rooted below the machine's, a cgroup outside the
+// root is beyond the hook, so the walk takes out any entry for it, whether
+// it lists the cgroup or only finds it in the scope. The outer test makes
+// the cgroups and runs the inner one in a cgroup namespace of its own,
+// rooted at a cgroup beside them, with cgroupfs mounted afresh.
+func TestCgroupScopeWalkTakesOutCgroupsOutsideTheRoot(t *testing.T) {
+	requireBPFOrigin(t)
+	unshare, err := exec.LookPath("unshare")
+	if err != nil {
+		t.Skip("unshare not available")
+	}
+	dir := filepath.Join(podenv.CgroupRoot, fmt.Sprintf("cargowall-origin-outside-%d", os.Getpid()))
+	root, listed, empty := filepath.Join(dir, "root"), filepath.Join(dir, "listed"), filepath.Join(dir, "empty")
+	cgroups := []string{dir, root, listed, empty}
+	for _, d := range cgroups {
+		require.NoError(t, os.Mkdir(d, 0o755))
+	}
+	t.Cleanup(func() {
+		for i := len(cgroups) - 1; i >= 0; i-- {
+			for j := 0; j < 50 && os.Remove(cgroups[i]) != nil; j++ {
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	})
+	task := exec.Command("sleep", "60")
+	require.NoError(t, task.Start())
+	t.Cleanup(func() {
+		_ = task.Process.Kill()
+		_ = task.Wait()
+	})
+	require.NoError(t, os.WriteFile(filepath.Join(listed, "cgroup.procs"), []byte(strconv.Itoa(task.Process.Pid)), 0))
+	idOf := func(path string) uint64 {
+		id, err := podenv.CgroupID(strings.TrimPrefix(path, podenv.CgroupRoot))
+		require.NoError(t, err)
+		return id
+	}
+	rootDir, err := os.Open(root)
+	require.NoError(t, err)
+	defer rootDir.Close()
+	cmd := exec.Command(unshare, "--cgroup", "--mount", "--propagation", "private", "sh", "-c",
+		`umount -l /sys/fs/cgroup && mount -t cgroup2 cgroup2 /sys/fs/cgroup && exec "$0" -test.run '^TestCgroupScopeOutsideInner$' -test.v`,
+		os.Args[0])
+	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(rootDir.Fd())}
+	cmd.Env = append(os.Environ(), fmt.Sprintf("CARGOWALL_SCOPE_OUTSIDE=%d,%d", idOf(listed), idOf(empty)))
+	out, err := cmd.CombinedOutput()
+	t.Logf("inside cgroup namespace:\n%s", out)
+	require.NoError(t, err)
+	require.Contains(t, string(out), "--- PASS: TestCgroupScopeOutsideInner")
+}
+
+// TestCgroupScopeOutsideInner is TestCgroupScopeWalkTakesOutCgroupsOutsideTheRoot's
+// half in a cgroup namespace of its own; on its own it skips.
+func TestCgroupScopeOutsideInner(t *testing.T) {
+	ids := os.Getenv("CARGOWALL_SCOPE_OUTSIDE")
+	if ids == "" {
+		t.Skip("run by TestCgroupScopeWalkTakesOutCgroupsOutsideTheRoot")
+	}
+	var listed, empty uint64
+	_, err := fmt.Sscanf(ids, "%d,%d", &listed, &empty)
+	require.NoError(t, err)
+	ino, err := podenv.PidNamespaceInode()
+	require.NoError(t, err)
+	s := loadWalkScope(t, ino, 65536)
+	for _, id := range []uint64{listed, empty} {
+		require.NoError(t, s.cgroups().Put(id, uint8(1)))
+	}
+	require.NoError(t, s.walk(false))
+	var v uint8
+	require.Error(t, s.cgroups().Lookup(listed, &v), "a listed cgroup outside the root is taken out")
+	require.Error(t, s.cgroups().Lookup(empty, &v), "and so is one the scope holds that nothing listed")
+}
+
 // A map too small for every cgroup the walk records costs those cgroups,
 // with a warning, as in the kernel, and not the scope. From the host pid
 // namespace every task on the machine is ours, so the walk finds plenty.

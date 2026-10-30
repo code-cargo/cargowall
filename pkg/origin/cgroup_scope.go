@@ -222,7 +222,8 @@ func (s *cgroupScope) cgroups() *ebpf.Map { return s.objs.MapScopeCgroups }
 // The first walk, at startup, must list this process's own cgroup, which
 // is in the subtree: one that lists none of ours would leave the scope
 // empty while the hook reports it attached. It reads the subtree's level
-// from it too. Later walks only reconcile.
+// from it too. Later walks only reconcile, and stop between cgroups once
+// close has asked, so a close waits out one cgroup, not the walk.
 func (s *cgroupScope) walk(first bool) error {
 	tasks, err := s.walkTasks()
 	if err != nil {
@@ -235,6 +236,9 @@ func (s *cgroupScope) walk(first bool) error {
 	}
 	found := newWalkFindings()
 	for id, l := range tasks {
+		if s.stopping() {
+			return nil
+		}
 		if l.level == 0 {
 			for tgid := range l.tgids {
 				found.inRoot[tgid] = true
@@ -247,15 +251,27 @@ func (s *cgroupScope) walk(first bool) error {
 		}
 		s.reconcileListed(id, l, &found)
 	}
-	s.reconcileRecorded(tasks, &found)
-	s.last = found
+	if s.reconcileRecorded(tasks, &found) {
+		s.last = found
+	}
 	return nil
+}
+
+// stopping reports whether close has asked the walk to stop.
+func (s *cgroupScope) stopping() bool {
+	select {
+	case <-s.stop:
+		return true
+	default:
+		return false
+	}
 }
 
 // reconcileListed reconciles cgroup id, which the task walk listed: one
 // that holds a task of ours and no other is recorded. One outside our
-// cgroup namespace's root is beyond the hook whatever it holds, and each
-// process of ours there is reported.
+// cgroup namespace's root is beyond the hook whatever it holds: an entry
+// a tracepoint made for it is taken out (outsideRoot), and each process
+// of ours there is reported.
 func (s *cgroupScope) reconcileListed(id uint64, l *listed, found *walkFindings) {
 	dir, path, inside, err := s.openCgroup(id)
 	if err != nil {
@@ -264,6 +280,7 @@ func (s *cgroupScope) reconcileListed(id uint64, l *listed, found *walkFindings)
 	}
 	defer dir.Close()
 	if !inside {
+		s.outsideRoot(id)
 		for tgid := range l.tgids {
 			found.outside[tgid] = true
 			if !s.last.outside[tgid] {
@@ -319,9 +336,11 @@ func (s *cgroupScope) unreadable(id uint64, path string, err error, found *walkF
 // not reach, which held no task of ours when it ran: one a task of ours
 // entered beside another task, or at the same moment as one, and has since
 // left, or one a failed delete left in. One found removed is not opened
-// again (stale). A read of the scope cut short still has the cgroups it
-// read checked, and the rest wait for a later walk.
-func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFindings) {
+// again (stale), and one outside our cgroup namespace's root is taken out
+// (outsideRoot). A read of the scope cut short still has the cgroups it
+// read checked, and the rest wait for a later walk. False when close cut
+// the pass short.
+func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFindings) bool {
 	ids, err := scopeCgroups(s.objs.MapScopeCgroups)
 	if err != nil {
 		found.unlisted = true
@@ -341,6 +360,9 @@ func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFi
 		}
 	}
 	for _, id := range ids {
+		if s.stopping() {
+			return false
+		}
 		if listed[id] != nil || s.stale[id] {
 			continue
 		}
@@ -353,12 +375,23 @@ func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFi
 			s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
 			continue
 		}
-		if !inside {
-			path = fmt.Sprintf("id %d, outside our cgroup namespace's root", id)
+		if inside {
+			s.reconcile(id, dir, path, found, nil)
+		} else {
+			s.outsideRoot(id)
 		}
-		s.reconcile(id, dir, path, found, nil)
 		dir.Close()
 	}
+	return true
+}
+
+// outsideRoot takes out of the scope a cgroup outside our cgroup
+// namespace's root, which a task of ours entered: the hook, at that root,
+// never sees its sockets, so its entry would only hold a place the map
+// keeps for cgroups the hook does see. A tracepoint records it again on
+// the next entry, and the next walk takes it out again.
+func (s *cgroupScope) outsideRoot(id uint64) {
+	_ = s.objs.MapScopeCgroups.Delete(id)
 }
 
 // scopeBatch is how many entries scopeCgroups reads per call.

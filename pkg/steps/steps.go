@@ -60,7 +60,7 @@ import (
 
 // workerComm is the /proc/<pid>/comm value of the GitHub Actions runner's
 // per-job worker process (13 chars, fits TASK_COMM_LEN untruncated).
-const workerComm = "Runner.Worker"
+const workerComm = podenv.RunnerWorkerComm
 
 // stepChildEvent mirrors struct step_child_event in bpf/stepbpf.c.
 type stepChildEvent struct {
@@ -688,7 +688,7 @@ func (t *Tracker) stepCmdline(pid int) string {
 // lines into our audit stream. The scan survives only as a fallback for
 // standalone starts, and then only when it is unambiguous.
 func findWorkerPID() (int, error) {
-	if pid, ok := podenv.AncestorByComm(os.Getpid(), workerComm); ok {
+	if pid, _, ok := podenv.AncestorByComm(os.Getpid(), workerComm); ok {
 		return pid, nil
 	}
 	pid, count := scanUniqueByComm(workerComm)

@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -181,6 +182,30 @@ func TestSystemdTree(t *testing.T) {
 	}
 	if got, err := systemdTree(daemon("tcp:host=localhost,port=4242")); err == nil {
 		t.Errorf("systemdTree over tcp = %q, want an error", got)
+	}
+}
+
+// A D-Bus address is a ";" list of transports with "," parameters, tried
+// in turn; the paths come in order, up to the first entry that is not one.
+func TestBusSocketPaths(t *testing.T) {
+	for addr, want := range map[string]struct {
+		paths      []string
+		unfollowed string
+	}{
+		"unix:path=/run/dbus/system_bus_socket":                         {[]string{"/run/dbus/system_bus_socket"}, ""},
+		"unix:path=/host/bus,guid=0123":                                 {[]string{"/host/bus"}, ""},
+		"unix:path=/host/run/dbus/system_bus_socket;unix:path=/run/bus": {[]string{"/host/run/dbus/system_bus_socket", "/run/bus"}, ""},
+		"unix:guid=0123,path=/run/bus;":                                 {[]string{"/run/bus"}, ""},
+		"unix:path=/run/bus;tcp:host=h;unix:path=/x":                    {[]string{"/run/bus"}, "tcp:host=h"},
+		"unix:abstract=/tmp/dbus-x":                                     {nil, "unix:abstract=/tmp/dbus-x"},
+	} {
+		paths, unfollowed, err := busSocketPaths(addr)
+		if err != nil || !slices.Equal(paths, want.paths) || unfollowed != want.unfollowed {
+			t.Errorf("busSocketPaths(%q) = %q, %q, %v; want %q, %q", addr, paths, unfollowed, err, want.paths, want.unfollowed)
+		}
+	}
+	if _, _, err := busSocketPaths(";"); err == nil {
+		t.Errorf(`busSocketPaths(";"): want an error`)
 	}
 }
 

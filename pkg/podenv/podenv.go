@@ -380,13 +380,20 @@ func underRoot(path string) bool {
 	return path != "" && path != "/.." && !strings.HasPrefix(path, "/../")
 }
 
-// kubepods reports whether our cgroup is in kubelet's tree: kubepods under
-// the cgroupfs driver, <root>-kubepods.slice under the systemd driver with
-// a cgroup root of its own, so the name is matched anywhere in the path. A
-// false match only refuses: outright in the host pid namespace, and outside
-// it for want of a pod cgroup in the path.
+// kubepods reports whether our cgroup is in kubelet's tree, by a whole
+// path segment anywhere in the path: kubepods under the cgroupfs driver,
+// kubepods.slice under the systemd driver, or <root>-kubepods.slice with a
+// cgroup root of its own. A unit merely named for it is not (a VM's
+// ci-kubepods-builder.service). A false match only refuses: outright in
+// the host pid namespace, and outside it for want of a pod cgroup in the
+// path.
 func (s Shape) kubepods() bool {
-	return strings.Contains(s.CgroupPath, "kubepods")
+	for _, seg := range strings.Split(s.CgroupPath, "/") {
+		if seg == "kubepods" || seg == "kubepods.slice" || strings.HasSuffix(seg, "-kubepods.slice") {
+			return true
+		}
+	}
+	return false
 }
 
 // limitedScope is the scope that judges only this job's sockets, with the
@@ -589,10 +596,11 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 	if private && (s.Dockerd.Kind == DockerdLocal || s.Dockerd.Kind == DockerdForeign) {
 		s.Dockerd.probeContainerTree(dockerSocket)
 	}
-	if private && s.CgroupPath != "" && s.CgroupPath != "/" {
+	if private && s.CgroupPath != "" && s.CgroupPath != "/" && s.PidNS == PidNSPrivate && !s.kubepods() {
 		s.CgroupTree, s.CgroupTreeReason = probeCgroupTree(CgroupRoot)
 	} else {
-		s.CgroupTreeReason = "not probed: read only in a private cgroup namespace below its root"
+		s.CgroupTreeReason = "not probed: read only in a private cgroup namespace below its root, " +
+			"outside kubelet's tree, in a pid namespace of our own"
 	}
 	if env, uid, err := dockerEnv(); err != nil {
 		s.DockerHostReason = err.Error()

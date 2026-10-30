@@ -39,33 +39,44 @@ const defaultDockerHost = "/var/run/docker.sock"
 
 // dockerEnv is the environment the job's docker CLI runs in, which says
 // which daemon it uses, and the user it runs as, whose passwd entry gives
-// the CLI a home without HOME: under sudo, the environment sudo was given
-// and SUDO_UID, the job's, since a plain sudo strips DOCKER_HOST and hands
-// us root's HOME; otherwise ours, and "" for our own user. Under sudo our
-// own environment says nothing of the job's, so a sudo that cannot be read
-// leaves the daemon unidentified (sudoEnv).
+// the CLI a home without HOME. Under the sudo that started us, the
+// environment sudo was given and SUDO_UID, the job's, since a plain sudo
+// strips DOCKER_HOST and hands us root's HOME; otherwise ours, and "" for
+// our own user. Under sudo our own environment says nothing of the job's,
+// so a sudo that cannot be found or read leaves the daemon unidentified
+// (startedBySudo).
 func dockerEnv() (getenv func(string) string, uid string, err error) {
 	uid = os.Getenv("SUDO_UID")
 	if uid == "" {
 		return os.Getenv, "", nil
 	}
-	env, err := sudoEnv(os.Getppid())
+	env, err := startedBySudo(os.Getppid())
 	if err != nil {
 		return nil, "", fmt.Errorf("started under sudo, whose environment, the job's, cannot be read: %w", err)
+	}
+	if env == nil {
+		return os.Getenv, "", nil
 	}
 	return func(k string) string { return env[k] }, uid, nil
 }
 
-// sudoEnv reads the environment of the nearest process named sudo from
-// pid up, through any shell sudo ran in between. There is none to find
-// for a process started detached (by setsid, or in the background of a
-// shell that has since exited), which init has adopted.
-func sudoEnv(pid int) (map[string]string, error) {
-	sudo, ok := AncestorByComm(pid, "sudo")
+// startedBySudo reads the environment of the sudo that started us: the
+// nearest process named sudo from pid up, through any process between,
+// as a shell sudo ran. The walk stops at the runner's worker, whose step
+// started us: a sudo above it started the runner itself, so the SUDO_UID
+// we carry is the runner's, inherited, and our environment is the job's;
+// that is nil, no error. With neither to find, as for a process started
+// detached (by setsid, or in the background of a shell that has since
+// exited), which init has adopted, the environment is unknown.
+func startedBySudo(pid int) (map[string]string, error) {
+	found, comm, ok := AncestorByComm(pid, "sudo", RunnerWorkerComm)
 	if !ok {
 		return nil, errors.New("no sudo among cargowall's parents")
 	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", sudo))
+	if comm == RunnerWorkerComm {
+		return nil, nil
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", found))
 	if err != nil {
 		return nil, err
 	}

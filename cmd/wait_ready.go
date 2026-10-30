@@ -25,6 +25,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // WaitReadyCmd blocks until cargowall writes its ready sentinel, fails fast
@@ -135,27 +137,18 @@ func processAlive(pid int) bool {
 	if err := syscall.Kill(pid, 0); err != nil && !errors.Is(err, syscall.EPERM) {
 		return false
 	}
-	comm, err := procComm(pid)
-	if err != nil {
+	// comm is the executable's name, which the kernel cuts to 15 bytes.
+	comm := podenv.Comm(pid)
+	if comm == "" {
 		return false
 	}
 	// wait-ready IS the cargowall binary, so its own comm is the expected
 	// value. That keeps this correct for a renamed or vendored binary, and
 	// under `go test`, where both sides are the test binary.
-	if self, serr := procComm(os.Getpid()); serr == nil && comm == self {
+	if self := podenv.Comm(os.Getpid()); self != "" && comm == self {
 		return true
 	}
 	return comm == "cargowall"
-}
-
-// procComm returns a process's executable name (comm), which the kernel
-// truncates to 15 characters.
-func procComm(pid int) (string, error) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(data)), nil
 }
 
 // owns reports whether a state file was written by this run, in three tiers:

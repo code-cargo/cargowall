@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -44,10 +45,11 @@ func TestParseEnviron(t *testing.T) {
 	}
 }
 
-// sudoEnv finds the nearest sudo through the processes between, and reads
-// the environment sudo was given. Here a shell named sudo stands in for
-// it, with a child of its own.
-func TestSudoEnv(t *testing.T) {
+// startedBySudo finds the nearest sudo through the processes between, and
+// reads the environment sudo was given, unless the runner's worker comes
+// first: a sudo above it started the runner, not us. Copies of sh named
+// sudo and Runner.Worker stand in for both.
+func TestStartedBySudo(t *testing.T) {
 	sh, err := exec.LookPath("sh")
 	if err != nil {
 		t.Skip("no sh")
@@ -56,42 +58,56 @@ func TestSudoEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fake := filepath.Join(t.TempDir(), "sudo")
-	if err := os.WriteFile(fake, data, 0o755); err != nil {
-		t.Fatal(err)
+	dir := t.TempDir()
+	standIn := func(name string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
 	}
-	// The trailing command keeps the shell from exec'ing sleep in its place.
-	cmd := exec.Command(fake, "-c", "sleep 60; :")
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "DOCKER_HOST=tcp://dind:2375"}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
-	var child int
-	for i := 0; i < 250 && child == 0; i++ {
-		kids, _ := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", cmd.Process.Pid, cmd.Process.Pid))
-		if f := strings.Fields(string(kids)); len(f) > 0 {
-			child, _ = strconv.Atoi(f[0])
-		} else {
+	sudo, worker := standIn("sudo"), standIn(RunnerWorkerComm)
+	// start runs script under the stand-in sudo, with DOCKER_HOST in its
+	// environment, and returns the sleep at the bottom of the chain. The
+	// trailing commands keep each shell from exec'ing the next in its place.
+	start := func(script string) int {
+		cmd := exec.Command(sudo, "-c", script+"; :")
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "DOCKER_HOST=tcp://dind:2375"}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+		pid := cmd.Process.Pid
+		for i := 0; i < 250; i++ {
+			kids, _ := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
+			if f := strings.Fields(string(kids)); len(f) > 0 {
+				pid, _ = strconv.Atoi(f[0])
+				continue
+			}
+			if Comm(pid) == "sleep" {
+				t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+				return pid
+			}
 			time.Sleep(20 * time.Millisecond)
 		}
+		t.Fatalf("no sleep at the bottom of %q", script)
+		return 0
 	}
-	if child == 0 {
-		t.Fatal("the stand-in sudo started no child")
+
+	env, err := startedBySudo(start("sleep 60"))
+	if err != nil || env["DOCKER_HOST"] != "tcp://dind:2375" {
+		t.Errorf("under sudo: got %v, %v; want the stand-in sudo's environment", env, err)
 	}
-	env, err := sudoEnv(child)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := env["DOCKER_HOST"]; got != "tcp://dind:2375" {
-		t.Errorf("sudoEnv(child of sudo)[DOCKER_HOST] = %q, want the stand-in's", got)
+	env, err = startedBySudo(start(worker + " -c 'sleep 60; :'"))
+	if err != nil || env != nil {
+		t.Errorf("under a worker a sudo started: got %v, %v; want our own environment (nil)", env, err)
 	}
 	// Init has no parent, and is not sudo.
-	if _, err := sudoEnv(1); err == nil {
-		t.Errorf("sudoEnv(1): want an error, from no sudo among its parents")
+	if _, err := startedBySudo(1); err == nil {
+		t.Errorf("startedBySudo(1): want an error, from no sudo among its parents")
 	}
 }
 

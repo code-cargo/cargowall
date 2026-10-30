@@ -158,6 +158,8 @@ func TestHookScope(t *testing.T) {
 		// The host's daemon, through its socket, starts containers outside
 		// our pid namespace, which the scope never reaches.
 		{"privileged container outside Kubernetes, the host's dockerd", host("/system.slice/docker-a.scope", PidNSPrivate, hidden), false, all},
+		{"runner VM, a unit named for kubepods", host("/system.slice/ci-kubepods-builder.service", PidNSHost, local), true, all},
+		{"hostPID pod, cgroupfs driver under a custom cgroup root", host("/custom/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/a", PidNSHost, local), false, all},
 		{"hostPID pod, systemd driver under a custom cgroup root", host("/custom.slice/custom-kubepods.slice/custom-kubepods-pod0e4b1f2a_7c3d_4e5f_8a9b_0c1d2e3f4a5b.slice/cri-containerd-a.scope", PidNSHost, local), false, all},
 		{"host cgroupns, pid namespace unread", with(host(runner, PidNSUnknown, local), func(s *Shape) { s.PidNSReason = "stat: permission denied" }), false, all},
 		{"host cgroupns, path unread", Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied", PidNS: PidNSHost, Dockerd: local}, false, all},

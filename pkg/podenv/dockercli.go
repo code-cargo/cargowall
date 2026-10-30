@@ -78,22 +78,19 @@ func startedBySudo(pid int, uid string) (map[string]string, error) {
 	if !ok {
 		return nil, errors.New("no sudo among cargowall's parents")
 	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", found))
+	if err != nil {
+		return nil, err
+	}
+	env := parseEnviron(data)
 	if comm == procfs.RunnerWorkerComm {
-		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", found))
-		if err != nil {
-			return nil, err
-		}
-		if parseEnviron(data)["SUDO_UID"] != uid {
+		if env["SUDO_UID"] != uid {
 			return nil, fmt.Errorf("no sudo between the runner's worker (pid %d), which has no SUDO_UID %s, and us: "+
 				"one exec'd us in its place", found, uid)
 		}
 		return nil, nil
 	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", found))
-	if err != nil {
-		return nil, err
-	}
-	return parseEnviron(data), nil
+	return env, nil
 }
 
 // parseEnviron parses a /proc/<pid>/environ: NUL-separated KEY=value. A

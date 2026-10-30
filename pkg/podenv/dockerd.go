@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -242,6 +243,15 @@ func runtimePid(pid int32) (int32, error) {
 		return 0, err
 	}
 	addr, config := dockerdFlags(cmdline)
+	// dockerd resolves a relative path against its working directory,
+	// which a probe from another mount namespace cannot follow inside its
+	// root.
+	for _, p := range []string{addr, config} {
+		if p != "" && !filepath.IsAbs(p) {
+			return 0, fmt.Errorf("its containerd address or daemon.json %q is relative to a working directory "+
+				"this probe does not follow", p)
+		}
+	}
 	if addr == "" {
 		if addr, err = configuredContainerd(root, config); err != nil {
 			return 0, err

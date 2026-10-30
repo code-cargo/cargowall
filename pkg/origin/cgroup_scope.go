@@ -88,6 +88,14 @@ type walkFindings struct {
 	unlisted                                            bool
 }
 
+// firstTime notes k as found by this walk, and reports whether neither
+// this walk nor the last had found it: the time to log it.
+func firstTime[K comparable](found, last map[K]bool, k K) bool {
+	first := !found[k] && !last[k]
+	found[k] = true
+	return first
+}
+
 func newWalkFindings() walkFindings {
 	return walkFindings{
 		shared: make(map[uint64]bool), unremoved: make(map[uint64]bool),
@@ -245,8 +253,7 @@ func (s *cgroupScope) walk(first bool) error {
 		}
 		if l.level == 0 {
 			for tgid := range l.tgids {
-				found.inRoot[tgid] = true
-				if !s.last.inRoot[tgid] {
+				if firstTime(found.inRoot, s.last.inRoot, tgid) {
 					s.logger.Warn("A task of this job is in the root cgroup, where its sockets pass the cgroup hook",
 						"pid", tgid)
 				}
@@ -287,13 +294,11 @@ func (s *cgroupScope) reconcileMarked(listed map[uint64]*listed, marked map[uint
 		if listed[id] != nil {
 			continue
 		}
-		dir, path, inside, err := s.openCgroup(id)
-		if cgroupGone(err) {
+		dir, path, inside, gone := s.open(id, found)
+		if gone {
 			s.unmark(id)
-			continue
 		}
-		if err != nil {
-			s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
+		if dir == nil {
 			continue
 		}
 		s.clearMark(id, dir, path, inside, found)
@@ -347,13 +352,10 @@ func (s *cgroupScope) cutShort(err error, found *walkFindings) {
 // each entry of ours records the cgroup again until the next walk takes it
 // out.
 func (s *cgroupScope) mark(id uint64, path string, found *walkFindings) {
-	if err := s.objs.MapScopeShared.Put(id, uint8(1)); err != nil {
-		if !found.unmarked[id] && !s.last.unmarked[id] {
-			s.logger.Warn("Container egress cgroup scope could not mark a cgroup shared with tasks outside this job, "+
-				"which a task of this job entering it records again until the next walk", "cgroup", path, "error", err,
-				"capacity", s.objs.MapScopeShared.MaxEntries())
-		}
-		found.unmarked[id] = true
+	if err := s.objs.MapScopeShared.Put(id, uint8(1)); err != nil && firstTime(found.unmarked, s.last.unmarked, id) {
+		s.logger.Warn("Container egress cgroup scope could not mark a cgroup shared with tasks outside this job, "+
+			"which a task of this job entering it records again until the next walk", "cgroup", path, "error", err,
+			"capacity", s.objs.MapScopeShared.MaxEntries())
 	}
 }
 
@@ -378,17 +380,15 @@ func (s *cgroupScope) stopping() bool {
 // hook whatever it holds: an entry a tracepoint made for it is taken out
 // (outsideRoot), and each process of ours there is reported.
 func (s *cgroupScope) reconcileListed(id uint64, l *listed, marked bool, found *walkFindings) {
-	dir, path, inside, err := s.openCgroup(id)
-	if err != nil {
-		s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
+	dir, path, inside, _ := s.open(id, found)
+	if dir == nil {
 		return
 	}
 	defer dir.Close()
 	if !inside {
 		s.outsideRoot(id)
 		for tgid := range l.tgids {
-			found.outside[tgid] = true
-			if !s.last.outside[tgid] {
+			if firstTime(found.outside, s.last.outside, tgid) {
 				p, _ := podenv.ReadCgroupPath(fmt.Sprintf("/proc/%d/cgroup", tgid))
 				s.logger.Warn("A task of this job is in a cgroup outside our cgroup namespace's root, "+
 					"which the cgroup hook never sees", "pid", tgid, "cgroup", p)
@@ -428,6 +428,17 @@ func (s *cgroupScope) reconcile(id uint64, dir *os.File, path string, found *wal
 	return false
 }
 
+// open opens cgroup id for a pass of the walk, reporting one it cannot
+// open; gone says the cgroup has been removed, which needs no report.
+func (s *cgroupScope) open(id uint64, found *walkFindings) (dir *os.File, path string, inside, gone bool) {
+	dir, path, inside, err := s.openCgroup(id)
+	if err != nil {
+		s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
+		return nil, "", false, cgroupGone(err)
+	}
+	return dir, path, inside, false
+}
+
 // unreadable reports a cgroup the walk could not open or read, which stays
 // as it was, unless it has been removed, which needs nothing: no task can
 // enter it again, and its release takes it out of the scope.
@@ -435,8 +446,7 @@ func (s *cgroupScope) unreadable(id uint64, path string, err error, found *walkF
 	if cgroupGone(err) {
 		return
 	}
-	found.unreadable[id] = true
-	if !s.last.unreadable[id] {
+	if firstTime(found.unreadable, s.last.unreadable, id) {
 		s.logger.Warn("Container egress cgroup scope cannot read a cgroup of this job's, and leaves it as it is",
 			"cgroup", path, "error", err)
 	}
@@ -472,13 +482,11 @@ func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFi
 		if listed[id] != nil || s.stale[id] {
 			continue
 		}
-		dir, path, inside, err := s.openCgroup(id)
-		if cgroupGone(err) {
+		dir, path, inside, gone := s.open(id, found)
+		if gone {
 			s.stale[id] = true
-			continue
 		}
-		if err != nil {
-			s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
+		if dir == nil {
 			continue
 		}
 		if !inside {
@@ -597,8 +605,7 @@ func (s *cgroupScope) recorded(id uint64) bool {
 func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFindings) {
 	err := s.objs.MapScopeCgroups.Update(id, uint8(1), ebpf.UpdateNoExist)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
-		found.unrecorded[id] = true
-		if !s.last.unrecorded[id] {
+		if firstTime(found.unrecorded, s.last.unrecorded, id) {
 			s.logger.Warn("Container egress cgroup scope could not record a cgroup this job is in, "+
 				"and its sockets pass the cgroup hook", "cgroup", path, "error", err,
 				"capacity", s.objs.MapScopeCgroups.MaxEntries())
@@ -627,19 +634,16 @@ func (s *cgroupScope) leave(id uint64, path string, ours bool, found *walkFindin
 	s.mark(id, path, found)
 	err := s.objs.MapScopeCgroups.Delete(id)
 	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-		found.unremoved[id] = true
-		if !s.last.unremoved[id] {
+		if firstTime(found.unremoved, s.last.unremoved, id) {
 			s.logger.Warn("Container egress cgroup scope could not take out a cgroup it shares with tasks outside "+
 				"this job, whose sockets the hook still judges", "cgroup", path, "error", err)
 		}
 		return
 	}
-	if err != nil && !ours {
+	if err != nil && !ours || !firstTime(found.shared, s.last.shared, id) {
 		return
 	}
-	found.shared[id] = true
 	switch {
-	case s.last.shared[id]:
 	case ours:
 		s.logger.Warn("A task of this job is in a cgroup shared with tasks outside it, "+
 			"where its sockets pass the cgroup hook", "cgroup", path)

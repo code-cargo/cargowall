@@ -294,22 +294,46 @@ func (s Shape) HookScope() (Scope, error) {
 	// Under the machine's root every daemon's containers reach the hook,
 	// and those of one whose runtime is in our pid namespace are recorded
 	// as they start.
+	if err := s.daemonRefusal(false); err != nil {
+		return Scope{}, err
+	}
+	return scope, nil
+}
+
+// daemonRefusal says why the daemon behind the socket may make containers
+// the hook does not judge, in either cgroup namespace, or nil: one we
+// cannot see, or cannot identify, or whose runtime is outside our pid
+// namespace (runtimeRefusal). In a private one (private) the hook sees
+// only what is under the namespace's root, so a daemon we see must show
+// its containers' tree under it too, and another container's daemon its
+// own cgroup.
+func (s Shape) daemonRefusal(private bool) error {
 	switch s.Dockerd.Kind {
 	case DockerdAbsent:
-		return scope, nil
+		return nil
 	case DockerdLocal, DockerdForeign:
 		if err := s.runtimeRefusal(); err != nil {
-			return Scope{}, err
+			return err
 		}
-		return scope, nil
+		// Its containers are made in the tree its cgroup driver uses: its
+		// runtime's cgroup mount, or the one of the systemd it reaches,
+		// which is that one's cgroup namespace's root unless it was given
+		// another tree, such as the host's. When that root is under ours,
+		// and a foreign daemon's own cgroup too, so are its containers.
+		if private && (!underRoot(s.Dockerd.ContainerTree) || (s.Dockerd.Kind == DockerdForeign && !underRoot(s.Dockerd.Cgroup))) {
+			return fmt.Errorf("the cgroup hook cannot be shown to reach the containers of a %s dockerd, "+
+				"which may be outside this container (%s; its cgroup %q, cgroup driver %q, containers' cgroup tree %q)",
+				s.Dockerd.Kind, s.Dockerd.Reason, s.Dockerd.Cgroup, s.Dockerd.CgroupDriver, s.Dockerd.ContainerTree)
+		}
+		return nil
 	case DockerdHidden:
-		return Scope{}, fmt.Errorf("the cgroup hook judges only our pid namespace, and the docker daemon's "+
-			"containers are outside it (%s)", s.Dockerd.Reason)
+		return fmt.Errorf("the docker daemon's pid is outside our pid namespace, and so are the containers it "+
+			"makes, which the cgroup hook cannot be shown to judge, possibly the host's own (%s)", s.Dockerd.Reason)
 	case DockerdUnknown:
-		return Scope{}, fmt.Errorf("the cgroup hook judges only our pid namespace, beside an unidentified dockerd (%s)",
-			s.Dockerd.Reason)
+		return fmt.Errorf("beside an unidentified dockerd, the cgroup hook cannot be shown to judge this job's "+
+			"containers (%s)", s.Dockerd.Reason)
 	default:
-		return Scope{}, fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
+		return fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
 	}
 }
 
@@ -339,29 +363,8 @@ func (s Shape) privateScope() (Scope, error) {
 	if err := s.partialRefusal(); err != nil {
 		return Scope{}, err
 	}
-	switch s.Dockerd.Kind {
-	case DockerdAbsent:
-	case DockerdLocal, DockerdForeign:
-		if err := s.runtimeRefusal(); err != nil {
-			return Scope{}, err
-		}
-		// Its containers are made in the tree its cgroup driver uses: its
-		// own cgroup mount, or the one of the systemd it reaches, which is
-		// that one's cgroup namespace's root unless it was given another
-		// tree, such as the host's. When that root is under ours, and a
-		// foreign daemon's own cgroup too, so are its containers.
-		if !underRoot(s.Dockerd.ContainerTree) || (s.Dockerd.Kind == DockerdForeign && !underRoot(s.Dockerd.Cgroup)) {
-			return Scope{}, fmt.Errorf("the cgroup hook cannot be shown to reach the containers of a %s dockerd, "+
-				"which may be outside this container (%s; its cgroup %q, cgroup driver %q, containers' cgroup tree %q)",
-				s.Dockerd.Kind, s.Dockerd.Reason, s.Dockerd.Cgroup, s.Dockerd.CgroupDriver, s.Dockerd.ContainerTree)
-		}
-	case DockerdHidden:
-		return Scope{}, fmt.Errorf("the cgroup hook cannot reach containers of a dockerd we cannot see, "+
-			"possibly the host's own (%s)", s.Dockerd.Reason)
-	case DockerdUnknown:
-		return Scope{}, fmt.Errorf("in a private cgroup namespace beside an unidentified dockerd (%s)", s.Dockerd.Reason)
-	default:
-		return Scope{}, fmt.Errorf("dockerd kind %d has no hook-scope rule", s.Dockerd.Kind)
+	if err := s.daemonRefusal(true); err != nil {
+		return Scope{}, err
 	}
 	if s.CgroupPath == "/" {
 		return Scope{}, nil

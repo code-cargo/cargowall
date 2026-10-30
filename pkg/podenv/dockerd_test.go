@@ -171,6 +171,8 @@ func TestRuntimePid(t *testing.T) {
 		{"a default that is there and does not answer", []string{dead, sock}, []string{noConfig}, 0},
 		{"a given address that does not answer", nil, []string{noConfig, "--containerd=" + absent}, 0},
 		{"none there", []string{absent}, []string{noConfig}, -1},
+		{"a relative daemon.json, against a working directory not followed", []string{sock}, []string{"--config-file=daemon.json"}, 0},
+		{"a relative containerd address", []string{sock}, []string{noConfig, "--containerd=run/containerd.sock"}, 0},
 	} {
 		containerdDefaults = c.defaults
 		pid := dockerd(c.flags...)

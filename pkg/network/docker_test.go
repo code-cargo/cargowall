@@ -27,16 +27,32 @@ import (
 )
 
 // newTestDaemonConfig points a daemonConfig at a temp dir and counts reloads.
-func newTestDaemonConfig(t *testing.T) (daemonConfig, *int) {
+func newTestDaemonConfig(t *testing.T) (*daemonConfig, *int) {
 	t.Helper()
 	dir := t.TempDir()
 	reloads := 0
-	return daemonConfig{
-		path:   filepath.Join(dir, "daemon.json"),
-		backup: filepath.Join(dir, "daemon.json.cargowall.bak"),
-		absent: filepath.Join(dir, "daemon.json.cargowall.absent"),
-		reload: func(*slog.Logger) error { reloads++; return nil },
+	return &daemonConfig{
+		path:    filepath.Join(dir, "daemon.json"),
+		backup:  filepath.Join(dir, "daemon.json.cargowall.bak"),
+		absent:  filepath.Join(dir, "daemon.json.cargowall.absent"),
+		rewrite: filepath.Join(dir, "daemon.json.cargowall.rewrite"),
+		reload:  func(*slog.Logger) error { reloads++; return nil },
 	}, &reloads
+}
+
+func requireContent(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, string(want), string(got))
+}
+
+// setAside lists the backups restore set aside rather than deleted.
+func setAside(t *testing.T, c *daemonConfig) []string {
+	t.Helper()
+	matches, err := filepath.Glob(c.backup + ".unrestored-*")
+	require.NoError(t, err)
+	return matches
 }
 
 func readDaemonJSON(t *testing.T, path string) map[string]any {
@@ -163,4 +179,119 @@ func TestDaemonConfig_UnparsableOriginalIsRestoredVerbatim(t *testing.T) {
 			require.Equal(t, original, got)
 		})
 	}
+}
+
+// A record only proves what daemon.json held when cargowall rewrote it. A
+// file changed since — config management installing one where there was
+// none, an operator editing it — is not cargowall's to delete or replace.
+func TestDaemonConfig_FileChangedSinceRewriteIsLeftAlone(t *testing.T) {
+	installed := []byte(`{"registry-mirrors": ["https://mirror.example"]}`)
+
+	t.Run("installed where there was none, then a new run", func(t *testing.T) {
+		c, _ := newTestDaemonConfig(t)
+		require.NoError(t, c.configure("172.17.0.1", slog.New(slog.DiscardHandler)))
+		// The run is killed; config management installs a real file.
+		require.NoError(t, os.WriteFile(c.path, installed, 0o644))
+
+		require.NoError(t, c.configure("172.17.0.1", slog.New(slog.DiscardHandler)))
+		require.NoError(t, c.restore(slog.New(slog.DiscardHandler)))
+		requireContent(t, c.path, installed)
+	})
+	t.Run("edited after the rewrite, then restored", func(t *testing.T) {
+		c, reloads := newTestDaemonConfig(t)
+		original := []byte(`{"log-driver": "json-file"}`)
+		require.NoError(t, os.WriteFile(c.path, original, 0o644))
+		require.NoError(t, c.configure("172.17.0.1", slog.New(slog.DiscardHandler)))
+		require.NoError(t, os.WriteFile(c.path, installed, 0o644))
+
+		require.NoError(t, c.restore(slog.New(slog.DiscardHandler)))
+		requireContent(t, c.path, installed)
+		require.Zero(t, *reloads)
+		aside := setAside(t, c)
+		require.Len(t, aside, 1, "the pre-cargowall original is kept, not deleted")
+		requireContent(t, aside[0], original)
+		requireNotExist(t, c.backup)
+		requireNotExist(t, c.rewrite)
+	})
+	// A backup left without a rewrite record (a run killed before the
+	// rewrite landed, or an older build's) cannot be matched to the file.
+	t.Run("backup without a rewrite record", func(t *testing.T) {
+		c, _ := newTestDaemonConfig(t)
+		require.NoError(t, os.WriteFile(c.path, installed, 0o644))
+		require.NoError(t, os.WriteFile(c.backup, []byte(`{"old": true}`), 0o600))
+
+		require.NoError(t, c.restore(slog.New(slog.DiscardHandler)))
+		requireContent(t, c.path, installed)
+		require.Len(t, setAside(t, c), 1)
+	})
+	t.Run("killed before the rewrite landed", func(t *testing.T) {
+		c, _ := newTestDaemonConfig(t)
+		original := []byte(`{"log-driver": "json-file"}`)
+		require.NoError(t, os.WriteFile(c.path, original, 0o644))
+		require.NoError(t, c.configure("172.17.0.1", slog.New(slog.DiscardHandler)))
+		require.NoError(t, os.WriteFile(c.path, original, 0o644)) // as if the rename never ran
+
+		require.NoError(t, c.restore(slog.New(slog.DiscardHandler)))
+		requireContent(t, c.path, original)
+		require.Empty(t, setAside(t, c), "a backup equal to the file is simply dropped")
+		requireNotExist(t, c.backup)
+	})
+}
+
+// A daemon.json that is a symlink into managed config, or kept 0600, must
+// come back that way: the rename lands on the target and carries the mode.
+func TestDaemonConfig_KeepsSymlinkAndMode(t *testing.T) {
+	c, _ := newTestDaemonConfig(t)
+	managed := filepath.Join(t.TempDir(), "managed-daemon.json")
+	original := []byte(`{"log-driver": "json-file"}`)
+	require.NoError(t, os.WriteFile(managed, original, 0o600))
+	require.NoError(t, os.Symlink(managed, c.path))
+
+	check := func(when string) {
+		fi, err := os.Lstat(c.path)
+		require.NoError(t, err)
+		require.Equal(t, os.ModeSymlink, fi.Mode()&os.ModeSymlink, "%s: daemon.json is still the symlink", when)
+		fi, err = os.Stat(managed)
+		require.NoError(t, err)
+		require.Equal(t, os.FileMode(0o600), fi.Mode().Perm(), "%s: the target keeps its mode", when)
+	}
+
+	require.NoError(t, c.configure("172.17.0.1", slog.New(slog.DiscardHandler)))
+	check("after the rewrite")
+	require.Equal(t, []any{"172.17.0.1"}, readDaemonJSON(t, managed)["dns"])
+
+	require.NoError(t, c.restore(slog.New(slog.DiscardHandler)))
+	check("after the restore")
+	requireContent(t, managed, original)
+}
+
+// The undo is registered before configure and a second signal runs it on
+// another goroutine. Whichever gets there first, the original survives: a
+// restore first leaves configure refused, a configure first is undone.
+func TestDaemonConfig_ConcurrentRestoreKeepsOriginal(t *testing.T) {
+	original := []byte(`{"log-driver": "json-file"}`)
+	for range 50 {
+		c, _ := newTestDaemonConfig(t)
+		require.NoError(t, os.WriteFile(c.path, original, 0o644))
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = c.restore(slog.New(slog.DiscardHandler))
+		}()
+		_ = c.configure("172.17.0.1", slog.New(slog.DiscardHandler))
+		<-done
+		requireContent(t, c.path, original)
+	}
+}
+
+func TestDaemonConfig_ConfigureAfterRestoreRefused(t *testing.T) {
+	c, _ := newTestDaemonConfig(t)
+	original := []byte(`{"log-driver": "json-file"}`)
+	require.NoError(t, os.WriteFile(c.path, original, 0o644))
+
+	require.NoError(t, c.restore(slog.New(slog.DiscardHandler)))
+	require.Error(t, c.configure("172.17.0.1", slog.New(slog.DiscardHandler)))
+	requireContent(t, c.path, original)
+	requireNotExist(t, c.backup)
 }

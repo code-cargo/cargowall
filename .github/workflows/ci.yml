@@ -51,7 +51,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+      - uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           mode: audit
           offline: ${{ env.CW_OFFLINE }}
@@ -93,7 +93,7 @@ jobs:
       id-token: write
       checks: write
     steps:
-      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+      - uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           mode: audit
           offline: ${{ env.CW_OFFLINE }}
@@ -141,7 +141,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+      - uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           mode: audit
           offline: ${{ env.CW_OFFLINE }}
@@ -195,7 +195,7 @@ jobs:
         run: bash scripts/ci/enforce.sh warm-resolver
 
       - name: Start CargoWall via Action
-        uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+        uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         env:
           # 3a telemetry: per-program overhead numbers (cg_origin_egress vs
           # the tc_egress baseline) land in the daemon's shutdown log during
@@ -283,15 +283,14 @@ jobs:
         run: bash scripts/ci/cgroup-enforce.sh pre
 
       - name: Start CargoWall with cgroup enforcement (issue #106 phase 3b)
-        uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
-        env:
+        uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
+        with:
+          mode: enforce
           # The whole point of this job: the root-cgroup hook is
           # authoritative for traffic with a local socket (pre-NAT, socket
           # context), with TC egress still attached as the fail-closed
           # backstop for everything else.
-          CARGOWALL_CONTAINER_EGRESS: 'enforce'
-        with:
-          mode: enforce
+          container-egress: enforce
           offline: 'true'
           allowed-hosts: |
              docker.io
@@ -326,8 +325,6 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
-      # Pinned to cargowall-action's main: its container-egress and tls-sni
-      # inputs (and the rest of the v2 action) postdate every v1 tag.
       - name: Start CargoWall with L7 (SNI/Host) enforcement
         uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
@@ -372,7 +369,7 @@ jobs:
         run: chmod +x bin/cargowall
 
       - name: Start CargoWall via Action
-        uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+        uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           mode: audit
           offline: 'true'
@@ -658,6 +655,6 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
-      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
+      - uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           binary-path: ./bin/cargowall

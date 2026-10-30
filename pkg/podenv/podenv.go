@@ -417,7 +417,7 @@ func (s Shape) sharedPidNS(pod bool, in, whose string) (scope Scope, done bool, 
 // Under reports whether the cgroup at path is sub or below it, by path, as
 // one cgroup namespace gives both: "" is no cgroup, which covers nothing,
 // and "/" covers every cgroup. scopebpf.c's in_subtree asks the same of an
-// id, through at most 32 parents, and past that records a cgroup the hook
+// id, through at most 31 parents, and past that records a cgroup the hook
 // judges anyway.
 func Under(path, sub string) bool {
 	return sub != "" && (path == sub || strings.HasPrefix(path, strings.TrimSuffix(sub, "/")+"/"))

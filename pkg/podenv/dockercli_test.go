@@ -19,7 +19,9 @@ package podenv
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +30,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/procfs"
 )
@@ -222,6 +226,42 @@ func TestDockerCLIHost(t *testing.T) {
 	check("a config the CLI cannot parse either", env(), "", false)
 	home := func(k string) string { return map[string]string{"HOME": filepath.Dir(dir)}[k] }
 	check("a HOME with no .docker", home, "", false)
+
+	// A FIFO where a config file should be is refused, not waited on.
+	fifo := func(path string) {
+		t.Helper()
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if err := unix.Mkfifo(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unblocked := func(name string, getenv func(string) string) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			check(name, getenv, "", true)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the probe waits on the FIFO", name)
+		}
+	}
+	fifo(filepath.Join(dir, "config.json"))
+	unblocked("a FIFO for the config", env())
+	sum := sha256.Sum256([]byte("remote"))
+	meta := filepath.Join(dir, "contexts", "meta", hex.EncodeToString(sum[:]), "meta.json")
+	fifo(meta)
+	unblocked("a FIFO for the context's meta.json", env("DOCKER_CONTEXT", "remote"))
+	for _, path := range []string{filepath.Join(dir, "config.json"), meta} {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	context("remote", "tcp://builder:2376")
 
 	// Without HOME the CLI reads its user's passwd entry's home: under
 	// sudo, the job user's (SUDO_UID), not ours.

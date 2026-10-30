@@ -26,11 +26,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/procfs"
 )
@@ -123,6 +126,26 @@ var passwdHome = func(uid string) string {
 	return ""
 }
 
+// readConfig reads a docker config file, at a path the job's environment
+// picks, as root reads it: opened without waiting, and read only if it is a
+// regular file, since a FIFO or a device there would hold the probe, and
+// Detect with it, for good. At most 1 MiB is read.
+func readConfig(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (%v)", path, fi.Mode().Type())
+	}
+	return io.ReadAll(io.LimitReader(f, 1<<20))
+}
+
 // dockerCLIHost is the daemon address the docker CLI would use in the
 // environment getenv reads, run as uid ("" for our own user), resolved as
 // the CLI resolves it: DOCKER_HOST; else the context DOCKER_CONTEXT names,
@@ -147,7 +170,7 @@ func dockerCLIHost(getenv func(string) string, uid string) (host, setting string
 	name, setting := getenv("DOCKER_CONTEXT"), "DOCKER_CONTEXT"
 	if name == "" && dir != "" {
 		config := filepath.Join(dir, "config.json")
-		data, err := os.ReadFile(config)
+		data, err := readConfig(config)
 		if errors.Is(err, fs.ErrNotExist) {
 			return "", "", nil
 		}
@@ -173,7 +196,7 @@ func dockerCLIHost(getenv func(string) string, uid string) (host, setting string
 		return "", "", fmt.Errorf("%s: no docker config directory", setting)
 	}
 	sum := sha256.Sum256([]byte(name))
-	data, err := os.ReadFile(filepath.Join(dir, "contexts", "meta", hex.EncodeToString(sum[:]), "meta.json"))
+	data, err := readConfig(filepath.Join(dir, "contexts", "meta", hex.EncodeToString(sum[:]), "meta.json"))
 	if err != nil {
 		return "", "", fmt.Errorf("%s: %w", setting, err)
 	}

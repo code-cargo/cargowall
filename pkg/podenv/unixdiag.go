@@ -27,11 +27,12 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"os"
 	"time"
 
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
+
+	"github.com/code-cargo/cargowall/pkg/sockdiag"
 )
 
 // struct unix_diag_req and struct unix_diag_msg, and the attributes asked
@@ -72,29 +73,10 @@ func unixDiag(netns string, ino uint64) ([]unixSock, error) {
 	if ino > math.MaxUint32 {
 		return nil, fmt.Errorf("socket inode %d is past unix_diag's 32 bits", ino)
 	}
-	cfg := &netlink.Config{}
-	if netns != "" {
-		f, err := os.Open(netns)
-		if err != nil {
-			return nil, err
-		}
-		defer f.Close()
-		cfg.NetNS = int(f.Fd())
-	}
-	conn, err := netlink.Dial(unix.NETLINK_SOCK_DIAG, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("dial sock_diag netlink: %w", err)
-	}
-	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		return nil, fmt.Errorf("set netlink deadline: %w", err)
-	}
 	req := make([]byte, sizeofUnixDiagReq)
 	req[0] = unix.AF_UNIX
-	flags := netlink.Request
 	if ino == 0 {
 		binary.NativeEndian.PutUint32(req[4:8], 1<<tcpEstablished)
-		flags |= netlink.Dump
 	} else {
 		binary.NativeEndian.PutUint32(req[8:12], uint32(ino))
 	}
@@ -102,10 +84,7 @@ func unixDiag(netns string, ino uint64) ([]unixSock, error) {
 	// No cookie to check: INET_DIAG_NOCOOKIE in both halves.
 	binary.NativeEndian.PutUint32(req[16:20], math.MaxUint32)
 	binary.NativeEndian.PutUint32(req[20:24], math.MaxUint32)
-	msgs, err := conn.Execute(netlink.Message{
-		Header: netlink.Header{Type: netlink.HeaderType(unix.SOCK_DIAG_BY_FAMILY), Flags: flags},
-		Data:   req,
-	})
+	msgs, err := sockdiag.Request(netns, req, ino == 0, 2*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("unix_diag: %w", err)
 	}

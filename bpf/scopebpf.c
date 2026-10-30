@@ -153,7 +153,7 @@ static __always_inline __u64 scope_id(struct cgroup *cg)
 // by its own and its parents' ids: a cgroup's self is its first member, so
 // a parent css is the parent cgroup. By id, not by level: in a cgroup
 // namespace rooted below the machine's (a nested node's) userspace sees a
-// path, not a level. A cgroup more than SUBTREE_MAX_DEPTH below it reads as
+// path, not a level. A cgroup SUBTREE_MAX_DEPTH or more below it reads as
 // outside it, which only records a cgroup the hook judges anyway, and lists
 // it in the walk, where pkg/origin matches by path, with no bound.
 static __always_inline bool in_subtree(struct cgroup *cg)

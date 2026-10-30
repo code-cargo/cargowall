@@ -23,7 +23,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"maps"
 	"os"
 	"strings"
 	"syscall"
@@ -70,9 +69,9 @@ type cgroupScope struct {
 	done     chan struct{}
 	watching bool                      // start has run watch, which closes done
 	reported [bpf.ScopeStatsMax]uint64 // last counts logged, owned by watch
-	// What the walks so far found and logged, so a walk logs only what
-	// none had (remember). Owned by the walk.
-	last walkFindings
+	// What the walks found and logged lately, so a walk logs only what
+	// none of them had (remember). Owned by the walk.
+	last walkMemory
 	// Recorded cgroups the walk found removed, which it no longer opens:
 	// ids are never reused, and release takes their entries out. It keeps
 	// only ids still in the map. Owned by the walk.
@@ -90,32 +89,67 @@ type walkFindings struct {
 	unlisted                                            bool
 }
 
+// walkMemory is what the walks found and logged lately, as walkFindings
+// has it, with how many whole walks have gone by since one last found each
+// (remember).
+type walkMemory struct {
+	shared, unremoved, unrecorded, unreadable, unmarked map[uint64]int
+	inRoot, outside                                     map[uint32]int
+	unlisted                                            bool
+}
+
 // firstTime notes k as found by this walk, and reports whether neither
-// this walk nor an earlier one had found it: the time to log it.
-func firstTime[K comparable](found, last map[K]bool, k K) bool {
-	first := !found[k] && !last[k]
+// this walk nor a recent one had found it: the time to log it.
+func firstTime[K comparable](found map[K]bool, last map[K]int, k K) bool {
+	_, recent := last[k]
+	first := !found[k] && !recent
 	found[k] = true
 	return first
 }
 
-// remember adds what a walk found to what the walks before it found: a
-// finding is logged the first time a walk makes it, and not again when it
-// comes back on a later one, as a runtime's periodic exec stage would.
-// That the scope could not be read whole is the last walk's alone, logged
-// again once a walk has read it whole.
-func (f *walkFindings) remember(found walkFindings) {
-	for _, m := range [][2]map[uint64]bool{
-		{f.shared, found.shared},
-		{f.unremoved, found.unremoved},
-		{f.unrecorded, found.unrecorded},
-		{f.unreadable, found.unreadable},
-		{f.unmarked, found.unmarked},
-	} {
-		maps.Copy(m[0], m[1])
+// forgetAfter is how many whole walks a finding is remembered after the
+// last that made it, five minutes of them: one that comes and goes within
+// that, as a runtime's periodic exec stage does, is logged once, one that
+// comes back after it is logged again, and only what the last five
+// minutes found is kept.
+const forgetAfter = 30
+
+// remember adds what a walk found to what the walks before it found
+// lately, and forgets what none of the last forgetAfter has found. That
+// the scope could not be read whole is the last walk's alone, logged again
+// once a walk has read it whole.
+func (m *walkMemory) remember(found walkFindings) {
+	age(m.shared, found.shared)
+	age(m.unremoved, found.unremoved)
+	age(m.unrecorded, found.unrecorded)
+	age(m.unreadable, found.unreadable)
+	age(m.unmarked, found.unmarked)
+	age(m.inRoot, found.inRoot)
+	age(m.outside, found.outside)
+	m.unlisted = found.unlisted
+}
+
+// age counts one more walk since each finding in last, forgets those past
+// forgetAfter, and notes those found as found by this one.
+func age[K comparable](last map[K]int, found map[K]bool) {
+	for k, n := range last {
+		if n++; n > forgetAfter {
+			delete(last, k)
+		} else {
+			last[k] = n
+		}
 	}
-	maps.Copy(f.inRoot, found.inRoot)
-	maps.Copy(f.outside, found.outside)
-	f.unlisted = found.unlisted
+	for k := range found {
+		last[k] = 0
+	}
+}
+
+func newWalkMemory() walkMemory {
+	return walkMemory{
+		shared: make(map[uint64]int), unremoved: make(map[uint64]int),
+		unrecorded: make(map[uint64]int), unreadable: make(map[uint64]int), unmarked: make(map[uint64]int),
+		inRoot: make(map[uint32]int), outside: make(map[uint32]int),
+	}
 }
 
 func newWalkFindings() walkFindings {
@@ -206,7 +240,7 @@ func loadCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, err
 	}
 	s := &cgroupScope{
 		logger: logger, sub: sub, stop: make(chan struct{}), done: make(chan struct{}),
-		last: newWalkFindings(), stale: make(map[uint64]bool),
+		last: newWalkMemory(), stale: make(map[uint64]bool),
 	}
 	if err := cargowallEbpf.LoadObjects(logger, "scopebpf", spec, ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
@@ -343,8 +377,10 @@ func (s *cgroupScope) reconcileMarked(tasks map[uint64]*listed, marked map[uint6
 // task of ours is looked at again: a task outside that entered between the
 // look and the clearing was not seen by scope_leave, which marks only
 // cgroups the scope holds, so the cgroup is marked again, and taken out
-// should a task of ours have entered since and recorded it (leave);
-// record's own second look covers the other.
+// should a task of ours have entered since and recorded it (leave). A task
+// of ours alone that entered while the mark was up, which scope_enter
+// passed over, is recorded; record's own second look covers a task outside
+// entering after that.
 func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside bool, found *walkFindings) {
 	m, err := cgroupMembers(dir)
 	switch {
@@ -359,8 +395,13 @@ func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside boo
 		s.record(id, dir, path, found)
 	default:
 		s.unmark(id)
-		if again, err := cgroupMembers(dir); err == nil && again.theirs {
+		again, err := cgroupMembers(dir)
+		switch {
+		case err != nil:
+		case again.theirs:
 			s.leave(id, path, again.ours, found)
+		case again.ours && inside:
+			s.record(id, dir, path, found)
 		}
 	}
 }

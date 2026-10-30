@@ -385,7 +385,7 @@ func loadWalkScope(t *testing.T, ino, maxEntries uint32) *cgroupScope {
 	spec.Maps[bpf.ScopeBpfMapMapScopeShared].MaxEntries = maxEntries
 	require.NoError(t, spec.Variables[bpf.ScopeBpfVarSelfTgid].Set(uint32(os.Getpid())))
 	var log bytes.Buffer
-	s := &cgroupScope{logger: slog.New(slog.NewTextHandler(&log, nil)), last: newWalkFindings(), stale: make(map[uint64]bool)}
+	s := &cgroupScope{logger: slog.New(slog.NewTextHandler(&log, nil)), last: newWalkMemory(), stale: make(map[uint64]bool)}
 	require.NoError(t, spec.LoadAndAssign(&s.objs, nil))
 	t.Cleanup(s.release)
 	s.mount, err = os.Open(podenv.CgroupRoot)
@@ -582,10 +582,11 @@ func TestCgroupScopeOutsideInner(t *testing.T) {
 }
 
 // A finding is logged the first time a walk makes it, not again when it
-// comes back after a walk without it; a read of the scope cut short is
-// logged again once a walk has read it whole.
+// comes back within forgetAfter walks without it, and again after that;
+// a read of the scope cut short is logged again once a walk has read it
+// whole.
 func TestWalkFindingsRemembered(t *testing.T) {
-	last := newWalkFindings()
+	last := newWalkMemory()
 	walk := func(unlisted bool, ids ...uint64) (logged []uint64) {
 		found := newWalkFindings()
 		for _, id := range ids {
@@ -603,6 +604,16 @@ func TestWalkFindingsRemembered(t *testing.T) {
 	require.True(t, last.unlisted)
 	require.Equal(t, []uint64{2}, walk(false, 1, 2))
 	require.False(t, last.unlisted, "a whole read clears the cut-short read")
+	for range forgetAfter {
+		walk(false, 2)
+	}
+	require.Equal(t, 0, last.shared[2], "one every walk finds stays fresh")
+	require.Empty(t, walk(false, 1), "found again within forgetAfter walks")
+	for range forgetAfter + 1 {
+		walk(false)
+	}
+	require.Empty(t, last.shared, "forgotten after forgetAfter walks without it")
+	require.Equal(t, []uint64{1, 2}, walk(false, 1, 2), "and logged again")
 }
 
 // Clearing a mark the listing did not reach: a cgroup a task of ours has
@@ -656,15 +667,23 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	s.clearMark(ownID, dir, path, true, &found)
 	require.True(t, marked() && !recorded(), "an entry made between the looks is taken out, the mark kept")
 
+	// A task of ours alone entering an empty cgroup between the looks,
+	// which scope_enter passed over for the mark, is recorded.
+	looksRead("", "7\n")
+	s.clearMark(ownID, dir, path, true, &found)
+	require.True(t, !marked() && recorded(), "a task of ours entering between the looks is recorded")
+	require.NoError(t, s.cgroups().Delete(ownID))
+	s.mark(ownID, path, &found)
+
 	// A cgroup still shared keeps its mark, and what an earlier walk logged
 	// of it stands, so it is not reported again.
-	s.last.shared[ownID] = true
+	s.last.shared[ownID] = 0
 	found = newWalkFindings()
 	looksRead("0\n")
 	s.clearMark(ownID, dir, path, true, &found)
 	require.True(t, marked(), "a still-shared cgroup keeps its mark")
 	s.last.remember(found)
-	require.True(t, s.last.shared[ownID], "and stays logged")
+	require.Contains(t, s.last.shared, ownID, "and stays logged")
 
 	looksRead("7\n")
 	s.clearMark(ownID, dir, path, false, &found)
@@ -706,8 +725,8 @@ func TestCgroupScopeWalkFullMapWarns(t *testing.T) {
 	s := loadWalkScope(t, ino, 1)
 	var log bytes.Buffer
 	s.logger = slog.New(slog.NewTextHandler(&log, nil))
-	s.last.shared[1<<62] = true
+	s.last.shared[1<<62] = 0
 	require.NoError(t, s.walk())
 	require.Contains(t, log.String(), "could not record a cgroup")
-	require.True(t, s.last.shared[1<<62], "what an earlier walk found is remembered by a walk without it")
+	require.Equal(t, 1, s.last.shared[1<<62], "what an earlier walk found is remembered by a walk without it")
 }

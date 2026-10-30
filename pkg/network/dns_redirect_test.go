@@ -24,7 +24,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -95,54 +94,6 @@ func TestFlushResolvedCache_Success(t *testing.T) {
 
 	if err := FlushResolvedCache(context.Background(), discardLogger()); err != nil {
 		t.Fatalf("expected nil on successful flush, got %v", err)
-	}
-}
-
-// TestDNSRedirectRules_Shape pins the rule slice: mark RETURN exemptions
-// first (the proxy's upstream client and startup stub peeks), then the
-// systemd-resolved stub DNAT (makes the querying process's own
-// socket visible to the proxy instead of resolved's), then the generic
-// DNAT that still excludes the rest of 127.0.0.0/8 (the proxy listen must
-// never be DNAT'd), then the INPUT anti-resurrection guards. Order is
-// load-bearing: install order is slice order and teardown reverses it, so
-// the exemptions outlive every DNAT they exempt from.
-func TestDNSRedirectRules_Shape(t *testing.T) {
-	want := []string{
-		"OUTPUT -t nat -p udp --dport 53 -m mark --mark 0xCA12 -j RETURN",
-		"OUTPUT -t nat -p tcp --dport 53 -m mark --mark 0xCA12 -j RETURN",
-		"OUTPUT -t nat -p udp -d 127.0.0.53 --dport 53 -j DNAT --to-destination 127.0.0.1:53",
-		"OUTPUT -t nat -p tcp -d 127.0.0.53 --dport 53 -j DNAT --to-destination 127.0.0.1:53",
-		"OUTPUT -t nat -p udp --dport 53 ! -d 127.0.0.0/8 -j DNAT --to-destination 127.0.0.1:53",
-		"OUTPUT -t nat -p tcp --dport 53 ! -d 127.0.0.0/8 -j DNAT --to-destination 127.0.0.1:53",
-		"INPUT -p udp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP",
-		"INPUT -p tcp ! -i lo --sport 53 -m conntrack --ctstate NEW -j DROP",
-	}
-	assertRules(t, dnsRedirectRules(""), want)
-
-	// With a bridge listener, the container rules follow every host rule,
-	// so teardown removes them first and the host redirect outlives them.
-	want = append(want,
-		"-I PREROUTING -t nat -i docker0 -p udp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
-		"-I PREROUTING -t nat -i docker0 -p tcp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
-		"-I PREROUTING -t nat -i br-+ -p udp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
-		"-I PREROUTING -t nat -i br-+ -p tcp --dport 53 -j DNAT --to-destination 172.17.0.1:53",
-	)
-	assertRules(t, dnsRedirectRules("172.17.0.1"), want)
-}
-
-func assertRules(t *testing.T, rules []dnsRedirectRule, want []string) {
-	t.Helper()
-	if len(rules) != len(want) {
-		t.Fatalf("got %d rules, want %d", len(rules), len(want))
-	}
-	for i, r := range rules {
-		got := r.chain + " " + strings.Join(r.args, " ")
-		if r.insert {
-			got = "-I " + got
-		}
-		if got != want[i] {
-			t.Errorf("rule %d:\n  got  %q\n  want %q", i, got, want[i])
-		}
 	}
 }
 

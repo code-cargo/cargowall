@@ -15,11 +15,13 @@
 //go:build linux
 
 // Requested-vs-applied postures for the layers a flag requests but the
-// runtime can fail to deliver: the cgroup egress hook and the L7 layer riding
-// it. A lost enforce rung fails startup — the operator asked for a guarantee
-// the job would not have. A lost observe rung only warns, and is recorded so
-// the job summary can say the measurement never ran: an observe run that
-// reports no would-blocks reads exactly like a clean one.
+// runtime can fail to deliver: the cgroup egress hook, the L7 layer riding
+// it, and the DNS redirect. A lost enforce rung fails startup — the operator
+// asked for a guarantee the job would not have. A lost observe rung only
+// warns, and is recorded so the job summary can say the measurement never
+// ran: an observe run that reports no would-blocks reads exactly like a
+// clean one. The redirect's flag has no rungs of its own; what it guards is
+// the policy's enforcement, so the policy's mode decides.
 package cmd
 
 import (
@@ -41,6 +43,13 @@ var posturesFile = "/tmp/cargowall-postures"
 const (
 	postureContainerEgress = "container-egress"
 	postureTLSSNI          = "tls-sni"
+	postureDNSRedirect     = "dns-redirect-iptables"
+)
+
+// The redirect's flag is a bool; these are its values in the record.
+const (
+	dnsRedirectOn  = "on"
+	dnsRedirectOff = "off"
 )
 
 // maxPostureReasonBytes bounds a reason: it lands in a job-summary table
@@ -81,13 +90,20 @@ type postureLedger struct {
 
 // newPostures registers each layer against its OWN flag's constants: the
 // two flags happen to share the spellings "off" and "enforce", and neither
-// the skip nor the fail-closed decision may lean on that.
-func newPostures(cmd *StartCmd, kernel string, logger *slog.Logger) *postureLedger {
+// the skip nor the fail-closed decision may lean on that. enforcing is the
+// loaded policy's mode, which decides for the DNS redirect: the redirect
+// only does anything while DNS tracking runs.
+func newPostures(cmd *StartCmd, kernel string, enforcing bool, logger *slog.Logger) *postureLedger {
 	p := &postureLedger{kernel: kernel, logger: logger}
 	p.register(postureContainerEgress, cmd.ContainerEgress, ContainerEgressOff,
 		cmd.ContainerEgress == ContainerEgressEnforce)
 	p.register(postureTLSSNI, cmd.TLSSNI, TLSSNIOff,
 		cmd.TLSSNI == TLSSNIEnforce || cmd.TLSSNI == TLSSNIEnforcePinned)
+	redirect := dnsRedirectOff
+	if cmd.DNSRedirectIptables && !cmd.DisableDNSTracking {
+		redirect = dnsRedirectOn
+	}
+	p.register(postureDNSRedirect, redirect, dnsRedirectOff, enforcing)
 	return p
 }
 

@@ -28,7 +28,8 @@ import (
 
 // StopCmd reads a pidfile written by `cargowall start --pidfile X`, sends
 // SIGTERM to that process, and waits for it to exit (so subsequent CI
-// teardown steps can rely on iptables/Docker DNS having been restored).
+// teardown steps can rely on the DNS redirect and Docker DNS having been
+// restored).
 type StopCmd struct {
 	Pidfile string        `help:"Path to the pidfile written by 'cargowall start --pidfile X'" required:"" env:"CARGOWALL_PIDFILE"`
 	Timeout time.Duration `help:"How long to wait for the process to exit after SIGTERM" default:"15s"`

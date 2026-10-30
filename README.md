@@ -220,7 +220,7 @@ sudo cargowall start \
   --dns-upstream 8.8.8.8:53
 ```
 
-By default, standalone mode does **not** install the iptables DNS redirect or rewrite Docker's DNS config. You need to route DNS traffic through the local proxy yourself, otherwise hostname rules will never populate (e.g. the `github.com` allow rule above will stay empty and traffic will be blocked under a deny-by-default policy). Three options:
+By default, standalone mode does **not** install the DNS redirect or rewrite Docker's DNS config. You need to route DNS traffic through the local proxy yourself, otherwise hostname rules will never populate (e.g. the `github.com` allow rule above will stay empty and traffic will be blocked under a deny-by-default policy). Three options:
 
 1. **Pass the orthogonal flags** to let cargowall do the wiring (recommended on CI runners):
    ```bash
@@ -245,7 +245,7 @@ Useful flags (most available as env vars — see `cargowall start --help`):
 | `--debug` | — | Verbose logging |
 | `--github-action` | `CARGOWALL_GITHUB_ACTION` | GitHub Actions preset (expands the orthogonal flags below) |
 | `--gitlab-ci` | `CARGOWALL_GITLAB_CI` | GitLab CI preset (same plumbing, GitLab service host auto-allow instead) |
-| `--dns-redirect-iptables` | `CARGOWALL_DNS_REDIRECT_IPTABLES` | iptables DNAT outbound :53 → `127.0.0.1:53`; with `--docker-dns-interception`, also container :53 arriving on a docker bridge → the bridge listener |
+| `--dns-redirect-iptables` | `CARGOWALL_DNS_REDIRECT_IPTABLES` | DNAT outbound :53 → `127.0.0.1:53`; with `--docker-dns-interception`, also container :53 arriving on a docker bridge → the bridge listener. Installed as the nftables table `ip cargowall` over netlink, so no iptables or nft binary is needed (the name predates that). If it cannot be installed, startup fails under an enforcing policy; under audit the job summary lists it |
 | `--docker-dns-interception` | `CARGOWALL_DOCKER_DNS_INTERCEPTION` | Listen on the Docker bridge IP and rewrite `/etc/docker/daemon.json` (skipped for a daemon in another container, such as a dind sidecar) |
 | `--dns-query-filtering` | `CARGOWALL_DNS_QUERY_FILTERING` | Filter DNS queries against the policy (blocks DNS tunneling). CNAME targets of allowed hosts are auto-permitted, so CNAME-chasing clients aren't refused |
 | `--prepopulate-dns-cache` | `CARGOWALL_PREPOPULATE_DNS_CACHE` | Seed the BPF allowlist from systemd-resolved + existing TCP connections |
@@ -310,7 +310,7 @@ build:
       - /tmp/cargowall.ndjson
 ```
 
-`--gitlab-ci` bundles the iptables DNS redirect, Docker DNS interception, query filtering, cache pre-population, cloud metadata auto-allow, and GitLab host auto-allow. To use just a subset, pass the orthogonal flags individually (see the flag table above).
+`--gitlab-ci` bundles the DNS redirect, Docker DNS interception, query filtering, cache pre-population, cloud metadata auto-allow, and GitLab host auto-allow. To use just a subset, pass the orthogonal flags individually (see the flag table above).
 
 **Tip**: `CARGOWALL_PIDFILE` is read by both `start` and `stop`. Setting it once as a CI variable lets both invocations agree on the path without repeating `--pidfile` in every step.
 

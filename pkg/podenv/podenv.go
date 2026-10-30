@@ -218,7 +218,8 @@ type Shape struct {
 	InitCgroupReason string
 	// KubeletHosts is whether /etc/hosts is the one kubelet writes into
 	// every container of a pod, and KubeletHostsReason why it could not be
-	// read, which counts as kubelet's (inPod).
+	// read, which leaves a pod unknown where the hook would be scoped
+	// (limitedScope).
 	KubeletHosts       bool
 	KubeletHostsReason string
 	Dockerd            Dockerd
@@ -384,7 +385,7 @@ func (s Shape) privateScope() (Scope, error) {
 	// entrypoint making room for nested cgroups, or systemd as its init),
 	// and the hook judges all of it, as at "/". A nested node always has
 	// some: its kubelet and runtime are outside every pod's pid namespace.
-	if !pod && s.CgroupTree == CgroupTreeOurs {
+	if !pod && s.KubeletHostsReason == "" && s.CgroupTree == CgroupTreeOurs {
 		return Scope{}, nil
 	}
 	return s.limitedScope(pod)
@@ -429,13 +430,16 @@ func underRoot(path string) bool {
 	return path != "" && path != "/.." && !strings.HasPrefix(path, "/../")
 }
 
-// inPod reports whether we are in a Kubernetes pod: our cgroup is in
-// kubelet's tree (kubepods), or /etc/hosts is kubelet's, the one sign a
-// kubelet that makes no pod cgroups (cgroupsPerQOS=false) leaves. A pod is
-// judged whole, by its cgroup, which outside kubelet's tree no path shows,
-// so the hosts file alone, or one that could not be read, only refuses.
+// inPod reports whether we are shown to be in a Kubernetes pod: our cgroup
+// is in kubelet's tree (kubepods), or /etc/hosts is kubelet's, the one sign
+// a kubelet that makes no pod cgroups (cgroupsPerQOS=false) leaves. A pod
+// is judged whole, by its cgroup, which outside kubelet's tree no path
+// shows, so the hosts file alone only refuses. In the host pid namespace
+// only a sign counts, as nothing else marks a machine single-tenant;
+// where the hook would be scoped, a hosts file that could not be read
+// refuses too (limitedScope).
 func (s Shape) inPod() bool {
-	return s.kubepods() || s.KubeletHosts || s.KubeletHostsReason != ""
+	return s.kubepods() || s.KubeletHosts
 }
 
 // kubepods reports whether our cgroup is in kubelet's tree, by a whole
@@ -457,12 +461,16 @@ func (s Shape) kubepods() bool {
 // limitedScope is the scope that judges only this job's sockets, with the
 // job's subtree: the pod's cgroup in a pod, our own cgroup outside one.
 func (s Shape) limitedScope(pod bool) (Scope, error) {
+	if !pod && s.KubeletHostsReason != "" {
+		return Scope{}, fmt.Errorf("whether this is a Kubernetes pod, whose other containers the cgroup hook "+
+			"would have to judge too, is unknown: /etc/hosts could not be read (%s)", s.KubeletHostsReason)
+	}
 	sub := s.CgroupPath
 	if pod {
 		if sub = podCgroup(s.CgroupPath); sub == "" {
 			return Scope{}, fmt.Errorf("in a Kubernetes pod whose cgroup %s is in no pod cgroup of kubelet's "+
-				"(kubelet's /etc/hosts %v, %q): the cgroup hook would not judge the pod's other containers",
-				s.CgroupPath, s.KubeletHosts, s.KubeletHostsReason)
+				"(kubelet's /etc/hosts: %v): the cgroup hook would not judge the pod's other containers",
+				s.CgroupPath, s.KubeletHosts)
 		}
 	} else if CgroupLevel(s.CgroupPath) == 0 {
 		return Scope{}, errors.New("in the root cgroup outside the host pid namespace: no cgroup of this job's own " +

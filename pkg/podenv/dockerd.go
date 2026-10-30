@@ -102,8 +102,12 @@ type Dockerd struct {
 	// itself (runtimePid). 0 when it could not be shown, and Reason says
 	// why. Read only where the scope depends on it.
 	Runtime int32
-	// pid is the daemon's pid in our pid namespace, 0 when not visible.
+	// pid is the daemon's pid in our pid namespace: the process serving
+	// the socket, 0 when not visible or when only its listener's is known.
 	pid int32
+	// info is the daemon's GET /info, asked once (askInfo).
+	info    *daemonInfo
+	infoErr error
 }
 
 // note adds why a fact could not be read to the reason.
@@ -122,6 +126,12 @@ func (d *Dockerd) note(fact string, err error) {
 // manager (systemd, for docker.socket and dockerd -H fd://). A visible
 // server can still be another container's process once the pod shares one
 // pid namespace, so the mount namespace is the decisive comparison.
+//
+// A server that cannot be shown (no unix_diag, a daemon still starting,
+// a connection held by none or by two) leaves the listener's mount
+// namespace to decide the kind, as it did before the server was looked
+// for: the daemon.json rewrite reads nothing else. Its runtime is then not
+// looked for, so wherever the scope depends on the daemon it refuses.
 func probeDockerd(socket string) Dockerd {
 	unknown := func(err error) Dockerd { return Dockerd{Kind: DockerdUnknown, Reason: err.Error()} }
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -153,8 +163,9 @@ func probeDockerd(socket string) Dockerd {
 	if pid == 0 {
 		return Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
 	}
-	if pid, err = servingPid(conn.(*net.UnixConn)); err != nil {
-		return unknown(err)
+	server, unserved := servingPid(conn.(*net.UnixConn))
+	if unserved == nil {
+		pid = server
 	}
 	ours, err := nsInode("/proc/self/ns/mnt")
 	if err != nil {
@@ -164,19 +175,31 @@ func probeDockerd(socket string) Dockerd {
 	if err != nil {
 		return unknown(err)
 	}
+	daemon := Dockerd{Kind: DockerdLocal, pid: pid}
 	if ours != theirs {
-		d := Dockerd{Kind: DockerdForeign, Reason: fmt.Sprintf("pid %d has another mount namespace", pid), pid: pid}
-		d.Cgroup, _ = ReadCgroupPath("/proc/" + strconv.Itoa(int(pid)) + "/cgroup")
-		return d
+		daemon = Dockerd{Kind: DockerdForeign, Reason: fmt.Sprintf("pid %d has another mount namespace", pid), pid: pid}
+		daemon.Cgroup, _ = ReadCgroupPath("/proc/" + strconv.Itoa(int(pid)) + "/cgroup")
 	}
-	return Dockerd{Kind: DockerdLocal, pid: pid}
+	if unserved != nil {
+		daemon.pid = 0
+		daemon.note(fmt.Sprintf("what serves it, for which its listener (pid %d) stands in", pid), unserved)
+	}
+	return daemon
 }
 
 // probeRuntime finds the daemon's runtime (runtimePid), asking the daemon
 // at socket the address of its containerd should no connection show one.
-// Only a daemon whose pid we see has one to find.
+// Only a daemon whose pid we see has one to find, and only one shown to
+// serve the socket, not its listener standing in.
 func (d *Dockerd) probeRuntime(socket string) {
-	runtime, err := runtimePid(d.pid, func() (string, error) { return containerdAddress(socket) })
+	if d.pid == 0 {
+		d.note("its runtime", errors.New("not looked for without the process serving the socket"))
+		return
+	}
+	runtime, err := runtimePid(d.pid, func() (string, error) {
+		info, err := d.askInfo(socket)
+		return info.containerdAddress(), err
+	})
 	if err != nil {
 		d.note("its runtime", err)
 		return
@@ -194,7 +217,11 @@ func (d *Dockerd) probeContainerTree(socket string) {
 	if runtime == 0 {
 		return
 	}
-	driver, err := cgroupDriver(socket)
+	info, err := d.askInfo(socket)
+	driver := info.CgroupDriver
+	if err == nil && driver == "" {
+		err = errors.New("GET /info names no cgroup driver")
+	}
 	if err != nil {
 		d.note("its cgroup driver", err)
 		if d.ContainerTree, err = unaskedTree(runtime); err != nil {
@@ -227,28 +254,60 @@ func (d *Dockerd) probeContainerTree(socket string) {
 // it rather than as its flags, daemon.json and the sockets there now
 // would pick it: the holder of the other end of each connection the
 // daemon made, by inode, which unix_diag gives in the daemon's network
-// namespace. A connection whose other end no process we see holds may be
-// to a containerd outside our pid namespace, and refuses. A daemon
-// connected to no containerd runs one in its own process (ownContainerd).
+// namespace. A connection whose other end no process we see holds, looked
+// at again a moment later (runtimeRetry), may be to a containerd outside
+// our pid namespace, and refuses. A daemon connected to no containerd runs
+// one in its own process (ownContainerd).
 func runtimePid(pid int32, containerdAddr func() (string, error)) (int32, error) {
+	containerd, unheld, err := connectedContainerd(pid)
+	if err == nil && unheld != 0 {
+		runtimeRetry()
+		containerd, unheld, err = connectedContainerd(pid)
+	}
+	switch {
+	case err != nil:
+		return 0, err
+	case unheld != 0:
+		return 0, fmt.Errorf("no process we see holds the other end of a connection it made (socket %d), "+
+			"which may be a containerd outside our pid namespace", unheld)
+	case len(containerd) == 1 && containerd[0] > 0 && containerd[0] <= math.MaxInt32:
+		return int32(containerd[0]), nil
+	case len(containerd) > 1:
+		return 0, fmt.Errorf("it is connected to more than one containerd (pids %v)", containerd)
+	}
+	if err := ownContainerd(pid, containerdAddr); err != nil {
+		return 0, fmt.Errorf("it is connected to no containerd, and %w", err)
+	}
+	return pid, nil
+}
+
+// runtimeRetry waits before runtimePid looks again at a connection whose
+// other end no process held: a holder exiting has closed it by then, and
+// a descriptor in flight between processes has landed. A test stands in.
+var runtimeRetry = func() { time.Sleep(100 * time.Millisecond) }
+
+// connectedContainerd is the containerd processes at the other end of the
+// connections the daemon at pid made, and a socket at the other end of
+// one that no process we see holds, 0 for none.
+func connectedContainerd(pid int32) (containerd []int, unheld uint64, err error) {
 	proc := "/proc/" + strconv.Itoa(int(pid))
 	inodes, err := procfs.Sockets(int(pid))
 	if err != nil {
-		return 0, fmt.Errorf("its sockets: %w", err)
+		return nil, 0, fmt.Errorf("its sockets: %w", err)
 	}
 	netns := proc + "/ns/net"
 	ours, err := nsInode("/proc/self/ns/net")
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	if theirs, err := nsInode(netns); err != nil {
-		return 0, err
+		return nil, 0, err
 	} else if theirs == ours {
 		netns = ""
 	}
 	socks, err := unixDiag(netns, 0)
 	if err != nil {
-		return 0, fmt.Errorf("its connections: %w", err)
+		return nil, 0, fmt.Errorf("its connections: %w", err)
 	}
 	held := make(map[uint64]bool, len(inodes))
 	for _, ino := range inodes {
@@ -265,13 +324,11 @@ func runtimePid(pid int32, containerdAddr func() (string, error)) (int32, error)
 	}
 	holders, err := procfs.SocketHolders(peers)
 	if err != nil {
-		return 0, fmt.Errorf("its connections' other ends: %w", err)
+		return nil, 0, fmt.Errorf("its connections' other ends: %w", err)
 	}
-	var containerd []int
 	for peer := range peers {
 		if len(holders[peer]) == 0 {
-			return 0, fmt.Errorf("no process we see holds the other end of a connection it made (socket %d), "+
-				"which may be a containerd outside our pid namespace", peer)
+			unheld = peer
 		}
 		for _, p := range holders[peer] {
 			if procfs.Comm(p) == "containerd" && !slices.Contains(containerd, p) {
@@ -279,16 +336,7 @@ func runtimePid(pid int32, containerdAddr func() (string, error)) (int32, error)
 			}
 		}
 	}
-	switch {
-	case len(containerd) == 1 && containerd[0] > 0 && containerd[0] <= math.MaxInt32:
-		return int32(containerd[0]), nil
-	case len(containerd) > 1:
-		return 0, fmt.Errorf("it is connected to more than one containerd (pids %v)", containerd)
-	}
-	if err := ownContainerd(pid, containerdAddr); err != nil {
-		return 0, fmt.Errorf("it is connected to no containerd, and %w", err)
-	}
-	return pid, nil
+	return containerd, unheld, nil
 }
 
 // ownContainerd says why the daemon at pid, connected to no containerd,
@@ -352,29 +400,30 @@ func unaskedTree(pid int32) (string, error) {
 	return own, nil
 }
 
-// containerdAddress asks the daemon at socket for the address of its
-// containerd (GET /info), "" for none named.
-func containerdAddress(socket string) (string, error) {
-	var info struct{ Containerd *struct{ Address string } }
-	if err := dockerGet(socket, "/info", &info); err != nil {
-		return "", err
-	}
-	if info.Containerd == nil {
-		return "", nil
-	}
-	return strings.TrimPrefix(info.Containerd.Address, "unix://"), nil
+// daemonInfo is what the probes read from the daemon's GET /info: its
+// cgroup driver, and where it reaches its containerd.
+type daemonInfo struct {
+	CgroupDriver string
+	Containerd   *struct{ Address string }
 }
 
-// cgroupDriver asks the daemon at socket for its cgroup driver (GET /info).
-func cgroupDriver(socket string) (string, error) {
-	var info struct{ CgroupDriver string }
-	if err := dockerGet(socket, "/info", &info); err != nil {
-		return "", err
+// containerdAddress is the address of the daemon's containerd, without the
+// unix:// scheme, "" for none named.
+func (i daemonInfo) containerdAddress() string {
+	if i.Containerd == nil {
+		return ""
 	}
-	if info.CgroupDriver == "" {
-		return "", errors.New("GET /info names no cgroup driver")
+	return strings.TrimPrefix(i.Containerd.Address, "unix://")
+}
+
+// askInfo asks the daemon at socket for GET /info, once for every probe
+// that reads it, so a busy daemon costs its timeout once.
+func (d *Dockerd) askInfo(socket string) (daemonInfo, error) {
+	if d.info == nil {
+		d.info = &daemonInfo{}
+		d.infoErr = dockerGet(socket, "/info", d.info)
 	}
-	return info.CgroupDriver, nil
+	return *d.info, d.infoErr
 }
 
 // dockerGet asks the daemon at socket for path, within 2s, and decodes

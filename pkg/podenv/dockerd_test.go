@@ -58,18 +58,41 @@ func fakeDaemon(t *testing.T, status int, body string) string {
 	return sock
 }
 
-// The daemon names its cgroup driver in /info; an answer without one, or
-// an error, leaves it unread.
-func TestCgroupDriver(t *testing.T) {
-	if got, err := cgroupDriver(fakeDaemon(t, http.StatusOK, `{"CgroupDriver":"systemd","CgroupVersion":"2"}`)); err != nil || got != "systemd" {
-		t.Errorf("cgroupDriver = %q, %v; want systemd", got, err)
+// The daemon's /info is asked once for every probe that reads it, error
+// and all: its cgroup driver, and its containerd's address without the
+// scheme, or none.
+func TestAskInfo(t *testing.T) {
+	sock := fakeDaemon(t, http.StatusOK, `{"CgroupDriver":"systemd","Containerd":{"Address":"unix:///run/containerd/containerd.sock"}}`)
+	var d Dockerd
+	if info, err := d.askInfo(sock); err != nil || info.CgroupDriver != "systemd" || info.containerdAddress() != "/run/containerd/containerd.sock" {
+		t.Errorf("askInfo = %+v, %v; want systemd, /run/containerd/containerd.sock", info, err)
 	}
-	for _, d := range []struct {
+	if err := os.Remove(sock); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := d.askInfo(sock); err != nil || info.CgroupDriver != "systemd" {
+		t.Errorf("askInfo again = %+v, %v; want the first answer, not asked again", info, err)
+	}
+	for body, want := range map[string]string{
+		`{"Containerd":{"Address":"/var/run/docker/containerd/containerd.sock","Namespaces":{"Containers":"moby"}}}`: "/var/run/docker/containerd/containerd.sock",
+		`{"CgroupDriver":"cgroupfs"}`: "",
+	} {
+		var d Dockerd
+		if info, err := d.askInfo(fakeDaemon(t, http.StatusOK, body)); err != nil || info.containerdAddress() != want {
+			t.Errorf("askInfo(%s) = %+v, %v; want containerd at %q", body, info, err, want)
+		}
+	}
+	for _, c := range []struct {
 		status int
 		body   string
-	}{{http.StatusOK, `{"CgroupVersion":"2"}`}, {http.StatusInternalServerError, `{}`}, {http.StatusOK, `{not json`}} {
-		if got, err := cgroupDriver(fakeDaemon(t, d.status, d.body)); err == nil {
-			t.Errorf("cgroupDriver(%d %s) = %q, want an error", d.status, d.body, got)
+	}{{http.StatusInternalServerError, `{}`}, {http.StatusOK, `{not json`}} {
+		var d Dockerd
+		sock := fakeDaemon(t, c.status, c.body)
+		if _, err := d.askInfo(sock); err == nil {
+			t.Errorf("askInfo(%d %s): want an error", c.status, c.body)
+		}
+		if _, err := d.askInfo(sock); err == nil {
+			t.Errorf("askInfo(%d %s) again: want the error kept", c.status, c.body)
 		}
 	}
 }
@@ -96,6 +119,17 @@ func TestProbeContainerTree(t *testing.T) {
 	d = probe(Dockerd{Kind: DockerdLocal, pid: int32(os.Getpid())}, fakeDaemon(t, http.StatusOK, `{"CgroupDriver":"none"}`))
 	if d.ContainerTree != "" || !strings.Contains(d.Reason, "no rule") {
 		t.Errorf("unknown driver: got %+v, want no tree, with the reason", d)
+	}
+	// One that names none is judged as one that did not say.
+	d = probe(Dockerd{Kind: DockerdLocal, pid: int32(os.Getpid())}, fakeDaemon(t, http.StatusOK, `{"CgroupVersion":"2"}`))
+	if d.ContainerTree != ours || !strings.Contains(d.Reason, "names no cgroup driver") {
+		t.Errorf("no driver named: got %+v, want our own mount's root %q, with the reason", d, ours)
+	}
+	// Without the process serving the socket, its listener standing in,
+	// no runtime is looked for, and no tree.
+	d = probe(Dockerd{Kind: DockerdLocal}, fakeDaemon(t, http.StatusOK, `{"CgroupDriver":"cgroupfs"}`))
+	if d.Runtime != 0 || d.ContainerTree != "" || !strings.Contains(d.Reason, "not looked for") {
+		t.Errorf("unserved: got %+v, want no runtime and no tree, with the reason", d)
 	}
 	// A daemon that does not say, as a busy one may not in time, is judged
 	// by both drivers' trees as its runtime sees them, a containerd it is
@@ -165,15 +199,17 @@ var standInHeld []net.Conn
 // descriptor for it; as "serve" it answers HTTP on the listener it was
 // handed; as "connect" it holds a connection to each socket in the list
 // $CARGOWALL_TEST_SOCK, once each has answered, and holds those it
-// accepts at $CARGOWALL_TEST_LISTEN, if set. Each connection it accepts is
-// answered with a byte.
+// accepts at $CARGOWALL_TEST_LISTEN, if set. As "lend" it parks each as
+// "hide" does, and holds it again once the test makes
+// $CARGOWALL_TEST_TRIGGER. Each connection it accepts is answered with a
+// byte.
 func TestStandIn(t *testing.T) {
 	role, sock, ready := os.Getenv("CARGOWALL_TEST_ROLE"), os.Getenv("CARGOWALL_TEST_SOCK"), os.Getenv("CARGOWALL_TEST_READY")
 	if role == "" {
 		t.Skip("run by standIn")
 	}
 	switch role {
-	case "listen", "drop", "hide":
+	case "listen", "drop", "hide", "lend":
 		standInAccept(t, sock, role)
 	case "serve":
 		l, err := net.FileListener(os.NewFile(3, "listener"))
@@ -229,14 +265,54 @@ func standInAccept(t *testing.T, sock, role string) {
 			case "listen":
 				standInHeld = append(standInHeld, c)
 				continue
-			case "hide":
+			case "hide", "lend":
 				if err := parkConn(park[0], c); err != nil {
 					t.Error(err)
 				}
 			}
 			c.Close()
+			if role == "lend" {
+				go takeBack(t, park[1])
+			}
 		}
 	}()
+}
+
+// takeBack holds again, for "lend", the connection parked on sock, once
+// $CARGOWALL_TEST_TRIGGER exists, and then makes it with ".done" added.
+func takeBack(t *testing.T, sock int) {
+	trigger := os.Getenv("CARGOWALL_TEST_TRIGGER")
+	for {
+		if _, err := os.Stat(trigger); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	oob := make([]byte, unix.CmsgSpace(4))
+	_, oobn, _, _, err := unix.Recvmsg(sock, make([]byte, 1), oob, 0)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+	if err != nil || len(msgs) != 1 {
+		t.Errorf("parked message: %v, %d control messages", err, len(msgs))
+		return
+	}
+	fds, err := unix.ParseUnixRights(&msgs[0])
+	if err != nil || len(fds) != 1 {
+		t.Errorf("parked descriptor: %v, %v", err, fds)
+		return
+	}
+	c, err := net.FileConn(os.NewFile(uintptr(fds[0]), "lent"))
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	standInHeld = append(standInHeld, c)
+	if err := os.WriteFile(trigger+".done", nil, 0o644); err != nil {
+		t.Error(err)
+	}
 }
 
 // parkConn sends a descriptor for c in a message on sock, where it stays
@@ -358,6 +434,30 @@ func TestRuntimePid(t *testing.T) {
 			t.Errorf("%s: runtimePid = %d, %v; want containerd's %d", c.name, got, err, c.want)
 		}
 	}
+	// A far end in flight at the first look, held at the second: the look
+	// again waits for the stand-in to take it back.
+	trigger := filepath.Join(t.TempDir(), "trigger")
+	lentSock := filepath.Join(t.TempDir(), "containerd.sock")
+	lender := standIn(t, "containerd", "lend", []string{"CARGOWALL_TEST_SOCK=" + lentSock, "CARGOWALL_TEST_TRIGGER=" + trigger})
+	borrower := daemon("dockerd", lentSock)
+	saved := runtimeRetry
+	t.Cleanup(func() { runtimeRetry = saved })
+	runtimeRetry = func() {
+		if err := os.WriteFile(trigger, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 250; i++ {
+			if _, err := os.Stat(trigger + ".done"); err == nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatal("the lent connection was never taken back")
+	}
+	if got, err := runtimePid(borrower, unread); err != nil || got != lender {
+		t.Errorf("a far end in flight at the first look: runtimePid = %d, %v; want containerd's %d", got, err, lender)
+	}
+	runtimeRetry = saved
 	if os.Geteuid() != 0 {
 		return
 	}
@@ -365,23 +465,6 @@ func TestRuntimePid(t *testing.T) {
 	apart := standInWith(t, netns, "dockerd", "connect", []string{"CARGOWALL_TEST_SOCK=" + sock})
 	if got, err := runtimePid(apart, unread); err != nil || got != containerd {
 		t.Errorf("in a network namespace of its own: runtimePid = %d, %v; want containerd's %d", got, err, containerd)
-	}
-}
-
-// A daemon names its containerd's address in /info, without the scheme,
-// or none.
-func TestContainerdAddress(t *testing.T) {
-	for body, want := range map[string]string{
-		`{"Containerd":{"Address":"/var/run/docker/containerd/containerd.sock","Namespaces":{"Containers":"moby"}}}`: "/var/run/docker/containerd/containerd.sock",
-		`{"Containerd":{"Address":"unix:///run/containerd/containerd.sock"}}`:                                        "/run/containerd/containerd.sock",
-		`{"CgroupDriver":"cgroupfs"}`: "",
-	} {
-		if got, err := containerdAddress(fakeDaemon(t, http.StatusOK, body)); err != nil || got != want {
-			t.Errorf("containerdAddress(%s) = %q, %v; want %q", body, got, err, want)
-		}
-	}
-	if got, err := containerdAddress(fakeDaemon(t, http.StatusInternalServerError, `{}`)); err == nil {
-		t.Errorf("containerdAddress(500) = %q, want an error", got)
 	}
 }
 

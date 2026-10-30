@@ -121,6 +121,11 @@ func TestHookScope(t *testing.T) {
 		// to be one.
 		{"privileged pod without pod cgroups", with(host("/system.slice/cri-containerd-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), kubeletHosts), false, all},
 		{"privileged container, hosts file unread", with(host("/system.slice/docker-a.scope", PidNSPrivate, Dockerd{Kind: DockerdAbsent}), hostsUnread), false, all},
+		{"nested node, tree read as ours alone, hosts file unread", with(with(nested("/system.slice/cri-containerd-a.scope", PidNSPrivate, local), tree(CgroupTreeOurs)), hostsUnread), false, all},
+		// In the host pid namespace only a sign of a pod counts: nothing
+		// else marks a machine single-tenant.
+		{"runner VM, hosts file unread", with(host(runner, PidNSHost, local), hostsUnread), true, all},
+		{"ARC runner pod, hosts file unread", with(host(pod, PidNSPrivate, foreign), hostsUnread), true, inPod},
 		{"hostPID pod without pod cgroups", with(host("/system.slice/cri-containerd-a.scope", PidNSHost, local), kubeletHosts), false, all},
 		{"nested node, pod without pod cgroups", with(with(nested("/system.slice/cri-containerd-a.scope", PidNSPrivate, local), tree(CgroupTreeOurs)), kubeletHosts), false, all},
 		{"ARC runner pod, kubelet's hosts file", with(host(pod, PidNSPrivate, foreign), kubeletHosts), true, inPod},
@@ -612,8 +617,9 @@ func TestProbeDockerd_NotASocket(t *testing.T) {
 }
 
 // A daemon in our own process shares our mount namespace: local. A
-// listener that accepts and does not answer serves nothing, and is
-// unidentified.
+// listener that accepts and does not answer is not shown to serve, and
+// stands in for what does: local by its mount namespace, with no daemon's
+// pid to look for a runtime by.
 func TestProbeDockerd_Local(t *testing.T) {
 	if d := probeDockerd(fakeDaemon(t, http.StatusOK, `{}`)); d.Kind != DockerdLocal || d.pid != int32(os.Getpid()) {
 		t.Errorf("local daemon: got %+v, want local, this process", d)
@@ -629,7 +635,7 @@ func TestProbeDockerd_Local(t *testing.T) {
 			c.Close()
 		}
 	}()
-	if d := probeDockerd(sock); d.Kind != DockerdUnknown || !strings.Contains(d.Reason, "_ping") {
-		t.Errorf("silent listener: got %+v, want unknown, unanswered", d)
+	if d := probeDockerd(sock); d.Kind != DockerdLocal || d.pid != 0 || !strings.Contains(d.Reason, "stands in") || !strings.Contains(d.Reason, "_ping") {
+		t.Errorf("silent listener: got %+v, want local by the listener, unanswered, no daemon's pid", d)
 	}
 }

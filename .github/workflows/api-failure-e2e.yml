@@ -375,10 +375,7 @@ jobs:
       - name: Stop cargowall and assert clean teardown
         run: |
           sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
-          # One table holds the whole redirect: the DNAT and the input guard.
-          if sudo nft list table ip cargowall > /dev/null 2>&1; then
-            echo "::error::DNS redirect table leaked after stop"; exit 1
-          fi
+          bash scripts/ci/dns-redirect-gone.sh /tmp/cargowall.log "after stop"
           getent hosts example.com > /dev/null \
             || { echo "::error::DNS broken after teardown"; exit 1; }
 
@@ -570,9 +567,7 @@ jobs:
 
       - name: Assert host state restored and no misreported sentinels
         run: |
-          if sudo nft list table ip cargowall > /dev/null 2>&1; then
-            echo "::error::DNS redirect table leaked — startup SIGTERM did not run teardown"; exit 1
-          fi
+          bash scripts/ci/dns-redirect-gone.sh /tmp/cargowall.log "after the startup SIGTERM"
           # The cancelled fetch must not be misreported as an outage: even
           # with api-failure-mode=fail, no failure sentinel may be written.
           test ! -f /tmp/cargowall-failed \
@@ -697,9 +692,7 @@ jobs:
           # cannot repair itself. Arbitrary sudo working again is the proof.
           sudo -n /usr/bin/id -u > /dev/null \
             || { echo "::error::sudo still restricted after forced teardown"; exit 1; }
-          if sudo nft list table ip cargowall > /dev/null 2>&1; then
-            echo "::error::DNS redirect table leaked through the forced teardown"; exit 1
-          fi
+          bash scripts/ci/dns-redirect-gone.sh /tmp/cargowall.log "after the forced teardown"
           if sudo test -f /etc/docker/daemon.json.cargowall.bak; then
             echo "::error::daemon.json backup left behind — Docker DNS not restored"; exit 1
           fi

@@ -34,32 +34,33 @@ import (
 // redirect must already be up, so setup records the failure and settle
 // reports it.
 type dnsRedirect struct {
-	installed *network.DNSRedirect
-	err       error // why setup failed
+	active bool
+	err    error // why setup failed
 }
 
 // startDNSRedirect installs the redirect for the proxy, and for its
 // container listener at bridgeIP when there is one. The returned undo
-// removes it; the caller defers it. Unlike the other host mutations it is
-// registered after setup: the kernel deletes the table with its owning
-// socket however the process ends, so a signal landing mid-setup leaves
-// nothing behind.
+// removes it; the caller defers it. It is registered before the install,
+// like every host mutation's: the kernel deletes the table with its owning
+// socket however the process ends, but a forced shutdown landing
+// mid-install still owes the flush of the flows DNAT'd to the proxy
+// meanwhile, and its teardown waits for the install to finish.
 func startDNSRedirect(bridgeIP string, teardowns *teardownList, logger *slog.Logger) (*dnsRedirect, func()) {
-	installed, err := network.SetupDNSRedirect(logger, bridgeIP)
-	if err != nil {
-		return &dnsRedirect{err: err}, func() {}
-	}
+	redirect := network.NewDNSRedirect(logger)
 	undo := teardowns.add(func() {
-		if err := installed.Teardown(); err != nil {
+		if err := redirect.Teardown(); err != nil {
 			logger.Warn("Failed to tear down DNS redirect", "error", err)
 		}
 	})
-	return &dnsRedirect{installed: installed}, undo
+	if err := redirect.Install(bridgeIP); err != nil {
+		return &dnsRedirect{err: err}, undo
+	}
+	return &dnsRedirect{active: true}, undo
 }
 
 // isActive reports whether the redirect is in place. Nil-safe: nil is the
 // redirect not requested.
-func (r *dnsRedirect) isActive() bool { return r != nil && r.installed != nil }
+func (r *dnsRedirect) isActive() bool { return r != nil && r.active }
 
 // settle hands a failed setup to the ledger, which owns the log line and
 // decides whether startup fails. Nil-safe.

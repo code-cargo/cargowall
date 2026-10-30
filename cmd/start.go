@@ -456,6 +456,15 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		return nil
 	}
 
+	// postures decides what losing a requested layer means: a lost enforce
+	// rung fails startup, a lost observe rung is recorded for the summary.
+	// Built as soon as the policy's mode is settled, so a lost redirect
+	// fails before any eBPF is loaded.
+	postures := newPostures(cmd, caps.KernelVersion, !configMgr.IsAuditMode(), logger)
+	if err := redirect.settle(postures); err != nil {
+		return err
+	}
+
 	// Find network interface
 	ifname := cmd.Interface
 	if ifname == "" {
@@ -571,12 +580,6 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// two-phase boot order — observer before the event reader, docker
 	// tracking after the dockerd restart — lives in containerAttribution;
 	// a nil value is the disabled feature and every call below no-ops.
-	// postures decides what losing a requested layer means: a lost enforce
-	// rung fails startup, a lost observe rung is recorded for the summary.
-	postures := newPostures(cmd, caps.KernelVersion, !configMgr.IsAuditMode(), logger)
-	if err := redirect.settle(postures); err != nil {
-		return err
-	}
 	hookScope, hookScopeErr := shape.HookScope()
 	attribution, err := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
 		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, hookScope, hookScopeErr, &objs, postures, logger)

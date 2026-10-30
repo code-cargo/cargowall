@@ -89,10 +89,11 @@ func tallyEvents(evts []events.AuditEvent) (blocked, allowed, dnsBlocked, protoB
 }
 
 // renderPostures writes a table of the postures that did not come up as
-// requested, with why. Only observe rungs can appear (a lost enforce rung
-// fails startup), so the table says the measurement never ran — without it,
-// an observe run reporting no would-blocks reads exactly like a clean one.
-// Nothing at all when every requested posture applied.
+// requested, with why. A lost fail-closed posture fails startup, so what
+// appears is what was allowed to be lost: an observe rung, whose absence
+// would make a run reporting no would-blocks read exactly like a clean one;
+// the DNS redirect under an auditing policy; or any layer lost in policy
+// lockdown. Nothing at all when every requested posture applied.
 func renderPostures(w io.Writer, recs []postureLine) {
 	var lost []postureLine
 	for _, r := range recs {

@@ -300,12 +300,12 @@ func TestDNSRedirect_Ownership(t *testing.T) {
 	stale := other.AddTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: RedirectTable})
 	other.AddChain(&nftables.Chain{Name: "leftover", Table: stale})
 	require.NoError(t, other.Flush())
-	r, err := SetupDNSRedirect(logger, "10.54.0.1")
-	require.NoError(t, err)
+	r := NewDNSRedirect(logger)
+	require.NoError(t, r.Install("10.54.0.1"))
 	want := map[string]int{"output": 6, "input": 2, "prerouting": 4}
 	require.Equal(t, want, redirectRules(t), "setup must replace an unowned table, not add to it")
 
-	_, err = SetupDNSRedirect(logger, "")
+	err = NewDNSRedirect(logger).Install("")
 	require.ErrorIs(t, err, unix.EPERM, "a second setup must not take over a live redirect")
 	require.ErrorContains(t, err, "another process owns the table")
 	other.DelTable(stale)
@@ -314,15 +314,26 @@ func TestDNSRedirect_Ownership(t *testing.T) {
 	_ = other.Flush()
 	require.Equal(t, want, redirectRules(t), "nothing another socket did may touch the table")
 
-	_, err = SetupDNSRedirect(logger, "fd00::1")
-	require.Error(t, err, "an IPv6 bridge IP is refused")
+	require.Error(t, NewDNSRedirect(logger).Install("fd00::1"), "an IPv6 bridge IP is refused")
+	require.Error(t, r.Install(""), "an installed redirect is not installed twice")
 
 	require.NoError(t, r.Teardown())
 	require.Empty(t, redirectRules(t), "teardown must remove the table")
+	require.NoError(t, r.Teardown(), "a second teardown is a no-op")
+	require.Error(t, r.Install(""), "a torn-down redirect is not installed again")
+	require.Empty(t, redirectRules(t))
+
+	// Teardown registered ahead of the install, as startup does, and run
+	// first by a forced shutdown: the install that follows must not leave a
+	// table no undo will remove.
+	early := NewDNSRedirect(logger)
+	require.NoError(t, early.Teardown(), "nothing installed, nothing to remove")
+	require.Error(t, early.Install(""))
+	require.Empty(t, redirectRules(t))
 
 	// The socket closing without a teardown, as when the process dies.
-	r, err = SetupDNSRedirect(logger, "")
-	require.NoError(t, err)
+	r = NewDNSRedirect(logger)
+	require.NoError(t, r.Install(""))
 	require.Equal(t, map[string]int{"output": 6, "input": 2}, redirectRules(t))
 	require.NoError(t, r.conn.Close())
 	require.Empty(t, redirectRules(t), "the kernel must delete the table with the socket that owns it")
@@ -336,12 +347,16 @@ func TestDNSRedirect_Holder(t *testing.T) {
 	if os.Getenv(holderEnv) != "1" {
 		t.Skip("the redirect-holding child of TestDNSRedirect_DiesWithProcess")
 	}
-	if _, err := SetupDNSRedirect(discardLogger(), ""); err != nil {
+	r := NewDNSRedirect(discardLogger())
+	if err := r.Install(""); err != nil {
 		fmt.Println("setup:", err)
 		os.Exit(1)
 	}
 	fmt.Println("installed")
 	time.Sleep(time.Minute)
+	// An unreachable redirect would let a GC finalize its socket, deleting
+	// the table before the parent's kill.
+	runtime.KeepAlive(r)
 }
 
 // TestDNSRedirect_DiesWithProcess: a process killed outright, with no
@@ -371,8 +386,8 @@ func TestDNSRedirect_DiesWithProcess(t *testing.T) {
 // install sets up the redirect for the rest of the test.
 func install(t *testing.T, bridgeIP string) {
 	t.Helper()
-	r, err := SetupDNSRedirect(discardLogger(), bridgeIP)
-	require.NoError(t, err)
+	r := NewDNSRedirect(discardLogger())
+	require.NoError(t, r.Install(bridgeIP))
 	t.Cleanup(func() { _ = r.Teardown() })
 }
 

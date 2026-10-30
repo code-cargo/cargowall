@@ -37,7 +37,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/config"
-	"github.com/code-cargo/cargowall/pkg/network"
 	"github.com/code-cargo/cargowall/pkg/origin"
 	"github.com/code-cargo/cargowall/pkg/podenv"
 	"github.com/code-cargo/cargowall/pkg/steps"
@@ -167,7 +166,7 @@ func TestPostures_DNSRedirect(t *testing.T) {
 
 	p, buf := ledger(&StartCmd{DNSRedirect: true}, true)
 	require.EqualError(t, failed.settle(p),
-		"--dns-redirect=on requested but could not be applied: "+
+		"--dns-redirect=true requested but could not be applied: "+
 			"nftables: installing table ip cargowall: operation not supported")
 	assert.Contains(t, buf.String(), "level=ERROR")
 
@@ -176,7 +175,7 @@ func TestPostures_DNSRedirect(t *testing.T) {
 	require.NoError(t, failed.settle(p), "an auditing policy blocks nothing, so the loss is not fatal")
 	assert.Contains(t, buf.String(), "level=WARN")
 	want := []postureLine{{
-		Posture: postureDNSRedirect, Requested: "on", Applied: "off",
+		Posture: postureDNSRedirect, Requested: "true", Applied: "false",
 		Reason: "nftables: installing table ip cargowall: operation not supported",
 	}}
 	assert.Equal(t, want, p.lines())
@@ -189,10 +188,26 @@ func TestPostures_DNSRedirect(t *testing.T) {
 	assert.Empty(t, p.layers)
 
 	p, _ = ledger(&StartCmd{DNSRedirect: true}, true)
-	require.NoError(t, (&dnsRedirect{installed: &network.DNSRedirect{}}).settle(p))
+	require.NoError(t, (&dnsRedirect{active: true}).settle(p))
 	require.NoError(t, (*dnsRedirect)(nil).settle(p), "nil is the redirect not requested")
 	assert.False(t, (*dnsRedirect)(nil).isActive())
 	assert.False(t, p.layers[0].degraded())
+}
+
+// Policy lockdown stays up deny-all until the job ends, and the job has
+// already failed: a lost fail-closed layer is logged and recorded, never a
+// startup error, which would take the whole firewall down with it.
+func TestPostures_LockdownLossIsNotFatal(t *testing.T) {
+	var buf bytes.Buffer
+	cmd := &StartCmd{ContainerEgress: ContainerEgressEnforce, DNSRedirect: true, policyLockdown: true}
+	p := newPostures(cmd, "6.6.141", true, slog.New(slog.NewTextHandler(&buf, nil)))
+	require.NoError(t, p.lose(postureContainerEgress, "hook refused"))
+	require.NoError(t, (&dnsRedirect{err: errors.New("nftables: EPERM")}).settle(p))
+	assert.Equal(t, 2, strings.Count(buf.String(), "level=ERROR"), "still logged as the error it is")
+	assert.Contains(t, buf.String(), "staying up in policy lockdown")
+	for _, l := range p.lines() {
+		assert.True(t, l.degraded(), "%s is recorded as lost", l.Posture)
+	}
 }
 
 // Without step attribution the hook never starts: fatal under enforce, a

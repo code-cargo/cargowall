@@ -67,7 +67,7 @@ test:
 
 test-bpf:
 	@printf "${GREEN}Running BPF tests (requires root)...${RESET}\n"
-	sudo go test -v -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/steps/ ./pkg/origin/
+	sudo go test -v -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/steps/ ./pkg/origin/ ./pkg/firewall/
 
 verifier-budget:
 	@printf "${GREEN}Measuring BPF verifier budget on $$(uname -r) (requires root)...${RESET}\n"
@@ -77,7 +77,7 @@ test-ci:
 	@printf "${GREEN}Running CI tests...${RESET}\n"
 	go run gotest.tools/gotestsum@latest --junitfile test-results.xml --format testdox -- ./...
 	@printf "${GREEN}Running BPF tests with sudo...${RESET}\n"
-	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/steps/ ./pkg/origin/
+	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/steps/ ./pkg/origin/ ./pkg/firewall/
 
 vet:
 	$(call check_tool,staticcheck)

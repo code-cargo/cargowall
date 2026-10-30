@@ -765,6 +765,29 @@ func TestTcEgressPortSpecificRules(t *testing.T) {
 			wantRet: tcActShot,
 		},
 
+		// A subnet rule's ports cover every address in it, not just one: the
+		// verdict looks under the matched rule's network address.
+		{
+			name:    "IPv4 TCP to another address in the subnet on allowed port",
+			packet:  craftIPv4TCP(t, "10.0.0.200", 443),
+			wantRet: tcActOK,
+		},
+		{
+			name:    "IPv4 TCP to another address in the subnet on denied port",
+			packet:  craftIPv4TCP(t, "10.0.0.200", 22),
+			wantRet: tcActShot,
+		},
+		{
+			name:    "IPv6 TCP to another address in the subnet on allowed port",
+			packet:  craftIPv6TCP(t, "2001:db8:1:ffff::abcd", 443),
+			wantRet: tcActOK,
+		},
+		{
+			name:    "IPv6 TCP to another address in the subnet on denied port",
+			packet:  craftIPv6TCP(t, "2001:db8:1:ffff::abcd", 22),
+			wantRet: tcActShot,
+		},
+
 		// Wildcard port deny after CIDR match (Gap 3):
 		// IP matches port_specific CIDR, no specific IP:port entry,
 		// falls back to wildcard 0.0.0.0:9090 / [::]:9090 which has action=0 (deny).
@@ -812,11 +835,14 @@ func TestTcEgressProtocolEnforcement(t *testing.T) {
 	err := objs.MapDefaultAction.Update(&defKey, &defVal, ebpf.UpdateAny)
 	require.NoError(t, err)
 
-	// Add 10.0.0.0/24 with port_specific=1
-	key4 := TcBpfLpmKey{Prefixlen: 24, Ip: ipToU32("10.0.0.0")}
+	// Host routes 10.0.0.1/32 and 10.0.0.2/32 with port_specific=1: the shape
+	// the firewall writes for a resolved hostname's addresses, whose port
+	// entries are keyed by the address itself (host bits 0).
 	val := TcBpfLpmVal{Action: 1, PortSpecific: 1}
-	err = objs.MapCidrs.Update(&key4, &val, ebpf.UpdateAny)
-	require.NoError(t, err)
+	for _, host := range []string{"10.0.0.1", "10.0.0.2"} {
+		key4 := TcBpfLpmKey{Prefixlen: 32, Ip: ipToU32(host)}
+		require.NoError(t, objs.MapCidrs.Update(&key4, &val, ebpf.UpdateAny))
+	}
 
 	// Allow 10.0.0.1:443 TCP ONLY (no UDP entry)
 	portVal := TcBpfPortVal{Action: 1}
@@ -834,9 +860,9 @@ func TestTcEgressProtocolEnforcement(t *testing.T) {
 	err = objs.MapPorts.Update(&portKeyICMP, &portVal, ebpf.UpdateAny)
 	require.NoError(t, err)
 
-	// Add IPv6 2001:db8:1::/48 with port_specific=1
-	key6 := TcBpfLpmKeyV6{Prefixlen: 48}
-	ip6 := net.ParseIP("2001:db8:1::")
+	// Host route 2001:db8:1::1/128 with port_specific=1
+	key6 := TcBpfLpmKeyV6{Prefixlen: 128}
+	ip6 := net.ParseIP("2001:db8:1::1")
 	copy(key6.Ip[:], ip6.To16())
 	err = objs.MapCidrsV6.Update(&key6, &val, ebpf.UpdateAny)
 	require.NoError(t, err)
@@ -1504,22 +1530,24 @@ func craftICMPv6NDP(t *testing.T) []byte {
 	return append(append(eth, ip6...), icmp...)
 }
 
-// addPortV4 inserts an IPv4 port rule for both TCP and UDP.
-func addPortV4(t *testing.T, m *ebpf.Map, ip uint32, port uint16, action uint8) {
+// addPortV4 inserts an IPv4 port rule for both TCP and UDP, keyed the way
+// the firewall keys it: the owning rule's network address and host bits
+// (0/0 for the wildcard-port entries).
+func addPortV4(t *testing.T, m *ebpf.Map, ip uint32, hostBits uint8, port uint16, action uint8) {
 	t.Helper()
 	val := TcBpfPortVal{Action: action}
 	for _, proto := range []uint8{ipprotoTCP, ipprotoUDP} {
-		key := TcBpfPortKey{Ip: ip, Port: port, Proto: proto}
+		key := TcBpfPortKey{Ip: ip, Port: port, Proto: proto, HostBits: hostBits}
 		require.NoError(t, m.Update(&key, &val, ebpf.UpdateAny))
 	}
 }
 
-// addPortV6 inserts an IPv6 port rule for both TCP and UDP.
-func addPortV6(t *testing.T, m *ebpf.Map, ipStr string, port uint16, action uint8) {
+// addPortV6 inserts an IPv6 port rule for both TCP and UDP; see addPortV4.
+func addPortV6(t *testing.T, m *ebpf.Map, ipStr string, hostBits uint8, port uint16, action uint8) {
 	t.Helper()
 	val := TcBpfPortVal{Action: action}
 	for _, proto := range []uint8{ipprotoTCP, ipprotoUDP} {
-		key := TcBpfPortKeyV6{Port: port, Proto: proto}
+		key := TcBpfPortKeyV6{Port: port, Proto: proto, HostBits: hostBits}
 		if ipStr != "" {
 			ip6 := net.ParseIP(ipStr)
 			copy(key.Ip[:], ip6.To16())
@@ -1528,11 +1556,13 @@ func addPortV6(t *testing.T, m *ebpf.Map, ipStr string, port uint16, action uint
 	}
 }
 
-// setupPortSpecificRules configures the BPF maps with port-specific rules.
+// setupPortSpecificRules configures the BPF maps with port-specific subnet
+// rules, in the shape pkg/firewall writes them (port entries keyed by the
+// subnet's network address and host bits).
 // Default action: deny
-// IPv4: 10.0.0.0/24 port_specific=1; 10.0.0.1:443 allow; 10.0.0.1:22 deny
+// IPv4: 10.0.0.0/24 port_specific=1; :443 allow; :22 deny
 // IPv4: wildcard 0.0.0.0:8080 allow; wildcard 0.0.0.0:9090 deny
-// IPv6: 2001:db8:1::/48 port_specific=1; [2001:db8:1::1]:443 allow; [2001:db8:1::1]:22 deny
+// IPv6: 2001:db8:1::/48 port_specific=1; :443 allow; :22 deny
 // IPv6: wildcard [::]:8080 allow; wildcard [::]:9090 deny
 func setupPortSpecificRules(t *testing.T, objs *TcBpfObjects) {
 	t.Helper()
@@ -1545,28 +1575,29 @@ func setupPortSpecificRules(t *testing.T, objs *TcBpfObjects) {
 
 	// Add IPv4 CIDR 10.0.0.0/24 with port_specific=1
 	key4 := TcBpfLpmKey{Prefixlen: 24, Ip: ipToU32("10.0.0.0")}
-	val := TcBpfLpmVal{Action: 1, PortSpecific: 1}
-	err = objs.MapCidrs.Update(&key4, &val, ebpf.UpdateAny)
+	val4 := TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 8}
+	err = objs.MapCidrs.Update(&key4, &val4, ebpf.UpdateAny)
 	require.NoError(t, err)
 
 	// IPv4 port rules (TCP + UDP for each)
-	addPortV4(t, objs.MapPorts, ipToU32("10.0.0.1"), 443, 1) // allow
-	addPortV4(t, objs.MapPorts, 0, 8080, 1)                  // wildcard allow
-	addPortV4(t, objs.MapPorts, ipToU32("10.0.0.1"), 22, 0)  // deny
-	addPortV4(t, objs.MapPorts, 0, 9090, 0)                  // wildcard deny
+	addPortV4(t, objs.MapPorts, ipToU32("10.0.0.0"), 8, 443, 1) // allow
+	addPortV4(t, objs.MapPorts, 0, 0, 8080, 1)                  // wildcard allow
+	addPortV4(t, objs.MapPorts, ipToU32("10.0.0.0"), 8, 22, 0)  // deny
+	addPortV4(t, objs.MapPorts, 0, 0, 9090, 0)                  // wildcard deny
 
 	// Add IPv6 CIDR 2001:db8:1::/48 with port_specific=1
 	key6 := TcBpfLpmKeyV6{Prefixlen: 48}
 	ip6 := net.ParseIP("2001:db8:1::")
 	copy(key6.Ip[:], ip6.To16())
-	err = objs.MapCidrsV6.Update(&key6, &val, ebpf.UpdateAny)
+	val6 := TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 80}
+	err = objs.MapCidrsV6.Update(&key6, &val6, ebpf.UpdateAny)
 	require.NoError(t, err)
 
 	// IPv6 port rules (TCP + UDP for each)
-	addPortV6(t, objs.MapPortsV6, "2001:db8:1::1", 443, 1) // allow
-	addPortV6(t, objs.MapPortsV6, "", 8080, 1)             // wildcard allow
-	addPortV6(t, objs.MapPortsV6, "2001:db8:1::1", 22, 0)  // deny
-	addPortV6(t, objs.MapPortsV6, "", 9090, 0)             // wildcard deny
+	addPortV6(t, objs.MapPortsV6, "2001:db8:1::", 80, 443, 1) // allow
+	addPortV6(t, objs.MapPortsV6, "", 0, 8080, 1)             // wildcard allow
+	addPortV6(t, objs.MapPortsV6, "2001:db8:1::", 80, 22, 0)  // deny
+	addPortV6(t, objs.MapPortsV6, "", 0, 9090, 0)             // wildcard deny
 }
 
 // craftIPv4HeaderWithFragOffset creates an IPv4 header with specified fragment offset

@@ -346,9 +346,8 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
 	// Host routes (/32) share the per-IP accumulator with AddIP so a shared IP
 	// contributed by both a static rule and a DNS resolution keeps the union of
-	// all its rules instead of last-write-wins narrowing (issue #71). Genuine
-	// subnets fall through to a direct LPM write — their port entries are keyed
-	// by the network address, a separate pre-existing concern.
+	// all its rules instead of last-write-wins narrowing. Genuine subnets fall
+	// through to a direct LPM write.
 	if prefixLen == 32 {
 		_, err := f.addIPv4Locked(ip4, ip4.String(), actionVal, ports)
 		return err
@@ -358,6 +357,11 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 	// which is required for LPM trie prefix matching.
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
 
+	// The verdict finds a subnet's port entries by masking the destination
+	// down to the network address the LPM match leaves open host_bits of, so
+	// the entries are keyed by (network address, host_bits) — ip4 is already
+	// the network address, net.ParseCIDR masks it.
+	hostBits := uint8(32 - prefixLen)
 	key := bpf.TcBpfLpmKey{
 		Prefixlen: prefixLen,
 		Ip:        ipUint32,
@@ -365,15 +369,17 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 	val := bpf.TcBpfLpmVal{
 		Action:       actionVal,
 		PortSpecific: 0,
+		HostBits:     hostBits,
 	}
 
 	if len(ports) > 0 {
 		val.PortSpecific = 1
 		for _, pp := range ports {
 			portKey := bpf.TcBpfPortKey{
-				Ip:    ipUint32,
-				Port:  pp.Port,
-				Proto: pp.Proto,
+				Ip:       ipUint32,
+				Port:     pp.Port,
+				Proto:    pp.Proto,
+				HostBits: hostBits,
 			}
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
@@ -405,6 +411,8 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 		return nil
 	}
 
+	// Keyed by (network address, host_bits), as in addCIDRv4.
+	hostBits := uint8(128 - prefixLen)
 	var key bpf.TcBpfLpmKeyV6
 	key.Prefixlen = prefixLen
 	copy(key.Ip[:], ip6)
@@ -412,6 +420,7 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 	val := bpf.TcBpfLpmVal{
 		Action:       actionVal,
 		PortSpecific: 0,
+		HostBits:     hostBits,
 	}
 
 	if len(ports) > 0 {
@@ -421,6 +430,7 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 			copy(portKey.Ip[:], ip6)
 			portKey.Port = pp.Port
 			portKey.Proto = pp.Proto
+			portKey.HostBits = hostBits
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
 			}

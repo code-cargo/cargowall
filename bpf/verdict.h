@@ -46,20 +46,30 @@ struct lpm_key {
     __u32 ip;
 } __attribute__((packed));
 
-// Value for LPM trie - action with optional port restrictions
+// Value for LPM trie - action with optional port restrictions.
+//
+// host_bits is the address width the rule leaves open: 32 (128 for IPv6)
+// minus its prefix length, so 0 is a host route. A port-specific rule's
+// port entries are keyed by the rule's network address plus host_bits (see
+// port_key), and the LPM lookup returns only this value, not the key that
+// matched — host_bits is how the verdict recovers which prefix that was.
 struct lpm_val {
     __u8 action;      // 0 = deny, 1 = allow
     __u8 port_specific; // 0 = all ports, 1 = check port map
-    __u16 pad;
+    __u8 host_bits;
+    __u8 pad;
 } __attribute__((packed));
 
-// Key for port-specific rules. For ICMP (proto=1) the port field is always 0;
-// ICMP has no L4 port, so the protocol byte alone discriminates the rule.
+// Key for port-specific rules: the owning rule's network address and
+// host_bits (see lpm_val), so a subnet's entries are found from any address
+// inside it and a host route's from its own. The wildcard-port entries are
+// ip 0 / host_bits 0. For ICMP (proto=1) the port field is always 0; ICMP
+// has no L4 port, so the protocol byte alone discriminates the rule.
 struct port_key {
     __u32 ip;
     __u16 port;
     __u8 proto;           // IPPROTO_TCP (6), IPPROTO_UDP (17), or IPPROTO_ICMP (1)
-    __u8 pad;
+    __u8 host_bits;
 } __attribute__((packed));
 
 // Value for port rules - just allow/deny
@@ -76,12 +86,13 @@ struct lpm_key_v6 {
     __u8 ip[16];
 } __attribute__((packed));
 
-// IPv6 port key
+// IPv6 port key — the network address and host_bits of the owning rule, as
+// in port_key.
 struct port_key_v6 {
     __u8 ip[16];
     __u16 port;
     __u8 proto;           // IPPROTO_TCP (6) or IPPROTO_UDP (17)
-    __u8 pad;
+    __u8 host_bits;
 } __attribute__((packed));
 
 // ---- Shared rule/config maps ----
@@ -148,12 +159,46 @@ static __always_inline __u8 audit_mode_active(void) {
     return (audit_mode && *audit_mode == 1) ? 1 : 0;
 }
 
+// rule_net_v4 masks ip (network byte order) down to the network address of
+// a rule leaving host_bits open — the address its port entries are keyed by.
+// host_bits 0 (a host route) returns ip unchanged.
+static __always_inline __u32 rule_net_v4(__u32 ip_nbo, __u8 host_bits) {
+    if (host_bits >= 32)
+        return 0;
+    return ip_nbo & bpf_htonl(0xffffffffU << host_bits);
+}
+
+// rule_net_v6 is rule_net_v4 for a 16-byte address, worked as two 64-bit
+// halves so the masking stays a few straight-line instructions.
+static __always_inline void rule_net_v6(__u8 out[16], const __u8 ip[16], __u8 host_bits) {
+    __u64 hi, lo;
+    __builtin_memcpy(&hi, ip, 8);
+    __builtin_memcpy(&lo, ip + 8, 8);
+    __u64 hi_mask = ~0ULL;
+    __u64 lo_mask = ~0ULL;
+    if (host_bits >= 128) {
+        hi_mask = 0;
+        lo_mask = 0;
+    } else if (host_bits >= 64) {
+        hi_mask = ~0ULL << (host_bits - 64);
+        lo_mask = 0;
+    } else {
+        lo_mask = ~0ULL << host_bits;
+    }
+    hi &= bpf_cpu_to_be64(hi_mask);
+    lo &= bpf_cpu_to_be64(lo_mask);
+    __builtin_memcpy(out, &hi, 8);
+    __builtin_memcpy(out + 8, &lo, 8);
+}
+
 // verdict_allowed_v4 returns 1 if a packet to dst (network byte order) on
 // dst_port (host order) / proto is allowed, 0 if denied. This is the exact
 // decision tc_egress made inline before phase 3b: LPM rule match →
 // port-specific check → 0.0.0.0 wildcard port → default action. A no-LPM
 // match consults only the wildcard-port entry, never a specific-IP port —
-// preserving the original asymmetry.
+// preserving the original asymmetry. The port-specific check looks under
+// the MATCHED rule's network address, so a subnet rule's ports cover every
+// address inside it, not only the network address itself.
 static __always_inline __u8 verdict_allowed_v4(__u32 dst_ip_nbo, __u16 dst_port, __u8 proto) {
     struct lpm_key key = {
         .prefixlen = 32,
@@ -172,10 +217,10 @@ static __always_inline __u8 verdict_allowed_v4(__u32 dst_ip_nbo, __u16 dst_port,
             }
         } else {
             struct port_key pkey = {
-                .ip = dst_ip_nbo,
+                .ip = rule_net_v4(dst_ip_nbo, rule->host_bits),
                 .port = dst_port,
                 .proto = proto,
-                .pad = 0
+                .host_bits = rule->host_bits
             };
             struct port_val *pval = bpf_map_lookup_elem(&map_ports, &pkey);
             if (pval) {
@@ -185,6 +230,7 @@ static __always_inline __u8 verdict_allowed_v4(__u32 dst_ip_nbo, __u16 dst_port,
                 }
             } else {
                 pkey.ip = 0;  // 0.0.0.0
+                pkey.host_bits = 0;
                 pval = bpf_map_lookup_elem(&map_ports, &pkey);
                 if (pval) {
                     decision_made = 1;
@@ -199,7 +245,7 @@ static __always_inline __u8 verdict_allowed_v4(__u32 dst_ip_nbo, __u16 dst_port,
             .ip = 0,  // 0.0.0.0 wildcard
             .port = dst_port,
             .proto = proto,
-            .pad = 0
+            .host_bits = 0
         };
         struct port_val *pval = bpf_map_lookup_elem(&map_ports, &pkey);
         if (pval) {
@@ -241,9 +287,10 @@ static __always_inline __u8 verdict_allowed_v6(const __u8 dst_ip6[16], __u16 dst
         } else {
             struct port_key_v6 pkey;
             __builtin_memset(&pkey, 0, sizeof(pkey));
-            __builtin_memcpy(pkey.ip, dst_ip6, 16);
+            rule_net_v6(pkey.ip, dst_ip6, rule->host_bits);
             pkey.port = dst_port;
             pkey.proto = proto;
+            pkey.host_bits = rule->host_bits;
 
             struct port_val *pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
             if (pval) {
@@ -253,6 +300,7 @@ static __always_inline __u8 verdict_allowed_v6(const __u8 dst_ip6[16], __u16 dst
                 }
             } else {
                 __builtin_memset(pkey.ip, 0, 16);
+                pkey.host_bits = 0;
                 pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
                 if (pval) {
                     decision_made = 1;

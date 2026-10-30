@@ -30,6 +30,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -159,14 +160,20 @@ func probeDockerd(socket string) Dockerd {
 
 // probeContainerTree reads where the daemon makes its containers' cgroups:
 // it asks the daemon for its cgroup driver over the socket, and finds the
-// tree that driver uses. Only a daemon whose pid we see has one to find.
-// One that does not answer in time, as a busy one may not, is judged by
-// both drivers' trees (unaskedTree).
+// tree that driver uses, as its runtime sees the machine (runtimePid).
+// Only a daemon whose pid we see has one to find. One that does not answer
+// in time, as a busy one may not, is judged by both drivers' trees
+// (unaskedTree).
 func (d *Dockerd) probeContainerTree(socket string) {
+	runtime, err := runtimePid(d.pid)
+	if err != nil {
+		d.note("its runtime", err)
+		return
+	}
 	driver, err := cgroupDriver(socket)
 	if err != nil {
 		d.note("its cgroup driver", err)
-		if d.ContainerTree, err = unaskedTree(d.pid); err != nil {
+		if d.ContainerTree, err = unaskedTree(runtime); err != nil {
 			d.note("its containers' cgroup tree", err)
 		}
 		return
@@ -175,9 +182,9 @@ func (d *Dockerd) probeContainerTree(socket string) {
 	var tree string
 	switch driver {
 	case "cgroupfs":
-		tree, err = mountRootOf(d.pid)
+		tree, err = mountRootOf(runtime)
 	case "systemd":
-		tree, err = systemdTree(d.pid)
+		tree, err = systemdTree(runtime)
 	default:
 		err = fmt.Errorf("cgroup driver %q has no rule", driver)
 	}
@@ -186,6 +193,38 @@ func (d *Dockerd) probeContainerTree(socket string) {
 		return
 	}
 	d.ContainerTree = tree
+}
+
+// containerdSockets are where dockerd reaches containerd, in its order: a
+// containerd of the machine's that answers, else the one it runs itself. A
+// test stands in for them.
+var containerdSockets = []string{"/run/containerd/containerd.sock", "/var/run/docker/containerd/containerd.sock"}
+
+// runtimePid is the process whose view of the machine decides where the
+// daemon at pid makes its containers' cgroups: containerd, whose shims run
+// runc, which makes them in its cgroup mount (cgroupfs) or asks the
+// systemd its environment's bus leads to (systemd), both containerd's.
+// containerd is found as the peer at the first of its sockets that takes
+// a connection, resolved in the daemon's root, and one outside our pid
+// namespace cannot be shown. With none answering, the daemon's own view is
+// taken, which a containerd it runs as its child shares.
+func runtimePid(pid int32) (int32, error) {
+	root, err := unix.Open("/proc/"+strconv.Itoa(int(pid))+"/root", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer unix.Close(root)
+	for _, path := range containerdSockets {
+		peer, err := socketPeerIn(root, path)
+		if err != nil {
+			continue
+		}
+		if peer == 0 {
+			return 0, fmt.Errorf("the containerd it reaches at %s is outside our pid namespace", path)
+		}
+		return peer, nil
+	}
+	return pid, nil
 }
 
 // unaskedTree is the tree a daemon whose cgroup driver is unknown makes
@@ -311,7 +350,8 @@ var errNoSystemd = errors.New("no systemd to reach")
 // socket, tcp), which this probe cannot follow and which it returns as
 // unfollowed: the client reaches it only if every path before it fails.
 // The address is a list of entries separated by ";", each a transport and
-// its "key=value" parameters separated by ",".
+// its "key=value" parameters separated by ",", whose values may escape a
+// byte as %XX.
 func busSocketPaths(addr string) (paths []string, unfollowed string, err error) {
 	for _, entry := range strings.Split(addr, ";") {
 		if entry == "" {
@@ -321,7 +361,10 @@ func busSocketPaths(addr string) (paths []string, unfollowed string, err error) 
 		path := ""
 		for _, kv := range strings.Split(params, ",") {
 			if v, ok := strings.CutPrefix(kv, "path="); ok && transport == "unix" {
-				path = v
+				// Values may escape any byte as %XX, as URL paths do.
+				if path, err = url.PathUnescape(v); err != nil {
+					return nil, "", fmt.Errorf("its system bus address %q: %w", entry, err)
+				}
 			}
 		}
 		if path == "" {

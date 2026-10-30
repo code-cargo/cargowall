@@ -379,6 +379,15 @@ func (s Shape) sharedPidNS(kubepods bool, in, whose string) (scope Scope, done b
 	}
 }
 
+// Under reports whether the cgroup at path is sub or below it, by path, as
+// one cgroup namespace gives both: "" is no cgroup, which covers nothing,
+// and "/" covers every cgroup. scopebpf.c's in_subtree asks the same of an
+// id, through at most 32 parents, and past that records a cgroup the hook
+// judges anyway.
+func Under(path, sub string) bool {
+	return sub != "" && (path == sub || strings.HasPrefix(path, strings.TrimSuffix(sub, "/")+"/"))
+}
+
 // underRoot reports whether a cgroup path, as our cgroup namespace gives
 // it, is under the namespace's root: the kernel starts one outside it with
 // "/..". "" is unknown, and not under it.
@@ -434,7 +443,7 @@ func (s Shape) initRefusal(sub string) error {
 	if s.InitCgroup == "" {
 		return fmt.Errorf("the cgroup of our pid namespace's init is unknown (%s)", s.InitCgroupReason)
 	}
-	if s.InitCgroup != sub && !strings.HasPrefix(s.InitCgroup, strings.TrimSuffix(sub, "/")+"/") {
+	if !Under(s.InitCgroup, sub) {
 		return fmt.Errorf("our pid namespace's init, pid 1, is in %s, outside this job's cgroup %s: the namespace "+
 			"is a node's or a machine's, and every task in it would count as this job's", s.InitCgroup, sub)
 	}

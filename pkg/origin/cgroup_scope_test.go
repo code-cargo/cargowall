@@ -84,15 +84,6 @@ func TestCgroupGone(t *testing.T) {
 	}
 }
 
-func TestUnder(t *testing.T) {
-	const pod = "/kubepods.slice/kubepods-pod1.slice"
-	require.True(t, under(pod, pod))
-	require.True(t, under(pod+"/cri-containerd-a.scope", pod))
-	require.False(t, under(pod+"x/cri-containerd-a.scope", pod), "a sibling whose name extends the pod's")
-	require.False(t, under("/docker/a", pod))
-	require.False(t, under(pod, ""), "no pod cgroup covers nothing")
-}
-
 // The startup walk, run from our own pid namespace as in a pod, records a
 // cgroup only our tasks are in, whatever its name, and leaves out one that
 // a task outside the namespace is in too: there, a task of ours was left
@@ -542,10 +533,12 @@ func TestCgroupScopeOutsideInner(t *testing.T) {
 	require.Error(t, s.cgroups().Lookup(empty, &v), "and so is one the scope holds that nothing listed")
 }
 
-// Clearing a mark looks twice: a task outside our pid namespace that enters
-// between the first look and the clearing leaves the cgroup marked. A mark
-// the map cannot take is reported, once.
-func TestCgroupScopeClearMarkLooksTwice(t *testing.T) {
+// Clearing a mark the listing did not reach: a cgroup a task of ours has
+// entered since, which scope_enter left out for the mark, is recorded; one
+// with none of ours is looked at twice, so that a task outside entering
+// between the looks leaves it marked, as record's own second look does for
+// the other. A mark the map cannot take is reported, once.
+func TestCgroupScopeClearMark(t *testing.T) {
 	own := ownCgroupBelowRoot(t)
 	ino, err := podenv.PidNamespaceInode()
 	require.NoError(t, err)
@@ -555,26 +548,43 @@ func TestCgroupScopeClearMarkLooksTwice(t *testing.T) {
 	dir, path, _, err := s.openCgroup(ownID)
 	require.NoError(t, err)
 	defer dir.Close()
-	marked := func() bool {
-		var v uint8
-		return s.objs.MapScopeShared.Lookup(ownID, &v) == nil
-	}
+	var v uint8
+	marked := func() bool { return s.objs.MapScopeShared.Lookup(ownID, &v) == nil }
+	recorded := func() bool { return s.cgroups().Lookup(ownID, &v) == nil }
 	found := newWalkFindings()
+	// looksRead stands in for cgroup.threads, a reading per look.
+	looksRead := func(reads ...string) {
+		t.Helper()
+		looks := 0
+		swap(t, &readThreads, func(*os.File) ([]byte, error) {
+			r := reads[min(looks, len(reads)-1)]
+			looks++
+			return []byte(r), nil
+		})
+	}
+
 	s.mark(ownID, path, &found)
-	require.True(t, marked())
-	looks := 0
-	swap(t, &readThreads, func(*os.File) ([]byte, error) {
-		looks++
-		if looks == 1 {
-			return []byte("7\n"), nil
-		}
-		return []byte("7\n0\n"), nil
-	})
-	s.clearMark(ownID, dir, path, &found)
-	require.True(t, marked(), "a task outside that entered between the looks keeps the mark")
+	looksRead("7\n")
+	s.clearMark(ownID, dir, path, true, &found)
+	require.True(t, !marked() && recorded(), "a cgroup ours alone loses its mark and is recorded")
+
+	require.NoError(t, s.cgroups().Delete(ownID))
+	s.mark(ownID, path, &found)
+	looksRead("7\n", "7\n0\n")
+	s.clearMark(ownID, dir, path, true, &found)
+	require.True(t, marked() && !recorded(), "a task outside entering before record's second look takes it out and marks it")
+
+	looksRead("", "0\n")
+	s.clearMark(ownID, dir, path, true, &found)
+	require.True(t, marked(), "a task outside entering between the looks at an empty cgroup keeps the mark")
+
+	looksRead("7\n")
+	s.clearMark(ownID, dir, path, false, &found)
+	require.True(t, !marked() && !recorded(), "one outside our cgroup namespace's root is unmarked, never recorded")
 
 	var log bytes.Buffer
 	s.logger = slog.New(slog.NewTextHandler(&log, nil))
+	require.NoError(t, s.objs.MapScopeShared.Put(ownID, uint8(1)))
 	s.mark(ownID+1, "/full", &found)
 	s.mark(ownID+1, "/full", &found)
 	require.Equal(t, 1, strings.Count(log.String(), "could not mark a cgroup shared"), "a full mark map is reported once a walk")

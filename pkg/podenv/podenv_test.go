@@ -303,6 +303,26 @@ func TestCgroupMountRoot(t *testing.T) {
 	}
 }
 
+func TestUnder(t *testing.T) {
+	const pod = "/kubepods.slice/kubepods-pod1.slice"
+	for _, c := range []struct {
+		path, sub string
+		want      bool
+	}{
+		{pod, pod, true},
+		{pod + "/cri-containerd-a.scope", pod, true},
+		{pod + "x/cri-containerd-a.scope", pod, false}, // a sibling whose name extends the pod's
+		{"/docker/a", pod, false},
+		{pod, "", false},         // no cgroup covers nothing
+		{"/docker/a", "/", true}, // the root covers every cgroup
+		{pod + "/a", pod + "/", true},
+	} {
+		if got := Under(c.path, c.sub); got != c.want {
+			t.Errorf("Under(%q, %q) = %v, want %v", c.path, c.sub, got, c.want)
+		}
+	}
+}
+
 // The kernel starts a path outside the reader's cgroup namespace's root
 // with "/.."; a cgroup may be named "..x" under it.
 func TestUnderRoot(t *testing.T) {

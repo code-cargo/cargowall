@@ -111,9 +111,12 @@ func parseEnviron(data []byte) map[string]string {
 // passwdHome is the home directory of the user with uid in the passwd
 // database, or of the current user for "", or "".
 var passwdHome = func(uid string) string {
-	u, err := user.Current()
+	var u *user.User
+	var err error
 	if uid != "" {
 		u, err = user.LookupId(uid)
+	} else {
+		u, err = user.Current()
 	}
 	if err == nil {
 		return u.HomeDir

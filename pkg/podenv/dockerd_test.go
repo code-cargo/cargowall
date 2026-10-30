@@ -77,6 +77,10 @@ func TestProbeContainerTree(t *testing.T) {
 	if err != nil {
 		t.Skipf("no cgroup v2 mount at %s: %v", CgroupRoot, err)
 	}
+	// No containerd to find: the daemon's own view decides.
+	saved := containerdSockets
+	containerdSockets = nil
+	t.Cleanup(func() { containerdSockets = saved })
 	d := Dockerd{Kind: DockerdLocal, pid: int32(os.Getpid())}
 	d.probeContainerTree(fakeDaemon(t, http.StatusOK, `{"CgroupDriver":"cgroupfs"}`))
 	if d.CgroupDriver != "cgroupfs" || d.ContainerTree != ours {
@@ -94,6 +98,59 @@ func TestProbeContainerTree(t *testing.T) {
 	d.probeContainerTree(fakeDaemon(t, http.StatusServiceUnavailable, `{}`))
 	if d.CgroupDriver != "" || d.ContainerTree != ours || !strings.Contains(d.Reason, "its cgroup driver") {
 		t.Errorf("unasked: got %+v, want our own mount's root %q, noting the driver unread", d, ours)
+	}
+}
+
+// The runtime whose view decides is the containerd answering at the first
+// of dockerd's sockets for it, found in dockerd's root; with none, dockerd
+// itself. A child of the test, listening, stands in for containerd.
+func TestRuntimePid(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "containerd.sock")
+	cmd := exec.Command(os.Args[0], "-test.run", "^TestRuntimeListener$")
+	cmd.Env = append(os.Environ(), "CARGOWALL_TEST_LISTEN="+sock)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	for i := 0; i < 250; i++ {
+		if _, err := os.Stat(sock); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	saved := containerdSockets
+	t.Cleanup(func() { containerdSockets = saved })
+	containerdSockets = []string{filepath.Join(t.TempDir(), "absent.sock"), sock}
+	if got, err := runtimePid(int32(os.Getpid())); err != nil || got != int32(cmd.Process.Pid) {
+		t.Errorf("runtimePid = %d, %v; want the listener's pid %d", got, err, cmd.Process.Pid)
+	}
+	containerdSockets = []string{filepath.Join(t.TempDir(), "absent.sock")}
+	if got, err := runtimePid(int32(os.Getpid())); err != nil || got != int32(os.Getpid()) {
+		t.Errorf("runtimePid with no containerd = %d, %v; want the daemon's own %d", got, err, os.Getpid())
+	}
+}
+
+// TestRuntimeListener is TestRuntimePid's stand-in containerd; on its own
+// it skips.
+func TestRuntimeListener(t *testing.T) {
+	sock := os.Getenv("CARGOWALL_TEST_LISTEN")
+	if sock == "" {
+		t.Skip("run by TestRuntimePid")
+	}
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		c.Close()
 	}
 }
 
@@ -254,6 +311,7 @@ func TestBusSocketPaths(t *testing.T) {
 		unfollowed string
 	}{
 		"unix:path=/run/dbus/system_bus_socket":                         {[]string{"/run/dbus/system_bus_socket"}, ""},
+		"unix:path=%2frun%2fdbus%2fsystem_bus_socket":                   {[]string{"/run/dbus/system_bus_socket"}, ""},
 		"unix:path=/host/bus,guid=0123":                                 {[]string{"/host/bus"}, ""},
 		"unix:path=/host/run/dbus/system_bus_socket;unix:path=/run/bus": {[]string{"/host/run/dbus/system_bus_socket", "/run/bus"}, ""},
 		"unix:guid=0123,path=/run/bus;":                                 {[]string{"/run/bus"}, ""},
@@ -265,8 +323,10 @@ func TestBusSocketPaths(t *testing.T) {
 			t.Errorf("busSocketPaths(%q) = %q, %q, %v; want %q, %q", addr, paths, unfollowed, err, want.paths, want.unfollowed)
 		}
 	}
-	if _, _, err := busSocketPaths(";"); err == nil {
-		t.Errorf(`busSocketPaths(";"): want an error`)
+	for _, addr := range []string{";", "unix:path=%zz"} {
+		if _, _, err := busSocketPaths(addr); err == nil {
+			t.Errorf("busSocketPaths(%q): want an error", addr)
+		}
 	}
 }
 

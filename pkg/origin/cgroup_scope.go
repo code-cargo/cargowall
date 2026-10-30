@@ -110,7 +110,7 @@ type subtree struct {
 // cgroup at own, whose kernel level is ownLevel: both paths are below the
 // same namespace root, so their depths differ as their levels do.
 func subtreeLevel(sub, own string, ownLevel uint32) (uint32, error) {
-	if !under(own, sub) {
+	if !podenv.Under(own, sub) {
 		return 0, fmt.Errorf("this process's cgroup %s is not under the job's cgroup %s", own, sub)
 	}
 	below := podenv.CgroupLevel(own) - podenv.CgroupLevel(sub)
@@ -284,7 +284,7 @@ func (s *cgroupScope) reconcileMarked(listed map[uint64]*listed, marked map[uint
 		if listed[id] != nil {
 			continue
 		}
-		dir, path, _, err := s.openCgroup(id)
+		dir, path, inside, err := s.openCgroup(id)
 		if cgroupGone(err) {
 			s.unmark(id)
 			continue
@@ -293,25 +293,32 @@ func (s *cgroupScope) reconcileMarked(listed map[uint64]*listed, marked map[uint
 			s.unreadable(id, fmt.Sprintf("id %d", id), err, found)
 			continue
 		}
-		s.clearMark(id, dir, path, found)
+		s.clearMark(id, dir, path, inside, found)
 		dir.Close()
 	}
 	return true
 }
 
 // clearMark clears the mark of the cgroup open at dir, id, if no task
-// outside our pid namespace is in it, then looks again: one that entered
-// between the look and the clearing was not seen by scope_leave, which
-// marks only cgroups the scope holds, and would have the job's next entry
-// record it.
-func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, found *walkFindings) {
+// outside our pid namespace is in it. One a task of ours has entered since
+// the listing, which scope_enter left out for the mark, is recorded, as
+// the listing would have, where the hook can see it (inside). One with no
+// task of ours is looked at again: a task outside that entered between the
+// look and the clearing was not seen by scope_leave, which marks only
+// cgroups the scope holds, and would have the job's next entry record it;
+// record's own second look covers the other.
+func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside bool, found *walkFindings) {
 	m, err := cgroupMembers(dir)
 	switch {
 	case cgroupGone(err):
 		s.unmark(id)
 	case err != nil:
 		s.unreadable(id, path, err, found)
-	case !m.theirs:
+	case m.theirs:
+	case m.ours && inside:
+		s.unmark(id)
+		s.record(id, dir, path, found)
+	default:
 		s.unmark(id)
 		if again, err := cgroupMembers(dir); err == nil && again.theirs {
 			s.mark(id, path, found)
@@ -383,7 +390,7 @@ func (s *cgroupScope) reconcileListed(id uint64, l *listed, marked bool, found *
 		}
 		return
 	}
-	if under(path, s.sub.path) {
+	if podenv.Under(path, s.sub.path) {
 		return
 	}
 	existed := s.recorded(id)
@@ -670,13 +677,6 @@ func (s *cgroupScope) walkTasks() (map[uint64]*listed, error) {
 		tasks[id].tgids[uint32(binary.NativeEndian.Uint64(out[i+8:]))] = true
 	}
 	return tasks, nil
-}
-
-// under reports whether the cgroup at path is sub or below it, by path:
-// scopebpf.c's in_subtree asks the same of an id, through at most 32
-// parents, and past that records a cgroup the hook judges anyway.
-func under(path, sub string) bool {
-	return sub != "" && (path == sub || strings.HasPrefix(path, sub+"/"))
 }
 
 // cgroupGone reports whether err says the cgroup was removed: its handle

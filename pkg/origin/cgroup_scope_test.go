@@ -319,9 +319,9 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	// Taking out a cgroup that was never in the scope, with no task of
 	// ours left in it, changes nothing and is not reported; one with a
 	// task of ours in it is.
-	s.leave(idOf(late), lateRel, false)
+	s.leave(idOf(late), lateRel, false, false)
 	require.NotContains(t, log.String(), lateRel, "nothing changed")
-	s.leave(idOf(late), lateRel, true)
+	s.leave(idOf(late), lateRel, true, false)
 	require.Contains(t, log.String(), lateRel, "a task of ours passes the hook there")
 
 	// A task of ours in the root cgroup is reported once, however many
@@ -657,12 +657,18 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	s.clearMark(ownID, dir, path, true)
 	require.True(t, marked() && !recorded(), "a task outside entering before record's second look takes it out and marks it")
 
-	// A task outside entering an empty cgroup between the looks, with
-	// none of ours there and none in the scope, leaves it unmarked, as
-	// scope_leave leaves what the scope does not hold.
+	// A task outside entering an empty cgroup between the looks puts back
+	// the mark the walk cleared, held as it was, though the scope does not
+	// hold the cgroup now; an unheld one, with none of ours there, stays
+	// cleared, as scope_leave leaves what the scope does not hold.
 	looksRead("", "0\n")
 	s.clearMark(ownID, dir, path, true)
-	require.True(t, !marked() && !recorded(), "an empty cgroup a task outside enters between the looks stays unmarked")
+	require.True(t, s.heldMark(ownID) && !recorded(), "a held mark cleared on an empty look is put back, held")
+	s.forgetMark(ownID)
+	s.mark(ownID, path, false)
+	looksRead("", "0\n")
+	s.clearMark(ownID, dir, path, true)
+	require.True(t, !marked() && !recorded(), "an unheld one stays cleared")
 
 	// One a task of ours recorded meanwhile, beside it, is taken out and
 	// marked.
@@ -681,6 +687,14 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	looksRead("7\n", "7\n0\n")
 	s.reconcileListed(ownID, &listed{tgids: map[uint32]bool{7: true}}, true)
 	require.True(t, marked() && !recorded(), "a listed cgroup unmarked while a task outside entered is marked again")
+	require.True(t, s.heldMark(ownID), "held, as it was")
+
+	// The same with only a held mark, the scope not holding the cgroup: a
+	// task outside rejoining ours between the looks keeps the mark held,
+	// not one a later walk would forget.
+	looksRead("7\n", "7\n0\n")
+	s.reconcileListed(ownID, &listed{tgids: map[uint32]bool{7: true}}, true)
+	require.True(t, s.heldMark(ownID) && !recorded(), "a held mark cleared and put back stays held")
 
 	// A task of ours alone entering an empty cgroup between the looks,
 	// which scope_enter passed over for the mark, is recorded.
@@ -746,6 +760,27 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	require.Equal(t, settleLooks, looks, "the looks are bounded")
 	require.True(t, marked() && !recorded(), "and past them the cgroup is marked and left out")
 	s.forgetMark(ownID)
+
+	// A second look the walk's own fault fails (EMFILE) says nothing of the
+	// cgroup: the write is undone, the entry it made taken out and the mark
+	// it cleared put back, without a mark the cgroup did not have.
+	s.forgetMark(ownID)
+	looksRead(syscall.EMFILE)
+	s.record(ownID, dir, path)
+	require.True(t, !marked() && !recorded(), "a recording whose look ran short of descriptors is undone")
+	require.Contains(t, log.String(), "for want of its own", "and reported as the walk's own")
+	s.warned = make(map[finding]time.Time)
+	log.Reset()
+	// A recorded cgroup a pass cannot read for the same reason stays
+	// recorded, where another error takes it out.
+	require.NoError(t, s.cgroups().Put(ownID, uint8(1)))
+	restoreOwn := swap(t, &readThreads, failReading(ownID, syscall.EMFILE))
+	require.True(t, s.reconcileRecorded(map[uint64]*listed{}))
+	restoreOwn()
+	require.True(t, recorded() && !marked(), "a recorded cgroup read short of descriptors stays recorded")
+	require.NoError(t, s.cgroups().Delete(ownID))
+	s.warned = make(map[finding]time.Time)
+	log.Reset()
 
 	// A second look that cannot read the cgroup leaves it as it was, which
 	// judges no task outside: clearMark puts the mark back, and record

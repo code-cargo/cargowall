@@ -326,15 +326,16 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
+      # Pinned to cargowall-action's main: its container-egress and tls-sni
+      # inputs (and the rest of the v2 action) postdate every v1 tag.
       - name: Start CargoWall with L7 (SNI/Host) enforcement
-        uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8-rc.1
-        env:
-          # L7 rides the cgroup hook, and its enforce rungs require the hook
-          # itself to enforce.
-          CARGOWALL_CONTAINER_EGRESS: 'enforce'
-          CARGOWALL_TLS_SNI: 'enforce'
+        uses: code-cargo/cargowall-action@f3518be3b920aa33dd0c1fecad3b9a99bf8b00aa # main, v2.0.0-rc.11
         with:
           mode: enforce
+          # L7 rides the cgroup hook, and its enforce rungs require the hook
+          # itself to enforce.
+          container-egress: enforce
+          tls-sni: enforce
           offline: 'true'
           allowed-hosts: |
              docker.io

@@ -94,3 +94,23 @@ func AncestorByComm(fromPid int, comms ...string) (pid int, comm string, ok bool
 	}
 	return 0, "", false
 }
+
+// ChildrenByComm is the processes whose parent is pid and whose comm is
+// comm, by a look over /proc.
+func ChildrenByComm(pid int, comm string) []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var children []int
+	for _, e := range entries {
+		child, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		if ppid, ok := ParentPid(child); ok && ppid == pid && Comm(child) == comm {
+			children = append(children, child)
+		}
+	}
+	return children
+}

@@ -18,7 +18,10 @@ package procfs
 
 import (
 	"os"
+	"os/exec"
+	"slices"
 	"testing"
+	"time"
 )
 
 // Note: none of these assume a process name is absent from the test's
@@ -74,5 +77,29 @@ func TestAncestorByComm(t *testing.T) {
 	}
 	if _, _, ok := AncestorByComm(os.Getpid(), "no-such-comm-xx"); ok {
 		t.Errorf("AncestorByComm(self, no-such-comm-xx): want false")
+	}
+}
+
+func TestChildrenByComm(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	found := false
+	for i := 0; i < 250 && !found; i++ {
+		found = slices.Contains(ChildrenByComm(os.Getpid(), "sleep"), cmd.Process.Pid)
+		if !found {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if !found {
+		t.Errorf("ChildrenByComm(self, sleep) does not list our sleep %d", cmd.Process.Pid)
+	}
+	if got := ChildrenByComm(os.Getpid(), "no-such-comm-xx"); len(got) != 0 {
+		t.Errorf("ChildrenByComm(self, no-such-comm-xx) = %v", got)
 	}
 }

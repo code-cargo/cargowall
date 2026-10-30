@@ -751,22 +751,27 @@ func (s *cgroupScope) watch() {
 }
 
 func (s *cgroupScope) report() {
-	for slot, msg := range [bpf.ScopeStatsMax]string{
-		bpf.ScopeStatFull: "Container egress cgroup scope full: cgroups this job entered were not recorded, and their sockets pass the cgroup hook",
-		bpf.ScopeStatRoot: "Tasks of this job entered the root cgroup, where their sockets pass the cgroup hook",
-		bpf.ScopeStatFailed: "Container egress cgroup scope failed to record or take out cgroups as tasks entered them, " +
-			"which stay as they were until the next walk",
-		bpf.ScopeStatShared: "Cgroups this job entered were entered by tasks outside it and left the scope: " +
-			"sockets there pass the cgroup hook",
-		bpf.ScopeStatUnreleased: "Container egress cgroup scope failed to forget released cgroups, " +
-			"whose entries keep their places in it for good",
+	scope, shared := s.objs.MapScopeCgroups.MaxEntries(), s.objs.MapScopeShared.MaxEntries()
+	for slot, w := range [bpf.ScopeStatsMax]struct {
+		msg  string
+		args []any // the capacities the count is against, if any
+	}{
+		bpf.ScopeStatFull: {"Container egress cgroup scope full: cgroups this job entered were not recorded, " +
+			"and their sockets pass the cgroup hook", []any{"capacity", scope}},
+		bpf.ScopeStatRoot: {"Tasks of this job entered the root cgroup, where their sockets pass the cgroup hook", nil},
+		bpf.ScopeStatFailed: {"Container egress cgroup scope failed to record, take out or mark cgroups as tasks " +
+			"entered them, which stay as they were until the next walk", []any{"capacity", scope, "shared_capacity", shared}},
+		bpf.ScopeStatShared: {"Cgroups this job entered were entered by tasks outside it and left the scope: " +
+			"sockets there pass the cgroup hook", nil},
+		bpf.ScopeStatUnreleased: {"Container egress cgroup scope failed to forget released cgroups, " +
+			"whose entries keep their places in it for good", []any{"capacity", scope}},
 	} {
 		var n uint64
 		if err := s.objs.MapScopeStats.Lookup(uint32(slot), &n); err != nil || n <= s.reported[slot] {
 			continue
 		}
 		s.reported[slot] = n
-		s.logger.Warn(msg, "times", n, "capacity", s.objs.MapScopeCgroups.MaxEntries())
+		s.logger.Warn(w.msg, append([]any{"times", n}, w.args...)...)
 	}
 }
 

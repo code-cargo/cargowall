@@ -21,7 +21,8 @@
 #ifndef __PIDNS_H__
 #define __PIDNS_H__
 
-// MAX_PID_NS_LEVEL: a task's upid chain is at most this deep.
+// MAX_PID_NS_LEVEL: a pid namespace is at most this deep, so a task's upid
+// chain holds at most one entry more, levels 0 to 32.
 #define PIDNS_MAX_LEVEL 32
 
 // ns_tgid_of returns t's process id as numbered in the daemon's pid
@@ -39,9 +40,9 @@ static __always_inline __u32 ns_tgid_of(struct task_struct *t)
     if (!p)
         return 0;
     unsigned int level = BPF_CORE_READ(p, level);
-    if (level >= PIDNS_MAX_LEVEL)
-        level = PIDNS_MAX_LEVEL - 1;
-    for (unsigned int i = 0; i < PIDNS_MAX_LEVEL; i++) {
+    if (level > PIDNS_MAX_LEVEL)
+        level = PIDNS_MAX_LEVEL;
+    for (unsigned int i = 0; i <= PIDNS_MAX_LEVEL; i++) {
         if (i > level)
             break;
         struct upid up;

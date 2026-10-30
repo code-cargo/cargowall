@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // fakeDaemon serves an /info answer on a unix socket of its own, and
@@ -201,6 +203,57 @@ func TestDockerdFlags(t *testing.T) {
 		if addr != want[0] || config != want[1] {
 			t.Errorf("dockerdFlags(%q) = %q, %q; want %q, %q", in, addr, config, want[0], want[1])
 		}
+	}
+}
+
+// A socket systemd listens on was handed to the daemon it activated: its
+// child named dockerd. Any other listener is the daemon itself. Copies of
+// sh named systemd and dockerd stand in for both.
+func TestActivatedDaemon(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh")
+	}
+	data, err := os.ReadFile(sh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	standIn := func(name string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	systemd, dockerd := standIn("systemd"), standIn("dockerd")
+	start := func(script string, args ...string) int32 {
+		cmd := exec.Command(systemd, append([]string{"-c", script + "; :", "systemd"}, args...)...)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+		return int32(cmd.Process.Pid)
+	}
+	activator := start(`"$1" -c 'sleep 60; :' & sleep 60`, dockerd)
+	var got int32
+	for i := 0; i < 250; i++ {
+		if got, err = activatedDaemon(filepath.Join(dir, "no.sock"), activator); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil || procfs.Comm(int(got)) != "dockerd" {
+		t.Errorf("activatedDaemon(systemd with a dockerd child) = %d, %v; want the child", got, err)
+	}
+	if got, err := activatedDaemon("", start("sleep 60")); err == nil {
+		t.Errorf("activatedDaemon(systemd with no dockerd child) = %d, want an error", got)
+	}
+	if got, err := activatedDaemon("", int32(os.Getpid())); err != nil || got != int32(os.Getpid()) {
+		t.Errorf("activatedDaemon(another listener) = %d, %v; want itself", got, err)
 	}
 }
 

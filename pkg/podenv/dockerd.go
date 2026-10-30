@@ -39,6 +39,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // DockerdKind is what is behind the Docker socket.
@@ -116,8 +118,8 @@ func (d *Dockerd) note(fact string, err error) {
 // pid namespace, 0 when it is not visible there. A visible pid can still
 // be another container's process once the pod shares one pid namespace, so
 // the mount namespace is the decisive comparison. A socket-activated
-// daemon reports the activating service manager, which shares ours on a
-// host.
+// daemon reports the activating service manager, systemd, whose dockerd
+// child is taken for the daemon (activatedDaemon).
 func probeDockerd(socket string) Dockerd {
 	unknown := func(err error) Dockerd { return Dockerd{Kind: DockerdUnknown, Reason: err.Error()} }
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -148,6 +150,9 @@ func probeDockerd(socket string) Dockerd {
 	}
 	if pid == 0 {
 		return Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
+	}
+	if pid, err = activatedDaemon(socket, pid); err != nil {
+		return unknown(err)
 	}
 	ours, err := nsInode("/proc/self/ns/mnt")
 	if err != nil {
@@ -362,28 +367,60 @@ func unaskedTree(pid int32) (string, error) {
 
 // cgroupDriver asks the daemon at socket for its cgroup driver (GET /info).
 func cgroupDriver(socket string) (string, error) {
+	var info struct{ CgroupDriver string }
+	if err := dockerGet(socket, "/info", &info); err != nil {
+		return "", err
+	}
+	if info.CgroupDriver == "" {
+		return "", errors.New("GET /info names no cgroup driver")
+	}
+	return info.CgroupDriver, nil
+}
+
+// dockerGet asks the daemon at socket for path, within 2s, and decodes
+// its JSON answer into out, unless out is nil.
+func dockerGet(socket, path string, out any) error {
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "unix", socket)
 	}}
 	defer tr.CloseIdleConnections()
 	client := http.Client{Transport: tr, Timeout: 2 * time.Second}
-	resp, err := client.Get("http://docker/info")
+	resp, err := client.Get("http://docker" + path)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("GET /info: %s", resp.Status)
+		return fmt.Errorf("GET %s: %s", path, resp.Status)
 	}
-	var info struct{ CgroupDriver string }
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&info); err != nil {
-		return "", fmt.Errorf("GET /info: %w", err)
+	if out == nil {
+		return nil
 	}
-	if info.CgroupDriver == "" {
-		return "", errors.New("GET /info names no cgroup driver")
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out); err != nil {
+		return fmt.Errorf("GET %s: %w", path, err)
 	}
-	return info.CgroupDriver, nil
+	return nil
+}
+
+// activatedDaemon is the daemon serving the socket whose listener is pid:
+// pid itself, unless pid is systemd, which made the socket and activated
+// the daemon on it (docker.socket, dockerd -H fd://). Then the daemon is
+// systemd's child named dockerd, asked first over the socket (GET /_ping)
+// so that one activated on demand is up; without exactly one such child it
+// is unidentified. Any other listener is the daemon, whatever its name: a
+// podman service, or a stand-in.
+func activatedDaemon(socket string, pid int32) (int32, error) {
+	if procfs.Comm(int(pid)) != "systemd" {
+		return pid, nil
+	}
+	_ = dockerGet(socket, "/_ping", nil)
+	children := procfs.ChildrenByComm(int(pid), "dockerd")
+	if len(children) != 1 {
+		return 0, fmt.Errorf("the socket's listener is systemd (pid %d), with %d dockerd children we see, "+
+			"not the one that would be the daemon", pid, len(children))
+	}
+	return int32(children[0]), nil
 }
 
 // mountRootOf is the root of pid's cgroup v2 mount at CgroupRoot, as our

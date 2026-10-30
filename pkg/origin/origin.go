@@ -57,6 +57,11 @@ import (
 	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
+// cgroupAttachPath is where Start attaches the hook: the tree
+// podenv.Shape.HookScope showed this process is in. A test attaches below
+// it, where only its own sockets reach the program.
+var cgroupAttachPath = podenv.CgroupRoot
+
 // The ringbuf wire layout is bpf.OriginEvent (bpf/origin_event.go) — the one
 // Go mirror of struct origin_event, shared with the BTF layout test so the
 // struct this reader casts bytes to is the struct the test validates.
@@ -332,7 +337,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		// Set before load, with the map it reads: the program never judges,
 		// even briefly, a socket that is not this job's. The stand-in takes
 		// the scope map's size.
-		s, err := startCgroupScope(logger, scope.Subtree)
+		s, err := loadCgroupScope(logger, scope.Subtree)
 		if err != nil {
 			return nil, err
 		}
@@ -370,6 +375,14 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		return nil, fmt.Errorf("failed to arm loopback carve-out: %w", err)
 	}
 
+	// The hook verified, the scope starts recording, before the hook can
+	// judge a socket by it.
+	if o.cgroups != nil {
+		if err := o.cgroups.start(); err != nil {
+			return nil, err
+		}
+	}
+
 	// Telemetry: what else is attached at the root cgroup (Docker's or
 	// systemd's own programs), before and after ours joins them. Under
 	// ALLOW_MULTI every program runs and the effective verdict is their AND:
@@ -394,7 +407,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		// cgroup or in a cgroup this job's tasks have entered, and passes
 		// the rest, a neighbour pod's included, with no verdict and no
 		// record.
-		Path:    podenv.CgroupRoot,
+		Path:    cgroupAttachPath,
 		Attach:  ebpf.AttachCGroupInetEgress,
 		Program: o.objs.CgOriginEgress,
 	})
@@ -561,7 +574,7 @@ func (o *Observer) Blocked() uint64 { return o.blocked.Load() }
 func (o *Observer) Records() uint64 { return o.records.Load() }
 
 func (o *Observer) logAttachedEgressPrograms(when string) {
-	cg, err := os.Open(podenv.CgroupRoot)
+	cg, err := os.Open(cgroupAttachPath)
 	if err != nil {
 		o.logger.Debug("Cannot open root cgroup for program query", "error", err)
 		return

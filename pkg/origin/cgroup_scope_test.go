@@ -19,6 +19,7 @@ package origin
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -160,9 +161,10 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	podRel := strings.TrimPrefix(pod, podenv.CgroupRoot)
 	// The test walks by hand; the tick would race it.
 	swap(t, &scopeStatsInterval, time.Hour)
-	s, err := startCgroupScope(slog.New(slog.NewTextHandler(&log, nil)), podRel)
+	s, err := loadCgroupScope(slog.New(slog.NewTextHandler(&log, nil)), podRel)
 	require.NoError(t, err)
 	t.Cleanup(s.close)
+	require.NoError(t, s.start())
 	// In the host cgroup namespace a path's depth is the kernel's level.
 	require.Equal(t, podenv.CgroupLevel(podRel), s.sub.level, "the walk read the subtree's level")
 	idOf := func(path string) uint64 {
@@ -196,7 +198,7 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	// A walk that finds a cgroup shared takes out an entry a tracepoint made
 	// for it.
 	require.NoError(t, s.cgroups().Put(idOf(shared), uint8(1)))
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	require.False(t, recorded(shared), "the walk takes a shared cgroup out")
 	require.Equal(t, 1, strings.Count(log.String(), sharedRel), "and reports it once, not on every walk")
 
@@ -220,17 +222,17 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 		}
 		return readThreadsFile(dir)
 	})
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	restore()
 	require.True(t, recorded(shared) && !marked(shared), "a cgroup ours alone again is unmarked and recorded")
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	require.True(t, !recorded(shared) && marked(shared), "and shared again, taken out and marked")
 
 	// A cgroup taken out while a task outside the namespace was in it, as a
 	// tracepoint does, is recorded again by the next walk once it holds
 	// only ours.
 	require.NoError(t, s.cgroups().Delete(idOf(own)))
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	require.True(t, recorded(own), "a cgroup ours alone again is recorded again")
 
 	// A recorded cgroup that holds no task of ours, only another's, is
@@ -241,11 +243,11 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	theirsRel := strings.TrimPrefix(theirs, podenv.CgroupRoot)
 	require.NoError(t, s.cgroups().Put(idOf(theirs), uint8(1)))
 	restore = swap(t, &readThreads, failReading(idOf(theirs), syscall.EIO))
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	restore()
 	require.True(t, recorded(theirs), "a cgroup the walk cannot read stays as it was")
 	require.Contains(t, log.String(), "cannot read a cgroup")
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	require.False(t, recorded(theirs), "a recorded cgroup only another task is in")
 	var theirsLine string
 	for _, line := range strings.Split(log.String(), "\n") {
@@ -267,7 +269,7 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 		}
 		return readThreadsFile(dir)
 	})
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	restore()
 	require.Error(t, s.objs.MapScopeShared.Lookup(idOf(theirs), &v), "a marked cgroup no task outside is in loses its mark")
 
@@ -277,8 +279,8 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 		return []uint64{idOf(theirs)}, ebpf.ErrIterationAborted
 	})
 	require.NoError(t, s.cgroups().Put(idOf(theirs), uint8(1)))
-	require.NoError(t, s.walk(false))
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
+	require.NoError(t, s.walk())
 	restore()
 	require.False(t, recorded(theirs), "a cgroup the cut-short read reached")
 	require.Equal(t, 1, strings.Count(log.String(), "could not read all its cgroups"), "reported once")
@@ -291,11 +293,11 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	require.NoError(t, s.cgroups().Put(goneID, uint8(1)))
 	require.NoError(t, os.Remove(gone))
 	before := strings.Count(log.String(), "level=WARN")
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	require.Equal(t, before, strings.Count(log.String(), "level=WARN"), "a removed cgroup is not reported:\n%s", log.String())
 	require.True(t, s.stale[goneID], "and it is not opened again")
 	require.NoError(t, s.cgroups().Delete(goneID))
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	require.False(t, s.stale[goneID], "until its release has taken it out")
 
 	// A cgroup recorded and then found removed by the second look may
@@ -323,7 +325,7 @@ func TestCgroupScopeWalkInner(t *testing.T) {
 	// A task of ours in the root cgroup is reported once, however many
 	// walks find it there.
 	require.Equal(t, 1, strings.Count(log.String(), "in the root cgroup"), "reported by the first walk")
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	require.Equal(t, 1, strings.Count(log.String(), "in the root cgroup"), "and not again")
 }
 
@@ -408,15 +410,38 @@ func ownCgroupBelowRoot(t *testing.T) string {
 	return own
 }
 
+// Loading the scope finds our cgroup and the subtree's level with nothing
+// attached but the walk's iterator, which hooks nothing until it is read;
+// a scope closed before it starts does not wait for a watch that never
+// ran.
+func TestCgroupScopeLoadAttachesNothing(t *testing.T) {
+	requireBPFOrigin(t)
+	own := ownCgroupBelowRoot(t)
+	s, err := loadCgroupScope(slog.New(slog.NewTextHandler(io.Discard, nil)), own)
+	require.NoError(t, err)
+	require.Equal(t, []link.Link{s.iter}, s.links, "only the iterator is attached")
+	require.Equal(t, podenv.CgroupLevel(own), s.sub.level, "the subtree's level is read")
+	closed := make(chan struct{})
+	go func() {
+		s.close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing a scope that never started hangs")
+	}
+}
+
 // A walk that lists no task of ours (here, of a pid namespace no task is
 // in) fails rather than leave the scope empty under a hook that reports
 // itself attached.
 func TestCgroupScopeWalkNeedsOwnCgroup(t *testing.T) {
 	s := loadWalkScope(t, 1, 64)
-	require.ErrorContains(t, s.walk(true), "did not list this process's cgroup")
+	require.ErrorContains(t, s.findOwn(), "did not list this process's cgroup")
 	// Only at startup: a later walk reconciles whatever it lists, and one
 	// fact that has changed since does not stop it.
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 }
 
 // A cgroup the walk cannot read is reported and passed over, once, and the
@@ -432,8 +457,8 @@ func TestCgroupScopeWalkSkipsUnreadableCgroups(t *testing.T) {
 	ownID, err := podenv.CgroupID(own)
 	require.NoError(t, err)
 	swap(t, &readThreads, failReading(ownID, syscall.EIO))
-	require.NoError(t, s.walk(false))
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
+	require.NoError(t, s.walk())
 	require.Equal(t, 1, strings.Count(log.String(), "cannot read a cgroup"), "reported once")
 	var v uint8
 	require.Error(t, s.cgroups().Lookup(ownID, &v), "the unreadable cgroup is left as it was")
@@ -455,7 +480,7 @@ func TestCgroupScopeWalkStopsOnClose(t *testing.T) {
 	s := loadWalkScope(t, ino, 65536)
 	s.stop = make(chan struct{})
 	close(s.stop)
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	ids, err := scopeCgroups(s.cgroups())
 	require.NoError(t, err)
 	require.Empty(t, ids, "a walk asked to stop records nothing")
@@ -545,10 +570,39 @@ func TestCgroupScopeOutsideInner(t *testing.T) {
 	for _, id := range []uint64{listed, empty} {
 		require.NoError(t, s.cgroups().Put(id, uint8(1)))
 	}
-	require.NoError(t, s.walk(false))
+	require.NoError(t, s.walk())
 	var v uint8
 	require.Error(t, s.cgroups().Lookup(listed, &v), "a listed cgroup outside the root is taken out")
 	require.Error(t, s.cgroups().Lookup(empty, &v), "and so is one the scope holds that nothing listed")
+	dir, path, inside, err := s.openCgroup(empty)
+	require.NoError(t, err)
+	dir.Close()
+	require.False(t, inside)
+	require.Equal(t, "/..", path, "one outside the root is named as the kernel names it, not by a path of ours")
+}
+
+// A finding is logged the first time a walk makes it, not again when it
+// comes back after a walk without it; a read of the scope cut short is
+// logged again once a walk has read it whole.
+func TestWalkFindingsRemembered(t *testing.T) {
+	last := newWalkFindings()
+	walk := func(unlisted bool, ids ...uint64) (logged []uint64) {
+		found := newWalkFindings()
+		for _, id := range ids {
+			if firstTime(found.shared, last.shared, id) {
+				logged = append(logged, id)
+			}
+		}
+		found.unlisted = unlisted
+		last.remember(found)
+		return logged
+	}
+	require.Equal(t, []uint64{1}, walk(false, 1))
+	require.Empty(t, walk(false))
+	require.Empty(t, walk(true, 1), "found again after a walk without it")
+	require.True(t, last.unlisted)
+	require.Equal(t, []uint64{2}, walk(false, 1, 2))
+	require.False(t, last.unlisted, "a whole read clears the cut-short read")
 }
 
 // Clearing a mark the listing did not reach: a cgroup a task of ours has
@@ -602,13 +656,15 @@ func TestCgroupScopeClearMark(t *testing.T) {
 	s.clearMark(ownID, dir, path, true, &found)
 	require.True(t, marked() && !recorded(), "an entry made between the looks is taken out, the mark kept")
 
-	// A cgroup still shared keeps what the last walk logged of it, so it is
-	// not reported again when the walk next lists it.
+	// A cgroup still shared keeps its mark, and what an earlier walk logged
+	// of it stands, so it is not reported again.
 	s.last.shared[ownID] = true
 	found = newWalkFindings()
 	looksRead("0\n")
 	s.clearMark(ownID, dir, path, true, &found)
-	require.True(t, found.shared[ownID], "a still-shared cgroup stays logged")
+	require.True(t, marked(), "a still-shared cgroup keeps its mark")
+	s.last.remember(found)
+	require.True(t, s.last.shared[ownID], "and stays logged")
 
 	looksRead("7\n")
 	s.clearMark(ownID, dir, path, false, &found)
@@ -650,6 +706,8 @@ func TestCgroupScopeWalkFullMapWarns(t *testing.T) {
 	s := loadWalkScope(t, ino, 1)
 	var log bytes.Buffer
 	s.logger = slog.New(slog.NewTextHandler(&log, nil))
-	require.NoError(t, s.walk(false))
+	s.last.shared[1<<62] = true
+	require.NoError(t, s.walk())
 	require.Contains(t, log.String(), "could not record a cgroup")
+	require.True(t, s.last.shared[1<<62], "what an earlier walk found is remembered by a walk without it")
 }

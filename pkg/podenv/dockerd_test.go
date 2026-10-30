@@ -354,8 +354,22 @@ func TestServingPid(t *testing.T) {
 	if got, err := servingPid(conn.(*net.UnixConn)); err != nil || got != server {
 		t.Errorf("servingPid = %d, %v; want the stand-in serving it, %d", got, err, server)
 	}
-	if d := probeDockerd(sock); d.Kind != DockerdLocal || d.pid != server {
+	if d := probeDockerd(sock, true); d.Kind != DockerdLocal || d.pid != server {
 		t.Errorf("probeDockerd = %+v, want the stand-in %d, local", d, server)
+	}
+	if os.Geteuid() != 0 {
+		return
+	}
+	// A unit may give its daemon a mount namespace of its own over the same
+	// config (PrivateTmp): the listener's, ours, decides it is local.
+	private, err := l.File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	apart := standInWith(t, &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}, "dockerd", "serve", nil, private)
+	private.Close()
+	if d := probeDockerd(sock, true); d.Kind != DockerdLocal || (d.pid != server && d.pid != apart) {
+		t.Errorf("served from a mount namespace of its own: probeDockerd = %+v, want local, by the listener", d)
 	}
 }
 

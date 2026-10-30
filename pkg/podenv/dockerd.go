@@ -50,15 +50,17 @@ type DockerdKind int
 const (
 	DockerdUnknown DockerdKind = iota // the probe failed
 	DockerdAbsent                     // no socket
-	// DockerdLocal: the daemon shares our mount namespace, so its
-	// daemon.json is ours and our service manager can restart it.
+	// DockerdLocal: the socket's listener shares our mount namespace, so
+	// the daemon's daemon.json is ours and our service manager can
+	// restart it: the listener is the daemon, or the service manager that
+	// made the socket it was activated on.
 	DockerdLocal
-	// DockerdForeign: the daemon's pid is visible but its mount namespace is
-	// not ours: another container sharing our pid namespace, or the host's
-	// own daemon when we share the host's.
+	// DockerdForeign: the listener's pid is visible but its mount
+	// namespace is not ours: another container sharing our pid namespace,
+	// or the host's own daemon when we share the host's.
 	DockerdForeign
-	// DockerdHidden: the daemon's pid is outside our pid namespace, so
-	// neither it nor any container it starts is visible to us.
+	// DockerdHidden: the listener's pid is outside our pid namespace, so
+	// neither the daemon nor any container it starts is visible to us.
 	DockerdHidden
 )
 
@@ -82,7 +84,7 @@ type Dockerd struct {
 	// Reason is the evidence for Foreign or Hidden, or the probe error for
 	// Unknown, and why a fact below could not be read.
 	Reason string
-	// Cgroup is a Foreign daemon's cgroup v2 path as /proc/<pid>/cgroup
+	// Cgroup is a Foreign listener's cgroup v2 path as /proc/<pid>/cgroup
 	// gives it in our cgroup namespace, "" when it could not be read. A
 	// path under our namespace's root does not start with "/..".
 	Cgroup string
@@ -102,8 +104,9 @@ type Dockerd struct {
 	// itself (runtimePid). 0 when it could not be shown, and Reason says
 	// why. Read only where the scope depends on it.
 	Runtime int32
-	// pid is the daemon's pid in our pid namespace: the process serving
-	// the socket, 0 when not visible or when only its listener's is known.
+	// pid is the pid, in our pid namespace, of the process serving the
+	// socket, looked for only where the scope reads the daemon's runtime
+	// (probeDockerd), and 0 elsewhere or when it could not be shown.
 	pid int32
 	// info is the daemon's GET /info, asked once (askInfo).
 	info    *daemonInfo
@@ -118,21 +121,24 @@ func (d *Dockerd) note(fact string, err error) {
 	d.Reason += fact + ": " + err.Error()
 }
 
-// probeDockerd identifies the daemon as the process serving a connection
-// to its socket (servingPid). SO_PEERCRED on the connection first gives
-// the listener's pid translated into our pid namespace, 0 when it is not
-// visible there, and then neither is what it serves. The listener need not
-// be the server: a socket-activated daemon's was made by its service
-// manager (systemd, for docker.socket and dockerd -H fd://). A visible
-// server can still be another container's process once the pod shares one
-// pid namespace, so the mount namespace is the decisive comparison.
+// probeDockerd identifies the daemon behind the socket by its listener:
+// SO_PEERCRED on a connection gives the listener's pid translated into our
+// pid namespace, 0 when it is not visible there, and then neither is what
+// it serves. The listener's mount namespace decides whether the daemon's
+// config and service are ours, which is all the daemon.json rewrite reads:
+// the daemon's own, or a socket-activated daemon's service manager's
+// (systemd, for docker.socket and dockerd -H fd://), whose unit may give
+// the daemon a mount namespace of its own (PrivateTmp) over the same
+// config. A visible pid can still be another container's process once the
+// pod shares one pid namespace, so the mount namespace is the decisive
+// comparison.
 //
-// A server that cannot be shown (no unix_diag, a daemon still starting,
-// a connection held by none or by two) leaves the listener's mount
-// namespace to decide the kind, as it did before the server was looked
-// for: the daemon.json rewrite reads nothing else. Its runtime is then not
-// looked for, so wherever the scope depends on the daemon it refuses.
-func probeDockerd(socket string) Dockerd {
+// With findServer, where the scope reads the daemon's runtime, it also
+// finds the process serving the socket (servingPid), the daemon itself
+// whatever made its listener. One that cannot be shown (no unix_diag, a
+// daemon still starting, a connection held by none or by two) leaves no
+// runtime to look for, and the scope refuses.
+func probeDockerd(socket string, findServer bool) Dockerd {
 	unknown := func(err error) Dockerd { return Dockerd{Kind: DockerdUnknown, Reason: err.Error()} }
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -163,10 +169,6 @@ func probeDockerd(socket string) Dockerd {
 	if pid == 0 {
 		return Dockerd{Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"}
 	}
-	server, unserved := servingPid(conn.(*net.UnixConn))
-	if unserved == nil {
-		pid = server
-	}
 	ours, err := nsInode("/proc/self/ns/mnt")
 	if err != nil {
 		return unknown(err)
@@ -175,14 +177,17 @@ func probeDockerd(socket string) Dockerd {
 	if err != nil {
 		return unknown(err)
 	}
-	daemon := Dockerd{Kind: DockerdLocal, pid: pid}
+	daemon := Dockerd{Kind: DockerdLocal}
 	if ours != theirs {
-		daemon = Dockerd{Kind: DockerdForeign, Reason: fmt.Sprintf("pid %d has another mount namespace", pid), pid: pid}
+		daemon = Dockerd{Kind: DockerdForeign, Reason: fmt.Sprintf("pid %d has another mount namespace", pid)}
 		daemon.Cgroup, _ = ReadCgroupPath("/proc/" + strconv.Itoa(int(pid)) + "/cgroup")
 	}
-	if unserved != nil {
-		daemon.pid = 0
-		daemon.note(fmt.Sprintf("what serves it, for which its listener (pid %d) stands in", pid), unserved)
+	if findServer {
+		if server, err := servingPid(conn.(*net.UnixConn)); err != nil {
+			daemon.note("the process serving it", err)
+		} else {
+			daemon.pid = server
+		}
 	}
 	return daemon
 }

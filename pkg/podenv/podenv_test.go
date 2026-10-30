@@ -567,7 +567,7 @@ func TestProbeCgroupMount(t *testing.T) {
 }
 
 func TestProbeDockerd_NoSocket(t *testing.T) {
-	if d := probeDockerd(filepath.Join(t.TempDir(), "docker.sock")); d.Kind != DockerdAbsent {
+	if d := probeDockerd(filepath.Join(t.TempDir(), "docker.sock"), true); d.Kind != DockerdAbsent {
 		t.Fatalf("absent socket: got %+v, want absent", d)
 	}
 }
@@ -575,7 +575,7 @@ func TestProbeDockerd_NoSocket(t *testing.T) {
 // A dial failing with anything but ENOENT (here EINVAL, a path longer than
 // sun_path) is unknown, with the error kept.
 func TestProbeDockerd_Unknown(t *testing.T) {
-	d := probeDockerd("/" + strings.Repeat("x", 200))
+	d := probeDockerd("/"+strings.Repeat("x", 200), true)
 	if d.Kind != DockerdUnknown || d.Reason == "" {
 		t.Fatalf("non-socket path: got %+v, want unknown with a reason", d)
 	}
@@ -591,7 +591,7 @@ func TestProbeDockerd_Refused(t *testing.T) {
 	}
 	l.SetUnlinkOnClose(false)
 	l.Close()
-	if d := probeDockerd(sock); d.Kind != DockerdUnknown || !strings.Contains(d.Reason, "refused") {
+	if d := probeDockerd(sock, true); d.Kind != DockerdUnknown || !strings.Contains(d.Reason, "refused") {
 		t.Fatalf("socket with no listener: got %+v, want unknown, refused", d)
 	}
 }
@@ -604,25 +604,30 @@ func TestProbeDockerd_NotASocket(t *testing.T) {
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if d := probeDockerd(dir); d.Kind != DockerdAbsent {
+	if d := probeDockerd(dir, true); d.Kind != DockerdAbsent {
 		t.Errorf("directory at the socket path: got %+v, want absent", d)
 	}
 	file := filepath.Join(t.TempDir(), "docker.sock")
 	if err := os.WriteFile(file, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if d := probeDockerd(file); d.Kind != DockerdAbsent {
+	if d := probeDockerd(file, true); d.Kind != DockerdAbsent {
 		t.Errorf("file at the socket path: got %+v, want absent", d)
 	}
 }
 
-// A daemon in our own process shares our mount namespace: local. A
-// listener that accepts and does not answer is not shown to serve, and
-// stands in for what does: local by its mount namespace, with no daemon's
-// pid to look for a runtime by.
+// A daemon in our own process shares our mount namespace: local, and
+// where the scope reads its runtime, found serving. A listener that
+// accepts and does not answer is local by its mount namespace, with no
+// server shown to look for a runtime by; where nothing reads the runtime,
+// it is not asked.
 func TestProbeDockerd_Local(t *testing.T) {
-	if d := probeDockerd(fakeDaemon(t, http.StatusOK, `{}`)); d.Kind != DockerdLocal || d.pid != int32(os.Getpid()) {
+	served := fakeDaemon(t, http.StatusOK, `{}`)
+	if d := probeDockerd(served, true); d.Kind != DockerdLocal || d.pid != int32(os.Getpid()) {
 		t.Errorf("local daemon: got %+v, want local, this process", d)
+	}
+	if d := probeDockerd(served, false); d.Kind != DockerdLocal || d.pid != 0 || d.Reason != "" {
+		t.Errorf("local daemon, no runtime read: got %+v, want local, no server looked for", d)
 	}
 	sock := filepath.Join(t.TempDir(), "docker.sock")
 	l, err := net.Listen("unix", sock)
@@ -635,7 +640,7 @@ func TestProbeDockerd_Local(t *testing.T) {
 			c.Close()
 		}
 	}()
-	if d := probeDockerd(sock); d.Kind != DockerdLocal || d.pid != 0 || !strings.Contains(d.Reason, "stands in") || !strings.Contains(d.Reason, "_ping") {
-		t.Errorf("silent listener: got %+v, want local by the listener, unanswered, no daemon's pid", d)
+	if d := probeDockerd(sock, true); d.Kind != DockerdLocal || d.pid != 0 || !strings.Contains(d.Reason, "the process serving it") || !strings.Contains(d.Reason, "_ping") {
+		t.Errorf("silent listener: got %+v, want local by the listener, unanswered, no server", d)
 	}
 }

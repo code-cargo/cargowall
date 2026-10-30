@@ -709,12 +709,16 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 	} else {
 		s.KubeletHosts = hosts
 	}
-	s.Dockerd = probeDockerd(dockerSocket)
-	// A private cgroup namespace's root bounds the hook, so where a daemon
-	// makes its containers, and who else is in the tree, matter there only.
+	// Only a hook below the machine's root, or scoped, reads the daemon's
+	// runtime: a private cgroup namespace's root bounds the hook, and the
+	// scope judges a private pid namespace. A private cgroup namespace
+	// also reads where the daemon makes its containers, and who else is in
+	// the tree.
+	readsRuntime := egressHook && (s.CgroupNS == CgroupNSPrivate || s.PidNS == PidNSPrivate)
 	private := egressHook && s.CgroupNS == CgroupNSPrivate
+	s.Dockerd = probeDockerd(dockerSocket, readsRuntime)
 	visible := s.Dockerd.Kind == DockerdLocal || s.Dockerd.Kind == DockerdForeign
-	if visible && (private || egressHook && s.PidNS == PidNSPrivate) {
+	if readsRuntime && visible {
 		s.Dockerd.probeRuntime(dockerSocket)
 	}
 	if private && visible {

@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"strings"
 	"syscall"
@@ -67,9 +68,10 @@ type cgroupScope struct {
 	sub      subtree
 	stop     chan struct{}
 	done     chan struct{}
+	watching bool                      // start has run watch, which closes done
 	reported [bpf.ScopeStatsMax]uint64 // last counts logged, owned by watch
-	// What the last walk found and logged, so the next logs only what is
-	// new, and keeps only what it finds again. Owned by the walk.
+	// What the walks so far found and logged, so a walk logs only what
+	// none had (remember). Owned by the walk.
 	last walkFindings
 	// Recorded cgroups the walk found removed, which it no longer opens:
 	// ids are never reused, and release takes their entries out. It keeps
@@ -89,11 +91,31 @@ type walkFindings struct {
 }
 
 // firstTime notes k as found by this walk, and reports whether neither
-// this walk nor the last had found it: the time to log it.
+// this walk nor an earlier one had found it: the time to log it.
 func firstTime[K comparable](found, last map[K]bool, k K) bool {
 	first := !found[k] && !last[k]
 	found[k] = true
 	return first
+}
+
+// remember adds what a walk found to what the walks before it found: a
+// finding is logged the first time a walk makes it, and not again when it
+// comes back on a later one, as a runtime's periodic exec stage would.
+// That the scope could not be read whole is the last walk's alone, logged
+// again once a walk has read it whole.
+func (f *walkFindings) remember(found walkFindings) {
+	for _, m := range [][2]map[uint64]bool{
+		{f.shared, found.shared},
+		{f.unremoved, found.unremoved},
+		{f.unrecorded, found.unrecorded},
+		{f.unreadable, found.unreadable},
+		{f.unmarked, found.unmarked},
+	} {
+		maps.Copy(m[0], m[1])
+	}
+	maps.Copy(f.inRoot, found.inRoot)
+	maps.Copy(f.outside, found.outside)
+	f.unlisted = found.unlisted
 }
 
 func newWalkFindings() walkFindings {
@@ -144,14 +166,16 @@ func setCgroupScope(spec *ebpf.CollectionSpec, sub subtree) error {
 	return nil
 }
 
-// startCgroupScope loads the scope collection for our pid namespace, attaches
-// its tracepoints, then walks the tasks that predate them, so a task that
-// enters a cgroup while the walk runs is recorded by one or the other.
-// subtreePath is the job's subtree, which the hook judges whole: the
-// programs leave it alone and the walk skips it. The verifier logs only
-// its statistics, as for the origin collection: a branch-level log of each
-// program would be kept for the life of the process.
-func startCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, error) {
+// loadCgroupScope loads the scope collection for our pid namespace and
+// finds this process's cgroup in a first look over the tasks (findOwn),
+// which gives the subtree's level, while nothing of the scope is attached:
+// the hook is verified with the scope's map and that level before the
+// scope's tracepoints change anything on the node (start). subtreePath is
+// the job's subtree, which the hook judges whole: the programs leave it
+// alone and the walk skips it. The verifier logs only its statistics, as
+// for the origin collection: a branch-level log of each program would be
+// kept for the life of the process.
+func loadCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, error) {
 	ino, err := podenv.PidNamespaceInode()
 	if err != nil {
 		return nil, fmt.Errorf("cgroup scope: %w", err)
@@ -193,25 +217,38 @@ func startCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, er
 		s.release()
 		return nil, fmt.Errorf("cgroup scope: %w", err)
 	}
-	for _, p := range []*ebpf.Program{s.objs.ScopeFork, s.objs.ScopeAttach, s.objs.ScopeRelease} {
-		l, err := link.AttachTracing(link.TracingOptions{Program: p, AttachType: ebpf.AttachTraceRawTp})
-		if err != nil {
-			s.release()
-			return nil, fmt.Errorf("cgroup scope: failed to attach %s: %w", p, err)
-		}
-		s.links = append(s.links, l)
-	}
+	// The walk's iterator runs only when read, so attaching it hooks
+	// nothing.
 	if s.iter, err = link.AttachIter(link.IterOptions{Program: s.objs.ScopeTaskIter}); err != nil {
 		s.release()
 		return nil, fmt.Errorf("cgroup scope: failed to attach the task walk: %w", err)
 	}
 	s.links = append(s.links, s.iter)
-	if err := s.walk(true); err != nil {
+	if err := s.findOwn(); err != nil {
 		s.release()
 		return nil, fmt.Errorf("cgroup scope: task walk: %w", err)
 	}
-	go s.watch()
 	return s, nil
+}
+
+// start attaches the scope's tracepoints, then walks the tasks that
+// predate them, so a task that enters a cgroup while the walk runs is
+// recorded by one or the other, and watches from then on. On an error the
+// caller closes the scope.
+func (s *cgroupScope) start() error {
+	for _, p := range []*ebpf.Program{s.objs.ScopeFork, s.objs.ScopeAttach, s.objs.ScopeRelease} {
+		l, err := link.AttachTracing(link.TracingOptions{Program: p, AttachType: ebpf.AttachTraceRawTp})
+		if err != nil {
+			return fmt.Errorf("cgroup scope: failed to attach %s: %w", p, err)
+		}
+		s.links = append(s.links, l)
+	}
+	if err := s.walk(); err != nil {
+		return fmt.Errorf("cgroup scope: task walk: %w", err)
+	}
+	s.watching = true
+	go s.watch()
+	return nil
 }
 
 // cgroups is the map the scoped hook loads in place of its stand-in.
@@ -230,20 +267,12 @@ func (s *cgroupScope) cgroups() *ebpf.Map { return s.objs.MapScopeCgroups }
 // passed over, and the rest are still reconciled. Then it checks the
 // recorded cgroups the listing did not reach (reconcileRecorded).
 //
-// The first walk, at startup, must list this process's own cgroup, which
-// is in the subtree: one that lists none of ours would leave the scope
-// empty while the hook reports it attached. It reads the subtree's level
-// from it too. Later walks only reconcile, and stop between cgroups once
-// close has asked, so a close waits out one cgroup, not the walk.
-func (s *cgroupScope) walk(first bool) error {
+// A walk stops between cgroups once close has asked, so a close waits out
+// one cgroup, not the walk.
+func (s *cgroupScope) walk() error {
 	tasks, err := s.walkTasks()
 	if err != nil {
 		return err
-	}
-	if first {
-		if err := s.checkOwn(tasks); err != nil {
-			return err
-		}
 	}
 	found := newWalkFindings()
 	marked := s.readMarks(&found)
@@ -263,7 +292,7 @@ func (s *cgroupScope) walk(first bool) error {
 		s.reconcileListed(id, l, marked[id], &found)
 	}
 	if s.reconcileRecorded(tasks, &found) && s.reconcileMarked(tasks, marked, &found) {
-		s.last = found
+		s.last.remember(found)
 	}
 	return nil
 }
@@ -286,12 +315,12 @@ func (s *cgroupScope) readMarks(found *walkFindings) map[uint64]bool {
 // listing did not reach and that no task outside our pid namespace is in
 // any more, so that a task of ours entering it is recorded again as it
 // enters. One removed loses its mark. False when close cut it short.
-func (s *cgroupScope) reconcileMarked(listed map[uint64]*listed, marked map[uint64]bool, found *walkFindings) bool {
+func (s *cgroupScope) reconcileMarked(tasks map[uint64]*listed, marked map[uint64]bool, found *walkFindings) bool {
 	for id := range marked {
 		if s.stopping() {
 			return false
 		}
-		if listed[id] != nil {
+		if tasks[id] != nil {
 			continue
 		}
 		dir, path, inside, gone := s.open(id, found)
@@ -324,8 +353,7 @@ func (s *cgroupScope) clearMark(id uint64, dir *os.File, path string, inside boo
 	case err != nil:
 		s.unreadable(id, path, err, found)
 	case m.theirs:
-		// Still shared: what the last walk logged of it stands.
-		found.shared[id] = s.last.shared[id]
+		// Still shared: the mark stays.
 	case m.ours && inside:
 		s.unmark(id)
 		s.record(id, dir, path, found)
@@ -354,7 +382,7 @@ func (s *cgroupScope) cutShort(err error, found *walkFindings) {
 func (s *cgroupScope) mark(id uint64, path string, found *walkFindings) {
 	if err := s.objs.MapScopeShared.Put(id, uint8(1)); err != nil && firstTime(found.unmarked, s.last.unmarked, id) {
 		s.logger.Warn("Container egress cgroup scope could not mark a cgroup shared with tasks outside this job, "+
-			"which a task of this job entering it records again until the next walk", "cgroup", path, "error", err,
+			"which a task of this job entering it records again until the next walk", "cgroup", path, "cgroup_id", id, "error", err,
 			"capacity", s.objs.MapScopeShared.MaxEntries())
 	}
 }
@@ -448,7 +476,7 @@ func (s *cgroupScope) unreadable(id uint64, path string, err error, found *walkF
 	}
 	if firstTime(found.unreadable, s.last.unreadable, id) {
 		s.logger.Warn("Container egress cgroup scope cannot read a cgroup of this job's, and leaves it as it is",
-			"cgroup", path, "error", err)
+			"cgroup", path, "cgroup_id", id, "error", err)
 	}
 }
 
@@ -460,7 +488,7 @@ func (s *cgroupScope) unreadable(id uint64, path string, err error, found *walkF
 // (outsideRoot). A read of the scope cut short still has the cgroups it
 // read checked, and the rest wait for a later walk. False when close cut
 // the pass short.
-func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFindings) bool {
+func (s *cgroupScope) reconcileRecorded(tasks map[uint64]*listed, found *walkFindings) bool {
 	ids, err := scopeCgroups(s.objs.MapScopeCgroups)
 	if err != nil {
 		s.cutShort(err, found)
@@ -479,7 +507,7 @@ func (s *cgroupScope) reconcileRecorded(listed map[uint64]*listed, found *walkFi
 		if s.stopping() {
 			return false
 		}
-		if listed[id] != nil || s.stale[id] {
+		if tasks[id] != nil || s.stale[id] {
 			continue
 		}
 		dir, path, inside, gone := s.open(id, found)
@@ -558,7 +586,24 @@ func (s *cgroupScope) openCgroup(id uint64) (dir *os.File, path string, inside b
 		return dir, "/", true, nil
 	}
 	rel, inside := strings.CutPrefix(target, podenv.CgroupRoot+"/")
-	return dir, "/" + rel, inside, nil
+	if !inside {
+		// Beyond our namespace's root, no path of ours names it: the
+		// kernel's own notation says where, as /proc/<pid>/cgroup does.
+		return dir, "/..", false, nil
+	}
+	return dir, "/" + rel, true, nil
+}
+
+// findOwn looks over the tasks for this process's own cgroup, which is in
+// the subtree, and reads the subtree's level from it (checkOwn), at
+// startup: a look that lists none of ours would leave the scope empty
+// while the hook reports it attached.
+func (s *cgroupScope) findOwn() error {
+	tasks, err := s.walkTasks()
+	if err != nil {
+		return err
+	}
+	return s.checkOwn(tasks)
 }
 
 // checkOwn requires the task walk to have listed this process's own
@@ -607,7 +652,7 @@ func (s *cgroupScope) record(id uint64, dir *os.File, path string, found *walkFi
 	if err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
 		if firstTime(found.unrecorded, s.last.unrecorded, id) {
 			s.logger.Warn("Container egress cgroup scope could not record a cgroup this job is in, "+
-				"and its sockets pass the cgroup hook", "cgroup", path, "error", err,
+				"and its sockets pass the cgroup hook", "cgroup", path, "cgroup_id", id, "error", err,
 				"capacity", s.objs.MapScopeCgroups.MaxEntries())
 		}
 		return
@@ -636,20 +681,26 @@ func (s *cgroupScope) leave(id uint64, path string, ours bool, found *walkFindin
 	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		if firstTime(found.unremoved, s.last.unremoved, id) {
 			s.logger.Warn("Container egress cgroup scope could not take out a cgroup it shares with tasks outside "+
-				"this job, whose sockets the hook still judges", "cgroup", path, "error", err)
+				"this job, whose sockets the hook still judges", "cgroup", path, "cgroup_id", id, "error", err)
 		}
 		return
 	}
-	if err != nil && !ours || !firstTime(found.shared, s.last.shared, id) {
+	if errors.Is(err, ebpf.ErrKeyNotExist) && !ours {
+		// Never recorded, and with none of ours in it: nothing of this
+		// job's leaves, and nothing is noted, so a task of ours entering
+		// later is told.
+		return
+	}
+	if !firstTime(found.shared, s.last.shared, id) {
 		return
 	}
 	switch {
 	case ours:
 		s.logger.Warn("A task of this job is in a cgroup shared with tasks outside it, "+
-			"where its sockets pass the cgroup hook", "cgroup", path)
+			"where its sockets pass the cgroup hook", "cgroup", path, "cgroup_id", id)
 	default:
 		s.logger.Warn("A cgroup a task of this job entered holds tasks outside it, and no longer one of "+
-			"this job's: it leaves the scope, and sockets this job made there pass the cgroup hook", "cgroup", path)
+			"this job's: it leaves the scope, and sockets this job made there pass the cgroup hook", "cgroup", path, "cgroup_id", id)
 	}
 }
 
@@ -746,7 +797,7 @@ func (s *cgroupScope) watch() {
 // one is returned. A walk close cut short reconciled nothing, so it shows
 // no recovery.
 func (s *cgroupScope) rewalk(failing string) string {
-	if err := s.walk(false); err != nil {
+	if err := s.walk(); err != nil {
 		if err.Error() != failing {
 			s.logger.Warn("Container egress cgroup scope: task walk failed, and the scope stands as it was",
 				"error", err)
@@ -792,7 +843,9 @@ func (s *cgroupScope) report() {
 // nothing updates; Observer.Close detaches the hook before calling this.
 func (s *cgroupScope) close() {
 	close(s.stop)
-	<-s.done
+	if s.watching {
+		<-s.done
+	}
 	s.release()
 }
 

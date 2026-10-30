@@ -18,9 +18,17 @@ package origin
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/cargowall/bpf"
@@ -28,13 +36,28 @@ import (
 )
 
 // Start in the scoped shape, as on ARC, whose jobs alone run it: the scope
-// collection loads and walks first, the hook's stand-in takes the scope
-// map's size and is replaced by that map, the hook's subtree constants
-// are the walk's, and Close releases the scope with the hook. A mismatch
-// between the stand-in and the scope map fails only here, or on ARC.
+// collection loads and finds our cgroup first, the hook's stand-in takes
+// the scope map's size and is replaced by that map, the hook's subtree
+// constants are the walk's, and Close releases the scope with the hook. A
+// mismatch between the stand-in and the scope map fails only here, or on
+// ARC. The hook attaches at a cgroup this process moves into, not the
+// host's root, so only this process's sockets ever reach it.
 func TestStartScoped(t *testing.T) {
 	requireBPFOrigin(t)
-	own := ownCgroupBelowRoot(t)
+	cg := filepath.Join(podenv.CgroupRoot, fmt.Sprintf("cargowall-origin-start-%d", os.Getpid()))
+	require.NoError(t, os.Mkdir(cg, 0o755))
+	home, err := podenv.ReadCgroupPath("/proc/self/cgroup")
+	require.NoError(t, err)
+	self := []byte(strconv.Itoa(os.Getpid()))
+	require.NoError(t, os.WriteFile(filepath.Join(cg, "cgroup.procs"), self, 0))
+	t.Cleanup(func() {
+		_ = os.WriteFile(filepath.Join(podenv.CgroupRoot, home, "cgroup.procs"), self, 0)
+		for i := 0; i < 50 && os.Remove(cg) != nil; i++ {
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
+	own := strings.TrimPrefix(cg, podenv.CgroupRoot)
+	swap(t, &cgroupAttachPath, cg)
 	spec, err := bpf.LoadTcBpf()
 	require.NoError(t, err)
 	var tc bpf.TcBpfObjects
@@ -69,6 +92,24 @@ func TestStartScoped(t *testing.T) {
 	require.NoError(t, o.objs.ScopeSubtreeLevel.Get(&level))
 	require.Equal(t, ownID, id, "the hook's subtree is the scope's")
 	require.Equal(t, podenv.CgroupLevel(own), level, "at the level the walk read, in the host cgroup namespace the path's depth")
+	progInfo, err := o.objs.CgOriginEgress.Info()
+	require.NoError(t, err)
+	progID, _ := progInfo.ID()
+	attached := func(path string) bool {
+		f, err := os.Open(path)
+		require.NoError(t, err)
+		defer f.Close()
+		res, err := link.QueryPrograms(link.QueryOptions{Target: int(f.Fd()), Attach: ebpf.AttachCGroupInetEgress})
+		require.NoError(t, err)
+		for _, p := range res.Programs {
+			if p.ID == progID {
+				return true
+			}
+		}
+		return false
+	}
+	require.True(t, attached(cg), "the hook is attached at the test's cgroup")
+	require.False(t, attached(podenv.CgroupRoot), "and not at the host's root")
 
 	o.Close()
 	closed = true

@@ -256,7 +256,6 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 	var dnsServer *dns.Server
 	var containerDNS *dockerDNS
-	var dockerBridgeIP string
 	var redirect *dnsRedirect
 	if !cmd.DisableDNSTracking {
 		// Infrastructure auto-allows must be installed before the proxy below
@@ -283,10 +282,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 		addIPv6Listener(cmd, dnsServer)
 		if cmd.DockerDNSInterception {
-			var restore func()
-			containerDNS, restore = startDockerDNS(dnsServer, shape.Dockerd, teardowns, logger)
-			defer restore()
-			dockerBridgeIP = containerDNS.bridgeIP
+			containerDNS = startDockerDNS(dnsServer, shape.Dockerd, logger)
 		}
 
 		dnsErrCh := make(chan error, 1)
@@ -310,6 +306,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		logger.Debug("DNS proxy server started",
 			"listen", listenAddr,
 			"upstream", upstream)
+		// Point the daemon at the bridge listener now that it is known to
+		// hold, or say that it does not.
+		defer containerDNS.useListener(teardowns, cmd.DNSRedirect)()
 
 		// Force all outbound DNS through the proxy. This catches processes
 		// that bypass /etc/resolv.conf and query upstream DNS directly
@@ -608,7 +607,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
 	// load-bearing under --container-egress=enforce — the docker bridge
-	// listener that daemon.json points every container at. Previously this
+	// listener that daemon.json points every container at, once the proxy
+	// holds it: else port 53 there is another process's. Previously this
 	// lived in the CI-only config path, so `--container-egress=enforce
 	// --docker-dns-interception` without a CI preset enforced against an
 	// allowlist that never contained bridgeIP:53 and container resolution
@@ -625,8 +625,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	if dnsUpstreamHost, _, err := net.SplitHostPort(cmd.DNSUpstream); err == nil {
 		dnsIPs = append(dnsIPs, dnsUpstreamHost)
 	}
-	if dockerBridgeIP != "" {
-		dnsIPs = append(dnsIPs, dockerBridgeIP)
+	if bridgeIP := containerDNS.listeningIP(); bridgeIP != "" {
+		dnsIPs = append(dnsIPs, bridgeIP)
 	}
 	configMgr.EnsureDNSAllowed(dnsIPs)
 
@@ -885,7 +885,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// of the cgroup hook only (one LPM write — cheap enough for the event
 	// stream goroutine), never added to the shared policy: TC's off-host
 	// enforcement must be un-widenable by workload-influenced input.
-	attribution.startUserspace(ctx, dnsServer, dockerBridgeIP, auditLogger, attribution.allowLocalNetwork)
+	attribution.startUserspace(ctx, dnsServer, containerDNS.listeningIP(), auditLogger, attribution.allowLocalNetwork)
 
 	if startupInterrupted(ctx, logger, "pre-ready") {
 		return nil

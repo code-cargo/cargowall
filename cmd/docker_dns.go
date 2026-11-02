@@ -38,62 +38,100 @@ const dockerSocket = "/var/run/docker.sock"
 // for a foreign daemon both are skipped and the redirect alone catches its
 // containers' DNS.
 //
-// The bridge listener binds over UDP and TCP both or neither, and only once
-// it holds is anything sent to it: when it does not, the daemon is not
-// restarted onto it (restartDaemon), and the redirect drops container DNS at
-// the bridge rather than sending it there (redirectSpec). Either would hand
-// the queries to whatever holds the address instead, or to nothing.
+// The listener binds over UDP and TCP both or neither, and nothing is
+// pointed at it until it is known to hold, once the proxy is ready
+// (useListener): one that does not is another process's address, or no
+// one's, and daemon.json or the bridge DNAT would hand container DNS to it.
 type dockerDNS struct {
-	bridgeIP string // "" when there is no docker bridge: the feature is idle
+	bridgeIP string         // "" when there is no docker bridge: the feature is idle
+	dockerd  podenv.Dockerd // the daemon behind the socket: whether daemon.json is ours
 	// proxy holds the bridge listener, and once it is ready says whether it
 	// bound (dns.Server.BindError).
 	proxy interface{ BindError(addr string) error }
-	// restart restarts the daemon, which applies the daemon.json rewrite; nil
-	// when the daemon is not ours or daemon.json was not rewritten.
-	restart func(*slog.Logger) error
-	undo    func() // restores daemon.json
-	logger  *slog.Logger
+	// configure rewrites daemon.json to point the daemon's containers at the
+	// listener, and restore undoes it: network.ConfigureDockerDNS and
+	// RestoreDockerDNS, which a test stands in for.
+	configure func(dnsIP string, logger *slog.Logger) error
+	restore   func(logger *slog.Logger) error
+	restart   bool // daemon.json was rewritten: the daemon restart applies it
+	logger    *slog.Logger
 }
 
-// startDockerDNS adds the bridge listener and, only for a daemon proven
-// local, rewrites daemon.json: a foreign or unidentified one is left alone,
-// and the redirect covers its containers. The returned undo restores
-// daemon.json; the caller defers it. It is registered before the rewrite,
-// so a signal landing mid-write still has one: the second-signal path runs
-// it on another goroutine, and pkg/network serializes the two, so it either
-// undoes a finished rewrite or stops one from starting. Restoring a file
-// that was never written leaves it alone.
-func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, teardowns *teardownList,
-	logger *slog.Logger,
-) (*dockerDNS, func()) {
-	d := &dockerDNS{proxy: dnsServer, logger: logger}
+// startDockerDNS adds the bridge listener, before the proxy starts. Nothing
+// is pointed at it yet (useListener).
+func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, logger *slog.Logger) *dockerDNS {
+	d := &dockerDNS{
+		dockerd: dockerd, proxy: dnsServer,
+		configure: network.ConfigureDockerDNS, restore: network.RestoreDockerDNS, logger: logger,
+	}
 	bridgeIP, err := network.GetDockerBridgeIP()
 	if err != nil {
 		logger.Debug("Docker bridge not found, container DNS filtering unavailable", "error", err)
-		return d, func() {}
+		return d
 	}
 	d.bridgeIP = bridgeIP
 	// Marked container-serving so queries arriving there attribute via the
 	// container-IP lookup, never the host-netns sockdiag path.
 	dnsServer.AddContainerListenAddr(d.listenAddr())
-	logger.Info("Docker DNS interception enabled", "docker_bridge", bridgeIP)
+	return d
+}
 
-	if dockerd.Kind != podenv.DockerdLocal {
-		logger.Info("Docker daemon not proven local; leaving its config alone, container DNS is redirected at the bridge",
-			"dockerd", dockerd.Kind.String(), "reason", dockerd.Reason)
-		return d, func() {}
+// useListener puts the bridge listener to use once the proxy is ready, or
+// warns that the proxy could not bind it, which with the redirect on is a
+// lost dns-redirect posture too (startDNSRedirect). Only for a daemon proven
+// local, and only onto a bound listener, is daemon.json rewritten: a foreign
+// or unidentified daemon is left alone, and the redirect, when on, covers
+// its containers. The returned undo restores daemon.json; the caller defers
+// it. It is registered before the rewrite, so a signal landing mid-write
+// still has one: the second-signal path runs it on another goroutine, and
+// pkg/network serializes the two, so it either undoes a finished rewrite or
+// stops one from starting. Nil-safe.
+func (d *dockerDNS) useListener(teardowns *teardownList, redirect bool) func() {
+	if d.bridge() == "" {
+		return func() {}
 	}
-	d.undo = teardowns.add(func() {
-		if err := network.RestoreDockerDNS(logger); err != nil {
-			logger.Warn("Failed to restore Docker DNS", "error", err)
+	local := d.dockerd.Kind == podenv.DockerdLocal
+	if err := d.listenerErr(); err != nil {
+		d.logger.Warn(unboundListener(local, redirect), "addr", d.listenAddr(), "error", err)
+		return func() {}
+	}
+	d.logger.Info("Docker DNS interception enabled", "docker_bridge", d.bridgeIP)
+	if !local {
+		msg := "Docker daemon not proven local; leaving its config alone, container DNS is redirected at the bridge"
+		if !redirect {
+			msg = "Docker daemon not proven local; leaving its config alone, so its containers reach the proxy " +
+				"only by naming the bridge listener"
+		}
+		d.logger.Info(msg, "dockerd", d.dockerd.Kind.String(), "reason", d.dockerd.Reason)
+		return func() {}
+	}
+	undo := teardowns.add(func() {
+		if err := d.restore(d.logger); err != nil {
+			d.logger.Warn("Failed to restore Docker DNS", "error", err)
 		}
 	})
-	if err := network.ConfigureDockerDNS(bridgeIP, logger); err != nil {
-		logger.Warn("Failed to configure Docker DNS", "error", err)
-		return d, d.undo
+	if err := d.configure(d.bridgeIP, d.logger); err != nil {
+		d.logger.Warn("Failed to configure Docker DNS", "error", err)
+		return undo
 	}
-	d.restart = network.RestartDockerDaemon
-	return d, d.undo
+	d.restart = true
+	return undo
+}
+
+// unboundListener is useListener's warning for a bridge listener the proxy
+// could not bind: what containers resolve through instead, which turns on
+// whether daemon.json was the proxy's to rewrite and whether the redirect is
+// on.
+func unboundListener(local, redirect bool) string {
+	msg := "Docker DNS interception unavailable: the proxy could not listen on the docker bridge"
+	if local {
+		msg += ", so daemon.json is left alone"
+	}
+	msg += "; containers resolve as their daemon configures them, around the proxy"
+	if redirect {
+		msg += ", which the DNS redirect does not cover either (a lost dns-redirect posture)"
+	}
+	return msg
 }
 
 // listenAddr is the proxy's listener on the docker bridge.
@@ -118,21 +156,23 @@ func (d *dockerDNS) listenerErr() error {
 	return d.proxy.BindError(d.listenAddr())
 }
 
+// listeningIP is the docker bridge's IP when the proxy holds its listener
+// there, "" otherwise: the address container DNS may be sent to and allowed
+// at. Valid once the proxy is ready. Nil-safe.
+func (d *dockerDNS) listeningIP() string {
+	if d.listenerErr() != nil {
+		return ""
+	}
+	return d.bridge()
+}
+
 // restartDaemon applies the daemon.json rewrite: Docker's SIGHUP handler
-// does not reload DNS settings, so only a full restart does. Without the
-// bridge listener it undoes the rewrite instead, and the daemon keeps the
-// DNS it has. Nil-safe.
+// does not reload DNS settings, so only a full restart does. Nil-safe.
 func (d *dockerDNS) restartDaemon() {
-	if d == nil || d.restart == nil {
+	if d == nil || !d.restart {
 		return
 	}
-	if err := d.listenerErr(); err != nil {
-		d.logger.Warn("Not restarting the Docker daemon onto the bridge listener, which the proxy could not bind; "+
-			"daemon.json is restored, and its containers keep the DNS they have", "addr", d.listenAddr(), "error", err)
-		d.undo()
-		return
-	}
-	if err := d.restart(d.logger); err != nil {
+	if err := network.RestartDockerDaemon(d.logger); err != nil {
 		d.logger.Warn("Failed to restart Docker daemon for DNS config", "error", err)
 	}
 }

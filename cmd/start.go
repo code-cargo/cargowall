@@ -297,8 +297,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}()
 
 		// Wait for the proxy to bind its listeners, or to fail to: the
-		// redirect below covers IPv6 only if the proxy holds its IPv6
-		// listener (startDNSRedirect).
+		// redirect below covers IPv6, and containers, only if the proxy holds
+		// its listeners for them (startDNSRedirect).
 		select {
 		case err := <-dnsErrCh:
 			return fmt.Errorf("DNS proxy server failed to start: %w", err)
@@ -318,7 +318,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		// including across error-return paths below.
 		if cmd.DNSRedirect {
 			var teardownRedirect func()
-			redirect, teardownRedirect = startDNSRedirect(dnsServer, dockerBridgeIP, teardowns, logger)
+			redirect, teardownRedirect = startDNSRedirect(dnsServer, containerDNS, teardowns, logger)
 			defer teardownRedirect()
 		}
 	}

@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"log/slog"
+	"net"
 
 	"github.com/code-cargo/cargowall/pkg/dns"
 	"github.com/code-cargo/cargowall/pkg/network"
@@ -36,10 +37,18 @@ const dockerSocket = "/var/run/docker.sock"
 // reads its own daemon.json and no service manager of ours manages it, so
 // for a foreign daemon both are skipped and the redirect alone catches its
 // containers' DNS.
+//
+// The bridge listener binds over UDP and TCP both or neither, and when it
+// does not, the redirect drops container DNS at the bridge rather than
+// sending it there (redirectSpec): a DNAT would hand the queries to whatever
+// holds the address instead, or to nothing.
 type dockerDNS struct {
 	bridgeIP string // "" when there is no docker bridge: the feature is idle
-	restart  bool   // the daemon is ours and daemon.json was rewritten: restart applies it
-	logger   *slog.Logger
+	// proxy holds the bridge listener, and once it is ready says whether it
+	// bound (dns.Server.BindError).
+	proxy   interface{ BindError(addr string) error }
+	restart bool // the daemon is ours and daemon.json was rewritten: restart applies it
+	logger  *slog.Logger
 }
 
 // startDockerDNS adds the bridge listener and, only for a daemon proven
@@ -53,7 +62,7 @@ type dockerDNS struct {
 func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, teardowns *teardownList,
 	logger *slog.Logger,
 ) (*dockerDNS, func()) {
-	d := &dockerDNS{logger: logger}
+	d := &dockerDNS{proxy: dnsServer, logger: logger}
 	bridgeIP, err := network.GetDockerBridgeIP()
 	if err != nil {
 		logger.Debug("Docker bridge not found, container DNS filtering unavailable", "error", err)
@@ -62,7 +71,7 @@ func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, teardowns *te
 	d.bridgeIP = bridgeIP
 	// Marked container-serving so queries arriving there attribute via the
 	// container-IP lookup, never the host-netns sockdiag path.
-	dnsServer.AddContainerListenAddr(bridgeIP + ":53")
+	dnsServer.AddContainerListenAddr(d.listenAddr())
 	logger.Info("Docker DNS interception enabled", "docker_bridge", bridgeIP)
 
 	if dockerd.Kind != podenv.DockerdLocal {
@@ -81,6 +90,28 @@ func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, teardowns *te
 	}
 	d.restart = true
 	return d, undo
+}
+
+// listenAddr is the proxy's listener on the docker bridge.
+func (d *dockerDNS) listenAddr() string { return net.JoinHostPort(d.bridgeIP, "53") }
+
+// bridge is the docker bridge's IP, "" when there is none. Nil-safe: nil is
+// the feature off.
+func (d *dockerDNS) bridge() string {
+	if d == nil {
+		return ""
+	}
+	return d.bridgeIP
+}
+
+// listenerErr is why the proxy is not listening on the docker bridge, nil
+// when it is or there is no bridge. Valid once the proxy is ready.
+// Nil-safe.
+func (d *dockerDNS) listenerErr() error {
+	if d.bridge() == "" {
+		return nil
+	}
+	return d.proxy.BindError(d.listenAddr())
 }
 
 // restartDaemon applies the daemon.json rewrite: Docker's SIGHUP handler

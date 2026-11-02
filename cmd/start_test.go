@@ -1241,12 +1241,9 @@ func TestWriteFailureSentinel_StampsPidAndSanitizes(t *testing.T) {
 // The readers' reason leaves it out.
 func TestWriteFailureSentinel_NamesRefusedPosture(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "failed")
-	refusal := &postureRefusal{
-		posture: postureContainerEgress,
-		msg:     "--container-egress=enforce requested but could not be applied: x",
-	}
-	publishStartupFailure(path, fmt.Errorf("%w", refusal), quietLogger())
-	reason := "cargowall startup failed: " + refusal.msg
+	lost := errors.New("--container-egress=enforce requested but could not be applied: x")
+	publishStartupFailure(path, lost, postureContainerEgress, quietLogger())
+	reason := "cargowall startup failed: " + lost.Error()
 
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
@@ -1256,7 +1253,7 @@ func TestWriteFailureSentinel_NamesRefusedPosture(t *testing.T) {
 	assert.Equal(t, os.Getpid(), pid)
 	assert.Equal(t, reason, sentinelReason(data))
 
-	publishStartupFailure(path, errors.New("no eBPF"), quietLogger())
+	publishStartupFailure(path, errors.New("no eBPF"), "", quietLogger())
 	data, err = os.ReadFile(path)
 	require.NoError(t, err)
 	assert.NotContains(t, string(data), "refused=", "any other failure names no posture")

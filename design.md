@@ -604,25 +604,32 @@ no step attribution, a failed raise) means different things per rung. Under
 `--container-egress=observe` the hook is measurement: the loss warns, the run
 continues with TC enforcing as always, and the job summary lists the posture
 as not applied — an observe run that never ran reads exactly like a clean
-one otherwise. Under `--container-egress=enforce` the loss fails startup: TC
-would still police post-NAT traffic, but not the pre-NAT, loopback, and
-bridge egress the operator asked to have enforced, and reporting that after
-the job ran is the fail-open direction. `--tls-sni` follows the same rule
-for its enforce rungs, and the DNS redirect for an enforcing policy (see
-GitHub Actions Integration). Under `--api-failure-mode=fail` lockdown none
+one otherwise. Under `--container-egress=enforce` and an enforcing policy the
+loss fails startup: TC would still police post-NAT traffic, but not the
+pre-NAT, loopback, and bridge egress the operator asked to have enforced,
+and reporting that after the job ran is the fail-open direction. Under an
+auditing policy (`mode: audit`, or `--api-failure-mode=audit`'s fallback)
+the hook drops nothing even at enforce, so its loss costs only measurement
+and warns like observe's. `--tls-sni` follows the same rule for its enforce
+rungs, and the DNS redirect for an enforcing policy (see GitHub Actions
+Integration). Under `--api-failure-mode=fail` lockdown none
 of these losses fails startup: the job has already failed, and lockdown
 stays up deny-all on purpose, where exiting would take TC's deny-all down
 with it. The loss is logged as an error and recorded instead. The policy lives in one place, `postureLedger`
 (`cmd/postures.go`).
 
-A fatal loss is a `postureRefusal`, and the failure sentinel names its
-posture on a line of its own, `refused=<posture>`, between the pid stamp and
-the reason. The action fails the step on that line even under
+A fatal loss is a refusal, and says so twice: the failure sentinel names
+its posture on a line of its own, `refused=<posture>`, between the pid stamp
+and the reason, and `cargowall start` exits with status 3. The ledger records
+the posture on the start command as it decides, so no wrapping of the error
+on the way out can hide it. The action fails the step on either, even under
 `fail-on-unsupported: false`, which is for a runner that cannot run
-cargowall at all: this one can, just not with the enforcement the job's
-flags or policy call for, and carrying on would run the job with no
-firewall. It rides the sentinel the action already reads to decide, so no
-second write can lose it.
+cargowall at all: this one can, just not with the enforcement this run's
+flags, preset and policy call for, and carrying on would run the job with no
+firewall. The exit status needs no file, so a sentinel that could not be
+written (a full `/tmp`, a directory planted at its path) does not lose the
+refusal. The sentinel's format, writer and readers, lives in
+`cmd/sentinel.go`.
 
 **One post-verdict pipeline.** Both hooks feed the same steps in
 `pkg/events` (`outcome.go`): hostname/CNAME resolution, late-allow

@@ -19,11 +19,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"os"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -175,90 +171,4 @@ func (r runIdentity) owns(data stateFile) bool {
 		}
 	}
 	return !data.modTime.Before(r.anchor.Add(-staleSlack))
-}
-
-// stateFile is a defensively-read state file: content plus mtime.
-type stateFile struct {
-	data    []byte
-	modTime time.Time
-}
-
-// readStateFile reads a cargowall state file from world-writable /tmp
-// defensively: symlinks and non-regular files are ignored (Lstat +
-// O_NOFOLLOW) and the read is bounded.
-func readStateFile(path string) (stateFile, bool) {
-	fi, err := os.Lstat(path)
-	if err != nil || !fi.Mode().IsRegular() {
-		return stateFile{}, false
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return stateFile{}, false
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, 8192))
-	if err != nil {
-		return stateFile{}, false
-	}
-	return stateFile{data: data, modTime: fi.ModTime()}, true
-}
-
-// writeFailureSentinel publishes the failure sentinel: the writer's pid on
-// the first line (so a reader can tell THIS run's sentinel from a previous
-// run's leftover by comparing against the pidfile, which mtime alone cannot
-// do after a SIGKILL), then, when startup failed on a refused posture, a
-// `refused=<posture>` line naming it (see postureRefusal), then a bounded,
-// control-character-stripped reason — unsanitized text here reaches CI
-// logs, where an embedded newline plus a `::`-prefixed line is a
-// workflow-command injection. The refusal rides here rather than in a file
-// of its own: the action reads this file to decide anyway, so a refusal
-// cannot be lost to a second write that failed.
-func writeFailureSentinel(path, reason, refused string) error {
-	head := fmt.Sprintf("pid=%d\n", os.Getpid())
-	if refused != "" {
-		head += "refused=" + refused + "\n"
-	}
-	return writeSentinel(path, []byte(head+sanitizeReason(reason)+"\n"))
-}
-
-// publishStartupFailure writes the failure sentinel for a startup that
-// returned err, naming the posture when err is a refused one.
-func publishStartupFailure(path string, err error, logger *slog.Logger) {
-	if werr := writeFailureSentinel(path, "cargowall startup failed: "+err.Error(), refusedPosture(err)); werr != nil {
-		logger.Warn("Failed to write failure sentinel", "path", path, "error", werr)
-	}
-}
-
-// sentinelPid extracts the `pid=N` stamp from a sentinel's first line.
-func sentinelPid(data []byte) (int, bool) {
-	first, _, _ := strings.Cut(string(data), "\n")
-	rest, ok := strings.CutPrefix(strings.TrimSpace(first), "pid=")
-	if !ok {
-		return 0, false
-	}
-	pid, err := strconv.Atoi(rest)
-	if err != nil || pid <= 0 {
-		return 0, false
-	}
-	return pid, true
-}
-
-// sentinelReason renders a sentinel's human-readable reason for CI logs:
-// the pid stamp and any refused= line are dropped, control characters are
-// stripped (the file is world-writable, and an embedded newline plus a `::`
-// prefix is a workflow command injection), and the result is bounded and
-// never empty.
-func sentinelReason(data []byte) string {
-	body := string(data)
-	if first, rest, found := strings.Cut(body, "\n"); found && strings.HasPrefix(strings.TrimSpace(first), "pid=") {
-		body = rest
-		if line, after, found := strings.Cut(body, "\n"); found && strings.HasPrefix(line, "refused=") {
-			body = after
-		}
-	}
-	reason := sanitizeReason(strings.TrimSpace(body))
-	if reason == "" {
-		return "(no reason recorded)"
-	}
-	return reason
 }

@@ -28,6 +28,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -95,8 +96,7 @@ func TestPostures_LostEnforceFailsStartup(t *testing.T) {
 			}
 			err := p.lose(tc.lose, reason)
 			require.EqualError(t, err, tc.want)
-			assert.Equal(t, tc.lose, refusedPosture(fmt.Errorf("startup: %w", err)),
-				"the failure sentinel names the refused posture, through any wrapping")
+			assert.Equal(t, tc.lose, *p.refused, "the failure sentinel and exit status name the refused posture")
 
 			r := p.find(tc.lose)
 			assert.True(t, r.degraded(), "a fatal loss still marks the record")
@@ -138,12 +138,45 @@ func TestPostures_LostObserveIsRecordedNotFatal(t *testing.T) {
 	assert.Equal(t, p.lines(), readPostures(), "the summary must read back exactly what start wrote")
 }
 
-// Only a lost fail-closed posture is a refusal: any other startup error
-// keeps the action's fail-on-unsupported handling.
-func TestRefusedPosture_OnlyARefusal(t *testing.T) {
-	assert.Empty(t, refusedPosture(nil))
-	assert.Empty(t, refusedPosture(errors.New("failed to attach TC program")))
-	assert.Equal(t, postureTLSSNI, refusedPosture(&postureRefusal{posture: postureTLSSNI}))
+// Under an auditing policy an enforce rung drops nothing, so losing it costs
+// measurement only: it warns and is recorded, like a lost observe rung, and
+// names no refused posture.
+func TestPostures_EnforceRungUnderAuditPolicyIsNotFatal(t *testing.T) {
+	var buf bytes.Buffer
+	cmd := &StartCmd{ContainerEgress: ContainerEgressEnforce, TLSSNI: TLSSNIEnforcePinned}
+	p := newPostures(cmd, "6.6.141", false, slog.New(slog.NewTextHandler(&buf, nil)))
+	require.NoError(t, p.lose(postureContainerEgress, "hook refused"))
+	require.NoError(t, p.lose(postureTLSSNI, "the cgroup egress hook it rides is not running"))
+	assert.Equal(t, 2, strings.Count(buf.String(), "level=WARN"), buf.String())
+	assert.NotContains(t, buf.String(), "level=ERROR")
+	assert.Empty(t, cmd.refusedPosture)
+	for _, l := range p.lines() {
+		assert.True(t, l.degraded(), "%s is recorded as lost", l.Posture)
+	}
+}
+
+// Only a refused posture changes the exit status; the error itself, its
+// message and its chain, is what startup returned.
+func TestRefusalExit(t *testing.T) {
+	assert.NoError(t, refusalExit(nil, postureTLSSNI))
+	plain := errors.New("failed to attach TC program")
+	assert.Same(t, plain, refusalExit(plain, ""), "any other failure keeps kong's exit status 1")
+
+	err := refusalExit(plain, postureDNSRedirect)
+	var coder interface{ ExitCode() int }
+	require.ErrorAs(t, fmt.Errorf("run: %w", err), &coder, "kong finds the status through wrapping")
+	assert.Equal(t, exitRefused, coder.ExitCode())
+	assert.ErrorIs(t, err, plain)
+	assert.EqualError(t, err, plain.Error())
+}
+
+// The action reads a refused= line only in this shape (sentinelRefusal in
+// cargowall-action), so a posture named outside it would fail open there.
+func TestPostureNames_MatchTheActionsPattern(t *testing.T) {
+	pattern := regexp.MustCompile(`^[a-z][a-z-]{0,63}$`)
+	for _, name := range []string{postureContainerEgress, postureTLSSNI, postureDNSRedirect} {
+		assert.Regexp(t, pattern, name)
+	}
 }
 
 // A second loss of the same layer keeps the first reason: it is the cause,
@@ -179,7 +212,7 @@ func TestPostures_DNSRedirect(t *testing.T) {
 	require.EqualError(t, err,
 		"--dns-redirect=true requested but could not be applied: "+
 			"nftables: installing table ip cargowall: operation not supported")
-	assert.Equal(t, postureDNSRedirect, refusedPosture(err))
+	assert.Equal(t, postureDNSRedirect, *p.refused)
 	assert.Contains(t, buf.String(), "level=ERROR")
 
 	redirectStateFiles(t)
@@ -220,6 +253,7 @@ func TestPostures_LockdownLossIsNotFatal(t *testing.T) {
 	for _, l := range p.lines() {
 		assert.True(t, l.degraded(), "%s is recorded as lost", l.Posture)
 	}
+	assert.Empty(t, cmd.refusedPosture, "lockdown fails the job itself")
 }
 
 // Without step attribution the hook never starts: fatal under enforce, a

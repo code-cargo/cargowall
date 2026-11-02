@@ -175,21 +175,9 @@ func udp6(src, dst net.IP, sport, dport uint16, payload string) []byte {
 	binary.BigEndian.PutUint16(udp[4:], uint16(8+len(payload)))
 	copy(udp[8:], payload)
 	// The pseudo-header: both addresses, the UDP length, the next header.
-	sum := uint32(len(udp)) + unix.IPPROTO_UDP
-	for _, words := range [][]byte{b[8:40], udp} {
-		for i := 0; i+1 < len(words); i += 2 {
-			sum += uint32(binary.BigEndian.Uint16(words[i:]))
-		}
-		if len(words)%2 == 1 {
-			sum += uint32(words[len(words)-1]) << 8
-		}
-	}
-	for sum > 0xffff {
-		sum = sum&0xffff + sum>>16
-	}
-	check := ^uint16(sum)
+	check := inetChecksum(uint32(len(udp))+unix.IPPROTO_UDP, b[8:40], udp)
 	if check == 0 {
-		check = 0xffff
+		check = 0xffff // zero is no checksum, which IPv6 refuses
 	}
 	binary.BigEndian.PutUint16(udp[6:], check)
 	return b
@@ -205,14 +193,7 @@ func udp4(src, dst net.IP, sport, dport uint16, payload string) []byte {
 	b[9] = unix.IPPROTO_UDP
 	copy(b[12:16], src.To4())
 	copy(b[16:20], dst.To4())
-	var sum uint32
-	for i := 0; i < 20; i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(b[i:]))
-	}
-	for sum > 0xffff {
-		sum = sum&0xffff + sum>>16
-	}
-	binary.BigEndian.PutUint16(b[10:], ^uint16(sum))
+	binary.BigEndian.PutUint16(b[10:], inetChecksum(0, b[:20]))
 	binary.BigEndian.PutUint16(b[20:], sport)
 	binary.BigEndian.PutUint16(b[22:], dport)
 	binary.BigEndian.PutUint16(b[24:], uint16(8+len(payload)))
@@ -244,11 +225,17 @@ func tcp4SYN(src, dst net.IP, sport, dport uint16) []byte {
 	return b
 }
 
-// inetChecksum is the internet checksum of words, folded onto sum.
+// inetChecksum is the internet checksum (RFC 1071) of words, which it sums
+// as one run of bytes, folded onto sum: a pseudo-header's length and
+// protocol, for a transport checksum. Only the last of words may be of odd
+// length, as a payload can be; its last byte is padded with zero.
 func inetChecksum(sum uint32, words ...[]byte) uint16 {
 	for _, w := range words {
 		for i := 0; i+1 < len(w); i += 2 {
 			sum += uint32(binary.BigEndian.Uint16(w[i:]))
+		}
+		if len(w)%2 == 1 {
+			sum += uint32(w[len(w)-1]) << 8
 		}
 	}
 	for sum > 0xffff {

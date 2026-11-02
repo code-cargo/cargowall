@@ -605,11 +605,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		return err
 	}
 
-	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
-	// load-bearing under --container-egress=enforce — the docker bridge
-	// listener that daemon.json points every container at, once the proxy
-	// holds it: else port 53 there is another process's. Previously this
-	// lived in the CI-only config path, so `--container-egress=enforce
+	// DNS infrastructure, port 53 (dnsInfraIPs). Previously this lived in
+	// the CI-only config path, so `--container-egress=enforce
 	// --docker-dns-interception` without a CI preset enforced against an
 	// allowlist that never contained bridgeIP:53 and container resolution
 	// died with EPERM. Unconditional: even with DNS tracking disabled (no
@@ -621,14 +618,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// broader loopback allow exists would shadow the /8 all-ports allow and
 	// deny 127.0.0.1 on every other port. With the /8 already in place, the
 	// covered-check inside ensureAllowed skips the /32 instead.
-	dnsIPs := []string{"127.0.0.1"}
-	if dnsUpstreamHost, _, err := net.SplitHostPort(cmd.DNSUpstream); err == nil {
-		dnsIPs = append(dnsIPs, dnsUpstreamHost)
-	}
-	if bridgeIP := containerDNS.listeningIP(); bridgeIP != "" {
-		dnsIPs = append(dnsIPs, bridgeIP)
-	}
-	configMgr.EnsureDNSAllowed(dnsIPs)
+	configMgr.EnsureDNSAllowed(dnsInfraIPs(cmd.DNSUpstream, containerDNS))
 
 	// BPF runtime stats (3a telemetry): global kernel accounting while
 	// enabled; the per-program numbers land in one shutdown log line each.

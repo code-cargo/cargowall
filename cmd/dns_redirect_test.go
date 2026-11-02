@@ -30,8 +30,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
-
-	"github.com/code-cargo/cargowall/pkg/network"
 )
 
 // listenErr is a bind failure as the proxy reports it (dns.Server's
@@ -94,9 +92,9 @@ func TestIPv6Gap(t *testing.T) {
 // Container DNS reaches the proxy when the proxy holds its listener on the
 // docker bridge. The reason it does not names the address once, and why:
 // the bind error repeats the address, and only its protocol and cause are
-// kept.
+// kept. Without a bridge, or with the feature off, there is nothing to
+// reach.
 func TestBridgeGap(t *testing.T) {
-	d := &dockerDNS{bridgeIP: "172.17.0.1"}
 	for _, c := range []struct {
 		name string
 		err  error
@@ -114,34 +112,12 @@ func TestBridgeGap(t *testing.T) {
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			assert.Equal(t, c.gap, bridgeGap(d, c.err))
+			d := &dockerDNS{bridgeIP: "172.17.0.1", proxy: bindErrs{"172.17.0.1:53": c.err}}
+			assert.Equal(t, c.gap, bridgeGap(d))
 		})
 	}
-}
-
-// The redirect sends container DNS to the bridge listener only once the
-// proxy holds it, and otherwise leaves the bridge without a rule, neither
-// DNAT nor drop; IPv6 DNS likewise goes to the IPv6 listener only once that
-// is held. No bridge is no bridge rule.
-func TestRedirectSpec(t *testing.T) {
-	held := listenErr("udp4", "172.17.0.1:53", unix.EADDRINUSE)
-	held6 := listenErr("udp6", "[::1]:53", unix.EADDRINUSE)
-	for _, c := range []struct {
-		name               string
-		ipv6Err, bridgeErr error
-		bridgeIP           string
-		want               network.RedirectSpec
-	}{
-		{"whole", nil, nil, "172.17.0.1", network.RedirectSpec{IPv6: true, BridgeIP: "172.17.0.1"}},
-		{"bridge listener unbound", nil, held, "172.17.0.1", network.RedirectSpec{IPv6: true}},
-		{"IPv6 listener unbound", held6, nil, "172.17.0.1", network.RedirectSpec{BridgeIP: "172.17.0.1"}},
-		{"neither bound", held6, held, "172.17.0.1", network.RedirectSpec{}},
-		{"no bridge", nil, nil, "", network.RedirectSpec{IPv6: true}},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			assert.Equal(t, c.want, redirectSpec(c.ipv6Err, c.bridgeIP, c.bridgeErr))
-		})
-	}
+	assert.Empty(t, bridgeGap(&dockerDNS{proxy: bindErrs{":53": unix.EADDRINUSE}}))
+	assert.Empty(t, bridgeGap(nil))
 }
 
 // A redirect in place but not whole is active, so the resolved cache flush
@@ -201,9 +177,9 @@ func TestDNSRedirect_PartialIsALoss(t *testing.T) {
 func TestDNSRedirect_BothGapsKeepTheirCauses(t *testing.T) {
 	refused := errors.New("nftables: installing table inet cargowall: netlink receive: address family not supported " +
 		"by protocol (the kernel may lack inet tables or IPv6 nat: CONFIG_NF_TABLES_INET, or nf_nat for IPv6)")
-	d := &dockerDNS{bridgeIP: "255.255.255.255"}
-	r := installed(ipv6Gap(nil, refused, func() bool { return true }),
-		bridgeGap(d, listenErr("udp4", d.listenAddr(), unix.EADDRNOTAVAIL)), slog.New(slog.DiscardHandler))
+	const bridge = "255.255.255.255:53"
+	d := &dockerDNS{bridgeIP: "255.255.255.255", proxy: bindErrs{bridge: listenErr("udp4", bridge, unix.EADDRNOTAVAIL)}}
+	r := installed(ipv6Gap(nil, refused, func() bool { return true }), bridgeGap(d), slog.New(slog.DiscardHandler))
 	require.Greater(t, len(r.err.Error()), maxPostureReasonBytes, "the worst case must be one the record cuts")
 
 	redirectStateFiles(t)

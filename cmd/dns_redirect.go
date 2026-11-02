@@ -87,13 +87,14 @@ func ipv6Gap(bindErr, refused error, hostIPv6 func() bool) string {
 }
 
 // bridgeGap is why container DNS will not reach the proxy, "" when it will:
-// bindErr is why the proxy does not hold its listener on the docker bridge,
-// and the redirect then leaves container DNS alone (redirectSpec).
-func bridgeGap(containerDNS *dockerDNS, bindErr error) string {
-	if bindErr == nil {
+// the proxy does not hold its listener on the docker bridge, and the
+// redirect then leaves container DNS alone (dockerDNS.listeningIP).
+func bridgeGap(containerDNS *dockerDNS) string {
+	err := containerDNS.listenerErr()
+	if err == nil {
 		return ""
 	}
-	return listenGap(containerDNS.listenAddr(), bindErr)
+	return listenGap(containerDNS.listenAddr(), err)
 }
 
 // listenGap is why the proxy does not hold its listener at addr, as a
@@ -113,26 +114,11 @@ func listenGap(addr string, err error) string {
 	}
 }
 
-// redirectSpec is the redirect for the listeners the proxy holds once it is
-// ready: IPv6 DNS goes to its IPv6 listener only when that is bound
-// (ipv6BindErr nil), and container DNS to its docker bridge listener at
-// bridgeIP only when that one is (bridgeBindErr nil). Otherwise the bridge
-// gets no rule at all: a DNAT would hand container DNS to whatever holds the
-// address, and a drop would block DNS under an auditing policy, which
-// promises to block nothing, while under an enforcing one the loss already
-// refuses startup.
-func redirectSpec(ipv6BindErr error, bridgeIP string, bridgeBindErr error) network.RedirectSpec {
-	spec := network.RedirectSpec{IPv6: ipv6BindErr == nil}
-	if bridgeBindErr == nil {
-		spec.BridgeIP = bridgeIP
-	}
-	return spec
-}
-
-// startDNSRedirect installs the redirect for the proxy, and for its
-// container listener on the docker bridge when there is one, once the proxy
-// has bound its listeners (redirectSpec), and what that leaves uncovered is
-// ipv6Gap's and bridgeGap's to say. The returned undo
+// startDNSRedirect installs the redirect for the listeners the proxy holds
+// once it is ready: IPv6 DNS goes to its IPv6 listener only when that is
+// bound, and container DNS to its docker bridge listener only when that one
+// is (dockerDNS.listeningIP). What that leaves uncovered is ipv6Gap's and
+// bridgeGap's to say. The returned undo
 // removes it; the caller defers it. It is registered before the install,
 // like every host mutation's: a forced shutdown landing mid-install waits
 // for it, then removes the table, which an unowned one needs, and flushes
@@ -150,12 +136,10 @@ func startDNSRedirect(dnsServer *dns.Server, containerDNS *dockerDNS, teardowns 
 		}
 	})
 	bindErr := dnsServer.BindError(network.ProxyAddrIPv6)
-	bridgeErr := containerDNS.listenerErr()
-	if err := redirect.Install(redirectSpec(bindErr, containerDNS.bridge(), bridgeErr)); err != nil {
+	if err := redirect.Install(network.RedirectSpec{IPv6: bindErr == nil, BridgeIP: containerDNS.listeningIP()}); err != nil {
 		return notInstalled(err, logger), undo
 	}
-	return installed(ipv6Gap(bindErr, redirect.IPv6Refused(), network.HostIPv6), bridgeGap(containerDNS, bridgeErr),
-		logger), undo
+	return installed(ipv6Gap(bindErr, redirect.IPv6Refused(), network.HostIPv6), bridgeGap(containerDNS), logger), undo
 }
 
 // installed records a redirect in place, whole unless it has a gap: ipv6

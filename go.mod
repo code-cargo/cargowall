@@ -7,6 +7,7 @@ toolchain go1.26.7
 require (
 	github.com/alecthomas/kong v1.16.1
 	github.com/cilium/ebpf v0.22.0
+	github.com/google/nftables v0.3.0
 	github.com/mdlayher/netlink v1.11.2
 	github.com/miekg/dns v1.1.73
 	github.com/stretchr/testify v1.12.1

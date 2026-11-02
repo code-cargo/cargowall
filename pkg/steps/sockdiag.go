@@ -36,7 +36,7 @@ import (
 // via NETLINK_SOCK_DIAG: source address → cookie → map_sock_step.
 //
 // A dump (matched client-side by source) is used instead of an exact
-// 4-tuple lookup deliberately: the iptables DNAT that steers DNS to the
+// 4-tuple lookup deliberately: the DNAT that steers DNS to the
 // proxy rewrites the packet, not the client socket, so the client's socket
 // still names the ORIGINAL resolver as its peer — the proxy-side 4-tuple
 // doesn't exist in the client's socket table.

@@ -48,7 +48,7 @@ JSON
 # nohup + & + disown lets cargowall outlive this step's shell. The
 # privileged-Docker stand-in for GitLab SaaS doesn't exist on GitHub
 # Actions runners, so we exercise the same code path on the Azure-backed
-# Linux runner — eBPF + sudo + iptables work the same.
+# Linux runner — eBPF + sudo + nftables work the same.
 start() {
   sudo nohup ./bin/cargowall start \
     --gitlab-ci \

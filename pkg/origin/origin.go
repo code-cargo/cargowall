@@ -434,7 +434,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 // observer, and releases the collection, in that order so the reader never
 // sees a closed map. The full-fidelity worker does not drain its backlog —
 // each queued report can cost a 500ms PTR lookup, and a full queue would
-// hold shutdown (and every teardown behind it: iptables DNAT, daemon.json
+// hold shutdown (and every teardown behind it: the DNS redirect, daemon.json
 // restore) hostage for minutes while the hook is still attached. Instead
 // the backlog is triaged: queued Blocks divert to the must-audit lane and
 // their audit records still land (counted as degraded); queued would-blocks

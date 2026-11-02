@@ -80,8 +80,8 @@ JSON
   echo "✅ pod up: cw-pod (netns owner), cw-client (workload)"
 }
 
-# What this locks: no --github-action or --gitlab-ci, so no iptables DNS
-# redirect and no Docker DNS rewrite; the workload reaches the proxy at
+# What this locks: no --github-action or --gitlab-ci, so no DNS redirect
+# and no Docker DNS rewrite; the workload reaches the proxy at
 # 127.0.0.1:53 only through the pod resolv.conf. Query filtering stays off,
 # as it is for the operator-injected sidecar, so a denied name still
 # resolves and the block lands at TC. Policy comes from a file

@@ -15,11 +15,15 @@
 //go:build linux
 
 // Requested-vs-applied postures for the layers a flag requests but the
-// runtime can fail to deliver: the cgroup egress hook and the L7 layer riding
-// it. A lost enforce rung fails startup — the operator asked for a guarantee
-// the job would not have. A lost observe rung only warns, and is recorded so
-// the job summary can say the measurement never ran: an observe run that
-// reports no would-blocks reads exactly like a clean one.
+// runtime can fail to deliver: the cgroup egress hook, the L7 layer riding
+// it, and the DNS redirect. A lost enforce rung fails startup — the operator
+// asked for a guarantee the job would not have. A lost observe rung only
+// warns, and is recorded so the job summary can say the measurement never
+// ran: an observe run that reports no would-blocks reads exactly like a
+// clean one. The redirect's flag has no rungs of its own; what it guards is
+// the policy's enforcement, so the policy's mode decides. Under policy
+// lockdown no loss is fatal: lockdown has already failed the job and stays up
+// deny-all on purpose, and exiting would take the whole firewall down.
 package cmd
 
 import (
@@ -41,6 +45,14 @@ var posturesFile = "/tmp/cargowall-postures"
 const (
 	postureContainerEgress = "container-egress"
 	postureTLSSNI          = "tls-sni"
+	postureDNSRedirect     = "dns-redirect"
+)
+
+// The redirect's flag is a bool; these are its values in the record,
+// spelled as the flag takes them.
+const (
+	dnsRedirectOn  = "true"
+	dnsRedirectOff = "false"
 )
 
 // maxPostureReasonBytes bounds a reason: it lands in a job-summary table
@@ -49,7 +61,8 @@ const maxPostureReasonBytes = 300
 
 // postureLine is one layer's line in posturesFile, the whole of what
 // crosses from `cargowall start` to `cargowall summary`. Values are flag
-// rungs ("off", "observe", "enforce", "enforce-pinned").
+// rungs ("off", "observe", "enforce", "enforce-pinned"), or a bool flag's
+// "true" and "false".
 type postureLine struct {
 	Posture   string `json:"posture"`
 	Requested string `json:"requested"`
@@ -74,20 +87,28 @@ type postureLayer struct {
 // enforce rung into a failed start, and a missing one must not quietly
 // degrade instead.
 type postureLedger struct {
-	layers []postureLayer
-	kernel string // uname release, for verifier reasons: the budget is per-kernel
-	logger *slog.Logger
+	layers   []postureLayer
+	kernel   string // uname release, for verifier reasons: the budget is per-kernel
+	lockdown bool   // policy lockdown: no loss fails startup
+	logger   *slog.Logger
 }
 
 // newPostures registers each layer against its OWN flag's constants: the
 // two flags happen to share the spellings "off" and "enforce", and neither
-// the skip nor the fail-closed decision may lean on that.
-func newPostures(cmd *StartCmd, kernel string, logger *slog.Logger) *postureLedger {
-	p := &postureLedger{kernel: kernel, logger: logger}
+// the skip nor the fail-closed decision may lean on that. enforcing is the
+// loaded policy's mode, which decides for the DNS redirect: the redirect
+// only does anything while DNS tracking runs.
+func newPostures(cmd *StartCmd, kernel string, enforcing bool, logger *slog.Logger) *postureLedger {
+	p := &postureLedger{kernel: kernel, lockdown: cmd.policyLockdown, logger: logger}
 	p.register(postureContainerEgress, cmd.ContainerEgress, ContainerEgressOff,
 		cmd.ContainerEgress == ContainerEgressEnforce)
 	p.register(postureTLSSNI, cmd.TLSSNI, TLSSNIOff,
 		cmd.TLSSNI == TLSSNIEnforce || cmd.TLSSNI == TLSSNIEnforcePinned)
+	redirect := dnsRedirectOff
+	if cmd.DNSRedirect && !cmd.DisableDNSTracking {
+		redirect = dnsRedirectOn
+	}
+	p.register(postureDNSRedirect, redirect, dnsRedirectOff, enforcing)
 	return p
 }
 
@@ -130,8 +151,10 @@ func (p *postureLedger) lines() []postureLine {
 // A fail-closed rung returns an error the caller must fail startup with: TC
 // egress would still police post-NAT traffic, but the job would run without
 // the pre-NAT/loopback/bridge or name-level enforcement it asked for, and
-// saying so after the fact is the fail-open direction. Any other loss warns,
-// and the summary lists it.
+// saying so after the fact is the fail-open direction. Under policy lockdown
+// it logs the error and carries on instead: the job has already failed, and
+// lockdown's deny-all firewall must stay up until the job ends. Any other
+// loss warns, and the summary lists it.
 func (p *postureLedger) lose(posture, reason string) error {
 	r := p.find(posture)
 	if r == nil {
@@ -142,7 +165,11 @@ func (p *postureLedger) lose(posture, reason string) error {
 		r.Reason = truncateReason(reason)
 	}
 	msg := fmt.Sprintf("--%s=%s requested but could not be applied", posture, r.Requested)
-	if r.failClosed {
+	switch {
+	case r.failClosed && p.lockdown:
+		p.logger.Error(msg+"; staying up in policy lockdown", "reason", reason)
+		return nil
+	case r.failClosed:
 		p.logger.Error(msg, "reason", reason)
 		return fmt.Errorf("%s: %s", msg, reason)
 	}

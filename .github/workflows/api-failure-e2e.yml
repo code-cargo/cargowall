@@ -1,7 +1,7 @@
 name: api-failure-e2e
 
 # End-to-end verification of --api-failure-mode (#96) on a real runner: the
-# actual binary, real eBPF TC attach, real iptables DNS redirect, and a local
+# actual binary, real eBPF TC attach, real nftables DNS redirect, and a local
 # mock of the CodeCargo policy API driving each failure class.
 #
 # Jobs (each on a fresh VM so scenarios can't contaminate each other):
@@ -41,6 +41,10 @@ on:
       # the legacy-clsact teardown these jobs protect lives in pkg/tc
       - "pkg/tc/**"
       - "bpf/**"
+      # the redirect's teardown proof, and the modules it is built on
+      - "scripts/ci/dns-redirect-gone.sh"
+      - "go.mod"
+      - "go.sum"
       - ".github/workflows/api-failure-e2e.yml"
   workflow_dispatch:
 
@@ -52,7 +56,7 @@ permissions:
   contents: read
 
 # Jobs whose behavior depends on the runner's kernel or distro (BPF test
-# runs, iptables, sudo, the resolver setup) run on a matrix of the current
+# runs, nftables, sudo, the resolver setup) run on a matrix of the current
 # Ubuntu LTS and the one before it, so a new runner image shows up as one
 # failing leg instead of a broken main.
 jobs:
@@ -375,12 +379,7 @@ jobs:
       - name: Stop cargowall and assert clean teardown
         run: |
           sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
-          if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
-            echo "::error::DNS DNAT rules leaked after stop"; exit 1
-          fi
-          if sudo iptables -S INPUT | grep -q -- '--sport 53'; then
-            echo "::error::DNS INPUT guard rules leaked after stop"; exit 1
-          fi
+          bash scripts/ci/dns-redirect-gone.sh /tmp/cargowall.log "after stop"
           getent hosts example.com > /dev/null \
             || { echo "::error::DNS broken after teardown"; exit 1; }
 
@@ -547,10 +546,10 @@ jobs:
           # policyFetchTotalBudget, so a 1s-granularity poll plus command
           # overhead could let lockdown be decided before the kill lands.
           for i in $(seq 1 150); do
-            sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' && break
+            sudo nft list table ip cargowall > /dev/null 2>&1 && break
             sleep 0.2
           done
-          sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' \
+          sudo nft list table ip cargowall > /dev/null 2>&1 \
             || { echo "::error::DNS redirect never appeared"; cat /tmp/cargowall.log; exit 1; }
 
           # $CARGO is sudo's pid; the REAL cargowall pid is in the pidfile
@@ -572,12 +571,7 @@ jobs:
 
       - name: Assert host state restored and no misreported sentinels
         run: |
-          if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
-            echo "::error::DNAT rules leaked — startup SIGTERM did not run teardown"; exit 1
-          fi
-          if sudo iptables -S INPUT | grep -q -- '--sport 53'; then
-            echo "::error::DNS INPUT guard rules leaked — startup SIGTERM did not run teardown"; exit 1
-          fi
+          bash scripts/ci/dns-redirect-gone.sh /tmp/cargowall.log "after the startup SIGTERM"
           # The cancelled fetch must not be misreported as an outage: even
           # with api-failure-mode=fail, no failure sentinel may be written.
           test ! -f /tmp/cargowall-failed \
@@ -651,7 +645,7 @@ jobs:
               --config /etc/cargowall/config.json \
               --dns-upstream 8.8.8.8:53 \
               --sudo-lockdown \
-              --sudo-allow-commands "/usr/sbin/iptables,/usr/sbin/ip6tables" \
+              --sudo-allow-commands "/usr/sbin/nft" \
               --audit-mode \
               --pidfile /tmp/cargowall.pid > /tmp/cargowall.log 2>&1 &
             CW_PID=$!
@@ -670,7 +664,7 @@ jobs:
       - name: Assert sudo lockdown and the DNS redirect are in place
         run: |
           # An allow-listed command still works...
-          sudo -n /usr/sbin/iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53' \
+          sudo -n /usr/sbin/nft list table ip cargowall > /dev/null \
             || { echo "::error::DNS redirect not installed"; exit 1; }
           # ...while anything else is denied. That IS the lockdown, and it
           # needs no privileged file access to observe.
@@ -702,12 +696,7 @@ jobs:
           # cannot repair itself. Arbitrary sudo working again is the proof.
           sudo -n /usr/bin/id -u > /dev/null \
             || { echo "::error::sudo still restricted after forced teardown"; exit 1; }
-          if sudo iptables -t nat -S OUTPUT | grep -q '127.0.0.1:53'; then
-            echo "::error::DNAT rules leaked through the forced teardown"; exit 1
-          fi
-          if sudo iptables -S INPUT | grep -q -- '--sport 53'; then
-            echo "::error::DNS INPUT guard rules leaked through the forced teardown"; exit 1
-          fi
+          bash scripts/ci/dns-redirect-gone.sh /tmp/cargowall.log "after the forced teardown"
           if sudo test -f /etc/docker/daemon.json.cargowall.bak; then
             echo "::error::daemon.json backup left behind — Docker DNS not restored"; exit 1
           fi

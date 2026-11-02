@@ -198,7 +198,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	defer dnsCancel()
 
 	// Arm signal handling BEFORE the first host mutation (Docker DNS config,
-	// iptables redirect below). A SIGTERM during startup — the action kills
+	// DNS redirect below). A SIGTERM during startup — the action kills
 	// the process when its readiness wait times out — used to hit Go's
 	// default disposition: instant death, no defers, leaving the DNAT rules
 	// pointed at a dead proxy and daemon.json rewritten, i.e. a runner with
@@ -221,9 +221,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		case <-ctx.Done():
 			return
 		}
-		// Some startup phases (Docker restart, iptables under a wedged
-		// xtables lock) are not context-aware, so the graceful unwind can
-		// lag the first signal by tens of seconds. A second signal means
+		// Some startup phases (the Docker restart) are not context-aware,
+		// so the graceful unwind can lag the first signal by tens of
+		// seconds. A second signal means
 		// "stop waiting" — but a bare os.Exit here would skip every defer
 		// and leave sudoers locked down, the DNAT rule pointing at a dead
 		// proxy, and daemon.json rewritten, with no process left to undo
@@ -259,10 +259,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	var dnsServer *dns.Server
 	var containerDNS *dockerDNS
 	var dockerBridgeIP string
-	// Tracks whether the iptables DNS redirect is actually in place, so the
-	// post-snapshot systemd-resolved cache flush runs only when there is a
-	// proxy for future upstream lookups to traverse.
-	var dnsRedirectActive bool
+	var redirect *dnsRedirect
 	if !cmd.DisableDNSTracking {
 		// Infrastructure auto-allows must be installed before the proxy below
 		// arms query filtering (issue #119).
@@ -312,27 +309,15 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			"listen", listenAddr,
 			"upstream", upstream)
 
-		// Set up iptables DNAT to force all outbound DNS through the proxy.
-		// This catches processes that bypass /etc/resolv.conf and query
-		// upstream DNS directly (e.g., Go's pure resolver, Node.js).
-		// Teardown is deferred immediately so the rule never outlives the
-		// process — including across error-return paths below.
-		if cmd.DNSRedirectIptables {
-			// Registered BEFORE the mutation: iptables -A can partially
-			// apply, and a signal landing mid-install must still leave a
-			// registered undo. Deleting rules that were never added is a
-			// logged no-op.
-			teardownRedirect := teardowns.add(func() {
-				if err := network.TeardownDNSRedirect(logger, dockerBridgeIP); err != nil {
-					logger.Warn("Failed to tear down DNS redirect", "error", err)
-				}
-			})
+		// Force all outbound DNS through the proxy. This catches processes
+		// that bypass /etc/resolv.conf and query upstream DNS directly
+		// (e.g., Go's pure resolver, Node.js). Teardown is deferred
+		// immediately so the redirect never outlives the process —
+		// including across error-return paths below.
+		if cmd.DNSRedirect {
+			var teardownRedirect func()
+			redirect, teardownRedirect = startDNSRedirect(dockerBridgeIP, teardowns, logger)
 			defer teardownRedirect()
-			if err := network.SetupDNSRedirect(logger, dockerBridgeIP); err != nil {
-				logger.Warn("Failed to set up DNS redirect (iptables)", "error", err)
-			} else {
-				dnsRedirectActive = true
-			}
 		}
 	}
 
@@ -471,6 +456,15 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		return nil
 	}
 
+	// postures decides what losing a requested layer means: a lost enforce
+	// rung fails startup, a lost observe rung is recorded for the summary.
+	// Built as soon as the policy's mode is settled, so a lost redirect
+	// fails before any eBPF is loaded.
+	postures := newPostures(cmd, caps.KernelVersion, !configMgr.IsAuditMode(), logger)
+	if err := redirect.settle(postures); err != nil {
+		return err
+	}
+
 	// Find network interface
 	ifname := cmd.Interface
 	if ifname == "" {
@@ -586,9 +580,6 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// two-phase boot order — observer before the event reader, docker
 	// tracking after the dockerd restart — lives in containerAttribution;
 	// a nil value is the disabled feature and every call below no-ops.
-	// postures decides what losing a requested layer means: a lost enforce
-	// rung fails startup, a lost observe rung is recorded for the summary.
-	postures := newPostures(cmd, caps.KernelVersion, logger)
 	hookScope, hookScopeErr := shape.HookScope()
 	attribution, err := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
 		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, hookScope, hookScopeErr, &objs, postures, logger)
@@ -737,9 +728,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 		// Shared resolver that uses the systemd-resolved stub listener for
 		// looking up cached DNS entries. Used for existing-connection reverse
-		// DNS and Phase 1 cache population. Marked so the stub DNAT rule in
-		// dnsRedirectRules (installed before this runs) passes these peeks
-		// through to the real stub instead of looping them into the proxy.
+		// DNS and Phase 1 cache population. Marked so the redirect's stub
+		// DNAT (installed before this runs) passes these peeks through to
+		// the real stub instead of looping them into the proxy.
 		cacheResolver := &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -762,7 +753,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		// live: with no proxy in the upstream path, flushing would only
 		// churn the cache for no benefit. Non-fatal — hosts without
 		// systemd-resolved work via the redirect.
-		if dnsRedirectActive {
+		if redirect.isActive() {
 			if err := network.FlushResolvedCache(ctx, logger); err != nil {
 				logger.Warn("Failed to flush systemd-resolved cache (non-fatal)", "error", err)
 			}
@@ -951,7 +942,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		cancel()
 	}
 
-	// Sudo lockdown, iptables DNS redirect, and Docker DNS restore all run
+	// Sudo lockdown, DNS redirect, and Docker DNS restore all run
 	// via defers registered at setup time — so they fire on every return
 	// path, not just signal-driven shutdown.
 	return nil
@@ -1012,7 +1003,7 @@ func downgradeRecord(typ datapb.CargoWallDowngradeType, fe *PolicyFetchError, de
 	return d
 }
 
-// teardownList holds the undo operations for host mutations (iptables DNAT,
+// teardownList holds the undo operations for host mutations (DNS redirect,
 // daemon.json, sudoers, pidfile). Each add() wraps the undo in sync.OnceFunc
 // and returns it for the caller's defer, while also recording it so the
 // second-signal force path can run every registered undo — whichever path

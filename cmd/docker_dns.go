@@ -30,8 +30,8 @@ const dockerSocket = "/var/run/docker.sock"
 
 // dockerDNS owns --docker-dns-interception: the proxy's listener on the
 // docker bridge, and pointing the daemon's containers at it. The bridge
-// listener and the PREROUTING redirect (network.SetupDNSRedirect) work for
-// any daemon whose bridge is in our netns. Rewriting daemon.json and
+// listener and the redirect's prerouting chain (network.DNSRedirect) work
+// for any daemon whose bridge is in our netns. Rewriting daemon.json and
 // restarting the daemon only work for one that runs here: a dind sidecar
 // reads its own daemon.json and no service manager of ours manages it, so
 // for a foreign daemon both are skipped and the redirect alone catches its

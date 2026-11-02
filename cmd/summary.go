@@ -86,9 +86,8 @@ func (c *SummaryCmd) Run() error {
 		return fmt.Errorf("failed to parse steps JSON: %w", err)
 	}
 
-	// Postures `cargowall start` could not apply (observe rungs only — a
-	// lost enforce rung fails startup). Rendered near the top of every
-	// summary shape.
+	// Postures `cargowall start` could not apply: what it was allowed to lose
+	// (see renderPostures). Rendered near the top of every summary shape.
 	postures := readPostures()
 
 	// Read audit log

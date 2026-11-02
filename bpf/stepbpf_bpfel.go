@@ -13,6 +13,31 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type StepBpfStepChildEvent struct {
+	_       structs.HostLayout
+	Kind    uint32
+	Tgid    uint32
+	Ordinal uint32
+}
+
+type StepBpfStepEventKind uint32
+
+const (
+	StepBpfStepEventKindSTEP_EV_FORK StepBpfStepEventKind = 1
+	StepBpfStepEventKindSTEP_EV_EXEC StepBpfStepEventKind = 2
+	StepBpfStepEventKindSTEP_EV_EXIT StepBpfStepEventKind = 3
+)
+
+type StepBpfStepExecEvent struct {
+	_       structs.HostLayout
+	Kind    uint32
+	Tgid    uint32
+	Ordinal uint32
+	ArgvLen uint32
+	Argv    [256]int8
+	Comm    [16]int8
+}
+
 type StepBpfStepState struct {
 	_           structs.HostLayout
 	WorkerTgid  uint32
@@ -35,14 +60,18 @@ type StepBpfTaskIterRec struct {
 const (
 	StepBpfMapMapSockStep             = "map_sock_step"
 	StepBpfMapMapStepEvents           = "map_step_events"
+	StepBpfMapMapStepExecPending      = "map_step_exec_pending"
 	StepBpfMapMapStepState            = "map_step_state"
 	StepBpfMapMapTaskNspid            = "map_task_nspid"
 	StepBpfMapMapTaskStep             = "map_task_step"
 	StepBpfProgCgSockCreate           = "cg_sock_create"
+	StepBpfProgStepExec               = "step_exec"
 	StepBpfProgStepExit               = "step_exit"
 	StepBpfProgStepFork               = "step_fork"
 	StepBpfProgStepTaskIter           = "step_task_iter"
 	StepBpfVarBtfAnchorStepChildEvent = "btf_anchor_step_child_event"
+	StepBpfVarBtfAnchorStepEventKind  = "btf_anchor_step_event_kind"
+	StepBpfVarBtfAnchorStepExecEvent  = "btf_anchor_step_exec_event"
 	StepBpfVarBtfAnchorTaskIterRec    = "btf_anchor_task_iter_rec"
 	StepBpfVarPidnsIno                = "pidns_ino"
 )
@@ -90,6 +119,7 @@ type StepBpfSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type StepBpfProgramSpecs struct {
 	CgSockCreate *ebpf.ProgramSpec `ebpf:"cg_sock_create"`
+	StepExec     *ebpf.ProgramSpec `ebpf:"step_exec"`
 	StepExit     *ebpf.ProgramSpec `ebpf:"step_exit"`
 	StepFork     *ebpf.ProgramSpec `ebpf:"step_fork"`
 	StepTaskIter *ebpf.ProgramSpec `ebpf:"step_task_iter"`
@@ -99,11 +129,12 @@ type StepBpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type StepBpfMapSpecs struct {
-	MapSockStep   *ebpf.MapSpec `ebpf:"map_sock_step"`
-	MapStepEvents *ebpf.MapSpec `ebpf:"map_step_events"`
-	MapStepState  *ebpf.MapSpec `ebpf:"map_step_state"`
-	MapTaskNspid  *ebpf.MapSpec `ebpf:"map_task_nspid"`
-	MapTaskStep   *ebpf.MapSpec `ebpf:"map_task_step"`
+	MapSockStep        *ebpf.MapSpec `ebpf:"map_sock_step"`
+	MapStepEvents      *ebpf.MapSpec `ebpf:"map_step_events"`
+	MapStepExecPending *ebpf.MapSpec `ebpf:"map_step_exec_pending"`
+	MapStepState       *ebpf.MapSpec `ebpf:"map_step_state"`
+	MapTaskNspid       *ebpf.MapSpec `ebpf:"map_task_nspid"`
+	MapTaskStep        *ebpf.MapSpec `ebpf:"map_task_step"`
 }
 
 // StepBpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -111,6 +142,8 @@ type StepBpfMapSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type StepBpfVariableSpecs struct {
 	BtfAnchorStepChildEvent *ebpf.VariableSpec `ebpf:"btf_anchor_step_child_event"`
+	BtfAnchorStepEventKind  *ebpf.VariableSpec `ebpf:"btf_anchor_step_event_kind"`
+	BtfAnchorStepExecEvent  *ebpf.VariableSpec `ebpf:"btf_anchor_step_exec_event"`
 	BtfAnchorTaskIterRec    *ebpf.VariableSpec `ebpf:"btf_anchor_task_iter_rec"`
 	PidnsIno                *ebpf.VariableSpec `ebpf:"pidns_ino"`
 }
@@ -135,17 +168,19 @@ func (o *StepBpfObjects) Close() error {
 //
 // It can be passed to LoadStepBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type StepBpfMaps struct {
-	MapSockStep   *ebpf.Map `ebpf:"map_sock_step"`
-	MapStepEvents *ebpf.Map `ebpf:"map_step_events"`
-	MapStepState  *ebpf.Map `ebpf:"map_step_state"`
-	MapTaskNspid  *ebpf.Map `ebpf:"map_task_nspid"`
-	MapTaskStep   *ebpf.Map `ebpf:"map_task_step"`
+	MapSockStep        *ebpf.Map `ebpf:"map_sock_step"`
+	MapStepEvents      *ebpf.Map `ebpf:"map_step_events"`
+	MapStepExecPending *ebpf.Map `ebpf:"map_step_exec_pending"`
+	MapStepState       *ebpf.Map `ebpf:"map_step_state"`
+	MapTaskNspid       *ebpf.Map `ebpf:"map_task_nspid"`
+	MapTaskStep        *ebpf.Map `ebpf:"map_task_step"`
 }
 
 func (m *StepBpfMaps) Close() error {
 	return _StepBpfClose(
 		m.MapSockStep,
 		m.MapStepEvents,
+		m.MapStepExecPending,
 		m.MapStepState,
 		m.MapTaskNspid,
 		m.MapTaskStep,
@@ -157,6 +192,8 @@ func (m *StepBpfMaps) Close() error {
 // It can be passed to LoadStepBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type StepBpfVariables struct {
 	BtfAnchorStepChildEvent *ebpf.Variable `ebpf:"btf_anchor_step_child_event"`
+	BtfAnchorStepEventKind  *ebpf.Variable `ebpf:"btf_anchor_step_event_kind"`
+	BtfAnchorStepExecEvent  *ebpf.Variable `ebpf:"btf_anchor_step_exec_event"`
 	BtfAnchorTaskIterRec    *ebpf.Variable `ebpf:"btf_anchor_task_iter_rec"`
 	PidnsIno                *ebpf.Variable `ebpf:"pidns_ino"`
 }
@@ -166,6 +203,7 @@ type StepBpfVariables struct {
 // It can be passed to LoadStepBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type StepBpfPrograms struct {
 	CgSockCreate *ebpf.Program `ebpf:"cg_sock_create"`
+	StepExec     *ebpf.Program `ebpf:"step_exec"`
 	StepExit     *ebpf.Program `ebpf:"step_exit"`
 	StepFork     *ebpf.Program `ebpf:"step_fork"`
 	StepTaskIter *ebpf.Program `ebpf:"step_task_iter"`
@@ -174,6 +212,7 @@ type StepBpfPrograms struct {
 func (p *StepBpfPrograms) Close() error {
 	return _StepBpfClose(
 		p.CgSockCreate,
+		p.StepExec,
 		p.StepExit,
 		p.StepFork,
 		p.StepTaskIter,

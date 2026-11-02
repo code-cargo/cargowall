@@ -54,19 +54,21 @@ func TestReadCmdline_GoneFallsBackEmpty(t *testing.T) {
 	assert.Empty(t, readCmdline(0))
 }
 
-// rec encodes one task_iter_rec as the step_task_iter iterator streams it.
-func rec(tid, tgid, ppid, nsTgid uint32) []byte {
+// encodeRec encodes one task_iter_rec as the step_task_iter iterator
+// streams it.
+func encodeRec(r bpf.StepBpfTaskIterRec) []byte {
 	var buf bytes.Buffer
-	_ = binary.Write(&buf, binary.NativeEndian, bpf.StepBpfTaskIterRec{Tid: tid, Tgid: tgid, Ppid: ppid, NsTgid: nsTgid})
+	_ = binary.Write(&buf, binary.NativeEndian, r)
 	return buf.Bytes()
+}
+
+func rec(tid, tgid, ppid, nsTgid uint32) []byte {
+	return encodeRec(bpf.StepBpfTaskIterRec{Tid: tid, Tgid: tgid, Ppid: ppid, NsTgid: nsTgid})
 }
 
 // exitingRec encodes the record of a task already in do_exit.
 func exitingRec(tid, tgid, ppid, nsTgid uint32) []byte {
-	var buf bytes.Buffer
-	_ = binary.Write(&buf, binary.NativeEndian,
-		bpf.StepBpfTaskIterRec{Tid: tid, Tgid: tgid, Ppid: ppid, NsTgid: nsTgid, Exiting: 1})
-	return buf.Bytes()
+	return encodeRec(bpf.StepBpfTaskIterRec{Tid: tid, Tgid: tgid, Ppid: ppid, NsTgid: nsTgid, Exiting: 1})
 }
 
 func concat(recs ...[]byte) []byte {
@@ -343,24 +345,63 @@ func TestTagContainerProcess_UnknownPidAndWalkFailureAreNoOps(t *testing.T) {
 	assert.Error(t, m2.Lookup(uint32(1000), &got))
 }
 
-// The taggers report whether the leader holds the tag. A leader the walk
-// lists only as exiting tags nothing, descendants included.
-func TestTagContainerProcess_ReportsWhetherLeaderTagged(t *testing.T) {
-	gone := containerSnapshot()
-	delete(gone.tids, 1000)
-	tr, m := newSnapshotTracker(t, gone, nil)
-	assert.False(t, tr.TagContainerProcess(50, 42))
-	assert.False(t, tr.AdoptContainerProcess(50, 42))
-	var got uint32
-	assert.Error(t, m.Lookup(uint32(3000), &got), "a gone leader's descendants must be left alone")
-
+// The taggers return the ordinal the subtree holds. A pid the walk does
+// not list holds none, and nor does a leader listed only as exiting whose
+// children are gone too; a failed walk is an error, not an exit.
+func TestTagContainerProcess_ReportsWhatTheSubtreeHolds(t *testing.T) {
 	live, _ := newSnapshotTracker(t, containerSnapshot(), nil)
-	assert.True(t, live.TagContainerProcess(50, 42))
-	assert.True(t, live.AdoptContainerProcess(50, 43), "a leader keeping its own tag still holds one")
-	assert.False(t, live.TagContainerProcess(999, 42))
+	held, err := live.TagContainerProcess(50, 42)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(42), held)
+	held, err = live.AdoptContainerProcess(50, 43)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(42), held, "adoption keeps, and reports, the tag the leader holds")
+	held, err = live.TagContainerProcess(999, 42)
+	assert.Zero(t, held)
+	assert.NoError(t, err, "a pid the walk does not list is gone, not a failure")
+
+	gone := &procSnapshot{tids: map[uint32][]uint32{}, global: map[int]uint32{50: 1000}}
+	tr, _ := newSnapshotTracker(t, gone, nil)
+	held, err = tr.TagContainerProcess(50, 42)
+	assert.Zero(t, held)
+	assert.NoError(t, err)
 
 	failing, _ := newSnapshotTracker(t, nil, errors.New("iterator closed"))
-	assert.False(t, failing.TagContainerProcess(50, 42))
+	held, err = failing.TagContainerProcess(50, 42)
+	assert.Zero(t, held)
+	assert.ErrorContains(t, err, "iterator closed")
+}
+
+// An exiting leader's children are still listed under it, and live: they
+// take the tag, which then counts as applied.
+func TestTagContainerProcess_ExitingLeaderTagsLiveChildren(t *testing.T) {
+	snap := containerSnapshot()
+	delete(snap.tids, 1000) // every leader thread exiting
+	tr, m := newSnapshotTracker(t, snap, nil)
+	held, err := tr.TagContainerProcess(50, 42)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(42), held)
+	var got uint32
+	require.NoError(t, m.Lookup(uint32(3000), &got))
+	assert.Equal(t, uint32(42), got)
+}
+
+// A step map that refuses every write (full) is an error, never an exit.
+func TestTagContainerProcess_FullMapIsAnError(t *testing.T) {
+	m, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 4, ValueSize: 4, MaxEntries: 1})
+	if err != nil {
+		t.Skipf("cannot create BPF map (needs CAP_BPF, run under sudo): %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	require.NoError(t, m.Put(uint32(1), uint32(1)))
+	tr := &Tracker{
+		taskMap:    m,
+		logger:     slog.Default(),
+		snapshotFn: func() (*procSnapshot, error) { return containerSnapshot(), nil },
+	}
+	held, err := tr.TagContainerProcess(50, 42)
+	assert.Zero(t, held)
+	assert.Error(t, err)
 }
 
 // loadTcObjects loads the tcbpf collection that owns the tracker's shared

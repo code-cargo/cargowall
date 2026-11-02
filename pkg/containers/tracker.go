@@ -63,12 +63,13 @@ import (
 // (Tag overwrites the leader for start/exec; Adopt is create-only for
 // reconcile adoption, so a wrongly-swept live container keeps its real
 // ordinal), and resolve which step was active at a given time. Both
-// taggers report whether the leader holds the tag: false means its task
-// was gone by the time the step maps were written. Narrow on purpose — the
-// step maps stay owned by pkg/steps.
+// taggers return the ordinal the container's tasks hold: 0 with a nil
+// error when its task was gone by the task walk, 0 with an error when the
+// walk or the writes failed. Narrow on purpose — the step maps stay owned
+// by pkg/steps.
 type StepTagger interface {
-	TagContainerProcess(pid int, ordinal uint32) bool
-	AdoptContainerProcess(pid int, ordinal uint32) bool
+	TagContainerProcess(pid int, ordinal uint32) (uint32, error)
+	AdoptContainerProcess(pid int, ordinal uint32) (uint32, error)
 	OrdinalAt(t time.Time) uint32
 }
 

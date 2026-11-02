@@ -17,6 +17,8 @@
 package bpf
 
 import (
+	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -31,6 +33,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/podenv"
 )
@@ -211,55 +214,110 @@ func TestStepFork(t *testing.T) {
 	}, 2*time.Second, 50*time.Millisecond, "exit tracepoint must delete the child's entries")
 }
 
-// TestStepFork_RecycledTidStartsClean: a tid can come back from the pid
-// allocator still holding a tag, one userspace wrote to a task that exited
-// between its task walk and its map write, after step_exit had run. A
-// child of an untagged parent must come out untagged all the same. The
-// test steers a fork onto a chosen pid through ns_last_pid, and tries again
-// when something else on the host takes that pid first.
-func TestStepFork_RecycledTidStartsClean(t *testing.T) {
-	tcObjs, _, iter := loadStepObjects(t)
-	if self, ok := globalTgid(t, iter, os.Getpid()); !ok || int(self) != os.Getpid() {
-		t.Skip("needs the initial pid namespace, where a pid is the tid the maps are keyed by")
-	}
-	// No worker, so every fork is case 2, and no thread of this process
-	// (any of them may be the one that forks) holds a tag.
-	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{Enabled: 1}))
-	for _, rec := range taskRecords(t, iter) {
-		if int(rec.Tgid) == os.Getpid() {
-			_ = tcObjs.MapTaskStep.Delete(rec.Tid)
-		}
-	}
+// readProcInt reads an integer /proc/sys value.
+func readProcInt(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	n, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	require.NoError(t, err)
+	return n
+}
 
+// onRecycledTid plants a stale tag at a free pid, steers the pid allocator
+// onto it through ns_last_pid, runs spawn, and returns the lookup of that
+// tid in map_task_step while spawn's task still lives (once it exits,
+// step_exit deletes the entry whatever step_fork did). spawn reports
+// whether its new task drew the pid, and returns how to end it. Something
+// else on the host can take the pid first, so it tries again; it skips
+// after 20 misses.
+func onRecycledTid(t *testing.T, tcObjs *TcBpfObjects, spawn func(pid int) (bool, func())) error {
+	t.Helper()
 	const stale = uint32(77)
+	pidMax := readProcInt(t, "/proc/sys/kernel/pid_max")
 	for range 20 {
-		raw, err := os.ReadFile("/proc/sys/kernel/ns_last_pid")
-		require.NoError(t, err)
-		last, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-		require.NoError(t, err)
-		pid := last + 100
+		pid := readProcInt(t, "/proc/sys/kernel/ns_last_pid") + 100
+		if pid >= pidMax {
+			pid = 1000 // allocation resumes above RESERVED_PIDS (300) after a wrap
+		}
 		if _, err := os.Stat("/proc/" + strconv.Itoa(pid)); err == nil {
 			continue
 		}
 		require.NoError(t, tcObjs.MapTaskStep.Put(uint32(pid), stale))
 		require.NoError(t, os.WriteFile("/proc/sys/kernel/ns_last_pid", []byte(strconv.Itoa(pid-1)), 0))
-
-		child := exec.Command("sleep", "5")
-		require.NoError(t, child.Start())
-		landed := child.Process.Pid == pid
+		landed, end := spawn(pid)
 		var got uint32
-		lookupErr := tcObjs.MapTaskStep.Lookup(uint32(pid), &got)
-		_ = child.Process.Kill()
-		_ = child.Wait()
+		err := tcObjs.MapTaskStep.Lookup(uint32(pid), &got)
+		end()
 		_ = tcObjs.MapTaskStep.Delete(uint32(pid))
 		if !landed {
 			continue
 		}
-		require.ErrorIs(t, lookupErr, ebpf.ErrKeyNotExist,
-			"a child of an untagged parent kept its recycled tid's tag %d", got)
-		return
+		if err == nil {
+			return fmt.Errorf("tid %d kept tag %d", pid, got)
+		}
+		return err
 	}
-	t.Skip("no fork landed on a chosen pid in 20 tries")
+	t.Skip("no new task landed on a chosen pid in 20 tries")
+	return nil
+}
+
+// untagSelf readies this process to be the untagged creator of a recycled
+// tid: it must run in the initial pid namespace, where a pid is the tid the
+// maps are keyed by, and no thread of it (any may be the one that forks)
+// may hold a tag.
+func untagSelf(t *testing.T, tcObjs *TcBpfObjects, iter *link.Iter) {
+	t.Helper()
+	if self, ok := globalTgid(t, iter, os.Getpid()); !ok || int(self) != os.Getpid() {
+		t.Skip("needs the initial pid namespace, where a pid is the tid the maps are keyed by")
+	}
+	for _, rec := range taskRecords(t, iter) {
+		if int(rec.Tgid) == os.Getpid() {
+			_ = tcObjs.MapTaskStep.Delete(rec.Tid)
+		}
+	}
+}
+
+// TestStepFork_RecycledTidStartsClean: a tid can come back from the pid
+// allocator still holding a tag, one userspace wrote to a task that exited
+// between its task walk and its map write, after step_exit had run. A
+// child of an untagged parent must come out untagged all the same, and so
+// must any child while attribution is off, when a create-only seed pass
+// would keep the stale value. No worker is set, so every fork is case 2.
+func TestStepFork_RecycledTidStartsClean(t *testing.T) {
+	tcObjs, _, iter := loadStepObjects(t)
+	untagSelf(t, tcObjs, iter)
+	for _, enabled := range []uint32{1, 0} {
+		require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{Enabled: enabled}))
+		err := onRecycledTid(t, tcObjs, func(pid int) (bool, func()) {
+			child := exec.Command("sleep", "5")
+			require.NoError(t, child.Start())
+			return child.Process.Pid == pid, func() { _ = child.Process.Kill(); _ = child.Wait() }
+		})
+		require.ErrorIs(t, err, ebpf.ErrKeyNotExist, "enabled=%d", enabled)
+	}
+}
+
+// TestStepFork_RecycledTidStartsClean_IoWorker: an io_uring worker never
+// reaches sched_process_fork, so the tid it draws is cleared only because
+// step_fork runs at task_newtask. An SQPOLL ring makes one, a thread of
+// this process, when it is set up.
+func TestStepFork_RecycledTidStartsClean_IoWorker(t *testing.T) {
+	tcObjs, _, iter := loadStepObjects(t)
+	untagSelf(t, tcObjs, iter)
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{Enabled: 1}))
+	err := onRecycledTid(t, tcObjs, func(pid int) (bool, func()) {
+		var params [120]byte // struct io_uring_params
+		const setupSQPoll = 1 << 1
+		binary.NativeEndian.PutUint32(params[8:], setupSQPoll)
+		fd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, 1, uintptr(unsafe.Pointer(&params[0])), 0)
+		if errno != 0 {
+			t.Skipf("io_uring SQPOLL unavailable: %v", errno)
+		}
+		_, err := os.Stat("/proc/self/task/" + strconv.Itoa(pid))
+		return err == nil, func() { _ = unix.Close(int(fd)) }
+	})
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist)
 }
 
 // TestStepTaskIter_FlagsExitingTask: the walk lists a zombie, flagged as

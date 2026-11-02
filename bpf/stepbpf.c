@@ -128,9 +128,21 @@ static __always_inline struct step_state *step_state(void) {
     return bpf_map_lookup_elem(&map_step_state, &key);
 }
 
-// Tag propagation. Runs synchronously inside fork(), in the parent's
+// clear_entry deletes key from map if it is there. A delete takes the
+// bucket's lock even for an absent key, and step_fork clears an entry for
+// most tasks the host creates; a lookup takes none.
+static __always_inline void clear_entry(void *map, __u32 *key)
+{
+    if (bpf_map_lookup_elem(map, key))
+        bpf_map_delete_elem(map, key);
+}
+
+// Tag propagation. Runs inside copy_process, in the creating thread's
 // context, so the child's tag exists before its first instruction — step
-// attribution has no detection race for host processes.
+// attribution has no detection race for host processes. task_newtask, not
+// sched_process_fork: it fires for every task copy_process makes, io_uring
+// and vhost workers included, which never reach sched_process_fork. Such
+// a worker takes its creator's tag, as a thread does.
 //
 // The namespace bridge is maintained first and unconditionally (not gated
 // on enabled): userspace relies on map_task_nspid being complete from
@@ -148,17 +160,18 @@ static __always_inline struct step_state *step_state(void) {
 //      Untagged lineages stay untagged — absence is meaningful (pre-daemon
 //      or non-runner processes).
 //
-// Both cases set the child's entries outright, a delete where there is
-// nothing to copy: the child's tid can be a recycled one that still holds
-// an entry. Userspace tags container tasks from a task walk, and a task
-// that exits between the walk and the write keeps a tag step_exit has
+// The child's entries are set outright, cleared where there is nothing to
+// copy and while attribution is off: the child's tid can be a recycled one
+// that still holds an entry. Userspace tags tasks from a task walk, and a
+// task that exits between the walk and the write keeps a tag step_exit has
 // already run for; the iterator can likewise re-seed a namespace entry for
 // a task it caught exiting.
-SEC("tp_btf/sched_process_fork")
-int BPF_PROG(step_fork, struct task_struct *parent, struct task_struct *child)
+SEC("tp_btf/task_newtask")
+int BPF_PROG(step_fork, struct task_struct *child, __u64 clone_flags)
 {
-    __u32 parent_tid = parent->pid;
-    __u32 parent_tgid = parent->tgid;
+    __u64 parent = bpf_get_current_pid_tgid();
+    __u32 parent_tid = (__u32)parent;
+    __u32 parent_tgid = parent >> 32;
     __u32 child_tid = child->pid;
     __u32 child_tgid = child->tgid;
 
@@ -173,11 +186,13 @@ int BPF_PROG(step_fork, struct task_struct *parent, struct task_struct *child)
     if (ns_tgid)
         bpf_map_update_elem(&map_task_nspid, &child_tid, &ns_tgid, BPF_ANY);
     else
-        bpf_map_delete_elem(&map_task_nspid, &child_tid);
+        clear_entry(&map_task_nspid, &child_tid);
 
     struct step_state *st = step_state();
-    if (!st || !st->enabled)
+    if (!st || !st->enabled) {
+        clear_entry(&map_task_step, &child_tid);
         return 0;
+    }
 
     if (parent_tgid == st->worker_tgid && child_tgid == child_tid) {
         __u32 ord = (__u32)__sync_fetch_and_add(&st->next_ordinal, 1);
@@ -196,7 +211,7 @@ int BPF_PROG(step_fork, struct task_struct *parent, struct task_struct *child)
     if (ord)
         bpf_map_update_elem(&map_task_step, &child_tid, ord, BPF_ANY);
     else
-        bpf_map_delete_elem(&map_task_step, &child_tid);
+        clear_entry(&map_task_step, &child_tid);
     return 0;
 }
 

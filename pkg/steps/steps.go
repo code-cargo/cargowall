@@ -316,7 +316,7 @@ func (t *Tracker) attach() error {
 		AttachType: ebpf.AttachTraceRawTp,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to attach sched_process_fork: %w", err)
+		return fmt.Errorf("failed to attach task_newtask: %w", err)
 	}
 	t.links = append(t.links, forkLink)
 
@@ -394,19 +394,41 @@ func (t *Tracker) seedExisting(snap *procSnapshot) {
 }
 
 // tagTasks writes ordinal for every live thread of the (global) tgid as
-// listed in snap, and reports whether any of them holds a tag afterwards:
-// written, or already there for a create-only write. Seeding passes
-// UpdateNoExist so a tid the fork tracepoint already tagged keeps its
-// kernel-assigned ordinal; container leaders pass UpdateAny (see
-// TagContainerProcess for why overwrite is safe there and only there).
-func (t *Tracker) tagTasks(snap *procSnapshot, tgid, ordinal uint32, flags ebpf.MapUpdateFlags) bool {
-	tagged := false
+// listed in snap, and returns the ordinal they hold afterwards: ordinal
+// where a write landed, what a create-only write found otherwise, the
+// leader thread's own first. 0 with a nil error means snap lists no live
+// thread of tgid; a failed write is an error only when no thread holds a
+// tag. Seeding passes UpdateNoExist so a tid the fork tracepoint already
+// tagged keeps its kernel-assigned ordinal; container leaders pass
+// UpdateAny (see TagContainerProcess for why overwrite is safe there and
+// only there).
+func (t *Tracker) tagTasks(snap *procSnapshot, tgid, ordinal uint32, flags ebpf.MapUpdateFlags) (uint32, error) {
+	var held, leaderHeld uint32
+	var errs []error
 	for _, tid := range snap.tids[tgid] {
-		if err := t.taskMap.Update(tid, ordinal, flags); err == nil || errors.Is(err, ebpf.ErrKeyExist) {
-			tagged = true
+		v := ordinal
+		if err := t.taskMap.Update(tid, ordinal, flags); errors.Is(err, ebpf.ErrKeyExist) {
+			if t.taskMap.Lookup(tid, &v) != nil {
+				continue // exited between the two calls
+			}
+		} else if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if held == 0 {
+			held = v
+		}
+		if tid == tgid {
+			leaderHeld = v
 		}
 	}
-	return tagged
+	if leaderHeld != 0 {
+		return leaderHeld, nil
+	}
+	if held != 0 {
+		return held, nil
+	}
+	return 0, errors.Join(errs...)
 }
 
 // TagContainerProcess tags a container workload subtree rooted at pid.
@@ -417,11 +439,15 @@ func (t *Tracker) tagTasks(snap *procSnapshot, tgid, ordinal uint32, flags ebpf.
 //
 // pid is as dockerd reported it, i.e. numbered in the daemon's namespace
 // when dockerd shares it (the caller's cgroup identity check has already
-// confirmed that pid is the expected container in our /proc). A pid the
-// task walk cannot see — exited, or a dockerd outside our namespace — is
-// skipped, as is a leader whose threads are all exiting. It reports
-// whether the leader holds the tag: false means nothing was tagged, and
-// the caller must not report the ordinal as applied.
+// confirmed that pid is the expected container in our /proc).
+//
+// It returns the ordinal the subtree holds: the leader's, or the caller's
+// when only children of an exiting leader took it. 0 with a nil error
+// means the walk listed none of it alive: the task had exited, or was
+// exiting, when the walk ran. One that exits between the walk and the write
+// still counts as tagged, and its entry stays until step_fork clears it for
+// the tid's next task. An error means the walk or the writes failed, which
+// says nothing of the task.
 //
 // The leader's threads are written with UpdateAny: a freshly shim-forked
 // leader is untagged in the normal case, an exec re-tag into a long-lived
@@ -429,15 +455,8 @@ func (t *Tracker) tagTasks(snap *procSnapshot, tgid, ordinal uint32, flags ebpf.
 // self-heals a stale entry left by a recycled tid. Descendants are
 // create-only — children forked after an earlier tag already carry correct
 // kernel-inherited ordinals that must never be clobbered.
-func (t *Tracker) TagContainerProcess(pid int, ordinal uint32) bool {
-	snap, leader, ok := t.resolve(pid)
-	if !ok || !t.tagTasks(snap, leader, ordinal, ebpf.UpdateAny) {
-		return false
-	}
-	for _, p := range snap.subtree(leader)[1:] {
-		t.tagTasks(snap, p, ordinal, ebpf.UpdateNoExist)
-	}
-	return true
+func (t *Tracker) TagContainerProcess(pid int, ordinal uint32) (uint32, error) {
+	return t.tagSubtree(pid, ordinal, ebpf.UpdateAny)
 }
 
 // AdoptContainerProcess tags a container subtree like TagContainerProcess
@@ -448,32 +467,42 @@ func (t *Tracker) TagContainerProcess(pid int, ordinal uint32) bool {
 // start — must survive and only truly untagged tasks take the caller's
 // (sentinel) ordinal. The overwrite rationale above does not apply here:
 // adoption is not an exec re-tag, and a recycled-tid stale entry is the
-// rarer wrong to optimize for than demoting a live container. It reports
-// whether the leader holds a tag, its own or the caller's.
-func (t *Tracker) AdoptContainerProcess(pid int, ordinal uint32) bool {
-	snap, leader, ok := t.resolve(pid)
-	if !ok || !t.tagTasks(snap, leader, ordinal, ebpf.UpdateNoExist) {
-		return false
-	}
-	for _, p := range snap.subtree(leader)[1:] {
-		t.tagTasks(snap, p, ordinal, ebpf.UpdateNoExist)
-	}
-	return true
+// rarer wrong to optimize for than demoting a live container. What it
+// returns is as for TagContainerProcess: an existing leader tag is the
+// ordinal held.
+func (t *Tracker) AdoptContainerProcess(pid int, ordinal uint32) (uint32, error) {
+	return t.tagSubtree(pid, ordinal, ebpf.UpdateNoExist)
 }
 
-// resolve takes a fresh task walk and translates a daemon-namespace pid to
-// the global tgid the step maps are keyed by.
-func (t *Tracker) resolve(pid int) (*procSnapshot, uint32, bool) {
+// tagSubtree takes a fresh task walk, translates the daemon-namespace pid
+// to the global tgid the step maps are keyed by, and tags its threads with
+// leaderFlags and its descendants create-only. See TagContainerProcess for
+// what it returns.
+func (t *Tracker) tagSubtree(pid int, ordinal uint32, leaderFlags ebpf.MapUpdateFlags) (uint32, error) {
 	snap, err := t.snapshotFn()
 	if err != nil {
-		t.logger.Warn("Task walk failed", "error", err)
-		return nil, 0, false
+		return 0, fmt.Errorf("task walk: %w", err)
 	}
 	leader, ok := snap.global[pid]
 	if !ok {
-		return nil, 0, false // exited mid-flight, or not numbered in our namespace
+		return 0, nil // exited mid-flight, or not numbered in our namespace
 	}
-	return snap, leader, true
+	held, err := t.tagTasks(snap, leader, ordinal, leaderFlags)
+	// An exiting leader's children are still listed under it, and live.
+	childTook := false
+	for _, p := range snap.subtree(leader)[1:] {
+		h, cerr := t.tagTasks(snap, p, ordinal, ebpf.UpdateNoExist)
+		childTook = childTook || h == ordinal
+		err = errors.Join(err, cerr)
+	}
+	switch {
+	case held != 0:
+		return held, nil
+	case childTook:
+		return ordinal, nil
+	default:
+		return 0, err
+	}
 }
 
 // procSnapshot is one pass of the step_task_iter walk: every task in the

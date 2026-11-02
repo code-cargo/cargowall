@@ -53,10 +53,10 @@ func enterNetns(t *testing.T) {
 	}
 	runtime.LockOSThread()
 	require.NoError(t, unix.Unshare(unix.CLONE_NEWNET))
-	// No duplicate address detection, so an IPv6 address is usable as soon
-	// as it is added, on every kernel: some run it even on a NOARP TUN, and
-	// a tentative address refuses to be bound. The sysctls are this thread's
-	// namespace's, and interfaces made from here on take the default.
+	// No duplicate address detection, which can hold an IPv6 address
+	// tentative, unbindable, for a second or more even on a TUN. Net sysctls
+	// are the writing thread's namespace's; interfaces made from here on take
+	// the default.
 	for _, conf := range []string{"all", "default"} {
 		if err := os.WriteFile("/proc/sys/net/ipv6/conf/"+conf+"/accept_dad", []byte("0"), 0); err != nil &&
 			!errors.Is(err, os.ErrNotExist) {
@@ -107,8 +107,12 @@ func addTun(t *testing.T, name string, addr net.IP) *os.File {
 	return f
 }
 
-// addAddr6 gives interface name the IPv6 address addr/64, usable at once
-// since enterNetns turns duplicate address detection off.
+// addAddr6 gives interface name the IPv6 address addr/64 and waits until it
+// can be bound: ubuntu-26.04's kernel refused a new one (EADDRNOTAVAIL) for
+// a while even without duplicate detection. If it never can, the failure
+// carries this namespace's view of the addresses and the link
+// (/proc/thread-self: /proc/self is the main thread's, which another test
+// may have left in its own namespace, and /sys the host's).
 func addAddr6(t *testing.T, name string, addr net.IP) {
 	t.Helper()
 	iface, err := net.InterfaceByName(name)
@@ -125,6 +129,28 @@ func addAddr6(t *testing.T, name string, addr net.IP) {
 	copy(req.addr[:], addr.To16())
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(sock), unix.SIOCSIFADDR, uintptr(unsafe.Pointer(&req)))
 	require.Zero(t, errno, "adding %s to %s", addr, name)
+
+	at := &net.UDPAddr{IP: addr}
+	if addr.IsLinkLocalUnicast() {
+		at.Zone = name
+	}
+	// A loop on this goroutine, not assert.Eventually: that polls from
+	// another goroutine, on a thread outside this namespace.
+	var lastErr error
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		c, err := net.ListenUDP("udp6", at)
+		if lastErr = err; err == nil {
+			c.Close()
+			return
+		}
+	}
+	state, _ := os.ReadFile("/proc/thread-self/net/if_inet6")
+	var flags net.Flags
+	if iface, err := net.InterfaceByName(name); err == nil {
+		flags = iface.Flags
+	}
+	require.FailNow(t, fmt.Sprintf("%s on %s never became usable: %v", addr, name, lastErr),
+		"link %v; if_inet6 (index, prefix, scope, flags: 0x40 tentative, 0x08 dadfailed):\n%s", flags, state)
 }
 
 // udp6 builds an IPv6/UDP packet, with the checksum IPv6 requires.

@@ -96,6 +96,10 @@ type RedirectSpec struct {
 	// BridgeIP is the proxy's container listener on the docker bridge, ""
 	// for none.
 	BridgeIP string
+	// DropBridgeDNS drops the DNS arriving on a docker bridge instead of
+	// sending it to BridgeIP, for a proxy that does not hold its listener
+	// there. It takes effect only with a BridgeIP.
+	DropBridgeDNS bool
 }
 
 // HostIPv6 reports whether this network namespace has an IPv6 address
@@ -166,7 +170,14 @@ func HostIPv6() bool {
 // listener to send it to. A bridge's IPv6 address is not one cargowall can
 // count on holding, and DNAT to an address it does not hold hands the query
 // to whatever does.
-func redirectChains(ipv6 bool, bridgeIP net.IP) []redirectChain {
+//
+// With bridge.drop the proxy does not hold its listener on the bridge, so
+// DNS arriving there is dropped instead, of either family, for that same
+// reason: a DNAT would hand IPv4 queries to whatever holds the address, or
+// to nothing. Containers on a bridge then resolve nothing, rather than
+// around the proxy. The drops read no address, so in an inet table they
+// drop IPv6 as well.
+func redirectChains(ipv6 bool, bridge bridgeDNS) []redirectChain {
 	var v4, v6 []expr.Any
 	if ipv6 {
 		v4, v6 = nfproto(unix.NFPROTO_IPV4), nfproto(unix.NFPROTO_IPV6)
@@ -201,26 +212,37 @@ func redirectChains(ipv6 bool, bridgeIP net.IP) []redirectChain {
 		{name: "output", kind: "nat", hook: unix.NF_INET_LOCAL_OUT, priority: natPriority, rules: output},
 		{name: "input", kind: "filter", hook: unix.NF_INET_LOCAL_IN, priority: filterPriority, rules: input},
 	}
-	if bridgeIP == nil {
+	if bridge.ip == nil {
 		return chains
 	}
-	bridges := [][]expr.Any{iifname(expr.CmpOpEq, "docker0"), iifnamePrefix("br-")}
+	ifaces := [][]expr.Any{iifname(expr.CmpOpEq, "docker0"), iifnamePrefix("br-")}
 	var prerouting [][]expr.Any
-	for _, bridge := range bridges {
+	for _, iface := range ifaces {
 		prerouting = append(prerouting, udpAndTCP(func(proto []expr.Any) []expr.Any {
-			return slices.Concat(v4, bridge, proto, port(dstPort, 53), dnat(bridgeIP, 53))
+			if bridge.drop {
+				return slices.Concat(iface, proto, port(dstPort, 53), verdict(expr.VerdictDrop))
+			}
+			return slices.Concat(v4, iface, proto, port(dstPort, 53), dnat(bridge.ip, 53))
 		})...)
 	}
-	if ipv6 {
-		for _, bridge := range bridges {
+	if ipv6 && !bridge.drop {
+		for _, iface := range ifaces {
 			prerouting = append(prerouting, udpAndTCP(func(proto []expr.Any) []expr.Any {
-				return slices.Concat(v6, bridge, proto, port(dstPort, 53), verdict(expr.VerdictDrop))
+				return slices.Concat(v6, iface, proto, port(dstPort, 53), verdict(expr.VerdictDrop))
 			})...)
 		}
 	}
 	return append(chains, redirectChain{
 		name: "prerouting", kind: "nat", hook: unix.NF_INET_PRE_ROUTING, priority: natPriority, rules: prerouting,
 	})
+}
+
+// bridgeDNS is what the prerouting chain does with DNS arriving on a docker
+// bridge: send it to the proxy's listener at ip, or, with drop, drop it.
+// Without an ip there is no chain.
+type bridgeDNS struct {
+	ip   net.IP
+	drop bool
 }
 
 // DNSRedirect is the redirect. Once installed it keeps the netlink socket
@@ -276,7 +298,8 @@ func NewDNSRedirect(logger *slog.Logger) *DNSRedirect {
 // spec.IPv6 IPv6 DNS to ProxyAddrIPv6, except the proxy's own marked
 // queries, and the input guard keeps flushed flows from being re-picked-up
 // in reverse. A bridge IP in spec, where the proxy has a container
-// listener, also redirects container DNS crossing a docker bridge.
+// listener, also redirects container DNS crossing a docker bridge, or with
+// DropBridgeDNS drops it.
 //
 // One transaction builds the table, so a failure leaves the host as it
 // was. It first replaces a table of the same name that no socket owns (add,
@@ -297,11 +320,12 @@ func NewDNSRedirect(logger *slog.Logger) *DNSRedirect {
 // IPv4 redirect is never lost to a part of the kernel only IPv6 needs. When
 // the ip table fails the same way, that is the error returned.
 func (r *DNSRedirect) Install(spec RedirectSpec) error {
-	var bridge net.IP
+	var bridge bridgeDNS
 	if spec.BridgeIP != "" {
-		if bridge = net.ParseIP(spec.BridgeIP).To4(); bridge == nil {
+		if bridge.ip = net.ParseIP(spec.BridgeIP).To4(); bridge.ip == nil {
 			return fmt.Errorf("docker bridge IP %q is not an IPv4 address", spec.BridgeIP)
 		}
+		bridge.drop = spec.DropBridgeDNS
 	}
 
 	r.mu.Lock()
@@ -332,7 +356,8 @@ func (r *DNSRedirect) Install(spec RedirectSpec) error {
 	}
 	r.conn, r.family, r.owned = conn, fam, owned
 	r.logger.Info("DNS redirect installed", "nftables_table", fam.String()+" "+RedirectTable, "owned", r.owned,
-		"ipv6", ipv6, "container_bridge_redirect", bridge != nil)
+		"ipv6", ipv6, "container_bridge_redirect", bridge.ip != nil && !bridge.drop,
+		"container_bridge_dns_dropped", bridge.drop)
 	r.mu.Unlock()
 
 	// Purge DNS flow state predating the redirect — nat verdicts are
@@ -375,7 +400,7 @@ var errLeftover = errors.New("other family's table")
 // another process's table. That refusal takes the new table back out: on
 // the socket that made it, and failing that on a new one, since an unowned
 // table outlives its socket. One that still stands is named in the error.
-func (r *DNSRedirect) installFamily(fam tableFamily, ipv6 bool, bridge net.IP) (*netlink.Conn, bool, error) {
+func (r *DNSRedirect) installFamily(fam tableFamily, ipv6 bool, bridge bridgeDNS) (*netlink.Conn, bool, error) {
 	conn, owned, err := r.installOwned(fam, ipv6, bridge)
 	if err != nil {
 		return nil, false, err
@@ -402,7 +427,7 @@ func (r *DNSRedirect) installFamily(fam tableFamily, ipv6 bool, bridge net.IP) (
 
 // installOwned installs the table as family fam, owned unless the kernel
 // refuses the flag, which it then is not asked for again.
-func (r *DNSRedirect) installOwned(fam tableFamily, ipv6 bool, bridge net.IP) (*netlink.Conn, bool, error) {
+func (r *DNSRedirect) installOwned(fam tableFamily, ipv6 bool, bridge bridgeDNS) (*netlink.Conn, bool, error) {
 	var chains []netlink.Message
 	for _, c := range redirectChains(ipv6, bridge) {
 		msgs, err := chainMsgs(fam, c)

@@ -535,6 +535,81 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 	}
 }
 
+// TestDNSRedirect_BridgeUnbound: with DropBridgeDNS, for a proxy that does
+// not hold its listener on the bridge, DNS a container sends through docker0
+// or a br-* bridge is dropped. It never reaches whatever holds the bridge
+// address in the proxy's place, sent there or to a resolver of the
+// container's own, here one on the host itself; with IPv6 covered, IPv6 DNS
+// there is dropped as well. DNS arriving on any other interface is not
+// touched.
+func TestDNSRedirect_BridgeUnbound(t *testing.T) {
+	enterNetns(t)
+	bridgeIP := net.IPv4(10, 54, 0, 1)
+	docker0 := addTun(t, "docker0", bridgeIP)
+	user := addTun(t, "br-test", net.IPv4(10, 55, 0, 1))
+	other := addTun(t, "cw0", net.IPv4(10, 56, 0, 1))
+	for name, addr := range map[string]string{"docker0": "fd54::1", "br-test": "fd55::1", "cw0": "fd56::1"} {
+		addAddr6(t, name, net.ParseIP(addr))
+	}
+	holder := listenUDP(t, "10.54.0.1:53")
+	hostResolver := listenUDP(t, "10.56.0.1:53")
+	hostResolver6 := listenUDP(t, "[fd56::1]:53")
+
+	// Without the redirect, both reach their listener: what the drop stops
+	// below is DNS that would otherwise have been answered.
+	_, err := docker0.Write(udp4(net.IPv4(10, 54, 0, 2), bridgeIP, 5000, 53, "before"))
+	require.NoError(t, err)
+	got, _ := received(t, holder, arrives)
+	require.Equal(t, "before", got)
+	_, err = docker0.Write(udp4(net.IPv4(10, 54, 0, 2), net.IPv4(10, 56, 0, 1), 5000, 53, "before"))
+	require.NoError(t, err)
+	got, _ = received(t, hostResolver, arrives)
+	require.Equal(t, "before", got)
+
+	for _, ipv6 := range []bool{false, true} {
+		r := NewDNSRedirect(discardLogger())
+		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6, BridgeIP: bridgeIP.String(), DropBridgeDNS: true}))
+		t.Cleanup(func() { _ = r.Teardown() }) // a failure above skips the Teardown below
+
+		for _, c := range []struct {
+			wire      *os.File
+			src, src6 net.IP
+		}{
+			{docker0, net.IPv4(10, 54, 0, 2), net.ParseIP("fd54::2")},
+			{user, net.IPv4(10, 55, 0, 2), net.ParseIP("fd55::2")},
+		} {
+			for dst, l := range map[string]*net.UDPConn{"10.54.0.1": holder, "10.56.0.1": hostResolver} {
+				_, err := c.wire.Write(udp4(c.src, net.ParseIP(dst), 5000, 53, c.wire.Name()))
+				require.NoError(t, err)
+				got, _ := received(t, l, absent)
+				require.Empty(t, got, "ipv6 %v: DNS on %s for %s must be dropped", ipv6, c.wire.Name(), dst)
+			}
+
+			_, err := c.wire.Write(udp6(c.src6, net.ParseIP("fd56::1"), 5000, 53, c.wire.Name()+"6"))
+			require.NoError(t, err)
+			if ipv6 {
+				got, _ := received(t, hostResolver6, absent)
+				require.Empty(t, got, "IPv6 DNS on %s must be dropped", c.wire.Name())
+			} else {
+				got, _ := received(t, hostResolver6, arrives)
+				require.Equal(t, c.wire.Name()+"6", got, "an IPv4-only redirect leaves IPv6 container DNS on %s alone",
+					c.wire.Name())
+			}
+		}
+
+		_, err := other.Write(udp4(net.IPv4(10, 56, 0, 2), net.IPv4(10, 56, 0, 1), 5000, 53, "other"))
+		require.NoError(t, err)
+		got, _ := received(t, hostResolver, arrives)
+		require.Equal(t, "other", got, "ipv6 %v: DNS arriving off a docker bridge is no bridge's to drop", ipv6)
+		_, err = other.Write(udp6(net.ParseIP("fd56::2"), net.ParseIP("fd56::1"), 5000, 53, "other6"))
+		require.NoError(t, err)
+		got, _ = received(t, hostResolver6, arrives)
+		require.Equal(t, "other6", got, "ipv6 %v: IPv6 DNS arriving off a docker bridge is no bridge's to drop", ipv6)
+
+		require.NoError(t, r.Teardown())
+	}
+}
+
 // TestDNSRedirect_AheadOfHostNAT: DNS meets the redirect before the DNAT a
 // host nat table applies at dstnat, where Docker's published-port and
 // kube-proxy's service DNAT sit, whichever table registered first and

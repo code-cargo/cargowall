@@ -25,12 +25,13 @@ import (
 	"github.com/miekg/dns"
 )
 
-// Optional listeners, which the DNS redirect sends IPv6 DNS to, and the
-// networks a listener binds.
+// Optional listeners, which the DNS redirect sends IPv6 and container DNS
+// to, and the networks a listener binds.
 
 // AddOptionalListenAddr adds an address the proxy listens on if it can,
-// attributed via the host sockdiag path: the DNS redirect's [::1]:53, which
-// IPv6 DNS is sent to only once it is known to be bound. It binds over UDP
+// attributed via the host sockdiag path unless AddContainerListenAddr adds
+// it: the DNS redirect's [::1]:53, which IPv6 DNS is sent to only once it is
+// known to be bound, and likewise the docker bridge's. It binds over UDP
 // and TCP both or neither, so nothing redirected there finds half of it
 // held by another process. A failure is logged at Debug and left to
 // BindError: what it costs is the caller's call. Call before Start.

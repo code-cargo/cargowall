@@ -44,16 +44,28 @@ func TestListenProtos(t *testing.T) {
 	}
 }
 
-// freeLoopback6Port is a port free on [::1] for UDP, or a skip where
-// loopback has no IPv6.
-func freeLoopback6Port(t *testing.T) int {
+// freePort is a port free on host for UDP, or a skip where host is not
+// one to listen on here, as [::1] is not where loopback has no IPv6.
+func freePort(t *testing.T, host string) int {
 	t.Helper()
-	c, err := net.ListenPacket("udp6", "[::1]:0")
+	addr := net.JoinHostPort(host, "0")
+	c, err := net.ListenPacket(listenProtos(addr)[0], addr)
 	if err != nil {
-		t.Skipf("no IPv6 loopback here: %v", err)
+		t.Skipf("cannot listen on %s here: %v", host, err)
 	}
 	defer c.Close()
 	return c.LocalAddr().(*net.UDPAddr).Port
+}
+
+// optionalListeners are the ways an optional listener is added: the
+// redirect's IPv6 one, and the docker bridge's, container-serving, here on
+// a loopback address of its own.
+var optionalListeners = []struct {
+	name, host string
+	add        func(*Server, string)
+}{
+	{"ipv6", "::1", (*Server).AddOptionalListenAddr},
+	{"container", "127.0.0.2", (*Server).AddContainerListenAddr},
 }
 
 // startServer runs a server with filtering on and no rules, so every query
@@ -93,19 +105,27 @@ func TestAddOptionalListenAddr_Once(t *testing.T) {
 	assert.Equal(t, []string{"[::1]:53"}, s.optionalAddrs)
 }
 
-// An optional IPv6 listener binds over IPv6 and answers there.
-func TestStart_OptionalListenerServesIPv6(t *testing.T) {
-	addr := net.JoinHostPort("::1", strconv.Itoa(freeLoopback6Port(t)))
-	s := newListenTestServer()
-	s.AddOptionalListenAddr(addr)
-	require.NoError(t, startServer(t, s))
-	require.NoError(t, s.BindError(addr))
+// An optional listener binds over its address's family and answers there,
+// and the docker bridge's stays container-serving.
+func TestStart_OptionalListenerServes(t *testing.T) {
+	for _, o := range optionalListeners {
+		t.Run(o.name, func(t *testing.T) {
+			addr := net.JoinHostPort(o.host, strconv.Itoa(freePort(t, o.host)))
+			s := newListenTestServer()
+			o.add(s, addr)
+			require.NoError(t, startServer(t, s))
+			require.NoError(t, s.BindError(addr))
 
-	for _, proto := range []string{"udp6", "tcp6"} {
-		c := &dns.Client{Net: proto, Timeout: 2 * time.Second}
-		reply, _, err := c.Exchange(new(dns.Msg).SetQuestion("blocked.example.", dns.TypeA), addr)
-		require.NoError(t, err, "%s: the proxy must answer on %s", proto, addr)
-		assert.Equal(t, dns.RcodeRefused, reply.Rcode, proto)
+			for _, proto := range listenProtos(addr) {
+				c := &dns.Client{Net: proto, Timeout: 2 * time.Second}
+				reply, _, err := c.Exchange(new(dns.Msg).SetQuestion("blocked.example.", dns.TypeA), addr)
+				require.NoError(t, err, "%s: the proxy must answer on %s", proto, addr)
+				assert.Equal(t, dns.RcodeRefused, reply.Rcode, proto)
+			}
+			if o.name == "container" {
+				assert.Equal(t, attributeContainerIP, s.listenerModes[o.host])
+			}
+		})
 	}
 }
 
@@ -114,38 +134,38 @@ func TestStart_OptionalListenerServesIPv6(t *testing.T) {
 // could have held is left free, so nothing sent there meets a proxy that is
 // only half there.
 func TestStart_OptionalListenerBindsWholeOrNot(t *testing.T) {
-	for _, held := range []string{"udp6", "tcp6"} {
-		t.Run(held, func(t *testing.T) {
-			port := freeLoopback6Port(t)
-			addr := net.JoinHostPort("::1", strconv.Itoa(port))
-			var other string
-			if held == "udp6" {
-				c, err := net.ListenPacket(held, addr)
-				require.NoError(t, err)
-				t.Cleanup(func() { c.Close() })
-				other = "tcp6"
-			} else {
-				l, err := net.Listen(held, addr)
-				require.NoError(t, err)
-				t.Cleanup(func() { l.Close() })
-				other = "udp6"
-			}
+	for _, o := range optionalListeners {
+		for i := range 2 {
+			addr := net.JoinHostPort(o.host, "0")
+			held, other := listenProtos(addr)[i], listenProtos(addr)[1-i]
+			t.Run(o.name+"/"+held, func(t *testing.T) {
+				addr := net.JoinHostPort(o.host, strconv.Itoa(freePort(t, o.host)))
+				if i == 0 {
+					c, err := net.ListenPacket(held, addr)
+					require.NoError(t, err)
+					t.Cleanup(func() { c.Close() })
+				} else {
+					l, err := net.Listen(held, addr)
+					require.NoError(t, err)
+					t.Cleanup(func() { l.Close() })
+				}
 
-			s := newListenTestServer()
-			s.AddOptionalListenAddr(addr)
-			require.NoError(t, startServer(t, s), "an optional listener that cannot bind must not fail Start")
-			require.ErrorContains(t, s.BindError(addr), held)
+				s := newListenTestServer()
+				o.add(s, addr)
+				require.NoError(t, startServer(t, s), "an optional listener that cannot bind must not fail Start")
+				require.ErrorContains(t, s.BindError(addr), held)
 
-			if other == "udp6" {
-				c, err := net.ListenPacket(other, addr)
-				require.NoError(t, err, "the proxy must not keep the UDP half")
-				c.Close()
-			} else {
-				l, err := net.Listen(other, addr)
-				require.NoError(t, err, "the proxy must not keep the TCP half")
-				l.Close()
-			}
-		})
+				if i == 0 {
+					l, err := net.Listen(other, addr)
+					require.NoError(t, err, "the proxy must not keep the TCP half")
+					l.Close()
+				} else {
+					c, err := net.ListenPacket(other, addr)
+					require.NoError(t, err, "the proxy must not keep the UDP half")
+					c.Close()
+				}
+			})
+		}
 	}
 }
 

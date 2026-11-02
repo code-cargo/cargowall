@@ -430,13 +430,13 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// A bind failure is fatal only for the PRIMARY address: without
 	// 127.0.0.1:53 there is no proxy and the daemon must not come up claiming
-	// one. An optional address (AddOptionalListenAddr) binds whole or not at
-	// all, and its failure is its caller's to judge. A secondary address (the
-	// docker bridge listener) held by a leftover process must NOT take down the
-	// whole daemon — the proxy serves every other address, exactly as it did
-	// when each listener bound itself inside ListenAndServe. The fatal path
-	// shuts down whatever was already bound so nothing leaks past the error
-	// return.
+	// one. An optional address (AddOptionalListenAddr, the docker bridge
+	// listener's too) binds whole or not at all, and its failure is its
+	// caller's to judge. A plain secondary address held by a leftover process
+	// must NOT take down the whole daemon — the proxy serves every other
+	// address, exactly as it did when each listener bound itself inside
+	// ListenAndServe. The fatal path shuts down whatever was already bound so
+	// nothing leaks past the error return.
 	failStart := func(addr, proto string, err error) error {
 		s.shutdownServers()
 		return fmt.Errorf("failed to listen on %s/%s: %w", addr, proto, err)
@@ -463,8 +463,7 @@ func (s *Server) Start(ctx context.Context) error {
 						return failStart(addr, proto, err)
 					}
 					s.logger.Error("DNS listener unavailable; continuing without it — "+
-						"clients configured to use this address (docker daemon.json points "+
-						"containers at the bridge listener) will fail to resolve until "+
+						"clients configured to use this address will fail to resolve until "+
 						"whatever holds the address is stopped and cargowall restarted",
 						"addr", addr, "proto", proto, "error", err)
 					continue
@@ -477,8 +476,7 @@ func (s *Server) Start(ctx context.Context) error {
 						return failStart(addr, proto, err)
 					}
 					s.logger.Error("DNS listener unavailable; continuing without it — "+
-						"clients configured to use this address (docker daemon.json points "+
-						"containers at the bridge listener) will fail to resolve until "+
+						"clients configured to use this address will fail to resolve until "+
 						"whatever holds the address is stopped and cargowall restarted",
 						"addr", addr, "proto", proto, "error", err)
 					continue

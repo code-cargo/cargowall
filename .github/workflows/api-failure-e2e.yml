@@ -541,16 +541,19 @@ jobs:
           CARGO=$!
 
           # Wait for the DNS redirect to be installed — proof we are past the
-          # host mutations and inside the (hanging, ~10s) policy fetch.
+          # host mutations and inside the (hanging, ~10s) policy fetch. The
+          # runner's loopback has ::1, so the table is the dual-stack inet one.
           # Poll at 200ms: the hanging fetch only holds startup for the 10s
           # policyFetchTotalBudget, so a 1s-granularity poll plus command
           # overhead could let lockdown be decided before the kill lands.
           for i in $(seq 1 150); do
-            sudo nft list table ip cargowall > /dev/null 2>&1 && break
+            sudo nft list tables 2> /dev/null | grep -qE '^table (ip|inet) cargowall( |$)' && break
             sleep 0.2
           done
-          sudo nft list table ip cargowall > /dev/null 2>&1 \
+          sudo nft list tables 2> /dev/null | grep -qE '^table (ip|inet) cargowall( |$)' \
             || { echo "::error::DNS redirect never appeared"; cat /tmp/cargowall.log; exit 1; }
+          sudo nft list table inet cargowall > /dev/null 2>&1 \
+            || { echo "::error::DNS redirect is IPv4 only (ip cargowall) on a runner whose loopback has IPv6"; cat /tmp/cargowall.log; exit 1; }
 
           # $CARGO is sudo's pid; the REAL cargowall pid is in the pidfile
           # (written at process entry). Signal through sudo (it forwards),
@@ -664,7 +667,7 @@ jobs:
       - name: Assert sudo lockdown and the DNS redirect are in place
         run: |
           # An allow-listed command still works...
-          sudo -n /usr/sbin/nft list table ip cargowall > /dev/null \
+          sudo -n /usr/sbin/nft list table inet cargowall > /dev/null \
             || { echo "::error::DNS redirect not installed"; exit 1; }
           # ...while anything else is denied. That IS the lockdown, and it
           # needs no privileged file access to observe.

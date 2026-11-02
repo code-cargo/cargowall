@@ -18,6 +18,7 @@ package network
 
 import (
 	"net"
+	"net/netip"
 	"os"
 	"slices"
 	"testing"
@@ -36,37 +37,66 @@ func tupleOrigPayload(t *testing.T, ct ctTuple) []byte {
 	if err != nil {
 		t.Fatalf("marshal tuple: %v", err)
 	}
-	return append(nfgenmsgV4(), attrs...)
+	return append(nfgenmsg(ct.family()), attrs...)
 }
 
 // TestParseConntrackTupleOrig_RoundTrip: a tuple written by the marshaller
 // parses back identically — pinning both to the same attribute layout
-// (nesting, byte order).
+// (nesting, byte order), for IPv4 and IPv6 alike.
 func TestParseConntrackTupleOrig_RoundTrip(t *testing.T) {
-	want := ctTuple{
-		srcIP:   [4]byte{10, 1, 0, 223},
-		dstIP:   [4]byte{168, 63, 129, 16},
-		proto:   unix.IPPROTO_UDP,
-		srcPort: 40732,
-		dstPort: 53,
-	}
-	got, ok := parseConntrackTupleOrig(tupleOrigPayload(t, want))
-	if !ok {
-		t.Fatal("round-trip parse reported incomplete tuple")
-	}
-	if got != want {
-		t.Fatalf("round-trip mismatch: got %+v want %+v", got, want)
-	}
-	if !got.isDNS() {
-		t.Fatal("udp/53 tuple not classified as DNS")
-	}
+	for _, pair := range [][2]string{{"10.1.0.223", "168.63.129.16"}, {"fd00::223", "2001:4860:4860::8888"}} {
+		want := ctTuple{
+			src:     netip.MustParseAddr(pair[0]),
+			dst:     netip.MustParseAddr(pair[1]),
+			proto:   unix.IPPROTO_UDP,
+			srcPort: 40732,
+			dstPort: 53,
+		}
+		got, ok := parseConntrackTupleOrig(tupleOrigPayload(t, want))
+		if !ok {
+			t.Fatalf("%s: round-trip parse reported incomplete tuple", pair[0])
+		}
+		if got != want {
+			t.Fatalf("round-trip mismatch: got %+v want %+v", got, want)
+		}
+		if !got.isDNS() {
+			t.Fatal("udp/53 tuple not classified as DNS")
+		}
 
-	// Non-default conntrack zone survives the round trip — a delete that
-	// drops the zone addresses zone 0 and ENOENTs on the real entry.
-	want.zone = 7
-	got, ok = parseConntrackTupleOrig(tupleOrigPayload(t, want))
-	if !ok || got != want {
-		t.Fatalf("zoned round-trip mismatch: ok=%v got %+v want %+v", ok, got, want)
+		// Non-default conntrack zone survives the round trip — a delete that
+		// drops the zone addresses zone 0 and ENOENTs on the real entry.
+		want.zone = 7
+		got, ok = parseConntrackTupleOrig(tupleOrigPayload(t, want))
+		if !ok || got != want {
+			t.Fatalf("zoned round-trip mismatch: ok=%v got %+v want %+v", ok, got, want)
+		}
+	}
+}
+
+// A tuple whose addresses are of two families addresses no entry: a delete
+// aimed by it would miss, so it does not parse.
+func TestParseConntrackTupleOrig_MixedFamilies(t *testing.T) {
+	ae := netlink.NewAttributeEncoder()
+	ae.Nested(ctaTupleOrig, func(nae *netlink.AttributeEncoder) error {
+		nae.Nested(ctaTupleIP, func(iae *netlink.AttributeEncoder) error {
+			iae.Bytes(ctaIPv4Src, []byte{1, 2, 3, 4})
+			iae.Bytes(ctaIPv6Dst, netip.MustParseAddr("fd00::1").AsSlice())
+			return nil
+		})
+		nae.Nested(ctaTupleProto, func(pae *netlink.AttributeEncoder) error {
+			pae.Uint8(ctaProtoNum, unix.IPPROTO_UDP)
+			pae.Bytes(ctaProtoSrcPort, be16(1000))
+			pae.Bytes(ctaProtoDstPort, be16(53))
+			return nil
+		})
+		return nil
+	})
+	attrs, err := ae.Encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, ok := parseConntrackTupleOrig(append(nfgenmsg(unix.AF_INET), attrs...)); ok {
+		t.Fatal("a tuple with an IPv4 source and an IPv6 destination parsed as complete")
 	}
 }
 
@@ -89,13 +119,13 @@ func TestParseConntrackTupleOrig_Incomplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if _, ok := parseConntrackTupleOrig(append(nfgenmsgV4(), attrs...)); ok {
+	if _, ok := parseConntrackTupleOrig(append(nfgenmsg(unix.AF_INET), attrs...)); ok {
 		t.Fatal("tuple without CTA_TUPLE_PROTO parsed as complete")
 	}
 
 	for name, data := range map[string][]byte{
 		"empty":          {},
-		"nfgenmsg-only":  nfgenmsgV4(),
+		"nfgenmsg-only":  nfgenmsg(unix.AF_INET),
 		"short-nfgenmsg": {0},
 	} {
 		if _, ok := parseConntrackTupleOrig(data); ok {
@@ -108,12 +138,12 @@ func TestParseConntrackTupleOrig_Incomplete(t *testing.T) {
 // (shorter than a header, longer than the buffer) must not panic and must
 // not fabricate a complete tuple.
 func TestParseConntrackTupleOrig_MalformedAttr(t *testing.T) {
-	tooShort := append(nfgenmsgV4(), 2, 0, ctaTupleOrig, 0) // nla_len=2 < NLA_HDRLEN
+	tooShort := append(nfgenmsg(unix.AF_INET), 2, 0, ctaTupleOrig, 0) // nla_len=2 < NLA_HDRLEN
 	if _, ok := parseConntrackTupleOrig(tooShort); ok {
 		t.Fatal("undersized attribute parsed as complete")
 	}
 
-	tooLong := append(nfgenmsgV4(), 0xFF, 0, ctaTupleOrig, 0) // nla_len=255 > buffer
+	tooLong := append(nfgenmsg(unix.AF_INET), 0xFF, 0, ctaTupleOrig, 0) // nla_len=255 > buffer
 	if _, ok := parseConntrackTupleOrig(tooLong); ok {
 		t.Fatal("oversized attribute parsed as complete")
 	}
@@ -179,7 +209,8 @@ func dialTCP(t *testing.T, addr string) uint16 {
 	return uint16(conn.LocalAddr().(*net.TCPAddr).Port)
 }
 
-// dumpAll dials its own socket, dumps every v4 tuple, and closes.
+// dumpAll dials its own socket, dumps every tuple of both families, and
+// closes.
 func dumpAll(t *testing.T) []ctTuple {
 	t.Helper()
 	conn, err := dialCt()
@@ -187,7 +218,7 @@ func dumpAll(t *testing.T) []ctTuple {
 		t.Fatalf("dial conntrack: %v", err)
 	}
 	defer conn.Close()
-	tuples, err := dumpTuples(conn, nil)
+	tuples, err := dumpTuples(conn, unix.AF_UNSPEC, nil)
 	if err != nil {
 		t.Fatalf("dump conntrack: %v", err)
 	}
@@ -253,7 +284,7 @@ func TestFlushDNSConntrack_Live(t *testing.T) {
 		}
 	}
 
-	if err := FlushDNSConntrack(discardLogger()); err != nil {
+	if err := FlushDNSConntrack(discardLogger(), true); err != nil {
 		t.Fatalf("FlushDNSConntrack: %v", err)
 	}
 

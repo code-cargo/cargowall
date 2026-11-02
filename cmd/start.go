@@ -281,6 +281,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			logger.Info("DNS query filtering enabled (blocks DNS tunneling)")
 		}
 
+		addIPv6Listener(cmd, dnsServer)
 		if cmd.DockerDNSInterception {
 			var restore func()
 			containerDNS, restore = startDockerDNS(dnsServer, shape.Dockerd, teardowns, logger)
@@ -295,12 +296,15 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			}
 		}()
 
-		// Check for early startup failure
+		// Wait for the proxy to bind its listeners, or to fail to: the
+		// redirect below covers IPv6 only if the proxy holds its IPv6
+		// listener (startDNSRedirect).
 		select {
 		case err := <-dnsErrCh:
 			return fmt.Errorf("DNS proxy server failed to start: %w", err)
-		case <-time.After(100 * time.Millisecond):
-			// OK, server likely started
+		case <-dnsServer.Ready():
+		case <-time.After(10 * time.Second):
+			return errors.New("DNS proxy server did not bind its listeners within 10s")
 		}
 
 		logger.Debug("DNS proxy server started",
@@ -314,7 +318,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		// including across error-return paths below.
 		if cmd.DNSRedirect {
 			var teardownRedirect func()
-			redirect, teardownRedirect = startDNSRedirect(dockerBridgeIP, teardowns, logger)
+			redirect, teardownRedirect = startDNSRedirect(dnsServer, dockerBridgeIP, teardowns, logger)
 			defer teardownRedirect()
 		}
 	}

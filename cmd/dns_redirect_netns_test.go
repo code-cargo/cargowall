@@ -61,26 +61,33 @@ func TestStartDNSRedirect_BridgeListenerNetns(t *testing.T) {
 	const bridgeIP = "127.0.0.2"
 	logger := slog.New(slog.DiscardHandler)
 	for _, held := range []bool{false, true} {
-		var holder net.PacketConn
-		if held {
-			holder, err = net.ListenPacket("udp4", bridgeIP+":53")
-			require.NoError(t, err)
-		}
-		srv := dns.NewServer(config.NewConfigManager(), new(firewall.MockFirewall), "192.0.2.1:53", "127.0.0.1:53", logger)
-		addIPv6Listener(&StartCmd{DNSRedirect: true}, srv)
-		d := &dockerDNS{bridgeIP: bridgeIP, proxy: srv, logger: logger}
-		srv.AddContainerListenAddr(d.listenAddr())
-		stop := startProxyIn(t, netns, srv)
+		t.Run(map[bool]string{false: "bound", true: "held"}[held], func(t *testing.T) {
+			// Each case's cleanups run on its own goroutine, which is in
+			// the namespace, before the next case: the proxy, the table and
+			// the holder never outlive a failed one.
+			enterNetns(t, netns)
+			if held {
+				holder, err := net.ListenPacket("udp4", bridgeIP+":53")
+				require.NoError(t, err)
+				t.Cleanup(func() { holder.Close() })
+			}
+			srv := dns.NewServer(config.NewConfigManager(), new(firewall.MockFirewall), "192.0.2.1:53", "127.0.0.1:53", logger)
+			addIPv6Listener(&StartCmd{DNSRedirect: true}, srv)
+			d := &dockerDNS{bridgeIP: bridgeIP, proxy: srv, logger: logger}
+			srv.AddContainerListenAddr(d.listenAddr())
+			t.Cleanup(startProxyIn(t, netns, srv))
 
-		r, undo := startDNSRedirect(srv, d, &teardownList{}, logger)
-		require.True(t, r.isActive())
-		assert.NotEmpty(t, redirectChainRules(t, "output"), "held %v: the host's DNS is redirected either way", held)
-		prerouting := redirectChainRules(t, "prerouting")
-		if held {
-			assert.Empty(t, prerouting, "no bridge rule may name an address another process holds, nor drop in its place")
-			assert.Equal(t, dnsRedirectHost, r.applied)
-			assert.ErrorContains(t, r.err, "container DNS is not redirected: another process holds 127.0.0.2:53")
-		} else {
+			r, undo := startDNSRedirect(srv, d, &teardownList{}, logger)
+			t.Cleanup(undo)
+			require.True(t, r.isActive())
+			assert.NotEmpty(t, redirectChainRules(t, "output"), "the host's DNS is redirected either way")
+			prerouting := redirectChainRules(t, "prerouting")
+			if held {
+				assert.Empty(t, prerouting, "no bridge rule may name an address another process holds, nor drop in its place")
+				assert.Equal(t, dnsRedirectHost, r.applied)
+				assert.ErrorContains(t, r.err, "container DNS is not redirected: another process holds 127.0.0.2:53")
+				return
+			}
 			require.NoError(t, r.err)
 			var dnats int
 			for _, rule := range prerouting {
@@ -89,13 +96,17 @@ func TestStartDNSRedirect_BridgeListenerNetns(t *testing.T) {
 				}
 			}
 			assert.Equal(t, 4, dnats, "a DNAT to the bridge listener for docker0 and br-*, UDP and TCP")
-		}
-		undo()
-		stop()
-		if holder != nil {
-			holder.Close()
-		}
+		})
 	}
+}
+
+// enterNetns moves the calling goroutine into the network namespace netns,
+// on a thread locked to it for good: the thread exits with the goroutine
+// rather than carrying the namespace back into the scheduler's pool.
+func enterNetns(t *testing.T, netns *os.File) {
+	t.Helper()
+	runtime.LockOSThread()
+	require.NoError(t, unix.Setns(int(netns.Fd()), unix.CLONE_NEWNET))
 }
 
 // setLoopbackUp brings this thread's namespace's loopback up, which gives
@@ -115,7 +126,8 @@ func setLoopbackUp(t *testing.T) {
 // startProxyIn starts srv in the network namespace netns and returns once
 // it has bound its listeners, and a func that stops it. Start binds on its
 // goroutine's thread, which the scheduler picks, so the goroutine locks one
-// and moves it into the namespace first.
+// and moves it into the namespace first, as enterNetns does: it cannot fail
+// the test from there.
 func startProxyIn(t *testing.T, netns *os.File, srv *dns.Server) func() {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())

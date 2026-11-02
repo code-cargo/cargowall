@@ -77,7 +77,8 @@ func TestIPv6Gap(t *testing.T) {
 
 // Container DNS reaches the proxy when the proxy holds its listener on the
 // docker bridge, and the reason it does not names the address and why.
-// Without a bridge, or with the feature off, there is nothing to reach.
+// Without a bridge, or with the feature off, there is nothing to reach, and
+// the proxy is not asked.
 func TestBridgeGap(t *testing.T) {
 	for _, c := range []struct {
 		name string
@@ -85,7 +86,7 @@ func TestBridgeGap(t *testing.T) {
 		gap  string
 	}{
 		{name: "bound", d: &dockerDNS{bridgeIP: "172.17.0.1", proxy: bindErrs{}}},
-		{name: "no bridge", d: &dockerDNS{proxy: bindErrs{}}},
+		{name: "no bridge", d: &dockerDNS{proxy: bindErrs{":53": unix.EADDRINUSE}}},
 		{name: "interception off"},
 		{
 			name: "port held",
@@ -107,7 +108,8 @@ func TestBridgeGap(t *testing.T) {
 // The redirect sends container DNS to the bridge listener only once the
 // proxy holds it, and drops it at the bridge when not; IPv6 DNS likewise
 // goes to the IPv6 listener only once that is held. No bridge, or the
-// feature off, is no bridge chain, and nothing to drop.
+// feature off, is no bridge chain, and nothing to drop, whatever the proxy
+// says of an address it was never given.
 func TestRedirectSpec(t *testing.T) {
 	held := fmt.Errorf("udp4: %w", unix.EADDRINUSE)
 	bound := &dockerDNS{bridgeIP: "172.17.0.1", proxy: bindErrs{}}
@@ -122,7 +124,7 @@ func TestRedirectSpec(t *testing.T) {
 		{"bridge listener unbound", nil, unbound, network.RedirectSpec{IPv6: true, BridgeIP: "172.17.0.1", DropBridgeDNS: true}},
 		{"IPv6 listener unbound", held, bound, network.RedirectSpec{BridgeIP: "172.17.0.1"}},
 		{"neither bound", held, unbound, network.RedirectSpec{BridgeIP: "172.17.0.1", DropBridgeDNS: true}},
-		{"no bridge", nil, &dockerDNS{proxy: bindErrs{}}, network.RedirectSpec{IPv6: true}},
+		{"no bridge", nil, &dockerDNS{proxy: bindErrs{":53": held}}, network.RedirectSpec{IPv6: true}},
 		{"interception off", nil, nil, network.RedirectSpec{IPv6: true}},
 	} {
 		t.Run(c.name, func(t *testing.T) {

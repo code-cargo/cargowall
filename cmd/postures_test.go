@@ -50,8 +50,11 @@ func verifierTooLarge() error {
 		&ebpf.VerifierError{Cause: unix.E2BIG, Log: []string{"BPF program is too large. Processed 1000001 insn"}})
 }
 
+// ledgerWithLog points the state files at a temp dir: a fatal loss
+// publishes the record.
 func ledgerWithLog(t *testing.T, egress, sni string) (*postureLedger, *bytes.Buffer) {
 	t.Helper()
+	redirectStateFiles(t)
 	var buf bytes.Buffer
 	cmd := &StartCmd{ContainerEgress: egress, TLSSNI: sni}
 	return newPostures(cmd, "6.6.141", true, slog.New(slog.NewTextHandler(&buf, nil))), &buf
@@ -68,7 +71,9 @@ func TestPostures_OffLayersAreNotTracked(t *testing.T) {
 // Every rung that promises drops is fail-closed, each checked against its
 // own flag: a lost one is a startup error naming the flag and the reason —
 // the text the failure sentinel carries to the action — and the record is
-// marked lost too, so it agrees with the sentinel whoever publishes it.
+// published with that line alone, marked fatal, which is what the action
+// fails the step on. A layer not yet raised is left out rather than
+// reported applied.
 func TestPostures_LostEnforceFailsStartup(t *testing.T) {
 	for _, tc := range []struct {
 		egress, sni, lose, reason, want string
@@ -101,6 +106,14 @@ func TestPostures_LostEnforceFailsStartup(t *testing.T) {
 			assert.Equal(t, "off", r.Applied)
 			assert.Contains(t, buf.String(), "level=ERROR")
 			assert.Contains(t, buf.String(), tc.want[:strings.Index(tc.want, ": ")], "the ledger owns the log line")
+
+			requested := tc.egress
+			if tc.lose == postureTLSSNI {
+				requested = tc.sni
+			}
+			assert.Equal(t, []postureLine{{
+				Posture: tc.lose, Requested: requested, Applied: "off", Reason: reason, Fatal: true,
+			}}, readPostures(), "published before the failure sentinel, with only the lost layer")
 		})
 	}
 }
@@ -131,6 +144,7 @@ func TestPostures_LostObserveIsRecordedNotFatal(t *testing.T) {
 	assert.Equal(t, 2, strings.Count(out, "level=WARN"), out)
 	assert.NotContains(t, out, "level=ERROR")
 	assert.Contains(t, out, `msg="--tls-sni=observe requested but could not be applied"`)
+	assert.NoFileExists(t, posturesFile, "only a fatal loss publishes before every posture is final")
 
 	p.write()
 	assert.Equal(t, p.lines(), readPostures(), "the summary must read back exactly what start wrote")
@@ -164,11 +178,16 @@ func TestPostures_DNSRedirect(t *testing.T) {
 		return newPostures(cmd, "6.6.141", enforcing, slog.New(slog.NewTextHandler(&buf, nil))), &buf
 	}
 
+	redirectStateFiles(t)
 	p, buf := ledger(&StartCmd{DNSRedirect: true}, true)
 	require.EqualError(t, failed.settle(p),
 		"--dns-redirect=true requested but could not be applied: "+
 			"nftables: installing table ip cargowall: operation not supported")
 	assert.Contains(t, buf.String(), "level=ERROR")
+	assert.Equal(t, []postureLine{{
+		Posture: postureDNSRedirect, Requested: "true", Applied: "false",
+		Reason: "nftables: installing table ip cargowall: operation not supported", Fatal: true,
+	}}, readPostures(), "the action fails the step on a fatal line")
 
 	redirectStateFiles(t)
 	p, buf = ledger(&StartCmd{DNSRedirect: true}, false)
@@ -198,6 +217,7 @@ func TestPostures_DNSRedirect(t *testing.T) {
 // already failed: a lost fail-closed layer is logged and recorded, never a
 // startup error, which would take the whole firewall down with it.
 func TestPostures_LockdownLossIsNotFatal(t *testing.T) {
+	redirectStateFiles(t)
 	var buf bytes.Buffer
 	cmd := &StartCmd{ContainerEgress: ContainerEgressEnforce, DNSRedirect: true, policyLockdown: true}
 	p := newPostures(cmd, "6.6.141", true, slog.New(slog.NewTextHandler(&buf, nil)))
@@ -207,7 +227,9 @@ func TestPostures_LockdownLossIsNotFatal(t *testing.T) {
 	assert.Contains(t, buf.String(), "staying up in policy lockdown")
 	for _, l := range p.lines() {
 		assert.True(t, l.degraded(), "%s is recorded as lost", l.Posture)
+		assert.False(t, l.Fatal, "%s did not stop startup", l.Posture)
 	}
+	assert.NoFileExists(t, posturesFile, "nothing for the action to fail the step on: lockdown fails it already")
 }
 
 // Without step attribution the hook never starts: fatal under enforce, a

@@ -69,6 +69,10 @@ type postureLine struct {
 	Applied   string `json:"applied"`
 	// Why Applied is not Requested; empty when they match.
 	Reason string `json:"reason,omitempty"`
+	// Fatal marks the loss that stopped startup. The action fails the step
+	// on it even with fail-on-unsupported off: cargowall can run on this
+	// runner, just not with the guarantee the job asked for.
+	Fatal bool `json:"fatal,omitempty"`
 }
 
 func (l postureLine) degraded() bool { return l.Applied != l.Requested }
@@ -143,10 +147,7 @@ func (p *postureLedger) lines() []postureLine {
 
 // lose reports that posture could not come up. There is no partial descent:
 // every way a layer fails leaves it computing no verdict, so the layer goes
-// to off, keeping the first reason. The ledger owns the log line. On the
-// fatal path the failure sentinel is what leaves the process — write runs
-// only once both raises succeed — so the in-memory mark there serves the
-// log and the ledger's own consistency, nothing downstream.
+// to off, keeping the first reason. The ledger owns the log line.
 //
 // A fail-closed rung returns an error the caller must fail startup with: TC
 // egress would still police post-NAT traffic, but the job would run without
@@ -155,6 +156,11 @@ func (p *postureLedger) lines() []postureLine {
 // it logs the error and carries on instead: the job has already failed, and
 // lockdown's deny-all firewall must stay up until the job ends. Any other
 // loss warns, and the summary lists it.
+//
+// The fatal path publishes the record itself, ahead of the failure sentinel
+// the returned error becomes, holding only the lost layer, marked fatal: the
+// layers still to be raised were never tried, and saying they applied would
+// be false.
 func (p *postureLedger) lose(posture, reason string) error {
 	r := p.find(posture)
 	if r == nil {
@@ -171,6 +177,8 @@ func (p *postureLedger) lose(posture, reason string) error {
 		return nil
 	case r.failClosed:
 		p.logger.Error(msg, "reason", reason)
+		r.Fatal = true
+		p.publish([]postureLine{r.postureLine})
 		return fmt.Errorf("%s: %s", msg, reason)
 	}
 	p.logger.Warn(msg, "reason", reason)
@@ -192,10 +200,15 @@ func (p *postureLedger) errReason(err error) string {
 	return first
 }
 
-// write publishes the record for the summary step. Best-effort like the
-// mode file: a failed write only costs the summary its Postures block.
-func (p *postureLedger) write() {
-	data, err := json.Marshal(p.lines())
+// write publishes the record for the summary step once every posture is
+// final.
+func (p *postureLedger) write() { p.publish(p.lines()) }
+
+// publish writes lines to posturesFile. Best-effort like the mode file: a
+// failed write costs the summary its Postures block and, on the fatal path,
+// the action its reason to fail the step.
+func (p *postureLedger) publish(lines []postureLine) {
+	data, err := json.Marshal(lines)
 	if err == nil {
 		err = writeSentinel(posturesFile, data)
 	}

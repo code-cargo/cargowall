@@ -615,6 +615,13 @@ stays up deny-all on purpose, where exiting would take TC's deny-all down
 with it. The loss is logged as an error and recorded instead. The policy lives in one place, `postureLedger`
 (`cmd/postures.go`).
 
+A fatal loss publishes the postures record before the failure sentinel,
+holding only the lost layer, marked `fatal` (the layers not yet raised were
+never tried). The action fails the step on that line even under
+`fail-on-unsupported: false`, which is for a runner that cannot run
+cargowall at all: this one can, just not with the guarantee the job asked
+for, and carrying on would run the job with no firewall.
+
 **One post-verdict pipeline.** Both hooks feed the same steps in
 `pkg/events` (`outcome.go`): hostname/CNAME resolution, late-allow
 reconciliation, the audit record, and the block notification. `processEvent`

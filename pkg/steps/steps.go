@@ -44,7 +44,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 	"unicode/utf8"
 	"unsafe"
 
@@ -101,13 +100,10 @@ type Tracker struct {
 	logger        *slog.Logger
 	done          chan struct{}
 
-	// Boundary history for OrdinalAt — see the boundary type.
+	// Boundary history for OrdinalAt and for reporting steps — see the
+	// boundary type.
 	boundaryMu sync.Mutex
 	boundaries []boundary
-
-	// Fork times of steps not yet reported, by ordinal; run's goroutine
-	// only. See handleStepEvent.
-	forkedAt map[uint32]time.Time
 
 	// DNS-path client attribution (sock_diag lookups, caching, map joins) —
 	// see clientResolver. Constructed in Start, closed in Close.
@@ -170,8 +166,8 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 
 	t := &Tracker{
 		workerPID: workerPID,
-		// Snapshot the worker's argv so the reconciler can detect a
-		// pre-exec cmdline read (the child briefly shares/copies it).
+		// The worker's argv: a step root that exits without exec'ing ran
+		// a copy of it, and reports it as its command line.
 		workerCmdline: readCmdline(workerPID),
 		stateMap:      tcObjs.MapStepState,
 		taskMap:       tcObjs.MapTaskStep,
@@ -582,45 +578,6 @@ func (s *procSnapshot) subtree(root uint32) []uint32 {
 	return pids
 }
 
-// boundary records one step_child_event as observed by run(), stamped with
-// wall-clock receive time so external event streams that carry their own
-// timestamps (Docker's timeNano) can be resolved against the step that was
-// active when the event happened, not whichever step is active when a
-// possibly backlogged stream gets processed.
-type boundary struct {
-	ordinal uint32
-	at      time.Time
-}
-
-// boundaryHistory bounds the ring; ordinals are monotonic so old entries
-// only matter for as long as an external event could plausibly be delayed.
-const boundaryHistory = 256
-
-// recordBoundary appends one observed boundary, trimming the ring to
-// boundaryHistory (append reallocation keeps the retained backing bounded).
-func (t *Tracker) recordBoundary(ordinal uint32, at time.Time) {
-	t.boundaryMu.Lock()
-	defer t.boundaryMu.Unlock()
-	t.boundaries = append(t.boundaries, boundary{ordinal: ordinal, at: at})
-	if len(t.boundaries) > boundaryHistory {
-		t.boundaries = t.boundaries[1:]
-	}
-}
-
-// OrdinalAt returns the ordinal of the latest step boundary observed at or
-// before tm, or 0 when tm predates every observed boundary (callers treat 0
-// as untagged, which degrades to the stricter attribution tier by design).
-func (t *Tracker) OrdinalAt(tm time.Time) uint32 {
-	t.boundaryMu.Lock()
-	defer t.boundaryMu.Unlock()
-	for i := len(t.boundaries) - 1; i >= 0; i-- {
-		if !t.boundaries[i].at.After(tm) {
-			return t.boundaries[i].ordinal
-		}
-	}
-	return 0
-}
-
 // findWorkerPID locates the Runner.Worker that owns THIS job. Ancestry
 // first: the daemon is spawned inside the cargowall action's step, so at
 // startup its parent chain runs through the right worker — on a host with
@@ -686,6 +643,18 @@ const cmdlineMax = 256
 // at cmdlineMax, marking a cut, its own or one already made (cut), "...".
 func formatCmdline(args []byte, cut bool) string {
 	s := strings.TrimRight(strings.ReplaceAll(string(args), "\x00", " "), " ")
+	if cut {
+		// A cut already made can split a multi-byte character: drop an
+		// incomplete one at the end, looking back no further than a rune.
+		for i := len(s) - 1; i >= 0 && i > len(s)-utf8.UTFMax; i-- {
+			if utf8.RuneStart(s[i]) {
+				if !utf8.FullRuneInString(s[i:]) {
+					s = s[:i]
+				}
+				break
+			}
+		}
+	}
 	if len(s) > cmdlineMax {
 		// Back off to a rune boundary so the cap can't split a multi-byte
 		// character. Bounded to one rune's width: cmdline is arbitrary

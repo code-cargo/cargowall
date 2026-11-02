@@ -504,8 +504,7 @@ func (t *Tracker) markExecSeen(containerID, execID string) (seen bool) {
 // inspectExecPid reads an exec's leader PID, retrying briefly: dockerd
 // emits exec_start BEFORE it records the process pid from containerd, so an
 // immediate inspect reads Pid 0 for an exec that is very much alive
-// (confirmed against dockerd 28/29; same publish-race shape as the
-// stepCmdline retry in pkg/steps). An exec that never got a pid keeps
+// (confirmed against dockerd 28/29). An exec that never got a pid keeps
 // reading 0 and falls out as unattributable — the stricter tier, by
 // design. One that started and has already finished reads its pid with
 // Running false, and is errExecExited. The retry window is small against

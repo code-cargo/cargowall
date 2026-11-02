@@ -196,7 +196,7 @@ func TestStart_RejectsNilObjects(t *testing.T) {
 // appendBoundaryCapped drives the same recordBoundary that run() calls, so
 // the ring-cap tests below exercise the production trim, not a mirror.
 func appendBoundaryCapped(tr *Tracker, b boundary) {
-	tr.recordBoundary(b.ordinal, b.at)
+	tr.recordBoundary(b)
 }
 
 func TestOrdinalAt(t *testing.T) {

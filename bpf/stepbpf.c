@@ -29,7 +29,7 @@
 // whenever cargowall runs inside a container (ARC runners are Kubernetes
 // pods). map_task_nspid is the bridge — global tid → daemon-namespace
 // tgid — seeded for pre-existing tasks by step_task_iter and kept current
-// by step_fork/step_exit. It is what lets the reconciler read
+// by step_fork, step_exec (a de_thread moves it) and step_exit. It is what lets the reconciler read
 // /proc/<tgid>/cmdline for a boundary event, lets userspace resolve the
 // process behind a socket, and lets pkg/steps translate the /proc-numbered
 // pids it discovers into the global ids the kernel needs.
@@ -86,9 +86,13 @@ struct {
 // ---- Owned by this collection ----
 
 // Event kinds on map_step_events; every event starts with its kind.
-#define STEP_EV_FORK 1
-#define STEP_EV_EXEC 2
-#define STEP_EV_EXIT 3
+enum step_event_kind {
+    STEP_EV_FORK = 1,
+    STEP_EV_EXEC = 2,
+    STEP_EV_EXIT = 3,
+};
+
+const enum step_event_kind *btf_anchor_step_event_kind __attribute__((unused));
 
 // New-step notifications for the userspace reconciler, emitted once per new
 // direct child process of Runner.Worker, before the child runs user code
@@ -110,16 +114,17 @@ const struct step_child_event *btf_anchor_step_child_event __attribute__((unused
 // What a step runs, from its root's first exec (STEP_EV_EXEC): argv is the
 // start of the new program's argument area, NUL-separated, and argv_len
 // the whole area's length (0 if unreadable), so a value over
-// STEP_ARGV_MAX says argv was cut. A fork event cannot carry it: the child
-// is still a copy of Runner.Worker, and a /proc read races the exec,
-// reading empty mid-exec. A root that exits without exec'ing reports
-// STEP_EV_EXIT, with no argv.
+// STEP_ARGV_MAX says argv was cut; comm is the new program's name, for
+// when it is. A fork event cannot carry them: the child is still a copy of
+// Runner.Worker, and a /proc read races the exec, reading empty mid-exec.
+// A root that exits without exec'ing reports STEP_EV_EXIT, with neither.
 struct step_exec_event {
     __u32 kind;
     __u32 tgid;
     __u32 ordinal;
     __u32 argv_len;
     char argv[STEP_ARGV_MAX];
+    char comm[16];
 };
 
 const struct step_exec_event *btf_anchor_step_exec_event __attribute__((unused));
@@ -256,8 +261,8 @@ int BPF_PROG(step_fork, struct task_struct *child, __u64 clone_flags)
 
 // emit_step_exec reports a pending step root's first exec, or its exit
 // before one, and takes it out of map_step_exec_pending. tgid is global;
-// the event carries the daemon-namespace pid, which the caller still has
-// in map_task_nspid.
+// the event carries the daemon-namespace pid from map_task_nspid, 0 once
+// the leader's own exit has deleted it (userspace has it from the fork).
 static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid, __u32 kind)
 {
     __u32 *ord = bpf_map_lookup_elem(&map_step_exec_pending, &tgid);
@@ -278,6 +283,7 @@ static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid,
             __u64 n = len > STEP_ARGV_MAX ? STEP_ARGV_MAX : len;
             if (bpf_probe_read_user(ev->argv, n, (const void *)start))
                 len = 0;
+            bpf_get_current_comm(ev->comm, sizeof(ev->comm));
         }
         ev->argv_len = len > 0xffffffff ? 0xffffffff : len;
         bpf_ringbuf_submit(ev, 0);
@@ -320,12 +326,15 @@ int BPF_PROG(step_exec, struct task_struct *p, pid_t old_pid, struct linux_binpr
 // PID-reuse hygiene: drop the tag and the namespace entry when the task
 // exits. Unconditional — a delete on an absent key is cheap, and gating on
 // step_state would cost the same lookup. A step root that exits without
-// exec'ing reports it first, while its namespace entry is still there.
+// exec'ing reports it first, when its last thread exits: the leader alone
+// exiting is a pthread_exit, or a de_thread whose exec is still to come.
+// do_exit counts the thread out of signal->live before this fires.
 SEC("tp_btf/sched_process_exit")
 int BPF_PROG(step_exit, struct task_struct *task)
 {
     __u32 tid = task->pid;
-    emit_step_exec(task, tid, STEP_EV_EXIT);
+    if (BPF_CORE_READ(task, signal, live.counter) == 0)
+        emit_step_exec(task, task->tgid, STEP_EV_EXIT);
     bpf_map_delete_elem(&map_task_step, &tid);
     bpf_map_delete_elem(&map_task_nspid, &tid);
     return 0;

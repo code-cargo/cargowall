@@ -20,6 +20,14 @@ type StepBpfStepChildEvent struct {
 	Ordinal uint32
 }
 
+type StepBpfStepEventKind uint32
+
+const (
+	StepBpfStepEventKindSTEP_EV_FORK StepBpfStepEventKind = 1
+	StepBpfStepEventKindSTEP_EV_EXEC StepBpfStepEventKind = 2
+	StepBpfStepEventKindSTEP_EV_EXIT StepBpfStepEventKind = 3
+)
+
 type StepBpfStepExecEvent struct {
 	_       structs.HostLayout
 	Kind    uint32
@@ -27,6 +35,7 @@ type StepBpfStepExecEvent struct {
 	Ordinal uint32
 	ArgvLen uint32
 	Argv    [256]int8
+	Comm    [16]int8
 }
 
 type StepBpfStepState struct {
@@ -61,6 +70,7 @@ const (
 	StepBpfProgStepFork               = "step_fork"
 	StepBpfProgStepTaskIter           = "step_task_iter"
 	StepBpfVarBtfAnchorStepChildEvent = "btf_anchor_step_child_event"
+	StepBpfVarBtfAnchorStepEventKind  = "btf_anchor_step_event_kind"
 	StepBpfVarBtfAnchorStepExecEvent  = "btf_anchor_step_exec_event"
 	StepBpfVarBtfAnchorTaskIterRec    = "btf_anchor_task_iter_rec"
 	StepBpfVarPidnsIno                = "pidns_ino"
@@ -132,6 +142,7 @@ type StepBpfMapSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type StepBpfVariableSpecs struct {
 	BtfAnchorStepChildEvent *ebpf.VariableSpec `ebpf:"btf_anchor_step_child_event"`
+	BtfAnchorStepEventKind  *ebpf.VariableSpec `ebpf:"btf_anchor_step_event_kind"`
 	BtfAnchorStepExecEvent  *ebpf.VariableSpec `ebpf:"btf_anchor_step_exec_event"`
 	BtfAnchorTaskIterRec    *ebpf.VariableSpec `ebpf:"btf_anchor_task_iter_rec"`
 	PidnsIno                *ebpf.VariableSpec `ebpf:"pidns_ino"`
@@ -181,6 +192,7 @@ func (m *StepBpfMaps) Close() error {
 // It can be passed to LoadStepBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type StepBpfVariables struct {
 	BtfAnchorStepChildEvent *ebpf.Variable `ebpf:"btf_anchor_step_child_event"`
+	BtfAnchorStepEventKind  *ebpf.Variable `ebpf:"btf_anchor_step_event_kind"`
 	BtfAnchorStepExecEvent  *ebpf.Variable `ebpf:"btf_anchor_step_exec_event"`
 	BtfAnchorTaskIterRec    *ebpf.Variable `ebpf:"btf_anchor_task_iter_rec"`
 	PidnsIno                *ebpf.Variable `ebpf:"pidns_ino"`

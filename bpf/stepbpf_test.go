@@ -41,9 +41,9 @@ import (
 
 // Step event kinds (STEP_EV_* in stepbpf.c).
 const (
-	stepEvFork = 1
-	stepEvExec = 2
-	stepEvExit = 3
+	stepEvFork = uint32(StepBpfStepEventKindSTEP_EV_FORK)
+	stepEvExec = uint32(StepBpfStepEventKindSTEP_EV_EXEC)
+	stepEvExit = uint32(StepBpfStepEventKindSTEP_EV_EXIT)
 )
 
 // readStepEvent reads the next step event: its kind, and the event decoded
@@ -145,7 +145,7 @@ func globalTgid(t *testing.T, iter *link.Iter, nsPid int) (uint32, bool) {
 }
 
 // loadStepObjects loads StepBpf against TcBpf's shared maps and attaches
-// the fork and exit tracepoints and the task iterator, as pkg/steps.Start
+// the fork, exec and exit tracepoints and the task iterator, as pkg/steps.Start
 // does. It skips without kernel BTF; the step hooks stay disabled until a
 // test writes map_step_state, and are disabled again on cleanup.
 func loadStepObjects(t *testing.T) (*TcBpfObjects, *StepBpfObjects, *link.Iter) {
@@ -261,6 +261,8 @@ func TestStepFork(t *testing.T) {
 	})
 	require.Equal(t, childPID, execEv.Tgid)
 	require.Equal(t, "sleep\x001\x00", argvOf(execEv))
+	comm := unsafe.Slice((*byte)(unsafe.Pointer(&execEv.Comm[0])), len(execEv.Comm))
+	require.Equal(t, "sleep", strings.TrimRight(string(comm), "\x00"), "the exec event carries the program's name")
 	require.EqualValues(t, len("sleep\x001\x00"), execEv.ArgvLen)
 
 	// Exit hygiene: once the child is reaped, its tag and namespace entry
@@ -336,10 +338,12 @@ func TestStepExec_FirstExecOnly(t *testing.T) {
 }
 
 // TestHelperExecFromThread is not a test: TestStepExec_FromThreadKeepsTag
-// runs the test binary with STEPBPF_EXEC_FROM_THREAD set, and this execs
-// `sleep 2` from a thread other than the leader.
+// runs the test binary with STEPBPF_EXEC_FROM_THREAD set to a file, and
+// this writes there the tid of a thread other than the leader, then execs
+// `sleep 2` from it.
 func TestHelperExecFromThread(t *testing.T) {
-	if os.Getenv("STEPBPF_EXEC_FROM_THREAD") == "" {
+	tidFile := os.Getenv("STEPBPF_EXEC_FROM_THREAD")
+	if tidFile == "" {
 		t.Skip("helper process only")
 	}
 	errs := make(chan error, 1)
@@ -350,6 +354,10 @@ func TestHelperExecFromThread(t *testing.T) {
 			go execFrom() // the leader: try again from another thread
 			select {}
 		}
+		if err := os.WriteFile(tidFile, []byte(strconv.Itoa(unix.Gettid())), 0o600); err != nil {
+			errs <- err
+			return
+		}
 		errs <- unix.Exec("/bin/sleep", []string{"sleep", "2"}, os.Environ())
 	}
 	go execFrom()
@@ -358,7 +366,8 @@ func TestHelperExecFromThread(t *testing.T) {
 
 // TestStepExec_FromThreadKeepsTag: a process whose non-leader thread execs
 // keeps its tag and namespace pid. The exec'ing thread takes the leader's
-// tid, under which the leader's exit has already deleted both entries.
+// tid, under which the leader's exit has already deleted both entries, and
+// its own tid's entries move with it rather than staying behind.
 func TestStepExec_FromThreadKeepsTag(t *testing.T) {
 	tcObjs, _, iter := loadStepObjects(t)
 	selfTgid, ok := globalTgid(t, iter, os.Getpid())
@@ -370,8 +379,9 @@ func TestStepExec_FromThreadKeepsTag(t *testing.T) {
 	}
 	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: selfTgid, Enabled: 1, NextOrdinal: 5}))
 
+	tidFile := t.TempDir() + "/tid"
 	child := exec.Command(os.Args[0], "-test.run", "^TestHelperExecFromThread$")
-	child.Env = append(os.Environ(), "STEPBPF_EXEC_FROM_THREAD=1")
+	child.Env = append(os.Environ(), "STEPBPF_EXEC_FROM_THREAD="+tidFile)
 	require.NoError(t, child.Start())
 	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
 	pid := child.Process.Pid
@@ -380,12 +390,81 @@ func TestStepExec_FromThreadKeepsTag(t *testing.T) {
 		return err == nil && strings.TrimSpace(string(comm)) == "sleep"
 	}, 5*time.Second, 10*time.Millisecond, "the helper must exec sleep")
 
+	raw, err := os.ReadFile(tidFile)
+	require.NoError(t, err)
+	oldTid, err := strconv.Atoi(string(raw))
+	require.NoError(t, err)
+	require.NotEqual(t, pid, oldTid, "the helper must exec from a thread other than the leader")
+
+	// comm changes before sched_process_exec fires, so the move can still
+	// be on its way.
 	tgid := uint32(pid)
 	var ord, nsPid uint32
-	require.NoError(t, tcObjs.MapTaskStep.Lookup(tgid, &ord), "the process must keep its tag")
+	require.Eventually(t, func() bool {
+		return tcObjs.MapTaskStep.Lookup(tgid, &ord) == nil && tcObjs.MapTaskNspid.Lookup(tgid, &nsPid) == nil
+	}, 2*time.Second, 10*time.Millisecond, "the process must keep its tag and namespace pid")
 	require.GreaterOrEqual(t, ord, uint32(5))
-	require.NoError(t, tcObjs.MapTaskNspid.Lookup(tgid, &nsPid), "and its namespace pid")
 	require.EqualValues(t, pid, nsPid)
+	var v uint32
+	require.ErrorIs(t, tcObjs.MapTaskStep.Lookup(uint32(oldTid), &v), ebpf.ErrKeyNotExist,
+		"the exec'ing thread's old tid must not keep a tag")
+	require.ErrorIs(t, tcObjs.MapTaskNspid.Lookup(uint32(oldTid), &v), ebpf.ErrKeyNotExist,
+		"nor a namespace pid")
+}
+
+// stepRootExecsFromThread is the worker for TestStepExec_FirstExecFromThread:
+// it waits for a line on stdin, then forks a step root that never execs
+// itself but starts a thread, and that thread execs: the root's first exec
+// comes from a thread other than its leader.
+const stepRootExecsFromThread = `
+import os, sys, threading
+sys.stdin.readline()
+pid = os.fork()
+if pid == 0:
+    t = threading.Thread(target=lambda: os.execv("/bin/sleep", ["sleep", "1"]))
+    t.start()
+    t.join()
+    os._exit(1)
+os.waitpid(pid, 0)
+`
+
+// TestStepExec_FirstExecFromThread: a step root whose first exec comes from
+// a thread other than its leader reports that exec, not an exit. de_thread
+// makes the leader exit before the exec completes, and that exit is not the
+// process's.
+func TestStepExec_FirstExecFromThread(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+	tcObjs, objs, iter := loadStepObjects(t)
+	rd, err := ringbuf.NewReader(objs.MapStepEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { rd.Close() })
+
+	worker := exec.Command(python, "-c", stepRootExecsFromThread)
+	stdin, err := worker.StdinPipe()
+	require.NoError(t, err)
+	require.NoError(t, worker.Start())
+	t.Cleanup(func() { _ = stdin.Close(); _ = worker.Process.Kill(); _ = worker.Wait() })
+	workerTgid, ok := globalTgid(t, iter, worker.Process.Pid)
+	require.True(t, ok)
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: workerTgid, Enabled: 1, NextOrdinal: 5}))
+
+	_, err = stdin.Write([]byte("\n"))
+	require.NoError(t, err)
+	fork, _ := awaitStepEvent(t, rd, stepEvFork, 0, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool { return true })
+	rd.SetDeadline(time.Now().Add(3 * time.Second))
+	for {
+		kind, _, ev := readStepEvent(t, rd)
+		if kind == stepEvFork || ev.Ordinal != fork.Ordinal {
+			continue
+		}
+		require.Equal(t, stepEvExec, kind, "the step must report its exec, not its leader's exit")
+		require.Equal(t, "sleep\x001\x00", argvOf(ev))
+		require.Equal(t, fork.Tgid, ev.Tgid)
+		return
+	}
 }
 
 // TestStepExit_WithoutExec: a step root that exits without exec'ing reports
@@ -654,7 +733,7 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 	require.True(t, ok, "step_exec_event must be a struct, got %T", typ)
 	var execEv StepBpfStepExecEvent
 	require.Equal(t, uint32(unsafe.Sizeof(execEv)), st.Size, "struct size")
-	require.Len(t, st.Members, 5)
+	require.Len(t, st.Members, 6)
 	for i, w := range []struct {
 		name string
 		off  uintptr
@@ -664,6 +743,7 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 		{"ordinal", unsafe.Offsetof(execEv.Ordinal)},
 		{"argv_len", unsafe.Offsetof(execEv.ArgvLen)},
 		{"argv", unsafe.Offsetof(execEv.Argv)},
+		{"comm", unsafe.Offsetof(execEv.Comm)},
 	} {
 		require.Equal(t, w.name, st.Members[i].Name)
 		require.Equal(t, w.off, uintptr(st.Members[i].Offset.Bytes()))

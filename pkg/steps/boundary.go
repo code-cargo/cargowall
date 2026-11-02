@@ -14,29 +14,12 @@
 
 //go:build linux
 
-// Package steps provides causal per-workflow-step attribution of network
-// traffic. Runner.Worker forks one direct child process per workflow step;
-// the step_fork tracepoint (bpf/stepbpf.c) tags each such child with a
-// monotonically increasing ordinal, every other fork inherits the forking
-// thread's tag, and the cgroup hooks copy the tag onto each socket cookie —
-// so every TC event carries the step that (transitively) created its socket.
-// Attribution only: no verdict consults these maps.
-//
-// Pid numbering: the kernel side keys everything by global (init-namespace)
-// ids; everything this package reads from /proc — the worker pid, the
-// daemon's own pid, container leaders reported by dockerd — is numbered in
-// the daemon's pid namespace, a different space whenever cargowall runs
-// inside a container (ARC runners are Kubernetes pods). The step_task_iter
-// BPF iterator bridges the two: it walks the daemon's namespace subtree,
-// seeds the kernel's global→namespace table (map_task_nspid, which is what
-// makes boundary events and socket pids resolvable) and streams the
-// process tree in global ids, so seeding and container tagging never scan
-// /proc. On a plain VM the translation is the identity.
 package steps
 
 import (
 	"encoding/binary"
 	"errors"
+	"os"
 	"strings"
 	"time"
 	"unsafe"
@@ -47,35 +30,118 @@ import (
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
-// Step event kinds on map_step_events; every event starts with its kind
-// (STEP_EV_* in bpf/stepbpf.c).
-const (
-	stepEvFork = 1
-	stepEvExec = 2
-	stepEvExit = 3
-)
+// boundary is one step's start: its fork as run() observed it, stamped
+// with wall-clock receive time so external event streams that carry their
+// own timestamps (Docker's timeNano) can be resolved against the step that
+// was active when the event happened, not whichever step is active when a
+// possibly backlogged stream gets processed. pid is the step root,
+// numbered in our pid namespace; reported is whether its step_boundary
+// event is written.
+type boundary struct {
+	ordinal  uint32
+	at       time.Time
+	pid      uint32
+	reported bool
+}
 
-// forkedAtMax bounds the fork times kept for steps whose exec or exit
-// event has not arrived: ordinals only grow, so an entry this far behind
-// the newest one lost its event.
-const forkedAtMax = 1024
+// boundaryHistory bounds the ring; ordinals are monotonic so old entries
+// only matter for as long as an external event could plausibly be delayed.
+const boundaryHistory = 256
+
+// reportAfter is how long a step waits for the exec or exit event that
+// reports it. One that has not come by then was lost (a full ring buffer,
+// a full map_step_exec_pending), and the step is reported from /proc.
+const reportAfter = 2 * time.Second
+
+// recordBoundary appends one observed boundary, trimming the ring to
+// boundaryHistory (append reallocation keeps the retained backing bounded).
+func (t *Tracker) recordBoundary(b boundary) {
+	t.boundaryMu.Lock()
+	defer t.boundaryMu.Unlock()
+	t.boundaries = append(t.boundaries, b)
+	if len(t.boundaries) > boundaryHistory {
+		t.boundaries = t.boundaries[1:]
+	}
+}
+
+// OrdinalAt returns the ordinal of the latest step boundary observed at or
+// before tm, or 0 when tm predates every observed boundary (callers treat 0
+// as untagged, which degrades to the stricter attribution tier by design).
+func (t *Tracker) OrdinalAt(tm time.Time) uint32 {
+	t.boundaryMu.Lock()
+	defer t.boundaryMu.Unlock()
+	for i := len(t.boundaries) - 1; i >= 0; i-- {
+		if !t.boundaries[i].at.After(tm) {
+			return t.boundaries[i].ordinal
+		}
+	}
+	return 0
+}
+
+// claimBoundary marks ordinal's boundary reported and returns it, recording
+// one at now when its fork event never came (OrdinalAt then knows the step
+// from its exec on). ok is false when it was already reported.
+func (t *Tracker) claimBoundary(ordinal, pid uint32, now time.Time) (b boundary, ok bool) {
+	t.boundaryMu.Lock()
+	for i := len(t.boundaries) - 1; i >= 0; i-- {
+		if t.boundaries[i].ordinal == ordinal {
+			b, ok = t.boundaries[i], !t.boundaries[i].reported
+			t.boundaries[i].reported = true
+			t.boundaryMu.Unlock()
+			return b, ok
+		}
+	}
+	t.boundaryMu.Unlock()
+	b = boundary{ordinal: ordinal, at: now, pid: pid, reported: true}
+	t.recordBoundary(b)
+	return b, true
+}
+
+// unreported claims the boundaries not yet reported that forked before
+// cutoff.
+func (t *Tracker) unreported(cutoff time.Time) []boundary {
+	t.boundaryMu.Lock()
+	defer t.boundaryMu.Unlock()
+	var out []boundary
+	for i := range t.boundaries {
+		if b := &t.boundaries[i]; !b.reported && b.at.Before(cutoff) {
+			b.reported = true
+			out = append(out, *b)
+		}
+	}
+	return out
+}
 
 // run consumes the step events and re-reports each step as an audit event
 // with its command line attached, giving the summary pipeline a
 // human-readable marker per step even before the action supplies plan
-// names.
+// names. It wakes every reportAfter while a step waits, to report one
+// whose event was lost, and reports what is left when the reader closes.
 func (t *Tracker) run() {
 	defer close(t.done)
 	for {
+		t.reader.SetDeadline(time.Now().Add(reportAfter))
 		record, err := t.reader.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				return
-			}
+		switch {
+		case errors.Is(err, ringbuf.ErrClosed):
+			t.reportLost(time.Now().Add(time.Hour))
+			return
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			t.reportLost(time.Now().Add(-reportAfter))
+		case err != nil:
 			t.logger.Error("Failed to read step event", "error", err)
-			continue
+		default:
+			t.handleStepEvent(record.RawSample, time.Now())
 		}
-		t.handleStepEvent(record.RawSample, time.Now())
+	}
+}
+
+// reportLost reports the steps forked before cutoff whose exec or exit
+// event never came, with what /proc shows for the root by now: a lost
+// event's step must not vanish from the audit stream.
+func (t *Tracker) reportLost(cutoff time.Time) {
+	for _, b := range t.unreported(cutoff) {
+		t.reportStep(b, sanitizeCmdline(readCmdline(int(b.pid))))
 	}
 }
 
@@ -89,66 +155,62 @@ func (t *Tracker) handleStepEvent(raw []byte, now time.Time) {
 	if len(raw) < 4 {
 		return
 	}
-	switch binary.NativeEndian.Uint32(raw) {
-	case stepEvFork:
+	switch bpf.StepBpfStepEventKind(binary.NativeEndian.Uint32(raw)) {
+	case bpf.StepBpfStepEventKindSTEP_EV_FORK:
 		if len(raw) < int(unsafe.Sizeof(bpf.StepBpfStepChildEvent{})) {
 			return
 		}
 		ev := (*bpf.StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
-		t.recordBoundary(ev.Ordinal, now)
-		if t.forkedAt == nil {
-			t.forkedAt = make(map[uint32]time.Time)
-		}
-		t.forkedAt[ev.Ordinal] = now
-		if len(t.forkedAt) > forkedAtMax {
-			for ord := range t.forkedAt {
-				if ord+forkedAtMax < ev.Ordinal {
-					delete(t.forkedAt, ord)
-				}
-			}
-		}
-	case stepEvExec, stepEvExit:
+		t.recordBoundary(boundary{ordinal: ev.Ordinal, at: now, pid: ev.Tgid})
+	case bpf.StepBpfStepEventKindSTEP_EV_EXEC, bpf.StepBpfStepEventKindSTEP_EV_EXIT:
 		if len(raw) < int(unsafe.Sizeof(bpf.StepBpfStepExecEvent{})) {
 			return
 		}
 		ev := (*bpf.StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
+		b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now)
+		if !ok {
+			return // reported as lost already
+		}
 		cmdline := t.workerCmdline
-		if ev.Kind == stepEvExec {
+		if bpf.StepBpfStepEventKind(ev.Kind) == bpf.StepBpfStepEventKindSTEP_EV_EXEC {
 			n := min(int(ev.ArgvLen), len(ev.Argv))
-			argv := unsafe.Slice((*byte)(unsafe.Pointer(&ev.Argv[0])), n)
-			cmdline = formatCmdline(argv, int(ev.ArgvLen) > len(ev.Argv))
+			cmdline = formatCmdline(cBytes(ev.Argv[:n]), int(ev.ArgvLen) > len(ev.Argv))
 			if cmdline == "" {
-				// The kernel could not read the arguments. The exec is
-				// done, so /proc no longer races it.
-				cmdline = readCmdline(int(ev.Tgid))
+				// The kernel could not read the arguments: the program's
+				// name, from the same exec. /proc could by now show
+				// another exec, or another process on a reused pid.
+				cmdline = strings.TrimRight(string(cBytes(ev.Comm[:])), "\x00")
 			}
 		}
-		at, ok := t.forkedAt[ev.Ordinal]
-		if !ok {
-			at = now
-		}
-		delete(t.forkedAt, ev.Ordinal)
-		t.reportStep(ev.Ordinal, ev.Tgid, sanitizeCmdline(cmdline), at)
+		t.reportStep(b, sanitizeCmdline(cmdline))
 	}
 }
 
+// cBytes views a bpf2go char array as bytes.
+func cBytes(a []int8) []byte {
+	if len(a) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(&a[0])), len(a))
+}
+
 // reportStep logs a step and writes its step_boundary event, stamped with
-// the step's fork time. pid is numbered in our pid namespace (see
+// the step's fork time. The pid is numbered in our pid namespace (see
 // map_task_nspid).
-func (t *Tracker) reportStep(ordinal, pid uint32, cmdline string, forkedAt time.Time) {
+func (t *Tracker) reportStep(b boundary, cmdline string) {
 	t.logger.Info("Workflow step process started",
-		"step_ordinal", ordinal,
-		"pid", pid,
+		"step_ordinal", b.ordinal,
+		"pid", b.pid,
 		"cmdline", cmdline)
 	if t.auditLogger == nil {
 		return
 	}
 	if err := t.auditLogger.LogEvent(events.AuditEvent{
-		Timestamp:   forkedAt,
+		Timestamp:   b.at,
 		EventType:   events.EventStepBoundary,
 		Process:     cmdline,
-		PID:         pid,
-		StepOrdinal: ordinal,
+		PID:         b.pid,
+		StepOrdinal: b.ordinal,
 	}); err != nil {
 		t.logger.Error("Failed to write audit log", "error", err)
 	}
@@ -164,8 +226,7 @@ func (t *Tracker) reportStep(ordinal, pid uint32, cmdline string, forkedAt time.
 // standard run-step shape). Every other later token is where flags and
 // values (and therefore secrets passed on a command line, e.g. docker
 // args) could appear, and is dropped. Everything written to logs, the
-// audit JSONL, or the summary goes through this; the full string stays
-// internal to the fork→exec retry comparison.
+// audit JSONL, or the summary goes through this.
 func sanitizeCmdline(cmdline string) string {
 	fields := strings.Fields(cmdline)
 	if len(fields) <= 2 {

@@ -26,7 +26,7 @@ import (
 // StepBpf is built for BPF v3: step_fork allocates ordinals with a fetching
 // atomic add, which needs BPF_FETCH. clang 18 emitted it under bpf2go's
 // default -mcpu=v1 anyway; clang 21 enforces the CPU level and refuses.
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -cflags -mcpu=v3 -output-dir bpf -type task_iter_rec -type step_child_event -type step_exec_event StepBpf bpf/stepbpf.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -cflags -mcpu=v3 -output-dir bpf -type task_iter_rec -type step_child_event -type step_exec_event -type step_event_kind StepBpf bpf/stepbpf.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -output-dir bpf OriginBpf bpf/originbpf.c
 // ScopeBpf counts with an atomic add, built for v3 like StepBpf.
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -go-package bpf -cc clang -cflags -mcpu=v3 -output-dir bpf ScopeBpf bpf/scopebpf.c

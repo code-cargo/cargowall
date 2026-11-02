@@ -285,12 +285,34 @@ static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid,
     bpf_map_delete_elem(&map_step_exec_pending, &tgid);
 }
 
-// A step root's first exec. At this tracepoint the new program's arguments
-// are in place in its memory, which a /proc read from userspace can only
-// race. One lookup per exec anywhere on the host.
+// move_entry moves a task's entry in map from tid from to tid to, if it
+// has one.
+static __always_inline void move_entry(void *map, __u32 *from, __u32 *to)
+{
+    __u32 *v = bpf_map_lookup_elem(map, from);
+    if (!v)
+        return;
+    __u32 val = *v;
+    bpf_map_update_elem(map, to, &val, BPF_ANY);
+    bpf_map_delete_elem(map, from);
+}
+
+// A task's exec. A thread other than the leader that execs takes the
+// leader's tid (de_thread), and the leader's exit has already deleted the
+// entries under it: the process's tag and namespace pid are the exec'ing
+// thread's, still under old_pid, and move with it. Then a step root's
+// first exec reports what the step runs: at this tracepoint the new
+// program's arguments are in place in its memory, which a /proc read from
+// userspace can only race. A lookup or two per exec anywhere on the host.
 SEC("tp_btf/sched_process_exec")
 int BPF_PROG(step_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
 {
+    __u32 tid = p->pid;
+    __u32 old = old_pid;
+    if (old != tid) {
+        move_entry(&map_task_step, &old, &tid);
+        move_entry(&map_task_nspid, &old, &tid);
+    }
     emit_step_exec(p, p->tgid, STEP_EV_EXEC);
     return 0;
 }

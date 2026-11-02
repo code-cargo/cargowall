@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -332,6 +333,59 @@ func TestStepExec_FirstExecOnly(t *testing.T) {
 			require.NotEqual(t, first.Ordinal, ev.Ordinal, "a second event (kind %d) for the step", ev.Kind)
 		}
 	}
+}
+
+// TestHelperExecFromThread is not a test: TestStepExec_FromThreadKeepsTag
+// runs the test binary with STEPBPF_EXEC_FROM_THREAD set, and this execs
+// `sleep 2` from a thread other than the leader.
+func TestHelperExecFromThread(t *testing.T) {
+	if os.Getenv("STEPBPF_EXEC_FROM_THREAD") == "" {
+		t.Skip("helper process only")
+	}
+	errs := make(chan error, 1)
+	var execFrom func()
+	execFrom = func() {
+		runtime.LockOSThread() // never unlocked: this thread execs, or stays busy
+		if unix.Gettid() == unix.Getpid() {
+			go execFrom() // the leader: try again from another thread
+			select {}
+		}
+		errs <- unix.Exec("/bin/sleep", []string{"sleep", "2"}, os.Environ())
+	}
+	go execFrom()
+	t.Fatal(<-errs)
+}
+
+// TestStepExec_FromThreadKeepsTag: a process whose non-leader thread execs
+// keeps its tag and namespace pid. The exec'ing thread takes the leader's
+// tid, under which the leader's exit has already deleted both entries.
+func TestStepExec_FromThreadKeepsTag(t *testing.T) {
+	tcObjs, _, iter := loadStepObjects(t)
+	selfTgid, ok := globalTgid(t, iter, os.Getpid())
+	require.True(t, ok)
+	if int(selfTgid) != os.Getpid() {
+		// The maps are read by pid below: a task walk would re-seed the
+		// namespace entry and hide a lost one.
+		t.Skip("needs the initial pid namespace, where a pid is the tid the maps are keyed by")
+	}
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: selfTgid, Enabled: 1, NextOrdinal: 5}))
+
+	child := exec.Command(os.Args[0], "-test.run", "^TestHelperExecFromThread$")
+	child.Env = append(os.Environ(), "STEPBPF_EXEC_FROM_THREAD=1")
+	require.NoError(t, child.Start())
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	pid := child.Process.Pid
+	require.Eventually(t, func() bool {
+		comm, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
+		return err == nil && strings.TrimSpace(string(comm)) == "sleep"
+	}, 5*time.Second, 10*time.Millisecond, "the helper must exec sleep")
+
+	tgid := uint32(pid)
+	var ord, nsPid uint32
+	require.NoError(t, tcObjs.MapTaskStep.Lookup(tgid, &ord), "the process must keep its tag")
+	require.GreaterOrEqual(t, ord, uint32(5))
+	require.NoError(t, tcObjs.MapTaskNspid.Lookup(tgid, &nsPid), "and its namespace pid")
+	require.EqualValues(t, pid, nsPid)
 }
 
 // TestStepExit_WithoutExec: a step root that exits without exec'ing reports

@@ -145,6 +145,53 @@ func TestDaemonConfig_RecoversRewriteLeftByUncleanExit(t *testing.T) {
 	})
 }
 
+// recover undoes the rewrite a killed run left and writes none of its own,
+// so a run that will not point the daemon at its listener still puts the
+// original back. It says whether there was a rewrite to undo, leaves a
+// daemon.json with no record of ours alone, and reloads nothing: only a
+// restart applies the original to a daemon started on the rewrite.
+func TestDaemonConfig_RecoverUndoesOnlyALeftover(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	for _, c := range []struct {
+		name     string
+		original []byte
+	}{{"original existed", []byte(`{"log-driver": "json-file"}`)}, {"no original", nil}} {
+		t.Run(c.name, func(t *testing.T) {
+			dc, reloads := newTestDaemonConfig(t)
+			if c.original != nil {
+				require.NoError(t, os.WriteFile(dc.path, c.original, 0o644))
+			}
+			require.NoError(t, dc.configure("172.17.0.1", logger))
+			// No restore: that run was killed.
+
+			recovered, err := dc.recover(logger)
+			require.NoError(t, err)
+			require.True(t, recovered)
+			if c.original != nil {
+				requireContent(t, dc.path, c.original)
+			} else {
+				requireNotExist(t, dc.path)
+			}
+			for _, record := range []string{dc.backup, dc.absent, dc.rewrite} {
+				requireNotExist(t, record)
+			}
+			require.Zero(t, *reloads)
+
+			recovered, err = dc.recover(logger)
+			require.NoError(t, err)
+			require.False(t, recovered, "a rewrite is undone once")
+		})
+	}
+
+	dc, _ := newTestDaemonConfig(t)
+	mine := []byte(`{"dns": ["10.0.0.2"]}`)
+	require.NoError(t, os.WriteFile(dc.path, mine, 0o644))
+	recovered, err := dc.recover(logger)
+	require.NoError(t, err)
+	require.False(t, recovered)
+	requireContent(t, dc.path, mine)
+}
+
 // Without a record of the original there is nothing to restore from, so a
 // failed backup must stop the rewrite rather than log and carry on.
 func TestDaemonConfig_BackupFailureLeavesOriginalUntouched(t *testing.T) {

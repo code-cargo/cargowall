@@ -126,6 +126,35 @@ func RestoreDockerDNS(logger *slog.Logger) error {
 	return dockerDaemonConfig.restore(logger)
 }
 
+// RecoverDockerDNS undoes a daemon.json rewrite that a previous run left
+// behind, as ConfigureDockerDNS does first, without rewriting it again, and
+// reports whether there was one: a daemon started since reads it, so only a
+// restart (RestartDockerDaemon) applies the original again. With nothing
+// recorded, daemon.json is left alone.
+func RecoverDockerDNS(logger *slog.Logger) (bool, error) {
+	return dockerDaemonConfig.recover(logger)
+}
+
+// recover is RecoverDockerDNS.
+func (c *daemonConfig) recover(logger *slog.Logger) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.recoverLocked(logger)
+}
+
+// recoverLocked settles the records a run left without restoring, which
+// hold the real original. Caller holds c.mu.
+func (c *daemonConfig) recoverLocked(logger *slog.Logger) (bool, error) {
+	recovered, err := c.restoreFiles(logger)
+	if err != nil {
+		return recovered, fmt.Errorf("undo the daemon.json rewrite a previous run left: %w", err)
+	}
+	if recovered {
+		logger.Warn("Restored daemon.json left rewritten by a previous run that did not shut down cleanly")
+	}
+	return recovered, nil
+}
+
 // configure records the original before touching it — the backup, or the
 // absent marker when there was no daemon.json — then the bytes it is about
 // to write, and refuses to rewrite without those records, since restore can
@@ -140,12 +169,8 @@ func (c *daemonConfig) configure(dnsIP string, logger *slog.Logger) error {
 	}
 	logger.Info("Configuring Docker DNS", "dns", dnsIP)
 
-	recovered, err := c.restoreFiles(logger)
-	if err != nil {
-		return fmt.Errorf("undo the daemon.json rewrite a previous run left: %w", err)
-	}
-	if recovered {
-		logger.Warn("Restored daemon.json left rewritten by a previous run that did not shut down cleanly")
+	if _, err := c.recoverLocked(logger); err != nil {
+		return err
 	}
 
 	existingConfig := make(map[string]any)

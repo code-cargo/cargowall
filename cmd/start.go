@@ -256,7 +256,6 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 	var dnsServer *dns.Server
 	var containerDNS *dockerDNS
-	var dockerBridgeIP string
 	var redirect *dnsRedirect
 	if !cmd.DisableDNSTracking {
 		// Infrastructure auto-allows must be installed before the proxy below
@@ -283,10 +282,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 		addIPv6Listener(cmd, dnsServer)
 		if cmd.DockerDNSInterception {
-			var restore func()
-			containerDNS, restore = startDockerDNS(dnsServer, shape.Dockerd, teardowns, logger)
-			defer restore()
-			dockerBridgeIP = containerDNS.bridgeIP
+			containerDNS = startDockerDNS(dnsServer, shape.Dockerd, logger)
 		}
 
 		dnsErrCh := make(chan error, 1)
@@ -297,8 +293,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}()
 
 		// Wait for the proxy to bind its listeners, or to fail to: the
-		// redirect below covers IPv6 only if the proxy holds its IPv6
-		// listener (startDNSRedirect).
+		// redirect below covers IPv6, and containers, only if the proxy holds
+		// its listeners for them (startDNSRedirect).
 		select {
 		case err := <-dnsErrCh:
 			return fmt.Errorf("DNS proxy server failed to start: %w", err)
@@ -310,6 +306,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		logger.Debug("DNS proxy server started",
 			"listen", listenAddr,
 			"upstream", upstream)
+		// Point the daemon at the bridge listener now that it is known to
+		// hold, or say that it does not.
+		defer containerDNS.useListener(teardowns, cmd.DNSRedirect)()
 
 		// Force all outbound DNS through the proxy. This catches processes
 		// that bypass /etc/resolv.conf and query upstream DNS directly
@@ -318,7 +317,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		// including across error-return paths below.
 		if cmd.DNSRedirect {
 			var teardownRedirect func()
-			redirect, teardownRedirect = startDNSRedirect(dnsServer, dockerBridgeIP, teardowns, logger)
+			redirect, teardownRedirect = startDNSRedirect(dnsServer, containerDNS, teardowns, logger)
 			defer teardownRedirect()
 		}
 	}
@@ -606,10 +605,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		return err
 	}
 
-	// DNS infrastructure, port 53: the proxy's upstream, loopback, and —
-	// load-bearing under --container-egress=enforce — the docker bridge
-	// listener that daemon.json points every container at. Previously this
-	// lived in the CI-only config path, so `--container-egress=enforce
+	// DNS infrastructure, port 53 (dnsInfraIPs). Previously this lived in
+	// the CI-only config path, so `--container-egress=enforce
 	// --docker-dns-interception` without a CI preset enforced against an
 	// allowlist that never contained bridgeIP:53 and container resolution
 	// died with EPERM. Unconditional: even with DNS tracking disabled (no
@@ -621,14 +618,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// broader loopback allow exists would shadow the /8 all-ports allow and
 	// deny 127.0.0.1 on every other port. With the /8 already in place, the
 	// covered-check inside ensureAllowed skips the /32 instead.
-	dnsIPs := []string{"127.0.0.1"}
-	if dnsUpstreamHost, _, err := net.SplitHostPort(cmd.DNSUpstream); err == nil {
-		dnsIPs = append(dnsIPs, dnsUpstreamHost)
-	}
-	if dockerBridgeIP != "" {
-		dnsIPs = append(dnsIPs, dockerBridgeIP)
-	}
-	configMgr.EnsureDNSAllowed(dnsIPs)
+	configMgr.EnsureDNSAllowed(dnsInfraIPs(cmd.DNSUpstream, containerDNS))
 
 	// BPF runtime stats (3a telemetry): global kernel accounting while
 	// enabled; the per-program numbers land in one shutdown log line each.
@@ -885,7 +875,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// of the cgroup hook only (one LPM write — cheap enough for the event
 	// stream goroutine), never added to the shared policy: TC's off-host
 	// enforcement must be un-widenable by workload-influenced input.
-	attribution.startUserspace(ctx, dnsServer, dockerBridgeIP, auditLogger, attribution.allowLocalNetwork)
+	attribution.startUserspace(ctx, dnsServer, containerDNS.listeningIP(), auditLogger, attribution.allowLocalNetwork)
 
 	if startupInterrupted(ctx, logger, "pre-ready") {
 		return nil

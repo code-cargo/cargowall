@@ -87,13 +87,12 @@ const (
 // a container's client socket, and whose wildcard fallback could even
 // mis-hit an unrelated host socket on the same ephemeral port). Explicit
 // marking rather than inference: a future non-container extra listener must
-// not silently classify its clients as containers. Call before Start.
-func (s *Server) AddContainerListenAddr(addr string) {
-	s.AddListenAddr(addr)
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		s.listenerModes[host] = attributeContainerIP
-	}
-}
+// not silently classify its clients as containers. It binds as AddListenAddr
+// says, whole or not at all, and BindError says why not. One on a host
+// already serving the sockdiag path, the primary's above all, is not added:
+// the mode is the host's, and it would reclassify that listener's queries.
+// Call before Start.
+func (s *Server) AddContainerListenAddr(addr string) { s.addListenAddr(addr, attributeContainerIP) }
 
 // attributionMode returns the listener's attribution mode for a query —
 // attributeHostSockdiag unless the listen address was created

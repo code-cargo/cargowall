@@ -94,7 +94,8 @@ type RedirectSpec struct {
 	// family ip, IPv4 only.
 	IPv6 bool
 	// BridgeIP is the proxy's container listener on the docker bridge, ""
-	// for none.
+	// for none. Name one only once the proxy is known to hold it: the DNAT
+	// to it hands container DNS to whatever holds the address.
 	BridgeIP string
 }
 

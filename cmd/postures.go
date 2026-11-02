@@ -59,6 +59,13 @@ const (
 	// dnsRedirectIPv4 is the redirect in place for IPv4 but not for the
 	// host's IPv6, which goes around the proxy (dnsRedirect.settle).
 	dnsRedirectIPv4 = "ipv4"
+	// dnsRedirectHost is the redirect in place for the host but not for
+	// containers: their DNS goes around the proxy, for want of its listener
+	// on the docker bridge.
+	dnsRedirectHost = "host"
+	// dnsRedirectHostIPv4 is both: the redirect covers the host's IPv4 DNS
+	// alone.
+	dnsRedirectHostIPv4 = "host-ipv4"
 )
 
 // maxPostureReasonBytes bounds a reason: it lands in a job-summary table

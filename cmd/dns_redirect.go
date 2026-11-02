@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"strings"
 
 	"golang.org/x/sys/unix"
 
@@ -38,19 +40,24 @@ import (
 // policy's mode, which is known only after the policy loads: by then the
 // redirect must already be up, so setup records the failure and settle
 // reports it. A redirect that covers IPv4 but not the IPv6 the host has is
-// a loss too: IPv6 DNS then goes around the proxy the same way.
+// a loss too: IPv6 DNS then goes around the proxy the same way. So is one
+// that leaves container DNS alone for want of the proxy's listener on the
+// docker bridge: containers then resolve around the proxy.
 type dnsRedirect struct {
-	active bool  // the redirect is in place, for IPv4 at least
-	err    error // why it is not, or not for IPv6; nil when it is whole
+	active bool  // the redirect is in place, for the host's IPv4 at least
+	err    error // why it is not, or not whole; nil when it is whole
+	// applied is what a redirect in place but not whole covers, as the
+	// posture record spells it: dnsRedirectIPv4, dnsRedirectHost or
+	// dnsRedirectHostIPv4.
+	applied string
 }
 
 // addIPv6Listener adds the proxy's listener at network.ProxyAddrIPv6, the
-// one the redirect sends IPv6 DNS to, as an optional one: whether it binds
-// decides whether the redirect covers IPv6 (startDNSRedirect). Called
-// before the proxy starts.
+// one the redirect sends IPv6 DNS to: whether it binds decides whether the
+// redirect covers IPv6 (startDNSRedirect). Called before the proxy starts.
 func addIPv6Listener(cmd *StartCmd, dnsServer *dns.Server) {
 	if cmd.DNSRedirect {
-		dnsServer.AddOptionalListenAddr(network.ProxyAddrIPv6)
+		dnsServer.AddListenAddr(network.ProxyAddrIPv6)
 	}
 }
 
@@ -67,7 +74,7 @@ func ipv6Gap(bindErr, refused error, hostIPv6 func() bool) string {
 	case bindErr == nil && refused == nil:
 		return ""
 	case errors.Is(bindErr, unix.EADDRINUSE):
-		return fmt.Sprintf("another process holds %s, a resolver clients can ask around the proxy", network.ProxyAddrIPv6)
+		return listenGap(network.ProxyAddrIPv6, bindErr) + ", a resolver clients can ask around the proxy"
 	case !hostIPv6():
 		return ""
 	case bindErr == nil:
@@ -75,20 +82,49 @@ func ipv6Gap(bindErr, refused error, hostIPv6 func() bool) string {
 	case errors.Is(bindErr, unix.EADDRNOTAVAIL), errors.Is(bindErr, unix.EAFNOSUPPORT):
 		return "loopback has no IPv6 address for the proxy to listen on"
 	default:
-		return fmt.Sprintf("the proxy cannot listen on %s: %v", network.ProxyAddrIPv6, bindErr)
+		return listenGap(network.ProxyAddrIPv6, bindErr)
 	}
 }
 
-// startDNSRedirect installs the redirect for the proxy, and for its
-// container listener at bridgeIP when there is one, once the proxy has
-// bound its listeners: it covers IPv6 only when the proxy holds its IPv6
-// listener, and the rest is ipv6Gap's to say. The returned undo
+// bridgeGap is why container DNS will not reach the proxy, "" when it will:
+// the proxy does not hold its listener on the docker bridge, and the
+// redirect then leaves container DNS alone (dockerDNS.listeningIP).
+func bridgeGap(containerDNS *dockerDNS) string {
+	err := containerDNS.listenerErr()
+	if err == nil {
+		return ""
+	}
+	return listenGap(containerDNS.listenAddr(), err)
+}
+
+// listenGap is why the proxy does not hold its listener at addr, as a
+// posture reason puts it: another process holds the address, or the bind
+// failed for a cause of its own. The reason names the address once: the
+// error listenBoth returns names it again (udp4: listen udp4 <addr>: bind:
+// ...), so of that only the protocol and the cause are kept.
+func listenGap(addr string, err error) string {
+	var op *net.OpError
+	switch {
+	case errors.Is(err, unix.EADDRINUSE):
+		return "another process holds " + addr
+	case errors.As(err, &op):
+		return fmt.Sprintf("the proxy cannot listen on %s: %s %v", addr, op.Net, op.Err)
+	default:
+		return fmt.Sprintf("the proxy cannot listen on %s: %v", addr, err)
+	}
+}
+
+// startDNSRedirect installs the redirect for the listeners the proxy holds
+// once it is ready: IPv6 DNS goes to its IPv6 listener only when that is
+// bound, and container DNS to its docker bridge listener only when that one
+// is (dockerDNS.listeningIP). What that leaves uncovered is ipv6Gap's and
+// bridgeGap's to say. The returned undo
 // removes it; the caller defers it. It is registered before the install,
 // like every host mutation's: a forced shutdown landing mid-install waits
 // for it, then removes the table, which an unowned one needs, and flushes
 // the flows DNAT'd to the proxy meanwhile, which even an owned one dying
 // with the process does not do.
-func startDNSRedirect(dnsServer *dns.Server, bridgeIP string, teardowns *teardownList,
+func startDNSRedirect(dnsServer *dns.Server, containerDNS *dockerDNS, teardowns *teardownList,
 	logger *slog.Logger,
 ) (*dnsRedirect, func()) {
 	redirect := network.NewDNSRedirect(logger)
@@ -100,15 +136,43 @@ func startDNSRedirect(dnsServer *dns.Server, bridgeIP string, teardowns *teardow
 		}
 	})
 	bindErr := dnsServer.BindError(network.ProxyAddrIPv6)
-	if err := redirect.Install(network.RedirectSpec{IPv6: bindErr == nil, BridgeIP: bridgeIP}); err != nil {
+	if err := redirect.Install(network.RedirectSpec{IPv6: bindErr == nil, BridgeIP: containerDNS.listeningIP()}); err != nil {
 		return notInstalled(err, logger), undo
 	}
-	if gap := ipv6Gap(bindErr, redirect.IPv6Refused(), network.HostIPv6); gap != "" {
-		err := fmt.Errorf("IPv6 DNS is not redirected: %s", gap)
-		logger.Info("DNS redirect covers IPv4 only; the policy's mode decides what that costs once it loads", "error", err)
-		return &dnsRedirect{active: true, err: err}, undo
+	return installed(ipv6Gap(bindErr, redirect.IPv6Refused(), network.HostIPv6), bridgeGap(containerDNS), logger), undo
+}
+
+// installed records a redirect in place, whole unless it has a gap: ipv6
+// when IPv6 DNS goes around the proxy, bridge when container DNS does, for
+// want of the bridge listener, "" for none. One with a gap is recorded at
+// what it still covers, with every gap's reason, and says so in the log
+// where it happened, as notInstalled does.
+func installed(ipv6, bridge string, logger *slog.Logger) *dnsRedirect {
+	r := &dnsRedirect{active: true}
+	switch {
+	case ipv6 != "" && bridge != "":
+		r.applied = dnsRedirectHostIPv4
+	case ipv6 != "":
+		r.applied = dnsRedirectIPv4
+	case bridge != "":
+		r.applied = dnsRedirectHost
+	default:
+		return r
 	}
-	return &dnsRedirect{active: true}, undo
+	// The bridge's reason goes first: it is short, while IPv6's can carry a
+	// kernel refusal and its hint, and the record keeps only the first
+	// maxPostureReasonBytes, so in this order both causes survive.
+	var gaps []string
+	if bridge != "" {
+		gaps = append(gaps, "container DNS is not redirected: "+bridge)
+	}
+	if ipv6 != "" {
+		gaps = append(gaps, "IPv6 DNS is not redirected: "+ipv6)
+	}
+	r.err = errors.New(strings.Join(gaps, "; "))
+	logger.Info("DNS redirect not whole; the policy's mode decides what that costs once it loads",
+		"covers", r.applied, "error", r.err)
+	return r
 }
 
 // notInstalled records a redirect that did not come up, and says so in the
@@ -120,19 +184,19 @@ func notInstalled(err error, logger *slog.Logger) *dnsRedirect {
 	return &dnsRedirect{err: err}
 }
 
-// isActive reports whether the redirect is in place, for IPv4 at least.
-// Nil-safe: nil is the redirect not requested.
+// isActive reports whether the redirect is in place, for the host's IPv4 at
+// least. Nil-safe: nil is the redirect not requested.
 func (r *dnsRedirect) isActive() bool { return r != nil && r.active }
 
 // settle hands a failed setup to the ledger, which owns the log line and
-// decides whether startup fails; one in place for IPv4 alone is recorded as
-// that. Nil-safe.
+// decides whether startup fails; one in place but not whole is recorded at
+// what it covers. Nil-safe.
 func (r *dnsRedirect) settle(postures *postureLedger) error {
 	if r == nil || r.err == nil {
 		return nil
 	}
 	if r.active {
-		return postures.loseTo(postureDNSRedirect, dnsRedirectIPv4, postures.errReason(r.err))
+		return postures.loseTo(postureDNSRedirect, r.applied, postures.errReason(r.err))
 	}
 	return postures.lose(postureDNSRedirect, postures.errReason(r.err))
 }

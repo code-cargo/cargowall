@@ -79,17 +79,24 @@ func setLinkUp(t *testing.T, name string) {
 }
 
 // addTun creates TUN interface name holding addr/24, up, and returns the
-// file whose writes arrive on it.
+// file whose writes arrive on it and whose reads are what the kernel routes
+// out of it. The file is nonblocking, made once the interface is attached,
+// so the runtime's poller serves it and a read can time out.
 func addTun(t *testing.T, name string, addr net.IP) *os.File {
 	t.Helper()
-	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	require.NoError(t, err)
+	ifr, err := unix.NewIfreq(name)
+	if err == nil {
+		ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
+		err = unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr)
+	}
+	if err != nil {
+		unix.Close(fd)
+		require.NoError(t, err)
+	}
 	f := os.NewFile(uintptr(fd), name)
 	t.Cleanup(func() { f.Close() })
-	ifr, err := unix.NewIfreq(name)
-	require.NoError(t, err)
-	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
-	require.NoError(t, unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr))
 
 	sock, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	require.NoError(t, err)
@@ -168,21 +175,9 @@ func udp6(src, dst net.IP, sport, dport uint16, payload string) []byte {
 	binary.BigEndian.PutUint16(udp[4:], uint16(8+len(payload)))
 	copy(udp[8:], payload)
 	// The pseudo-header: both addresses, the UDP length, the next header.
-	sum := uint32(len(udp)) + unix.IPPROTO_UDP
-	for _, words := range [][]byte{b[8:40], udp} {
-		for i := 0; i+1 < len(words); i += 2 {
-			sum += uint32(binary.BigEndian.Uint16(words[i:]))
-		}
-		if len(words)%2 == 1 {
-			sum += uint32(words[len(words)-1]) << 8
-		}
-	}
-	for sum > 0xffff {
-		sum = sum&0xffff + sum>>16
-	}
-	check := ^uint16(sum)
+	check := inetChecksum(uint32(len(udp))+unix.IPPROTO_UDP, b[8:40], udp)
 	if check == 0 {
-		check = 0xffff
+		check = 0xffff // zero is no checksum, which IPv6 refuses
 	}
 	binary.BigEndian.PutUint16(udp[6:], check)
 	return b
@@ -198,19 +193,83 @@ func udp4(src, dst net.IP, sport, dport uint16, payload string) []byte {
 	b[9] = unix.IPPROTO_UDP
 	copy(b[12:16], src.To4())
 	copy(b[16:20], dst.To4())
-	var sum uint32
-	for i := 0; i < 20; i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(b[i:]))
-	}
-	for sum > 0xffff {
-		sum = sum&0xffff + sum>>16
-	}
-	binary.BigEndian.PutUint16(b[10:], ^uint16(sum))
+	binary.BigEndian.PutUint16(b[10:], inetChecksum(0, b[:20]))
 	binary.BigEndian.PutUint16(b[20:], sport)
 	binary.BigEndian.PutUint16(b[22:], dport)
 	binary.BigEndian.PutUint16(b[24:], uint16(8+len(payload)))
 	copy(b[28:], payload)
 	return b
+}
+
+// tcp4SYN builds an IPv4/TCP SYN with both checksums: unlike UDP's, TCP's
+// is not optional, and the kernel checks it on a packet arriving off a
+// TUN.
+func tcp4SYN(src, dst net.IP, sport, dport uint16) []byte {
+	b := make([]byte, 40)
+	b[0] = 0x45 // version 4, 5-word header
+	binary.BigEndian.PutUint16(b[2:], uint16(len(b)))
+	b[8] = 64 // TTL
+	b[9] = unix.IPPROTO_TCP
+	copy(b[12:16], src.To4())
+	copy(b[16:20], dst.To4())
+	binary.BigEndian.PutUint16(b[10:], inetChecksum(0, b[:20]))
+	tcp := b[20:]
+	binary.BigEndian.PutUint16(tcp[0:], sport)
+	binary.BigEndian.PutUint16(tcp[2:], dport)
+	binary.BigEndian.PutUint32(tcp[4:], 1)                // sequence number
+	tcp[12] = 5 << 4                                      // 5-word header
+	tcp[13] = 0x02                                        // SYN
+	binary.BigEndian.PutUint16(tcp[14:], 0xffff)          // window
+	pseudo := uint32(unix.IPPROTO_TCP) + uint32(len(tcp)) // and both addresses
+	binary.BigEndian.PutUint16(tcp[16:], inetChecksum(pseudo, b[12:20], tcp))
+	return b
+}
+
+// inetChecksum is the internet checksum (RFC 1071) of words, which it sums
+// as one run of bytes, folded onto sum: a pseudo-header's length and
+// protocol, for a transport checksum. Only the last of words may be of odd
+// length, as a payload can be; its last byte is padded with zero.
+func inetChecksum(sum uint32, words ...[]byte) uint16 {
+	for _, w := range words {
+		for i := 0; i+1 < len(w); i += 2 {
+			sum += uint32(binary.BigEndian.Uint16(w[i:]))
+		}
+		if len(w)%2 == 1 {
+			sum += uint32(w[len(w)-1]) << 8
+		}
+	}
+	for sum > 0xffff {
+		sum = sum&0xffff + sum>>16
+	}
+	return ^uint16(sum)
+}
+
+// synAcked sends a TCP SYN from src:sport to dst:dport in on wire, and
+// reports whether a SYN-ACK from dst:dport comes back out of it: a listener
+// took the SYN, under whatever DNAT the reply undoes.
+func synAcked(t *testing.T, wire *os.File, src, dst net.IP, sport, dport uint16) bool {
+	t.Helper()
+	_, err := wire.Write(tcp4SYN(src, dst, sport, dport))
+	require.NoError(t, err)
+	buf := make([]byte, 1500)
+	require.NoError(t, wire.SetReadDeadline(time.Now().Add(arrives)))
+	for {
+		n, err := wire.Read(buf)
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return false
+		}
+		require.NoError(t, err)
+		p := buf[:n]
+		if n < 20 || p[0]>>4 != 4 || p[9] != unix.IPPROTO_TCP || n < int(p[0]&0x0f)*4+20 {
+			continue // not IPv4 TCP: the IPv6 the interface sends of its own accord
+		}
+		tcp := p[int(p[0]&0x0f)*4:]
+		if net.IP(p[12:16]).Equal(dst) && net.IP(p[16:20]).Equal(src) &&
+			binary.BigEndian.Uint16(tcp[0:]) == dport && binary.BigEndian.Uint16(tcp[2:]) == sport &&
+			tcp[13]&0x12 == 0x12 {
+			return true
+		}
+	}
 }
 
 // ipNet is network ("udp" or "tcp") for addr's family.
@@ -474,11 +533,11 @@ func TestDNSRedirect_InputGuard(t *testing.T) {
 }
 
 // TestDNSRedirect_Bridge: DNS a container sends through docker0 or a br-*
-// bridge reaches the proxy's listener on the bridge IP with its source kept,
-// and DNS arriving on any other interface does not. With IPv6 covered, IPv6
-// DNS arriving on a bridge is dropped, wherever it was sent: there is no
-// IPv6 listener for it. Here it is sent to a resolver on the host itself,
-// which an IPv4-only redirect lets it reach.
+// bridge reaches the proxy's listener on the bridge IP, over UDP with its
+// source kept and over TCP, and DNS arriving on any other interface does
+// not. With IPv6 covered, IPv6 DNS arriving on a bridge is dropped, wherever
+// it was sent: there is no IPv6 listener for it. Here it is sent to a
+// resolver on the host itself, which an IPv4-only redirect lets it reach.
 func TestDNSRedirect_Bridge(t *testing.T) {
 	enterNetns(t)
 	bridgeIP := net.IPv4(10, 54, 0, 1)
@@ -490,8 +549,10 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 		addAddr6(t, name, net.ParseIP(addr))
 	}
 	l := listenUDP(t, "10.54.0.1:53")
+	listenTCPAt(t, "10.54.0.1:53")
 	hostResolver6 := listenUDP(t, "[fd56::1]:53")
 
+	sport := uint16(6000) // a port per TCP handshake: none reuses a half-open one
 	for _, ipv6 := range []bool{false, true} {
 		r := NewDNSRedirect(discardLogger())
 		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6, BridgeIP: bridgeIP.String()}))
@@ -509,6 +570,9 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 			got, from := received(t, l, arrives)
 			require.Equal(t, c.wire.Name(), got, "ipv6 %v: DNS on %s must reach the bridge listener", ipv6, c.wire.Name())
 			require.True(t, from.IP.Equal(c.src), "DNAT must keep the container's source, got %s", from)
+			sport++
+			require.True(t, synAcked(t, c.wire, c.src, resolver, sport, 53),
+				"ipv6 %v: TCP DNS on %s must reach the bridge listener", ipv6, c.wire.Name())
 
 			_, err = c.wire.Write(udp6(c.src6, net.ParseIP("fd56::1"), 5000, 53, c.wire.Name()+"6"))
 			require.NoError(t, err)

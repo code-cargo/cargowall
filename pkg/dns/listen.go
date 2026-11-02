@@ -18,6 +18,7 @@ package dns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"slices"
@@ -25,22 +26,45 @@ import (
 	"github.com/miekg/dns"
 )
 
-// Optional listeners, which the DNS redirect sends IPv6 DNS to, and the
-// networks a listener binds.
+// The listeners beside the primary, which the DNS redirect sends IPv6 and
+// container DNS to, and the networks a listener binds.
 
-// AddOptionalListenAddr adds an address the proxy listens on if it can,
-// attributed via the host sockdiag path: the DNS redirect's [::1]:53, which
-// IPv6 DNS is sent to only once it is known to be bound. It binds over UDP
-// and TCP both or neither, so nothing redirected there finds half of it
-// held by another process. A failure is logged at Debug and left to
-// BindError: what it costs is the caller's call. Call before Start.
-func (s *Server) AddOptionalListenAddr(addr string) {
-	if slices.Contains(s.optionalAddrs, addr) {
-		return // bound once: a second listener on it could only fail
+// AddListenAddr adds an address the proxy listens on beside the primary, if
+// it can, attributed via the host sockdiag path unless AddContainerListenAddr
+// adds it: the DNS redirect's [::1]:53, which IPv6 DNS is sent to only once
+// it is known to be bound, and likewise the docker bridge's. It binds over
+// UDP and TCP both or neither, so nothing sent there finds half of it held
+// by another process. A failure is logged at Debug and left to BindError:
+// what it costs is the caller's call. Call before Start.
+func (s *Server) AddListenAddr(addr string) { s.addListenAddr(addr, attributeHostSockdiag) }
+
+// addListenAddr adds a listener at addr whose queries are attributed by
+// mode, and reports whether it did. An address is added once, and the
+// primary's not at all: a second listener on one could only fail. A host
+// serves listeners of one mode only, the primary's that of the host
+// sockdiag path: the mode is the listener host's (attributionMode), so a
+// listener of the other one would reclassify every query the host's
+// listeners already get.
+func (s *Server) addListenAddr(addr string, mode listenerAttribution) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || addr == s.listenAddr || slices.Contains(s.additionalAddrs, addr) {
+		return false
 	}
-	s.AddListenAddr(addr)
-	s.optionalAddrs = append(s.optionalAddrs, addr)
+	for _, a := range append([]string{s.listenAddr}, s.additionalAddrs...) {
+		if h, _, _ := net.SplitHostPort(a); h == host && s.listenerModes[h] != mode {
+			return false
+		}
+	}
+	s.additionalAddrs = append(s.additionalAddrs, addr)
+	if mode != attributeHostSockdiag {
+		s.listenerModes[host] = mode
+	}
+	return true
 }
+
+// errNotAdded is BindError's answer for an address no listener was added
+// at.
+var errNotAdded = errors.New("no listener was added at that address")
 
 // Ready is closed once Start has bound its listeners. A primary that cannot
 // bind ends Start with its error instead, and Ready stays open.
@@ -53,9 +77,18 @@ func (s *Server) readyCh() chan struct{} {
 	return s.ready
 }
 
-// BindError is why an optional listener did not bind, nil when it did.
-// Valid once Ready is closed.
-func (s *Server) BindError(addr string) error { return s.bindErrs[addr] }
+// BindError is why the listener at addr did not bind, nil when it did, and
+// errNotAdded when none was added there (addListenAddr). Valid once Ready is
+// closed, by when the primary has bound.
+func (s *Server) BindError(addr string) error {
+	switch {
+	case addr == s.listenAddr:
+		return nil
+	case !slices.Contains(s.additionalAddrs, addr):
+		return errNotAdded
+	}
+	return s.bindErrs[addr]
+}
 
 // listenBoth binds addr over UDP and TCP and serves both, or binds neither.
 func (s *Server) listenBoth(ctx context.Context, lc *net.ListenConfig, addr string) error {

@@ -91,9 +91,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 	// freshness to the pidfile, so publishing after its removal would make
 	// a genuine sentinel look like a previous run's leftover.
 	if err != nil && cmd.FailureFile != "" {
-		if werr := writeFailureSentinel(cmd.FailureFile, "cargowall startup failed: "+err.Error()); werr != nil {
-			cmd.Logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
-		}
+		publishStartupFailure(cmd.FailureFile, err, cmd.Logger)
 	}
 	if cmd.Pidfile != "" {
 		if rerr := os.Remove(cmd.Pidfile); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
@@ -1078,16 +1076,6 @@ func removeStaleStateFiles(cmd *StartCmd, logger *slog.Logger) {
 // is echoed verbatim into CI logs by the consumer.
 const maxSentinelReasonBytes = 4096
 
-// writeFailureSentinel publishes the failure sentinel: the writer's pid on
-// the first line (so a reader can tell THIS run's sentinel from a previous
-// run's leftover by comparing against the pidfile, which mtime alone cannot
-// do after a SIGKILL), then a bounded, control-character-stripped reason —
-// unsanitized text here reaches CI logs, where an embedded newline plus a
-// `::`-prefixed line is a workflow-command injection.
-func writeFailureSentinel(path, reason string) error {
-	return writeSentinel(path, []byte(fmt.Sprintf("pid=%d\n%s\n", os.Getpid(), sanitizeReason(reason))))
-}
-
 // sanitizeReason bounds a reason and strips control characters (including
 // newlines) so it can never start a log line at the consumer.
 func sanitizeReason(s string) string {
@@ -1301,7 +1289,7 @@ func handlePolicyFetchFailure(cmd *StartCmd, configMgr *config.Manager, auditLog
 		// run was locked down and why.
 		writeDowngradeFile(downgradeRecord(datapb.CargoWallDowngradeType_CARGO_WALL_DOWNGRADE_TYPE_LOCKDOWN, fe, reason), logger)
 		if cmd.FailureFile != "" {
-			if werr := writeFailureSentinel(cmd.FailureFile, reason); werr != nil {
+			if werr := writeFailureSentinel(cmd.FailureFile, reason, ""); werr != nil {
 				logger.Warn("Failed to write failure sentinel", "path", cmd.FailureFile, "error", werr)
 			}
 		}

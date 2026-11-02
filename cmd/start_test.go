@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1225,7 +1226,7 @@ func TestLoadCIConfig_LockdownKeepsInfraAllowsWithHostnamelessApiUrl(t *testing.
 // mtime-only anchoring could not prevent.
 func TestWriteFailureSentinel_StampsPidAndSanitizes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "failed")
-	require.NoError(t, writeFailureSentinel(path, "boom\n::error::injected"))
+	require.NoError(t, writeFailureSentinel(path, "boom\n::error::injected", ""))
 
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
@@ -1233,4 +1234,30 @@ func TestWriteFailureSentinel_StampsPidAndSanitizes(t *testing.T) {
 	assert.Equal(t, fmt.Sprintf("pid=%d", os.Getpid()), first)
 	assert.NotContains(t, rest, "\n::error::", "control characters must be stripped from the reason")
 	assert.Contains(t, rest, "::error::injected", "the text itself is kept, just never at a line start")
+}
+
+// A refused posture rides the sentinel the action already reads, on a line
+// of its own after the pid stamp, so it cannot be lost to a second write.
+// The readers' reason leaves it out.
+func TestWriteFailureSentinel_NamesRefusedPosture(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "failed")
+	refusal := &postureRefusal{
+		posture: postureContainerEgress,
+		msg:     "--container-egress=enforce requested but could not be applied: x",
+	}
+	publishStartupFailure(path, fmt.Errorf("%w", refusal), quietLogger())
+	reason := "cargowall startup failed: " + refusal.msg
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf("pid=%d\nrefused=container-egress\n%s\n", os.Getpid(), reason), string(data))
+	pid, ok := sentinelPid(data)
+	assert.True(t, ok)
+	assert.Equal(t, os.Getpid(), pid)
+	assert.Equal(t, reason, sentinelReason(data))
+
+	publishStartupFailure(path, errors.New("no eBPF"), quietLogger())
+	data, err = os.ReadFile(path)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "refused=", "any other failure names no posture")
 }

@@ -17,7 +17,9 @@
 package containers
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -25,6 +27,11 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// errTaskExiting is verifyContainerTask's error for a task that is exiting
+// on a cgroup v1 host: the kernel reports "/" in every v1 hierarchy for an
+// exiting task in place of its cgroup.
+var errTaskExiting = errors.New("task is exiting")
 
 // verifyContainerTask confirms that pid currently belongs to containerID by
 // reading /proc/<pid>/cgroup and requiring a cgroup path that names the full
@@ -43,6 +50,7 @@ func verifyContainerTask(procRoot, cgroupRoot string, pid int, containerID strin
 
 	identityConfirmed := false
 	var v2Path string
+	v1Lines, v1Root := 0, 0
 	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
 		// Format: hierarchy-ID:controller-list:cgroup-path; v2 is "0::<path>".
 		parts := strings.SplitN(line, ":", 3)
@@ -54,9 +62,17 @@ func verifyContainerTask(procRoot, cgroupRoot string, pid int, containerID strin
 		}
 		if parts[0] == "0" && parts[1] == "" {
 			v2Path = parts[2]
+		} else {
+			v1Lines++
+			if parts[2] == "/" {
+				v1Root++
+			}
 		}
 	}
 	if !identityConfirmed {
+		if v1Lines > 0 && v1Root == v1Lines && (v2Path == "" || v2Path == "/") {
+			return 0, fmt.Errorf("pid %d: %w", pid, errTaskExiting)
+		}
 		return 0, fmt.Errorf("pid %d is not in a cgroup of container %s", pid, containerID[:min(12, len(containerID))])
 	}
 	if v2Path == "" || !strings.Contains(v2Path, containerID) {
@@ -68,4 +84,12 @@ func verifyContainerTask(procRoot, cgroupRoot string, pid int, containerID strin
 		return 0, nil // cgroup vanished or unmounted at this root: degrade to IP classification
 	}
 	return st.Ino, nil
+}
+
+// taskGone reports whether verifyContainerTask failed because the task is
+// gone, rather than because it sits in another cgroup: it has no /proc entry
+// (exited, or a pid this /proc cannot see), or it is exiting. A pid in
+// another cgroup is the recycled pid the check is for, and never gone.
+func taskGone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ESRCH) || errors.Is(err, errTaskExiting)
 }

@@ -17,6 +17,7 @@
 package containers
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -131,5 +132,32 @@ func TestVerifyContainerTask(t *testing.T) {
 				assert.Zero(t, ino)
 			}
 		})
+	}
+}
+
+// A pid whose /proc entry is missing, whose task dies mid-read (ESRCH), or
+// that cgroup v1 reports as exiting is gone; one that reads but sits in
+// another cgroup, the v2 root included, is not.
+func TestTaskGone(t *testing.T) {
+	_, err := verifyContainerTask(t.TempDir(), t.TempDir(), 4242, strings.Repeat("c", 64))
+	assert.True(t, taskGone(err), "no /proc entry: %v", err)
+	assert.True(t, taskGone(fmt.Errorf("read cgroup of pid 4242: %w", unix.ESRCH)))
+
+	for _, tc := range []struct {
+		name, cgroup string
+		gone         bool
+	}{
+		{"another container's cgroup", cgroupV2Line(strings.Repeat("d", 64)), false},
+		{"v2 root cgroup", "0::/", false},
+		// cgroup v1 reports an exiting task as "/" in every v1 hierarchy.
+		{"v1, exiting", "12:cpu,cpuacct:/\n4:memory:/\n1:name=systemd:/", true},
+		{"hybrid, exiting", "12:cpu,cpuacct:/\n1:name=systemd:/\n0::/", true},
+		{"v1, another container", "12:cpu,cpuacct:/docker/" + strings.Repeat("d", 64) + "\n4:memory:/", false},
+	} {
+		procRoot := t.TempDir()
+		writeProcEntry(t, procRoot, 4242, tc.cgroup+"\n", "app")
+		_, err = verifyContainerTask(procRoot, t.TempDir(), 4242, strings.Repeat("c", 64))
+		require.Error(t, err, tc.name)
+		assert.Equal(t, tc.gone, taskGone(err), "%s: %v", tc.name, err)
 	}
 }

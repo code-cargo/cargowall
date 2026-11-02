@@ -165,11 +165,17 @@ type Tracker struct {
 
 	lastEventNano atomic.Int64
 
+	// pidsVisible is set by the first identity check that passes: it proves
+	// this /proc sees the daemon's pids, so a missing one has exited (see
+	// exitedFirst).
+	pidsVisible atomic.Bool
+
 	// Correlation counters — the 3a telemetry, logged at Close.
 	tagged           atomic.Uint64
 	execTagged       atomic.Uint64
 	reconciled       atomic.Uint64
 	identityRejected atomic.Uint64
+	exitedBeforeTag  atomic.Uint64
 	tagSkipped       atomic.Uint64
 	tcEnriched       atomic.Uint64
 	tcContainerOnly  atomic.Uint64
@@ -444,6 +450,7 @@ func (t *Tracker) logSummary() {
 		"execs_tagged", t.execTagged.Load(),
 		"reconciled", t.reconciled.Load(),
 		"identity_rejected", t.identityRejected.Load(),
+		"exited_before_tag", t.exitedBeforeTag.Load(),
 		"tag_skipped", t.tagSkipped.Load(),
 		"tag_latency_ms_p50", p50,
 		"tag_latency_ms_p95", p95,

@@ -18,7 +18,6 @@ package cmd
 
 import (
 	"log/slog"
-	"net"
 
 	"github.com/code-cargo/cargowall/pkg/dns"
 	"github.com/code-cargo/cargowall/pkg/network"
@@ -38,24 +37,20 @@ const dockerSocket = "/var/run/docker.sock"
 // for a foreign daemon both are skipped and the redirect alone catches its
 // containers' DNS.
 type dockerDNS struct {
-	bridgeIP   string // "" when there is no docker bridge: the feature is idle
-	bridgeIPv6 string // the bridge's IPv6 listener, for an IPv6 redirect; "" for none
-	restart    bool   // the daemon is ours and daemon.json was rewritten: restart applies it
-	logger     *slog.Logger
+	bridgeIP string // "" when there is no docker bridge: the feature is idle
+	restart  bool   // the daemon is ours and daemon.json was rewritten: restart applies it
+	logger   *slog.Logger
 }
 
-// startDockerDNS adds the bridge listener, and with ipv6, a redirect that
-// covers IPv6, a second one on the bridge's IPv6 address when Docker runs
-// with IPv6, for the redirect to send containers' IPv6 DNS to. daemon.json
-// keeps naming the IPv4 listener. Only for a daemon proven local, it
-// rewrites daemon.json: a foreign or unidentified one is left alone,
+// startDockerDNS adds the bridge listener and, only for a daemon proven
+// local, rewrites daemon.json: a foreign or unidentified one is left alone,
 // and the redirect covers its containers. The returned undo restores
 // daemon.json; the caller defers it. It is registered before the rewrite,
 // so a signal landing mid-write still has one: the second-signal path runs
 // it on another goroutine, and pkg/network serializes the two, so it either
 // undoes a finished rewrite or stops one from starting. Restoring a file
 // that was never written leaves it alone.
-func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, ipv6 bool, teardowns *teardownList,
+func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, teardowns *teardownList,
 	logger *slog.Logger,
 ) (*dockerDNS, func()) {
 	d := &dockerDNS{logger: logger}
@@ -68,13 +63,7 @@ func startDockerDNS(dnsServer *dns.Server, dockerd podenv.Dockerd, ipv6 bool, te
 	// Marked container-serving so queries arriving there attribute via the
 	// container-IP lookup, never the host-netns sockdiag path.
 	dnsServer.AddContainerListenAddr(bridgeIP + ":53")
-	if ipv6 {
-		if v6, err := network.GetDockerBridgeIPv6(); err == nil {
-			d.bridgeIPv6 = v6
-			dnsServer.AddContainerListenAddr(net.JoinHostPort(v6, "53"))
-		}
-	}
-	logger.Info("Docker DNS interception enabled", "docker_bridge", bridgeIP, "docker_bridge_ipv6", d.bridgeIPv6)
+	logger.Info("Docker DNS interception enabled", "docker_bridge", bridgeIP)
 
 	if dockerd.Kind != podenv.DockerdLocal {
 		logger.Info("Docker daemon not proven local; leaving its config alone, container DNS is redirected at the bridge",

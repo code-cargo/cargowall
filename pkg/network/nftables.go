@@ -167,12 +167,12 @@ func ctStateNew() []expr.Any {
 	}
 }
 
-// dnat rewrites the destination to addr:p, in the family addr is written
-// in: 4 bytes for IPv4, 16 for IPv6.
+// dnat rewrites the destination to addr:p, in addr's family: an IPv4
+// address, however it is held, is written as its 4 bytes.
 func dnat(addr net.IP, p uint16) []expr.Any {
 	family := uint32(unix.NFPROTO_IPV6)
-	if len(addr) == net.IPv4len {
-		family = unix.NFPROTO_IPV4
+	if ip4 := addr.To4(); ip4 != nil {
+		family, addr = unix.NFPROTO_IPV4, ip4
 	}
 	return []expr.Any{
 		&expr.Immediate{Register: 1, Data: addr},

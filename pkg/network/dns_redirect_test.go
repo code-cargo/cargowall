@@ -201,7 +201,7 @@ func TestRedirectChains_Order(t *testing.T) {
 	}
 	target := func(rule []expr.Any) net.IP { return net.IP(rule[len(rule)-3].(*expr.Immediate).Data) }
 
-	chains := redirectChains(false, nil, nil)
+	chains := redirectChains(false, nil)
 	if len(chains) != 2 || chains[0].name != "output" || chains[1].name != "input" {
 		t.Fatalf("without a bridge want output and input chains, got %+v", chains)
 	}
@@ -220,7 +220,7 @@ func TestRedirectChains_Order(t *testing.T) {
 		}
 	}
 
-	chains = redirectChains(true, nil, nil)
+	chains = redirectChains(true, nil)
 	if returns, dnats, _, order := kinds(chains[0].rules); returns != 2 || dnats != 8 || order != "RRNNNNNNNN" {
 		t.Errorf("IPv6 output rules = %q, want the 2 mark returns ahead of 8 DNATs", order)
 	}
@@ -229,43 +229,37 @@ func TestRedirectChains_Order(t *testing.T) {
 			t.Errorf("an IPv6 output DNAT does not send to the proxy at ::1: %+v", rule[len(rule)-3])
 		}
 	}
-	if len(redirectChains(true, nil, nil)[1].rules) != 2 {
+	if len(chains[1].rules) != 2 {
 		t.Error("the input guard reads no address, so its 2 rules guard IPv6 as they are")
 	}
 
 	bridge := net.IPv4(172, 17, 0, 1).To4()
-	bridge6 := net.ParseIP("fd00:17::1")
-	chains = redirectChains(false, bridge, bridge6)
+	chains = redirectChains(false, bridge)
 	if len(chains) != 3 || chains[2].name != "prerouting" || chains[2].priority != -101 {
 		t.Fatalf("with a bridge want a prerouting chain at -101 third, got %+v", chains)
 	}
-	if _, dnats, _, _ := kinds(chains[2].rules); dnats != 4 {
-		t.Errorf("prerouting has %d DNATs, want 4 (docker0 and br-*, UDP and TCP): no IPv6 without ipv6", dnats)
+	if _, dnats, drops, _ := kinds(chains[2].rules); dnats != 4 || drops != 0 {
+		t.Errorf("prerouting has %d DNATs and %d drops, want 4 DNATs (docker0 and br-*, UDP and TCP)", dnats, drops)
 	}
 	for _, rule := range chains[2].rules {
 		if !target(rule).Equal(bridge) {
 			t.Errorf("a prerouting DNAT does not send to the bridge listener: %+v", rule[len(rule)-3])
 		}
 	}
-	chains = redirectChains(true, bridge, bridge6)
-	if _, dnats, _, _ := kinds(chains[2].rules); dnats != 8 {
-		t.Errorf("IPv6 prerouting has %d DNATs, want 8", dnats)
-	}
-	for _, rule := range chains[2].rules[4:] {
-		if !target(rule).Equal(bridge6) {
-			t.Errorf("an IPv6 prerouting DNAT does not send to the bridge's IPv6 listener: %+v", rule[len(rule)-3])
-		}
-	}
-	if chains = redirectChains(true, nil, bridge6); len(chains) != 3 || len(chains[2].rules) != 4 {
-		t.Errorf("an IPv6 bridge listener alone still gets its prerouting rules, got %+v", chains)
+	chains = redirectChains(true, bridge)
+	if _, _, _, order := kinds(chains[2].rules); order != "NNNNDDDD" {
+		t.Errorf("IPv6 prerouting rules = %q, want the 4 IPv4 DNATs, then 4 IPv6 drops", order)
 	}
 }
 
-// Every rule that reads an address or rewrites to one first matches the
-// packet's family: in an inet table, an IPv4 offset read on an IPv6 packet
-// compares bytes of its source address instead.
+// With ipv6 the table is inet, and every rule that reads an address,
+// rewrites to one, or acts on one family alone first matches the packet's
+// family: there an IPv4 offset read on an IPv6 packet compares bytes of its
+// source address instead. An ip table's packets are all IPv4, and its rules
+// carry no such match.
 func TestRedirectChains_FamilyGated(t *testing.T) {
-	for _, c := range redirectChains(true, net.IPv4(172, 17, 0, 1).To4(), net.ParseIP("fd00:17::1")) {
+	bridge := net.IPv4(172, 17, 0, 1).To4()
+	for _, c := range redirectChains(true, bridge) {
 		for i, rule := range c.rules {
 			var want byte
 			for _, e := range rule {
@@ -281,6 +275,9 @@ func TestRedirectChains_FamilyGated(t *testing.T) {
 					want = byte(e.Family)
 				}
 			}
+			if v, ok := rule[len(rule)-1].(*expr.Verdict); ok && v.Kind == expr.VerdictDrop && c.name == "prerouting" {
+				want = unix.NFPROTO_IPV6 // the bridge drops are IPv6's alone
+			}
 			if want == 0 {
 				continue
 			}
@@ -289,6 +286,37 @@ func TestRedirectChains_FamilyGated(t *testing.T) {
 			if !ok || !ok2 || meta.Key != expr.MetaKeyNFPROTO || len(cmp.Data) != 1 || cmp.Data[0] != want {
 				t.Errorf("%s rule %d is not gated on family %d first: %+v", c.name, i, want, rule[:2])
 			}
+		}
+	}
+	for _, c := range redirectChains(false, bridge) {
+		for i, rule := range c.rules {
+			for _, e := range rule {
+				if m, ok := e.(*expr.Meta); ok && m.Key == expr.MetaKeyNFPROTO {
+					t.Errorf("ip table %s rule %d matches nfproto, which is always IPv4 there", c.name, i)
+				}
+			}
+		}
+	}
+}
+
+// dnat writes an IPv4 address in its 4 bytes and family whatever form it is
+// held in: net.ParseIP returns 16.
+func TestDNAT_FamilyFromAddress(t *testing.T) {
+	for _, c := range []struct {
+		addr   net.IP
+		family uint32
+		len    int
+	}{
+		{net.ParseIP("172.17.0.1"), unix.NFPROTO_IPV4, net.IPv4len},
+		{net.IPv4(127, 0, 0, 1).To4(), unix.NFPROTO_IPV4, net.IPv4len},
+		{net.IPv6loopback, unix.NFPROTO_IPV6, net.IPv6len},
+	} {
+		exprs := dnat(c.addr, 53)
+		if got := exprs[0].(*expr.Immediate).Data; len(got) != c.len {
+			t.Errorf("dnat(%s) writes %d address bytes, want %d", c.addr, len(got), c.len)
+		}
+		if got := exprs[2].(*expr.NAT).Family; got != c.family {
+			t.Errorf("dnat(%s) family %d, want %d", c.addr, got, c.family)
 		}
 	}
 }

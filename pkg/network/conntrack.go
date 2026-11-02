@@ -90,11 +90,6 @@ func ctMsgType(subtype uint16) netlink.HeaderType {
 	return netlink.HeaderType(uint16(unix.NFNL_SUBSYS_CTNETLINK)<<8 | subtype)
 }
 
-// ctFamilies are the conntrack tables the flush covers: the redirect
-// covers IPv6 too where loopback has it, and an IPv6 dump on a host without
-// IPv6 flows is merely empty.
-var ctFamilies = []uint8{unix.AF_INET, unix.AF_INET6}
-
 // nfgenmsg returns the nfgenmsg header for a conntrack request on family's
 // table.
 func nfgenmsg(family uint8) []byte {
@@ -249,8 +244,8 @@ func dialCt() (*netlink.Conn, error) {
 	return conn, nil
 }
 
-// dumpTuples dumps family's conntrack table over conn, keeping the tuples
-// keep() accepts (nil keeps all). Best-effort by design: ctnetlink dumps
+// dumpTuples dumps family's conntrack table over conn, AF_UNSPEC for both
+// families' entries, keeping the tuples keep() accepts (nil keeps all). Best-effort by design: ctnetlink dumps
 // carry no consistency signal (the conntrack dump path never stamps
 // NLM_F_DUMP_INTR), so an entry that moves during the walk can be missed —
 // the flush makes no completeness claim. Unparseable entries are skipped,
@@ -307,23 +302,22 @@ func deleteTuple(conn *netlink.Conn, t ctTuple) (bool, error) {
 }
 
 // flushAttempt is one complete dial→dump→delete pass over the dport-53
-// entries. Re-running it is convergent: a re-dump no longer contains what a
-// prior pass already deleted. A delete-phase error returns partial progress
-// as "flushed N of M" so the eventual error names how far the flush got.
-func flushAttempt(logger *slog.Logger) error {
+// entries, IPv6 ones too with ipv6. Re-running it is convergent: a re-dump
+// no longer contains what a prior pass already deleted. A delete-phase
+// error returns partial progress as "flushed N of M" so the eventual error
+// names how far the flush got.
+func flushAttempt(logger *slog.Logger, ipv6 bool) error {
 	conn, err := dialCt()
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	var tuples []ctTuple
-	for _, family := range ctFamilies {
-		dns, err := dumpTuples(conn, family, ctTuple.isDNS)
-		if err != nil {
-			return err
-		}
-		tuples = append(tuples, dns...)
+	tuples, err := dumpTuples(conn, unix.AF_UNSPEC, func(t ctTuple) bool {
+		return t.isDNS() && (ipv6 || t.src.Is4())
+	})
+	if err != nil {
+		return err
 	}
 
 	// Fresh deadline for the deletes: a slow dump would otherwise leave
@@ -363,8 +357,9 @@ func flushAttempt(logger *slog.Logger) error {
 	return nil
 }
 
-// FlushDNSConntrack deletes every conntrack entry, IPv4 and IPv6, whose
-// original-direction destination port is 53 (TCP or UDP). nat is evaluated only on a
+// FlushDNSConntrack deletes every conntrack entry whose original-direction
+// destination port is 53 (TCP or UDP): IPv4 ones, and IPv6 ones with ipv6,
+// when the redirect covers IPv6 too. One it does not cover keeps its flows. nat is evaluated only on a
 // flow's first packet and the verdict replayed from its conntrack entry, so
 // DNS flow state predating the redirect bypasses the proxy — and state
 // surviving teardown keeps DNAT'ing to the dead proxy — until deleted.
@@ -372,10 +367,10 @@ func flushAttempt(logger *slog.Logger) error {
 // best-effort: the redirect stands regardless, and a returned error
 // names how far the flush got. Mechanics, collateral analysis, and
 // measurements: design.md.
-func FlushDNSConntrack(logger *slog.Logger) error {
+func FlushDNSConntrack(logger *slog.Logger, ipv6 bool) error {
 	var lastErr error
 	for range ctFlushAttempts {
-		err := flushAttempt(logger)
+		err := flushAttempt(logger, ipv6)
 		if err == nil {
 			return nil
 		}

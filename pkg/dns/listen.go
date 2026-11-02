@@ -16,7 +16,10 @@
 
 package dns
 
-import "net"
+import (
+	"net"
+	"slices"
+)
 
 // Listeners the DNS redirect sends queries to, and the networks a listener
 // binds.
@@ -26,6 +29,9 @@ import "net"
 // primary address, it must bind or Start fails: DNS redirected to a port
 // cargowall does not hold goes to whatever does.
 func (s *Server) AddRedirectListenAddr(addr string) {
+	if slices.Contains(s.requiredAddrs, addr) {
+		return // bound once: a second listener on it could only fail
+	}
 	s.AddListenAddr(addr)
 	s.requiredAddrs = append(s.requiredAddrs, addr)
 }

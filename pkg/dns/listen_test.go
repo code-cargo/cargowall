@@ -83,6 +83,16 @@ func newListenTestServer() *Server {
 		slog.New(slog.DiscardHandler))
 }
 
+// A redirect listener added twice is bound once: a second bind of the same
+// address could only fail, and would fail Start.
+func TestAddRedirectListenAddr_Once(t *testing.T) {
+	s := newListenTestServer()
+	s.AddRedirectListenAddr("[::1]:53")
+	s.AddRedirectListenAddr("[::1]:53")
+	assert.Equal(t, []string{"[::1]:53"}, s.additionalAddrs)
+	assert.Equal(t, []string{"[::1]:53"}, s.requiredAddrs)
+}
+
 // The redirect's IPv6 listener binds over IPv6 and answers there.
 func TestStart_RedirectListenerServesIPv6(t *testing.T) {
 	addr := net.JoinHostPort("::1", strconv.Itoa(freeLoopback6Port(t)))

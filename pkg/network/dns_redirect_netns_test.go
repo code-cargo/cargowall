@@ -400,12 +400,14 @@ func TestDNSRedirect_InputGuard(t *testing.T) {
 
 // TestDNSRedirect_Bridge: DNS a container sends through docker0 or a br-*
 // bridge reaches the proxy's listener on the bridge IP with its source kept,
-// and DNS arriving on any other interface does not. With IPv6 covered and a
-// bridge IPv6 listener, IPv6 container DNS does the same.
+// and DNS arriving on any other interface does not. With IPv6 covered, IPv6
+// DNS arriving on a bridge is dropped, wherever it was sent: there is no
+// IPv6 listener for it. Here it is sent to a resolver on the host itself,
+// which an IPv4-only redirect lets it reach.
 func TestDNSRedirect_Bridge(t *testing.T) {
 	enterNetns(t)
-	bridgeIP, bridgeIPv6 := net.IPv4(10, 54, 0, 1), net.ParseIP("fd54::1")
-	resolver, resolver6 := net.IPv4(8, 8, 8, 8), net.ParseIP("2001:4860:4860::8888")
+	bridgeIP := net.IPv4(10, 54, 0, 1)
+	resolver := net.IPv4(8, 8, 8, 8)
 	docker0 := addTun(t, "docker0", bridgeIP)
 	user := addTun(t, "br-test", net.IPv4(10, 55, 0, 1))
 	other := addTun(t, "cw0", net.IPv4(10, 56, 0, 1))
@@ -413,11 +415,11 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 		addAddr6(t, name, net.ParseIP(addr))
 	}
 	l := listenUDP(t, "10.54.0.1:53")
-	l6 := listenUDP(t, "[fd54::1]:53")
+	hostResolver6 := listenUDP(t, "[fd56::1]:53")
 
 	for _, ipv6 := range []bool{false, true} {
 		r := NewDNSRedirect(discardLogger())
-		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6, BridgeIP: bridgeIP.String(), BridgeIPv6: bridgeIPv6.String()}))
+		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6, BridgeIP: bridgeIP.String()}))
 
 		for _, c := range []struct {
 			wire      *os.File
@@ -432,26 +434,26 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 			require.Equal(t, c.wire.Name(), got, "ipv6 %v: DNS on %s must reach the bridge listener", ipv6, c.wire.Name())
 			require.True(t, from.IP.Equal(c.src), "DNAT must keep the container's source, got %s", from)
 
-			_, err = c.wire.Write(udp6(c.src6, resolver6, 5000, 53, c.wire.Name()+"6"))
+			_, err = c.wire.Write(udp6(c.src6, net.ParseIP("fd56::1"), 5000, 53, c.wire.Name()+"6"))
 			require.NoError(t, err)
-			if !ipv6 {
-				got, _ = received(t, l6, absent)
-				require.Empty(t, got, "an IPv4-only redirect leaves IPv6 container DNS on %s alone", c.wire.Name())
-				continue
+			if ipv6 {
+				got, _ = received(t, hostResolver6, absent)
+				require.Empty(t, got, "IPv6 DNS on %s must be dropped", c.wire.Name())
+			} else {
+				got, _ = received(t, hostResolver6, arrives)
+				require.Equal(t, c.wire.Name()+"6", got, "an IPv4-only redirect leaves IPv6 container DNS on %s alone",
+					c.wire.Name())
 			}
-			got, from = received(t, l6, arrives)
-			require.Equal(t, c.wire.Name()+"6", got, "IPv6 DNS on %s must reach the bridge's IPv6 listener", c.wire.Name())
-			require.True(t, from.IP.Equal(c.src6), "DNAT must keep the container's IPv6 source, got %s", from)
 		}
 
 		_, err := other.Write(udp4(net.IPv4(10, 56, 0, 2), resolver, 5000, 53, "other"))
 		require.NoError(t, err)
 		got, _ := received(t, l, absent)
 		require.Empty(t, got, "DNS arriving off a docker bridge must not be redirected")
-		_, err = other.Write(udp6(net.ParseIP("fd56::2"), resolver6, 5000, 53, "other6"))
+		_, err = other.Write(udp6(net.ParseIP("fd56::2"), net.ParseIP("fd56::1"), 5000, 53, "other6"))
 		require.NoError(t, err)
-		got, _ = received(t, l6, absent)
-		require.Empty(t, got, "IPv6 DNS arriving off a docker bridge must not be redirected")
+		got, _ = received(t, hostResolver6, arrives)
+		require.Equal(t, "other6", got, "ipv6 %v: IPv6 DNS arriving off a docker bridge is no bridge's to drop", ipv6)
 
 		require.NoError(t, r.Teardown())
 	}
@@ -535,8 +537,30 @@ func TestDNSRedirect_FlushesIPv6Flows(t *testing.T) {
 	}
 	query(t, "[fd53::2]:53", "flow6", true)
 	require.Equal(t, 1, dns6(), "the marked IPv6 query must leave a flow to flush")
-	require.NoError(t, FlushDNSConntrack(discardLogger()))
+	require.NoError(t, FlushDNSConntrack(discardLogger(), false))
+	require.Equal(t, 1, dns6(), "a flush for an IPv4-only redirect must leave IPv6 flows alone")
+	require.NoError(t, FlushDNSConntrack(discardLogger(), true))
 	require.Zero(t, dns6(), "the flush must delete IPv6 DNS flows")
+}
+
+// TestDNSRedirect_InetRefused: a kernel that refuses an inet table, which
+// bit 7 of the family byte stands in for, gets the IPv4-only redirect, and
+// IPv6Refused says why. A leftover of the other family is still removed.
+func TestDNSRedirect_InetRefused(t *testing.T) {
+	enterNetns(t)
+	addTun(t, "cw0", net.IPv4(10, 53, 0, 1))
+	proxy := listenUDP(t, "127.0.0.1:53")
+	r := NewDNSRedirect(discardLogger())
+	r.inet = 0x80
+	require.NoError(t, r.Install(RedirectSpec{IPv6: true}))
+	t.Cleanup(func() { _ = r.Teardown() })
+	require.Error(t, r.IPv6Refused(), "the refusal must be kept for the caller to report")
+	require.Equal(t, map[string]int{"ip output": 8, "ip input": 2}, redirectRules(t))
+	query(t, "10.53.0.2:53", "v4", false)
+	got, _ := received(t, proxy, arrives)
+	require.Equal(t, "v4", got, "the IPv4-only redirect must still redirect")
+	require.NoError(t, NewDNSRedirect(discardLogger()).IPv6Refused(), "nothing refused before an install")
+	require.NoError(t, removeLeftover(0x80), "a family the kernel lacks has no leftover, and must not fail the install")
 }
 
 // TestDNSRedirect_Ownership: the table belongs to the socket that made it.
@@ -572,8 +596,6 @@ func TestDNSRedirect_Ownership(t *testing.T) {
 	require.Equal(t, want, redirectRules(t), "nothing another socket did may touch the table")
 
 	require.Error(t, NewDNSRedirect(logger).Install(RedirectSpec{BridgeIP: "fd00::1"}), "an IPv6 bridge IP is refused")
-	require.Error(t, NewDNSRedirect(logger).Install(RedirectSpec{BridgeIPv6: "10.0.0.1"}),
-		"an IPv4 bridge IPv6 is refused")
 	require.Error(t, r.Install(RedirectSpec{}), "an installed redirect is not installed twice")
 
 	require.NoError(t, r.Teardown())

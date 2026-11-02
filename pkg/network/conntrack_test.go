@@ -218,13 +218,9 @@ func dumpAll(t *testing.T) []ctTuple {
 		t.Fatalf("dial conntrack: %v", err)
 	}
 	defer conn.Close()
-	var tuples []ctTuple
-	for _, family := range ctFamilies {
-		got, err := dumpTuples(conn, family, nil)
-		if err != nil {
-			t.Fatalf("dump conntrack: %v", err)
-		}
-		tuples = append(tuples, got...)
+	tuples, err := dumpTuples(conn, unix.AF_UNSPEC, nil)
+	if err != nil {
+		t.Fatalf("dump conntrack: %v", err)
 	}
 	return tuples
 }
@@ -288,7 +284,7 @@ func TestFlushDNSConntrack_Live(t *testing.T) {
 		}
 	}
 
-	if err := FlushDNSConntrack(discardLogger()); err != nil {
+	if err := FlushDNSConntrack(discardLogger(), true); err != nil {
 		t.Fatalf("FlushDNSConntrack: %v", err)
 	}
 

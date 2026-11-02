@@ -256,7 +256,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 	var dnsServer *dns.Server
 	var containerDNS *dockerDNS
-	var dockerBridgeIP, dockerBridgeIPv6 string
+	var dockerBridgeIP string
 	var redirect *dnsRedirect
 	if !cmd.DisableDNSTracking {
 		// Infrastructure auto-allows must be installed before the proxy below
@@ -281,12 +281,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			logger.Info("DNS query filtering enabled (blocks DNS tunneling)")
 		}
 
-		ipv6 := redirectIPv6(cmd, dnsServer)
+		ipv6, ipv6Gap := ipv6Coverage(cmd, dnsServer)
 		if cmd.DockerDNSInterception {
 			var restore func()
-			containerDNS, restore = startDockerDNS(dnsServer, shape.Dockerd, ipv6, teardowns, logger)
+			containerDNS, restore = startDockerDNS(dnsServer, shape.Dockerd, teardowns, logger)
 			defer restore()
-			dockerBridgeIP, dockerBridgeIPv6 = containerDNS.bridgeIP, containerDNS.bridgeIPv6
+			dockerBridgeIP = containerDNS.bridgeIP
 		}
 
 		dnsErrCh := make(chan error, 1)
@@ -315,9 +315,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		// including across error-return paths below.
 		if cmd.DNSRedirect {
 			var teardownRedirect func()
-			redirect, teardownRedirect = startDNSRedirect(network.RedirectSpec{
-				IPv6: ipv6, BridgeIP: dockerBridgeIP, BridgeIPv6: dockerBridgeIPv6,
-			}, teardowns, logger)
+			redirect, teardownRedirect = startDNSRedirect(network.RedirectSpec{IPv6: ipv6, BridgeIP: dockerBridgeIP},
+				ipv6Gap, teardowns, logger)
 			defer teardownRedirect()
 		}
 	}

@@ -17,7 +17,9 @@
 package cmd
 
 import (
+	"fmt"
 	"log/slog"
+	"net"
 
 	"github.com/code-cargo/cargowall/pkg/dns"
 	"github.com/code-cargo/cargowall/pkg/network"
@@ -33,31 +35,78 @@ import (
 // not come up is a lost posture, and what that costs depends on the
 // policy's mode, which is known only after the policy loads: by then the
 // redirect must already be up, so setup records the failure and settle
-// reports it.
+// reports it. A redirect that covers IPv4 but not the IPv6 the host has is
+// a loss too: IPv6 DNS then goes around the proxy the same way.
 type dnsRedirect struct {
-	err error // why setup failed; nil when the redirect is in place
+	active bool  // the redirect is in place, for IPv4 at least
+	err    error // why it is not, or not for IPv6; nil when it is whole
 }
 
-// redirectIPv6 reports whether the redirect will cover IPv6, and if so adds
-// the proxy's [::1]:53 listener it sends IPv6 DNS to. Called before the
-// proxy starts, so a listener that cannot bind fails startup with it. A
-// namespace whose loopback has no IPv6 gets the IPv4-only redirect.
-func redirectIPv6(cmd *StartCmd, dnsServer *dns.Server) bool {
-	if !cmd.DNSRedirect || !network.LoopbackIPv6() {
-		return false
+// ipv6Coverage decides whether the redirect covers IPv6 and, when it does,
+// adds the proxy's listener at network.ProxyAddrIPv6 that IPv6 DNS is sent
+// to. Called before the proxy starts, so that listener failing to bind
+// fails startup with it. gap is why the host's IPv6 DNS will go around the
+// proxy instead, "" when it will not.
+func ipv6Coverage(cmd *StartCmd, dnsServer *dns.Server) (ipv6 bool, gap string) {
+	if !cmd.DNSRedirect {
+		return false, ""
 	}
-	dnsServer.AddRedirectListenAddr("[::1]:53")
-	return true
+	ipv6, gap = decideIPv6(network.LoopbackIPv6(), network.HostIPv6, probeListen)
+	if ipv6 {
+		dnsServer.AddRedirectListenAddr(network.ProxyAddrIPv6)
+	}
+	return ipv6, gap
+}
+
+// decideIPv6 is ipv6Coverage's rule. IPv6 is covered when loopback has ::1
+// for the proxy and nothing else holds the port. When it cannot be, that is
+// a gap only on a host with IPv6 for DNS to leave by; one without has
+// nothing to cover. The port is probed rather than left to the proxy's
+// bind, whose failure would end startup in every mode, where an uncovered
+// IPv6 is a posture an auditing policy only records.
+func decideIPv6(loopback bool, hostIPv6 func() bool, probe func(addr string) error) (bool, string) {
+	if !loopback {
+		if hostIPv6() {
+			return false, "loopback has no IPv6 address for the proxy to listen on"
+		}
+		return false, ""
+	}
+	if err := probe(network.ProxyAddrIPv6); err != nil {
+		if hostIPv6() {
+			return false, fmt.Sprintf("the proxy cannot listen on %s: %v", network.ProxyAddrIPv6, err)
+		}
+		return false, ""
+	}
+	return true, ""
+}
+
+// probeListen binds addr over UDP and TCP and lets go, to learn whether the
+// proxy can hold it.
+func probeListen(addr string) error {
+	pc, err := net.ListenPacket("udp6", addr)
+	if err != nil {
+		return err
+	}
+	_ = pc.Close()
+	l, err := net.Listen("tcp6", addr)
+	if err != nil {
+		return err
+	}
+	return l.Close()
 }
 
 // startDNSRedirect installs the redirect for the proxy, and for its
-// container listener on the docker bridge when there is one. The returned undo
+// container listener on the docker bridge when there is one. gap is why
+// IPv6 is not covered (see ipv6Coverage), which the kernel refusing an inet
+// table can also be. The returned undo
 // removes it; the caller defers it. It is registered before the install,
 // like every host mutation's: a forced shutdown landing mid-install waits
 // for it, then removes the table, which an unowned one needs, and flushes
 // the flows DNAT'd to the proxy meanwhile, which even an owned one dying
 // with the process does not do.
-func startDNSRedirect(spec network.RedirectSpec, teardowns *teardownList, logger *slog.Logger) (*dnsRedirect, func()) {
+func startDNSRedirect(spec network.RedirectSpec, gap string, teardowns *teardownList,
+	logger *slog.Logger,
+) (*dnsRedirect, func()) {
 	redirect := network.NewDNSRedirect(logger)
 	undo := teardowns.add(func() {
 		// An Error, not a Warn: what it can leave behind is the host's DNS
@@ -69,7 +118,15 @@ func startDNSRedirect(spec network.RedirectSpec, teardowns *teardownList, logger
 	if err := redirect.Install(spec); err != nil {
 		return notInstalled(err, logger), undo
 	}
-	return &dnsRedirect{}, undo
+	if why := redirect.IPv6Refused(); why != nil && network.HostIPv6() {
+		gap = "the kernel took no inet table: " + why.Error()
+	}
+	if gap != "" {
+		err := fmt.Errorf("IPv6 DNS is not redirected: %s", gap)
+		logger.Info("DNS redirect covers IPv4 only; the policy's mode decides what that costs once it loads", "error", err)
+		return &dnsRedirect{active: true, err: err}, undo
+	}
+	return &dnsRedirect{active: true}, undo
 }
 
 // notInstalled records a redirect that did not come up, and says so in the
@@ -81,9 +138,9 @@ func notInstalled(err error, logger *slog.Logger) *dnsRedirect {
 	return &dnsRedirect{err: err}
 }
 
-// isActive reports whether the redirect is in place. Nil-safe: nil is the
-// redirect not requested.
-func (r *dnsRedirect) isActive() bool { return r != nil && r.err == nil }
+// isActive reports whether the redirect is in place, for IPv4 at least.
+// Nil-safe: nil is the redirect not requested.
+func (r *dnsRedirect) isActive() bool { return r != nil && r.active }
 
 // settle hands a failed setup to the ledger, which owns the log line and
 // decides whether startup fails. Nil-safe.

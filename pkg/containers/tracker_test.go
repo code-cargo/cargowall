@@ -53,23 +53,74 @@ type tagCall struct {
 
 // fakeTagger records TagContainerProcess calls and serves a settable
 // OrdinalAt result; both are called from the tracker's stream goroutine.
+// Every call is recorded. A pid in gone is one the task walk no longer
+// lists, and tags nothing; one in failOnce fails its next call with that
+// error; one in held already holds that ordinal, which adoption keeps.
 type fakeTagger struct {
-	mu      sync.Mutex
-	calls   []tagCall
-	ordinal uint32
+	mu       sync.Mutex
+	calls    []tagCall
+	ordinal  uint32
+	gone     map[int]bool
+	failOnce map[int]error
+	held     map[int]uint32
 }
 
-func (f *fakeTagger) TagContainerProcess(pid int, ordinal uint32) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, tagCall{pid: pid, ordinal: ordinal})
+func (f *fakeTagger) TagContainerProcess(pid int, ordinal uint32) (uint32, error) {
+	return f.tag(pid, ordinal, false)
 }
 
 // AdoptContainerProcess records like TagContainerProcess — the fake asserts
 // which pid/ordinal was written, not the map-update flag semantics (those
-// live in pkg/steps).
-func (f *fakeTagger) AdoptContainerProcess(pid int, ordinal uint32) {
-	f.TagContainerProcess(pid, ordinal)
+// live in pkg/steps) beyond adoption keeping a held tag.
+func (f *fakeTagger) AdoptContainerProcess(pid int, ordinal uint32) (uint32, error) {
+	return f.tag(pid, ordinal, true)
+}
+
+func (f *fakeTagger) tag(pid int, ordinal uint32, adopt bool) (uint32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, tagCall{pid: pid, ordinal: ordinal})
+	if err := f.failOnce[pid]; err != nil {
+		delete(f.failOnce, pid)
+		return 0, err
+	}
+	switch {
+	case f.gone[pid]:
+		return 0, nil
+	case adopt && f.held[pid] != 0:
+		return f.held[pid], nil
+	}
+	return ordinal, nil
+}
+
+// setGone makes pid one the task walk no longer lists.
+func (f *fakeTagger) setGone(pid int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.gone == nil {
+		f.gone = make(map[int]bool)
+	}
+	f.gone[pid] = true
+}
+
+// failNext makes pid's next tagging call fail with err.
+func (f *fakeTagger) failNext(pid int, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failOnce == nil {
+		f.failOnce = make(map[int]error)
+	}
+	f.failOnce[pid] = err
+}
+
+// setHeld makes pid's leader already hold ordinal.
+func (f *fakeTagger) setHeld(pid int, ordinal uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.held == nil {
+		f.held = make(map[int]uint32)
+	}
+	f.held[pid] = ordinal
 }
 
 func (f *fakeTagger) OrdinalAt(time.Time) uint32 {

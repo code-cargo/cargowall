@@ -21,11 +21,12 @@ type StepBpfStepState struct {
 }
 
 type StepBpfTaskIterRec struct {
-	_      structs.HostLayout
-	Tid    uint32
-	Tgid   uint32
-	Ppid   uint32
-	NsTgid uint32
+	_       structs.HostLayout
+	Tid     uint32
+	Tgid    uint32
+	Ppid    uint32
+	NsTgid  uint32
+	Exiting uint32
 }
 
 // Names of all BPF objects in the ELF.

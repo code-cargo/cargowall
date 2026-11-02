@@ -17,6 +17,9 @@
 package containers
 
 import (
+	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"testing"
@@ -24,6 +27,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/code-cargo/cargowall/pkg/events"
 )
 
 // waitLog waits for a line in the tracker's log. Handlers count before they
@@ -356,4 +361,168 @@ func TestExecCheckProvesPidsVisible(t *testing.T) {
 
 	f.waitLog(t, "Exec exited before it could be tagged")
 	assert.NotContains(t, f.logs.String(), "Exec identity check failed")
+}
+
+// A container that passes its identity check but is gone from the task walk
+// by the time the step maps are written was not tagged. It counts as having
+// exited before tagging, and its marker reports ordinal 0, never the step
+// it would have had.
+func TestStartGoneBeforeTagReportsNoTag(t *testing.T) {
+	f := newFixture(t)
+	id := strings.Repeat("a", 64)
+	f.addContainer(t, id, 4242, "172.17.0.40", false)
+	f.tagger.setGone(4242)
+	f.tagger.setOrdinal(7)
+	f.start(t)
+	f.daemon.push(startEvent(id, time.Now().UnixNano()))
+
+	ev := f.waitAttribution(t, "start", id)
+	assert.Zero(t, ev.StepOrdinal)
+	assert.Zero(t, f.tracker.tagged.Load())
+	assert.EqualValues(t, 1, f.tracker.exitedBeforeTag.Load())
+	assert.NotContains(t, f.logs.String(), "level=WARN")
+}
+
+// Adoption that tags nothing leaves nothing for the replayed start to
+// upgrade.
+func TestReconcileGoneBeforeTagIsNotUpgraded(t *testing.T) {
+	f := newFixture(t)
+	id := strings.Repeat("b", 64)
+	f.addContainer(t, id, 5151, "172.17.0.41", false)
+	f.daemon.setList(containerSummary{ID: id})
+	f.tagger.setGone(5151)
+	f.tagger.setOrdinal(7)
+	f.start(t)
+
+	ev := f.waitAttribution(t, "reconcile", id)
+	assert.Zero(t, ev.StepOrdinal)
+	assert.Zero(t, f.tracker.reconciled.Load())
+	assert.EqualValues(t, 1, f.tracker.exitedBeforeTag.Load())
+
+	// Replay the start, then a marker container to order the assertions.
+	f.daemon.push(startEvent(id, time.Now().UnixNano()))
+	markerID := strings.Repeat("c", 64)
+	f.addContainer(t, markerID, 5656, "172.17.0.42", false)
+	f.daemon.push(startEvent(markerID, time.Now().UnixNano()))
+	f.waitAttribution(t, "start", markerID)
+	assert.NotContains(t, f.logs.String(), "upgraded")
+	assert.EqualValues(t, 1, f.tracker.exitedBeforeTag.Load())
+}
+
+// An upgrade whose task is gone tags nothing and says so, while the
+// container's address still takes the real start's step.
+func TestUpgradeReconciledStartGoneBeforeTag(t *testing.T) {
+	tagger := &fakeTagger{}
+	tagger.setOrdinal(6)
+	tagger.setGone(4242)
+	tr := &Tracker{
+		tagger:     tagger,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		containers: map[string]*containerInfo{},
+	}
+	info := &containerInfo{
+		id: strings.Repeat("a", 64), initPID: 4242,
+		birthOrdinal: events.StepOrdinalPreDaemon, effectiveOrdinal: events.StepOrdinalPreDaemon, preDaemon: true,
+	}
+	tr.containers[info.id] = info
+
+	tr.upgradeReconciledStart(info, info.id, time.Now().UnixNano())
+
+	assert.Zero(t, tr.tagged.Load())
+	assert.EqualValues(t, 1, tr.exitedBeforeTag.Load())
+	assert.Equal(t, uint32(6), info.effectiveOrdinal)
+}
+
+// An exec whose task is gone by the time it would be tagged is not
+// attributed, and the container's address keeps its own step.
+func TestExecGoneBeforeTagReportsNoTag(t *testing.T) {
+	f := newFixture(t)
+	id := strings.Repeat("d", 64)
+	f.addContainer(t, id, 4242, "172.17.0.43", false)
+	f.tagger.setOrdinal(7)
+	f.start(t)
+	f.daemon.push(startEvent(id, time.Now().UnixNano()))
+	f.waitAttribution(t, "start", id)
+
+	execID := strings.Repeat("e", 64)
+	writeProcEntry(t, f.procRoot, 4747, cgroupV2Line(id)+"\n", "sh")
+	f.daemon.setExec(execID, execInspect{ID: execID, Running: true, Pid: 4747, ContainerID: id})
+	f.tagger.setGone(4747)
+	f.tagger.setOrdinal(9)
+	f.daemon.push(execStartEvent(id, execID, time.Now().UnixNano()))
+
+	f.waitLog(t, "Exec exited before it could be tagged")
+	assert.Zero(t, f.tracker.execTagged.Load())
+	assert.EqualValues(t, 1, f.tracker.exitedBeforeTag.Load())
+	assert.NotContains(t, f.logs.String(), "Container exec attributed")
+	ord, _, ok := f.tracker.LookupClient(&net.UDPAddr{IP: net.ParseIP("172.17.0.43"), Port: 1})
+	require.True(t, ok)
+	assert.Equal(t, uint32(7), ord)
+}
+
+// A failed task walk during adoption says nothing of the container: it is
+// counted as an untagged task, with a warning, and the container stays
+// armed for its replayed start to tag.
+func TestReconcileTagFailureKeepsUpgradeArmed(t *testing.T) {
+	f := newFixture(t)
+	id := strings.Repeat("1", 64)
+	f.addContainer(t, id, 5252, "172.17.0.44", false)
+	f.daemon.setList(containerSummary{ID: id})
+	f.tagger.failNext(5252, errors.New("iterator closed"))
+	f.tagger.setOrdinal(7)
+	f.start(t)
+
+	ev := f.waitAttribution(t, "reconcile", id)
+	assert.Zero(t, ev.StepOrdinal)
+	assert.Zero(t, f.tracker.reconciled.Load())
+	assert.Zero(t, f.tracker.exitedBeforeTag.Load())
+	assert.EqualValues(t, 1, f.tracker.tagSkipped.Load())
+	assert.Contains(t, f.logs.String(), "Could not tag container task")
+
+	f.daemon.push(startEvent(id, time.Now().UnixNano()))
+	f.waitLog(t, "upgraded from replayed start event")
+	assert.Contains(t, f.tagger.tagCalls(), tagCall{pid: 5252, ordinal: 7})
+}
+
+// Adoption that finds a real tag on the leader keeps it, and reports it:
+// the container's marker and its address follow that step, not the
+// pre-daemon sentinel the adoption would have written.
+func TestReconcileKeepsRealLeaderTag(t *testing.T) {
+	f := newFixture(t)
+	id := strings.Repeat("2", 64)
+	f.addContainer(t, id, 5353, "172.17.0.45", false)
+	f.daemon.setList(containerSummary{ID: id})
+	f.tagger.setHeld(5353, 5)
+	f.start(t)
+
+	ev := f.waitAttribution(t, "reconcile", id)
+	assert.Equal(t, uint32(5), ev.StepOrdinal)
+	assert.EqualValues(t, 1, f.tracker.reconciled.Load())
+	ord, _, ok := f.tracker.LookupClient(&net.UDPAddr{IP: net.ParseIP("172.17.0.45"), Port: 1})
+	require.True(t, ok)
+	assert.Equal(t, uint32(5), ord)
+}
+
+// An exec whose tagging fails (a full step map, say) warns and is not
+// attributed; it is not counted as an exit.
+func TestExecTagFailureWarns(t *testing.T) {
+	f := newFixture(t)
+	id := strings.Repeat("3", 64)
+	f.addContainer(t, id, 4242, "172.17.0.46", false)
+	f.tagger.setOrdinal(7)
+	f.start(t)
+	f.daemon.push(startEvent(id, time.Now().UnixNano()))
+	f.waitAttribution(t, "start", id)
+
+	execID := strings.Repeat("4", 64)
+	writeProcEntry(t, f.procRoot, 4848, cgroupV2Line(id)+"\n", "sh")
+	f.daemon.setExec(execID, execInspect{ID: execID, Running: true, Pid: 4848, ContainerID: id})
+	f.tagger.failNext(4848, errors.New("update: argument list too long"))
+	f.tagger.setOrdinal(9)
+	f.daemon.push(execStartEvent(id, execID, time.Now().UnixNano()))
+
+	f.waitLog(t, "Could not tag container task")
+	assert.Zero(t, f.tracker.execTagged.Load())
+	assert.Zero(t, f.tracker.exitedBeforeTag.Load())
+	assert.NotContains(t, f.logs.String(), "Container exec attributed")
 }

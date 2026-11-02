@@ -78,12 +78,15 @@ func TestDNSRedirect_IPv4OnlyIsALoss(t *testing.T) {
 		p := newPostures(cmd, "6.6.141", enforcing, slog.New(slog.NewTextHandler(&buf, nil)))
 		err := partial.settle(p)
 		if enforcing {
-			require.ErrorContains(t, err, "IPv6 DNS is not redirected")
+			require.ErrorContains(t, err, "--dns-redirect=true requested but applied only as ipv4: IPv6 DNS is not redirected")
 			assert.Equal(t, postureDNSRedirect, cmd.refusedPosture)
 		} else {
 			require.NoError(t, err)
-			assert.Contains(t, p.lines()[0].Reason, "IPv6 DNS is not redirected")
+			assert.Contains(t, buf.String(), "level=WARN")
 		}
+		line := p.lines()[0]
+		assert.Equal(t, "ipv4", line.Applied, "the summary must show the IPv4 redirect in place, not none")
+		assert.Contains(t, line.Reason, "IPv6 DNS is not redirected")
 	}
 	assert.NoError(t, (&dnsRedirect{active: true}).settle(nil), "a whole redirect has nothing to report")
 }

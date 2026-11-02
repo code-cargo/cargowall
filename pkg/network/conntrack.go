@@ -313,9 +313,11 @@ func flushAttempt(logger *slog.Logger, ipv6 bool) error {
 	}
 	defer conn.Close()
 
-	tuples, err := dumpTuples(conn, unix.AF_UNSPEC, func(t ctTuple) bool {
-		return t.isDNS() && (ipv6 || t.src.Is4())
-	})
+	family := uint8(unix.AF_INET)
+	if ipv6 {
+		family = unix.AF_UNSPEC
+	}
+	tuples, err := dumpTuples(conn, family, ctTuple.isDNS)
 	if err != nil {
 		return err
 	}

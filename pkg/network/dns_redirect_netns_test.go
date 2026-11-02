@@ -320,6 +320,40 @@ func TestDNSRedirect_Output(t *testing.T) {
 	}
 }
 
+// TestDNSRedirect_LinkLocalIPv6: DNS for a link-local resolver never goes
+// around the proxy. A socket connected to one is bound to its interface, so
+// once DNAT'd to ::1 the kernel cannot route it and the send fails at once;
+// an unbound socket's query reaches the proxy.
+func TestDNSRedirect_LinkLocalIPv6(t *testing.T) {
+	enterNetns(t)
+	addTun(t, "cw0", net.IPv4(10, 53, 0, 1))
+	addAddr6(t, "cw0", net.ParseIP("fe80::1"))
+	proxy6 := listenUDP(t, "[::1]:53")
+	install := func() {
+		r := NewDNSRedirect(discardLogger())
+		require.NoError(t, r.Install(RedirectSpec{IPv6: true}))
+		t.Cleanup(func() { _ = r.Teardown() })
+	}
+	resolver := &net.UDPAddr{IP: net.ParseIP("fe80::2"), Port: 53, Zone: "cw0"}
+
+	connected, err := net.DialUDP("udp6", nil, resolver)
+	require.NoError(t, err)
+	defer connected.Close()
+	install()
+	_, err = connected.Write([]byte("connected"))
+	require.ErrorIs(t, err, unix.ENETUNREACH, "a connected link-local query must fail, not leave")
+	got, _ := received(t, proxy6, absent)
+	require.Empty(t, got)
+
+	unbound, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified})
+	require.NoError(t, err)
+	defer unbound.Close()
+	_, err = unbound.WriteTo([]byte("unbound"), resolver)
+	require.NoError(t, err)
+	got, _ = received(t, proxy6, arrives)
+	require.Equal(t, "unbound", got, "an unbound link-local query must reach the proxy")
+}
+
 // TestDNSRedirect_InputGuard: a sport-53 packet that would open a flow from
 // outside is dropped, a reply to the proxy's own upstream query is not, and
 // loopback is exempt, in either table family; an inet table guards IPv6 the

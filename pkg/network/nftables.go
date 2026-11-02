@@ -213,7 +213,7 @@ func nftMsg(fam tableFamily, msgType uint16, flags netlink.HeaderFlags, attrs fu
 			Type:  netlink.HeaderType(unix.NFNL_SUBSYS_NFTABLES<<8 | msgType),
 			Flags: netlink.Request | netlink.Acknowledge | flags,
 		},
-		Data: append([]byte{byte(fam), unix.NFNETLINK_V0, 0, 0}, data...),
+		Data: append(nfgenmsg(byte(fam)), data...),
 	}, nil
 }
 

@@ -143,10 +143,14 @@ func notInstalled(err error, logger *slog.Logger) *dnsRedirect {
 func (r *dnsRedirect) isActive() bool { return r != nil && r.active }
 
 // settle hands a failed setup to the ledger, which owns the log line and
-// decides whether startup fails. Nil-safe.
+// decides whether startup fails; one in place for IPv4 alone is recorded as
+// that. Nil-safe.
 func (r *dnsRedirect) settle(postures *postureLedger) error {
 	if r == nil || r.err == nil {
 		return nil
+	}
+	if r.active {
+		return postures.loseTo(postureDNSRedirect, dnsRedirectIPv4, postures.errReason(r.err))
 	}
 	return postures.lose(postureDNSRedirect, postures.errReason(r.err))
 }

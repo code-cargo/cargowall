@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"slices"
@@ -80,8 +81,11 @@ const (
 )
 
 // ProxyAddrIPv6 is the proxy listener the redirect sends IPv6 DNS to: the
-// address the DNAT names and the listener cmd binds are this one value.
-var ProxyAddrIPv6 = net.JoinHostPort(net.IPv6loopback.String(), "53")
+// address the DNAT names (proxyIPv6) and the listener cmd binds are this one
+// value.
+const ProxyAddrIPv6 = "[::1]:53"
+
+var proxyIPv6 = netip.MustParseAddrPort(ProxyAddrIPv6)
 
 // RedirectSpec is what Install redirects.
 type RedirectSpec struct {
@@ -99,32 +103,34 @@ type RedirectSpec struct {
 // IPv6 disabled, as container runtimes leave one on an IPv4-only network,
 // has none.
 func LoopbackIPv6() bool {
-	return hasIPv6("lo", func(ip net.IP) bool { return ip.Equal(net.IPv6loopback) })
-}
-
-// HostIPv6 reports whether any interface other than loopback has an IPv6
-// address beyond link-local: whether IPv6 DNS can leave this namespace, and
-// so whether a redirect that does not cover IPv6 leaves a way around the
-// proxy.
-func HostIPv6() bool {
-	ifaces, err := net.Interfaces()
+	lo, err := net.InterfaceByName("lo")
 	if err != nil {
 		return false
 	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagLoopback == 0 && hasIPv6(iface.Name, net.IP.IsGlobalUnicast) {
+	return hasIPv6(lo, func(ip net.IP) bool { return ip.Equal(net.IPv6loopback) })
+}
+
+// HostIPv6 reports whether any interface other than loopback has an IPv6
+// address, link-local included, since DNS to an on-link resolver leaves by
+// one: whether IPv6 DNS can leave this namespace, and so whether a redirect
+// that does not cover IPv6 leaves a way around the proxy. Interfaces that
+// cannot be listed count as IPv6, the side that does not leave one
+// unreported.
+func HostIPv6() bool {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return true
+	}
+	for i := range ifaces {
+		if ifaces[i].Flags&net.FlagLoopback == 0 && hasIPv6(&ifaces[i], func(net.IP) bool { return true }) {
 			return true
 		}
 	}
 	return false
 }
 
-// hasIPv6 reports whether interface name holds an IPv6 address match accepts.
-func hasIPv6(name string, match func(net.IP) bool) bool {
-	iface, err := net.InterfaceByName(name)
-	if err != nil {
-		return false
-	}
+// hasIPv6 reports whether iface holds an IPv6 address match accepts.
+func hasIPv6(iface *net.Interface, match func(net.IP) bool) bool {
 	addrs, err := iface.Addrs()
 	if err != nil {
 		return false
@@ -156,6 +162,11 @@ func hasIPv6(name string, match func(net.IP) bool) bool {
 //     127.0.0.1, the proxy's listen address, is never DNAT'd;
 //   - with ipv6, IPv6 DNS likewise goes to the proxy at ProxyAddrIPv6, all
 //     but what is sent to ::1 itself. IPv6 has no resolved stub to send to.
+//     A socket bound to an interface, as connecting to a link-local resolver
+//     binds one, cannot reach ::1 once DNAT'd: the kernel's reroute keeps it
+//     to that interface, and the send fails with ENETUNREACH. That is DNS
+//     that reaches no resolver, not one around the proxy; an unbound socket
+//     sending to the same resolver reaches the proxy.
 //
 // input, a filter hook: an inbound sport-53 packet off loopback must not
 // CREATE a flow. A reply racing the conntrack flush would re-create it
@@ -202,9 +213,10 @@ func redirectChains(ipv6 bool, bridgeIP net.IP) []redirectChain {
 		}),
 	)
 	if ipv6 {
+		proxy6 := net.IP(proxyIPv6.Addr().AsSlice())
 		output = slices.Concat(output, udpAndTCP(func(proto []expr.Any) []expr.Any {
-			return slices.Concat(v6, proto, port(dstPort, 53), daddr6(expr.CmpOpNeq, net.IPv6loopback),
-				dnat(net.IPv6loopback, 53))
+			return slices.Concat(v6, proto, port(dstPort, 53), daddr6(expr.CmpOpNeq, proxy6),
+				dnat(proxy6, proxyIPv6.Port()))
 		}))
 	}
 	input := udpAndTCP(func(proto []expr.Any) []expr.Any {
@@ -396,10 +408,11 @@ func (r *DNSRedirect) installFamily(fam tableFamily, ipv6 bool, bridge net.IP) (
 }
 
 // removeLeftover removes a table of family fam that no socket owns (add,
-// delete), one an earlier run that did or did not cover IPv6 left. A live
-// socket's refuses (EPERM), and that fails the install as it would for the
-// install's own family. Anything else, such as a kernel that has no such
-// family, means there is no leftover to remove.
+// delete), one an earlier run that did or did not cover IPv6 left. A kernel
+// that has no such family (EAFNOSUPPORT, or EOPNOTSUPP before 6.8) has no
+// leftover to remove. Any other failure, a live socket's table refusing
+// (EPERM) above all, fails the install, as it would for the install's own
+// family: a leftover kept would be a second redirect.
 func removeLeftover(fam tableFamily) error {
 	create, errCreate := newTableMsg(fam, 0)
 	del, errDel := delTableMsg(fam)
@@ -411,10 +424,11 @@ func removeLeftover(fam tableFamily) error {
 		return fmt.Errorf("nftables: %w%s", err, installHint(err))
 	}
 	defer conn.Close()
-	if err := transact(conn, []netlink.Message{create, del}); errors.Is(err, unix.EPERM) {
-		return fmt.Errorf("nftables: removing table %s %s: %w%s", fam, RedirectTable, err, installHint(err))
+	err = transact(conn, []netlink.Message{create, del})
+	if err == nil || errors.Is(err, unix.EAFNOSUPPORT) || errors.Is(err, unix.EOPNOTSUPP) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("nftables: removing table %s %s: %w%s", fam, RedirectTable, err, installHint(err))
 }
 
 // installTable runs one install transaction, the table of family fam with
@@ -433,7 +447,11 @@ func installTable(fam tableFamily, flags uint32, chains []netlink.Message) (*net
 	}
 	if err := transact(conn, slices.Concat([]netlink.Message{create, del, table}, chains)); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("nftables: installing table %s %s: %w%s", fam, RedirectTable, err, installHint(err))
+		hint := installHint(err)
+		if fam == familyInet && inetRefused(err) {
+			hint = " (the kernel may lack inet tables or IPv6 nat: CONFIG_NF_TABLES_INET, or nf_nat for IPv6)"
+		}
+		return nil, fmt.Errorf("nftables: installing table %s %s: %w%s", fam, RedirectTable, err, hint)
 	}
 	return conn, nil
 }

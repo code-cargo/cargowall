@@ -56,6 +56,9 @@ const (
 const (
 	dnsRedirectOn  = "true"
 	dnsRedirectOff = "false"
+	// dnsRedirectIPv4 is the redirect in place for IPv4 but not for the
+	// host's IPv6, which goes around the proxy (dnsRedirect.settle).
+	dnsRedirectIPv4 = "ipv4"
 )
 
 // maxPostureReasonBytes bounds a reason: it lands in a job-summary table
@@ -146,9 +149,9 @@ func (p *postureLedger) lines() []postureLine {
 	return out
 }
 
-// lose reports that posture could not come up. There is no partial descent:
-// every way a layer fails leaves it computing no verdict, so the layer goes
-// to off, keeping the first reason. The ledger owns the log line. On the
+// lose reports that posture could not come up. Every way a layer fails
+// leaves it computing no verdict, so the layer goes to off, keeping the
+// first reason; the DNS redirect alone can stay in place in part (loseTo). The ledger owns the log line. On the
 // fatal path the failure sentinel is what leaves the process — write runs
 // only once both raises succeed — so the in-memory mark there serves the
 // log and the ledger's own consistency, nothing downstream.
@@ -161,15 +164,29 @@ func (p *postureLedger) lines() []postureLine {
 // lockdown's deny-all firewall must stay up until the job ends. Any other
 // loss warns, and the summary lists it.
 func (p *postureLedger) lose(posture, reason string) error {
+	return p.loseTo(posture, "", reason)
+}
+
+// loseTo is lose for a layer that still applies in part, recorded at the
+// value applied ("" for its off rung): the DNS redirect in place for IPv4
+// but not for the host's IPv6. What it costs is lose's: a requirement met in
+// part is not met.
+func (p *postureLedger) loseTo(posture, applied, reason string) error {
 	r := p.find(posture)
 	if r == nil {
 		return nil // never requested: nothing was promised
 	}
+	if applied == "" {
+		applied = r.off
+	}
 	if !r.degraded() {
-		r.Applied = r.off
+		r.Applied = applied
 		r.Reason = truncateReason(reason)
 	}
 	msg := fmt.Sprintf("--%s=%s requested but could not be applied", posture, r.Requested)
+	if applied != r.off {
+		msg = fmt.Sprintf("--%s=%s requested but applied only as %s", posture, r.Requested, applied)
+	}
 	switch {
 	case r.failClosed && p.lockdown:
 		p.logger.Error(msg+"; staying up in policy lockdown", "reason", reason)

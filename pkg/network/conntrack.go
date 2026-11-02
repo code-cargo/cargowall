@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"time"
 
@@ -57,6 +58,8 @@ const (
 	// Nested under CTA_TUPLE_IP (enum ctattr_ip).
 	ctaIPv4Src = 1 // CTA_IP_V4_SRC
 	ctaIPv4Dst = 2 // CTA_IP_V4_DST
+	ctaIPv6Src = 3 // CTA_IP_V6_SRC
+	ctaIPv6Dst = 4 // CTA_IP_V6_DST
 
 	// Nested under CTA_TUPLE_PROTO (enum ctattr_l4proto). Ports are wire
 	// (big-endian) u16 without the NLA_F_NET_BYTEORDER flag, so they are
@@ -87,23 +90,36 @@ func ctMsgType(subtype uint16) netlink.HeaderType {
 	return netlink.HeaderType(uint16(unix.NFNL_SUBSYS_CTNETLINK)<<8 | subtype)
 }
 
-// nfgenmsgV4 returns the nfgenmsg header for AF_INET — the redirect is
-// v4-only (an ip-family table, udp4/tcp4 proxy listeners), so v4 is the only
-// table with entries to flush.
-func nfgenmsgV4() []byte {
-	return []byte{unix.AF_INET, unix.NFNETLINK_V0, 0, 0}
+// ctFamilies are the conntrack tables the flush covers: the redirect
+// covers IPv6 too where loopback has it, and an IPv6 dump on a host without
+// IPv6 flows is merely empty.
+var ctFamilies = []uint8{unix.AF_INET, unix.AF_INET6}
+
+// nfgenmsg returns the nfgenmsg header for a conntrack request on family's
+// table.
+func nfgenmsg(family uint8) []byte {
+	return []byte{family, unix.NFNETLINK_V0, 0, 0}
 }
 
 // ctTuple is one flow's original-direction identity plus its conntrack
 // zone — exactly the fields ctnetlink needs to address the entry for
-// deletion. Ports and zone are host order.
+// deletion. The addresses are of one family, which is the entry's table.
+// Ports and zone are host order.
 type ctTuple struct {
-	srcIP   [4]byte
-	dstIP   [4]byte
+	src     netip.Addr
+	dst     netip.Addr
 	proto   uint8
 	srcPort uint16
 	dstPort uint16
 	zone    uint16
+}
+
+// family is the conntrack table the tuple lives in.
+func (t ctTuple) family() uint8 {
+	if t.src.Is4() {
+		return unix.AF_INET
+	}
+	return unix.AF_INET6
 }
 
 // isDNS reports whether the flow is one the DNS redirect claims: TCP or UDP
@@ -129,8 +145,13 @@ func marshalDeleteAttrs(t ctTuple) ([]byte, error) {
 	}
 	ae.Nested(ctaTupleOrig, func(nae *netlink.AttributeEncoder) error {
 		nae.Nested(ctaTupleIP, func(iae *netlink.AttributeEncoder) error {
-			iae.Bytes(ctaIPv4Src, t.srcIP[:])
-			iae.Bytes(ctaIPv4Dst, t.dstIP[:])
+			if t.src.Is4() {
+				iae.Bytes(ctaIPv4Src, t.src.AsSlice())
+				iae.Bytes(ctaIPv4Dst, t.dst.AsSlice())
+			} else {
+				iae.Bytes(ctaIPv6Src, t.src.AsSlice())
+				iae.Bytes(ctaIPv6Dst, t.dst.AsSlice())
+			}
 			return nil
 		})
 		nae.Nested(ctaTupleProto, func(pae *netlink.AttributeEncoder) error {
@@ -144,11 +165,11 @@ func marshalDeleteAttrs(t ctTuple) ([]byte, error) {
 	return ae.Encode()
 }
 
-// parseConntrackTupleOrig extracts the original-direction v4 tuple from one
-// conntrack message payload (nfgenmsg + attributes). ok is true only when
-// every field a delete needs was present and the payload decoded cleanly —
-// a v6 entry (no CTA_IP_V4_*) or a truncated message parses as !ok and is
-// skipped.
+// parseConntrackTupleOrig extracts the original-direction tuple, IPv4 or
+// IPv6, from one conntrack message payload (nfgenmsg + attributes). ok is
+// true only when every field a delete needs was present, both addresses of
+// one family, and the payload decoded cleanly — a truncated message parses
+// as !ok and is skipped.
 func parseConntrackTupleOrig(data []byte) (ctTuple, bool) {
 	var t ctTuple
 	if len(data) < sizeofNfgenmsg {
@@ -177,12 +198,12 @@ func parseConntrackTupleOrig(data []byte) (ctTuple, bool) {
 						for iad.Next() {
 							b := iad.Bytes()
 							switch {
-							case iad.Type() == ctaIPv4Src && len(b) == 4:
-								copy(t.srcIP[:], b)
-								haveSrc = true
-							case iad.Type() == ctaIPv4Dst && len(b) == 4:
-								copy(t.dstIP[:], b)
-								haveDst = true
+							case iad.Type() == ctaIPv4Src && len(b) == 4,
+								iad.Type() == ctaIPv6Src && len(b) == 16:
+								t.src, haveSrc = netip.AddrFromSlice(b)
+							case iad.Type() == ctaIPv4Dst && len(b) == 4,
+								iad.Type() == ctaIPv6Dst && len(b) == 16:
+								t.dst, haveDst = netip.AddrFromSlice(b)
 							}
 						}
 						return nil
@@ -210,7 +231,8 @@ func parseConntrackTupleOrig(data []byte) (ctTuple, bool) {
 			return nil
 		})
 	}
-	return t, ad.Err() == nil && haveSrc && haveDst && haveNum && haveSport && haveDport
+	return t, ad.Err() == nil && haveSrc && haveDst && t.src.Is4() == t.dst.Is4() &&
+		haveNum && haveSport && haveDport
 }
 
 // dialCt opens a NETLINK_NETFILTER socket with a bounded deadline so a lost
@@ -227,20 +249,20 @@ func dialCt() (*netlink.Conn, error) {
 	return conn, nil
 }
 
-// dumpTuples dumps the IPv4 conntrack table over conn, keeping the tuples
+// dumpTuples dumps family's conntrack table over conn, keeping the tuples
 // keep() accepts (nil keeps all). Best-effort by design: ctnetlink dumps
 // carry no consistency signal (the conntrack dump path never stamps
 // NLM_F_DUMP_INTR), so an entry that moves during the walk can be missed —
 // the flush makes no completeness claim. Unparseable entries are skipped,
 // not fatal: an entry we cannot address for deletion is one we could not
 // act on anyway.
-func dumpTuples(conn *netlink.Conn, keep func(ctTuple) bool) ([]ctTuple, error) {
+func dumpTuples(conn *netlink.Conn, family uint8, keep func(ctTuple) bool) ([]ctTuple, error) {
 	msgs, err := conn.Execute(netlink.Message{
 		Header: netlink.Header{
 			Type:  ctMsgType(ipctnlMsgCtGet),
 			Flags: netlink.Request | netlink.Dump,
 		},
-		Data: nfgenmsgV4(),
+		Data: nfgenmsg(family),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("conntrack dump: %w", err)
@@ -272,7 +294,7 @@ func deleteTuple(conn *netlink.Conn, t ctTuple) (bool, error) {
 			Type:  ctMsgType(ipctnlMsgCtDelete),
 			Flags: netlink.Request | netlink.Acknowledge,
 		},
-		Data: append(nfgenmsgV4(), attrs...),
+		Data: append(nfgenmsg(t.family()), attrs...),
 	})
 	switch {
 	case err == nil:
@@ -295,9 +317,13 @@ func flushAttempt(logger *slog.Logger) error {
 	}
 	defer conn.Close()
 
-	tuples, err := dumpTuples(conn, ctTuple.isDNS)
-	if err != nil {
-		return err
+	var tuples []ctTuple
+	for _, family := range ctFamilies {
+		dns, err := dumpTuples(conn, family, ctTuple.isDNS)
+		if err != nil {
+			return err
+		}
+		tuples = append(tuples, dns...)
 	}
 
 	// Fresh deadline for the deletes: a slow dump would otherwise leave
@@ -337,8 +363,8 @@ func flushAttempt(logger *slog.Logger) error {
 	return nil
 }
 
-// FlushDNSConntrack deletes every IPv4 conntrack entry whose original-
-// direction destination port is 53 (TCP or UDP). nat is evaluated only on a
+// FlushDNSConntrack deletes every conntrack entry, IPv4 and IPv6, whose
+// original-direction destination port is 53 (TCP or UDP). nat is evaluated only on a
 // flow's first packet and the verdict replayed from its conntrack entry, so
 // DNS flow state predating the redirect bypasses the proxy — and state
 // surviving teardown keeps DNAT'ing to the dead proxy — until deleted.

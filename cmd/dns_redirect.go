@@ -19,6 +19,7 @@ package cmd
 import (
 	"log/slog"
 
+	"github.com/code-cargo/cargowall/pkg/dns"
 	"github.com/code-cargo/cargowall/pkg/network"
 )
 
@@ -37,14 +38,26 @@ type dnsRedirect struct {
 	err error // why setup failed; nil when the redirect is in place
 }
 
+// redirectIPv6 reports whether the redirect will cover IPv6, and if so adds
+// the proxy's [::1]:53 listener it sends IPv6 DNS to. Called before the
+// proxy starts, so a listener that cannot bind fails startup with it. A
+// namespace whose loopback has no IPv6 gets the IPv4-only redirect.
+func redirectIPv6(cmd *StartCmd, dnsServer *dns.Server) bool {
+	if !cmd.DNSRedirect || !network.LoopbackIPv6() {
+		return false
+	}
+	dnsServer.AddRedirectListenAddr("[::1]:53")
+	return true
+}
+
 // startDNSRedirect installs the redirect for the proxy, and for its
-// container listener at bridgeIP when there is one. The returned undo
+// container listener on the docker bridge when there is one. The returned undo
 // removes it; the caller defers it. It is registered before the install,
 // like every host mutation's: a forced shutdown landing mid-install waits
 // for it, then removes the table, which an unowned one needs, and flushes
 // the flows DNAT'd to the proxy meanwhile, which even an owned one dying
 // with the process does not do.
-func startDNSRedirect(bridgeIP string, teardowns *teardownList, logger *slog.Logger) (*dnsRedirect, func()) {
+func startDNSRedirect(spec network.RedirectSpec, teardowns *teardownList, logger *slog.Logger) (*dnsRedirect, func()) {
 	redirect := network.NewDNSRedirect(logger)
 	undo := teardowns.add(func() {
 		// An Error, not a Warn: what it can leave behind is the host's DNS
@@ -53,7 +66,7 @@ func startDNSRedirect(bridgeIP string, teardowns *teardownList, logger *slog.Log
 			logger.Error("Failed to tear down DNS redirect", "error", err)
 		}
 	})
-	if err := redirect.Install(bridgeIP); err != nil {
+	if err := redirect.Install(spec); err != nil {
 		return notInstalled(err, logger), undo
 	}
 	return &dnsRedirect{}, undo

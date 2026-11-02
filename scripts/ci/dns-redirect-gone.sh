@@ -31,7 +31,8 @@ grep -q "DNS redirect removed" "$log" \
 # not read as an empty ruleset.
 tables=$(sudo nft list tables) \
   || { echo "::error::nft list tables failed $when"; exit 1; }
-if grep -qE "^table ip cargowall( |$)" <<< "$tables"; then
+# Either family: inet where loopback has IPv6, ip where it does not.
+if grep -qE "^table (ip|inet) cargowall( |$)" <<< "$tables"; then
   echo "::error::DNS redirect table still present $when"
   exit 1
 fi

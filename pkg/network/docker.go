@@ -74,6 +74,27 @@ func GetDockerBridgeIP() (string, error) {
 	return ipnet.IP.String(), nil
 }
 
+// GetDockerBridgeIPv6 returns the default bridge's IPv6 address, the first
+// that is neither link-local nor loopback, for the proxy's IPv6 container
+// listener. docker0 has one only when Docker runs with IPv6; the error
+// otherwise is the expected case, not a failure.
+func GetDockerBridgeIPv6() (string, error) {
+	iface, err := net.InterfaceByName("docker0")
+	if err != nil {
+		return "", fmt.Errorf("docker0 interface not found: %w", err)
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return "", fmt.Errorf("failed to get docker0 addresses: %w", err)
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() == nil && ipnet.IP.IsGlobalUnicast() {
+			return ipnet.IP.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no IPv6 address found on docker0")
+}
+
 // GetDockerBridgeSubnet returns the default bridge's IPv4 network in CIDR
 // form (e.g. "172.17.0.0/16"). The cgroup egress hook adjudicates bridge
 // traffic TC never saw — host→published-port via docker-proxy, container→

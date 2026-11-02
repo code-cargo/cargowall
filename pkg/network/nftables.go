@@ -47,8 +47,42 @@ const nftTableFOwner = 0x2
 // lost reply cannot stall startup or shutdown.
 const nftTimeout = 2 * time.Second
 
+// tableFamily is the redirect table's nf_tables family: inet when it covers
+// IPv6 as well as IPv4, ip when it covers IPv4 alone (see RedirectSpec).
+type tableFamily byte
+
+const (
+	familyIP   tableFamily = unix.NFPROTO_IPV4
+	familyInet tableFamily = unix.NFPROTO_INET
+)
+
+// String is the family as nft spells it, for messages that name the table.
+func (f tableFamily) String() string {
+	if f == familyInet {
+		return "inet"
+	}
+	return "ip"
+}
+
+// other is the family the table is not, whose leftover install removes.
+func (f tableFamily) other() tableFamily {
+	if f == familyInet {
+		return familyIP
+	}
+	return familyInet
+}
+
 // Expression helpers. A match loads into register 1 and compares it; dnat
 // loads its address into register 1 and its port into register 2.
+
+// nfproto matches the packet's family, which an inet table's rules must
+// before reading an address: the header layouts differ.
+func nfproto(proto byte) []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}},
+	}
+}
 
 // udpAndTCP is rule twice, given the UDP match and then the TCP one: DNS
 // rides both.
@@ -83,6 +117,14 @@ func daddr(op expr.CmpOp, addr []byte) []expr.Any {
 	return []expr.Any{
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: uint32(len(addr))},
 		&expr.Cmp{Op: op, Register: 1, Data: addr},
+	}
+}
+
+// daddr6 compares the whole IPv6 destination, 24 bytes into the header.
+func daddr6(op expr.CmpOp, addr net.IP) []expr.Any {
+	return []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 24, Len: net.IPv6len},
+		&expr.Cmp{Op: op, Register: 1, Data: addr.To16()},
 	}
 }
 
@@ -125,12 +167,18 @@ func ctStateNew() []expr.Any {
 	}
 }
 
+// dnat rewrites the destination to addr:p, in the family addr is written
+// in: 4 bytes for IPv4, 16 for IPv6.
 func dnat(addr net.IP, p uint16) []expr.Any {
+	family := uint32(unix.NFPROTO_IPV6)
+	if len(addr) == net.IPv4len {
+		family = unix.NFPROTO_IPV4
+	}
 	return []expr.Any{
 		&expr.Immediate{Register: 1, Data: addr},
 		&expr.Immediate{Register: 2, Data: binaryutil.BigEndian.PutUint16(p)},
 		&expr.NAT{
-			Type: expr.NATTypeDestNAT, Family: unix.NFPROTO_IPV4,
+			Type: expr.NATTypeDestNAT, Family: family,
 			RegAddrMin: 1, RegProtoMin: 2, Specified: true,
 		},
 	}
@@ -150,9 +198,9 @@ type redirectChain struct {
 	rules    [][]expr.Any
 }
 
-// nftMsg is one nf_tables request on the redirect table's family. Every
-// request asks for an ack, which is how transact learns each one's fate.
-func nftMsg(msgType uint16, flags netlink.HeaderFlags, attrs func(ae *netlink.AttributeEncoder)) (netlink.Message, error) {
+// nftMsg is one nf_tables request on a table of family fam. Every request
+// asks for an ack, which is how transact learns each one's fate.
+func nftMsg(fam tableFamily, msgType uint16, flags netlink.HeaderFlags, attrs func(ae *netlink.AttributeEncoder)) (netlink.Message, error) {
 	ae := netlink.NewAttributeEncoder()
 	ae.ByteOrder = binary.BigEndian // nf_tables attributes are network order
 	attrs(ae)
@@ -165,26 +213,26 @@ func nftMsg(msgType uint16, flags netlink.HeaderFlags, attrs func(ae *netlink.At
 			Type:  netlink.HeaderType(unix.NFNL_SUBSYS_NFTABLES<<8 | msgType),
 			Flags: netlink.Request | netlink.Acknowledge | flags,
 		},
-		Data: append(nfgenmsgV4(), data...),
+		Data: append([]byte{byte(fam), unix.NFNETLINK_V0, 0, 0}, data...),
 	}, nil
 }
 
-func newTableMsg(flags uint32) (netlink.Message, error) {
-	return nftMsg(unix.NFT_MSG_NEWTABLE, netlink.Create, func(ae *netlink.AttributeEncoder) {
+func newTableMsg(fam tableFamily, flags uint32) (netlink.Message, error) {
+	return nftMsg(fam, unix.NFT_MSG_NEWTABLE, netlink.Create, func(ae *netlink.AttributeEncoder) {
 		ae.String(unix.NFTA_TABLE_NAME, RedirectTable)
 		ae.Uint32(unix.NFTA_TABLE_FLAGS, flags)
 	})
 }
 
-func delTableMsg() (netlink.Message, error) {
-	return nftMsg(unix.NFT_MSG_DELTABLE, 0, func(ae *netlink.AttributeEncoder) {
+func delTableMsg(fam tableFamily) (netlink.Message, error) {
+	return nftMsg(fam, unix.NFT_MSG_DELTABLE, 0, func(ae *netlink.AttributeEncoder) {
 		ae.String(unix.NFTA_TABLE_NAME, RedirectTable)
 	})
 }
 
 // chainMsgs is the chain followed by its rules, appended in order.
-func chainMsgs(c redirectChain) ([]netlink.Message, error) {
-	chain, err := nftMsg(unix.NFT_MSG_NEWCHAIN, netlink.Create, func(ae *netlink.AttributeEncoder) {
+func chainMsgs(fam tableFamily, c redirectChain) ([]netlink.Message, error) {
+	chain, err := nftMsg(fam, unix.NFT_MSG_NEWCHAIN, netlink.Create, func(ae *netlink.AttributeEncoder) {
 		ae.String(unix.NFTA_CHAIN_TABLE, RedirectTable)
 		ae.String(unix.NFTA_CHAIN_NAME, c.name)
 		ae.Nested(unix.NFTA_CHAIN_HOOK, func(hook *netlink.AttributeEncoder) error {
@@ -199,12 +247,12 @@ func chainMsgs(c redirectChain) ([]netlink.Message, error) {
 	}
 	msgs := []netlink.Message{chain}
 	for i, exprs := range c.rules {
-		rule, err := nftMsg(unix.NFT_MSG_NEWRULE, netlink.Create|netlink.Append, func(ae *netlink.AttributeEncoder) {
+		rule, err := nftMsg(fam, unix.NFT_MSG_NEWRULE, netlink.Create|netlink.Append, func(ae *netlink.AttributeEncoder) {
 			ae.String(unix.NFTA_RULE_TABLE, RedirectTable)
 			ae.String(unix.NFTA_RULE_CHAIN, c.name)
 			ae.Nested(unix.NFTA_RULE_EXPRESSIONS, func(list *netlink.AttributeEncoder) error {
 				for _, e := range exprs {
-					b, err := expr.Marshal(unix.NFPROTO_IPV4, e)
+					b, err := expr.Marshal(byte(fam), e)
 					if err != nil {
 						return err
 					}

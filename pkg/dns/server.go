@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,7 +49,10 @@ type Server struct {
 
 	// Additional listen addresses (e.g., docker bridge IP for container DNS)
 	additionalAddrs []string
-	servers         []*dns.Server // All running servers
+	// requiredAddrs are additional addresses that must bind, as the primary
+	// must (AddRedirectListenAddr).
+	requiredAddrs []string
+	servers       []*dns.Server // All running servers
 
 	// DNS query filtering (blocks DNS tunneling)
 	filterQueries bool // When true, only forward queries for allowed domains
@@ -419,9 +423,9 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 	}
 
-	// A bind failure is fatal only for the PRIMARY address: without
-	// 127.0.0.1:53 there is no proxy and the daemon must not come up
-	// claiming one. A secondary address (the docker bridge listener) held by
+	// A bind failure is fatal only for the PRIMARY address and the redirect's
+	// (AddRedirectListenAddr): without 127.0.0.1:53 there is no proxy and the
+	// daemon must not come up claiming one. A secondary address (the docker bridge listener) held by
 	// a leftover process must NOT take down the whole daemon — the proxy
 	// serves every other address, exactly as it did when each listener bound
 	// itself inside ListenAndServe. The fatal path shuts down whatever was
@@ -445,8 +449,9 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to listen on %s/%s: %w", addr, proto, err)
 	}
 
+	required := func(addr string) bool { return addr == s.listenAddr || slices.Contains(s.requiredAddrs, addr) }
 	for _, addr := range allAddrs {
-		for _, proto := range []string{"udp4", "tcp4"} {
+		for _, proto := range listenProtos(addr) {
 			server := &dns.Server{
 				Addr:    addr,
 				Net:     proto,
@@ -459,10 +464,10 @@ func (s *Server) Start(ctx context.Context) error {
 			// Bind through the marking ListenConfig; miekg/dns uses a
 			// pre-bound conn when one is supplied instead of binding itself.
 			switch proto {
-			case "udp4":
+			case "udp4", "udp6":
 				pc, err := lc.ListenPacket(ctx, proto, addr)
 				if err != nil {
-					if addr == s.listenAddr {
+					if required(addr) {
 						return failStart(addr, proto, err)
 					}
 					s.logger.Error("DNS listener unavailable; continuing without it — "+
@@ -476,7 +481,7 @@ func (s *Server) Start(ctx context.Context) error {
 			default:
 				ln, err := lc.Listen(ctx, proto, addr)
 				if err != nil {
-					if addr == s.listenAddr {
+					if required(addr) {
 						return failStart(addr, proto, err)
 					}
 					s.logger.Error("DNS listener unavailable; continuing without it — "+

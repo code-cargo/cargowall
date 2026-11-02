@@ -29,6 +29,7 @@ import (
 	"slices"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/google/nftables"
 	"github.com/stretchr/testify/require"
@@ -96,6 +97,61 @@ func addTun(t *testing.T, name string, addr net.IP) *os.File {
 	return f
 }
 
+// addAddr6 gives interface name the IPv6 address addr/64. A TUN is NOARP, so
+// the address skips duplicate detection and is usable at once.
+func addAddr6(t *testing.T, name string, addr net.IP) {
+	t.Helper()
+	iface, err := net.InterfaceByName(name)
+	require.NoError(t, err)
+	sock, err := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	defer unix.Close(sock)
+	// struct in6_ifreq, which x/sys/unix does not carry.
+	req := struct {
+		addr      [16]byte
+		prefixlen uint32
+		ifindex   int32
+	}{prefixlen: 64, ifindex: int32(iface.Index)}
+	copy(req.addr[:], addr.To16())
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(sock), unix.SIOCSIFADDR, uintptr(unsafe.Pointer(&req)))
+	require.Zero(t, errno, "adding %s to %s", addr, name)
+}
+
+// udp6 builds an IPv6/UDP packet, with the checksum IPv6 requires.
+func udp6(src, dst net.IP, sport, dport uint16, payload string) []byte {
+	b := make([]byte, 48+len(payload))
+	b[0] = 0x60 // version 6
+	binary.BigEndian.PutUint16(b[4:], uint16(8+len(payload)))
+	b[6] = unix.IPPROTO_UDP
+	b[7] = 64 // hop limit
+	copy(b[8:24], src.To16())
+	copy(b[24:40], dst.To16())
+	udp := b[40:]
+	binary.BigEndian.PutUint16(udp[0:], sport)
+	binary.BigEndian.PutUint16(udp[2:], dport)
+	binary.BigEndian.PutUint16(udp[4:], uint16(8+len(payload)))
+	copy(udp[8:], payload)
+	// The pseudo-header: both addresses, the UDP length, the next header.
+	sum := uint32(len(udp)) + unix.IPPROTO_UDP
+	for _, words := range [][]byte{b[8:40], udp} {
+		for i := 0; i+1 < len(words); i += 2 {
+			sum += uint32(binary.BigEndian.Uint16(words[i:]))
+		}
+		if len(words)%2 == 1 {
+			sum += uint32(words[len(words)-1]) << 8
+		}
+	}
+	for sum > 0xffff {
+		sum = sum&0xffff + sum>>16
+	}
+	check := ^uint16(sum)
+	if check == 0 {
+		check = 0xffff
+	}
+	binary.BigEndian.PutUint16(udp[6:], check)
+	return b
+}
+
 // udp4 builds an IPv4/UDP packet. A zero UDP checksum means none, which
 // IPv4 allows.
 func udp4(src, dst net.IP, sport, dport uint16, payload string) []byte {
@@ -121,14 +177,49 @@ func udp4(src, dst net.IP, sport, dport uint16, payload string) []byte {
 	return b
 }
 
+// ipNet is network ("udp" or "tcp") for addr's family.
+func ipNet(network, addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+			return network + "6"
+		}
+	}
+	return network + "4"
+}
+
 func listenUDP(t *testing.T, addr string) *net.UDPConn {
 	t.Helper()
-	ua, err := net.ResolveUDPAddr("udp4", addr)
+	ua, err := net.ResolveUDPAddr(ipNet("udp", addr), addr)
 	require.NoError(t, err)
-	c, err := net.ListenUDP("udp4", ua)
+	c, err := net.ListenUDP(ipNet("udp", addr), ua)
 	require.NoError(t, err)
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+func listenTCPAt(t *testing.T, addr string) *net.TCPListener {
+	t.Helper()
+	l, err := net.Listen(ipNet("tcp", addr), addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { l.Close() })
+	return l.(*net.TCPListener)
+}
+
+// connects reports whether a TCP connection to dst lands on l.
+func connects(t *testing.T, dst string, l *net.TCPListener) bool {
+	t.Helper()
+	c, err := net.DialTimeout(ipNet("tcp", dst), dst, absent)
+	if err != nil {
+		return false
+	}
+	c.Close()
+	require.NoError(t, l.SetDeadline(time.Now().Add(arrives)))
+	a, err := l.Accept()
+	if err != nil {
+		return false
+	}
+	a.Close()
+	return true
 }
 
 // received reports what l got within wait, or "" when nothing came, and
@@ -154,7 +245,7 @@ func query(t *testing.T, addr, payload string, marked bool) {
 	if marked {
 		d.Control = MarkDNSProxySocket
 	}
-	c, err := d.Dial("udp4", addr)
+	c, err := d.Dial(ipNet("udp", addr), addr)
 	require.NoError(t, err)
 	defer c.Close()
 	_, err = c.Write([]byte(payload))
@@ -168,132 +259,209 @@ const (
 
 // TestDNSRedirect_Output: DNS this namespace sends leaves for the proxy at
 // 127.0.0.1:53, the systemd-resolved stub's included, while the proxy's own
-// marked queries and the rest of 127.0.0.0/8 go where they were sent.
+// marked queries and the rest of 127.0.0.0/8 go where they were sent. Those
+// hold in either table family; with IPv6 covered, IPv6 DNS likewise leaves
+// for [::1]:53, and without it goes where it was sent.
 func TestDNSRedirect_Output(t *testing.T) {
 	enterNetns(t)
 	addTun(t, "cw0", net.IPv4(10, 53, 0, 1))
+	addAddr6(t, "cw0", net.ParseIP("fd53::1"))
 	proxy := listenUDP(t, "127.0.0.1:53")
-	proxyTCP, err := net.Listen("tcp4", "127.0.0.1:53")
-	require.NoError(t, err)
-	t.Cleanup(func() { proxyTCP.Close() })
+	proxyTCP := listenTCPAt(t, "127.0.0.1:53")
+	proxy6 := listenUDP(t, "[::1]:53")
+	proxy6TCP := listenTCPAt(t, "[::1]:53")
 
 	// Without the redirect a query for an outside resolver leaves by cw0.
 	query(t, "10.53.0.2:53", "before", false)
 	got, _ := received(t, proxy, absent)
 	require.Empty(t, got, "the query reached the proxy with no redirect installed")
 
-	install(t, "")
+	for _, ipv6 := range []bool{false, true} {
+		r := NewDNSRedirect(discardLogger())
+		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6}))
 
-	query(t, "10.53.0.2:53", "outside", false)
-	got, _ = received(t, proxy, arrives)
-	require.Equal(t, "outside", got, "UDP DNS for an outside resolver must reach the proxy")
-
-	for _, stub := range []string{"127.0.0.53:53", "127.0.0.54:53"} {
-		query(t, stub, "stub", false)
+		query(t, "10.53.0.2:53", "outside", false)
 		got, _ = received(t, proxy, arrives)
-		require.Equal(t, "stub", got, "UDP DNS for the resolved stub at %s must reach the proxy", stub)
+		require.Equal(t, "outside", got, "ipv6 %v: UDP DNS for an outside resolver must reach the proxy", ipv6)
+
+		for _, stub := range []string{"127.0.0.53:53", "127.0.0.54:53"} {
+			query(t, stub, "stub", false)
+			got, _ = received(t, proxy, arrives)
+			require.Equal(t, "stub", got, "ipv6 %v: UDP DNS for the resolved stub at %s must reach the proxy", ipv6, stub)
+		}
+
+		for _, dst := range []string{"10.53.0.2:53", "127.0.0.53:53", "127.0.0.54:53"} {
+			require.True(t, connects(t, dst, proxyTCP), "ipv6 %v: TCP DNS for %s must reach the proxy", ipv6, dst)
+		}
+
+		query(t, "10.53.0.2:53", "marked", true)
+		got, _ = received(t, proxy, absent)
+		require.Empty(t, got, "ipv6 %v: the proxy's own marked query must not be redirected back to it", ipv6)
+
+		query(t, "127.0.0.2:53", "loopback", false)
+		got, _ = received(t, proxy, absent)
+		require.Empty(t, got, "ipv6 %v: loopback DNS other than the stub must not be redirected", ipv6)
+
+		query(t, "[fd53::2]:53", "outside6", false)
+		if ipv6 {
+			got, _ = received(t, proxy6, arrives)
+			require.Equal(t, "outside6", got, "UDP DNS for an outside IPv6 resolver must reach the proxy at [::1]:53")
+			require.True(t, connects(t, "[fd53::2]:53", proxy6TCP), "TCP DNS for an outside IPv6 resolver must reach the proxy")
+
+			query(t, "[fd53::2]:53", "marked6", true)
+			got, _ = received(t, proxy6, absent)
+			require.Empty(t, got, "the proxy's own marked IPv6 query must not be redirected back to it")
+		} else {
+			got, _ = received(t, proxy6, absent)
+			require.Empty(t, got, "an IPv4-only redirect leaves IPv6 DNS alone")
+		}
+
+		require.NoError(t, r.Teardown())
 	}
-
-	for _, dst := range []string{"10.53.0.2:53", "127.0.0.53:53", "127.0.0.54:53"} {
-		c, err := net.DialTimeout("tcp4", dst, arrives)
-		require.NoError(t, err, "TCP DNS for %s must reach the proxy", dst)
-		c.Close()
-		require.NoError(t, proxyTCP.(*net.TCPListener).SetDeadline(time.Now().Add(arrives)))
-		a, err := proxyTCP.Accept()
-		require.NoError(t, err, "the proxy's TCP listener did not get the %s connection", dst)
-		a.Close()
-	}
-
-	query(t, "10.53.0.2:53", "marked", true)
-	got, _ = received(t, proxy, absent)
-	require.Empty(t, got, "the proxy's own marked query must not be redirected back to it")
-
-	query(t, "127.0.0.2:53", "loopback", false)
-	got, _ = received(t, proxy, absent)
-	require.Empty(t, got, "loopback DNS other than the stub must not be redirected")
 }
 
 // TestDNSRedirect_InputGuard: a sport-53 packet that would open a flow from
 // outside is dropped, a reply to the proxy's own upstream query is not, and
-// loopback is exempt.
+// loopback is exempt, in either table family; an inet table guards IPv6 the
+// same way.
 func TestDNSRedirect_InputGuard(t *testing.T) {
 	enterNetns(t)
 	local, remote := net.IPv4(10, 53, 0, 1), net.IPv4(10, 53, 0, 2)
+	local6, remote6 := net.ParseIP("fd53::1"), net.ParseIP("fd53::2")
 	wire := addTun(t, "cw0", local)
+	addAddr6(t, "cw0", local6)
 	l := listenUDP(t, "10.53.0.1:40000")
+	l6 := listenUDP(t, "[fd53::1]:40000")
 
 	// The harness itself delivers before the guard exists.
 	_, err := wire.Write(udp4(remote, local, 53, 40000, "before"))
 	require.NoError(t, err)
 	got, _ := received(t, l, arrives)
 	require.Equal(t, "before", got)
-
-	install(t, "")
-
-	_, err = wire.Write(udp4(net.IPv4(10, 53, 0, 3), local, 53, 40000, "unsolicited"))
+	_, err = wire.Write(udp6(remote6, local6, 53, 40000, "before6"))
 	require.NoError(t, err)
-	got, _ = received(t, l, absent)
-	require.Empty(t, got, "an inbound sport-53 packet opening a flow must be dropped")
+	got, _ = received(t, l6, arrives)
+	require.Equal(t, "before6", got)
 
-	// The proxy's upstream query: marked, so it leaves by cw0 un-DNAT'd,
-	// and the resolver's answer rides the flow it opened.
 	marked := net.ListenConfig{Control: MarkDNSProxySocket}
-	upstream, err := marked.ListenPacket(t.Context(), "udp4", "10.53.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { upstream.Close() })
-	_, err = upstream.WriteTo([]byte("query"), &net.UDPAddr{IP: remote, Port: 53})
-	require.NoError(t, err)
-	port := uint16(upstream.LocalAddr().(*net.UDPAddr).Port)
-	_, err = wire.Write(udp4(remote, local, 53, port, "answer"))
-	require.NoError(t, err)
-	got, _ = received(t, upstream.(*net.UDPConn), arrives)
-	require.Equal(t, "answer", got, "a reply to the proxy's own query must pass the guard")
-
 	src, err := marked.ListenPacket(t.Context(), "udp4", "127.0.0.1:53")
 	require.NoError(t, err)
 	t.Cleanup(func() { src.Close() })
 	lo := listenUDP(t, "127.0.0.1:40001")
-	_, err = src.WriteTo([]byte("lo"), lo.LocalAddr())
-	require.NoError(t, err)
-	got, _ = received(t, lo, arrives)
-	require.Equal(t, "lo", got, "loopback sport-53 traffic is exempt from the guard")
+
+	for _, ipv6 := range []bool{false, true} {
+		r := NewDNSRedirect(discardLogger())
+		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6}))
+
+		_, err = wire.Write(udp4(net.IPv4(10, 53, 0, 3), local, 53, 40000, "unsolicited"))
+		require.NoError(t, err)
+		got, _ = received(t, l, absent)
+		require.Empty(t, got, "ipv6 %v: an inbound sport-53 packet opening a flow must be dropped", ipv6)
+
+		// The proxy's upstream query: marked, so it leaves by cw0 un-DNAT'd,
+		// and the resolver's answer rides the flow it opened.
+		upstream, err := marked.ListenPacket(t.Context(), "udp4", "10.53.0.1:0")
+		require.NoError(t, err)
+		_, err = upstream.WriteTo([]byte("query"), &net.UDPAddr{IP: remote, Port: 53})
+		require.NoError(t, err)
+		port := uint16(upstream.LocalAddr().(*net.UDPAddr).Port)
+		_, err = wire.Write(udp4(remote, local, 53, port, "answer"))
+		require.NoError(t, err)
+		got, _ = received(t, upstream.(*net.UDPConn), arrives)
+		require.Equal(t, "answer", got, "ipv6 %v: a reply to the proxy's own query must pass the guard", ipv6)
+		upstream.Close()
+
+		_, err = src.WriteTo([]byte("lo"), lo.LocalAddr())
+		require.NoError(t, err)
+		got, _ = received(t, lo, arrives)
+		require.Equal(t, "lo", got, "ipv6 %v: loopback sport-53 traffic is exempt from the guard", ipv6)
+
+		if ipv6 {
+			_, err = wire.Write(udp6(net.ParseIP("fd53::3"), local6, 53, 40000, "unsolicited6"))
+			require.NoError(t, err)
+			got, _ = received(t, l6, absent)
+			require.Empty(t, got, "an inbound IPv6 sport-53 packet opening a flow must be dropped")
+
+			upstream6, err := marked.ListenPacket(t.Context(), "udp6", "[fd53::1]:0")
+			require.NoError(t, err)
+			_, err = upstream6.WriteTo([]byte("query6"), &net.UDPAddr{IP: remote6, Port: 53})
+			require.NoError(t, err)
+			port := uint16(upstream6.LocalAddr().(*net.UDPAddr).Port)
+			_, err = wire.Write(udp6(remote6, local6, 53, port, "answer6"))
+			require.NoError(t, err)
+			got, _ = received(t, upstream6.(*net.UDPConn), arrives)
+			require.Equal(t, "answer6", got, "a reply to the proxy's own IPv6 query must pass the guard")
+			upstream6.Close()
+		}
+
+		require.NoError(t, r.Teardown())
+	}
 }
 
 // TestDNSRedirect_Bridge: DNS a container sends through docker0 or a br-*
 // bridge reaches the proxy's listener on the bridge IP with its source kept,
-// and DNS arriving on any other interface does not.
+// and DNS arriving on any other interface does not. With IPv6 covered and a
+// bridge IPv6 listener, IPv6 container DNS does the same.
 func TestDNSRedirect_Bridge(t *testing.T) {
 	enterNetns(t)
-	bridgeIP := net.IPv4(10, 54, 0, 1)
-	resolver := net.IPv4(8, 8, 8, 8)
+	bridgeIP, bridgeIPv6 := net.IPv4(10, 54, 0, 1), net.ParseIP("fd54::1")
+	resolver, resolver6 := net.IPv4(8, 8, 8, 8), net.ParseIP("2001:4860:4860::8888")
 	docker0 := addTun(t, "docker0", bridgeIP)
 	user := addTun(t, "br-test", net.IPv4(10, 55, 0, 1))
 	other := addTun(t, "cw0", net.IPv4(10, 56, 0, 1))
-	l := listenUDP(t, "10.54.0.1:53")
-
-	install(t, bridgeIP.String())
-
-	for _, c := range []struct {
-		wire *os.File
-		src  net.IP
-	}{{docker0, net.IPv4(10, 54, 0, 2)}, {user, net.IPv4(10, 55, 0, 2)}} {
-		_, err := c.wire.Write(udp4(c.src, resolver, 5000, 53, c.wire.Name()))
-		require.NoError(t, err)
-		got, from := received(t, l, arrives)
-		require.Equal(t, c.wire.Name(), got, "DNS on %s must reach the bridge listener", c.wire.Name())
-		require.True(t, from.IP.Equal(c.src), "DNAT must keep the container's source, got %s", from)
+	for name, addr := range map[string]string{"docker0": "fd54::1", "br-test": "fd55::1", "cw0": "fd56::1"} {
+		addAddr6(t, name, net.ParseIP(addr))
 	}
+	l := listenUDP(t, "10.54.0.1:53")
+	l6 := listenUDP(t, "[fd54::1]:53")
 
-	_, err := other.Write(udp4(net.IPv4(10, 56, 0, 2), resolver, 5000, 53, "other"))
-	require.NoError(t, err)
-	got, _ := received(t, l, absent)
-	require.Empty(t, got, "DNS arriving off a docker bridge must not be redirected")
+	for _, ipv6 := range []bool{false, true} {
+		r := NewDNSRedirect(discardLogger())
+		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6, BridgeIP: bridgeIP.String(), BridgeIPv6: bridgeIPv6.String()}))
+
+		for _, c := range []struct {
+			wire      *os.File
+			src, src6 net.IP
+		}{
+			{docker0, net.IPv4(10, 54, 0, 2), net.ParseIP("fd54::2")},
+			{user, net.IPv4(10, 55, 0, 2), net.ParseIP("fd55::2")},
+		} {
+			_, err := c.wire.Write(udp4(c.src, resolver, 5000, 53, c.wire.Name()))
+			require.NoError(t, err)
+			got, from := received(t, l, arrives)
+			require.Equal(t, c.wire.Name(), got, "ipv6 %v: DNS on %s must reach the bridge listener", ipv6, c.wire.Name())
+			require.True(t, from.IP.Equal(c.src), "DNAT must keep the container's source, got %s", from)
+
+			_, err = c.wire.Write(udp6(c.src6, resolver6, 5000, 53, c.wire.Name()+"6"))
+			require.NoError(t, err)
+			if !ipv6 {
+				got, _ = received(t, l6, absent)
+				require.Empty(t, got, "an IPv4-only redirect leaves IPv6 container DNS on %s alone", c.wire.Name())
+				continue
+			}
+			got, from = received(t, l6, arrives)
+			require.Equal(t, c.wire.Name()+"6", got, "IPv6 DNS on %s must reach the bridge's IPv6 listener", c.wire.Name())
+			require.True(t, from.IP.Equal(c.src6), "DNAT must keep the container's IPv6 source, got %s", from)
+		}
+
+		_, err := other.Write(udp4(net.IPv4(10, 56, 0, 2), resolver, 5000, 53, "other"))
+		require.NoError(t, err)
+		got, _ := received(t, l, absent)
+		require.Empty(t, got, "DNS arriving off a docker bridge must not be redirected")
+		_, err = other.Write(udp6(net.ParseIP("fd56::2"), resolver6, 5000, 53, "other6"))
+		require.NoError(t, err)
+		got, _ = received(t, l6, absent)
+		require.Empty(t, got, "IPv6 DNS arriving off a docker bridge must not be redirected")
+
+		require.NoError(t, r.Teardown())
+	}
 }
 
 // TestDNSRedirect_AheadOfHostNAT: DNS meets the redirect before the DNAT a
 // host nat table applies at dstnat, where Docker's published-port and
-// kube-proxy's service DNAT sit, whichever table registered first; the
-// proxy's own marked queries still get the host's DNAT.
+// kube-proxy's service DNAT sit, whichever table registered first and
+// whichever family the redirect's table is; the proxy's own marked queries
+// still get the host's DNAT.
 func TestDNSRedirect_AheadOfHostNAT(t *testing.T) {
 	enterNetns(t)
 	addTun(t, "cw0", net.IPv4(10, 53, 0, 1))
@@ -316,35 +484,65 @@ func TestDNSRedirect_AheadOfHostNAT(t *testing.T) {
 		}
 	}
 
-	for _, hostFirst := range []bool{true, false} {
-		var dropHost func()
-		if hostFirst {
-			dropHost = hostNAT()
+	for _, ipv6 := range []bool{false, true} {
+		for _, hostFirst := range []bool{true, false} {
+			var dropHost func()
+			if hostFirst {
+				dropHost = hostNAT()
+			}
+			r := NewDNSRedirect(discardLogger())
+			require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6}))
+			if !hostFirst {
+				dropHost = hostNAT()
+			}
+
+			query(t, "10.53.0.2:53", "job", false)
+			got, _ := received(t, proxy, arrives)
+			require.Equal(t, "job", got, "ipv6 %v, host table first %v: the job's DNS must reach the proxy", ipv6, hostFirst)
+			got, _ = received(t, service, absent)
+			require.Empty(t, got, "ipv6 %v, host table first %v: the host's DNAT must not win", ipv6, hostFirst)
+
+			query(t, "10.53.0.2:53", "upstream", true)
+			got, _ = received(t, service, arrives)
+			require.Equal(t, "upstream", got,
+				"ipv6 %v, host table first %v: the proxy's own query must get the host's DNAT", ipv6, hostFirst)
+
+			require.NoError(t, r.Teardown())
+			dropHost()
 		}
-		r := NewDNSRedirect(discardLogger())
-		require.NoError(t, r.Install(""))
-		if !hostFirst {
-			dropHost = hostNAT()
-		}
-
-		query(t, "10.53.0.2:53", "job", false)
-		got, _ := received(t, proxy, arrives)
-		require.Equal(t, "job", got, "host table first: %v: the job's DNS must reach the proxy", hostFirst)
-		got, _ = received(t, service, absent)
-		require.Empty(t, got, "host table first: %v: the host's DNAT must not win", hostFirst)
-
-		query(t, "10.53.0.2:53", "upstream", true)
-		got, _ = received(t, service, arrives)
-		require.Equal(t, "upstream", got, "host table first: %v: the proxy's own query must get the host's DNAT", hostFirst)
-
-		require.NoError(t, r.Teardown())
-		dropHost()
 	}
+}
+
+// TestDNSRedirect_FlushesIPv6Flows: an IPv6 DNS flow is flushed like an
+// IPv4 one. Conntrack tracks IPv6 here once the inet table's nat chains hook
+// it, so the flow is opened after the install, by a marked query the
+// redirect lets leave.
+func TestDNSRedirect_FlushesIPv6Flows(t *testing.T) {
+	enterNetns(t)
+	addTun(t, "cw0", net.IPv4(10, 53, 0, 1))
+	addAddr6(t, "cw0", net.ParseIP("fd53::1"))
+	r := NewDNSRedirect(discardLogger())
+	require.NoError(t, r.Install(RedirectSpec{IPv6: true}))
+	t.Cleanup(func() { _ = r.Teardown() })
+
+	dns6 := func() int {
+		conn, err := dialCt()
+		require.NoError(t, err)
+		defer conn.Close()
+		tuples, err := dumpTuples(conn, unix.AF_INET6, ctTuple.isDNS)
+		require.NoError(t, err)
+		return len(tuples)
+	}
+	query(t, "[fd53::2]:53", "flow6", true)
+	require.Equal(t, 1, dns6(), "the marked IPv6 query must leave a flow to flush")
+	require.NoError(t, FlushDNSConntrack(discardLogger()))
+	require.Zero(t, dns6(), "the flush must delete IPv6 DNS flows")
 }
 
 // TestDNSRedirect_Ownership: the table belongs to the socket that made it.
 // No other socket can delete it, a second cargowall in the namespace cannot
-// take it over, and closing the socket deletes it as surely as teardown.
+// take it over, whichever family either asks for, and closing the socket
+// deletes it as surely as teardown.
 func TestDNSRedirect_Ownership(t *testing.T) {
 	enterNetns(t)
 	requireOwnedTables(t)
@@ -358,26 +556,30 @@ func TestDNSRedirect_Ownership(t *testing.T) {
 	other.AddChain(&nftables.Chain{Name: "leftover", Table: stale})
 	require.NoError(t, other.Flush())
 	r := NewDNSRedirect(logger)
-	require.NoError(t, r.Install("10.54.0.1"))
-	want := map[string]int{"output": 8, "input": 2, "prerouting": 4}
+	require.NoError(t, r.Install(RedirectSpec{BridgeIP: "10.54.0.1"}))
+	want := map[string]int{"ip output": 8, "ip input": 2, "ip prerouting": 4}
 	require.Equal(t, want, redirectRules(t), "setup must replace an unowned table, not add to it")
 
-	err = NewDNSRedirect(logger).Install("")
-	require.ErrorIs(t, err, unix.EPERM, "a second setup must not take over a live redirect")
-	require.ErrorContains(t, err, "another process owns the table")
+	for _, ipv6 := range []bool{false, true} {
+		err = NewDNSRedirect(logger).Install(RedirectSpec{IPv6: ipv6})
+		require.ErrorIs(t, err, unix.EPERM, "ipv6 %v: a second setup must not take over a live redirect", ipv6)
+		require.ErrorContains(t, err, "another process owns the table")
+	}
 	other.DelTable(stale)
 	require.ErrorIs(t, other.Flush(), unix.EPERM, "another socket must not delete the table")
 	other.FlushRuleset()
 	_ = other.Flush()
 	require.Equal(t, want, redirectRules(t), "nothing another socket did may touch the table")
 
-	require.Error(t, NewDNSRedirect(logger).Install("fd00::1"), "an IPv6 bridge IP is refused")
-	require.Error(t, r.Install(""), "an installed redirect is not installed twice")
+	require.Error(t, NewDNSRedirect(logger).Install(RedirectSpec{BridgeIP: "fd00::1"}), "an IPv6 bridge IP is refused")
+	require.Error(t, NewDNSRedirect(logger).Install(RedirectSpec{BridgeIPv6: "10.0.0.1"}),
+		"an IPv4 bridge IPv6 is refused")
+	require.Error(t, r.Install(RedirectSpec{}), "an installed redirect is not installed twice")
 
 	require.NoError(t, r.Teardown())
 	require.Empty(t, redirectRules(t), "teardown must remove the table")
 	require.NoError(t, r.Teardown(), "a second teardown is a no-op")
-	require.Error(t, r.Install(""), "a torn-down redirect is not installed again")
+	require.Error(t, r.Install(RedirectSpec{}), "a torn-down redirect is not installed again")
 	require.Empty(t, redirectRules(t))
 
 	// Teardown registered ahead of the install, as startup does, and run
@@ -385,15 +587,43 @@ func TestDNSRedirect_Ownership(t *testing.T) {
 	// table no undo will remove.
 	early := NewDNSRedirect(logger)
 	require.NoError(t, early.Teardown(), "nothing installed, nothing to remove")
-	require.Error(t, early.Install(""))
+	require.Error(t, early.Install(RedirectSpec{}))
 	require.Empty(t, redirectRules(t))
 
 	// The socket closing without a teardown, as when the process dies.
-	r = NewDNSRedirect(logger)
-	require.NoError(t, r.Install(""))
-	require.Equal(t, map[string]int{"output": 8, "input": 2}, redirectRules(t))
-	require.NoError(t, r.conn.Close())
-	require.Empty(t, redirectRules(t), "the kernel must delete the table with the socket that owns it")
+	for _, ipv6 := range []bool{false, true} {
+		r = NewDNSRedirect(logger)
+		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6}))
+		require.NotEmpty(t, redirectRules(t))
+		require.NoError(t, r.conn.Close())
+		require.Empty(t, redirectRules(t), "ipv6 %v: the kernel must delete the table with the socket that owns it", ipv6)
+	}
+}
+
+// TestDNSRedirect_FamilySwitch: a leftover of the other family, from a run
+// that did or did not cover IPv6, goes with the install, so the host never
+// carries two redirects; an inet table holds both families' rules.
+func TestDNSRedirect_FamilySwitch(t *testing.T) {
+	enterNetns(t)
+	logger := discardLogger()
+	for _, c := range []struct {
+		from, to bool
+		want     map[string]int
+	}{
+		{false, true, map[string]int{"inet output": 10, "inet input": 2}},
+		{true, false, map[string]int{"ip output": 8, "ip input": 2}},
+	} {
+		leftover := refusedOwner(logger) // unowned, so it outlives its socket
+		require.NoError(t, leftover.Install(RedirectSpec{IPv6: c.from}))
+		require.NoError(t, leftover.conn.Close())
+		require.NotEmpty(t, redirectRules(t))
+
+		r := NewDNSRedirect(logger)
+		require.NoError(t, r.Install(RedirectSpec{IPv6: c.to}))
+		require.Equal(t, c.want, redirectRules(t), "from ipv6 %v to %v: the leftover must go", c.from, c.to)
+		require.NoError(t, r.Teardown())
+		require.Empty(t, redirectRules(t))
+	}
 }
 
 // TestDNSRedirect_Unowned: a kernel that refuses the owner flag, as those
@@ -405,10 +635,10 @@ func TestDNSRedirect_Unowned(t *testing.T) {
 	addTun(t, "cw0", net.IPv4(10, 53, 0, 1))
 	proxy := listenUDP(t, "127.0.0.1:53")
 	logger := discardLogger()
-	want := map[string]int{"output": 8, "input": 2}
+	want := map[string]int{"ip output": 8, "ip input": 2}
 
 	r := refusedOwner(logger)
-	require.NoError(t, r.Install(""), "a refused owner flag must fall back to an unowned table")
+	require.NoError(t, r.Install(RedirectSpec{}), "a refused owner flag must fall back to an unowned table")
 	require.False(t, r.owned)
 	require.Equal(t, want, redirectRules(t))
 	query(t, "10.53.0.2:53", "unowned", false)
@@ -419,20 +649,28 @@ func TestDNSRedirect_Unowned(t *testing.T) {
 	require.NoError(t, r.conn.Close())
 	require.Equal(t, want, redirectRules(t), "nothing deletes an unowned table with its socket")
 	next := refusedOwner(logger)
-	require.NoError(t, next.Install(""))
+	require.NoError(t, next.Install(RedirectSpec{}))
 	require.Equal(t, want, redirectRules(t), "the next install must replace the leftover, not add to it")
 	require.NoError(t, next.Teardown())
 	require.Empty(t, redirectRules(t))
 
+	// Teardown deletes the table of the family it installed: nothing else
+	// removes an unowned one.
+	dual := refusedOwner(logger)
+	require.NoError(t, dual.Install(RedirectSpec{IPv6: true}))
+	require.Equal(t, map[string]int{"inet output": 10, "inet input": 2}, redirectRules(t))
+	require.NoError(t, dual.Teardown())
+	require.Empty(t, redirectRules(t), "teardown must remove an unowned inet table")
+
 	// Deleted by another process: DNS went around the proxy from then on,
 	// and teardown says so rather than reporting a clean removal.
 	r = refusedOwner(logger)
-	require.NoError(t, r.Install(""))
+	require.NoError(t, r.Install(RedirectSpec{IPv6: true}))
 	other, err := nftables.New()
 	require.NoError(t, err)
-	other.DelTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: RedirectTable})
+	other.DelTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: RedirectTable})
 	require.NoError(t, other.Flush(), "an unowned table is anyone's to delete")
-	require.ErrorContains(t, r.Teardown(), "another process deleted it during the run")
+	require.ErrorContains(t, r.Teardown(), "table inet cargowall was already gone at teardown")
 	require.Empty(t, redirectRules(t))
 }
 
@@ -445,7 +683,7 @@ func TestDNSRedirect_Holder(t *testing.T) {
 		t.Skip("the redirect-holding child of TestDNSRedirect_DiesWithProcess")
 	}
 	r := NewDNSRedirect(discardLogger())
-	if err := r.Install(""); err != nil {
+	if err := r.Install(RedirectSpec{IPv6: true}); err != nil {
 		fmt.Println("setup:", err)
 		os.Exit(1)
 	}
@@ -495,7 +733,7 @@ func refusedOwner(logger *slog.Logger) *DNSRedirect {
 func requireOwnedTables(t *testing.T) {
 	t.Helper()
 	r := NewDNSRedirect(discardLogger())
-	require.NoError(t, r.Install(""))
+	require.NoError(t, r.Install(RedirectSpec{}))
 	owned := r.owned
 	require.NoError(t, r.Teardown())
 	if !owned {
@@ -503,30 +741,27 @@ func requireOwnedTables(t *testing.T) {
 	}
 }
 
-// install sets up the redirect for the rest of the test.
-func install(t *testing.T, bridgeIP string) {
-	t.Helper()
-	r := NewDNSRedirect(discardLogger())
-	require.NoError(t, r.Install(bridgeIP))
-	t.Cleanup(func() { _ = r.Teardown() })
-}
-
-// redirectRules counts the redirect table's rules per chain, read back by
-// google/nftables rather than by the code that wrote them.
+// redirectRules counts the redirect tables' rules per family and chain
+// ("ip output"), read back by google/nftables rather than by the code that
+// wrote them.
 func redirectRules(t *testing.T) map[string]int {
 	t.Helper()
 	conn, err := nftables.New()
 	require.NoError(t, err)
-	chains, err := conn.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
-	require.NoError(t, err)
 	out := map[string]int{}
-	for _, c := range chains {
-		if c.Table.Name != RedirectTable {
-			continue
-		}
-		rules, err := conn.GetRules(c.Table, c)
+	for family, name := range map[nftables.TableFamily]string{
+		nftables.TableFamilyIPv4: "ip", nftables.TableFamilyINet: "inet",
+	} {
+		chains, err := conn.ListChainsOfTableFamily(family)
 		require.NoError(t, err)
-		out[c.Name] = len(rules)
+		for _, c := range chains {
+			if c.Table.Name != RedirectTable {
+				continue
+			}
+			rules, err := conn.GetRules(c.Table, c)
+			require.NoError(t, err)
+			out[name+" "+c.Name] = len(rules)
+		}
 	}
 	return out
 }

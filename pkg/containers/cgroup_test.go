@@ -17,6 +17,7 @@
 package containers
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -132,4 +133,18 @@ func TestVerifyContainerTask(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A pid whose /proc entry is missing, or whose task dies mid-read (ESRCH),
+// is gone; one that reads but sits in another cgroup is not.
+func TestTaskGone(t *testing.T) {
+	_, err := verifyContainerTask(t.TempDir(), t.TempDir(), 4242, strings.Repeat("c", 64))
+	assert.True(t, taskGone(err), "no /proc entry: %v", err)
+	assert.True(t, taskGone(fmt.Errorf("read cgroup of pid 4242: %w", unix.ESRCH)))
+
+	procRoot := t.TempDir()
+	writeProcEntry(t, procRoot, 4242, cgroupV2Line(strings.Repeat("d", 64))+"\n", "app")
+	_, err = verifyContainerTask(procRoot, t.TempDir(), 4242, strings.Repeat("c", 64))
+	require.Error(t, err)
+	assert.False(t, taskGone(err), "another container's cgroup is a mismatch, not a gone task")
 }

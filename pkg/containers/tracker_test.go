@@ -17,8 +17,10 @@
 package containers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -323,6 +325,27 @@ type fixture struct {
 	cgroupRoot string
 	// allowLocal, when set before start, becomes Options.AllowLocalSubnet.
 	allowLocal func(netip.Prefix) error
+	// logs holds the tracker's log, Debug included.
+	logs *lockedBuffer
+}
+
+// lockedBuffer is a buffer the tracker's goroutines log into while a test
+// reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -333,6 +356,7 @@ func newFixture(t *testing.T) *fixture {
 		sink:       &recordingSink{},
 		procRoot:   t.TempDir(),
 		cgroupRoot: t.TempDir(),
+		logs:       &lockedBuffer{},
 	}
 }
 
@@ -349,7 +373,7 @@ func (f *fixture) start(t *testing.T) {
 		ProcRoot:         f.procRoot,
 		CgroupRoot:       f.cgroupRoot,
 		AllowLocalSubnet: f.allowLocal,
-	}, f.tagger, nil, auditLogger, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}, f.tagger, nil, auditLogger, slog.New(slog.NewTextHandler(f.logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	require.NoError(t, err)
 	f.tracker = tr
 	t.Cleanup(tr.Close)
@@ -513,6 +537,82 @@ func TestExecStartWithoutExecIDFallsBackToDiff(t *testing.T) {
 	ev := f.waitAttribution(t, "exec", id)
 	assert.Equal(t, uint32(4444), ev.PID)
 	assert.Contains(t, f.tagger.tagCalls(), tagCall{pid: 4444, ordinal: 11})
+}
+
+// A one-off exec (setup-buildx's post step) can finish before its pid is
+// checked. Its /proc entry is gone, and the daemon says it is no longer
+// running: there is nothing to tag, which is a skip, not a failed identity
+// check, and must not reach the job as a warning. Both ways of finding the
+// exec are covered: by the event's execID, and by diffing the container's
+// ExecIDs when the event lacks it.
+func TestExecExitedBeforeCheckIsNotAWarning(t *testing.T) {
+	for _, withExecID := range []bool{true, false} {
+		t.Run(fmt.Sprintf("execID attribute %t", withExecID), func(t *testing.T) {
+			f := newFixture(t)
+			id := strings.Repeat("6", 64)
+			f.addContainer(t, id, 4242, "172.17.0.31", false)
+			f.tagger.setOrdinal(7)
+			f.start(t)
+			f.daemon.push(startEvent(id, time.Now().UnixNano()))
+			f.waitAttribution(t, "start", id)
+
+			execID := strings.Repeat("7", 64)
+			f.daemon.setExec(execID, execInspect{ID: execID, Running: false, Pid: 4747, ContainerID: id})
+			f.daemon.updateContainer(id, func(c *containerInspect) { c.ExecIDs = []string{execID} })
+			f.tagger.setOrdinal(9)
+			attr := execID
+			if !withExecID {
+				attr = ""
+			}
+			f.daemon.push(execStartEvent(id, attr, time.Now().UnixNano()))
+
+			require.Eventually(t, func() bool { return f.tracker.tagSkipped.Load() == 1 }, waitFor, tick)
+			assert.Zero(t, f.tracker.identityRejected.Load())
+			assert.NotContains(t, f.tagger.tagCalls(), tagCall{pid: 4747, ordinal: 9})
+			assert.NotContains(t, f.logs.String(), "level=WARN")
+			assert.Contains(t, f.logs.String(), "Exec exited before it could be tagged")
+		})
+	}
+}
+
+// Two failures that are not that race keep the warning. A running exec
+// whose pid this /proc cannot see means the daemon's pids are in another
+// namespace, so every exec will fail the same way. A pid that does exist but
+// in another cgroup is the recycled pid the identity check is there for,
+// whether or not the exec has since exited.
+func TestExecIdentityFailuresStillWarn(t *testing.T) {
+	otherID := strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		name    string
+		running bool
+		proc    bool // the pid has a /proc entry, in otherID's cgroup
+	}{
+		{name: "running, pid not visible", running: true},
+		{name: "exited, pid recycled", running: false, proc: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			id := strings.Repeat("8", 64)
+			f.addContainer(t, id, 4242, "172.17.0.32", false)
+			f.tagger.setOrdinal(7)
+			f.start(t)
+			f.daemon.push(startEvent(id, time.Now().UnixNano()))
+			f.waitAttribution(t, "start", id)
+
+			execID := strings.Repeat("a", 64)
+			if tc.proc {
+				writeProcEntry(t, f.procRoot, 4848, cgroupV2Line(otherID)+"\n", "app")
+			}
+			f.daemon.setExec(execID, execInspect{ID: execID, Running: tc.running, Pid: 4848, ContainerID: id})
+			f.tagger.setOrdinal(9)
+			f.daemon.push(execStartEvent(id, execID, time.Now().UnixNano()))
+
+			require.Eventually(t, func() bool { return f.tracker.identityRejected.Load() == 1 }, waitFor, tick)
+			assert.Zero(t, f.tracker.tagSkipped.Load())
+			assert.NotContains(t, f.tagger.tagCalls(), tagCall{pid: 4848, ordinal: 9})
+			assert.Contains(t, f.logs.String(), `level=WARN msg="Exec identity check failed; not tagging"`)
+		})
+	}
 }
 
 func TestDieRemovesIPIndex(t *testing.T) {

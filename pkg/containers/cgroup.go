@@ -17,7 +17,9 @@
 package containers
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -68,4 +70,11 @@ func verifyContainerTask(procRoot, cgroupRoot string, pid int, containerID strin
 		return 0, nil // cgroup vanished or unmounted at this root: degrade to IP classification
 	}
 	return st.Ino, nil
+}
+
+// taskGone reports whether verifyContainerTask failed because pid has no
+// /proc entry, rather than because it sits in another cgroup: the task has
+// exited, or its pid is not one this /proc can see.
+func taskGone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ESRCH)
 }

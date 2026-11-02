@@ -220,7 +220,7 @@ func (t *Tracker) upgradeReconciledStart(info *containerInfo, id string, timeNan
 }
 
 func (t *Tracker) handleExecStart(ctx context.Context, containerID, execID string, timeNano int64) {
-	pid, err := t.resolveExecPid(ctx, containerID, execID)
+	pid, execID, err := t.resolveExecPid(ctx, containerID, execID)
 	if err != nil {
 		if errors.Is(err, errExecAlreadySeen) {
 			// Replayed exec_start after a stream reconnect (docker's `since`
@@ -245,6 +245,14 @@ func (t *Tracker) handleExecStart(ctx context.Context, containerID, execID strin
 	}
 
 	if _, err := verifyContainerTask(t.opts.ProcRoot, t.opts.CgroupRoot, pid, containerID); err != nil {
+		if taskGone(err) && t.execExited(ctx, execID) {
+			// A one-off exec (a post step's docker exec) finished before
+			// this check: there is no process left to tag.
+			t.tagSkipped.Add(1)
+			t.logger.Debug("Exec exited before it could be tagged; traffic stays in the container tier",
+				"container", shortID(containerID), "pid", pid)
+			return
+		}
 		t.identityRejected.Add(1)
 		t.logger.Warn("Exec identity check failed; not tagging", "container", shortID(containerID), "error", err)
 		return
@@ -280,28 +288,30 @@ func (t *Tracker) handleExecStart(ctx context.Context, containerID, execID strin
 // or logging it as a skip.
 var errExecAlreadySeen = errors.New("exec already handled")
 
-// resolveExecPid turns an exec event into the exec leader's host PID. The
-// execID attribute is the fast path; daemons that omit it fall back to
+// resolveExecPid turns an exec event into the exec leader's host PID and
+// the exec's id, which the event may not carry. The execID attribute is the
+// fast path; daemons that omit it fall back to
 // diffing the container's live ExecIDs against what we've already handled.
 // Both paths honour the seenExecs idempotency guard — the replay after a
 // stream reconnect arrives on whichever path the daemon supports.
 // The error exists for the Debug log: an unresolvable exec is expected
 // degradation (exec already exited), but WHICH failure occurred must be
 // diagnosable from a debug run.
-func (t *Tracker) resolveExecPid(ctx context.Context, containerID, execID string) (int, error) {
+func (t *Tracker) resolveExecPid(ctx context.Context, containerID, execID string) (int, string, error) {
 	ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
 	defer cancel()
 
 	if execID != "" {
 		if t.markExecSeen(containerID, execID) {
-			return 0, errExecAlreadySeen
+			return 0, "", errExecAlreadySeen
 		}
-		return t.inspectExecPid(ictx, execID)
+		pid, err := t.inspectExecPid(ictx, execID)
+		return pid, execID, err
 	}
 
 	cinsp, err := t.client.inspectContainer(ictx, containerID)
 	if err != nil {
-		return 0, fmt.Errorf("container inspect for exec fallback: %w", err)
+		return 0, "", fmt.Errorf("container inspect for exec fallback: %w", err)
 	}
 	sawSeen := false
 	for _, id := range cinsp.ExecIDs {
@@ -310,7 +320,7 @@ func (t *Tracker) resolveExecPid(ctx context.Context, containerID, execID string
 			continue
 		}
 		if pid, err := t.inspectExecPid(ictx, id); err == nil {
-			return pid, nil
+			return pid, id, nil
 		}
 	}
 	if sawSeen {
@@ -319,9 +329,21 @@ func (t *Tracker) resolveExecPid(ctx context.Context, containerID, execID string
 		// path exactly as on the execID fast path. (Approximation: an
 		// unseen exec that failed inspection alongside a seen one is also
 		// classified as replay; it would have been unattributable anyway.)
-		return 0, errExecAlreadySeen
+		return 0, "", errExecAlreadySeen
 	}
-	return 0, fmt.Errorf("no execID attribute and no unseen running exec among %d", len(cinsp.ExecIDs))
+	return 0, "", fmt.Errorf("no execID attribute and no unseen running exec among %d", len(cinsp.ExecIDs))
+}
+
+// execExited reports whether the daemon says the exec has finished. It is
+// asked only when the exec's pid has no /proc entry. That is a short exec
+// gone before the check, unless the daemon's pids are not ours to see (a
+// daemon in another pid namespace), which a still-running exec shows, and
+// which keeps the warning. So does an exec the daemon can no longer report.
+func (t *Tracker) execExited(ctx context.Context, execID string) bool {
+	ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
+	defer cancel()
+	insp, err := t.client.inspectExec(ictx, execID)
+	return err == nil && !insp.Running
 }
 
 // markExecSeen records execID under its container and reports whether it

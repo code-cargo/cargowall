@@ -106,15 +106,22 @@ struct {
 // step_task_iter. tid/tgid/ppid are global; ns_tgid is the process id
 // userspace sees. pkg/steps builds its process-tree views from these
 // instead of scanning /proc, which cannot reveal global ids from inside a
-// namespace.
+// namespace. exiting is 1 for a task already in do_exit: step_exit has run
+// or is about to, so a tag written to it would outlive it.
 struct task_iter_rec {
     __u32 tid;
     __u32 tgid;
     __u32 ppid;
     __u32 ns_tgid;
+    __u32 exiting;
 };
 
 const struct task_iter_rec *btf_anchor_task_iter_rec __attribute__((unused));
+
+// PF_EXITING from include/linux/sched.h (macros are not in BTF): set by
+// exit_signals() at the top of do_exit, before sched_process_exit fires,
+// and never cleared. A zombie still has it.
+#define PF_EXITING 0x00000004
 
 static __always_inline struct step_state *step_state(void) {
     __u32 key = 0;
@@ -140,6 +147,13 @@ static __always_inline struct step_state *step_state(void) {
 //   2. Anything else inherits the forking thread's tag, if it has one.
 //      Untagged lineages stay untagged — absence is meaningful (pre-daemon
 //      or non-runner processes).
+//
+// Both cases set the child's entries outright, a delete where there is
+// nothing to copy: the child's tid can be a recycled one that still holds
+// an entry. Userspace tags container tasks from a task walk, and a task
+// that exits between the walk and the write keeps a tag step_exit has
+// already run for; the iterator can likewise re-seed a namespace entry for
+// a task it caught exiting.
 SEC("tp_btf/sched_process_fork")
 int BPF_PROG(step_fork, struct task_struct *parent, struct task_struct *child)
 {
@@ -158,6 +172,8 @@ int BPF_PROG(step_fork, struct task_struct *parent, struct task_struct *child)
         ns_tgid = ns_tgid_of(child);
     if (ns_tgid)
         bpf_map_update_elem(&map_task_nspid, &child_tid, &ns_tgid, BPF_ANY);
+    else
+        bpf_map_delete_elem(&map_task_nspid, &child_tid);
 
     struct step_state *st = step_state();
     if (!st || !st->enabled)
@@ -179,6 +195,8 @@ int BPF_PROG(step_fork, struct task_struct *parent, struct task_struct *child)
     __u32 *ord = bpf_map_lookup_elem(&map_task_step, &parent_tid);
     if (ord)
         bpf_map_update_elem(&map_task_step, &child_tid, ord, BPF_ANY);
+    else
+        bpf_map_delete_elem(&map_task_step, &child_tid);
     return 0;
 }
 
@@ -220,7 +238,8 @@ int cg_sock_create(struct bpf_sock *ctx)
 // scopes the iteration to the opener's pid namespace — only the daemon's
 // subtree is visited — and ns_tgid_of filters, defensively, anything it
 // cannot map. Re-running it is idempotent, so container tagging takes a
-// fresh pass per call.
+// fresh pass per call. A task already exiting is listed, flagged, but not
+// seeded: step_exit may have deleted its entry already.
 SEC("iter/task")
 int step_task_iter(struct bpf_iter__task *ctx)
 {
@@ -235,8 +254,10 @@ int step_task_iter(struct bpf_iter__task *ctx)
         .tgid = t->tgid,
         .ppid = BPF_CORE_READ(t, real_parent, tgid),
         .ns_tgid = ns_tgid,
+        .exiting = (t->flags & PF_EXITING) ? 1 : 0,
     };
-    bpf_map_update_elem(&map_task_nspid, &rec.tid, &ns_tgid, BPF_ANY);
+    if (!rec.exiting)
+        bpf_map_update_elem(&map_task_nspid, &rec.tid, &ns_tgid, BPF_ANY);
     bpf_seq_write(ctx->meta->seq, &rec, sizeof(rec));
     return 0;
 }

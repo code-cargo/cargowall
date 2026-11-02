@@ -61,6 +61,14 @@ func rec(tid, tgid, ppid, nsTgid uint32) []byte {
 	return buf.Bytes()
 }
 
+// exitingRec encodes the record of a task already in do_exit.
+func exitingRec(tid, tgid, ppid, nsTgid uint32) []byte {
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.NativeEndian,
+		bpf.StepBpfTaskIterRec{Tid: tid, Tgid: tgid, Ppid: ppid, NsTgid: nsTgid, Exiting: 1})
+	return buf.Bytes()
+}
+
 func concat(recs ...[]byte) []byte {
 	var out []byte
 	for _, r := range recs {
@@ -93,6 +101,26 @@ func TestParseTaskRecords_BuildsTreeAndTranslation(t *testing.T) {
 	assert.Empty(t, snap.children[5])
 	assert.Equal(t, []uint32{100, 200, 300}, snap.subtree(100))
 	assert.Equal(t, []uint32{400}, snap.subtree(400))
+}
+
+// An exiting task contributes no tid to tag, but an exiting leader keeps
+// its place in the tree and its translation: its other threads can live on.
+func TestParseTaskRecords_ExitingTasksContributeNoTid(t *testing.T) {
+	snap := parseTaskRecords(concat(
+		exitingRec(100, 100, 1, 7), // a leader that has exited...
+		rec(101, 100, 1, 7),        // ...while one of its threads lives on
+		rec(200, 200, 100, 8),
+		exitingRec(201, 200, 100, 8), // a thread on its way out
+		exitingRec(300, 300, 1, 9),   // a zombie
+	))
+
+	assert.Equal(t, []uint32{101}, snap.tids[100])
+	assert.Equal(t, uint32(100), snap.global[7])
+	assert.Equal(t, []uint32{200}, snap.children[100])
+	assert.Equal(t, []uint32{200}, snap.tids[200])
+	assert.Empty(t, snap.tids[300])
+	assert.Equal(t, uint32(300), snap.global[9])
+	assert.Equal(t, []uint32{100, 300}, snap.children[1])
 }
 
 func TestProcSnapshot_SubtreeTerminatesOnCycle(t *testing.T) {
@@ -313,6 +341,26 @@ func TestTagContainerProcess_UnknownPidAndWalkFailureAreNoOps(t *testing.T) {
 	failing, m2 := newSnapshotTracker(t, nil, errors.New("iterator closed"))
 	failing.TagContainerProcess(50, 42)
 	assert.Error(t, m2.Lookup(uint32(1000), &got))
+}
+
+// The taggers report whether the leader holds the tag. A leader the walk
+// lists only as exiting tags nothing, descendants included.
+func TestTagContainerProcess_ReportsWhetherLeaderTagged(t *testing.T) {
+	gone := containerSnapshot()
+	delete(gone.tids, 1000)
+	tr, m := newSnapshotTracker(t, gone, nil)
+	assert.False(t, tr.TagContainerProcess(50, 42))
+	assert.False(t, tr.AdoptContainerProcess(50, 42))
+	var got uint32
+	assert.Error(t, m.Lookup(uint32(3000), &got), "a gone leader's descendants must be left alone")
+
+	live, _ := newSnapshotTracker(t, containerSnapshot(), nil)
+	assert.True(t, live.TagContainerProcess(50, 42))
+	assert.True(t, live.AdoptContainerProcess(50, 43), "a leader keeping its own tag still holds one")
+	assert.False(t, live.TagContainerProcess(999, 42))
+
+	failing, _ := newSnapshotTracker(t, nil, errors.New("iterator closed"))
+	assert.False(t, failing.TagContainerProcess(50, 42))
 }
 
 // loadTcObjects loads the tcbpf collection that owns the tracker's shared

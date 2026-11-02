@@ -50,10 +50,8 @@ func pidnsInode(t *testing.T) uint32 {
 	return ino
 }
 
-// globalTgid runs the task iterator and returns the global tgid of the
-// process numbered nsPid in this namespace — the translation pkg/steps
-// performs for the worker pid and for seeding.
-func globalTgid(t *testing.T, iter *link.Iter, nsPid int) (uint32, bool) {
+// taskRecords runs the task iterator once and returns its records.
+func taskRecords(t *testing.T, iter *link.Iter) []StepBpfTaskIterRec {
 	t.Helper()
 	rd, err := iter.Open()
 	require.NoError(t, err)
@@ -61,26 +59,40 @@ func globalTgid(t *testing.T, iter *link.Iter, nsPid int) (uint32, bool) {
 	data, err := io.ReadAll(rd)
 	require.NoError(t, err)
 	const recSize = int(unsafe.Sizeof(StepBpfTaskIterRec{}))
+	var recs []StepBpfTaskIterRec
 	for off := 0; off+recSize <= len(data); off += recSize {
-		rec := (*StepBpfTaskIterRec)(unsafe.Pointer(&data[off]))
-		if rec.Tid == rec.Tgid && int(rec.NsTgid) == nsPid {
-			return rec.Tgid, true
-		}
+		recs = append(recs, *(*StepBpfTaskIterRec)(unsafe.Pointer(&data[off])))
 	}
-	return 0, false
+	return recs
 }
 
-// TestStepFork verifies the step-attribution collection end to end on a real
-// kernel: it loads StepBpf against TcBpf's shared maps, attaches the tp_btf
-// tracepoints and the task iterator, declares the test process itself as
-// Runner.Worker (by the global tgid the iterator reports for our /proc
-// pid), forks a child, and asserts the kernel assigned it the configured
-// ordinal under its global tid, recorded its namespace pid in
-// map_task_nspid, and emitted the new-step ringbuf notification carrying
-// that namespace pid — the exact contract pkg/steps.Start builds on.
-// Requires root and kernel BTF. TestStepFork_InPidNamespace re-runs it
-// where global and namespace pids differ.
-func TestStepFork(t *testing.T) {
+// leaderRecord returns the iterator's record for the leader of the process
+// numbered nsPid in this namespace.
+func leaderRecord(t *testing.T, iter *link.Iter, nsPid int) (StepBpfTaskIterRec, bool) {
+	t.Helper()
+	for _, rec := range taskRecords(t, iter) {
+		if rec.Tid == rec.Tgid && int(rec.NsTgid) == nsPid {
+			return rec, true
+		}
+	}
+	return StepBpfTaskIterRec{}, false
+}
+
+// globalTgid runs the task iterator and returns the global tgid of the
+// process numbered nsPid in this namespace — the translation pkg/steps
+// performs for the worker pid and for seeding.
+func globalTgid(t *testing.T, iter *link.Iter, nsPid int) (uint32, bool) {
+	t.Helper()
+	rec, ok := leaderRecord(t, iter, nsPid)
+	return rec.Tgid, ok
+}
+
+// loadStepObjects loads StepBpf against TcBpf's shared maps and attaches
+// the fork and exit tracepoints and the task iterator, as pkg/steps.Start
+// does. It skips without kernel BTF; the step hooks stay disabled until a
+// test writes map_step_state, and are disabled again on cleanup.
+func loadStepObjects(t *testing.T) (*TcBpfObjects, *StepBpfObjects, *link.Iter) {
+	t.Helper()
 	tcObjs := loadBPFObjects(t)
 
 	spec, err := LoadStepBpf()
@@ -117,6 +129,24 @@ func TestStepFork(t *testing.T) {
 	iter, err := link.AttachIter(link.IterOptions{Program: objs.StepTaskIter})
 	require.NoError(t, err, "attach task iterator")
 	t.Cleanup(func() { iter.Close() })
+
+	// Disable so later tests in this package see inert step hooks.
+	t.Cleanup(func() { _ = tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{}) })
+	return tcObjs, &objs, iter
+}
+
+// TestStepFork verifies the step-attribution collection end to end on a real
+// kernel: it loads StepBpf against TcBpf's shared maps, attaches the tp_btf
+// tracepoints and the task iterator, declares the test process itself as
+// Runner.Worker (by the global tgid the iterator reports for our /proc
+// pid), forks a child, and asserts the kernel assigned it the configured
+// ordinal under its global tid, recorded its namespace pid in
+// map_task_nspid, and emitted the new-step ringbuf notification carrying
+// that namespace pid — the exact contract pkg/steps.Start builds on.
+// Requires root and kernel BTF. TestStepFork_InPidNamespace re-runs it
+// where global and namespace pids differ.
+func TestStepFork(t *testing.T) {
+	tcObjs, objs, iter := loadStepObjects(t)
 
 	rd, err := ringbuf.NewReader(objs.MapStepEvents)
 	require.NoError(t, err)
@@ -179,9 +209,89 @@ func TestStepFork(t *testing.T) {
 		return tcObjs.MapTaskStep.Lookup(childTgid, &v) != nil &&
 			tcObjs.MapTaskNspid.Lookup(childTgid, &v) != nil
 	}, 2*time.Second, 50*time.Millisecond, "exit tracepoint must delete the child's entries")
+}
 
-	// Disable so later tests in this package see inert step hooks.
-	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{}))
+// TestStepFork_RecycledTidStartsClean: a tid can come back from the pid
+// allocator still holding a tag, one userspace wrote to a task that exited
+// between its task walk and its map write, after step_exit had run. A
+// child of an untagged parent must come out untagged all the same. The
+// test steers a fork onto a chosen pid through ns_last_pid, and tries again
+// when something else on the host takes that pid first.
+func TestStepFork_RecycledTidStartsClean(t *testing.T) {
+	tcObjs, _, iter := loadStepObjects(t)
+	if self, ok := globalTgid(t, iter, os.Getpid()); !ok || int(self) != os.Getpid() {
+		t.Skip("needs the initial pid namespace, where a pid is the tid the maps are keyed by")
+	}
+	// No worker, so every fork is case 2, and no thread of this process
+	// (any of them may be the one that forks) holds a tag.
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{Enabled: 1}))
+	for _, rec := range taskRecords(t, iter) {
+		if int(rec.Tgid) == os.Getpid() {
+			_ = tcObjs.MapTaskStep.Delete(rec.Tid)
+		}
+	}
+
+	const stale = uint32(77)
+	for range 20 {
+		raw, err := os.ReadFile("/proc/sys/kernel/ns_last_pid")
+		require.NoError(t, err)
+		last, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+		require.NoError(t, err)
+		pid := last + 100
+		if _, err := os.Stat("/proc/" + strconv.Itoa(pid)); err == nil {
+			continue
+		}
+		require.NoError(t, tcObjs.MapTaskStep.Put(uint32(pid), stale))
+		require.NoError(t, os.WriteFile("/proc/sys/kernel/ns_last_pid", []byte(strconv.Itoa(pid-1)), 0))
+
+		child := exec.Command("sleep", "5")
+		require.NoError(t, child.Start())
+		landed := child.Process.Pid == pid
+		var got uint32
+		lookupErr := tcObjs.MapTaskStep.Lookup(uint32(pid), &got)
+		_ = child.Process.Kill()
+		_ = child.Wait()
+		_ = tcObjs.MapTaskStep.Delete(uint32(pid))
+		if !landed {
+			continue
+		}
+		require.ErrorIs(t, lookupErr, ebpf.ErrKeyNotExist,
+			"a child of an untagged parent kept its recycled tid's tag %d", got)
+		return
+	}
+	t.Skip("no fork landed on a chosen pid in 20 tries")
+}
+
+// TestStepTaskIter_FlagsExitingTask: the walk lists a zombie, flagged as
+// exiting, and does not put back the namespace entry step_exit deleted.
+// Userspace must not tag such a task: the tag would outlive it.
+func TestStepTaskIter_FlagsExitingTask(t *testing.T) {
+	tcObjs, _, iter := loadStepObjects(t)
+
+	child := exec.Command("true")
+	require.NoError(t, child.Start())
+	pid := child.Process.Pid
+	t.Cleanup(func() { _ = child.Wait() })
+	// Unreaped, the child stays listed after it exits.
+	require.Eventually(t, func() bool {
+		stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		if err != nil {
+			return false
+		}
+		end := strings.LastIndexByte(string(stat), ')')
+		return end > 0 && strings.HasPrefix(string(stat[end+1:]), " Z")
+	}, 2*time.Second, 10*time.Millisecond, "the child must become a zombie")
+
+	rec, ok := leaderRecord(t, iter, pid)
+	require.True(t, ok, "the walk must still list the zombie")
+	require.EqualValues(t, 1, rec.Exiting, "a zombie must be flagged as exiting")
+	var nsPid uint32
+	require.ErrorIs(t, tcObjs.MapTaskNspid.Lookup(rec.Tid, &nsPid), ebpf.ErrKeyNotExist,
+		"the walk must not re-seed an exited task's namespace entry")
+
+	self, ok := leaderRecord(t, iter, os.Getpid())
+	require.True(t, ok)
+	require.Zero(t, self.Exiting, "a live task must not be flagged")
 }
 
 // TestStepFork_InPidNamespace re-executes TestStepFork inside a fresh pid
@@ -287,7 +397,7 @@ func TestTaskIterRecLayoutMatchesBTF(t *testing.T) {
 
 	var rec StepBpfTaskIterRec
 	require.Equal(t, uint32(unsafe.Sizeof(rec)), st.Size, "struct size")
-	require.Len(t, st.Members, 4)
+	require.Len(t, st.Members, 5)
 	want := []struct {
 		name string
 		off  uintptr
@@ -296,6 +406,7 @@ func TestTaskIterRecLayoutMatchesBTF(t *testing.T) {
 		{"tgid", unsafe.Offsetof(rec.Tgid)},
 		{"ppid", unsafe.Offsetof(rec.Ppid)},
 		{"ns_tgid", unsafe.Offsetof(rec.NsTgid)},
+		{"exiting", unsafe.Offsetof(rec.Exiting)},
 	}
 	for i, w := range want {
 		require.Equal(t, w.name, st.Members[i].Name)

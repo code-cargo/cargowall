@@ -120,19 +120,29 @@ func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int
 	markerOrdinal := uint32(0)
 	var latencyMS float64
 	if identityOK && ordinal != 0 {
+		var tagged bool
 		if kind == "reconcile" {
 			// Create-only: adoption cannot tell "predates cargowall" from
 			// "wrongly swept and re-adopted", and the sentinel must never
 			// overwrite a real tag the container's original start wrote.
-			t.tagger.AdoptContainerProcess(info.initPID, ordinal)
-			t.reconciled.Add(1)
-		} else {
-			t.tagger.TagContainerProcess(info.initPID, ordinal)
+			if tagged = t.tagger.AdoptContainerProcess(info.initPID, ordinal); tagged {
+				t.reconciled.Add(1)
+			}
+		} else if tagged = t.tagger.TagContainerProcess(info.initPID, ordinal); tagged {
 			t.tagged.Add(1)
 			latencyMS = float64(time.Since(time.Unix(0, timeNano)).Microseconds()) / 1000
 			t.recordLatency(latencyMS)
 		}
-		markerOrdinal = ordinal
+		if tagged {
+			markerOrdinal = ordinal
+		} else {
+			// Exited between the identity check and the task walk: there is
+			// nothing left to upgrade either.
+			info.preDaemon = false
+			t.exitedBeforeTag.Add(1)
+			t.logger.Debug("Container exited before it could be tagged", "container", shortID(id),
+				"error", errTaskGone)
+		}
 	} else if ordinal == 0 {
 		// Started before any step boundary (or outside a workflow): stays
 		// untagged and classifies to the container-unattributed tier.
@@ -212,7 +222,12 @@ func (t *Tracker) upgradeReconciledStart(info *containerInfo, id string, timeNan
 	t.mu.Unlock()
 
 	// Identity was verified at adoption; the PID has not changed since.
-	t.tagger.TagContainerProcess(pid, ordinal)
+	if !t.tagger.TagContainerProcess(pid, ordinal) {
+		t.exitedBeforeTag.Add(1)
+		t.logger.Debug("Container exited before its attribution could be upgraded", "container", shortID(id),
+			"error", errTaskGone)
+		return
+	}
 	t.tagged.Add(1)
 	t.logger.Info("Container attribution upgraded from replayed start event",
 		"container", shortID(id), "step_ordinal", ordinal)
@@ -273,7 +288,11 @@ func (t *Tracker) handleExecStart(ctx context.Context, containerID, execID strin
 	}
 	t.pidsVisible.Store(true)
 
-	t.tagger.TagContainerProcess(pid, ordinal)
+	if !t.tagger.TagContainerProcess(pid, ordinal) {
+		t.exitedBeforeTag.Add(1)
+		t.logExecExited(containerID, execID, pid, errTaskGone)
+		return
+	}
 	t.execTagged.Add(1)
 	latencyMS := float64(time.Since(time.Unix(0, timeNano)).Microseconds()) / 1000
 	t.recordLatency(latencyMS)
@@ -302,6 +321,10 @@ func (t *Tracker) handleExecStart(ctx context.Context, containerID, execID strin
 // pid may since belong to another process, even one in the same container,
 // so it is never checked or tagged.
 var errExecExited = errors.New("exec already exited")
+
+// errTaskGone means a task passed its identity check but had exited, or was
+// exiting, by the time the step maps were written: nothing was tagged.
+var errTaskGone = errors.New("task gone before the step maps were written")
 
 // errExecAlreadySeen means the exec was handled on a previous delivery — a
 // reconnect replay, not a failure; handleExecStart returns without counting

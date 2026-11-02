@@ -53,23 +53,37 @@ type tagCall struct {
 
 // fakeTagger records TagContainerProcess calls and serves a settable
 // OrdinalAt result; both are called from the tracker's stream goroutine.
+// A pid in gone is one the task walk no longer lists: the call is recorded
+// but tags nothing.
 type fakeTagger struct {
 	mu      sync.Mutex
 	calls   []tagCall
 	ordinal uint32
+	gone    map[int]bool
 }
 
-func (f *fakeTagger) TagContainerProcess(pid int, ordinal uint32) {
+func (f *fakeTagger) TagContainerProcess(pid int, ordinal uint32) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, tagCall{pid: pid, ordinal: ordinal})
+	return !f.gone[pid]
 }
 
 // AdoptContainerProcess records like TagContainerProcess — the fake asserts
 // which pid/ordinal was written, not the map-update flag semantics (those
 // live in pkg/steps).
-func (f *fakeTagger) AdoptContainerProcess(pid int, ordinal uint32) {
-	f.TagContainerProcess(pid, ordinal)
+func (f *fakeTagger) AdoptContainerProcess(pid int, ordinal uint32) bool {
+	return f.TagContainerProcess(pid, ordinal)
+}
+
+// setGone makes pid one the task walk no longer lists.
+func (f *fakeTagger) setGone(pid int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.gone == nil {
+		f.gone = make(map[int]bool)
+	}
+	f.gone[pid] = true
 }
 
 func (f *fakeTagger) OrdinalAt(time.Time) uint32 {

@@ -393,15 +393,20 @@ func (t *Tracker) seedExisting(snap *procSnapshot) {
 	}
 }
 
-// tagTasks writes ordinal for every thread of the (global) tgid as listed
-// in snap. Seeding passes UpdateNoExist so a tid the fork tracepoint
-// already tagged keeps its kernel-assigned ordinal; container leaders pass
-// UpdateAny (see TagContainerProcess for why overwrite is safe there and
-// only there).
-func (t *Tracker) tagTasks(snap *procSnapshot, tgid, ordinal uint32, flags ebpf.MapUpdateFlags) {
+// tagTasks writes ordinal for every live thread of the (global) tgid as
+// listed in snap, and reports whether any of them holds a tag afterwards:
+// written, or already there for a create-only write. Seeding passes
+// UpdateNoExist so a tid the fork tracepoint already tagged keeps its
+// kernel-assigned ordinal; container leaders pass UpdateAny (see
+// TagContainerProcess for why overwrite is safe there and only there).
+func (t *Tracker) tagTasks(snap *procSnapshot, tgid, ordinal uint32, flags ebpf.MapUpdateFlags) bool {
+	tagged := false
 	for _, tid := range snap.tids[tgid] {
-		_ = t.taskMap.Update(tid, ordinal, flags)
+		if err := t.taskMap.Update(tid, ordinal, flags); err == nil || errors.Is(err, ebpf.ErrKeyExist) {
+			tagged = true
+		}
 	}
+	return tagged
 }
 
 // TagContainerProcess tags a container workload subtree rooted at pid.
@@ -414,7 +419,9 @@ func (t *Tracker) tagTasks(snap *procSnapshot, tgid, ordinal uint32, flags ebpf.
 // when dockerd shares it (the caller's cgroup identity check has already
 // confirmed that pid is the expected container in our /proc). A pid the
 // task walk cannot see — exited, or a dockerd outside our namespace — is
-// skipped.
+// skipped, as is a leader whose threads are all exiting. It reports
+// whether the leader holds the tag: false means nothing was tagged, and
+// the caller must not report the ordinal as applied.
 //
 // The leader's threads are written with UpdateAny: a freshly shim-forked
 // leader is untagged in the normal case, an exec re-tag into a long-lived
@@ -422,15 +429,15 @@ func (t *Tracker) tagTasks(snap *procSnapshot, tgid, ordinal uint32, flags ebpf.
 // self-heals a stale entry left by a recycled tid. Descendants are
 // create-only — children forked after an earlier tag already carry correct
 // kernel-inherited ordinals that must never be clobbered.
-func (t *Tracker) TagContainerProcess(pid int, ordinal uint32) {
+func (t *Tracker) TagContainerProcess(pid int, ordinal uint32) bool {
 	snap, leader, ok := t.resolve(pid)
-	if !ok {
-		return
+	if !ok || !t.tagTasks(snap, leader, ordinal, ebpf.UpdateAny) {
+		return false
 	}
-	t.tagTasks(snap, leader, ordinal, ebpf.UpdateAny)
 	for _, p := range snap.subtree(leader)[1:] {
 		t.tagTasks(snap, p, ordinal, ebpf.UpdateNoExist)
 	}
+	return true
 }
 
 // AdoptContainerProcess tags a container subtree like TagContainerProcess
@@ -441,15 +448,17 @@ func (t *Tracker) TagContainerProcess(pid int, ordinal uint32) {
 // start — must survive and only truly untagged tasks take the caller's
 // (sentinel) ordinal. The overwrite rationale above does not apply here:
 // adoption is not an exec re-tag, and a recycled-tid stale entry is the
-// rarer wrong to optimize for than demoting a live container.
-func (t *Tracker) AdoptContainerProcess(pid int, ordinal uint32) {
+// rarer wrong to optimize for than demoting a live container. It reports
+// whether the leader holds a tag, its own or the caller's.
+func (t *Tracker) AdoptContainerProcess(pid int, ordinal uint32) bool {
 	snap, leader, ok := t.resolve(pid)
-	if !ok {
-		return
+	if !ok || !t.tagTasks(snap, leader, ordinal, ebpf.UpdateNoExist) {
+		return false
 	}
-	for _, p := range snap.subtree(leader) {
+	for _, p := range snap.subtree(leader)[1:] {
 		t.tagTasks(snap, p, ordinal, ebpf.UpdateNoExist)
 	}
+	return true
 }
 
 // resolve takes a fresh task walk and translates a daemon-namespace pid to
@@ -494,8 +503,10 @@ func (t *Tracker) iterSnapshot() (*procSnapshot, error) {
 // parseTaskRecords decodes the iterator's stream of task_iter_rec (the
 // bpf2go-generated mirror of the C struct, so the layout has one source).
 // Threads contribute their tid to the leader's list and nothing else: they
-// share the leader's tree position and namespace pid. A trailing partial
-// record (a truncated read) is ignored.
+// share the leader's tree position and namespace pid. An exiting task
+// contributes no tid, since a tag written to it would outlive it, but an
+// exiting leader keeps its place in the tree: its other threads can still
+// be live. A trailing partial record (a truncated read) is ignored.
 func parseTaskRecords(data []byte) *procSnapshot {
 	snap := &procSnapshot{
 		tids:     make(map[uint32][]uint32),
@@ -505,7 +516,9 @@ func parseTaskRecords(data []byte) *procSnapshot {
 	const recSize = int(unsafe.Sizeof(bpf.StepBpfTaskIterRec{}))
 	for off := 0; off+recSize <= len(data); off += recSize {
 		rec := (*bpf.StepBpfTaskIterRec)(unsafe.Pointer(&data[off]))
-		snap.tids[rec.Tgid] = append(snap.tids[rec.Tgid], rec.Tid)
+		if rec.Exiting == 0 {
+			snap.tids[rec.Tgid] = append(snap.tids[rec.Tgid], rec.Tid)
+		}
 		if rec.Tid != rec.Tgid {
 			continue
 		}

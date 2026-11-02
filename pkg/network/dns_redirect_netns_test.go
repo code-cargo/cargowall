@@ -53,6 +53,16 @@ func enterNetns(t *testing.T) {
 	}
 	runtime.LockOSThread()
 	require.NoError(t, unix.Unshare(unix.CLONE_NEWNET))
+	// No duplicate address detection, so an IPv6 address is usable as soon
+	// as it is added, on every kernel: some run it even on a NOARP TUN, and
+	// a tentative address refuses to be bound. The sysctls are this thread's
+	// namespace's, and interfaces made from here on take the default.
+	for _, conf := range []string{"all", "default"} {
+		if err := os.WriteFile("/proc/sys/net/ipv6/conf/"+conf+"/accept_dad", []byte("0"), 0); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			require.NoError(t, err)
+		}
+	}
 	setLinkUp(t, "lo")
 }
 
@@ -97,8 +107,8 @@ func addTun(t *testing.T, name string, addr net.IP) *os.File {
 	return f
 }
 
-// addAddr6 gives interface name the IPv6 address addr/64. A TUN is NOARP, so
-// the address skips duplicate detection and is usable at once.
+// addAddr6 gives interface name the IPv6 address addr/64, usable at once
+// since enterNetns turns duplicate address detection off.
 func addAddr6(t *testing.T, name string, addr net.IP) {
 	t.Helper()
 	iface, err := net.InterfaceByName(name)

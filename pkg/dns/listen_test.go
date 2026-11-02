@@ -96,13 +96,29 @@ func newListenTestServer() *Server {
 }
 
 // A listener added twice is bound once, and the primary's address is not
-// added beside it: a second bind of the same address could only fail.
+// added beside it: a second bind of the same address could only fail. A
+// host serves listeners of one attribution mode, the primary's that of the
+// host sockdiag path, so a listener of the other mode there is not added,
+// and leaves the mode it would have reclassified alone. BindError says so
+// for an address it did not add.
 func TestAddListenAddr_Once(t *testing.T) {
 	s := newListenTestServer()
 	s.AddListenAddr("[::1]:53")
-	s.AddContainerListenAddr("[::1]:53")
-	s.AddListenAddr("127.0.0.1:0")
-	assert.Equal(t, []string{"[::1]:53"}, s.additionalAddrs)
+	s.AddContainerListenAddr("[::1]:53")   // a duplicate
+	s.AddContainerListenAddr("[::1]:5353") // the host already serves the sockdiag path
+	s.AddContainerListenAddr("127.0.0.1:53")
+	s.AddListenAddr("127.0.0.1:0") // the primary
+	s.AddContainerListenAddr("127.0.0.2:53")
+	s.AddContainerListenAddr("127.0.0.2:53")
+	s.AddListenAddr("127.0.0.2:5353") // the host already serves containers
+	s.AddListenAddr("not an address")
+	assert.Equal(t, []string{"[::1]:53", "127.0.0.2:53"}, s.additionalAddrs)
+	assert.Equal(t, map[string]listenerAttribution{"127.0.0.2": attributeContainerIP}, s.listenerModes)
+
+	for _, addr := range []string{"[::1]:5353", "127.0.0.1:53", "127.0.0.2:5353", "not an address", "192.0.2.9:53"} {
+		require.ErrorIs(t, s.BindError(addr), errNotAdded, addr)
+	}
+	assert.NoError(t, s.BindError("127.0.0.1:0"), "the primary is bound once Ready closes")
 }
 
 // The primary binds over UDP and TCP both or neither too, and either half

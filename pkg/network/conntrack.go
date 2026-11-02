@@ -245,12 +245,12 @@ func dialCt() (*netlink.Conn, error) {
 }
 
 // dumpTuples dumps family's conntrack table over conn, AF_UNSPEC for both
-// families' entries, keeping the tuples keep() accepts (nil keeps all). Best-effort by design: ctnetlink dumps
-// carry no consistency signal (the conntrack dump path never stamps
-// NLM_F_DUMP_INTR), so an entry that moves during the walk can be missed —
-// the flush makes no completeness claim. Unparseable entries are skipped,
-// not fatal: an entry we cannot address for deletion is one we could not
-// act on anyway.
+// families' entries, keeping the tuples keep() accepts (nil keeps all).
+// Best-effort by design: ctnetlink dumps carry no consistency signal (the
+// conntrack dump path never stamps NLM_F_DUMP_INTR), so an entry that moves
+// during the walk can be missed — the flush makes no completeness claim.
+// Unparseable entries are skipped, not fatal: an entry we cannot address for
+// deletion is one we could not act on anyway.
 func dumpTuples(conn *netlink.Conn, family uint8, keep func(ctTuple) bool) ([]ctTuple, error) {
 	msgs, err := conn.Execute(netlink.Message{
 		Header: netlink.Header{
@@ -360,15 +360,15 @@ func flushAttempt(logger *slog.Logger, ipv6 bool) error {
 }
 
 // FlushDNSConntrack deletes every conntrack entry whose original-direction
-// destination port is 53 (TCP or UDP): IPv4 ones, and IPv6 ones with ipv6,
-// when the redirect covers IPv6 too. One it does not cover keeps its flows. nat is evaluated only on a
-// flow's first packet and the verdict replayed from its conntrack entry, so
-// DNS flow state predating the redirect bypasses the proxy — and state
-// surviving teardown keeps DNAT'ing to the dead proxy — until deleted.
-// Scoped to port 53 (a full flush would churn unrelated NAT state) and
-// best-effort: the redirect stands regardless, and a returned error
-// names how far the flush got. Mechanics, collateral analysis, and
-// measurements: design.md.
+// destination port is 53 (TCP or UDP): IPv4 ones, and IPv6 ones with ipv6, when
+// the redirect covers IPv6 too. One it does not cover keeps its flows. nat is
+// evaluated only on a flow's first packet and the verdict replayed from its
+// conntrack entry, so DNS flow state predating the redirect bypasses the proxy
+// — and state surviving teardown keeps DNAT'ing to the dead proxy — until
+// deleted. Scoped to port 53 (a full flush would churn unrelated NAT state) and
+// best-effort: the redirect stands regardless, and a returned error names how
+// far the flush got. Mechanics, collateral analysis, and measurements:
+// design.md.
 func FlushDNSConntrack(logger *slog.Logger, ipv6 bool) error {
 	var lastErr error
 	for range ctFlushAttempts {

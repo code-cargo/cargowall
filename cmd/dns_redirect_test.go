@@ -28,19 +28,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// IPv6 is covered when the proxy holds its IPv6 listener. When it does
-// not, that is a gap only where the host has IPv6 for DNS to leave by, and
-// the reason says which of no IPv6 loopback or a held port it is.
-func TestDecideIPv6(t *testing.T) {
+// IPv6 is covered when the proxy holds its IPv6 listener and the kernel took
+// the inet table. Another process holding the port is a gap wherever it is:
+// a resolver anyone can ask at ::1. Anything else is a gap only where the
+// host has IPv6 for DNS to leave by, and the reason says which it is.
+func TestIPv6Gap(t *testing.T) {
+	refused := errors.New("nftables: installing table inet cargowall: address family not supported")
 	for _, c := range []struct {
-		name     string
-		bindErr  error
-		hostIPv6 bool
-		cover    bool
-		gap      string
+		name             string
+		bindErr, refused error
+		hostIPv6         bool
+		gap              string
 	}{
-		{name: "bound", hostIPv6: true, cover: true},
-		{name: "bound, no other IPv6", cover: true},
+		{name: "covered", hostIPv6: true},
+		{name: "covered, no other IPv6"},
 		{
 			name: "no ::1, host IPv6", bindErr: fmt.Errorf("udp6: %w", unix.EADDRNOTAVAIL), hostIPv6: true,
 			gap: "loopback has no IPv6 address",
@@ -48,13 +49,21 @@ func TestDecideIPv6(t *testing.T) {
 		{name: "no IPv6 at all", bindErr: fmt.Errorf("udp6: %w", unix.EAFNOSUPPORT)},
 		{
 			name: "port held, host IPv6", bindErr: fmt.Errorf("tcp6: %w", unix.EADDRINUSE), hostIPv6: true,
-			gap: "the proxy cannot listen on [::1]:53: tcp6: address already in use",
+			gap: "another process holds [::1]:53",
 		},
-		{name: "port held, no other IPv6", bindErr: unix.EADDRINUSE},
+		{
+			name: "port held, no other IPv6", bindErr: fmt.Errorf("udp6: %w", unix.EADDRINUSE),
+			gap: "another process holds [::1]:53",
+		},
+		{
+			name: "cannot bind, host IPv6", bindErr: fmt.Errorf("udp6: %w", unix.EACCES), hostIPv6: true,
+			gap: "the proxy cannot listen on [::1]:53: udp6: permission denied",
+		},
+		{name: "inet refused, host IPv6", refused: refused, hostIPv6: true, gap: "the kernel took no inet table"},
+		{name: "inet refused, no other IPv6", refused: refused},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			cover, gap := decideIPv6(c.bindErr, func() bool { return c.hostIPv6 })
-			assert.Equal(t, c.cover, cover)
+			gap := ipv6Gap(c.bindErr, c.refused, func() bool { return c.hostIPv6 })
 			if c.gap == "" {
 				assert.Empty(t, gap)
 			} else {

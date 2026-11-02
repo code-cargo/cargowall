@@ -54,6 +54,8 @@ type Server struct {
 	// Start has bound every listener.
 	optionalAddrs []string
 	bindErrs      map[string]error
+	readyOnce     sync.Once // makes ready
+	readyClose    sync.Once // closes it, once however often Start runs
 	ready         chan struct{}
 	servers       []*dns.Server // All running servers
 
@@ -145,7 +147,6 @@ func NewServer(cfg *config.Manager, fw firewall.Firewall, upstream, listenAddr s
 		cnameAllowed:  newLRUCache[string, derivedAllow](10000),
 		preResolved:   newLRUCache[string, struct{}](1000),
 		listenerModes: make(map[string]listenerAttribution),
-		ready:         make(chan struct{}),
 	}
 }
 
@@ -430,30 +431,18 @@ func (s *Server) Start(ctx context.Context) error {
 	// A bind failure is fatal only for the PRIMARY address: without
 	// 127.0.0.1:53 there is no proxy and the daemon must not come up claiming
 	// one. An optional address (AddOptionalListenAddr) binds whole or not at
-	// all, and its failure is its caller's to judge. A secondary address (the docker bridge listener) held by
-	// a leftover process must NOT take down the whole daemon — the proxy
-	// serves every other address, exactly as it did when each listener bound
-	// itself inside ListenAndServe. The fatal path shuts down whatever was
-	// already bound so nothing leaks past the error return.
+	// all, and its failure is its caller's to judge. A secondary address (the
+	// docker bridge listener) held by a leftover process must NOT take down the
+	// whole daemon — the proxy serves every other address, exactly as it did
+	// when each listener bound itself inside ListenAndServe. The fatal path
+	// shuts down whatever was already bound so nothing leaks past the error
+	// return.
 	failStart := func(addr, proto string, err error) error {
-		for _, srv := range s.servers {
-			if serr := srv.Shutdown(); serr != nil {
-				// Shutdown refuses until ActivateAndServe has marked the
-				// server started ("server not started") and in that case
-				// does NOT close the conn we bound — close it directly, or
-				// the :53 socket and its serve goroutine outlive the error.
-				if srv.PacketConn != nil {
-					_ = srv.PacketConn.Close()
-				}
-				if srv.Listener != nil {
-					_ = srv.Listener.Close()
-				}
-			}
-		}
-		s.servers = nil
+		s.shutdownServers()
 		return fmt.Errorf("failed to listen on %s/%s: %w", addr, proto, err)
 	}
 
+	s.servers = nil
 	s.bindErrs = make(map[string]error)
 	for _, addr := range allAddrs {
 		if slices.Contains(s.optionalAddrs, addr) {
@@ -498,7 +487,7 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 		}
 	}
-	close(s.ready)
+	s.readyClose.Do(func() { close(s.readyCh()) })
 
 	// Keep reference to primary server for compatibility
 	if len(s.servers) > 0 {
@@ -507,15 +496,8 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Wait for context cancellation
 	<-ctx.Done()
-
-	// Shutdown all servers
-	var lastErr error
-	for _, srv := range s.servers {
-		if err := srv.Shutdown(); err != nil {
-			lastErr = err
-		}
-	}
-	return lastErr
+	s.shutdownServers()
+	return nil
 }
 
 // handleDNSQuery processes DNS queries

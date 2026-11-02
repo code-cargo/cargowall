@@ -44,7 +44,14 @@ func (s *Server) AddOptionalListenAddr(addr string) {
 
 // Ready is closed once Start has bound its listeners. A primary that cannot
 // bind ends Start with its error instead, and Ready stays open.
-func (s *Server) Ready() <-chan struct{} { return s.ready }
+func (s *Server) Ready() <-chan struct{} { return s.readyCh() }
+
+// readyCh is Ready's channel, made on first use so that a Server not built
+// by NewServer has one too.
+func (s *Server) readyCh() chan struct{} {
+	s.readyOnce.Do(func() { s.ready = make(chan struct{}) })
+	return s.ready
+}
 
 // BindError is why an optional listener did not bind, nil when it did.
 // Valid once Ready is closed.
@@ -86,6 +93,26 @@ func (s *Server) serveOn(addr, proto string, pc net.PacketConn, ln net.Listener)
 			s.logger.Error("DNS server error", "error", err, "addr", addr)
 		}
 	}()
+}
+
+// shutdownServers stops every server Start bound. Shutdown refuses until
+// ActivateAndServe has marked a server started ("server not started", the
+// only error it returns without a deadline), and then it does NOT close the
+// conn we bound: close it directly, or a cancel that lands right after Ready
+// leaves the :53 socket and its serve goroutine behind.
+func (s *Server) shutdownServers() {
+	for _, srv := range s.servers {
+		if srv.Shutdown() == nil {
+			continue
+		}
+		if srv.PacketConn != nil {
+			_ = srv.PacketConn.Close()
+		}
+		if srv.Listener != nil {
+			_ = srv.Listener.Close()
+		}
+	}
+	s.servers = nil
 }
 
 // listenProtos are the networks a listener on addr binds: IPv6 for an IPv6

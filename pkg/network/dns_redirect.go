@@ -136,11 +136,12 @@ func HostIPv6() bool {
 //     127.0.0.1, the proxy's listen address, is never DNAT'd;
 //   - with ipv6, IPv6 DNS likewise goes to the proxy at ProxyAddrIPv6, all
 //     but what is sent to ::1 itself. IPv6 has no resolved stub to send to.
-//     A socket bound to an interface, as connecting to a link-local resolver
-//     binds one, cannot reach ::1 once DNAT'd: the kernel's reroute keeps it
-//     to that interface, and the send fails with ENETUNREACH. That is DNS
-//     that reaches no resolver, not one around the proxy; an unbound socket
-//     sending to the same resolver reaches the proxy.
+//     DNS for a link-local resolver gets no answer at all: a socket
+//     connected to one is bound to its interface, which keeps the DNAT'd
+//     packet from ::1 (ENETUNREACH at once), and an unbound socket's query
+//     reaches the proxy, whose answer, to a link-local source seen on
+//     loopback, cannot be routed back, so the client times out. That is DNS
+//     that reaches no resolver, not one around the proxy.
 //
 // input, a filter hook: an inbound sport-53 packet off loopback must not
 // CREATE a flow. A reply racing the conntrack flush would re-create it
@@ -281,10 +282,11 @@ func NewDNSRedirect(logger *slog.Logger) *DNSRedirect {
 // was. It first replaces a table of the same name that no socket owns (add,
 // delete, add: the first add makes the delete safe when there is none). A
 // table another live socket owns, such as a cargowall already running in
-// this network namespace, refuses that add, and Install fails. Before it, a
-// leftover of the other family, from a run with or without IPv6, is removed
-// the same way; that removal is its own transaction, so a kernel that has
-// no such family does not fail the install.
+// this network namespace, refuses that add, and Install fails. Once the
+// table is in, a leftover of the other family, from a run with or without
+// IPv6, is removed the same way, in a transaction of its own, so a kernel
+// that has no such family does not fail the install; a refusal there takes
+// the new table back out (see installFamily).
 //
 // The table is asked for owned, and the kernel's answer decides rather
 // than its version: one that refuses the flag, as kernels before 5.12 do
@@ -319,7 +321,7 @@ func (r *DNSRedirect) Install(spec RedirectSpec) error {
 		}
 	}
 	conn, owned, err := r.installFamily(fam, ipv6, bridge)
-	if err != nil && ipv6 && !errors.Is(err, unix.EPERM) {
+	if err != nil && ipv6 && !errors.Is(err, unix.EPERM) && !errors.Is(err, errLeftover) {
 		r.ipv6Refused = err
 		fam, ipv6 = familyIP, false
 		conn, owned, err = r.installFamily(fam, ipv6, bridge)
@@ -363,20 +365,36 @@ func inetRefused(err error) bool {
 	return errors.Is(err, unix.EAFNOSUPPORT) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOENT)
 }
 
+// errLeftover marks a failure to remove the other family's leftover, which
+// says nothing of whether the kernel takes the install's own family.
+var errLeftover = errors.New("other family's table")
+
 // installFamily installs the table as family fam, owned where the kernel
 // allows, and then removes a leftover of the other family, so that a
 // failed install leaves the host as it was and a refusal there can only be
-// another process's table.
+// another process's table. That refusal takes the new table back out: on
+// the socket that made it, and failing that on a new one, since an unowned
+// table outlives its socket. One that still stands is named in the error.
 func (r *DNSRedirect) installFamily(fam tableFamily, ipv6 bool, bridge net.IP) (*netlink.Conn, bool, error) {
 	conn, owned, err := r.installOwned(fam, ipv6, bridge)
 	if err != nil {
 		return nil, false, err
 	}
-	if err := removeLeftover(conn, fam.other()); err != nil {
-		if msg, merr := delTableMsg(fam); merr == nil {
-			_ = transact(conn, []netlink.Message{msg})
+	if err := removeLeftover(fam.other()); err != nil {
+		undo, uerr := delTableMsg(fam)
+		if uerr == nil {
+			uerr = transact(conn, []netlink.Message{undo})
 		}
 		_ = conn.Close()
+		if uerr != nil && !owned {
+			if uerr = deleteTable(fam); errors.Is(uerr, unix.ENOENT) {
+				uerr = nil
+			}
+		}
+		if uerr != nil && !owned {
+			return nil, false, fmt.Errorf("%w; and the table installed before it stays until removed "+
+				"(nft delete table %s %s): %v", err, fam, RedirectTable, uerr)
+		}
 		return nil, false, err
 	}
 	return conn, owned, nil
@@ -411,22 +429,29 @@ func (r *DNSRedirect) installOwned(fam tableFamily, ipv6 bool, bridge net.IP) (*
 }
 
 // removeLeftover removes a table of family fam that no socket owns (add,
-// delete), one an earlier run that did or did not cover IPv6 left, from
-// conn. A kernel that has no such family (EAFNOSUPPORT, or EOPNOTSUPP before
-// 6.8) has no leftover to remove. Any other failure, a live socket's table
-// refusing (EPERM) above all, fails the install, as it would for the
-// install's own family: a leftover kept would be a second redirect.
-func removeLeftover(conn *netlink.Conn, fam tableFamily) error {
+// delete), one an earlier run that did or did not cover IPv6 left. A kernel
+// that has no such family (EAFNOSUPPORT, or EOPNOTSUPP before 6.8) has no
+// leftover to remove. Any other failure, a live socket's table refusing
+// (EPERM) above all, fails the install, as it would for the install's own
+// family: a leftover kept would be a second redirect. It runs on a socket of
+// its own: a refused batch leaves the delete's answer queued, which on the
+// redirect's socket a later transaction would read as its own.
+func removeLeftover(fam tableFamily) error {
 	create, errCreate := newTableMsg(fam, 0)
 	del, errDel := delTableMsg(fam)
 	if err := errors.Join(errCreate, errDel); err != nil {
 		return fmt.Errorf("nftables: %w", err)
 	}
-	err := transact(conn, []netlink.Message{create, del})
+	conn, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
+	if err != nil {
+		return fmt.Errorf("nftables: %w: %w%s", errLeftover, err, installHint(err))
+	}
+	defer conn.Close()
+	err = transact(conn, []netlink.Message{create, del})
 	if err == nil || errors.Is(err, unix.EAFNOSUPPORT) || errors.Is(err, unix.EOPNOTSUPP) {
 		return nil
 	}
-	return fmt.Errorf("nftables: removing table %s %s: %w%s", fam, RedirectTable, err, installHint(err))
+	return fmt.Errorf("nftables: removing %w %s %s: %w%s", errLeftover, fam, RedirectTable, err, installHint(err))
 }
 
 // installTable runs one install transaction, the table of family fam with

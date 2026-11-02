@@ -148,3 +148,18 @@ func TestStart_OptionalListenerBindsWholeOrNot(t *testing.T) {
 		})
 	}
 }
+
+// Ready closes once however often Start runs, and a Server not built by
+// NewServer has one too.
+func TestReady_ClosesOnce(t *testing.T) {
+	s := newListenTestServer()
+	for range 2 {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- s.Start(ctx) }()
+		<-s.Ready()
+		cancel()
+		require.NoError(t, <-done)
+	}
+	assert.NotNil(t, (&Server{}).Ready())
+}

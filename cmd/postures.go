@@ -149,12 +149,12 @@ func (p *postureLedger) lines() []postureLine {
 	return out
 }
 
-// lose reports that posture could not come up. Every way a layer fails
-// leaves it computing no verdict, so the layer goes to off, keeping the
-// first reason; the DNS redirect alone can stay in place in part (loseTo). The ledger owns the log line. On the
-// fatal path the failure sentinel is what leaves the process — write runs
-// only once both raises succeed — so the in-memory mark there serves the
-// log and the ledger's own consistency, nothing downstream.
+// lose reports that posture could not come up. Every way a layer fails leaves
+// it computing no verdict, so the layer goes to off, keeping the first reason;
+// the DNS redirect alone can stay in place in part (loseTo). The ledger owns
+// the log line. On the fatal path the failure sentinel is what leaves the
+// process — write runs only once both raises succeed — so the in-memory mark
+// there serves the log and the ledger's own consistency, nothing downstream.
 //
 // A fail-closed rung returns an error the caller must fail startup with: TC
 // egress would still police post-NAT traffic, but the job would run without

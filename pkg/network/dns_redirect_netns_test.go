@@ -358,9 +358,10 @@ func TestDNSRedirect_Output(t *testing.T) {
 }
 
 // TestDNSRedirect_LinkLocalIPv6: DNS for a link-local resolver never goes
-// around the proxy. A socket connected to one is bound to its interface, so
-// once DNAT'd to ::1 the kernel cannot route it and the send fails at once;
-// an unbound socket's query reaches the proxy.
+// around the proxy, nor gets answered. A socket connected to one is bound to
+// its interface, so once DNAT'd to ::1 the kernel cannot route it and the
+// send fails at once; an unbound socket's query reaches the proxy, whose
+// answer to a link-local source seen on loopback cannot be routed back.
 func TestDNSRedirect_LinkLocalIPv6(t *testing.T) {
 	enterNetns(t)
 	addTun(t, "cw0", net.IPv4(10, 53, 0, 1))
@@ -387,8 +388,10 @@ func TestDNSRedirect_LinkLocalIPv6(t *testing.T) {
 	defer unbound.Close()
 	_, err = unbound.WriteTo([]byte("unbound"), resolver)
 	require.NoError(t, err)
-	got, _ = received(t, proxy6, arrives)
-	require.Equal(t, "unbound", got, "an unbound link-local query must reach the proxy")
+	got, from := received(t, proxy6, arrives)
+	require.Equal(t, "unbound", got, "an unbound link-local query must reach the proxy, not the resolver")
+	_, err = proxy6.WriteToUDP([]byte("answer"), from)
+	require.ErrorIs(t, err, unix.ENETUNREACH, "the proxy's answer to a link-local source cannot be routed back")
 }
 
 // TestDNSRedirect_InputGuard: a sport-53 packet that would open a flow from
@@ -568,7 +571,6 @@ func TestDNSRedirect_AheadOfHostNAT(t *testing.T) {
 			r := NewDNSRedirect(discardLogger())
 			require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6}))
 			t.Cleanup(func() { _ = r.Teardown() }) // a failure above skips the Teardown below
-			t.Cleanup(func() { _ = r.Teardown() }) // a failure above skips the Teardown below
 			if !hostFirst {
 				dropHost = hostNAT()
 			}
@@ -635,7 +637,7 @@ func TestDNSRedirect_InetRefused(t *testing.T) {
 	got, _ := received(t, proxy, arrives)
 	require.Equal(t, "v4", got, "the IPv4-only redirect must still redirect")
 	require.NoError(t, NewDNSRedirect(discardLogger()).IPv6Refused(), "nothing refused before an install")
-	require.NoError(t, removeLeftover(r.conn, 0x80), "a family the kernel lacks has no leftover, and must not fail the install")
+	require.NoError(t, removeLeftover(0x80), "a family the kernel lacks has no leftover, and must not fail the install")
 }
 
 // TestDNSRedirect_Ownership: the table belongs to the socket that made it.

@@ -289,6 +289,7 @@ func TestDNSRedirect_Output(t *testing.T) {
 	for _, ipv6 := range []bool{false, true} {
 		r := NewDNSRedirect(discardLogger())
 		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6}))
+		t.Cleanup(func() { _ = r.Teardown() }) // a failure above skips the Teardown below
 
 		query(t, "10.53.0.2:53", "outside", false)
 		got, _ = received(t, proxy, arrives)
@@ -396,6 +397,7 @@ func TestDNSRedirect_InputGuard(t *testing.T) {
 	for _, ipv6 := range []bool{false, true} {
 		r := NewDNSRedirect(discardLogger())
 		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6}))
+		t.Cleanup(func() { _ = r.Teardown() }) // a failure above skips the Teardown below
 
 		_, err = wire.Write(udp4(net.IPv4(10, 53, 0, 3), local, 53, 40000, "unsolicited"))
 		require.NoError(t, err)
@@ -464,6 +466,7 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 	for _, ipv6 := range []bool{false, true} {
 		r := NewDNSRedirect(discardLogger())
 		require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6, BridgeIP: bridgeIP.String()}))
+		t.Cleanup(func() { _ = r.Teardown() }) // a failure above skips the Teardown below
 
 		for _, c := range []struct {
 			wire      *os.File
@@ -538,6 +541,8 @@ func TestDNSRedirect_AheadOfHostNAT(t *testing.T) {
 			}
 			r := NewDNSRedirect(discardLogger())
 			require.NoError(t, r.Install(RedirectSpec{IPv6: ipv6}))
+			t.Cleanup(func() { _ = r.Teardown() }) // a failure above skips the Teardown below
+			t.Cleanup(func() { _ = r.Teardown() }) // a failure above skips the Teardown below
 			if !hostFirst {
 				dropHost = hostNAT()
 			}
@@ -604,7 +609,7 @@ func TestDNSRedirect_InetRefused(t *testing.T) {
 	got, _ := received(t, proxy, arrives)
 	require.Equal(t, "v4", got, "the IPv4-only redirect must still redirect")
 	require.NoError(t, NewDNSRedirect(discardLogger()).IPv6Refused(), "nothing refused before an install")
-	require.NoError(t, removeLeftover(0x80), "a family the kernel lacks has no leftover, and must not fail the install")
+	require.NoError(t, removeLeftover(r.conn, 0x80), "a family the kernel lacks has no leftover, and must not fail the install")
 }
 
 // TestDNSRedirect_Ownership: the table belongs to the socket that made it.

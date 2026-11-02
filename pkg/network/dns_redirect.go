@@ -98,45 +98,19 @@ type RedirectSpec struct {
 	BridgeIP string
 }
 
-// LoopbackIPv6 reports whether loopback holds ::1 in this network
-// namespace: whether the proxy can listen at ProxyAddrIPv6. A namespace with
-// IPv6 disabled, as container runtimes leave one on an IPv4-only network,
-// has none.
-func LoopbackIPv6() bool {
-	lo, err := net.InterfaceByName("lo")
-	if err != nil {
-		return false
-	}
-	return hasIPv6(lo, func(ip net.IP) bool { return ip.Equal(net.IPv6loopback) })
-}
-
-// HostIPv6 reports whether any interface other than loopback has an IPv6
-// address, link-local included, since DNS to an on-link resolver leaves by
-// one: whether IPv6 DNS can leave this namespace, and so whether a redirect
-// that does not cover IPv6 leaves a way around the proxy. Interfaces that
-// cannot be listed count as IPv6, the side that does not leave one
+// HostIPv6 reports whether this network namespace has an IPv6 address
+// other than loopback's, link-local included, since DNS to an on-link
+// resolver leaves by one: whether IPv6 DNS can leave it, and so whether a
+// redirect that does not cover IPv6 leaves a way around the proxy. Addresses
+// that cannot be listed count as IPv6, the side that leaves no gap
 // unreported.
 func HostIPv6() bool {
-	ifaces, err := net.Interfaces()
+	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return true
 	}
-	for i := range ifaces {
-		if ifaces[i].Flags&net.FlagLoopback == 0 && hasIPv6(&ifaces[i], func(net.IP) bool { return true }) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasIPv6 reports whether iface holds an IPv6 address match accepts.
-func hasIPv6(iface *net.Interface, match func(net.IP) bool) bool {
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return false
-	}
 	for _, a := range addrs {
-		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() == nil && match(ipnet.IP) {
+		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() == nil && !ipnet.IP.IsLoopback() {
 			return true
 		}
 	}
@@ -273,8 +247,8 @@ type DNSRedirect struct {
 	// without owned tables. Zero asks for an unowned table outright.
 	ownerFlag uint32
 	// inet is the family Install asks for first with spec.IPv6:
-	// familyInet, or one the kernel refuses when a test stands in for a
-	// kernel without inet tables.
+	// familyInet when zero, or one the kernel refuses when a test stands in
+	// for a kernel without inet tables.
 	inet tableFamily
 
 	mu     sync.Mutex
@@ -285,6 +259,9 @@ type DNSRedirect struct {
 	// ipv6Refused is why the kernel took no inet table, when spec.IPv6 asked
 	// for one and the redirect went in IPv4 only.
 	ipv6Refused error
+	// ownerRefused remembers the kernel refusing the owner flag, so a second
+	// family's install does not ask again.
+	ownerRefused bool
 }
 
 // NewDNSRedirect returns a redirect to Install. Register its Teardown
@@ -313,7 +290,10 @@ func NewDNSRedirect(logger *slog.Logger) *DNSRedirect {
 // than its version: one that refuses the flag, as kernels before 5.12 do
 // (EINVAL there, EOPNOTSUPP for a flag a later kernel does not know), gets
 // the same transaction again with the table unowned. Likewise a kernel that
-// refuses an inet table gets the IPv4-only one, and IPv6Refused says why.
+// will not take the inet table, for any reason but another process holding
+// the redirect (EPERM), gets the IPv4-only one, and IPv6Refused says why: an
+// IPv4 redirect is never lost to a part of the kernel only IPv6 needs. When
+// the ip table fails the same way, that is the error returned.
 func (r *DNSRedirect) Install(spec RedirectSpec) error {
 	var bridge net.IP
 	if spec.BridgeIP != "" {
@@ -334,9 +314,12 @@ func (r *DNSRedirect) Install(spec RedirectSpec) error {
 	fam, ipv6 := familyIP, false
 	if spec.IPv6 {
 		fam, ipv6 = r.inet, true
+		if fam == 0 {
+			fam = familyInet
+		}
 	}
 	conn, owned, err := r.installFamily(fam, ipv6, bridge)
-	if err != nil && ipv6 && inetRefused(err) {
+	if err != nil && ipv6 && !errors.Is(err, unix.EPERM) {
 		r.ipv6Refused = err
 		fam, ipv6 = familyIP, false
 		conn, owned, err = r.installFamily(fam, ipv6, bridge)
@@ -373,20 +356,35 @@ func (r *DNSRedirect) IPv6Refused() error {
 }
 
 // inetRefused reports whether an install of the inet table failed for want
-// of the family itself, which an ip table may not share: the family refused
-// (EAFNOSUPPORT, or EOPNOTSUPP before 6.8 rejected unknown families
-// outright), or its nat chain type missing (ENOENT). A cause both share,
-// such as no nat at all, fails the ip table the same way.
+// of the family itself: the family refused (EAFNOSUPPORT, or EOPNOTSUPP
+// before 6.8 rejected unknown families outright), or its nat chain type
+// missing (ENOENT). It picks the error's hint.
 func inetRefused(err error) bool {
 	return errors.Is(err, unix.EAFNOSUPPORT) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOENT)
 }
 
 // installFamily installs the table as family fam, owned where the kernel
-// allows, after removing a leftover of the other family.
+// allows, and then removes a leftover of the other family, so that a
+// failed install leaves the host as it was and a refusal there can only be
+// another process's table.
 func (r *DNSRedirect) installFamily(fam tableFamily, ipv6 bool, bridge net.IP) (*netlink.Conn, bool, error) {
-	if err := removeLeftover(fam.other()); err != nil {
+	conn, owned, err := r.installOwned(fam, ipv6, bridge)
+	if err != nil {
 		return nil, false, err
 	}
+	if err := removeLeftover(conn, fam.other()); err != nil {
+		if msg, merr := delTableMsg(fam); merr == nil {
+			_ = transact(conn, []netlink.Message{msg})
+		}
+		_ = conn.Close()
+		return nil, false, err
+	}
+	return conn, owned, nil
+}
+
+// installOwned installs the table as family fam, owned unless the kernel
+// refuses the flag, which it then is not asked for again.
+func (r *DNSRedirect) installOwned(fam tableFamily, ipv6 bool, bridge net.IP) (*netlink.Conn, bool, error) {
 	var chains []netlink.Message
 	for _, c := range redirectChains(ipv6, bridge) {
 		msgs, err := chainMsgs(fam, c)
@@ -395,36 +393,36 @@ func (r *DNSRedirect) installFamily(fam tableFamily, ipv6 bool, bridge net.IP) (
 		}
 		chains = append(chains, msgs...)
 	}
+	if r.ownerFlag == 0 || r.ownerRefused {
+		conn, err := installTable(fam, 0, chains)
+		return conn, false, err
+	}
 	conn, err := installTable(fam, r.ownerFlag, chains)
-	if r.ownerFlag != 0 && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP)) {
+	if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP) {
 		refused := err
 		if conn, err = installTable(fam, 0, chains); err == nil {
+			r.ownerRefused = true
 			r.logger.Info("The kernel refused an owned DNS redirect table (owned tables need 5.12), so it went in unowned: "+
 				"if cargowall dies without tearing it down, it stays until the next run replaces it", "refusal", refused)
-			return conn, false, nil
 		}
+		return conn, false, err
 	}
-	return conn, err == nil && r.ownerFlag != 0, err
+	return conn, err == nil, err
 }
 
 // removeLeftover removes a table of family fam that no socket owns (add,
-// delete), one an earlier run that did or did not cover IPv6 left. A kernel
-// that has no such family (EAFNOSUPPORT, or EOPNOTSUPP before 6.8) has no
-// leftover to remove. Any other failure, a live socket's table refusing
-// (EPERM) above all, fails the install, as it would for the install's own
-// family: a leftover kept would be a second redirect.
-func removeLeftover(fam tableFamily) error {
+// delete), one an earlier run that did or did not cover IPv6 left, from
+// conn. A kernel that has no such family (EAFNOSUPPORT, or EOPNOTSUPP before
+// 6.8) has no leftover to remove. Any other failure, a live socket's table
+// refusing (EPERM) above all, fails the install, as it would for the
+// install's own family: a leftover kept would be a second redirect.
+func removeLeftover(conn *netlink.Conn, fam tableFamily) error {
 	create, errCreate := newTableMsg(fam, 0)
 	del, errDel := delTableMsg(fam)
 	if err := errors.Join(errCreate, errDel); err != nil {
 		return fmt.Errorf("nftables: %w", err)
 	}
-	conn, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
-	if err != nil {
-		return fmt.Errorf("nftables: %w%s", err, installHint(err))
-	}
-	defer conn.Close()
-	err = transact(conn, []netlink.Message{create, del})
+	err := transact(conn, []netlink.Message{create, del})
 	if err == nil || errors.Is(err, unix.EAFNOSUPPORT) || errors.Is(err, unix.EOPNOTSUPP) {
 		return nil
 	}

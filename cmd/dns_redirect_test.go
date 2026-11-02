@@ -19,46 +19,47 @@ package cmd
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
-// IPv6 is covered when loopback has ::1 and the proxy's port is free. When
-// it cannot be, that is a gap only where the host has IPv6 for DNS to leave
-// by; and the port is probed only when there is a loopback to probe.
+// IPv6 is covered when the proxy holds its IPv6 listener. When it does
+// not, that is a gap only where the host has IPv6 for DNS to leave by, and
+// the reason says which of no IPv6 loopback or a held port it is.
 func TestDecideIPv6(t *testing.T) {
-	inUse := errors.New("address already in use")
 	for _, c := range []struct {
-		name               string
-		loopback, hostIPv6 bool
-		probe              error
-		cover              bool
-		gap                string
+		name     string
+		bindErr  error
+		hostIPv6 bool
+		cover    bool
+		gap      string
 	}{
-		{name: "covered", loopback: true, hostIPv6: true, cover: true},
-		{name: "covered, no other IPv6", loopback: true, cover: true},
-		{name: "no ::1, host IPv6", hostIPv6: true, gap: "loopback has no IPv6 address"},
-		{name: "no IPv6 at all"},
-		{name: "port held, host IPv6", loopback: true, hostIPv6: true, probe: inUse, gap: "address already in use"},
-		{name: "port held, no other IPv6", loopback: true, probe: inUse},
+		{name: "bound", hostIPv6: true, cover: true},
+		{name: "bound, no other IPv6", cover: true},
+		{
+			name: "no ::1, host IPv6", bindErr: fmt.Errorf("udp6: %w", unix.EADDRNOTAVAIL), hostIPv6: true,
+			gap: "loopback has no IPv6 address",
+		},
+		{name: "no IPv6 at all", bindErr: fmt.Errorf("udp6: %w", unix.EAFNOSUPPORT)},
+		{
+			name: "port held, host IPv6", bindErr: fmt.Errorf("tcp6: %w", unix.EADDRINUSE), hostIPv6: true,
+			gap: "the proxy cannot listen on [::1]:53: tcp6: address already in use",
+		},
+		{name: "port held, no other IPv6", bindErr: unix.EADDRINUSE},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			probed := false
-			cover, gap := decideIPv6(c.loopback, func() bool { return c.hostIPv6 }, func(addr string) error {
-				probed = true
-				assert.Equal(t, "[::1]:53", addr)
-				return c.probe
-			})
+			cover, gap := decideIPv6(c.bindErr, func() bool { return c.hostIPv6 })
 			assert.Equal(t, c.cover, cover)
 			if c.gap == "" {
 				assert.Empty(t, gap)
 			} else {
 				assert.Contains(t, gap, c.gap)
 			}
-			assert.Equal(t, c.loopback, probed, "the port is probed exactly when loopback has ::1")
 		})
 	}
 }

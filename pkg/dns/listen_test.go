@@ -58,7 +58,7 @@ func freeLoopback6Port(t *testing.T) int {
 
 // startServer runs a server with filtering on and no rules, so every query
 // is refused at once without an upstream, and returns its Start error, nil
-// once it is serving.
+// once it has bound its listeners.
 func startServer(t *testing.T, s *Server) error {
 	t.Helper()
 	s.EnableQueryFiltering(true)
@@ -69,7 +69,7 @@ func startServer(t *testing.T, s *Server) error {
 	case err := <-errCh:
 		cancel()
 		return err
-	case <-time.After(200 * time.Millisecond):
+	case <-s.Ready():
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -83,22 +83,23 @@ func newListenTestServer() *Server {
 		slog.New(slog.DiscardHandler))
 }
 
-// A redirect listener added twice is bound once: a second bind of the same
-// address could only fail, and would fail Start.
-func TestAddRedirectListenAddr_Once(t *testing.T) {
+// An optional listener added twice is bound once: a second bind of the
+// same address could only fail.
+func TestAddOptionalListenAddr_Once(t *testing.T) {
 	s := newListenTestServer()
-	s.AddRedirectListenAddr("[::1]:53")
-	s.AddRedirectListenAddr("[::1]:53")
+	s.AddOptionalListenAddr("[::1]:53")
+	s.AddOptionalListenAddr("[::1]:53")
 	assert.Equal(t, []string{"[::1]:53"}, s.additionalAddrs)
-	assert.Equal(t, []string{"[::1]:53"}, s.requiredAddrs)
+	assert.Equal(t, []string{"[::1]:53"}, s.optionalAddrs)
 }
 
-// The redirect's IPv6 listener binds over IPv6 and answers there.
-func TestStart_RedirectListenerServesIPv6(t *testing.T) {
+// An optional IPv6 listener binds over IPv6 and answers there.
+func TestStart_OptionalListenerServesIPv6(t *testing.T) {
 	addr := net.JoinHostPort("::1", strconv.Itoa(freeLoopback6Port(t)))
 	s := newListenTestServer()
-	s.AddRedirectListenAddr(addr)
+	s.AddOptionalListenAddr(addr)
 	require.NoError(t, startServer(t, s))
+	require.NoError(t, s.BindError(addr))
 
 	for _, proto := range []string{"udp6", "tcp6"} {
 		c := &dns.Client{Net: proto, Timeout: 2 * time.Second}
@@ -108,23 +109,42 @@ func TestStart_RedirectListenerServesIPv6(t *testing.T) {
 	}
 }
 
-// DNS redirected to a port cargowall does not hold goes to whatever does, so
-// a redirect listener that cannot bind fails Start, as the primary does. A
-// plain secondary listener only logs.
-func TestStart_RedirectListenerMustBind(t *testing.T) {
-	port := freeLoopback6Port(t)
-	addr := net.JoinHostPort("::1", strconv.Itoa(port))
-	held, err := net.ListenPacket("udp6", addr)
-	require.NoError(t, err)
-	t.Cleanup(func() { held.Close() })
+// An optional listener whose UDP or TCP half is held by another process
+// binds neither: the proxy still starts, BindError says why, and the half it
+// could have held is left free, so nothing sent there meets a proxy that is
+// only half there.
+func TestStart_OptionalListenerBindsWholeOrNot(t *testing.T) {
+	for _, held := range []string{"udp6", "tcp6"} {
+		t.Run(held, func(t *testing.T) {
+			port := freeLoopback6Port(t)
+			addr := net.JoinHostPort("::1", strconv.Itoa(port))
+			var other string
+			if held == "udp6" {
+				c, err := net.ListenPacket(held, addr)
+				require.NoError(t, err)
+				t.Cleanup(func() { c.Close() })
+				other = "tcp6"
+			} else {
+				l, err := net.Listen(held, addr)
+				require.NoError(t, err)
+				t.Cleanup(func() { l.Close() })
+				other = "udp6"
+			}
 
-	s := newListenTestServer()
-	s.AddRedirectListenAddr(addr)
-	err = startServer(t, s)
-	require.Error(t, err, "a redirect listener that cannot bind must fail Start")
-	assert.ErrorContains(t, err, "failed to listen on "+addr+"/udp6")
+			s := newListenTestServer()
+			s.AddOptionalListenAddr(addr)
+			require.NoError(t, startServer(t, s), "an optional listener that cannot bind must not fail Start")
+			require.ErrorContains(t, s.BindError(addr), held)
 
-	s = newListenTestServer()
-	s.AddListenAddr(addr)
-	assert.NoError(t, startServer(t, s), "a plain secondary listener that cannot bind only logs")
+			if other == "udp6" {
+				c, err := net.ListenPacket(other, addr)
+				require.NoError(t, err, "the proxy must not keep the UDP half")
+				c.Close()
+			} else {
+				l, err := net.Listen(other, addr)
+				require.NoError(t, err, "the proxy must not keep the TCP half")
+				l.Close()
+			}
+		})
+	}
 }

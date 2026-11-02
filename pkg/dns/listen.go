@@ -17,23 +17,75 @@
 package dns
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"slices"
+
+	"github.com/miekg/dns"
 )
 
-// Listeners the DNS redirect sends queries to, and the networks a listener
-// binds.
+// Optional listeners, which the DNS redirect sends IPv6 DNS to, and the
+// networks a listener binds.
 
-// AddRedirectListenAddr adds an address the DNS redirect sends queries to,
-// such as [::1]:53 for IPv6, attributed via the host sockdiag path. Like the
-// primary address, it must bind or Start fails: DNS redirected to a port
-// cargowall does not hold goes to whatever does.
-func (s *Server) AddRedirectListenAddr(addr string) {
-	if slices.Contains(s.requiredAddrs, addr) {
+// AddOptionalListenAddr adds an address the proxy listens on if it can,
+// attributed via the host sockdiag path: the DNS redirect's [::1]:53, which
+// IPv6 DNS is sent to only once it is known to be bound. It binds over UDP
+// and TCP both or neither, so nothing redirected there finds half of it
+// held by another process. A failure is logged at Debug and left to
+// BindError: what it costs is the caller's call. Call before Start.
+func (s *Server) AddOptionalListenAddr(addr string) {
+	if slices.Contains(s.optionalAddrs, addr) {
 		return // bound once: a second listener on it could only fail
 	}
 	s.AddListenAddr(addr)
-	s.requiredAddrs = append(s.requiredAddrs, addr)
+	s.optionalAddrs = append(s.optionalAddrs, addr)
+}
+
+// Ready is closed once Start has bound its listeners. A primary that cannot
+// bind ends Start with its error instead, and Ready stays open.
+func (s *Server) Ready() <-chan struct{} { return s.ready }
+
+// BindError is why an optional listener did not bind, nil when it did.
+// Valid once Ready is closed.
+func (s *Server) BindError(addr string) error { return s.bindErrs[addr] }
+
+// listenBoth binds addr over UDP and TCP and serves both, or binds neither.
+func (s *Server) listenBoth(ctx context.Context, lc *net.ListenConfig, addr string) error {
+	protos := listenProtos(addr)
+	pc, err := lc.ListenPacket(ctx, protos[0], addr)
+	if err != nil {
+		return fmt.Errorf("%s: %w", protos[0], err)
+	}
+	ln, err := lc.Listen(ctx, protos[1], addr)
+	if err != nil {
+		_ = pc.Close()
+		return fmt.Errorf("%s: %w", protos[1], err)
+	}
+	s.serveOn(addr, protos[0], pc, nil)
+	s.serveOn(addr, protos[1], nil, ln)
+	return nil
+}
+
+// serveOn serves DNS on a bound conn, pc for UDP or ln for TCP, in the
+// background, and keeps it for Start's shutdown.
+func (s *Server) serveOn(addr, proto string, pc net.PacketConn, ln net.Listener) {
+	server := &dns.Server{
+		Addr:       addr,
+		Net:        proto,
+		Handler:    dns.HandlerFunc(s.handleDNSQuery),
+		PacketConn: pc,
+		Listener:   ln,
+		NotifyStartedFunc: func() {
+			s.logger.Debug("DNS server is now listening", "addr", addr, "proto", proto)
+		},
+	}
+	s.servers = append(s.servers, server)
+	go func() {
+		if err := server.ActivateAndServe(); err != nil {
+			s.logger.Error("DNS server error", "error", err, "addr", addr)
+		}
+	}()
 }
 
 // listenProtos are the networks a listener on addr binds: IPv6 for an IPv6

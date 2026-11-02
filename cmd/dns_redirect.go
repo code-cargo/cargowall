@@ -17,9 +17,11 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/dns"
 	"github.com/code-cargo/cargowall/pkg/network"
@@ -42,57 +44,40 @@ type dnsRedirect struct {
 	err    error // why it is not, or not for IPv6; nil when it is whole
 }
 
-// ipv6Coverage decides whether the redirect covers IPv6 and, when it does,
-// adds the proxy's listener at network.ProxyAddrIPv6 that IPv6 DNS is sent
-// to. Called before the proxy starts, so that listener failing to bind
-// fails startup with it. gap is why the host's IPv6 DNS will go around the
-// proxy instead, "" when it will not.
-func ipv6Coverage(cmd *StartCmd, dnsServer *dns.Server) (ipv6 bool, gap string) {
-	if !cmd.DNSRedirect {
-		return false, ""
+// addIPv6Listener adds the proxy's listener at network.ProxyAddrIPv6, the
+// one the redirect sends IPv6 DNS to, as an optional one: whether it binds
+// decides whether the redirect covers IPv6 (ipv6Coverage). Called before the
+// proxy starts.
+func addIPv6Listener(cmd *StartCmd, dnsServer *dns.Server) {
+	if cmd.DNSRedirect {
+		dnsServer.AddOptionalListenAddr(network.ProxyAddrIPv6)
 	}
-	ipv6, gap = decideIPv6(network.LoopbackIPv6(), network.HostIPv6, probeListen)
-	if ipv6 {
-		dnsServer.AddRedirectListenAddr(network.ProxyAddrIPv6)
-	}
-	return ipv6, gap
 }
 
-// decideIPv6 is ipv6Coverage's rule. IPv6 is covered when loopback has ::1
-// for the proxy and nothing else holds the port. When it cannot be, that is
-// a gap only on a host with IPv6 for DNS to leave by; one without has
-// nothing to cover. The port is probed rather than left to the proxy's
-// bind, whose failure would end startup in every mode, where an uncovered
-// IPv6 is a posture an auditing policy only records.
-func decideIPv6(loopback bool, hostIPv6 func() bool, probe func(addr string) error) (bool, string) {
-	if !loopback {
-		if hostIPv6() {
-			return false, "loopback has no IPv6 address for the proxy to listen on"
-		}
-		return false, ""
-	}
-	if err := probe(network.ProxyAddrIPv6); err != nil {
-		if hostIPv6() {
-			return false, fmt.Sprintf("the proxy cannot listen on %s: %v", network.ProxyAddrIPv6, err)
-		}
-		return false, ""
-	}
-	return true, ""
+// ipv6Coverage reports, once the proxy is up, whether the redirect covers
+// IPv6, and gap, why the host's IPv6 DNS will go around the proxy instead
+// ("" when it will not).
+func ipv6Coverage(dnsServer *dns.Server) (ipv6 bool, gap string) {
+	return decideIPv6(dnsServer.BindError(network.ProxyAddrIPv6), network.HostIPv6)
 }
 
-// probeListen binds addr over UDP and TCP and lets go, to learn whether the
-// proxy can hold it.
-func probeListen(addr string) error {
-	pc, err := net.ListenPacket("udp6", addr)
-	if err != nil {
-		return err
+// decideIPv6 is ipv6Coverage's rule. IPv6 is covered when the proxy holds
+// its IPv6 listener: the redirect is installed after the proxy binds, so
+// what it sends there always has the proxy to reach. When the listener did
+// not bind, that is a gap only on a host with IPv6 for DNS to leave by; one
+// without has nothing to cover. A listener that cannot bind is a lost
+// posture rather than a failed start, which an auditing policy only records.
+func decideIPv6(bindErr error, hostIPv6 func() bool) (bool, string) {
+	switch {
+	case bindErr == nil:
+		return true, ""
+	case !hostIPv6():
+		return false, ""
+	case errors.Is(bindErr, unix.EADDRNOTAVAIL), errors.Is(bindErr, unix.EAFNOSUPPORT):
+		return false, "loopback has no IPv6 address for the proxy to listen on"
+	default:
+		return false, fmt.Sprintf("the proxy cannot listen on %s: %v", network.ProxyAddrIPv6, bindErr)
 	}
-	_ = pc.Close()
-	l, err := net.Listen("tcp6", addr)
-	if err != nil {
-		return err
-	}
-	return l.Close()
 }
 
 // startDNSRedirect installs the redirect for the proxy, and for its

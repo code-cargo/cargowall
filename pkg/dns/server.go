@@ -49,9 +49,12 @@ type Server struct {
 
 	// Additional listen addresses (e.g., docker bridge IP for container DNS)
 	additionalAddrs []string
-	// requiredAddrs are additional addresses that must bind, as the primary
-	// must (AddRedirectListenAddr).
-	requiredAddrs []string
+	// optionalAddrs are additional addresses bound if they can be, whose
+	// failure bindErrs records (AddOptionalListenAddr); ready closes once
+	// Start has bound every listener.
+	optionalAddrs []string
+	bindErrs      map[string]error
+	ready         chan struct{}
 	servers       []*dns.Server // All running servers
 
 	// DNS query filtering (blocks DNS tunneling)
@@ -142,6 +145,7 @@ func NewServer(cfg *config.Manager, fw firewall.Firewall, upstream, listenAddr s
 		cnameAllowed:  newLRUCache[string, derivedAllow](10000),
 		preResolved:   newLRUCache[string, struct{}](1000),
 		listenerModes: make(map[string]listenerAttribution),
+		ready:         make(chan struct{}),
 	}
 }
 
@@ -423,9 +427,10 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 	}
 
-	// A bind failure is fatal only for the PRIMARY address and the redirect's
-	// (AddRedirectListenAddr): without 127.0.0.1:53 there is no proxy and the
-	// daemon must not come up claiming one. A secondary address (the docker bridge listener) held by
+	// A bind failure is fatal only for the PRIMARY address: without
+	// 127.0.0.1:53 there is no proxy and the daemon must not come up claiming
+	// one. An optional address (AddOptionalListenAddr) binds whole or not at
+	// all, and its failure is its caller's to judge. A secondary address (the docker bridge listener) held by
 	// a leftover process must NOT take down the whole daemon — the proxy
 	// serves every other address, exactly as it did when each listener bound
 	// itself inside ListenAndServe. The fatal path shuts down whatever was
@@ -449,25 +454,23 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to listen on %s/%s: %w", addr, proto, err)
 	}
 
-	required := func(addr string) bool { return addr == s.listenAddr || slices.Contains(s.requiredAddrs, addr) }
+	s.bindErrs = make(map[string]error)
 	for _, addr := range allAddrs {
-		for _, proto := range listenProtos(addr) {
-			server := &dns.Server{
-				Addr:    addr,
-				Net:     proto,
-				Handler: dns.HandlerFunc(s.handleDNSQuery),
-				NotifyStartedFunc: func() {
-					s.logger.Debug("DNS server is now listening", "addr", addr, "proto", proto)
-				},
+		if slices.Contains(s.optionalAddrs, addr) {
+			if err := s.listenBoth(ctx, &lc, addr); err != nil {
+				s.bindErrs[addr] = err
+				s.logger.Debug("Optional DNS listener not bound", "addr", addr, "error", err)
 			}
-
+			continue
+		}
+		for _, proto := range listenProtos(addr) {
 			// Bind through the marking ListenConfig; miekg/dns uses a
 			// pre-bound conn when one is supplied instead of binding itself.
 			switch proto {
 			case "udp4", "udp6":
 				pc, err := lc.ListenPacket(ctx, proto, addr)
 				if err != nil {
-					if required(addr) {
+					if addr == s.listenAddr {
 						return failStart(addr, proto, err)
 					}
 					s.logger.Error("DNS listener unavailable; continuing without it — "+
@@ -477,11 +480,11 @@ func (s *Server) Start(ctx context.Context) error {
 						"addr", addr, "proto", proto, "error", err)
 					continue
 				}
-				server.PacketConn = pc
+				s.serveOn(addr, proto, pc, nil)
 			default:
 				ln, err := lc.Listen(ctx, proto, addr)
 				if err != nil {
-					if required(addr) {
+					if addr == s.listenAddr {
 						return failStart(addr, proto, err)
 					}
 					s.logger.Error("DNS listener unavailable; continuing without it — "+
@@ -491,18 +494,11 @@ func (s *Server) Start(ctx context.Context) error {
 						"addr", addr, "proto", proto, "error", err)
 					continue
 				}
-				server.Listener = ln
+				s.serveOn(addr, proto, nil, ln)
 			}
-			s.servers = append(s.servers, server)
-
-			// Start server in background
-			go func(srv *dns.Server, address string) {
-				if err := srv.ActivateAndServe(); err != nil {
-					s.logger.Error("DNS server error", "error", err, "addr", address)
-				}
-			}(server, addr)
 		}
 	}
+	close(s.ready)
 
 	// Keep reference to primary server for compatibility
 	if len(s.servers) > 0 {

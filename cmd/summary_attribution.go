@@ -42,12 +42,12 @@ const resolveRoundingSlack = 2 * time.Second
 // name can't identify a group). Callers derive the display name from the
 // index; grouping keys on the index so same-named steps stay distinct.
 //
-// A step_boundary event is emitted when the step process forks — the very
-// start of the step's window — so "the last step started at or before the
-// boundary timestamp" names the ordinal, without trusting window *ends*
-// (which is exactly where timestamp bucketing of connection events goes
-// wrong: long-lived sockets and post-job uploads land in whatever step is
-// current when packets flow).
+// A step_boundary event is stamped with the time the step process forks —
+// the very start of the step's window — so "the last step started at or
+// before the boundary timestamp" names the ordinal, without trusting window
+// *ends* (which is exactly where timestamp bucketing of connection events
+// goes wrong: long-lived sockets and post-job uploads land in whatever step
+// is current when packets flow).
 //
 // The assignment is monotonic — boundaries and steps are both ordered, so
 // each boundary first considers steps after the previous match, which

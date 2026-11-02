@@ -38,10 +38,63 @@ import (
 	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
-// stepChildEventT mirrors struct step_child_event in stepbpf.c.
-type stepChildEventT struct {
-	Tgid    uint32
-	Ordinal uint32
+// Step event kinds (STEP_EV_* in stepbpf.c).
+const (
+	stepEvFork = 1
+	stepEvExec = 2
+	stepEvExit = 3
+)
+
+// readStepEvent reads the next step event: its kind, and the event decoded
+// as the fork or the exec/exit struct its kind says it is.
+func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEvent, StepBpfStepExecEvent) {
+	t.Helper()
+	record, err := rd.Read()
+	require.NoError(t, err, "a step event must arrive")
+	raw := record.RawSample
+	require.GreaterOrEqual(t, len(raw), 4)
+	var fork StepBpfStepChildEvent
+	var execEv StepBpfStepExecEvent
+	switch kind := *(*uint32)(unsafe.Pointer(&raw[0])); kind {
+	case stepEvFork:
+		require.GreaterOrEqual(t, len(raw), int(unsafe.Sizeof(fork)))
+		fork = *(*StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
+		return kind, fork, execEv
+	case stepEvExec, stepEvExit:
+		require.GreaterOrEqual(t, len(raw), int(unsafe.Sizeof(execEv)))
+		execEv = *(*StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
+		return kind, fork, execEv
+	default:
+		t.Fatalf("unknown step event kind %d", kind)
+		return 0, fork, execEv
+	}
+}
+
+// argvOf returns the argument bytes an exec event copied.
+func argvOf(ev StepBpfStepExecEvent) string {
+	n := min(int(ev.ArgvLen), len(ev.Argv))
+	return string(unsafe.Slice((*byte)(unsafe.Pointer(&ev.Argv[0])), n))
+}
+
+// awaitStepEvent reads step events until one of kind for ordinal (any
+// ordinal when ordinal is 0) satisfies match, logging every event seen.
+func awaitStepEvent(t *testing.T, rd *ringbuf.Reader, kind, ordinal uint32,
+	match func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool,
+) (StepBpfStepChildEvent, StepBpfStepExecEvent) {
+	t.Helper()
+	rd.SetDeadline(time.Now().Add(3 * time.Second))
+	for {
+		k, fork, execEv := readStepEvent(t, rd)
+		ord := fork.Ordinal
+		if k != stepEvFork {
+			ord = execEv.Ordinal
+		}
+		t.Logf("step event: kind=%d ordinal=%d fork.tgid=%d exec.tgid=%d argv_len=%d", k, ord, fork.Tgid,
+			execEv.Tgid, execEv.ArgvLen)
+		if k == kind && (ordinal == 0 || ord == ordinal) && match(fork, execEv) {
+			return fork, execEv
+		}
+	}
 }
 
 // pidnsInode is the daemon-side half of the namespace bridge: the nsfs
@@ -129,6 +182,13 @@ func loadStepObjects(t *testing.T) (*TcBpfObjects, *StepBpfObjects, *link.Iter) 
 	require.NoError(t, err, "attach sched_process_exit")
 	t.Cleanup(func() { exitLink.Close() })
 
+	execLink, err := link.AttachTracing(link.TracingOptions{
+		Program:    objs.StepExec,
+		AttachType: ebpf.AttachTraceRawTp,
+	})
+	require.NoError(t, err, "attach sched_process_exec")
+	t.Cleanup(func() { execLink.Close() })
+
 	iter, err := link.AttachIter(link.IterOptions{Program: objs.StepTaskIter})
 	require.NoError(t, err, "attach task iterator")
 	t.Cleanup(func() { iter.Close() })
@@ -186,23 +246,21 @@ func TestStepFork(t *testing.T) {
 	require.Equal(t, childPID, nsPid, "map_task_nspid must carry the child's pid as we number it")
 
 	// The new-step notification must arrive for the reconciler. Other test
-	// machinery may fork too, so scan until the child's event or deadline,
-	// logging every boundary seen for diagnosis.
-	rd.SetDeadline(time.Now().Add(3 * time.Second))
-	for {
-		record, err := rd.Read()
-		require.NoError(t, err, "step ringbuf event for the child must arrive")
-		require.GreaterOrEqual(t, len(record.RawSample), int(unsafe.Sizeof(stepChildEventT{})))
-		ev := (*stepChildEventT)(unsafe.Pointer(&record.RawSample[0]))
-		comm, _ := os.ReadFile("/proc/" + strconv.Itoa(int(ev.Tgid)) + "/comm")
-		t.Logf("boundary event: tgid=%d ordinal=%d comm=%q", ev.Tgid, ev.Ordinal, string(comm))
-		if ev.Tgid != childPID {
-			continue
-		}
-		require.Equal(t, got, ev.Ordinal, "map tag and boundary event must agree")
-		require.GreaterOrEqual(t, ev.Ordinal, uint32(wantOrdinal))
-		break
-	}
+	// machinery may fork too (Go's pidfd probe is a worker child of its
+	// own), so scan until the child's event or deadline.
+	fork, _ := awaitStepEvent(t, rd, stepEvFork, 0, func(f StepBpfStepChildEvent, _ StepBpfStepExecEvent) bool {
+		return f.Tgid == childPID
+	})
+	require.Equal(t, got, fork.Ordinal, "map tag and boundary event must agree")
+	require.GreaterOrEqual(t, fork.Ordinal, uint32(wantOrdinal))
+
+	// Its first exec says what it runs, under the same ordinal and pid.
+	_, execEv := awaitStepEvent(t, rd, stepEvExec, fork.Ordinal, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool {
+		return true
+	})
+	require.Equal(t, childPID, execEv.Tgid)
+	require.Equal(t, "sleep\x001\x00", argvOf(execEv))
+	require.EqualValues(t, len("sleep\x001\x00"), execEv.ArgvLen)
 
 	// Exit hygiene: once the child is reaped, its tag and namespace entry
 	// must be gone.
@@ -212,6 +270,96 @@ func TestStepFork(t *testing.T) {
 		return tcObjs.MapTaskStep.Lookup(childTgid, &v) != nil &&
 			tcObjs.MapTaskNspid.Lookup(childTgid, &v) != nil
 	}, 2*time.Second, 50*time.Millisecond, "exit tracepoint must delete the child's entries")
+}
+
+// TestStepExec_CutsLongArguments: an argument area longer than the event
+// holds is copied up to the event's size, and its full length reported.
+func TestStepExec_CutsLongArguments(t *testing.T) {
+	tcObjs, objs, iter := loadStepObjects(t)
+	rd, err := ringbuf.NewReader(objs.MapStepEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { rd.Close() })
+	selfTgid, ok := globalTgid(t, iter, os.Getpid())
+	require.True(t, ok)
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: selfTgid, Enabled: 1, NextOrdinal: 5}))
+
+	arg := strings.Repeat("x", 300)
+	child := exec.Command("true", arg)
+	require.NoError(t, child.Start())
+	pid := uint32(child.Process.Pid)
+	require.NoError(t, child.Wait())
+
+	_, execEv := awaitStepEvent(t, rd, stepEvExec, 0, func(_ StepBpfStepChildEvent, e StepBpfStepExecEvent) bool {
+		return e.Tgid == pid
+	})
+	full := "true\x00" + arg + "\x00"
+	require.EqualValues(t, len(full), execEv.ArgvLen)
+	require.Equal(t, full[:len(execEv.Argv)], argvOf(execEv))
+}
+
+// TestStepExec_FirstExecOnly: a step root that execs again (a shell's
+// `exec`) is reported once, for what the worker started; its later exec
+// and its exit say nothing.
+func TestStepExec_FirstExecOnly(t *testing.T) {
+	tcObjs, objs, iter := loadStepObjects(t)
+	rd, err := ringbuf.NewReader(objs.MapStepEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { rd.Close() })
+	selfTgid, ok := globalTgid(t, iter, os.Getpid())
+	require.True(t, ok)
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: selfTgid, Enabled: 1, NextOrdinal: 5}))
+
+	child := exec.Command("sh", "-c", "exec true")
+	require.NoError(t, child.Start())
+	pid := uint32(child.Process.Pid)
+	require.NoError(t, child.Wait())
+
+	_, first := awaitStepEvent(t, rd, stepEvExec, 0, func(_ StepBpfStepChildEvent, e StepBpfStepExecEvent) bool {
+		return e.Tgid == pid
+	})
+	require.Equal(t, "sh\x00-c\x00exec true\x00", argvOf(first))
+	// Drain what is left: nothing more for this ordinal.
+	rd.SetDeadline(time.Now().Add(200 * time.Millisecond))
+	for {
+		record, err := rd.Read()
+		if err != nil {
+			require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+			break
+		}
+		raw := record.RawSample
+		if len(raw) >= int(unsafe.Sizeof(StepBpfStepExecEvent{})) && *(*uint32)(unsafe.Pointer(&raw[0])) != stepEvFork {
+			ev := (*StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
+			require.NotEqual(t, first.Ordinal, ev.Ordinal, "a second event (kind %d) for the step", ev.Kind)
+		}
+	}
+}
+
+// TestStepExit_WithoutExec: a step root that exits without exec'ing reports
+// its exit instead, with no arguments. The worker here is a shell, whose
+// subshell forks and exits without an exec.
+func TestStepExit_WithoutExec(t *testing.T) {
+	tcObjs, objs, iter := loadStepObjects(t)
+	rd, err := ringbuf.NewReader(objs.MapStepEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { rd.Close() })
+
+	sh := exec.Command("sh", "-c", "read x; ( : ); read y")
+	stdin, err := sh.StdinPipe()
+	require.NoError(t, err)
+	require.NoError(t, sh.Start())
+	t.Cleanup(func() { _ = stdin.Close(); _ = sh.Wait() })
+	shTgid, ok := globalTgid(t, iter, sh.Process.Pid)
+	require.True(t, ok)
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: shTgid, Enabled: 1, NextOrdinal: 5}))
+
+	_, err = stdin.Write([]byte("\n"))
+	require.NoError(t, err)
+	fork, _ := awaitStepEvent(t, rd, stepEvFork, 0, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool { return true })
+	_, exitEv := awaitStepEvent(t, rd, stepEvExit, fork.Ordinal, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool {
+		return true
+	})
+	require.Equal(t, fork.Tgid, exitEv.Tgid)
+	require.Zero(t, exitEv.ArgvLen)
 }
 
 // readProcInt reads an integer /proc/sys value.
@@ -431,13 +579,41 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 	st, ok := typ.(*btf.Struct)
 	require.True(t, ok, "step_child_event must be a struct, got %T", typ)
 
-	var ev stepChildEventT
+	var ev StepBpfStepChildEvent
 	require.Equal(t, uint32(unsafe.Sizeof(ev)), st.Size, "struct size")
-	require.Len(t, st.Members, 2)
-	require.Equal(t, "tgid", st.Members[0].Name)
-	require.Equal(t, uintptr(st.Members[0].Offset.Bytes()), unsafe.Offsetof(ev.Tgid))
-	require.Equal(t, "ordinal", st.Members[1].Name)
-	require.Equal(t, uintptr(st.Members[1].Offset.Bytes()), unsafe.Offsetof(ev.Ordinal))
+	require.Len(t, st.Members, 3)
+	for i, w := range []struct {
+		name string
+		off  uintptr
+	}{
+		{"kind", unsafe.Offsetof(ev.Kind)},
+		{"tgid", unsafe.Offsetof(ev.Tgid)},
+		{"ordinal", unsafe.Offsetof(ev.Ordinal)},
+	} {
+		require.Equal(t, w.name, st.Members[i].Name)
+		require.Equal(t, w.off, uintptr(st.Members[i].Offset.Bytes()))
+	}
+
+	typ, err = spec.Types.AnyTypeByName("step_exec_event")
+	require.NoError(t, err)
+	st, ok = typ.(*btf.Struct)
+	require.True(t, ok, "step_exec_event must be a struct, got %T", typ)
+	var execEv StepBpfStepExecEvent
+	require.Equal(t, uint32(unsafe.Sizeof(execEv)), st.Size, "struct size")
+	require.Len(t, st.Members, 5)
+	for i, w := range []struct {
+		name string
+		off  uintptr
+	}{
+		{"kind", unsafe.Offsetof(execEv.Kind)},
+		{"tgid", unsafe.Offsetof(execEv.Tgid)},
+		{"ordinal", unsafe.Offsetof(execEv.Ordinal)},
+		{"argv_len", unsafe.Offsetof(execEv.ArgvLen)},
+		{"argv", unsafe.Offsetof(execEv.Argv)},
+	} {
+		require.Equal(t, w.name, st.Members[i].Name)
+		require.Equal(t, w.off, uintptr(st.Members[i].Offset.Bytes()))
+	}
 }
 
 // TestTaskIterRecLayoutMatchesBTF pins the iterator record layout against

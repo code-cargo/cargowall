@@ -402,7 +402,8 @@ sequenceDiagram
 | `cg_connect6` | cgroup/connect6 | Maps IPv6 TCP socket cookie → PID |
 | `cg_sendmsg4` | cgroup/sendmsg4 | Maps IPv4 UDP socket cookie → PID |
 | `cg_sendmsg6` | cgroup/sendmsg6 | Maps IPv6 UDP socket cookie → PID |
-| `step_fork` / `step_exit` | tp_btf/task_newtask, tp_btf/sched_process_exit (stepbpf.c, separate collection; needs kernel BTF) | Step attribution: mint/inherit per-step process tags, drop at exit. Also maintains `map_task_nspid` (global tid → tgid as numbered in the daemon's pid namespace) for every new task. task_newtask fires for every task `copy_process` makes, io_uring and vhost workers included, which never reach sched_process_fork |
+| `step_fork` / `step_exit` | tp_btf/task_newtask, tp_btf/sched_process_exit (stepbpf.c, separate collection; needs kernel BTF) | Step attribution: mint/inherit per-step process tags, drop at exit. Also maintains `map_task_nspid` (global tid → tgid as numbered in the daemon's pid namespace) for every new task. task_newtask fires for every task `copy_process` makes, io_uring and vhost workers included, which never reach sched_process_fork. A new step's fork event records its boundary; a step root that exits without exec'ing reports that at exit |
+| `step_exec` | tp_btf/sched_process_exec (stepbpf.c) | A step root's first exec: reports what the step runs, from up to 256 bytes of the new program's argument area. The fork can't report it: a `/proc` read then races the exec, reading empty mid-exec or the worker's thread name before it |
 | `step_task_iter` | iter/task (stepbpf.c) | Task walk run by `pkg/steps` at start and per container tag: seeds `map_task_nspid` for tasks that predate the attach and streams the process tree in global ids, so userspace never has to translate pids through `/proc` |
 | `cg_sock_create` | cgroup/sock_create (stepbpf.c) | Copies the creating thread's step tag onto each socket cookie |
 | `scope_fork` / `scope_attach` / `scope_release` / `scope_task_iter` | tp_btf/task_newtask, tp_btf/cgroup_attach_task, tp_btf/cgroup_release, iter/task (scopebpf.c, separate collection loaded only when the egress hook is limited to this job) | Record in `map_scope_cgroups` each cgroup a task of the daemon's pid namespace enters: created there by clone3's `CLONE_INTO_CGROUP`, or moved there. Delete it, marking it shared (`map_scope_shared`) so that the job's next entry does not record it again, when a task outside the namespace enters it the same way, and forget both when the cgroup is released. Leave the job's subtree, which the hook judges whole, alone. The walk lists our tasks' cgroups at startup and every 10s, outside the subtree, and `pkg/origin` records each that no task outside the namespace is in |
@@ -426,8 +427,8 @@ and gives `pkg/steps` the process tree in global ids; `step_fork` keeps it
 current (a thread copies its process's entry, a process walks its upid
 chain to the daemon's namespace, identified by the nsfs inode passed in as
 `pidns_ino`); the cgroup hooks write the namespace tgid into `map_sock_pid`;
-boundary events carry the namespace pid so the reconciler's `/proc` read
-works. Kernel floor is unchanged: the `iter/task` target, `bpf_seq_write` and
+step events carry the namespace pid, for the reconciler's `/proc` read
+when the kernel could not copy a step's arguments. Kernel floor is unchanged: the `iter/task` target, `bpf_seq_write` and
 the `BPF_ITER_CREATE` command that opens an iterator instance all shipped in
 5.8 (uapi `bpf.h` at v5.8 lists `BPF_ITER_CREATE`; v5.7 does not), like the
 ring buffer.

@@ -85,11 +85,17 @@ struct {
 
 // ---- Owned by this collection ----
 
-// New-step notifications for the userspace reconciler: emitted once per new
-// direct child process of Runner.Worker, before the child runs user code.
-// tgid is the child's pid as numbered in the daemon's namespace, so the
-// reconciler can read its /proc entry directly (0 if untranslatable).
+// Event kinds on map_step_events; every event starts with its kind.
+#define STEP_EV_FORK 1
+#define STEP_EV_EXEC 2
+#define STEP_EV_EXIT 3
+
+// New-step notifications for the userspace reconciler, emitted once per new
+// direct child process of Runner.Worker, before the child runs user code
+// (STEP_EV_FORK). tgid is the child's pid as numbered in the daemon's
+// namespace (0 if untranslatable).
 struct step_child_event {
+    __u32 kind;
     __u32 tgid;
     __u32 ordinal;
 };
@@ -97,10 +103,41 @@ struct step_child_event {
 // BTF anchor — see the blocked_event anchor in tcbpf.c for rationale.
 const struct step_child_event *btf_anchor_step_child_event __attribute__((unused));
 
+// Bytes of a step's argument area its exec event carries: the cap
+// userspace puts on a command line anyway.
+#define STEP_ARGV_MAX 256
+
+// What a step runs, from its root's first exec (STEP_EV_EXEC): argv is the
+// start of the new program's argument area, NUL-separated, and argv_len
+// the whole area's length (0 if unreadable), so a value over
+// STEP_ARGV_MAX says argv was cut. A fork event cannot carry it: the child
+// is still a copy of Runner.Worker, and a /proc read races the exec,
+// reading empty mid-exec. A root that exits without exec'ing reports
+// STEP_EV_EXIT, with no argv.
+struct step_exec_event {
+    __u32 kind;
+    __u32 tgid;
+    __u32 ordinal;
+    __u32 argv_len;
+    char argv[STEP_ARGV_MAX];
+};
+
+const struct step_exec_event *btf_anchor_step_exec_event __attribute__((unused));
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 64 * 1024);
 } map_step_events SEC(".maps");
+
+// Step roots between fork and their first exec: global tgid → ordinal.
+// step_fork adds one, and step_exec or step_exit takes it out, so a
+// recycled tgid never finds an entry. Steps run a few at a time.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1024);
+} map_step_exec_pending SEC(".maps");
 
 // One record per task in the daemon's pid-namespace subtree, streamed by
 // step_task_iter. tid/tgid/ppid are global; ns_tgid is the process id
@@ -197,9 +234,11 @@ int BPF_PROG(step_fork, struct task_struct *child, __u64 clone_flags)
     if (parent_tgid == st->worker_tgid && child_tgid == child_tid) {
         __u32 ord = (__u32)__sync_fetch_and_add(&st->next_ordinal, 1);
         bpf_map_update_elem(&map_task_step, &child_tid, &ord, BPF_ANY);
+        bpf_map_update_elem(&map_step_exec_pending, &child_tgid, &ord, BPF_ANY);
         struct step_child_event *ev =
             bpf_ringbuf_reserve(&map_step_events, sizeof(*ev), 0);
         if (ev) {
+            ev->kind = STEP_EV_FORK;
             ev->tgid = ns_tgid;
             ev->ordinal = ord;
             bpf_ringbuf_submit(ev, 0);
@@ -215,13 +254,56 @@ int BPF_PROG(step_fork, struct task_struct *child, __u64 clone_flags)
     return 0;
 }
 
+// emit_step_exec reports a pending step root's first exec, or its exit
+// before one, and takes it out of map_step_exec_pending. tgid is global;
+// the event carries the daemon-namespace pid, which the caller still has
+// in map_task_nspid.
+static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid, __u32 kind)
+{
+    __u32 *ord = bpf_map_lookup_elem(&map_step_exec_pending, &tgid);
+    if (!ord)
+        return;
+    struct step_exec_event *ev = bpf_ringbuf_reserve(&map_step_events, sizeof(*ev), 0);
+    if (ev) {
+        __u32 *ns = bpf_map_lookup_elem(&map_task_nspid, &tgid);
+        ev->kind = kind;
+        ev->tgid = ns ? *ns : 0;
+        ev->ordinal = *ord;
+        __u64 len = 0;
+        if (kind == STEP_EV_EXEC) {
+            __u64 start = BPF_CORE_READ(task, mm, arg_start);
+            __u64 end = BPF_CORE_READ(task, mm, arg_end);
+            if (end > start)
+                len = end - start;
+            __u64 n = len > STEP_ARGV_MAX ? STEP_ARGV_MAX : len;
+            if (bpf_probe_read_user(ev->argv, n, (const void *)start))
+                len = 0;
+        }
+        ev->argv_len = len > 0xffffffff ? 0xffffffff : len;
+        bpf_ringbuf_submit(ev, 0);
+    }
+    bpf_map_delete_elem(&map_step_exec_pending, &tgid);
+}
+
+// A step root's first exec. At this tracepoint the new program's arguments
+// are in place in its memory, which a /proc read from userspace can only
+// race. One lookup per exec anywhere on the host.
+SEC("tp_btf/sched_process_exec")
+int BPF_PROG(step_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
+{
+    emit_step_exec(p, p->tgid, STEP_EV_EXEC);
+    return 0;
+}
+
 // PID-reuse hygiene: drop the tag and the namespace entry when the task
 // exits. Unconditional — a delete on an absent key is cheap, and gating on
-// step_state would cost the same lookup.
+// step_state would cost the same lookup. A step root that exits without
+// exec'ing reports it first, while its namespace entry is still there.
 SEC("tp_btf/sched_process_exit")
 int BPF_PROG(step_exit, struct task_struct *task)
 {
     __u32 tid = task->pid;
+    emit_step_exec(task, tid, STEP_EV_EXIT);
     bpf_map_delete_elem(&map_task_step, &tid);
     bpf_map_delete_elem(&map_task_nspid, &tid);
     return 0;

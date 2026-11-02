@@ -63,12 +63,6 @@ import (
 // per-job worker process (13 chars, fits TASK_COMM_LEN untruncated).
 const workerComm = procfs.RunnerWorkerComm
 
-// stepChildEvent mirrors struct step_child_event in bpf/stepbpf.c.
-type stepChildEvent struct {
-	Tgid    uint32
-	Ordinal uint32
-}
-
 // Options configures Start.
 type Options struct {
 	// WorkerPID is the Runner.Worker process ID. 0 auto-discovers it by
@@ -110,6 +104,10 @@ type Tracker struct {
 	// Boundary history for OrdinalAt — see the boundary type.
 	boundaryMu sync.Mutex
 	boundaries []boundary
+
+	// Fork times of steps not yet reported, by ordinal; run's goroutine
+	// only. See handleStepEvent.
+	forkedAt map[uint32]time.Time
 
 	// DNS-path client attribution (sock_diag lookups, caching, map joins) —
 	// see clientResolver. Constructed in Start, closed in Close.
@@ -328,6 +326,15 @@ func (t *Tracker) attach() error {
 		return fmt.Errorf("failed to attach sched_process_exit: %w", err)
 	}
 	t.links = append(t.links, exitLink)
+
+	execLink, err := link.AttachTracing(link.TracingOptions{
+		Program:    t.objs.StepExec,
+		AttachType: ebpf.AttachTraceRawTp,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to attach sched_process_exec: %w", err)
+	}
+	t.links = append(t.links, execLink)
 
 	// Same root-cgroup attachment rationale as the connect/sendmsg hooks in
 	// StartCargoWall: tag socket creation for every process on the machine.
@@ -614,115 +621,6 @@ func (t *Tracker) OrdinalAt(tm time.Time) uint32 {
 	return 0
 }
 
-// run consumes new-step notifications and re-reports them as audit events
-// with the child's command line attached, giving the summary pipeline a
-// human-readable marker per step even before the action supplies plan names.
-func (t *Tracker) run() {
-	defer close(t.done)
-	for {
-		record, err := t.reader.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				return
-			}
-			t.logger.Error("Failed to read step event", "error", err)
-			continue
-		}
-		if len(record.RawSample) < int(unsafe.Sizeof(stepChildEvent{})) {
-			continue
-		}
-		ev := (*stepChildEvent)(unsafe.Pointer(&record.RawSample[0]))
-
-		// Record the boundary before the cmdline retry loop below (which can
-		// sleep tens of ms) so OrdinalAt callers racing a fresh boundary
-		// resolve against it promptly.
-		t.recordBoundary(ev.Ordinal, time.Now())
-
-		// ev.Tgid is numbered in our pid namespace (see map_task_nspid), so
-		// /proc reads work from inside a container too.
-		cmdline := sanitizeCmdline(t.stepCmdline(int(ev.Tgid)))
-		t.logger.Info("Workflow step process started",
-			"step_ordinal", ev.Ordinal,
-			"pid", ev.Tgid,
-			"cmdline", cmdline)
-		if t.auditLogger != nil {
-			if err := t.auditLogger.LogEvent(events.AuditEvent{
-				EventType:   events.EventStepBoundary,
-				Process:     cmdline,
-				PID:         ev.Tgid,
-				StepOrdinal: ev.Ordinal,
-			}); err != nil {
-				t.logger.Error("Failed to write audit log", "error", err)
-			}
-		}
-	}
-}
-
-// sanitizeCmdline reduces an emitted command line to its first two argv
-// tokens plus any runner-generated script or action paths from later
-// positions. Boundary events describe Runner.Worker's direct children: the
-// step's own script path — the correlation token plan matching needs —
-// lives under the runner's _temp (run: steps, composite blocks) or
-// _actions (JS actions) directories, and sits at argv[2+] whenever shell
-// flags are in play (`bash --noprofile --norc -e -o pipefail x.sh` is the
-// standard run-step shape). Every other later token is where flags and
-// values (and therefore secrets passed on a command line, e.g. docker
-// args) could appear, and is dropped. Everything written to logs, the
-// audit JSONL, or the summary goes through this; the full string stays
-// internal to the fork→exec retry comparison.
-func sanitizeCmdline(cmdline string) string {
-	fields := strings.Fields(cmdline)
-	if len(fields) <= 2 {
-		return cmdline
-	}
-	kept := append([]string(nil), fields[:2]...)
-	dropped := false
-	for _, f := range fields[2:] {
-		if isRunnerPath(f) {
-			kept = append(kept, f)
-		} else {
-			dropped = true
-		}
-	}
-	out := strings.Join(kept, " ")
-	if dropped {
-		out += " ..."
-	}
-	return out
-}
-
-// isRunnerPath reports whether an argv token is a bare absolute path into
-// the runner's _temp/_actions trees — the shape of the script and action
-// paths the runner itself passes. Anchored, not a substring test: a
-// user-controlled value merely EMBEDDING those substrings (a URL with a
-// query string, a --flag=value, a volume spec) must not ride through the
-// redaction, so anything that isn't a plain absolute path ('=' from
-// flag-or-env values, ':' from URLs and mount specs) is rejected.
-func isRunnerPath(tok string) bool {
-	if !strings.HasPrefix(tok, "/") || strings.ContainsAny(tok, "=:") {
-		return false
-	}
-	return strings.Contains(tok, "/_temp/") || strings.Contains(tok, "/_actions/")
-}
-
-// stepCmdline reads the child's command line, retrying briefly while it
-// still shows the worker's own argv: the fork tracepoint fires before the
-// child is scheduled, so an immediate /proc read can see the pre-exec
-// COW/vfork copy of Runner.Worker's argv — the one value that would poison
-// step correlation. If it still matches after the retries, the child is a
-// genuine fork-without-exec and the parent's argv is its true cmdline.
-func (t *Tracker) stepCmdline(pid int) string {
-	var cmdline string
-	for range 10 {
-		cmdline = readCmdline(pid)
-		if cmdline != "" && cmdline != t.workerCmdline {
-			return cmdline
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return cmdline
-}
-
 // findWorkerPID locates the Runner.Worker that owns THIS job. Ancestry
 // first: the daemon is spawned inside the cargowall action's step, so at
 // startup its parent chain runs through the right worker — on a host with
@@ -771,28 +669,40 @@ func scanUniqueByComm(comm string) (first, count int) {
 // falling back to comm for kernel threads or when the process is gone.
 func readCmdline(pid int) string {
 	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
-	if err == nil && len(data) > 0 {
-		s := strings.TrimRight(strings.ReplaceAll(string(data), "\x00", " "), " ")
-		const maxLen = 256
-		if len(s) > maxLen {
-			// Back off to a rune boundary so the cap can't split a
-			// multi-byte character. Bounded to one rune's width: cmdline
-			// is arbitrary bytes, not guaranteed UTF-8, and a long run of
-			// continuation-range bytes must not walk the cut back
-			// further — if no boundary is that close, it isn't UTF-8 and
-			// the cap lands on the raw byte.
-			cut := maxLen
-			for cut > maxLen-utf8.UTFMax && !utf8.RuneStart(s[cut]) {
-				cut--
-			}
-			if !utf8.RuneStart(s[cut]) {
-				cut = maxLen
-			}
-			s = s[:cut] + "..."
-		}
-		if s != "" {
+	if err == nil {
+		if s := formatCmdline(data, false); s != "" {
 			return s
 		}
 	}
 	return procfs.Comm(pid)
+}
+
+// cmdlineMax caps a command line anywhere it is written. A step's exec
+// event carries this many bytes of arguments (STEP_ARGV_MAX in
+// bpf/stepbpf.c).
+const cmdlineMax = 256
+
+// formatCmdline joins a NUL-separated argument area with spaces and caps it
+// at cmdlineMax, marking a cut, its own or one already made (cut), "...".
+func formatCmdline(args []byte, cut bool) string {
+	s := strings.TrimRight(strings.ReplaceAll(string(args), "\x00", " "), " ")
+	if len(s) > cmdlineMax {
+		// Back off to a rune boundary so the cap can't split a multi-byte
+		// character. Bounded to one rune's width: cmdline is arbitrary
+		// bytes, not guaranteed UTF-8, and a long run of continuation-range
+		// bytes must not walk the cut back further — if no boundary is that
+		// close, it isn't UTF-8 and the cap lands on the raw byte.
+		end := cmdlineMax
+		for end > cmdlineMax-utf8.UTFMax && !utf8.RuneStart(s[end]) {
+			end--
+		}
+		if !utf8.RuneStart(s[end]) {
+			end = cmdlineMax
+		}
+		s, cut = s[:end], true
+	}
+	if cut && s != "" {
+		s += "..."
+	}
+	return s
 }

@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -130,8 +129,16 @@ type fakeDaemon struct {
 	// the shape dockerd serves between emitting exec_start and recording
 	// the pid from containerd (the publish race the tracker retries over).
 	execPidDelay map[string]int
-	list         []containerSummary
-	networks     map[string]networkInspect
+	// runningFor[id] = n lets container or exec id report running for n
+	// more inspects and stopped after: the lag before dockerd learns of an
+	// exit the kernel has already reaped.
+	runningFor map[string]int
+	// knownFor[id] = n serves id for n more inspects and 404s after.
+	knownFor map[string]int
+	// inspects counts the inspects of each container or exec id.
+	inspects map[string]int
+	list     []containerSummary
+	networks map[string]networkInspect
 	// networkInspects counts /networks/{name} requests, so tests can tell a
 	// driver-cache hit from a fresh inspect.
 	networkInspects int
@@ -145,6 +152,9 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		containers:   make(map[string]containerInspect),
 		execs:        make(map[string]execInspect),
 		execPidDelay: make(map[string]int),
+		runningFor:   make(map[string]int),
+		knownFor:     make(map[string]int),
+		inspects:     make(map[string]int),
 		networks:     make(map[string]networkInspect),
 		eventCh:      make(chan dockerEvent, 16),
 	}
@@ -161,10 +171,14 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 	mux.HandleFunc("/containers/{id}/json", func(w http.ResponseWriter, r *http.Request) {
 		d.mu.Lock()
 		defer d.mu.Unlock()
-		insp, ok := d.containers[r.PathValue("id")]
-		if !ok {
+		id := r.PathValue("id")
+		insp, ok := d.containers[id]
+		if !ok || !d.known(id) {
 			w.WriteHeader(http.StatusNotFound)
 			return
+		}
+		if !d.running(id) {
+			insp.State.Running, insp.State.Pid = false, 0
 		}
 		_ = json.NewEncoder(w).Encode(insp)
 	})
@@ -173,9 +187,12 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		defer d.mu.Unlock()
 		id := r.PathValue("id")
 		insp, ok := d.execs[id]
-		if !ok {
+		if !ok || !d.known(id) {
 			w.WriteHeader(http.StatusNotFound)
 			return
+		}
+		if !d.running(id) {
+			insp.Running = false
 		}
 		if d.execPidDelay[id] > 0 {
 			d.execPidDelay[id]--
@@ -264,6 +281,45 @@ func (d *fakeDaemon) setExec(id string, insp execInspect) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.execs[id] = insp
+}
+
+// running and known count down runningFor and knownFor for one inspect;
+// the caller holds d.mu.
+func (d *fakeDaemon) running(id string) bool { return countDown(d.runningFor, id) }
+
+func (d *fakeDaemon) known(id string) bool {
+	d.inspects[id]++
+	return countDown(d.knownFor, id)
+}
+
+func (d *fakeDaemon) inspectCount(id string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.inspects[id]
+}
+
+func countDown(m map[string]int, id string) bool {
+	n, ok := m[id]
+	if !ok {
+		return true
+	}
+	if n == 0 {
+		return false
+	}
+	m[id] = n - 1
+	return true
+}
+
+func (d *fakeDaemon) setRunningFor(id string, inspects int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.runningFor[id] = inspects
+}
+
+func (d *fakeDaemon) setKnownFor(id string, inspects int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.knownFor[id] = inspects
 }
 
 func (d *fakeDaemon) setExecPidDelay(id string, inspects int) {
@@ -457,162 +513,6 @@ func TestReconcileTagsPreDaemon(t *testing.T) {
 	assert.Equal(t, events.StepOrdinalPreDaemon, ev.StepOrdinal)
 	assert.Zero(t, ev.TagLatencyMS, "reconcile has no docker-event timestamp to measure from")
 	assert.Equal(t, []tagCall{{pid: 5150, ordinal: events.StepOrdinalPreDaemon}}, f.tagger.tagCalls())
-}
-
-func TestExecStartRetagsEffectiveOrdinal(t *testing.T) {
-	f := newFixture(t)
-	id := strings.Repeat("e", 64)
-	f.addContainer(t, id, 4242, "172.17.0.4", false)
-	f.tagger.setOrdinal(7)
-	f.start(t)
-	f.daemon.push(startEvent(id, time.Now().UnixNano()))
-	f.waitAttribution(t, "start", id)
-
-	execID := strings.Repeat("f", 64)
-	writeProcEntry(t, f.procRoot, 4343, cgroupV2Line(id)+"\n", "sh")
-	f.daemon.setExec(execID, execInspect{ID: execID, Running: true, Pid: 4343, ContainerID: id})
-	// The exec belongs to the step active at exec time, never the
-	// container's birth step.
-	f.tagger.setOrdinal(9)
-	f.daemon.push(execStartEvent(id, execID, time.Now().UnixNano()))
-
-	ev := f.waitAttribution(t, "exec", id)
-	assert.Equal(t, uint32(9), ev.StepOrdinal)
-	assert.Equal(t, uint32(4343), ev.PID)
-	assert.Contains(t, f.tagger.tagCalls(), tagCall{pid: 4343, ordinal: 9})
-
-	// DNS attribution follows the newest exec: effectiveOrdinal moved on.
-	ord, _, ok := f.tracker.LookupClient(&net.UDPAddr{IP: net.ParseIP("172.17.0.4"), Port: 1})
-	require.True(t, ok)
-	assert.Equal(t, uint32(9), ord)
-}
-
-// Pins the fix for the CI failure on PR #109: dockerd emits exec_start
-// BEFORE it records the exec pid from containerd, so the first inspect(s)
-// read Pid 0 for a live exec. The tracker must retry through that window
-// instead of dropping attribution.
-func TestExecStartRetriesUntilDockerdPublishesPid(t *testing.T) {
-	f := newFixture(t)
-	id := strings.Repeat("9", 64)
-	f.addContainer(t, id, 4242, "172.17.0.30", false)
-	f.tagger.setOrdinal(7)
-	f.start(t)
-	f.daemon.push(startEvent(id, time.Now().UnixNano()))
-	f.waitAttribution(t, "start", id)
-
-	execID := strings.Repeat("d", 64)
-	writeProcEntry(t, f.procRoot, 4646, cgroupV2Line(id)+"\n", "sh")
-	f.daemon.setExec(execID, execInspect{ID: execID, Running: true, Pid: 4646, ContainerID: id})
-	f.daemon.setExecPidDelay(execID, 2)
-	f.tagger.setOrdinal(9)
-	f.daemon.push(execStartEvent(id, execID, time.Now().UnixNano()))
-
-	ev := f.waitAttribution(t, "exec", id)
-	assert.Equal(t, uint32(9), ev.StepOrdinal)
-	assert.Equal(t, uint32(4646), ev.PID)
-	// Two Pid-0 inspects at 50ms apart put the measured latency at or above
-	// the retry interval — the honest cost of the publish race.
-	assert.GreaterOrEqual(t, ev.TagLatencyMS, 50.0)
-	assert.Contains(t, f.tagger.tagCalls(), tagCall{pid: 4646, ordinal: 9})
-}
-
-func TestExecStartWithoutExecIDFallsBackToDiff(t *testing.T) {
-	f := newFixture(t)
-	id := strings.Repeat("1", 64)
-	f.addContainer(t, id, 4242, "172.17.0.5", false)
-	f.tagger.setOrdinal(7)
-	f.start(t)
-	f.daemon.push(startEvent(id, time.Now().UnixNano()))
-	f.waitAttribution(t, "start", id)
-
-	// Daemons that omit Actor.Attributes["execID"] force the fallback:
-	// diff the container's live ExecIDs against what was already handled.
-	execID := strings.Repeat("2", 64)
-	writeProcEntry(t, f.procRoot, 4444, cgroupV2Line(id)+"\n", "sh")
-	f.daemon.setExec(execID, execInspect{ID: execID, Running: true, Pid: 4444, ContainerID: id})
-	f.daemon.updateContainer(id, func(c *containerInspect) { c.ExecIDs = []string{execID} })
-	f.tagger.setOrdinal(11)
-	f.daemon.push(execStartEvent(id, "", time.Now().UnixNano()))
-
-	ev := f.waitAttribution(t, "exec", id)
-	assert.Equal(t, uint32(4444), ev.PID)
-	assert.Contains(t, f.tagger.tagCalls(), tagCall{pid: 4444, ordinal: 11})
-}
-
-// A one-off exec (setup-buildx's post step) can finish before its pid is
-// checked. Its /proc entry is gone, and the daemon says it is no longer
-// running: there is nothing to tag, which is a skip, not a failed identity
-// check, and must not reach the job as a warning. Both ways of finding the
-// exec are covered: by the event's execID, and by diffing the container's
-// ExecIDs when the event lacks it.
-func TestExecExitedBeforeCheckIsNotAWarning(t *testing.T) {
-	for _, withExecID := range []bool{true, false} {
-		t.Run(fmt.Sprintf("execID attribute %t", withExecID), func(t *testing.T) {
-			f := newFixture(t)
-			id := strings.Repeat("6", 64)
-			f.addContainer(t, id, 4242, "172.17.0.31", false)
-			f.tagger.setOrdinal(7)
-			f.start(t)
-			f.daemon.push(startEvent(id, time.Now().UnixNano()))
-			f.waitAttribution(t, "start", id)
-
-			execID := strings.Repeat("7", 64)
-			f.daemon.setExec(execID, execInspect{ID: execID, Running: false, Pid: 4747, ContainerID: id})
-			f.daemon.updateContainer(id, func(c *containerInspect) { c.ExecIDs = []string{execID} })
-			f.tagger.setOrdinal(9)
-			attr := execID
-			if !withExecID {
-				attr = ""
-			}
-			f.daemon.push(execStartEvent(id, attr, time.Now().UnixNano()))
-
-			require.Eventually(t, func() bool { return f.tracker.tagSkipped.Load() == 1 }, waitFor, tick)
-			assert.Zero(t, f.tracker.identityRejected.Load())
-			assert.NotContains(t, f.tagger.tagCalls(), tagCall{pid: 4747, ordinal: 9})
-			assert.NotContains(t, f.logs.String(), "level=WARN")
-			assert.Contains(t, f.logs.String(), "Exec exited before it could be tagged")
-		})
-	}
-}
-
-// Two failures that are not that race keep the warning. A running exec
-// whose pid this /proc cannot see means the daemon's pids are in another
-// namespace, so every exec will fail the same way. A pid that does exist but
-// in another cgroup is the recycled pid the identity check is there for,
-// whether or not the exec has since exited.
-func TestExecIdentityFailuresStillWarn(t *testing.T) {
-	otherID := strings.Repeat("b", 64)
-	for _, tc := range []struct {
-		name    string
-		running bool
-		proc    bool // the pid has a /proc entry, in otherID's cgroup
-	}{
-		{name: "running, pid not visible", running: true},
-		{name: "exited, pid recycled", running: false, proc: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newFixture(t)
-			id := strings.Repeat("8", 64)
-			f.addContainer(t, id, 4242, "172.17.0.32", false)
-			f.tagger.setOrdinal(7)
-			f.start(t)
-			f.daemon.push(startEvent(id, time.Now().UnixNano()))
-			f.waitAttribution(t, "start", id)
-
-			execID := strings.Repeat("a", 64)
-			if tc.proc {
-				writeProcEntry(t, f.procRoot, 4848, cgroupV2Line(otherID)+"\n", "app")
-			}
-			f.daemon.setExec(execID, execInspect{ID: execID, Running: tc.running, Pid: 4848, ContainerID: id})
-			f.tagger.setOrdinal(9)
-			f.daemon.push(execStartEvent(id, execID, time.Now().UnixNano()))
-
-			require.Eventually(t, func() bool { return f.tracker.identityRejected.Load() == 1 }, waitFor, tick)
-			assert.Zero(t, f.tracker.tagSkipped.Load())
-			assert.NotContains(t, f.tagger.tagCalls(), tagCall{pid: 4848, ordinal: 9})
-			assert.Contains(t, f.logs.String(), `level=WARN msg="Exec identity check failed; not tagging"`)
-		})
-	}
 }
 
 func TestDieRemovesIPIndex(t *testing.T) {

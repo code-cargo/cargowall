@@ -81,9 +81,16 @@ func (t *Tracker) handleStart(ctx context.Context, id, kind string, timeNano int
 	// unrelated host process.
 	cgroupID, err := verifyContainerTask(t.opts.ProcRoot, t.opts.CgroupRoot, info.initPID, insp.ID)
 	identityOK := err == nil
-	if !identityOK {
+	if identityOK {
+		t.pidsVisible.Store(true)
+	} else if gone, derr := t.exitedFirst(ctx, err, t.containerRunning(id)); gone {
+		// `docker run --rm alpine true`: its init was reaped before this
+		// check, though inspect still gave its pid.
+		t.exitedBeforeTag.Add(1)
+		t.logger.Debug("Container exited before it could be tagged", "container", shortID(id), "error", err)
+	} else if ctx.Err() == nil { // shutting down mid-check is not a finding
 		t.identityRejected.Add(1)
-		t.logger.Warn("Container identity check failed; not tagging", "container", shortID(id), "error", err)
+		t.warnIdentity("Container identity check failed; not tagging", id, err, derr)
 	}
 	info.cgroupID = cgroupID
 
@@ -230,6 +237,11 @@ func (t *Tracker) handleExecStart(ctx context.Context, containerID, execID strin
 			// may since have been recycled.
 			return
 		}
+		if errors.Is(err, errExecExited) {
+			t.exitedBeforeTag.Add(1)
+			t.logExecExited(containerID, execID, pid, err)
+			return
+		}
 		t.tagSkipped.Add(1)
 		t.logger.Debug("Exec PID unresolvable; traffic stays in the container tier",
 			"container", shortID(containerID), "error", err)
@@ -245,18 +257,21 @@ func (t *Tracker) handleExecStart(ctx context.Context, containerID, execID strin
 	}
 
 	if _, err := verifyContainerTask(t.opts.ProcRoot, t.opts.CgroupRoot, pid, containerID); err != nil {
-		if taskGone(err) && t.execExited(ctx, execID) {
+		gone, derr := t.exitedFirst(ctx, err, t.execRunning(execID))
+		if gone {
 			// A one-off exec (a post step's docker exec) finished before
-			// this check: there is no process left to tag.
-			t.tagSkipped.Add(1)
-			t.logger.Debug("Exec exited before it could be tagged; traffic stays in the container tier",
-				"container", shortID(containerID), "pid", pid)
+			// this check.
+			t.exitedBeforeTag.Add(1)
+			t.logExecExited(containerID, execID, pid, err)
 			return
 		}
-		t.identityRejected.Add(1)
-		t.logger.Warn("Exec identity check failed; not tagging", "container", shortID(containerID), "error", err)
+		if ctx.Err() == nil { // shutting down mid-check is not a finding
+			t.identityRejected.Add(1)
+			t.warnIdentity("Exec identity check failed; not tagging", containerID, err, derr)
+		}
 		return
 	}
+	t.pidsVisible.Store(true)
 
 	t.tagger.TagContainerProcess(pid, ordinal)
 	t.execTagged.Add(1)
@@ -283,6 +298,11 @@ func (t *Tracker) handleExecStart(ctx context.Context, containerID, execID strin
 	})
 }
 
+// errExecExited marks an exec the daemon reports as already finished: its
+// pid may since belong to another process, even one in the same container,
+// so it is never checked or tagged.
+var errExecExited = errors.New("exec already exited")
+
 // errExecAlreadySeen means the exec was handled on a previous delivery — a
 // reconnect replay, not a failure; handleExecStart returns without counting
 // or logging it as a skip.
@@ -290,8 +310,8 @@ var errExecAlreadySeen = errors.New("exec already handled")
 
 // resolveExecPid turns an exec event into the exec leader's host PID and
 // the exec's id, which the event may not carry. The execID attribute is the
-// fast path; daemons that omit it fall back to
-// diffing the container's live ExecIDs against what we've already handled.
+// fast path; daemons that omit it fall back to diffing the container's live
+// ExecIDs against what we've already handled.
 // Both paths honour the seenExecs idempotency guard — the replay after a
 // stream reconnect arrives on whichever path the daemon supports.
 // The error exists for the Debug log: an unresolvable exec is expected
@@ -334,16 +354,84 @@ func (t *Tracker) resolveExecPid(ctx context.Context, containerID, execID string
 	return 0, "", fmt.Errorf("no execID attribute and no unseen running exec among %d", len(cinsp.ExecIDs))
 }
 
-// execExited reports whether the daemon says the exec has finished. It is
-// asked only when the exec's pid has no /proc entry. That is a short exec
-// gone before the check, unless the daemon's pids are not ours to see (a
-// daemon in another pid namespace), which a still-running exec shows, and
-// which keeps the warning. So does an exec the daemon can no longer report.
-func (t *Tracker) execExited(ctx context.Context, execID string) bool {
-	ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
-	defer cancel()
-	insp, err := t.client.inspectExec(ictx, execID)
-	return err == nil && !insp.Running
+// exitPolls and exitPollInterval bound how long exitedFirst asks the
+// daemon: dockerd learns of an exit from containerd some milliseconds after
+// the kernel reaps the task, and reports it running until then.
+const (
+	exitPolls        = 10
+	exitPollInterval = 20 * time.Millisecond
+)
+
+// exitedFirst reports whether a failed identity check is a task that
+// exited before it could be checked. Only a gone task can be (see
+// taskGone). Once any identity check has passed, this /proc sees the
+// daemon's pids, so a missing one has exited. Until then the daemon's pids
+// may be in another pid namespace, where every check fails this way, so the
+// daemon is asked, within a bound, until it reports the task stopped. A
+// task it still reports running, or cannot report at all, keeps the
+// warning; when asking failed, the error is returned for it. handleStart
+// asks on the event stream, so the bound is also how long a daemon whose
+// pids are out of sight holds each container start.
+func (t *Tracker) exitedFirst(ctx context.Context, err error, running func(context.Context) (bool, error)) (bool, error) {
+	if !taskGone(err) {
+		return false, nil
+	}
+	if t.pidsVisible.Load() {
+		return true, nil
+	}
+	for i := 1; ; i++ {
+		ictx, cancel := context.WithTimeout(ctx, unaryTimeout)
+		up, derr := running(ictx)
+		cancel()
+		if derr != nil {
+			return false, derr
+		}
+		if !up {
+			return true, nil
+		}
+		if i == exitPolls {
+			return false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(exitPollInterval):
+		}
+	}
+}
+
+// containerRunning and execRunning are exitedFirst's question to the
+// daemon.
+func (t *Tracker) containerRunning(id string) func(context.Context) (bool, error) {
+	return func(ctx context.Context) (bool, error) {
+		insp, err := t.client.inspectContainer(ctx, id)
+		return insp.State.Running, err
+	}
+}
+
+func (t *Tracker) execRunning(execID string) func(context.Context) (bool, error) {
+	return func(ctx context.Context) (bool, error) {
+		insp, err := t.client.inspectExec(ctx, execID)
+		return insp.Running, err
+	}
+}
+
+// logExecExited records an exec that finished before it could be tagged.
+// Whatever its leader left running in the background stays untagged, in
+// the container's tier, as it always has; a one-off exec leaves nothing.
+func (t *Tracker) logExecExited(containerID, execID string, pid int, err error) {
+	t.logger.Debug("Exec exited before it could be tagged; anything it left running stays in the container's tier",
+		"container", shortID(containerID), "exec", shortID(execID), "pid", pid, "error", err)
+}
+
+// warnIdentity logs a failed identity check, with the daemon's error when
+// asking it whether the task had exited failed.
+func (t *Tracker) warnIdentity(msg, containerID string, err, daemonErr error) {
+	args := []any{"container", shortID(containerID), "error", err}
+	if daemonErr != nil {
+		args = append(args, "daemon_error", daemonErr)
+	}
+	t.logger.Warn(msg, args...)
 }
 
 // markExecSeen records execID under its container and reports whether it
@@ -366,10 +454,11 @@ func (t *Tracker) markExecSeen(containerID, execID string) (seen bool) {
 // emits exec_start BEFORE it records the process pid from containerd, so an
 // immediate inspect reads Pid 0 for an exec that is very much alive
 // (confirmed against dockerd 28/29; same publish-race shape as the
-// stepCmdline retry in pkg/steps). A genuinely exited exec keeps reading 0
-// and falls out as unattributable — the stricter tier, by design. The retry
-// window is small against any real exec workload and is included in the
-// reported tag latency.
+// stepCmdline retry in pkg/steps). An exec that never got a pid keeps
+// reading 0 and falls out as unattributable — the stricter tier, by
+// design. One that started and has already finished reads its pid with
+// Running false, and is errExecExited. The retry window is small against
+// any real exec workload and is included in the reported tag latency.
 func (t *Tracker) inspectExecPid(ctx context.Context, execID string) (int, error) {
 	for i := 0; ; i++ {
 		insp, err := t.client.inspectExec(ctx, execID)
@@ -377,6 +466,9 @@ func (t *Tracker) inspectExecPid(ctx context.Context, execID string) (int, error
 			return 0, fmt.Errorf("exec inspect %s: %w", shortID(execID), err)
 		}
 		if insp.Pid != 0 {
+			if !insp.Running {
+				return 0, fmt.Errorf("exec %s: %w", shortID(execID), errExecExited)
+			}
 			return insp.Pid, nil
 		}
 		if i >= 19 {

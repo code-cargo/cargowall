@@ -25,7 +25,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -202,7 +201,7 @@ func TestRedirectChains_Order(t *testing.T) {
 	}
 	target := func(rule []expr.Any) net.IP { return net.IP(rule[len(rule)-3].(*expr.Immediate).Data) }
 
-	chains := redirectChains(false, bridgeDNS{})
+	chains := redirectChains(false, nil)
 	if len(chains) != 2 || chains[0].name != "output" || chains[1].name != "input" {
 		t.Fatalf("without a bridge want output and input chains, got %+v", chains)
 	}
@@ -221,7 +220,7 @@ func TestRedirectChains_Order(t *testing.T) {
 		}
 	}
 
-	chains = redirectChains(true, bridgeDNS{})
+	chains = redirectChains(true, nil)
 	if returns, dnats, _, order := kinds(chains[0].rules); returns != 2 || dnats != 8 || order != "RRNNNNNNNN" {
 		t.Errorf("IPv6 output rules = %q, want the 2 mark returns ahead of 8 DNATs", order)
 	}
@@ -235,7 +234,7 @@ func TestRedirectChains_Order(t *testing.T) {
 	}
 
 	bridge := net.IPv4(172, 17, 0, 1).To4()
-	chains = redirectChains(false, bridgeDNS{ip: bridge})
+	chains = redirectChains(false, bridge)
 	if len(chains) != 3 || chains[2].name != "prerouting" || chains[2].priority != -101 {
 		t.Fatalf("with a bridge want a prerouting chain at -101 third, got %+v", chains)
 	}
@@ -247,44 +246,9 @@ func TestRedirectChains_Order(t *testing.T) {
 			t.Errorf("a prerouting DNAT does not send to the bridge listener: %+v", rule[len(rule)-3])
 		}
 	}
-	chains = redirectChains(true, bridgeDNS{ip: bridge})
+	chains = redirectChains(true, bridge)
 	if _, _, _, order := kinds(chains[2].rules); order != "NNNNDDDD" {
 		t.Errorf("IPv6 prerouting rules = %q, want the 4 IPv4 DNATs, then 4 IPv6 drops", order)
-	}
-}
-
-// Without the proxy's listener on the bridge the prerouting chain stays, and
-// drops the DNS it would have sent there: no rule rewrites, and none matches
-// a family, so in an inet table IPv6 is dropped with IPv4 by the same 4
-// rules. The rest of the redirect is as it is with the listener.
-func TestRedirectChains_BridgeDrop(t *testing.T) {
-	bridge := net.IPv4(172, 17, 0, 1).To4()
-	for _, ipv6 := range []bool{false, true} {
-		chains := redirectChains(ipv6, bridgeDNS{ip: bridge, drop: true})
-		if len(chains) != 3 || chains[2].name != "prerouting" || chains[2].priority != -101 {
-			t.Fatalf("ipv6 %v: without the bridge listener want the prerouting chain kept, got %+v", ipv6, chains)
-		}
-		if n := len(chains[2].rules); n != 4 {
-			t.Errorf("ipv6 %v: prerouting has %d rules, want 4 drops (docker0 and br-*, UDP and TCP)", ipv6, n)
-		}
-		for i, rule := range chains[2].rules {
-			if v, ok := rule[len(rule)-1].(*expr.Verdict); !ok || v.Kind != expr.VerdictDrop {
-				t.Errorf("ipv6 %v: prerouting rule %d does not drop: %+v", ipv6, i, rule)
-			}
-			for _, e := range rule {
-				switch e := e.(type) {
-				case *expr.NAT:
-					t.Errorf("ipv6 %v: prerouting rule %d rewrites to an address the proxy does not hold", ipv6, i)
-				case *expr.Meta:
-					if e.Key == expr.MetaKeyNFPROTO {
-						t.Errorf("ipv6 %v: prerouting rule %d matches a family, letting the other one through", ipv6, i)
-					}
-				}
-			}
-		}
-		if !reflect.DeepEqual(chains[:2], redirectChains(ipv6, bridgeDNS{})) {
-			t.Errorf("ipv6 %v: the output and input chains must not change with the bridge listener", ipv6)
-		}
 	}
 }
 
@@ -294,7 +258,7 @@ func TestRedirectChains_BridgeDrop(t *testing.T) {
 // source address instead. An ip table's packets are all IPv4, and its rules
 // carry no such match.
 func TestRedirectChains_FamilyGated(t *testing.T) {
-	bridge := bridgeDNS{ip: net.IPv4(172, 17, 0, 1).To4()}
+	bridge := net.IPv4(172, 17, 0, 1).To4()
 	for _, c := range redirectChains(true, bridge) {
 		for i, rule := range c.rules {
 			var want byte

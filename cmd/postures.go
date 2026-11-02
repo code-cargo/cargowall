@@ -60,8 +60,8 @@ const (
 	// host's IPv6, which goes around the proxy (dnsRedirect.settle).
 	dnsRedirectIPv4 = "ipv4"
 	// dnsRedirectHost is the redirect in place for the host but not for
-	// containers: their DNS is dropped at the docker bridge, for want of the
-	// proxy's listener there.
+	// containers: their DNS goes around the proxy, for want of its listener
+	// on the docker bridge.
 	dnsRedirectHost = "host"
 	// dnsRedirectHostIPv4 is both: the redirect covers the host's IPv4 DNS
 	// alone.

@@ -68,6 +68,7 @@ test:
 test-bpf:
 	@printf "${GREEN}Running BPF tests (requires root)...${RESET}\n"
 	sudo go test -v -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/steps/ ./pkg/origin/ ./pkg/firewall/
+	sudo go test -v -count=1 -run 'Netns$$' ./cmd/
 
 verifier-budget:
 	@printf "${GREEN}Measuring BPF verifier budget on $$(uname -r) (requires root)...${RESET}\n"
@@ -78,6 +79,8 @@ test-ci:
 	go run gotest.tools/gotestsum@latest --junitfile test-results.xml --format testdox -- ./...
 	@printf "${GREEN}Running BPF tests with sudo...${RESET}\n"
 	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/steps/ ./pkg/origin/ ./pkg/firewall/
+	@printf "${GREEN}Running cmd's root-only tests with sudo...${RESET}\n"
+	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-cmd-root.xml --format testdox -- -count=1 -run 'Netns$$' ./cmd/
 
 vet:
 	$(call check_tool,staticcheck)

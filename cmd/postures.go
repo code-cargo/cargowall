@@ -16,14 +16,17 @@
 
 // Requested-vs-applied postures for the layers a flag requests but the
 // runtime can fail to deliver: the cgroup egress hook, the L7 layer riding
-// it, and the DNS redirect. A lost enforce rung fails startup — the operator
-// asked for a guarantee the job would not have. A lost observe rung only
-// warns, and is recorded so the job summary can say the measurement never
-// ran: an observe run that reports no would-blocks reads exactly like a
-// clean one. The redirect's flag has no rungs of its own; what it guards is
-// the policy's enforcement, so the policy's mode decides. Under policy
-// lockdown no loss is fatal: lockdown has already failed the job and stays up
-// deny-all on purpose, and exiting would take the whole firewall down.
+// it, and the DNS redirect. A lost enforce rung under an enforcing policy
+// fails startup — the operator asked for a guarantee the job would not have.
+// Under an auditing policy an enforce rung drops nothing (the hook checks the
+// audit gate), so losing it costs only measurement, like a lost observe
+// rung: that warns, and is recorded so the job summary can say the
+// measurement never ran, since an observe run that reports no would-blocks
+// reads exactly like a clean one. The redirect's flag has no rungs of its
+// own; what it guards is the policy's enforcement, so the policy's mode
+// decides there too. Under policy lockdown no loss is fatal: lockdown has
+// already failed the job and stays up deny-all on purpose, and exiting
+// would take the whole firewall down.
 package cmd
 
 import (
@@ -88,22 +91,24 @@ type postureLayer struct {
 // degrade instead.
 type postureLedger struct {
 	layers   []postureLayer
-	kernel   string // uname release, for verifier reasons: the budget is per-kernel
-	lockdown bool   // policy lockdown: no loss fails startup
+	kernel   string  // uname release, for verifier reasons: the budget is per-kernel
+	lockdown bool    // policy lockdown: no loss fails startup
+	refused  *string // StartCmd.refusedPosture: where a fatal loss names its posture
 	logger   *slog.Logger
 }
 
 // newPostures registers each layer against its OWN flag's constants: the
 // two flags happen to share the spellings "off" and "enforce", and neither
 // the skip nor the fail-closed decision may lean on that. enforcing is the
-// loaded policy's mode, which decides for the DNS redirect: the redirect
-// only does anything while DNS tracking runs.
+// loaded policy's mode: only under it does an enforce rung drop anything,
+// and the redirect matter to what is allowed. The redirect only does
+// anything while DNS tracking runs.
 func newPostures(cmd *StartCmd, kernel string, enforcing bool, logger *slog.Logger) *postureLedger {
-	p := &postureLedger{kernel: kernel, lockdown: cmd.policyLockdown, logger: logger}
+	p := &postureLedger{kernel: kernel, lockdown: cmd.policyLockdown, refused: &cmd.refusedPosture, logger: logger}
 	p.register(postureContainerEgress, cmd.ContainerEgress, ContainerEgressOff,
-		cmd.ContainerEgress == ContainerEgressEnforce)
+		enforcing && cmd.ContainerEgress == ContainerEgressEnforce)
 	p.register(postureTLSSNI, cmd.TLSSNI, TLSSNIOff,
-		cmd.TLSSNI == TLSSNIEnforce || cmd.TLSSNI == TLSSNIEnforcePinned)
+		enforcing && (cmd.TLSSNI == TLSSNIEnforce || cmd.TLSSNI == TLSSNIEnforcePinned))
 	redirect := dnsRedirectOff
 	if cmd.DNSRedirect && !cmd.DisableDNSTracking {
 		redirect = dnsRedirectOn
@@ -171,10 +176,39 @@ func (p *postureLedger) lose(posture, reason string) error {
 		return nil
 	case r.failClosed:
 		p.logger.Error(msg, "reason", reason)
+		// Recorded here rather than read back off the error, which any
+		// wrapping on the way out of startCargoWall could hide.
+		*p.refused = posture
 		return fmt.Errorf("%s: %s", msg, reason)
 	}
 	p.logger.Warn(msg, "reason", reason)
 	return nil
+}
+
+// exitRefused is `cargowall start`'s exit status when startup failed on a
+// refused posture. The failure sentinel names the posture too (see
+// writeFailureSentinel); the status is the channel that needs no file, for
+// a sentinel that could not be written. The action fails the step on
+// either, even with fail-on-unsupported off: cargowall can run on this
+// runner, just not with the enforcement this run's flags, preset and
+// policy call for, and carrying on would run the job with no firewall.
+const exitRefused = 3
+
+// refusalError carries exitRefused to kong, which exits with an error's
+// ExitCode.
+type refusalError struct{ error }
+
+func (refusalError) ExitCode() int { return exitRefused }
+
+func (e refusalError) Unwrap() error { return e.error }
+
+// refusalExit is err as StartCargoWall returns it: carrying exitRefused
+// when refused names a posture.
+func refusalExit(err error, refused string) error {
+	if err == nil || refused == "" {
+		return err
+	}
+	return refusalError{err}
 }
 
 // errReason condenses a failure into a posture reason. A verifier rejection

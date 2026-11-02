@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,17 +46,15 @@ type Server struct {
 	client     *dns.Client
 	server     *dns.Server
 
-	// Additional listen addresses (e.g., docker bridge IP for container DNS)
+	// additionalAddrs are the addresses beside the primary, each bound if it
+	// can be, whose failure bindErrs records (AddListenAddr); ready closes
+	// once Start has bound every listener.
 	additionalAddrs []string
-	// optionalAddrs are additional addresses bound if they can be, whose
-	// failure bindErrs records (AddOptionalListenAddr); ready closes once
-	// Start has bound every listener.
-	optionalAddrs []string
-	bindErrs      map[string]error
-	readyOnce     sync.Once // makes ready
-	readyClose    sync.Once // closes it, once however often Start runs
-	ready         chan struct{}
-	servers       []*dns.Server // All running servers
+	bindErrs        map[string]error
+	readyOnce       sync.Once // makes ready
+	readyClose      sync.Once // closes it, once however often Start runs
+	ready           chan struct{}
+	servers         []*dns.Server // All running servers
 
 	// DNS query filtering (blocks DNS tunneling)
 	filterQueries bool // When true, only forward queries for allowed domains
@@ -167,12 +164,6 @@ func (s *Server) SetAuditLogger(auditLogger *events.AuditLogger) {
 // reconciliation events.
 func (s *Server) SetRecentBlocks(rb *events.RecentBlocks) {
 	s.recentBlocks = rb
-}
-
-// AddListenAddr adds an additional address for the DNS server to listen on,
-// attributed via the host sockdiag path.
-func (s *Server) AddListenAddr(addr string) {
-	s.additionalAddrs = append(s.additionalAddrs, addr)
 }
 
 // EnableQueryFiltering enables DNS query filtering.
@@ -396,12 +387,8 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.seedHostSearchDomains()
 
-	// Collect all addresses to listen on
-	allAddrs := []string{s.listenAddr}
-	allAddrs = append(allAddrs, s.additionalAddrs...)
-
 	s.logger.Debug("DNS proxy server starting",
-		"addresses", allAddrs,
+		"addresses", append([]string{s.listenAddr}, s.additionalAddrs...),
 		"upstream", s.upstream)
 
 	// Create and start a server for each address (both UDP and TCP).
@@ -428,61 +415,22 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 	}
 
-	// A bind failure is fatal only for the PRIMARY address: without
-	// 127.0.0.1:53 there is no proxy and the daemon must not come up claiming
-	// one. An optional address (AddOptionalListenAddr, the docker bridge
-	// listener's too) binds whole or not at all, and its failure is its
-	// caller's to judge. A plain secondary address held by a leftover process
-	// must NOT take down the whole daemon — the proxy serves every other
-	// address, exactly as it did when each listener bound itself inside
-	// ListenAndServe. The fatal path shuts down whatever was already bound so
-	// nothing leaks past the error return.
-	failStart := func(addr, proto string, err error) error {
-		s.shutdownServers()
-		return fmt.Errorf("failed to listen on %s/%s: %w", addr, proto, err)
-	}
-
+	// Every listener binds over UDP and TCP both or neither (listenBoth), so
+	// nothing sent to an address finds half of it held by another process.
+	// Only the PRIMARY's failure is fatal: without 127.0.0.1:53 there is no
+	// proxy and the daemon must not come up claiming one. It binds first, so
+	// its failure leaves nothing bound. Any other address's failure is its
+	// caller's to judge (BindError): a leftover process holding the docker
+	// bridge address must not take down the whole daemon.
 	s.servers = nil
 	s.bindErrs = make(map[string]error)
-	for _, addr := range allAddrs {
-		if slices.Contains(s.optionalAddrs, addr) {
-			if err := s.listenBoth(ctx, &lc, addr); err != nil {
-				s.bindErrs[addr] = err
-				s.logger.Debug("Optional DNS listener not bound", "addr", addr, "error", err)
-			}
-			continue
-		}
-		for _, proto := range listenProtos(addr) {
-			// Bind through the marking ListenConfig; miekg/dns uses a
-			// pre-bound conn when one is supplied instead of binding itself.
-			switch proto {
-			case "udp4", "udp6":
-				pc, err := lc.ListenPacket(ctx, proto, addr)
-				if err != nil {
-					if addr == s.listenAddr {
-						return failStart(addr, proto, err)
-					}
-					s.logger.Error("DNS listener unavailable; continuing without it — "+
-						"clients configured to use this address will fail to resolve until "+
-						"whatever holds the address is stopped and cargowall restarted",
-						"addr", addr, "proto", proto, "error", err)
-					continue
-				}
-				s.serveOn(addr, proto, pc, nil)
-			default:
-				ln, err := lc.Listen(ctx, proto, addr)
-				if err != nil {
-					if addr == s.listenAddr {
-						return failStart(addr, proto, err)
-					}
-					s.logger.Error("DNS listener unavailable; continuing without it — "+
-						"clients configured to use this address will fail to resolve until "+
-						"whatever holds the address is stopped and cargowall restarted",
-						"addr", addr, "proto", proto, "error", err)
-					continue
-				}
-				s.serveOn(addr, proto, nil, ln)
-			}
+	if err := s.listenBoth(ctx, &lc, s.listenAddr); err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", s.listenAddr, err)
+	}
+	for _, addr := range s.additionalAddrs {
+		if err := s.listenBoth(ctx, &lc, addr); err != nil {
+			s.bindErrs[addr] = err
+			s.logger.Debug("DNS listener not bound", "addr", addr, "error", err)
 		}
 	}
 	s.readyClose.Do(func() { close(s.readyCh()) })

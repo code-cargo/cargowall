@@ -53,12 +53,11 @@ type dnsRedirect struct {
 }
 
 // addIPv6Listener adds the proxy's listener at network.ProxyAddrIPv6, the
-// one the redirect sends IPv6 DNS to, as an optional one: whether it binds
-// decides whether the redirect covers IPv6 (startDNSRedirect). Called
-// before the proxy starts.
+// one the redirect sends IPv6 DNS to: whether it binds decides whether the
+// redirect covers IPv6 (startDNSRedirect). Called before the proxy starts.
 func addIPv6Listener(cmd *StartCmd, dnsServer *dns.Server) {
 	if cmd.DNSRedirect {
-		dnsServer.AddOptionalListenAddr(network.ProxyAddrIPv6)
+		dnsServer.AddListenAddr(network.ProxyAddrIPv6)
 	}
 }
 

@@ -87,13 +87,10 @@ const (
 // a container's client socket, and whose wildcard fallback could even
 // mis-hit an unrelated host socket on the same ephemeral port). Explicit
 // marking rather than inference: a future non-container extra listener must
-// not silently classify its clients as containers. It is an optional
-// listener (AddOptionalListenAddr), bound over UDP and TCP both or neither,
-// and BindError says why not: the docker bridge's, which the DNS redirect
-// sends container DNS to only once it is known to be bound. Call before
-// Start.
+// not silently classify its clients as containers. It binds as AddListenAddr
+// says, whole or not at all, and BindError says why not. Call before Start.
 func (s *Server) AddContainerListenAddr(addr string) {
-	s.AddOptionalListenAddr(addr)
+	s.AddListenAddr(addr)
 	if host, _, err := net.SplitHostPort(addr); err == nil {
 		s.listenerModes[host] = attributeContainerIP
 	}

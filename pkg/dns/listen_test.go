@@ -57,14 +57,14 @@ func freePort(t *testing.T, host string) int {
 	return c.LocalAddr().(*net.UDPAddr).Port
 }
 
-// optionalListeners are the ways an optional listener is added: the
-// redirect's IPv6 one, and the docker bridge's, container-serving, here on
-// a loopback address of its own.
-var optionalListeners = []struct {
+// additionalListeners are the ways a listener beside the primary is added:
+// the redirect's IPv6 one, and the docker bridge's, container-serving, here
+// on a loopback address of its own.
+var additionalListeners = []struct {
 	name, host string
 	add        func(*Server, string)
 }{
-	{"ipv6", "::1", (*Server).AddOptionalListenAddr},
+	{"ipv6", "::1", (*Server).AddListenAddr},
 	{"container", "127.0.0.2", (*Server).AddContainerListenAddr},
 }
 
@@ -95,20 +95,66 @@ func newListenTestServer() *Server {
 		slog.New(slog.DiscardHandler))
 }
 
-// An optional listener added twice is bound once: a second bind of the
-// same address could only fail.
-func TestAddOptionalListenAddr_Once(t *testing.T) {
+// A listener added twice is bound once, and the primary's address is not
+// added beside it: a second bind of the same address could only fail.
+func TestAddListenAddr_Once(t *testing.T) {
 	s := newListenTestServer()
-	s.AddOptionalListenAddr("[::1]:53")
-	s.AddOptionalListenAddr("[::1]:53")
+	s.AddListenAddr("[::1]:53")
+	s.AddContainerListenAddr("[::1]:53")
+	s.AddListenAddr("127.0.0.1:0")
 	assert.Equal(t, []string{"[::1]:53"}, s.additionalAddrs)
-	assert.Equal(t, []string{"[::1]:53"}, s.optionalAddrs)
 }
 
-// An optional listener binds over its address's family and answers there,
-// and the docker bridge's stays container-serving.
-func TestStart_OptionalListenerServes(t *testing.T) {
-	for _, o := range optionalListeners {
+// The primary binds over UDP and TCP both or neither too, and either half
+// held by another process fails Start, naming it, with nothing left bound.
+func TestStart_PrimaryBindsWholeOrFails(t *testing.T) {
+	for i, held := range listenProtos("127.0.0.1:0") {
+		t.Run(held, func(t *testing.T) {
+			addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t, "127.0.0.1")))
+			other := listenProtos(addr)[1-i]
+			holdHalf(t, held, addr)
+
+			s := NewServer(config.NewConfigManager(), new(firewall.MockFirewall), "192.0.2.1:53", addr,
+				slog.New(slog.DiscardHandler))
+			require.ErrorContains(t, startServer(t, s), held)
+			requireFree(t, other, addr)
+		})
+	}
+}
+
+// holdHalf binds addr over proto, as another process holding that half.
+func holdHalf(t *testing.T, proto, addr string) {
+	t.Helper()
+	if proto == "udp4" || proto == "udp6" {
+		c, err := net.ListenPacket(proto, addr)
+		require.NoError(t, err)
+		t.Cleanup(func() { c.Close() })
+		return
+	}
+	l, err := net.Listen(proto, addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { l.Close() })
+}
+
+// requireFree fails unless addr can be bound over proto: the proxy did not
+// keep that half.
+func requireFree(t *testing.T, proto, addr string) {
+	t.Helper()
+	if proto == "udp4" || proto == "udp6" {
+		c, err := net.ListenPacket(proto, addr)
+		require.NoError(t, err, "the proxy must not keep the UDP half")
+		c.Close()
+		return
+	}
+	l, err := net.Listen(proto, addr)
+	require.NoError(t, err, "the proxy must not keep the TCP half")
+	l.Close()
+}
+
+// A listener beside the primary binds over its address's family and
+// answers there, and the docker bridge's stays container-serving.
+func TestStart_AdditionalListenerServes(t *testing.T) {
+	for _, o := range additionalListeners {
 		t.Run(o.name, func(t *testing.T) {
 			addr := net.JoinHostPort(o.host, strconv.Itoa(freePort(t, o.host)))
 			s := newListenTestServer()
@@ -129,41 +175,23 @@ func TestStart_OptionalListenerServes(t *testing.T) {
 	}
 }
 
-// An optional listener whose UDP or TCP half is held by another process
-// binds neither: the proxy still starts, BindError says why, and the half it
-// could have held is left free, so nothing sent there meets a proxy that is
-// only half there.
-func TestStart_OptionalListenerBindsWholeOrNot(t *testing.T) {
-	for _, o := range optionalListeners {
-		for i := range 2 {
-			addr := net.JoinHostPort(o.host, "0")
-			held, other := listenProtos(addr)[i], listenProtos(addr)[1-i]
+// A listener beside the primary whose UDP or TCP half is held by another
+// process binds neither: the proxy still starts, BindError says why, and the
+// half it could have held is left free, so nothing sent there meets a proxy
+// that is only half there.
+func TestStart_AdditionalListenerBindsWholeOrNot(t *testing.T) {
+	for _, o := range additionalListeners {
+		for i, held := range listenProtos(net.JoinHostPort(o.host, "0")) {
 			t.Run(o.name+"/"+held, func(t *testing.T) {
 				addr := net.JoinHostPort(o.host, strconv.Itoa(freePort(t, o.host)))
-				if i == 0 {
-					c, err := net.ListenPacket(held, addr)
-					require.NoError(t, err)
-					t.Cleanup(func() { c.Close() })
-				} else {
-					l, err := net.Listen(held, addr)
-					require.NoError(t, err)
-					t.Cleanup(func() { l.Close() })
-				}
+				other := listenProtos(addr)[1-i]
+				holdHalf(t, held, addr)
 
 				s := newListenTestServer()
 				o.add(s, addr)
-				require.NoError(t, startServer(t, s), "an optional listener that cannot bind must not fail Start")
+				require.NoError(t, startServer(t, s), "a listener beside the primary that cannot bind must not fail Start")
 				require.ErrorContains(t, s.BindError(addr), held)
-
-				if i == 0 {
-					l, err := net.Listen(other, addr)
-					require.NoError(t, err, "the proxy must not keep the TCP half")
-					l.Close()
-				} else {
-					c, err := net.ListenPacket(other, addr)
-					require.NoError(t, err, "the proxy must not keep the UDP half")
-					c.Close()
-				}
+				requireFree(t, other, addr)
 			})
 		}
 	}

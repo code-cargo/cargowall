@@ -25,22 +25,23 @@ import (
 	"github.com/miekg/dns"
 )
 
-// Optional listeners, which the DNS redirect sends IPv6 and container DNS
-// to, and the networks a listener binds.
+// The listeners beside the primary, which the DNS redirect sends IPv6 and
+// container DNS to, and the networks a listener binds.
 
-// AddOptionalListenAddr adds an address the proxy listens on if it can,
-// attributed via the host sockdiag path unless AddContainerListenAddr adds
-// it: the DNS redirect's [::1]:53, which IPv6 DNS is sent to only once it is
-// known to be bound, and likewise the docker bridge's. It binds over UDP
-// and TCP both or neither, so nothing redirected there finds half of it
-// held by another process. A failure is logged at Debug and left to
-// BindError: what it costs is the caller's call. Call before Start.
-func (s *Server) AddOptionalListenAddr(addr string) {
-	if slices.Contains(s.optionalAddrs, addr) {
-		return // bound once: a second listener on it could only fail
+// AddListenAddr adds an address the proxy listens on beside the primary, if
+// it can, attributed via the host sockdiag path unless AddContainerListenAddr
+// adds it: the DNS redirect's [::1]:53, which IPv6 DNS is sent to only once
+// it is known to be bound, and likewise the docker bridge's. It binds over
+// UDP and TCP both or neither, so nothing sent there finds half of it held
+// by another process. A failure is logged at Debug and left to BindError:
+// what it costs is the caller's call. An address is added once, and the
+// primary not at all: a second listener on one could only fail. Call before
+// Start.
+func (s *Server) AddListenAddr(addr string) {
+	if addr == s.listenAddr || slices.Contains(s.additionalAddrs, addr) {
+		return
 	}
-	s.AddListenAddr(addr)
-	s.optionalAddrs = append(s.optionalAddrs, addr)
+	s.additionalAddrs = append(s.additionalAddrs, addr)
 }
 
 // Ready is closed once Start has bound its listeners. A primary that cannot
@@ -54,8 +55,8 @@ func (s *Server) readyCh() chan struct{} {
 	return s.ready
 }
 
-// BindError is why an optional listener did not bind, nil when it did.
-// Valid once Ready is closed.
+// BindError is why the listener AddListenAddr added at addr did not bind,
+// nil when it did. Valid once Ready is closed.
 func (s *Server) BindError(addr string) error { return s.bindErrs[addr] }
 
 // listenBoth binds addr over UDP and TCP and serves both, or binds neither.

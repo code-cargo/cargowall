@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"net/netip"
@@ -25,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -50,7 +52,7 @@ func dockerUpWith(t *testing.T, dockerd podenv.Dockerd, cmd *StartCmd, servers f
 	daemonDNSServers = servers
 	t.Cleanup(func() { dockerFile, daemonDNSServers = saved, savedServers })
 	var buf bytes.Buffer
-	return newDockerUp(podenv.Shape{Dockerd: dockerd}, cmd, slog.New(slog.NewTextHandler(&buf, nil))), &buf
+	return newDockerUp(podenv.Shape{Dockerd: dockerd}, cmd, time.Now(), slog.New(slog.NewTextHandler(&buf, nil))), &buf
 }
 
 // The startup line says what waits for a Docker still to come up, by what
@@ -162,6 +164,76 @@ func TestDockerUp_Arrival(t *testing.T) {
 	assert.NotContains(t, buf.String(), "Docker answered")
 }
 
+// An arrival is timed from when startup began, not from the end of the
+// environment probe, whose pings can take seconds, in the log and the
+// summary alike.
+func TestDockerUp_ArrivalTimedFromStartup(t *testing.T) {
+	dockerUpFor(t, podenv.Dockerd{Kind: podenv.DockerdLocal}, &StartCmd{})
+	var buf bytes.Buffer
+	u := newDockerUp(podenv.Shape{Dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal}}, &StartCmd{},
+		time.Now().Add(-7200*time.Millisecond), slog.New(slog.NewTextHandler(&buf, nil)))
+	u.answered(false, nil)
+	assert.Contains(t, buf.String(), "Docker answered 7.2s after cargowall started")
+	rec, ok := readDockerRecord()
+	require.True(t, ok)
+	assert.InDelta(t, 7.2, rec.AfterS, 0.3)
+	assert.Equal(t, "Docker: the daemon answered 7s after CargoWall started.", dockerLine())
+}
+
+// Without a tracker (--container-egress=off), a watcher reports a pending
+// daemon's arrival, once, with container attribution not on; teardown stops
+// one still waiting, which then reports none. An up daemon gets no watcher.
+func TestDockerUp_Watcher(t *testing.T) {
+	saved := waitAnswer
+	t.Cleanup(func() { waitAnswer = saved })
+	answer := make(chan struct{})
+	stopped := make(chan struct{})
+	waitAnswer = func(ctx context.Context) error {
+		select {
+		case <-answer:
+			return nil
+		case <-ctx.Done():
+			close(stopped)
+			return ctx.Err()
+		}
+	}
+
+	u, buf := dockerUpFor(t, podenv.Dockerd{Kind: podenv.DockerdLocal}, &StartCmd{})
+	u.track(t.Context(), nil, nil, false, nil)
+	close(answer)
+	require.Eventually(t, func() bool {
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		return u.arrived
+	}, 2*time.Second, 10*time.Millisecond)
+	u.close()
+	assert.Equal(t, 1, strings.Count(buf.String(), "Docker answered"), buf.String())
+	assert.NotContains(t, buf.String(), "container attribution on")
+	rec, ok := readDockerRecord()
+	require.True(t, ok)
+	assert.True(t, rec.Answered)
+
+	answer = make(chan struct{})
+	u, buf = dockerUpFor(t, podenv.Dockerd{Kind: podenv.DockerdLocal}, &StartCmd{})
+	u.track(t.Context(), nil, nil, false, nil)
+	u.close()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("teardown did not stop the watcher")
+	}
+	assert.NotContains(t, buf.String(), "Docker answered")
+	assert.Contains(t, buf.String(), "Docker never answered")
+
+	waitAnswer = func(context.Context) error {
+		t.Error("an up daemon needs no watcher")
+		return nil
+	}
+	u, _ = dockerUpFor(t, podenv.Dockerd{Kind: podenv.DockerdLocal, Answers: true}, &StartCmd{})
+	u.track(t.Context(), nil, nil, false, nil)
+	u.close()
+}
+
 // Without the redirect, a pending daemon's daemon.json, left alone,
 // decides where its containers' DNS goes, and its lines say which: already
 // pointed at the IPv4 container listener by a previous run's rewrite (no
@@ -213,9 +285,12 @@ func TestDockerUp_DaemonJSON(t *testing.T) {
 }
 
 // A Docker still to come up that never answers is said so at teardown, and
-// in the summary: an Info with no bridge at startup, since no container of
-// its can have run, and a Warn with its bridges up, whose containers went
-// untracked. An arrival after teardown is none.
+// in the summary. With no bridge at startup no container of its can have
+// run: an Info, and a summary of no containers observed. With its bridges
+// up, or bridges that could not be listed, containers on them may have: a
+// Warn that they went untracked with container attribution on, an Info
+// with it off, where none was to be tracked, and a summary that names the
+// bridges, Docker's own names only. An arrival after teardown is none.
 func TestDockerUp_NeverAnswered(t *testing.T) {
 	u, buf := dockerUpFor(t, podenv.Dockerd{Kind: podenv.DockerdLocal}, &StartCmd{})
 	u.close()
@@ -225,10 +300,50 @@ func TestDockerUp_NeverAnswered(t *testing.T) {
 	assert.NotContains(t, buf.String(), "Docker answered")
 	assert.Equal(t, "Docker: the daemon never answered while CargoWall ran; no containers observed.", dockerLine())
 
-	u, buf = dockerUpFor(t, podenv.Dockerd{Kind: podenv.DockerdLocal, Bridges: []string{"docker0"}}, &StartCmd{})
-	u.close()
-	assert.Contains(t, buf.String(), "level=WARN")
-	assert.Contains(t, buf.String(), "containers on them went untracked")
+	bridges := podenv.Dockerd{Kind: podenv.DockerdLocal, Bridges: []string{"docker0", "br-0123456789ab"}}
+	unlisted := podenv.Dockerd{Kind: podenv.DockerdLocal, BridgesErr: errors.New("netlink: denied")}
+	for _, c := range []struct {
+		name    string
+		dockerd podenv.Dockerd
+		egress  string
+		warn    bool
+		log     string
+		summary string
+	}{
+		{
+			name: "bridges up, attribution on", dockerd: bridges, egress: ContainerEgressObserve, warn: true,
+			log:     "though its bridges were up at startup: any containers on them went untracked",
+			summary: "though its bridges were up at startup (docker0, br-0123456789ab); any containers on them went unobserved.",
+		},
+		{
+			name: "bridges up, attribution off", dockerd: bridges, egress: ContainerEgressOff,
+			log:     "though its bridges were up at startup; with container attribution off, none of its containers was to be tracked",
+			summary: "though its bridges were up at startup (docker0, br-0123456789ab); any containers on them went unobserved.",
+		},
+		{
+			name: "bridges not listed, attribution on", dockerd: unlisted, egress: ContainerEgressEnforce, warn: true,
+			log:     "its bridges could not be listed at startup: any containers on them went untracked",
+			summary: "and its bridges could not be listed at startup; any containers on them went unobserved.",
+		},
+		{
+			name: "bridges not listed, attribution off", dockerd: unlisted, egress: ContainerEgressOff,
+			log:     "its bridges could not be listed at startup; with container attribution off",
+			summary: "and its bridges could not be listed at startup; any containers on them went unobserved.",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			u, buf := dockerUpFor(t, c.dockerd, &StartCmd{ContainerEgress: c.egress})
+			u.close()
+			assert.Contains(t, buf.String(), c.log)
+			assert.Equal(t, c.warn, strings.Contains(buf.String(), "level=WARN"), buf.String())
+			assert.Contains(t, dockerLine(), c.summary)
+		})
+	}
+
+	require.NoError(t, writeSentinel(dockerFile, []byte(`{"answered":false,"bridges":["docker0","**x**"]}`)))
+	assert.Contains(t, dockerLine(), "(docker0);", "only Docker's own bridge names reach the summary")
+	require.NoError(t, writeSentinel(dockerFile, []byte(`{"answered":false,"bridges":["**x**"]}`)))
+	assert.Equal(t, "Docker: the daemon never answered while CargoWall ran; no containers observed.", dockerLine())
 
 	(*dockerUp)(nil).close()
 }

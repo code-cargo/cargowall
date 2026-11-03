@@ -43,6 +43,11 @@ var dockerFile = "/tmp/cargowall-docker"
 type dockerRecord struct {
 	Answered bool    `json:"answered"`
 	AfterS   float64 `json:"after_s,omitempty"` // seconds after startup
+	// Bridges are Docker's bridges up at startup, and BridgesUnlisted that
+	// they could not be listed: either way, containers of a daemon that never
+	// answered may have run on them.
+	Bridges         []string `json:"bridges,omitempty"`
+	BridgesUnlisted bool     `json:"bridges_unlisted,omitempty"`
 }
 
 // dockerUp is what startup makes of Docker's state (podenv.Dockerd), and,
@@ -65,8 +70,10 @@ type dockerUp struct {
 	attribution  bool // --container-egress is on
 	interception bool // --docker-dns-interception is on, with DNS tracking
 	redirect     bool // --dns-redirect is on, with DNS tracking
-	start        time.Time
-	logger       *slog.Logger
+	// start is when startup began, before the environment probe, whose
+	// pings can take seconds: an arrival is timed from it.
+	start  time.Time
+	logger *slog.Logger
 	// dnsLine says where a pending daemon's containers' DNS goes, read at
 	// startup (containerDNS), and dnsAround whether that is, or may be,
 	// around the proxy.
@@ -81,15 +88,16 @@ type dockerUp struct {
 
 // newDockerUp logs the runtime environment and what startup makes of
 // Docker's state in it: one Info line for a host with no Docker, or for one
-// still to come up, saying what starts when it answers.
-func newDockerUp(shape podenv.Shape, cmd *StartCmd, logger *slog.Logger) *dockerUp {
+// still to come up, saying what starts when it answers. began is when
+// startup did.
+func newDockerUp(shape podenv.Shape, cmd *StartCmd, began time.Time, logger *slog.Logger) *dockerUp {
 	logger.Info("Runtime environment", shape.LogArgs()...)
 	u := &dockerUp{
 		dockerd:      shape.Dockerd,
 		attribution:  cmd.ContainerEgress != ContainerEgressOff,
 		interception: cmd.DockerDNSInterception && !cmd.DisableDNSTracking,
 		redirect:     cmd.DNSRedirect && !cmd.DisableDNSTracking,
-		start:        time.Now(),
+		start:        began,
 		logger:       logger,
 	}
 	switch {
@@ -100,7 +108,7 @@ func newDockerUp(shape podenv.Shape, cmd *StartCmd, logger *slog.Logger) *docker
 			u.dnsLine, u.dnsAround = u.containerDNS()
 		}
 		logger.Info(u.pendingLine())
-		u.record(dockerRecord{})
+		u.record(dockerRecord{Bridges: u.dockerd.Bridges, BridgesUnlisted: u.dockerd.BridgesErr != nil})
 	}
 	return u
 }
@@ -170,11 +178,15 @@ func (u *dockerUp) track(ctx context.Context, a *containerAttribution, dnsServer
 	u.stop = cancel
 	u.mu.Unlock()
 	go func() {
-		if containers.WaitAnswer(wctx, dockerSocket) == nil {
+		if waitAnswer(wctx) == nil {
 			u.answered(false, nil)
 		}
 	}()
 }
+
+// waitAnswer is the watcher's wait for the daemon behind dockerSocket to
+// answer (containers.WaitAnswer), or a test's stand-in.
+var waitAnswer = func(ctx context.Context) error { return containers.WaitAnswer(ctx, dockerSocket) }
 
 // connected is the tracker's Options.OnConnect: its first connect to a
 // Docker still to come up is that Docker's arrival.
@@ -215,7 +227,8 @@ func (u *dockerUp) answered(tracked bool, carved []netip.Prefix) {
 // close stops the watcher, and says at teardown that a Docker still to come
 // up never did: with no bridge of its at startup no container of its can
 // have run, so nothing went untracked; with its bridges up, or bridges that
-// could not be listed, containers on them may have, untracked.
+// could not be listed, containers on them may have, untracked, which is a
+// Warn only with container attribution on: off, none was to be tracked.
 func (u *dockerUp) close() {
 	if u == nil || !u.dockerd.Pending() {
 		return
@@ -226,17 +239,22 @@ func (u *dockerUp) close() {
 	if u.stop != nil {
 		u.stop()
 	}
-	switch {
-	case u.arrived:
-	case len(u.dockerd.Bridges) > 0:
-		u.logger.Warn("Docker never answered, though its bridges were up at startup: containers on them went untracked",
-			"bridges", u.dockerd.Bridges)
-	case u.dockerd.BridgesErr != nil:
-		u.logger.Warn("Docker never answered, and its bridges could not be listed at startup: containers on any "+
-			"went untracked", "error", u.dockerd.BridgesErr)
-	default:
+	if u.arrived {
+		return
+	}
+	if len(u.dockerd.Bridges) == 0 && u.dockerd.BridgesErr == nil {
 		u.logger.Info("Docker never answered while cargowall ran, and had made no bridge: no container of its can " +
 			"have run, so none went untracked")
+		return
+	}
+	msg, args := "Docker never answered, though its bridges were up at startup", []any{"bridges", u.dockerd.Bridges}
+	if u.dockerd.BridgesErr != nil {
+		msg, args = "Docker never answered, and its bridges could not be listed at startup", []any{"error", u.dockerd.BridgesErr}
+	}
+	if u.attribution {
+		u.logger.Warn(msg+": any containers on them went untracked", args...)
+	} else {
+		u.logger.Info(msg+"; with container attribution off, none of its containers was to be tracked", args...)
 	}
 }
 
@@ -267,14 +285,27 @@ func readDockerRecord() (dockerRecord, bool) {
 }
 
 // dockerLine is the summary's neutral line about a Docker that was still to
-// come up at startup, "" for none.
+// come up at startup, "" for none. One that never answered had none of its
+// containers observed: with no bridge at startup none ran, while on the
+// bridges it had up, or on bridges that could not be listed, some may have.
+// Only names Docker's own bridges have are shown: the record is read from
+// world-writable /tmp.
 func dockerLine() string {
 	rec, ok := readDockerRecord()
 	switch {
 	case !ok:
 		return ""
-	case !rec.Answered:
-		return "Docker: the daemon never answered while CargoWall ran; no containers observed."
+	case rec.Answered:
+		return fmt.Sprintf("Docker: the daemon answered %.0fs after CargoWall started.", rec.AfterS)
 	}
-	return fmt.Sprintf("Docker: the daemon answered %.0fs after CargoWall started.", rec.AfterS)
+	bridges := slices.DeleteFunc(rec.Bridges, func(name string) bool { return !network.DockerBridge(name) })
+	switch {
+	case len(bridges) > 0:
+		return fmt.Sprintf("Docker: the daemon never answered while CargoWall ran, though its bridges were up at "+
+			"startup (%s); any containers on them went unobserved.", strings.Join(bridges, ", "))
+	case rec.BridgesUnlisted:
+		return "Docker: the daemon never answered while CargoWall ran, and its bridges could not be listed at " +
+			"startup; any containers on them went unobserved."
+	}
+	return "Docker: the daemon never answered while CargoWall ran; no containers observed."
 }

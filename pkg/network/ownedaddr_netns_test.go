@@ -105,6 +105,16 @@ func TestOwnedAddrs_TakesOverALeftover(t *testing.T) {
 	requireNoSource(t)
 	require.NoError(t, next.Remove())
 	assert.Empty(t, ownedOnLo(t))
+
+	// A leftover that cannot be deleted is refused, guard and all: added
+	// over as it is, it would keep what it was added with.
+	undo := setAddr(t, netip.PrefixFrom(ContainerDNSIPv4, 32), netip.Addr{}, "lo", ownedLabel)
+	stuck := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())
+	stuck.deleteAddr = func(netip.Addr) error { return errors.New("refused") }
+	require.ErrorContains(t, stuck.Add(ContainerDNSIPv4), "refused")
+	assert.Empty(t, guardRules(t), "a refused leftover leaves no guard")
+	require.NoError(t, stuck.Remove())
+	undo()
 }
 
 // requireNoSource fails unless the addresses are on lo as no source the

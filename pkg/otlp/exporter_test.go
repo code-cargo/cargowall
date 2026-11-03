@@ -30,17 +30,21 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/protobuf/proto"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 
-	collogspb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/collector/logs/v1"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
+
+// exportRequest is a decoded ExportLogsServiceRequest.
+type exportRequest struct {
+	ResourceLogs []*logspb.ResourceLogs
+}
 
 // collector is an httptest-backed OTLP endpoint that records decoded
 // export requests.
 type collector struct {
 	mu       sync.Mutex
-	requests []*collogspb.ExportLogsServiceRequest
+	requests []*exportRequest
 	headers  []http.Header
 	respond  func(w http.ResponseWriter, requestIndex int) // optional custom response
 	server   *httptest.Server
@@ -59,8 +63,9 @@ func newCollector(t *testing.T) *collector {
 			require.NoError(t, err)
 			require.NoError(t, gz.Close())
 		}
-		var req collogspb.ExportLogsServiceRequest
-		require.NoError(t, proto.Unmarshal(body, &req))
+		resourceLogs, err := unmarshalExportRequest(body)
+		require.NoError(t, err)
+		req := exportRequest{ResourceLogs: resourceLogs}
 
 		c.mu.Lock()
 		idx := len(c.requests)
@@ -79,7 +84,7 @@ func newCollector(t *testing.T) *collector {
 	return c
 }
 
-func (c *collector) recorded() []*collogspb.ExportLogsServiceRequest {
+func (c *collector) recorded() []*exportRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return slices.Clone(c.requests)
@@ -250,14 +255,7 @@ func TestExporter_PermanentErrorNotRetried(t *testing.T) {
 func TestExporter_PartialSuccessLogged(t *testing.T) {
 	c := newCollector(t)
 	c.respond = func(w http.ResponseWriter, _ int) {
-		resp := &collogspb.ExportLogsServiceResponse{
-			PartialSuccess: &collogspb.ExportLogsPartialSuccess{
-				RejectedLogRecords: 1,
-				ErrorMessage:       "attribute limit exceeded",
-			},
-		}
-		body, err := proto.Marshal(resp)
-		require.NoError(t, err)
+		body := exportResponse(1, "attribute limit exceeded")
 		w.Header().Set("Content-Type", "application/x-protobuf")
 		_, _ = w.Write(body)
 	}

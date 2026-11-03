@@ -25,7 +25,7 @@ on:
     paths:
       - "pkg/otlp/**"
       - "pkg/events/**"
-      - "pb/otlp/**"
+      - "go.mod"
       - "cmd/start.go"
       - ".github/workflows/otel-e2e.yml"
   workflow_dispatch:

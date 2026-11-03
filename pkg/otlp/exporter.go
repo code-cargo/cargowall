@@ -29,12 +29,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"google.golang.org/protobuf/proto"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 
-	collogspb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/collector/logs/v1"
-	commonpb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/common/v1"
-	logspb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/logs/v1"
-	resourcepb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/resource/v1"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
@@ -83,7 +81,7 @@ func New(cfg Config, version string, logger *slog.Logger) *Exporter {
 		client:   &http.Client{Timeout: cfg.Timeout},
 		queue:    make(chan events.AuditEvent, queueCapacity),
 		resource: buildResource(cfg, version),
-		scope:    &commonpb.InstrumentationScope{Name: scopeName, Version: version},
+		scope:    &commonpb.InstrumentationScope{Name: scopeName, Version: validUTF8(version)},
 		done:     make(chan struct{}),
 		logger:   logger,
 	}
@@ -196,16 +194,13 @@ func (e *Exporter) run() {
 // exponential backoff. Batches that exhaust retries or hit a permanent
 // error are dropped with a warning.
 func (e *Exporter) export(batch []*logspb.LogRecord) {
-	req := &collogspb.ExportLogsServiceRequest{
-		ResourceLogs: []*logspb.ResourceLogs{{
-			Resource: e.resource,
-			ScopeLogs: []*logspb.ScopeLogs{{
-				Scope:      e.scope,
-				LogRecords: batch,
-			}},
+	body, err := marshalExportRequest(&logspb.ResourceLogs{
+		Resource: e.resource,
+		ScopeLogs: []*logspb.ScopeLogs{{
+			Scope:      e.scope,
+			LogRecords: batch,
 		}},
-	}
-	body, err := proto.Marshal(req)
+	})
 	if err != nil {
 		e.logger.Warn("OTLP export failed to marshal batch", "error", err)
 		return
@@ -269,12 +264,9 @@ func (e *Exporter) send(body []byte) (retryable bool, retryAfter time.Duration, 
 		if err != nil {
 			return false, 0, nil // exported; response decode is best-effort
 		}
-		var exportResp collogspb.ExportLogsServiceResponse
-		if err := proto.Unmarshal(respBody, &exportResp); err == nil {
-			if ps := exportResp.GetPartialSuccess(); ps.GetRejectedLogRecords() > 0 {
-				e.logger.Warn("OTLP endpoint rejected some log records",
-					"rejected", ps.GetRejectedLogRecords(), "message", ps.GetErrorMessage())
-			}
+		if ps, err := parseExportResponse(respBody); err == nil && ps.rejectedLogRecords > 0 {
+			e.logger.Warn("OTLP endpoint rejected some log records",
+				"rejected", ps.rejectedLogRecords, "message", ps.errorMessage)
 		}
 		return false, 0, nil
 	case resp.StatusCode == http.StatusTooManyRequests,

@@ -15,14 +15,16 @@
 package otlp
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	"google.golang.org/protobuf/proto"
 
-	commonpb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/common/v1"
-	logspb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/logs/v1"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
@@ -287,6 +289,40 @@ func TestLogRecordFromEvent_ContainerAttributes(t *testing.T) {
 	attrs = attrMap(t, logRecordFromEvent(base).Attributes)
 	assert.NotContains(t, attrs, "cargowall.container_id")
 	assert.NotContains(t, attrs, "cargowall.container_origin")
+}
+
+// A workload sets its own comm, so a value that isn't UTF-8 must not fail
+// proto.Marshal for the batch that carries it.
+func TestLogRecordFromEvent_InvalidUTF8(t *testing.T) {
+	rec := logRecordFromEvent(events.AuditEvent{
+		Timestamp:   time.Now(),
+		EventType:   events.EventConnectionBlocked,
+		DstIP:       "93.184.216.34",
+		DstHostname: "bad\xffname.example",
+		DstPort:     443,
+		Process:     "\xff\xfe",
+		CNAMEChain:  []string{"ok.example", "bad\xfe.example"},
+		Blocked:     true,
+	})
+	_, err := proto.Marshal(rec)
+	require.NoError(t, err)
+
+	attrs := attrMap(t, rec.Attributes)
+	assert.Equal(t, "�", attrs["process.executable.name"].GetStringValue())
+	assert.Equal(t, "bad�name.example", attrs["server.address"].GetStringValue())
+	cnames := attrs["cargowall.cname_chain"].GetArrayValue().GetValues()
+	require.Len(t, cnames, 2)
+	assert.Equal(t, "bad�.example", cnames[1].GetStringValue())
+	assert.Equal(t, "connection blocked bad�name.example:443", rec.Body.GetStringValue())
+
+	e := New(Config{Endpoint: "http://127.0.0.1:1/v1/logs", ServiceName: "svc"}, "1.0\xff", discardLogger())
+	require.NoError(t, e.Shutdown(context.Background()))
+	assert.Equal(t, "1.0\uFFFD", e.scope.GetVersion())
+
+	res := buildResource(Config{ServiceName: "svc", ResourceAttrs: map[string]string{"k\xff": "v\xfe"}}, "")
+	_, err = proto.Marshal(res)
+	require.NoError(t, err)
+	assert.Equal(t, "v�", attrMap(t, res.Attributes)["k�"].GetStringValue())
 }
 
 func TestBuildResource(t *testing.T) {

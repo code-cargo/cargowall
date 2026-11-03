@@ -11,6 +11,7 @@ require (
 	github.com/mdlayher/netlink v1.11.2
 	github.com/miekg/dns v1.1.73
 	github.com/stretchr/testify v1.12.1
+	go.opentelemetry.io/proto/otlp v1.11.0
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688

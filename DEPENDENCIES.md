@@ -13,16 +13,11 @@ This file lists the dependencies used in this repository.
 | github.com/mdlayher/netlink               | MIT          | Matt Layher                                 |
 | github.com/miekg/dns                      | BSD-3-Clause | The Go Authors, Miek Gieben                 |
 | github.com/stretchr/testify               | MIT          | Mat Ryer, Tyler Bunnell and contributors    |
+| go.opentelemetry.io/proto/otlp            | Apache-2.0   | The OpenTelemetry Authors                   |
 | golang.org/x/net                          | BSD-3-Clause | The Go Authors                              |
 | golang.org/x/sys                          | BSD-3-Clause | The Go Authors                              |
 | google.golang.org/genproto/googleapis/api | Apache-2.0   | Google                                      |
 | google.golang.org/protobuf                | BSD-3-Clause | The Go Authors                              |
-
-## Generated code
-
-| Source                                                     | License    | Copyright Owner               |
-|------------------------------------------------------------|------------|-------------------------------|
-| opentelemetry-proto (`pb/otlp`, generated via buf from `buf.build/opentelemetry/opentelemetry`) | Apache-2.0 | The OpenTelemetry Authors |
 
 ## Indirect
 

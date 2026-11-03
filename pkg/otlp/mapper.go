@@ -21,16 +21,25 @@ import (
 	"sort"
 	"strings"
 
-	commonpb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/common/v1"
-	logspb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/logs/v1"
-	resourcepb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/resource/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
+// validUTF8 replaces invalid UTF-8 in a value bound for a proto3 string,
+// which must be UTF-8: one invalid string fails proto.Marshal for the whole
+// batch, and some values (a process's comm, the OTEL_RESOURCE_ATTRIBUTES
+// env) come from outside cargowall.
+func validUTF8(s string) string {
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
 func stringAttr(key, value string) *commonpb.KeyValue {
 	return &commonpb.KeyValue{
-		Key:   key,
-		Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: value}},
+		Key:   validUTF8(key),
+		Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: validUTF8(value)}},
 	}
 }
 
@@ -51,7 +60,7 @@ func boolAttr(key string, value bool) *commonpb.KeyValue {
 func stringArrayAttr(key string, values []string) *commonpb.KeyValue {
 	arr := make([]*commonpb.AnyValue, len(values))
 	for i, v := range values {
-		arr[i] = &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}}
+		arr[i] = &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: validUTF8(v)}}
 	}
 	return &commonpb.KeyValue{
 		Key:   key,
@@ -91,7 +100,7 @@ func logRecordFromEvent(ev events.AuditEvent) *logspb.LogRecord {
 		rec.SeverityText = "WARN"
 	}
 
-	rec.Body = &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: eventBody(ev)}}
+	rec.Body = &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: validUTF8(eventBody(ev))}}
 
 	attrs := make([]*commonpb.KeyValue, 0, 16)
 	if ev.SrcIP != "" {

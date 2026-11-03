@@ -195,6 +195,9 @@ type fakeDaemon struct {
 	networkInspects int
 
 	eventCh chan dockerEvent
+	// endCh ends the event stream being served, as a daemon that goes
+	// away does (endStream).
+	endCh chan struct{}
 }
 
 func newFakeDaemon(t *testing.T) *fakeDaemon {
@@ -215,6 +218,7 @@ func newFakeDaemonAfter(t *testing.T, ready <-chan struct{}) *fakeDaemon {
 		inspects:     make(map[string]int),
 		networks:     make(map[string]networkInspect),
 		eventCh:      make(chan dockerEvent, 16),
+		endCh:        make(chan struct{}, 1),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_ping", func(w http.ResponseWriter, _ *http.Request) {
@@ -315,11 +319,16 @@ func (d *fakeDaemon) serveEvents(w http.ResponseWriter, r *http.Request) {
 		case ev := <-d.eventCh:
 			_ = enc.Encode(ev)
 			fl.Flush()
+		case <-d.endCh:
+			return
 		case <-r.Context().Done():
 			return
 		}
 	}
 }
+
+// endStream ends the event stream being served, or the next one.
+func (d *fakeDaemon) endStream() { d.endCh <- struct{}{} }
 
 func (d *fakeDaemon) setContainer(insp containerInspect) {
 	d.mu.Lock()

@@ -92,6 +92,51 @@ func TestStartBeforeDaemonAnswers(t *testing.T) {
 	assert.NotContains(t, f.logs.String(), "level=WARN")
 }
 
+// waitConnect is the next Options.OnConnect call.
+func waitConnect(t *testing.T, connects <-chan connectCall) connectCall {
+	t.Helper()
+	select {
+	case c := <-connects:
+		return c
+	case <-time.After(waitFor):
+		t.Fatal("no connect")
+	}
+	return connectCall{}
+}
+
+// Once a session has connected, losing the daemon is a Warn, not the Debug
+// of a daemon not up yet, and the session that follows is no first one.
+// Its reconcile carves a bridge network created while the stream was down,
+// whose create event it never delivered.
+func TestReconnectAfterConnect(t *testing.T) {
+	f := newFixture(t)
+	f.daemon.setNetwork("bridge", "bridge", "172.17.0.0/16")
+	var mu sync.Mutex
+	var allowed []netip.Prefix
+	f.allowLocal = func(p netip.Prefix) error {
+		mu.Lock()
+		defer mu.Unlock()
+		allowed = append(allowed, p)
+		return nil
+	}
+	connects := make(chan connectCall, 4)
+	f.onConnect = func(first bool, carved []netip.Prefix) { connects <- connectCall{first, carved} }
+	f.start(t)
+	require.True(t, waitConnect(t, connects).first)
+
+	f.daemon.endStream()
+	gap := netip.MustParsePrefix("172.20.0.0/16")
+	f.daemon.setNetwork("gapnet", "bridge", gap.String())
+	c := waitConnect(t, connects)
+	assert.False(t, c.first, "a reconnect is no first session")
+	assert.Contains(t, c.carved, gap)
+	mu.Lock()
+	assert.Contains(t, allowed, gap)
+	mu.Unlock()
+	assert.Contains(t, f.logs.String(), `level=WARN msg="Docker event stream interrupted; reconnecting"`)
+	assert.NotContains(t, f.logs.String(), "not answering yet")
+}
+
 // WaitAnswer returns once the daemon answers, holding its request on a
 // socket that accepts and does not answer yet, and with ctx's error when
 // there is no daemon at all.

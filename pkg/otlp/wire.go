@@ -28,10 +28,11 @@ import (
 // package (go.opentelemetry.io/proto/otlp/collector/logs/v1) also holds the
 // gRPC service stubs and the grpc-gateway handler, so importing it links
 // grpc into the binary for messages that are one and two fields deep.
-// go.opentelemetry.io/proto/slim/otlp has no grpc, but it registers the
-// same proto paths as the full module, so a program that links both (the
-// SDK links the full one) panics at init. The field numbers are from
-// opentelemetry/proto/collector/logs/v1/logs_service.proto.
+// go.opentelemetry.io/proto/slim/otlp has no grpc either. Before v1.11.1
+// it registered the full module's proto paths, so a program that also
+// linked the SDK panicked at init; from v1.11.1 its paths are its own, at
+// the cost of a second copy of every OTLP type in such a program. The field
+// numbers are from opentelemetry/proto/collector/logs/v1/logs_service.proto.
 const (
 	requestResourceLogs   protowire.Number = 1 // ExportLogsServiceRequest.resource_logs
 	responsePartial       protowire.Number = 1 // ExportLogsServiceResponse.partial_success

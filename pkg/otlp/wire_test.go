@@ -25,6 +25,7 @@ import (
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoregistry"
 )
 
 // unmarshalExportRequest decodes an ExportLogsServiceRequest.
@@ -223,4 +224,12 @@ func FuzzParseExportResponse(f *testing.F) {
 		require.NoError(t, err)
 		assert.Equal(t, ps, again)
 	})
+}
+
+// The collector package carries gRPC stubs, so even a test import of it puts
+// grpc in go.mod. cmd's descriptor test can't see this package's test
+// imports; this one can.
+func TestCollectorPackageNotLinked(t *testing.T) {
+	_, err := protoregistry.GlobalFiles.FindFileByPath("opentelemetry/proto/collector/logs/v1/logs_service.proto")
+	assert.ErrorIs(t, err, protoregistry.NotFound)
 }

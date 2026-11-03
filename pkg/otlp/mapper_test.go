@@ -15,6 +15,7 @@
 package otlp
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -313,6 +314,10 @@ func TestLogRecordFromEvent_InvalidUTF8(t *testing.T) {
 	require.Len(t, cnames, 2)
 	assert.Equal(t, "bad�.example", cnames[1].GetStringValue())
 	assert.Equal(t, "connection blocked bad�name.example:443", rec.Body.GetStringValue())
+
+	e := New(Config{Endpoint: "http://127.0.0.1:1/v1/logs", ServiceName: "svc"}, "1.0\xff", discardLogger())
+	require.NoError(t, e.Shutdown(context.Background()))
+	assert.Equal(t, "1.0\uFFFD", e.scope.GetVersion())
 
 	res := buildResource(Config{ServiceName: "svc", ResourceAttrs: map[string]string{"k\xff": "v\xfe"}}, "")
 	_, err = proto.Marshal(res)

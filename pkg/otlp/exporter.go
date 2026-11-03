@@ -81,7 +81,7 @@ func New(cfg Config, version string, logger *slog.Logger) *Exporter {
 		client:   &http.Client{Timeout: cfg.Timeout},
 		queue:    make(chan events.AuditEvent, queueCapacity),
 		resource: buildResource(cfg, version),
-		scope:    &commonpb.InstrumentationScope{Name: scopeName, Version: version},
+		scope:    &commonpb.InstrumentationScope{Name: scopeName, Version: validUTF8(version)},
 		done:     make(chan struct{}),
 		logger:   logger,
 	}

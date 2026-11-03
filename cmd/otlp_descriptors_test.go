@@ -23,15 +23,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
-	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 // Programs that embed cargowall through this package commonly link the
 // OpenTelemetry SDK, which registers the upstream OTLP descriptors. A second
 // copy of one under the same proto path panics at init, before main, and
 // cargowall's own CI never links the SDK to see it. So every OTLP
-// descriptor linked here must be upstream's own, and no collector package
-// (their gRPC stubs link grpc) may be linked at all.
+// descriptor linked here must be registered by upstream's own Go packages,
+// and no collector package (their gRPC stubs link grpc) may be linked at
+// all. The Go package checked is the one that registered the file, which a
+// copied .pb.go keeping upstream's go_package option can't fake.
 func TestOTLPDescriptorsAreUpstream(t *testing.T) {
 	var linked int
 	protoregistry.GlobalFiles.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
@@ -41,9 +42,12 @@ func TestOTLPDescriptorsAreUpstream(t *testing.T) {
 		}
 		linked++
 		assert.False(t, strings.HasPrefix(path, "opentelemetry/proto/collector/"), "%s is linked", path)
-		opts, _ := fd.Options().(*descriptorpb.FileOptions)
-		assert.True(t, strings.HasPrefix(opts.GetGoPackage(), "go.opentelemetry.io/proto/otlp/"),
-			"%s is registered from %q", path, opts.GetGoPackage())
+		gp, ok := fd.(interface{ GoPackagePath() string })
+		if !assert.True(t, ok, "%s: the registering Go package is not exposed", path) {
+			return true
+		}
+		assert.True(t, strings.HasPrefix(gp.GoPackagePath(), "go.opentelemetry.io/proto/otlp/"),
+			"%s is registered by %q", path, gp.GoPackagePath())
 		return true
 	})
 	assert.Positive(t, linked, "the OTLP exporter's descriptors are linked")

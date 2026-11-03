@@ -94,7 +94,7 @@ func ipv6Gap(bindErr, refused error, hostIPv6 func() bool) string {
 // (dockerDNS.listeningIP). The IPv6 one counts only where the redirect
 // covers IPv6 (ipv6); where it does not, ipv6Gap speaks for the host and its
 // containers alike. On a host with no Docker neither counts: there is no
-// container whose DNS could go around the proxy (dockerDNS.noDocker).
+// container DNS to cover at startup (dockerDNS.noDocker).
 func containerGap(containerDNS *dockerDNS, ipv6 bool) string {
 	if containerDNS.noDocker() {
 		return ""

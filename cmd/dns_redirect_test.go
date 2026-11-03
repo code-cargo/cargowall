@@ -187,8 +187,8 @@ func TestDNSRedirect_PartialIsALoss(t *testing.T) {
 
 // A container listener the proxy could not bind costs the dns-redirect
 // posture only where Docker could be present. With no socket and no bridge
-// there is no container whose DNS could go around the proxy, so neither
-// family's refusal is a loss, under an enforcing policy or an auditing one.
+// there is no container DNS to cover at startup, so neither family's
+// refusal is a loss, under an enforcing policy or an auditing one.
 // A daemon still to come up, one up, bridges with no socket, and bridges
 // that could not be listed all still lose it to host: fatal under an
 // enforcing policy, recorded under an auditing one.

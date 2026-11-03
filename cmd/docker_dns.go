@@ -212,15 +212,18 @@ func unboundListener(local, restored, redirect, ipv6 bool) string {
 }
 
 // noDocker reports a host with no Docker: no socket and no bridge at start
-// (podenv.Dockerd.None). It has no containers, so a container listener the
-// proxy does not hold sends no container's DNS around the proxy, and costs
-// no dns-redirect posture (containerGap). A socket, a bridge, or bridges
-// that could not be listed are Docker that could be present. Nil-safe.
+// (podenv.Dockerd.None). It has no container DNS to cover, so a container
+// listener the proxy does not hold costs no dns-redirect posture
+// (containerGap). Only a Docker the job starts later could have containers
+// there, with no tracker and its daemon.json not rewritten: that family's
+// container DNS would then go around the proxy, unrecorded, which the
+// Info says (unheldWithoutDocker). A socket, a bridge, or bridges that
+// could not be listed are Docker that could be present. Nil-safe.
 func (d *dockerDNS) noDocker() bool { return d != nil && d.dockerd.None() }
 
 // unheldWithoutDocker logs, on a host with no Docker, the container
 // listeners the proxy does not hold, each with its reason, in one Info that
-// says why none of them counts.
+// says why none of them counts, and what one would cost.
 func (d *dockerDNS) unheldWithoutDocker(redirect bool) {
 	var unheld []string
 	for _, addr := range []netip.Addr{network.ContainerDNSIPv4, network.ContainerDNSIPv6} {
@@ -231,10 +234,10 @@ func (d *dockerDNS) unheldWithoutDocker(redirect bool) {
 	if len(unheld) == 0 {
 		return
 	}
-	msg := "Container DNS listener not held, which does not count: there is no Docker socket or bridge, " +
-		"so no container's DNS can go around the proxy"
+	msg := "Container DNS listener not held, which does not count: there was no Docker socket or bridge " +
+		"at startup, so it costs nothing unless Docker is started later"
 	if redirect {
-		msg += ", and the dns-redirect posture is kept"
+		msg += "; the dns-redirect posture is kept"
 	}
 	d.logger.Info(msg, "unheld", strings.Join(unheld, "; "))
 }

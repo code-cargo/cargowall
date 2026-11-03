@@ -201,8 +201,8 @@ func TestDockerDNS_UseListenerUnbound(t *testing.T) {
 
 // On a host with no Docker, a container listener the proxy could not bind
 // is no warning: one Info names each unheld address with its reason, and
-// says it does not count, the dns-redirect posture with it when the
-// redirect is requested. Docker that could be present, as bridges with no
+// says it does not count unless Docker is started later, the dns-redirect
+// posture kept when the redirect is requested. Docker that could be present, as bridges with no
 // socket or bridges that could not be listed, still warns.
 func TestDockerDNS_UseListenerNoDocker(t *testing.T) {
 	routed6 := errors.New("it is routed through tun0 by fd97:d1fb:f215::/48")
@@ -225,7 +225,7 @@ func TestDockerDNS_UseListenerNoDocker(t *testing.T) {
 				assert.NotContains(t, run.log, "level=WARN")
 				require.Equal(t, 1, strings.Count(run.log, "does not count"), run.log)
 				assert.Contains(t, run.log, "level=INFO msg=\"Container DNS listener not held, which does not count: "+
-					"there is no Docker socket or bridge")
+					"there was no Docker socket or bridge at startup, so it costs nothing unless Docker is started later")
 				for _, u := range c.unheld {
 					assert.Contains(t, run.log, u)
 				}

@@ -281,9 +281,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		}
 
 		addIPv6Listener(cmd, dnsServer)
-		if cmd.DockerDNSInterception {
-			containerDNS = startDockerDNS(dnsServer, shape.Dockerd, logger)
-		}
+		var removeContainerDNS func()
+		containerDNS, removeContainerDNS = startDockerDNS(cmd, dnsServer, shape.Dockerd, teardowns, logger)
+		defer removeContainerDNS()
 
 		dnsErrCh := make(chan error, 1)
 		go func() {
@@ -306,7 +306,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		logger.Debug("DNS proxy server started",
 			"listen", listenAddr,
 			"upstream", upstream)
-		// Point the daemon at the bridge listener now that it is known to
+		// Point the daemon at the container listener now that it is known to
 		// hold, or say that it does not.
 		defer containerDNS.useListener(teardowns, cmd.DNSRedirect)()
 
@@ -467,13 +467,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	}
 
 	// Find network interface
-	ifname := cmd.Interface
-	if ifname == "" {
-		var err error
-		ifname, err = network.FindPodInterface()
-		if err != nil {
-			return err
-		}
+	ifname, err := tcInterface(cmd)
+	if err != nil {
+		return err
 	}
 	logger.Info("Using network interface", "interface", ifname)
 
@@ -875,7 +871,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// of the cgroup hook only (one LPM write — cheap enough for the event
 	// stream goroutine), never added to the shared policy: TC's off-host
 	// enforcement must be un-widenable by workload-influenced input.
-	attribution.startUserspace(ctx, dnsServer, containerDNS.listeningIP(), auditLogger, attribution.allowLocalNetwork)
+	attribution.startUserspace(ctx, dnsServer, containerDNS.serving(), auditLogger, attribution.allowLocalNetwork)
 
 	if startupInterrupted(ctx, logger, "pre-ready") {
 		return nil
@@ -1157,8 +1153,8 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 		}
 	}
 
-	// DNS-infrastructure auto-allows (proxy upstream, loopback, docker
-	// bridge listener) are NOT added here: they run unconditionally in
+	// DNS-infrastructure auto-allows (proxy upstream, loopback, container
+	// DNS listeners) are NOT added here: they run unconditionally in
 	// startCargoWall after config load, independent of CI mode.
 
 	return apiPolicyLoaded

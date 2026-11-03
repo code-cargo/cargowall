@@ -64,16 +64,6 @@ var dockerDaemonConfig = &daemonConfig{
 	reload:  reloadDockerDaemon,
 }
 
-// GetDockerBridgeIP returns the IP address of the docker0 bridge interface.
-// This is typically 172.17.0.1 and is used as the gateway for Docker containers.
-func GetDockerBridgeIP() (string, error) {
-	ipnet, err := dockerBridgeIPNet()
-	if err != nil {
-		return "", err
-	}
-	return ipnet.IP.String(), nil
-}
-
 // GetDockerBridgeSubnet returns the default bridge's IPv4 network in CIDR
 // form (e.g. "172.17.0.0/16"). The cgroup egress hook adjudicates bridge
 // traffic TC never saw — host→published-port via docker-proxy, container→
@@ -89,10 +79,7 @@ func GetDockerBridgeSubnet() (string, error) {
 	return network.String(), nil
 }
 
-// dockerBridgeIPNet is the one walk of docker0's addresses — the bridge IP
-// (DNS listener) and the bridge subnet (local-net carve-out) must always
-// come from the same interface and address, or the two halves of docker
-// integration could disagree about which bridge they serve.
+// dockerBridgeIPNet is docker0's first IPv4 address, with its network.
 func dockerBridgeIPNet() (*net.IPNet, error) {
 	iface, err := net.InterfaceByName("docker0")
 	if err != nil {

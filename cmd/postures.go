@@ -60,8 +60,8 @@ const (
 	// host's IPv6, which goes around the proxy (dnsRedirect.settle).
 	dnsRedirectIPv4 = "ipv4"
 	// dnsRedirectHost is the redirect in place for the host but not for
-	// containers: their DNS goes around the proxy, for want of its listener
-	// on the docker bridge.
+	// containers: their DNS goes around the proxy, for want of its container
+	// listener.
 	dnsRedirectHost = "host"
 	// dnsRedirectHostIPv4 is both: the redirect covers the host's IPv4 DNS
 	// alone.
@@ -69,8 +69,13 @@ const (
 )
 
 // maxPostureReasonBytes bounds a reason: it lands in a job-summary table
-// cell and must leave the whole record well inside readStateFile's cap.
-const maxPostureReasonBytes = 300
+// cell and must leave the whole record well inside readStateFile's cap. It
+// fits a lost dns-redirect's reasons at their longest: the kernel refusing
+// the inet table, with its hint, beside the IPv4 container listener's
+// address refused for a route through an interface whose name is as long
+// as one gets. The IPv6 container listener counts only where IPv6 is
+// covered, so its reason never joins an IPv6 one.
+const maxPostureReasonBytes = 400
 
 // postureLine is one layer's line in posturesFile, the whole of what
 // crosses from `cargowall start` to `cargowall summary`. Values are flag

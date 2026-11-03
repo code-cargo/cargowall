@@ -66,6 +66,6 @@ func TestContainerAttributionNilSafe(t *testing.T) {
 		a.Close()
 		assert.Nil(t, a.enricherArg())
 		assert.Nil(t, a.observerProgram())
-		a.startUserspace(t.Context(), nil, "", nil, nil)
+		a.startUserspace(t.Context(), nil, false, nil, nil)
 	})
 }

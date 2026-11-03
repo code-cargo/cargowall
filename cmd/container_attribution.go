@@ -332,9 +332,10 @@ func (a *containerAttribution) subnetCarver(allow func(prefix netip.Prefix) erro
 }
 
 // startUserspace is the late phase: docker-events tracking, tagging, DNS
-// client attribution (only meaningful when the bridge listener exists), and
-// bridge-subnet discovery (allowLocalSubnet, may be nil).
-func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dns.Server, dockerBridgeIP string, auditLogger *events.AuditLogger, allowLocalSubnet func(prefix netip.Prefix) error) {
+// client attribution (only meaningful when the proxy holds a container
+// listener, containerDNS), and bridge-subnet discovery (allowLocalSubnet,
+// may be nil).
+func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dns.Server, containerDNS bool, auditLogger *events.AuditLogger, allowLocalSubnet func(prefix netip.Prefix) error) {
 	if a == nil {
 		return
 	}
@@ -345,7 +346,7 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 	}
 	a.tracker = ctr
 	a.enricher.Bind(ctr)
-	if dnsServer != nil && dockerBridgeIP != "" {
+	if dnsServer != nil && containerDNS {
 		dnsServer.SetContainerLookup(ctr.LookupClient)
 	}
 	a.logger.Info("Container attribution enabled")

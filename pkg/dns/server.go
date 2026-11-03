@@ -50,6 +50,7 @@ type Server struct {
 	// can be, whose failure bindErrs records (AddListenAddr); ready closes
 	// once Start has bound every listener.
 	additionalAddrs []string
+	prepares        map[string]func() error // what Start runs before an address binds (PrepareListenAddr)
 	bindErrs        map[string]error
 	readyOnce       sync.Once // makes ready
 	readyClose      sync.Once // closes it, once however often Start runs
@@ -419,16 +420,16 @@ func (s *Server) Start(ctx context.Context) error {
 	// nothing sent to an address finds half of it held by another process.
 	// Only the PRIMARY's failure is fatal: without 127.0.0.1:53 there is no
 	// proxy and the daemon must not come up claiming one. It binds first, so
-	// its failure leaves nothing bound. Any other address's failure is its
-	// caller's to judge (BindError): a leftover process holding the docker
-	// bridge address must not take down the whole daemon.
+	// its failure leaves nothing bound. Any other address's failure, or its
+	// preparation's, is its caller's to judge (BindError): a process holding
+	// a container listener's address must not take down the whole daemon.
 	s.servers = nil
 	s.bindErrs = make(map[string]error)
 	if err := s.listenBoth(ctx, &lc, s.listenAddr); err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", s.listenAddr, err)
 	}
 	for _, addr := range s.additionalAddrs {
-		if err := s.listenBoth(ctx, &lc, addr); err != nil {
+		if err := s.listenAdditional(ctx, &lc, addr); err != nil {
 			s.bindErrs[addr] = err
 			s.logger.Debug("DNS listener not bound", "addr", addr, "error", err)
 		}

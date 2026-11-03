@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -41,8 +42,8 @@ import (
 // redirect must already be up, so setup records the failure and settle
 // reports it. A redirect that covers IPv4 but not the IPv6 the host has is
 // a loss too: IPv6 DNS then goes around the proxy the same way. So is one
-// that leaves container DNS alone for want of the proxy's listener on the
-// docker bridge: containers then resolve around the proxy.
+// that leaves container DNS alone for want of the proxy's container
+// listener: containers then resolve around the proxy.
 type dnsRedirect struct {
 	active bool  // the redirect is in place, for the host's IPv4 at least
 	err    error // why it is not, or not whole; nil when it is whole
@@ -86,15 +87,24 @@ func ipv6Gap(bindErr, refused error, hostIPv6 func() bool) string {
 	}
 }
 
-// bridgeGap is why container DNS will not reach the proxy, "" when it will:
-// the proxy does not hold its listener on the docker bridge, and the
-// redirect then leaves container DNS alone (dockerDNS.listeningIP).
-func bridgeGap(containerDNS *dockerDNS) string {
-	err := containerDNS.listenerErr()
-	if err == nil {
-		return ""
+// containerGap is why container DNS will not all reach the proxy, "" when it
+// will: the proxy does not hold one of its container listeners, and the
+// redirect then leaves that family's container DNS alone
+// (dockerDNS.listeningIP). The IPv6 one counts only where the redirect
+// covers IPv6 (ipv6); where it does not, ipv6Gap speaks for the host and its
+// containers alike.
+func containerGap(containerDNS *dockerDNS, ipv6 bool) string {
+	addrs := []netip.Addr{network.ContainerDNSIPv4}
+	if ipv6 {
+		addrs = append(addrs, network.ContainerDNSIPv6)
 	}
-	return listenGap(containerDNS.listenAddr(), err)
+	var gaps []string
+	for _, addr := range addrs {
+		if err := containerDNS.listenerErr(addr); err != nil {
+			gaps = append(gaps, listenGap(containerListenAddr(addr), err))
+		}
+	}
+	return strings.Join(gaps, "; ")
 }
 
 // listenGap is why the proxy does not hold its listener at addr, as a
@@ -116,9 +126,9 @@ func listenGap(addr string, err error) string {
 
 // startDNSRedirect installs the redirect for the listeners the proxy holds
 // once it is ready: IPv6 DNS goes to its IPv6 listener only when that is
-// bound, and container DNS to its docker bridge listener only when that one
-// is (dockerDNS.listeningIP). What that leaves uncovered is ipv6Gap's and
-// bridgeGap's to say. The returned undo
+// bound, and container DNS to its container listener of its family only
+// when that one is (dockerDNS.listeningIP). What that leaves uncovered is
+// ipv6Gap's and containerGap's to say. The returned undo
 // removes it; the caller defers it. It is registered before the install,
 // like every host mutation's: a forced shutdown landing mid-install waits
 // for it, then removes the table, which an unowned one needs, and flushes
@@ -136,35 +146,47 @@ func startDNSRedirect(dnsServer *dns.Server, containerDNS *dockerDNS, teardowns 
 		}
 	})
 	bindErr := dnsServer.BindError(network.ProxyAddrIPv6)
-	if err := redirect.Install(network.RedirectSpec{IPv6: bindErr == nil, BridgeIP: containerDNS.listeningIP()}); err != nil {
+	spec := network.RedirectSpec{IPv6: bindErr == nil}
+	spec.ContainerIPv4, _ = netip.ParseAddr(containerDNS.listeningIP())
+	spec.ContainerIPv6, _ = netip.ParseAddr(containerDNS.listeningIPv6())
+	if err := redirect.Install(spec); err != nil {
 		return notInstalled(err, logger), undo
 	}
-	return installed(ipv6Gap(bindErr, redirect.IPv6Refused(), network.HostIPv6), bridgeGap(containerDNS), logger), undo
+	ipv6, container := redirectGaps(bindErr, redirect.IPv6Refused(), network.HostIPv6, containerDNS)
+	return installed(ipv6, container, logger), undo
+}
+
+// redirectGaps is what an installed redirect leaves uncovered: ipv6Gap's
+// and containerGap's reasons. IPv6 is covered, and the IPv6 container
+// listener counts, only where the proxy holds its IPv6 listener (bindErr
+// nil) and the kernel took the inet table (refused nil).
+func redirectGaps(bindErr, refused error, hostIPv6 func() bool, containerDNS *dockerDNS) (ipv6, container string) {
+	return ipv6Gap(bindErr, refused, hostIPv6), containerGap(containerDNS, bindErr == nil && refused == nil)
 }
 
 // installed records a redirect in place, whole unless it has a gap: ipv6
-// when IPv6 DNS goes around the proxy, bridge when container DNS does, for
-// want of the bridge listener, "" for none. One with a gap is recorded at
-// what it still covers, with every gap's reason, and says so in the log
-// where it happened, as notInstalled does.
-func installed(ipv6, bridge string, logger *slog.Logger) *dnsRedirect {
+// when IPv6 DNS goes around the proxy, container when container DNS does,
+// for want of a container listener, "" for none. One with a gap is
+// recorded at what it still covers, with every gap's reason, and says so in
+// the log where it happened, as notInstalled does.
+func installed(ipv6, container string, logger *slog.Logger) *dnsRedirect {
 	r := &dnsRedirect{active: true}
 	switch {
-	case ipv6 != "" && bridge != "":
+	case ipv6 != "" && container != "":
 		r.applied = dnsRedirectHostIPv4
 	case ipv6 != "":
 		r.applied = dnsRedirectIPv4
-	case bridge != "":
+	case container != "":
 		r.applied = dnsRedirectHost
 	default:
 		return r
 	}
-	// The bridge's reason goes first: it is short, while IPv6's can carry a
-	// kernel refusal and its hint, and the record keeps only the first
-	// maxPostureReasonBytes, so in this order both causes survive.
+	// The containers' reason goes first: it is short, while IPv6's can carry
+	// a kernel refusal and its hint, and were a record to outgrow
+	// maxPostureReasonBytes, the cut would fall in the hint.
 	var gaps []string
-	if bridge != "" {
-		gaps = append(gaps, "container DNS is not redirected: "+bridge)
+	if container != "" {
+		gaps = append(gaps, "container DNS is not redirected: "+container)
 	}
 	if ipv6 != "" {
 		gaps = append(gaps, "IPv6 DNS is not redirected: "+ipv6)

@@ -18,6 +18,7 @@ package dns
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"strconv"
@@ -58,8 +59,8 @@ func freePort(t *testing.T, host string) int {
 }
 
 // additionalListeners are the ways a listener beside the primary is added:
-// the redirect's IPv6 one, and the docker bridge's, container-serving, here
-// on a loopback address of its own.
+// the redirect's IPv6 one, and a container listener, container-serving,
+// here on a loopback address of its own.
 var additionalListeners = []struct {
 	name, host string
 	add        func(*Server, string)
@@ -168,7 +169,7 @@ func requireFree(t *testing.T, proto, addr string) {
 }
 
 // A listener beside the primary binds over its address's family and
-// answers there, and the docker bridge's stays container-serving.
+// answers there, and a container listener stays container-serving.
 func TestStart_AdditionalListenerServes(t *testing.T) {
 	for _, o := range additionalListeners {
 		t.Run(o.name, func(t *testing.T) {
@@ -211,6 +212,62 @@ func TestStart_AdditionalListenerBindsWholeOrNot(t *testing.T) {
 			})
 		}
 	}
+}
+
+// A listener's preparation runs once the primary is bound and before the
+// listener binds; its failure is the listener's BindError, the listener is
+// not bound, and the proxy still starts. Where the primary cannot bind,
+// nothing is prepared: the second proxy in a namespace touches nothing.
+func TestPrepareListenAddr(t *testing.T) {
+	primary := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t, "127.0.0.1")))
+	addr := net.JoinHostPort("127.0.0.2", strconv.Itoa(freePort(t, "127.0.0.2")))
+	refused := errors.New("refused")
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "prepared", true: "refused"}[fail], func(t *testing.T) {
+			s := NewServer(config.NewConfigManager(), new(firewall.MockFirewall), "192.0.2.1:53", primary,
+				slog.New(slog.DiscardHandler))
+			s.AddContainerListenAddr(addr)
+			// What the preparation found, on Start's goroutine: whether the
+			// primary was held and the listener's address still free.
+			var prepared, primaryHeld, addrFree bool
+			s.PrepareListenAddr(addr, func() error {
+				prepared = true
+				if c, err := net.ListenPacket("udp4", primary); err == nil {
+					c.Close()
+				} else {
+					primaryHeld = true
+				}
+				if c, err := net.ListenPacket("udp4", addr); err == nil {
+					addrFree = true
+					c.Close()
+				}
+				if fail {
+					return refused
+				}
+				return nil
+			})
+			require.NoError(t, startServer(t, s))
+			require.True(t, prepared)
+			assert.True(t, primaryHeld, "the primary must be bound before the preparation")
+			assert.True(t, addrFree, "the listener must bind only after its preparation")
+			if fail {
+				require.ErrorIs(t, s.BindError(addr), refused)
+				requireFree(t, "udp4", addr)
+				requireFree(t, "tcp4", addr)
+			} else {
+				require.NoError(t, s.BindError(addr))
+			}
+		})
+	}
+
+	holdHalf(t, "udp4", primary)
+	s := NewServer(config.NewConfigManager(), new(firewall.MockFirewall), "192.0.2.1:53", primary,
+		slog.New(slog.DiscardHandler))
+	s.AddContainerListenAddr(addr)
+	prepared := false
+	s.PrepareListenAddr(addr, func() error { prepared = true; return nil })
+	require.ErrorContains(t, startServer(t, s), primary)
+	assert.False(t, prepared, "a proxy without its primary must prepare nothing")
 }
 
 // Ready closes once however often Start runs, and a Server not built by

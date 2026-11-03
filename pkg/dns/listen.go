@@ -62,6 +62,30 @@ func (s *Server) addListenAddr(addr string, mode listenerAttribution) bool {
 	return true
 }
 
+// PrepareListenAddr has Start run prepare once the primary is bound, before
+// the listener at addr binds: setup the listener needs, such as its address,
+// that must not happen unless this process holds the primary. Holding
+// 127.0.0.1:53 is what tells one cargowall from a second in the same network
+// namespace, which must not touch what the first set up. An error is addr's
+// BindError, and the listener is not bound. Call before Start.
+func (s *Server) PrepareListenAddr(addr string, prepare func() error) {
+	if s.prepares == nil {
+		s.prepares = make(map[string]func() error)
+	}
+	s.prepares[addr] = prepare
+}
+
+// listenAdditional binds addr, a listener beside the primary, once its
+// preparation is done.
+func (s *Server) listenAdditional(ctx context.Context, lc *net.ListenConfig, addr string) error {
+	if prepare := s.prepares[addr]; prepare != nil {
+		if err := prepare(); err != nil {
+			return err
+		}
+	}
+	return s.listenBoth(ctx, lc, addr)
+}
+
 // errNotAdded is BindError's answer for an address no listener was added
 // at.
 var errNotAdded = errors.New("no listener was added at that address")

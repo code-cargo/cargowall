@@ -64,6 +64,27 @@ var dockerDaemonConfig = &daemonConfig{
 	reload:  reloadDockerDaemon,
 }
 
+// DockerDNSServers is daemon.json's "dns": the servers the daemon gives
+// its containers, nil when daemon.json sets none or there is none.
+func DockerDNSServers() ([]string, error) { return dockerDaemonConfig.dnsServers() }
+
+func (c *daemonConfig) dnsServers() ([]string, error) {
+	data, err := os.ReadFile(c.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var cfg struct {
+		DNS []string `json:"dns"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", c.path, err)
+	}
+	return cfg.DNS, nil
+}
+
 // GetDockerBridgeSubnet returns the default bridge's IPv4 network in CIDR
 // form (e.g. "172.17.0.0/16"). The cgroup egress hook adjudicates bridge
 // traffic TC never saw — host→published-port via docker-proxy, container→

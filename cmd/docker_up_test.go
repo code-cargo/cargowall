@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
 	"net/netip"
 	"path/filepath"
@@ -32,12 +33,22 @@ import (
 )
 
 // dockerUpFor is newDockerUp for dockerd and cmd, logging into the
-// returned buffer and recording into a dockerFile of the test's own.
+// returned buffer and recording into a dockerFile of the test's own, with a
+// daemon.json that sets no DNS.
 func dockerUpFor(t *testing.T, dockerd podenv.Dockerd, cmd *StartCmd) (*dockerUp, *bytes.Buffer) {
 	t.Helper()
-	saved := dockerFile
+	return dockerUpWith(t, dockerd, cmd, func() ([]string, error) { return nil, nil })
+}
+
+// dockerUpWith is dockerUpFor with servers standing in for daemon.json's
+// "dns".
+func dockerUpWith(t *testing.T, dockerd podenv.Dockerd, cmd *StartCmd, servers func() ([]string, error),
+) (*dockerUp, *bytes.Buffer) {
+	t.Helper()
+	saved, savedServers := dockerFile, daemonDNSServers
 	dockerFile = filepath.Join(t.TempDir(), "cargowall-docker")
-	t.Cleanup(func() { dockerFile = saved })
+	daemonDNSServers = servers
+	t.Cleanup(func() { dockerFile, daemonDNSServers = saved, savedServers })
 	var buf bytes.Buffer
 	return newDockerUp(podenv.Shape{Dockerd: dockerd}, cmd, slog.New(slog.NewTextHandler(&buf, nil))), &buf
 }
@@ -87,6 +98,15 @@ func TestDockerUp_StartupLines(t *testing.T) {
 			name:    "pending, bridges up but not answering",
 			dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Bridges: []string{"docker0"}},
 			want:    []string{"not answering yet though its bridges are up"}, record: true,
+		},
+		{
+			name:    "pending, bridges not listed",
+			dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, BridgesErr: errors.New("netlink: denied")},
+			want:    []string{"and its bridges could not be listed (netlink: denied)"}, record: true,
+		},
+		{
+			name: "bridges not listed, no socket", dockerd: podenv.Dockerd{Kind: podenv.DockerdAbsent, BridgesErr: errors.New("x")},
+			absent: []string{"No Docker on this host", "not answering"},
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -142,6 +162,56 @@ func TestDockerUp_Arrival(t *testing.T) {
 	assert.NotContains(t, buf.String(), "Docker answered")
 }
 
+// Without the redirect, a pending daemon's daemon.json, left alone,
+// decides where its containers' DNS goes, and its lines say which: already
+// pointed at the IPv4 container listener by a previous run's rewrite (no
+// Warn), around the proxy, not known when daemon.json cannot be read, and
+// around the proxy for a daemon whose daemon.json is not ours.
+func TestDockerUp_DaemonJSON(t *testing.T) {
+	cmd := &StartCmd{DockerDNSInterception: true}
+	local := podenv.Dockerd{Kind: podenv.DockerdLocal}
+	for _, c := range []struct {
+		name    string
+		dockerd podenv.Dockerd
+		servers func() ([]string, error)
+		want    string
+		warn    bool
+	}{
+		{
+			name: "pointed at the container listener", dockerd: local,
+			servers: func() ([]string, error) { return []string{"169.254.0.53"}, nil },
+			want:    "already points its containers at 169.254.0.53, so their DNS reaches the proxy",
+		},
+		{
+			name: "elsewhere", dockerd: local, servers: func() ([]string, error) { return []string{"8.8.8.8"}, nil },
+			want: "without --dns-redirect its containers' DNS goes around the proxy", warn: true,
+		},
+		{
+			name: "unreadable", dockerd: local,
+			servers: func() ([]string, error) { return nil, errors.New("/etc/docker/daemon.json: unexpected EOF") },
+			want: "could not be read (/etc/docker/daemon.json: unexpected EOF), so whether its containers' DNS reaches " +
+				"the proxy without --dns-redirect is not known",
+			warn: true,
+		},
+		{
+			name: "not ours", dockerd: podenv.Dockerd{Kind: podenv.DockerdForeign},
+			servers: func() ([]string, error) { return []string{"169.254.0.53"}, nil },
+			want:    "its daemon.json is not ours to read or rewrite", warn: true,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			u, buf := dockerUpWith(t, c.dockerd, cmd, c.servers)
+			assert.Contains(t, buf.String(), c.want, "the startup line")
+			u.answered(false, nil)
+			lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+			arrival := lines[len(lines)-1]
+			require.Contains(t, arrival, "Docker answered")
+			assert.Contains(t, arrival, c.want, "the arrival line")
+			assert.Equal(t, c.warn, strings.Contains(arrival, "level=WARN"))
+		})
+	}
+}
+
 // A Docker still to come up that never answers is said so at teardown, and
 // in the summary: an Info with no bridge at startup, since no container of
 // its can have run, and a Warn with its bridges up, whose containers went
@@ -174,7 +244,7 @@ func TestStartUserspace_DockerClasses(t *testing.T) {
 		{name: "no Docker", dockerd: podenv.Dockerd{Kind: podenv.DockerdAbsent}},
 		{
 			name: "bridges, no socket", dockerd: podenv.Dockerd{Kind: podenv.DockerdAbsent, Bridges: []string{"docker0"}},
-			warn: "no Docker socket to ask about their containers",
+			warn: "no Docker socket to ask about containers on its bridges",
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {

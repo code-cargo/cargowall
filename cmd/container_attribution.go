@@ -271,10 +271,10 @@ func (a *containerAttribution) ensureLoopbackAllowed(configMgr *config.Manager) 
 // compose stacks must not lose bridge-local traffic to enforce-mode EPERM
 // (or pollute shadow telemetry with false would-blocks) in that window.
 //
-// Only a daemon that has bridges and answered is asked for its networks
-// (podenv.Dockerd.Answers, the one ping startup makes). With no Docker
-// there is nothing to carve. With a Docker still to come up (Pending)
-// there is no container yet, and the tracker's first session carves every
+// Only a daemon that answered is asked for its networks
+// (podenv.Dockerd.Answers, the one ping startup makes), with Docker's
+// bridges or none. With no Docker there is nothing to carve. With a Docker
+// still to come up (Pending) the tracker's first session carves every
 // bridge network once the daemon answers; only a docker0 already up is
 // carved here, from its address.
 func (a *containerAttribution) preallowLocalNetworks(ctx context.Context, dockerd podenv.Dockerd) {
@@ -359,8 +359,9 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 	case a == nil || docker.dockerd.None():
 		return false
 	case docker.dockerd.Unreachable():
-		a.logger.Warn("Container attribution disabled: Docker bridges are up but there is no Docker socket to ask "+
-			"about their containers", "socket", dockerSocket, "bridges", docker.dockerd.Bridges)
+		a.logger.Warn("Container attribution disabled: there is no Docker socket to ask about containers on its "+
+			"bridges, which are up or could not be listed", "socket", dockerSocket, "bridges", docker.dockerd.Bridges,
+			"bridges_error", docker.dockerd.BridgesErr)
 		return false
 	}
 	ctr, err := containers.Start(ctx, containers.Options{

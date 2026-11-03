@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -48,8 +49,9 @@ type dockerRecord struct {
 // for a Docker still to come up (Pending), its arrival. On some hosts
 // (Blacksmith's) the socket accepts connections seconds before dockerd
 // answers on it, and before it has made a bridge. Nothing waits for it:
-// with no bridge there can be no bridge traffic yet, so nothing needs
-// carving before the cgroup hook adjudicates, and the container DNS
+// a daemon that has not answered has started no container cargowall could
+// ask about, so nothing needs carving before the cgroup hook adjudicates
+// (a docker0 already up is carved from its address), and the container DNS
 // addresses and the redirect's DNAT on docker0 and br-* cover bridges made
 // later. What does wait for the daemon, container tracking and the
 // carve-outs it makes, starts when it answers, and is logged then.
@@ -65,6 +67,11 @@ type dockerUp struct {
 	redirect     bool // --dns-redirect is on, with DNS tracking
 	start        time.Time
 	logger       *slog.Logger
+	// dnsLine says where a pending daemon's containers' DNS goes, read at
+	// startup (containerDNS), and dnsAround whether that is, or may be,
+	// around the proxy.
+	dnsLine   string
+	dnsAround bool
 
 	mu      sync.Mutex
 	arrived bool
@@ -89,6 +96,9 @@ func newDockerUp(shape podenv.Shape, cmd *StartCmd, logger *slog.Logger) *docker
 	case u.dockerd.None():
 		logger.Info("No Docker on this host: no Docker socket and no Docker bridge")
 	case u.dockerd.Pending():
+		if u.interception {
+			u.dnsLine, u.dnsAround = u.containerDNS()
+		}
 		logger.Info(u.pendingLine())
 		u.record(dockerRecord{})
 	}
@@ -98,26 +108,51 @@ func newDockerUp(shape podenv.Shape, cmd *StartCmd, logger *slog.Logger) *docker
 // pendingLine is the startup line for a Docker still to come up.
 func (u *dockerUp) pendingLine() string {
 	parts := []string{"Docker socket present, daemon not answering yet"}
-	if len(u.dockerd.Bridges) > 0 {
+	switch {
+	case u.dockerd.BridgesErr != nil:
+		parts[0] += ", and its bridges could not be listed (" + u.dockerd.BridgesErr.Error() + ")"
+	case len(u.dockerd.Bridges) > 0:
 		parts[0] += " though its bridges are up"
 	}
 	if u.attribution {
 		parts = append(parts, "container attribution and bridge carve-outs start when it does")
 	}
 	if u.interception {
-		parts = append(parts, u.containerDNS())
+		parts = append(parts, u.dnsLine)
 	}
 	return strings.Join(parts, "; ")
 }
 
-// containerDNS is where a Docker that comes up after cargowall has its
-// containers' DNS go.
-func (u *dockerUp) containerDNS() string {
-	if !u.redirect {
-		return "daemon.json is left alone, so without --dns-redirect its containers' DNS goes around the proxy"
+// daemonDNSServers reads daemon.json's "dns": network.DockerDNSServers, or
+// a test's stand-in.
+var daemonDNSServers = network.DockerDNSServers
+
+// containerDNS is where a Docker still to come up has its containers' DNS
+// go, and whether that is, or may be, around the proxy. With the redirect
+// it goes to the proxy whatever daemon.json says. Without it, daemon.json,
+// left alone, decides, as the daemon read it when it started: a previous
+// run's rewrite left in it points its containers at the IPv4 container
+// listener. A daemon whose daemon.json is not ours, or one that cannot be
+// read, cannot be said to.
+func (u *dockerUp) containerDNS() (string, bool) {
+	if u.redirect {
+		return fmt.Sprintf("its containers' DNS goes to %s and %s by the DNS redirect, and daemon.json is left alone",
+			network.ContainerDNSIPv4, network.ContainerDNSIPv6), false
 	}
-	return fmt.Sprintf("its containers' DNS goes to %s and %s by the DNS redirect, and daemon.json is left alone",
-		network.ContainerDNSIPv4, network.ContainerDNSIPv6)
+	if u.dockerd.Kind != podenv.DockerdLocal {
+		return "its daemon.json is not ours to read or rewrite, so without --dns-redirect its containers' DNS goes " +
+			"around the proxy", true
+	}
+	servers, err := daemonDNSServers()
+	switch {
+	case err != nil:
+		return "daemon.json is left alone and could not be read (" + err.Error() + "), so whether its containers' " +
+			"DNS reaches the proxy without --dns-redirect is not known", true
+	case slices.Contains(servers, network.ContainerDNSIPv4.String()):
+		return fmt.Sprintf("daemon.json is left alone, and already points its containers at %s, so their DNS "+
+			"reaches the proxy", network.ContainerDNSIPv4), false
+	}
+	return "daemon.json is left alone, so without --dns-redirect its containers' DNS goes around the proxy", true
 }
 
 // track starts container attribution's userspace half (startUserspace),
@@ -167,9 +202,9 @@ func (u *dockerUp) answered(tracked bool, carved []netip.Prefix) {
 		args = append(args, "carved", carved)
 	}
 	if u.interception {
-		parts = append(parts, u.containerDNS())
+		parts = append(parts, u.dnsLine)
 	}
-	if u.interception && !u.redirect {
+	if u.interception && u.dnsAround {
 		u.logger.Warn(strings.Join(parts, "; "), args...)
 	} else {
 		u.logger.Info(strings.Join(parts, "; "), args...)
@@ -178,9 +213,9 @@ func (u *dockerUp) answered(tracked bool, carved []netip.Prefix) {
 }
 
 // close stops the watcher, and says at teardown that a Docker still to come
-// up never did: with no bridge at startup no container of its can have run,
-// so nothing went untracked; with its bridges up, containers on them may
-// have, untracked.
+// up never did: with no bridge of its at startup no container of its can
+// have run, so nothing went untracked; with its bridges up, or bridges that
+// could not be listed, containers on them may have, untracked.
 func (u *dockerUp) close() {
 	if u == nil || !u.dockerd.Pending() {
 		return
@@ -196,8 +231,12 @@ func (u *dockerUp) close() {
 	case len(u.dockerd.Bridges) > 0:
 		u.logger.Warn("Docker never answered, though its bridges were up at startup: containers on them went untracked",
 			"bridges", u.dockerd.Bridges)
+	case u.dockerd.BridgesErr != nil:
+		u.logger.Warn("Docker never answered, and its bridges could not be listed at startup: containers on any "+
+			"went untracked", "error", u.dockerd.BridgesErr)
 	default:
-		u.logger.Info("Docker never answered while cargowall ran: no Docker container can have run, so none went untracked")
+		u.logger.Info("Docker never answered while cargowall ran, and had made no bridge: no container of its can " +
+			"have run, so none went untracked")
 	}
 }
 

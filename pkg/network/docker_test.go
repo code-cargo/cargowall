@@ -342,3 +342,26 @@ func TestDaemonConfig_ConfigureAfterRestoreRefused(t *testing.T) {
 	requireContent(t, c.path, original)
 	requireNotExist(t, c.backup)
 }
+
+// daemon.json's "dns" as the daemon reads it: none without a file or the
+// key, the servers with them, and an error for a file it cannot parse.
+func TestDockerDNSServers(t *testing.T) {
+	c, _ := newTestDaemonConfig(t)
+	got, err := c.dnsServers()
+	require.NoError(t, err)
+	require.Nil(t, got, "no daemon.json sets no DNS")
+
+	require.NoError(t, os.WriteFile(c.path, []byte(`{"log-level": "warn"}`), 0o644))
+	got, err = c.dnsServers()
+	require.NoError(t, err)
+	require.Nil(t, got)
+
+	require.NoError(t, os.WriteFile(c.path, []byte(`{"dns": ["169.254.0.53", "8.8.8.8"]}`), 0o644))
+	got, err = c.dnsServers()
+	require.NoError(t, err)
+	require.Equal(t, []string{"169.254.0.53", "8.8.8.8"}, got)
+
+	require.NoError(t, os.WriteFile(c.path, []byte(`{"dns": `), 0o644))
+	_, err = c.dnsServers()
+	require.ErrorContains(t, err, c.path)
+}

@@ -105,10 +105,12 @@ type Dockerd struct {
 	// why. Read only where the scope depends on it.
 	Runtime int32
 	// Bridges are the bridges Docker has made in our network namespace,
-	// docker0 and br-<network id> (network.DockerBridge), at the probe.
-	Bridges []string
-	// Answers is whether the daemon answered, asked only where it has
-	// bridges to show for it (probeUp).
+	// docker0 and br-<network id> (network.DockerBridge), at the probe,
+	// and BridgesErr why they could not be listed, which leaves them
+	// unknown rather than none.
+	Bridges    []string
+	BridgesErr error
+	// Answers is whether the daemon answered GET /_ping in time (probeUp).
 	Answers bool
 	// pid is the pid, in our pid namespace, of the process serving the
 	// socket, looked for only where the scope reads the daemon's runtime
@@ -440,12 +442,17 @@ func (d *Dockerd) askInfo(socket string) (daemonInfo, error) {
 // dockerGet asks the daemon at socket for path, within 2s, and decodes
 // its JSON answer into out, unless out is nil.
 func dockerGet(socket, path string, out any) error {
+	return dockerGetWithin(socket, path, out, 2*time.Second)
+}
+
+// dockerGetWithin is dockerGet within timeout.
+func dockerGetWithin(socket, path string, out any, timeout time.Duration) error {
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "unix", socket)
 	}}
 	defer tr.CloseIdleConnections()
-	client := http.Client{Transport: tr, Timeout: 2 * time.Second}
+	client := http.Client{Transport: tr, Timeout: timeout}
 	resp, err := client.Get("http://docker" + path)
 	if err != nil {
 		return err

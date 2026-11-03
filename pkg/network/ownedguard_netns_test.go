@@ -318,6 +318,8 @@ func TestUplinks(t *testing.T) {
 	addRoute(t, netip.MustParsePrefix("::/0"), "wan6")
 	assert.Equal(t, []string{"eth0", "br100", "wan4", "wan6"}, Uplinks("eth0"),
 		"each family's default-route links, every next hop's, beside the TC interface")
+	assert.Equal(t, []string{"wan6", "br100", "wan4"}, Uplinks("wan6"),
+		"a TC interface that carries a default route too, as a hosted runner's eth0 does, once")
 
 	require.NoError(t, newLink("eno1", "dummy", "", nil))
 	if err := newLink("bond0", "bond", "", nil); err != nil {

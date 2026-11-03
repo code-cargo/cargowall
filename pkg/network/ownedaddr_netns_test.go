@@ -32,35 +32,155 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// bothGuarded is the guard tables' rules with both addresses added.
+var bothGuarded = map[string]int{"ip input": 1, "ip forward": 1, "ip6 input": 1, "ip6 forward": 1}
+
 // The container DNS addresses go on lo, the IPv4 one labelled as cargowall's,
-// and come off again; once removed, none is added.
+// each with its guard, and come off again, guards and all; one added twice
+// is added once, and once removed, none is added.
 func TestOwnedAddrs_AddRemove(t *testing.T) {
 	enterNetns(t)
 	owned := NewOwnedAddrs(netip.Addr{}, discardLogger())
 	for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
 		require.NoError(t, owned.Add(addr))
 	}
+	require.NoError(t, owned.Add(ContainerDNSIPv4), "an address already added is not added again")
 	assert.Equal(t, map[netip.Addr]string{ContainerDNSIPv4: ownedLabel, ContainerDNSIPv6: ""}, ownedOnLo(t))
+	assert.Equal(t, bothGuarded, guardRules(t))
 
 	require.NoError(t, owned.Remove())
 	assert.Empty(t, ownedOnLo(t))
+	assert.Empty(t, guardRules(t), "the guards go with the addresses")
 	require.NoError(t, owned.Remove(), "a second Remove has nothing to do")
 	require.ErrorContains(t, owned.Add(ContainerDNSIPv4), "teardown has begun")
 	assert.Empty(t, ownedOnLo(t))
+	assert.Empty(t, guardRules(t))
 }
 
-// A run killed before its teardown leaves the addresses on lo. The next run
-// takes them over, as its own, and its teardown removes them.
+// A run killed before its teardown leaves the addresses on lo. Its guards
+// die with its sockets where the kernel owns them, and stay where it
+// cannot. The next run takes the addresses over, as its own, replaces a
+// guard left rather than adding to it, and its teardown removes both.
 func TestOwnedAddrs_TakesOverALeftover(t *testing.T) {
 	enterNetns(t)
-	killed := NewOwnedAddrs(netip.Addr{}, discardLogger())
-	next := NewOwnedAddrs(netip.Addr{}, discardLogger())
-	for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
-		require.NoError(t, killed.Add(addr))
-		require.NoError(t, next.Add(addr), "%s: a leftover is cargowall's own", addr)
+	for _, unowned := range []bool{false, true} {
+		killed := NewOwnedAddrs(netip.Addr{}, discardLogger())
+		if unowned {
+			killed.ownerFlag = 0 // a kernel that cannot own tables
+		}
+		next := NewOwnedAddrs(netip.Addr{}, discardLogger())
+		for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
+			require.NoError(t, killed.Add(addr))
+		}
+		owned := killed.added[0].guard.owned
+		require.Equal(t, !unowned && ownsTables(t), owned, "a guard is owned wherever the kernel can own one")
+		for _, a := range killed.added {
+			require.NoError(t, a.guard.conn.Close(), "the process dies")
+		}
+		if owned {
+			assert.Empty(t, guardRules(t), "an owned guard dies with its socket")
+		} else {
+			assert.Equal(t, bothGuarded, guardRules(t), "an unowned guard outlives its socket")
+		}
+		for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
+			require.NoError(t, next.Add(addr), "%s: a leftover is cargowall's own", addr)
+		}
+		assert.Equal(t, bothGuarded, guardRules(t), "unowned %v: a guard left is replaced", unowned)
+		require.NoError(t, next.Remove())
+		assert.Empty(t, ownedOnLo(t))
+		assert.Empty(t, guardRules(t))
 	}
-	require.NoError(t, next.Remove())
+}
+
+// An address whose guard cannot be installed is refused, and not added:
+// here another live socket owns a table of the guard's name, as a second
+// cargowall's would. The other family's guard is a table of its own.
+func TestOwnedAddrs_RefusedWithoutItsGuard(t *testing.T) {
+	enterNetns(t)
+	requireOwnedTables(t)
+	other, err := installGuard(ContainerDNSIPv4, nftTableFOwner, discardLogger())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = other.remove() })
+	owned := NewOwnedAddrs(netip.Addr{}, discardLogger())
+	t.Cleanup(func() { _ = owned.Remove() })
+
+	err = owned.Add(ContainerDNSIPv4)
+	require.ErrorContains(t, err, "its guard cannot be installed")
+	require.ErrorIs(t, err, unix.EPERM)
 	assert.Empty(t, ownedOnLo(t))
+	require.NoError(t, owned.Add(ContainerDNSIPv6))
+	assert.Equal(t, map[netip.Addr]string{ContainerDNSIPv6: ""}, ownedOnLo(t))
+}
+
+// With no DNS redirect in place, the addresses' guards still keep them from
+// every link but lo and the docker bridges. DNS for them arriving on docker0
+// or a br-* bridge reaches the proxy's listeners there, over UDP and TCP;
+// arriving on the uplink it does not, though without the guard it does.
+func TestOwnedAddrs_GuardWithoutRedirect(t *testing.T) {
+	enterNetns(t)
+	docker0 := addTun(t, "docker0", net.IPv4(10, 54, 0, 1))
+	user := addTun(t, "br-test", net.IPv4(10, 55, 0, 1))
+	uplink := addTun(t, "cw0", net.IPv4(10, 56, 0, 1))
+	for name, addr := range map[string]string{"docker0": "fd54::1", "br-test": "fd55::1", "cw0": "fd56::1"} {
+		addAddr6(t, name, net.ParseIP(addr))
+	}
+	v4, v6 := net.IP(ContainerDNSIPv4.AsSlice()), net.IP(ContainerDNSIPv6.AsSlice())
+	type link struct {
+		wire      *os.File
+		src, src6 net.IP
+	}
+	bridges := []link{
+		{docker0, net.IPv4(10, 54, 0, 2), net.ParseIP("fd54::2")},
+		{user, net.IPv4(10, 55, 0, 2), net.ParseIP("fd55::2")},
+	}
+	off := link{uplink, net.IPv4(10, 56, 0, 2), net.ParseIP("fd56::2")}
+	sport := uint16(7000) // a port per TCP handshake: none reuses a half-open one
+	// reaches reports whether DNS sent over c to the addresses reaches the
+	// listeners: UDP for each family, and a TCP handshake for IPv4.
+	reaches := func(c link, l, l6 *net.UDPConn, wait time.Duration) (u4, u6, syn bool) {
+		name := c.wire.Name()
+		_, err := c.wire.Write(udp4(c.src, v4, 5000, 53, name))
+		require.NoError(t, err)
+		got, _ := received(t, l, wait)
+		_, err = c.wire.Write(udp6(c.src6, v6, 5000, 53, name+"6"))
+		require.NoError(t, err)
+		got6, _ := received(t, l6, wait)
+		sport++
+		return got == name, got6 == name+"6", synAcked(t, c.wire, c.src, v4, sport, 53)
+	}
+
+	// The control: the addresses on lo, unguarded, are reached from the
+	// uplink.
+	for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
+		require.NoError(t, loopbackAddr(unix.RTM_NEWADDR, netlink.Create, addr, ""))
+	}
+	l, l6 := listenUDP(t, containerAddr(ContainerDNSIPv4)), listenUDP(t, containerAddr(ContainerDNSIPv6))
+	tcp := listenTCPAt(t, containerAddr(ContainerDNSIPv4))
+	u4, u6, syn := reaches(off, l, l6, arrives)
+	require.True(t, u4 && u6 && syn, "without the guard the uplink reaches the addresses (udp %v udp6 %v tcp %v)",
+		u4, u6, syn)
+	l.Close()
+	l6.Close()
+	tcp.Close()
+	for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
+		require.NoError(t, loopbackAddr(unix.RTM_DELADDR, 0, addr, ""))
+	}
+
+	owned := NewOwnedAddrs(netip.Addr{}, discardLogger())
+	t.Cleanup(func() { _ = owned.Remove() })
+	for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
+		require.NoError(t, owned.Add(addr))
+	}
+	require.Empty(t, redirectRules(t), "no redirect")
+	l, l6 = listenUDP(t, containerAddr(ContainerDNSIPv4)), listenUDP(t, containerAddr(ContainerDNSIPv6))
+	listenTCPAt(t, containerAddr(ContainerDNSIPv4))
+	for _, c := range bridges {
+		u4, u6, syn := reaches(c, l, l6, arrives)
+		assert.True(t, u4 && u6 && syn, "%s must reach the addresses (udp %v udp6 %v tcp %v)", c.wire.Name(),
+			u4, u6, syn)
+	}
+	u4, u6, syn = reaches(off, l, l6, absent)
+	assert.False(t, u4 || u6 || syn, "the uplink must not reach the addresses (udp %v udp6 %v tcp %v)", u4, u6, syn)
 }
 
 // An address something else holds is refused, with the reason, and not
@@ -139,6 +259,7 @@ func TestOwnedAddrs_RefusesAHolder(t *testing.T) {
 		} else {
 			require.EqualError(t, err, c.refusal, c.name)
 			assert.Equal(t, before, ownedOnLo(t), "%s: a refused address is not added", c.name)
+			assert.Empty(t, guardRules(t), "%s: nor guarded", c.name)
 		}
 		require.NoError(t, owned.Remove(), c.name)
 		undo()
@@ -158,34 +279,45 @@ func TestHostIPv6_NotFromLo(t *testing.T) {
 	assert.True(t, HostIPv6())
 }
 
-// TestDNSRedirect_ForwardDrop: were a container listener's address gone
-// while the redirect stands, the container DNS DNAT'd to it would be routed
-// off the host instead; the forward drop keeps it in. Without the redirect,
-// a packet for the address is forwarded, which shows the route out is there.
-func TestDNSRedirect_ForwardDrop(t *testing.T) {
+// Were a container DNS address gone while cargowall runs, container DNS
+// sent to it, by daemon.json or by the redirect's DNAT, would be routed off
+// the host instead; its guard's forward drop keeps it in, with the redirect
+// or without. Without the guard the packet is forwarded, which shows the
+// route out is there.
+func TestOwnedAddrs_ForwardDrop(t *testing.T) {
 	enterNetns(t)
 	require.NoError(t, os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0))
 	docker0 := addTun(t, "docker0", net.IPv4(10, 54, 0, 1))
 	uplink := addTun(t, "cw0", net.IPv4(10, 56, 0, 1))
-	// The container listener's address routed out of the uplink, as a
-	// default route would.
+	// The address routed out of the uplink, as a default route would.
 	addRoute(t, netip.MustParsePrefix("169.254.0.0/16"), "cw0")
 	src := net.IPv4(10, 54, 0, 2)
 	v4 := net.IP(ContainerDNSIPv4.AsSlice())
+	send := func(dst net.IP, sport uint16) {
+		_, err := docker0.Write(udp4(src, dst, sport, 53, "query"))
+		require.NoError(t, err)
+	}
 
-	_, err := docker0.Write(udp4(src, v4, 5000, 53, "before"))
-	require.NoError(t, err)
-	require.True(t, forwardedOut(t, uplink, v4, arrives), "without the redirect, the packet is forwarded out of cw0")
+	send(v4, 5000)
+	require.True(t, forwardedOut(t, uplink, v4, arrives), "without the guard, the packet is forwarded out of cw0")
+
+	owned := NewOwnedAddrs(netip.Addr{}, discardLogger())
+	t.Cleanup(func() { _ = owned.Remove() })
+	require.NoError(t, owned.Add(ContainerDNSIPv4))
+	require.NoError(t, loopbackAddr(unix.RTM_DELADDR, 0, ContainerDNSIPv4, ""), "the address gone from under cargowall")
+	send(v4, 5001)
+	require.False(t, forwardedOut(t, uplink, v4, absent), "DNS for the address must not leave by cw0")
 
 	r := NewDNSRedirect(discardLogger())
 	require.NoError(t, r.Install(RedirectSpec{ContainerIPv4: ContainerDNSIPv4}))
 	t.Cleanup(func() { _ = r.Teardown() })
-	for _, dst := range []net.IP{net.IPv4(8, 8, 8, 8), v4} {
-		_, err = docker0.Write(udp4(src, dst, 5001, 53, "after"))
-		require.NoError(t, err)
-		require.False(t, forwardedOut(t, uplink, v4, absent), "DNS DNAT'd to an address that is gone must not leave by cw0")
-	}
+	send(net.IPv4(8, 8, 8, 8), 5002)
+	require.False(t, forwardedOut(t, uplink, v4, absent), "nor may DNS DNAT'd to it")
 	require.NoError(t, r.Teardown())
+
+	require.NoError(t, owned.Remove())
+	send(v4, 5003)
+	require.True(t, forwardedOut(t, uplink, v4, arrives), "the guard goes with Remove")
 }
 
 // forwardedOut reports whether an IPv4 UDP packet for dst:53 comes out of
@@ -206,6 +338,12 @@ func forwardedOut(t *testing.T, wire *os.File, dst net.IP, wait time.Duration) b
 			return true
 		}
 	}
+}
+
+// guardRules counts the guard tables' rules per family and chain.
+func guardRules(t *testing.T) map[string]int {
+	t.Helper()
+	return tableRules(t, GuardTable)
 }
 
 // ownedOnLo is the container DNS addresses on lo, with their labels.

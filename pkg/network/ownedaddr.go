@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 
 	"github.com/mdlayher/netlink"
@@ -54,52 +55,74 @@ var (
 // alone, so on lo it is always a leftover.
 const ownedLabel = "lo:cargowall"
 
-// OwnedAddrs adds the container DNS addresses to lo, and at teardown removes
-// the ones it added. An address left by a run that did not tear down is
-// taken over, and removed in turn. Add and Remove may run concurrently: a
-// forced shutdown removes from another goroutine while the proxy's Start
-// adds. Remove waits for an Add in progress, and an Add after Remove refuses.
+// OwnedAddrs adds the container DNS addresses to lo, each with its guard
+// (GuardTable), and at teardown removes the ones it added. An address left
+// by a run that did not tear down is taken over, and removed in turn. Add
+// and Remove may run concurrently: a forced shutdown removes from another
+// goroutine while the proxy's Start adds. Remove waits for an Add in
+// progress, and an Add after Remove refuses.
 type OwnedAddrs struct {
 	upstream netip.Addr // the DNS upstream: an owned address equal to it is refused
 	logger   *slog.Logger
+	// ownerFlag is the flag the guard tables are asked for with:
+	// NFT_TABLE_F_OWNER, or zero when a test stands in for a kernel without
+	// owned tables.
+	ownerFlag uint32
 
 	mu    sync.Mutex
-	added []netip.Addr
+	added []ownedAddr
 	done  bool
+}
+
+// ownedAddr is an address Add added, and its guard.
+type ownedAddr struct {
+	addr  netip.Addr
+	guard *ownedGuard
 }
 
 // NewOwnedAddrs returns the addresses to Add, for a proxy whose upstream is
 // upstream (the zero Addr for none). Register its Remove first.
 func NewOwnedAddrs(upstream netip.Addr, logger *slog.Logger) *OwnedAddrs {
-	return &OwnedAddrs{upstream: upstream, logger: logger}
+	return &OwnedAddrs{upstream: upstream, logger: logger, ownerFlag: nftTableFOwner}
 }
 
 // Add adds addr to lo, as a host route, unless something already holds it
 // (holder): then it says why, and the address is not added. Nothing on the
 // host may already answer for it, or the proxy's listener would take that
-// over, or container DNS would be handed to that instead.
+// over, or container DNS would be handed to that instead. Its guard goes in
+// first, so the address is never there unguarded, and an address whose
+// guard cannot be installed is refused too. An address already added is
+// not added again.
 func (o *OwnedAddrs) Add(addr netip.Addr) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.done {
 		return errors.New("teardown has begun")
 	}
+	if slices.ContainsFunc(o.added, func(a ownedAddr) bool { return a.addr == addr }) {
+		return nil
+	}
 	leftover, err := o.holder(addr)
 	if err != nil {
 		return err
 	}
+	guard, err := installGuard(addr, o.ownerFlag, o.logger)
+	if err != nil {
+		return fmt.Errorf("its guard cannot be installed: %w", err)
+	}
 	if err := loopbackAddr(unix.RTM_NEWADDR, netlink.Create|netlink.Replace, addr, ownedLabel); err != nil {
-		return err
+		return errors.Join(err, guard.remove())
 	}
 	if leftover {
 		o.logger.Info("Took over the container DNS address a previous run left on lo", "addr", addr)
 	}
-	o.added = append(o.added, addr)
+	o.added = append(o.added, ownedAddr{addr: addr, guard: guard})
 	return nil
 }
 
-// Remove removes the addresses Add added. One already gone is no error.
-// Safe to call more than once, and nil-safe.
+// Remove removes the addresses Add added, each before its guard, so none is
+// there unguarded. An address already gone is no error. Safe to call more
+// than once, and nil-safe.
 func (o *OwnedAddrs) Remove() error {
 	if o == nil {
 		return nil
@@ -108,11 +131,12 @@ func (o *OwnedAddrs) Remove() error {
 	defer o.mu.Unlock()
 	o.done = true
 	var errs []error
-	for _, addr := range o.added {
-		err := loopbackAddr(unix.RTM_DELADDR, 0, addr, "")
+	for _, a := range o.added {
+		err := loopbackAddr(unix.RTM_DELADDR, 0, a.addr, "")
 		if err != nil && !errors.Is(err, unix.EADDRNOTAVAIL) && !errors.Is(err, unix.ENOENT) {
 			errs = append(errs, err)
 		}
+		errs = append(errs, a.guard.remove())
 	}
 	o.added = nil
 	return errors.Join(errs...)

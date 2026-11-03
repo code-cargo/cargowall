@@ -122,6 +122,30 @@ func TestStartDockerDNS_SecondInstanceNetns(t *testing.T) {
 	assert.True(t, onLo(t, network.ContainerDNSIPv6), "the second's teardown must leave the first's addresses")
 }
 
+// Docker DNS interception without the DNS redirect: the container DNS
+// addresses still come with their guards, whose tables the teardown takes
+// off with the addresses, and there is no redirect table.
+func TestStartDockerDNS_GuardedWithoutRedirectNetns(t *testing.T) {
+	netns := newNetns(t)
+	logger := slog.New(slog.DiscardHandler)
+	cmd := &StartCmd{DockerDNSInterception: true, DNSUpstream: "192.0.2.1:53"}
+	srv := dns.NewServer(config.NewConfigManager(), new(firewall.MockFirewall), cmd.DNSUpstream, "127.0.0.1:53", logger)
+	d, removeAddrs := startDockerDNS(cmd, srv, podenv.Dockerd{}, &teardownList{}, logger)
+	t.Cleanup(removeAddrs)
+	t.Cleanup(startProxyIn(t, netns, srv))
+
+	require.True(t, d.serving())
+	assert.True(t, onLo(t, network.ContainerDNSIPv4))
+	assert.True(t, onLo(t, network.ContainerDNSIPv6))
+	assert.Equal(t, map[string]int{"ip input": 1, "ip forward": 1, "ip6 input": 1, "ip6 forward": 1},
+		tableRuleCounts(t, network.GuardTable), "each address guarded, the redirect or none")
+	assert.Empty(t, tableRuleCounts(t, network.RedirectTable), "no redirect")
+
+	removeAddrs()
+	assert.False(t, onLo(t, network.ContainerDNSIPv4))
+	assert.Empty(t, tableRuleCounts(t, network.GuardTable), "the guards go with the addresses")
+}
+
 // newNetns moves the test's goroutine into a network namespace of its own,
 // with loopback up, and returns it for others to enter. Locked for good:
 // the thread exits with the test, and the namespace with it, rather than
@@ -226,6 +250,29 @@ func redirectChainRules(t *testing.T, name string) []*nftables.Rule {
 		}
 	}
 	return nil
+}
+
+// tableRuleCounts counts the rules of the tables named table per family
+// and chain ("ip6 input").
+func tableRuleCounts(t *testing.T, table string) map[string]int {
+	t.Helper()
+	conn, err := nftables.New()
+	require.NoError(t, err)
+	out := map[string]int{}
+	for family, name := range map[nftables.TableFamily]string{
+		nftables.TableFamilyIPv4: "ip", nftables.TableFamilyIPv6: "ip6", nftables.TableFamilyINet: "inet",
+	} {
+		chains, err := conn.ListChainsOfTableFamily(family)
+		require.NoError(t, err)
+		for _, c := range chains {
+			if c.Table.Name == table {
+				rules, err := conn.GetRules(c.Table, c)
+				require.NoError(t, err)
+				out[name+" "+c.Name] = len(rules)
+			}
+		}
+	}
+	return out
 }
 
 // dnatsTo reports whether rule DNATs to addr.

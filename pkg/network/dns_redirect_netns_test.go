@@ -541,7 +541,8 @@ func TestDNSRedirect_InputGuard(t *testing.T) {
 // covered, IPv6 container DNS goes to the IPv6 listener rather than being
 // dropped; an IPv4-only redirect leaves it alone. DNS arriving on any other
 // interface is not redirected, and does not reach the container listeners
-// even when sent to them directly.
+// even when sent to them directly: their addresses' guards, which came with
+// them, drop it.
 func TestDNSRedirect_Bridge(t *testing.T) {
 	enterNetns(t)
 	resolver := net.IPv4(8, 8, 8, 8)
@@ -749,7 +750,7 @@ func TestDNSRedirect_Ownership(t *testing.T) {
 	require.NoError(t, other.Flush())
 	r := NewDNSRedirect(logger)
 	require.NoError(t, r.Install(RedirectSpec{ContainerIPv4: ContainerDNSIPv4}))
-	want := map[string]int{"ip output": 8, "ip input": 3, "ip prerouting": 4, "ip forward": 1}
+	want := map[string]int{"ip output": 8, "ip input": 2, "ip prerouting": 4}
 	require.Equal(t, want, redirectRules(t), "setup must replace an unowned table, not add to it")
 
 	for _, ipv6 := range []bool{false, true} {
@@ -925,30 +926,43 @@ func refusedOwner(logger *slog.Logger) *DNSRedirect {
 // unowned instead.
 func requireOwnedTables(t *testing.T) {
 	t.Helper()
-	r := NewDNSRedirect(discardLogger())
-	require.NoError(t, r.Install(RedirectSpec{}))
-	owned := r.owned
-	require.NoError(t, r.Teardown())
-	if !owned {
+	if !ownsTables(t) {
 		t.Skip("this kernel cannot own nftables tables (5.12)")
 	}
 }
 
+// ownsTables reports whether this kernel can own nftables tables (5.12).
+func ownsTables(t *testing.T) bool {
+	t.Helper()
+	r := NewDNSRedirect(discardLogger())
+	require.NoError(t, r.Install(RedirectSpec{}))
+	owned := r.owned
+	require.NoError(t, r.Teardown())
+	return owned
+}
+
 // redirectRules counts the redirect tables' rules per family and chain
-// ("ip output"), read back by google/nftables rather than by the code that
-// wrote them.
+// ("ip output").
 func redirectRules(t *testing.T) map[string]int {
+	t.Helper()
+	return tableRules(t, RedirectTable)
+}
+
+// tableRules counts the rules of the tables named table per family and
+// chain ("ip6 input"), read back by google/nftables rather than by the code
+// that wrote them.
+func tableRules(t *testing.T, table string) map[string]int {
 	t.Helper()
 	conn, err := nftables.New()
 	require.NoError(t, err)
 	out := map[string]int{}
 	for family, name := range map[nftables.TableFamily]string{
-		nftables.TableFamilyIPv4: "ip", nftables.TableFamilyINet: "inet",
+		nftables.TableFamilyIPv4: "ip", nftables.TableFamilyIPv6: "ip6", nftables.TableFamilyINet: "inet",
 	} {
 		chains, err := conn.ListChainsOfTableFamily(family)
 		require.NoError(t, err)
 		for _, c := range chains {
-			if c.Table.Name != RedirectTable {
+			if c.Table.Name != table {
 				continue
 			}
 			rules, err := conn.GetRules(c.Table, c)

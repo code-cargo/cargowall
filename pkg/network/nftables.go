@@ -28,13 +28,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The redirect table's nf_tables encoding: the expression helpers its rules
-// are written in (dns_redirect.go holds the rules themselves), and its
-// messages, framed here on a socket the redirect keeps. google/nftables
-// encodes the rule expressions, but its
-// released Conn cannot carry this table: it writes every table with no
-// flags, and it hides the socket, while an owned table must be created,
-// changed and deleted from the one socket that owns it.
+// The nf_tables encoding of cargowall's tables, the redirect's and the
+// container DNS addresses' guards: the expression helpers their rules are
+// written in (dns_redirect.go and ownedguard.go hold the rules themselves),
+// and their messages, framed here on a socket the table's owner keeps.
+// google/nftables encodes the rule expressions, but its released Conn
+// cannot carry these tables: it writes every table with no flags, and it
+// hides the socket, while an owned table must be created, changed and
+// deleted from the one socket that owns it.
 
 // nftTableFOwner is NFT_TABLE_F_OWNER (include/uapi/linux/netfilter/
 // nf_tables.h, kernel 5.12; x/sys/unix does not carry it). An owned table
@@ -47,24 +48,29 @@ const nftTableFOwner = 0x2
 // lost reply cannot stall startup or shutdown.
 const nftTimeout = 2 * time.Second
 
-// tableFamily is the redirect table's nf_tables family: inet when it covers
-// IPv6 as well as IPv4, ip when it covers IPv4 alone (see RedirectSpec).
+// tableFamily is a table's nf_tables family. The redirect's is inet when it
+// covers IPv6 as well as IPv4, ip when it covers IPv4 alone (see
+// RedirectSpec); a guard's is its address's, ip or ip6.
 type tableFamily byte
 
 const (
 	familyIP   tableFamily = unix.NFPROTO_IPV4
+	familyIP6  tableFamily = unix.NFPROTO_IPV6
 	familyInet tableFamily = unix.NFPROTO_INET
 )
 
 // String is the family as nft spells it, for messages that name the table.
 func (f tableFamily) String() string {
-	if f == familyInet {
+	switch f {
+	case familyInet:
 		return "inet"
+	case familyIP6:
+		return "ip6"
 	}
 	return "ip"
 }
 
-// other is the family the table is not, whose leftover install removes.
+// other is the redirect's family it is not, whose leftover install removes.
 func (f tableFamily) other() tableFamily {
 	if f == familyInet {
 		return familyIP
@@ -188,8 +194,8 @@ func verdict(kind expr.VerdictKind) []expr.Any {
 	return []expr.Any{&expr.Verdict{Kind: kind}}
 }
 
-// redirectChain is one base chain of the redirect table and its rules, in
-// order.
+// redirectChain is one base chain of a table, the redirect's or a guard's,
+// and its rules, in order.
 type redirectChain struct {
 	name     string
 	kind     string // nft chain type: "nat" or "filter"
@@ -217,23 +223,23 @@ func nftMsg(fam tableFamily, msgType uint16, flags netlink.HeaderFlags, attrs fu
 	}, nil
 }
 
-func newTableMsg(fam tableFamily, flags uint32) (netlink.Message, error) {
+func newTableMsg(fam tableFamily, table string, flags uint32) (netlink.Message, error) {
 	return nftMsg(fam, unix.NFT_MSG_NEWTABLE, netlink.Create, func(ae *netlink.AttributeEncoder) {
-		ae.String(unix.NFTA_TABLE_NAME, RedirectTable)
+		ae.String(unix.NFTA_TABLE_NAME, table)
 		ae.Uint32(unix.NFTA_TABLE_FLAGS, flags)
 	})
 }
 
-func delTableMsg(fam tableFamily) (netlink.Message, error) {
+func delTableMsg(fam tableFamily, table string) (netlink.Message, error) {
 	return nftMsg(fam, unix.NFT_MSG_DELTABLE, 0, func(ae *netlink.AttributeEncoder) {
-		ae.String(unix.NFTA_TABLE_NAME, RedirectTable)
+		ae.String(unix.NFTA_TABLE_NAME, table)
 	})
 }
 
-// chainMsgs is the chain followed by its rules, appended in order.
-func chainMsgs(fam tableFamily, c redirectChain) ([]netlink.Message, error) {
+// chainMsgs is the chain in table followed by its rules, appended in order.
+func chainMsgs(fam tableFamily, table string, c redirectChain) ([]netlink.Message, error) {
 	chain, err := nftMsg(fam, unix.NFT_MSG_NEWCHAIN, netlink.Create, func(ae *netlink.AttributeEncoder) {
-		ae.String(unix.NFTA_CHAIN_TABLE, RedirectTable)
+		ae.String(unix.NFTA_CHAIN_TABLE, table)
 		ae.String(unix.NFTA_CHAIN_NAME, c.name)
 		ae.Nested(unix.NFTA_CHAIN_HOOK, func(hook *netlink.AttributeEncoder) error {
 			hook.Uint32(unix.NFTA_HOOK_HOOKNUM, c.hook)
@@ -248,7 +254,7 @@ func chainMsgs(fam tableFamily, c redirectChain) ([]netlink.Message, error) {
 	msgs := []netlink.Message{chain}
 	for i, exprs := range c.rules {
 		rule, err := nftMsg(fam, unix.NFT_MSG_NEWRULE, netlink.Create|netlink.Append, func(ae *netlink.AttributeEncoder) {
-			ae.String(unix.NFTA_RULE_TABLE, RedirectTable)
+			ae.String(unix.NFTA_RULE_TABLE, table)
 			ae.String(unix.NFTA_RULE_CHAIN, c.name)
 			ae.Nested(unix.NFTA_RULE_EXPRESSIONS, func(list *netlink.AttributeEncoder) error {
 				for _, e := range exprs {

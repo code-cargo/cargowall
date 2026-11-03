@@ -42,8 +42,9 @@ const dockerSocket = "/var/run/docker.sock"
 // for a foreign daemon both are skipped and the redirect alone catches its
 // containers' DNS.
 //
-// Each address is added (network.OwnedAddrs) only once the proxy holds its
-// primary listener, so a second cargowall in the netns, which never gets
+// Each address is added (network.OwnedAddrs), with the guard that keeps it
+// from every link but lo and the docker bridges, only once the proxy holds
+// its primary listener, so a second cargowall in the netns, which never gets
 // that far, never touches the first's. One something else already holds is
 // not added, and its listener does not bind. Each listener binds over UDP
 // and TCP both or neither, and nothing is pointed at one that did not

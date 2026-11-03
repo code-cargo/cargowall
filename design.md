@@ -387,7 +387,8 @@ sequenceDiagram
 
 ### OTLP Exporter (`pkg/otlp`)
 - Streams every audit event to an OTLP/HTTP logs endpoint as one log record per event, enabled iff the standard `OTEL_EXPORTER_OTLP[_LOGS]_ENDPOINT` env var is set
-- Hand-rolled exporter — no OpenTelemetry SDK dependency; OTLP protos are generated from `buf.build/opentelemetry/opentelemetry` (see `proto/buf.gen.otlp.yaml`) and marshaled with the existing `google.golang.org/protobuf` dep, so `go.mod` gains nothing
+- Hand-rolled exporter — no OpenTelemetry SDK dependency. The log data types come from `go.opentelemetry.io/proto/otlp` (the `common`, `resource` and `logs` packages only). A program that also links the SDK shares those registered descriptors; a second copy under the same proto paths, as the earlier vendored one was, panics at init
+- The two collector messages (`ExportLogsServiceRequest`, `ExportLogsServiceResponse`) are encoded by hand with `protowire` (`pkg/otlp/wire.go`): their generated package also holds the gRPC stubs and grpc-gateway handler, and importing it would link grpc. Tests pin the encoding to the generated messages' bytes and check that the collector package isn't linked
 - `http/protobuf` transport only; misconfiguration (e.g. `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`) logs a warning and disables export without affecting the firewall
 - Delivery is best-effort by design: bounded queue (2048) with non-blocking enqueue so the ring-buffer reader and DNS handler never stall; batches of 512 records or 5s; jittered exponential backoff on 429/5xx honoring `Retry-After`; drops (counted and logged) rather than backpressure
 - Shutdown flushes queued events with a 5s-bounded context before the audit logger closes

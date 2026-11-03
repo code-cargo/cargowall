@@ -20,9 +20,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 
-	commonpb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/common/v1"
-	logspb "github.com/code-cargo/cargowall/pb/otlp/opentelemetry/proto/logs/v1"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 

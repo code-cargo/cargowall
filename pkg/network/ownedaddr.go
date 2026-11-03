@@ -261,25 +261,11 @@ func ifaddrAttrs(b []byte) (addr netip.Addr, label string) {
 // EINVAL for blackhole, EACCES for prohibit, EHOSTUNREACH for unreachable,
 // ENETUNREACH for throw and for none.
 func specificRoute(addr netip.Addr) error {
-	family, generic := byte(unix.AF_INET), 16
+	generic := 16
 	if addr.Is6() {
-		family, generic = unix.AF_INET6, 47
+		generic = 47
 	}
-	// struct rtmsg: family, dst_len, src_len, tos, table, protocol, scope,
-	// type, flags.
-	rtm := make([]byte, unix.SizeofRtMsg)
-	rtm[0], rtm[1] = family, byte(addr.BitLen())
-	binary.NativeEndian.PutUint32(rtm[8:], unix.RTM_F_FIB_MATCH)
-	ae := netlink.NewAttributeEncoder()
-	ae.Bytes(unix.RTA_DST, addr.AsSlice())
-	attrs, err := ae.Encode()
-	if err != nil {
-		return err
-	}
-	replies, err := rtnetlink(netlink.Message{
-		Header: netlink.Header{Type: unix.RTM_GETROUTE, Flags: netlink.Request},
-		Data:   append(rtm, attrs...),
-	})
+	replies, err := fibMatch(addr)
 	if errors.Is(err, unix.ENETUNREACH) || errors.Is(err, unix.EHOSTUNREACH) ||
 		errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EACCES) {
 		return nil
@@ -291,31 +277,67 @@ func specificRoute(addr netip.Addr) error {
 		if len(m.Data) < unix.SizeofRtMsg || m.Data[7] != unix.RTN_UNICAST || int(m.Data[1]) <= generic {
 			continue
 		}
-		dst, oif := routeAttrs(m.Data[unix.SizeofRtMsg:])
+		dst, oifs := routeAttrs(m.Data[unix.SizeofRtMsg:])
 		prefix := netip.PrefixFrom(dst, int(m.Data[1]))
-		if oif == 0 {
+		if len(oifs) == 0 {
 			return fmt.Errorf("it is routed by %s", prefix)
 		}
-		return fmt.Errorf("it is routed through %s by %s", ifName(oif), prefix)
+		return fmt.Errorf("it is routed through %s by %s", ifName(oifs[0]), prefix)
 	}
 	return nil
 }
 
-// routeAttrs reads a route message's destination and output interface.
-func routeAttrs(b []byte) (dst netip.Addr, oif int) {
+// fibMatch is the route the kernel matches for addr, as it is configured
+// (RTM_F_FIB_MATCH), rather than the host route a plain lookup clones.
+func fibMatch(addr netip.Addr) ([]netlink.Message, error) {
+	family := byte(unix.AF_INET)
+	if addr.Is6() {
+		family = unix.AF_INET6
+	}
+	// struct rtmsg: family, dst_len, src_len, tos, table, protocol, scope,
+	// type, flags.
+	rtm := make([]byte, unix.SizeofRtMsg)
+	rtm[0], rtm[1] = family, byte(addr.BitLen())
+	binary.NativeEndian.PutUint32(rtm[8:], unix.RTM_F_FIB_MATCH)
+	ae := netlink.NewAttributeEncoder()
+	ae.Bytes(unix.RTA_DST, addr.AsSlice())
+	attrs, err := ae.Encode()
+	if err != nil {
+		return nil, err
+	}
+	return rtnetlink(netlink.Message{
+		Header: netlink.Header{Type: unix.RTM_GETROUTE, Flags: netlink.Request},
+		Data:   append(rtm, attrs...),
+	})
+}
+
+// routeAttrs reads a route message's destination and output interfaces:
+// its one (RTA_OIF), or each of a multipath route's next hops'.
+func routeAttrs(b []byte) (dst netip.Addr, oifs []int) {
 	ad, err := netlink.NewAttributeDecoder(b)
 	if err != nil {
-		return netip.Addr{}, 0
+		return netip.Addr{}, nil
 	}
 	for ad.Next() {
 		switch ad.Type() {
 		case unix.RTA_DST:
 			dst, _ = netip.AddrFromSlice(ad.Bytes())
 		case unix.RTA_OIF:
-			oif = int(ad.Uint32())
+			oifs = append(oifs, int(ad.Uint32()))
+		case unix.RTA_MULTIPATH:
+			// struct rtnexthop: len, flags, hops, ifindex, then the hop's
+			// attributes, to len.
+			for hops := ad.Bytes(); len(hops) >= unix.SizeofRtNexthop; {
+				n := int(binary.NativeEndian.Uint16(hops))
+				if n < unix.SizeofRtNexthop || n > len(hops) {
+					break
+				}
+				oifs = append(oifs, int(int32(binary.NativeEndian.Uint32(hops[4:]))))
+				hops = hops[(n+3)&^3:]
+			}
 		}
 	}
-	return dst.Unmap(), oif
+	return dst.Unmap(), oifs
 }
 
 // loopbackAddr adds (RTM_NEWADDR) or removes (RTM_DELADDR) addr on lo, as a

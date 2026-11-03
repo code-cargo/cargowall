@@ -48,12 +48,20 @@ func TestOwnedAddrs_GuardAdmitsBridgesButUplinks(t *testing.T) {
 		src, src6 net.IP
 	}
 	peer := net.HardwareAddr{2, 0, 0, 0, 0, 2}
-	// bridged is a bridge with a tap for its port, which delivers to the
-	// bridge's own address: a control that frames pass the port.
-	bridged := func(bridge, port string, n byte) link {
+	// bridged is a bridge with a tap for its port, by way of a bond where
+	// one is named, which delivers to the bridge's own address: a control
+	// that frames pass the port.
+	bridged := func(bridge, bond, port string, n byte) link {
 		newBridge(t, bridge)
 		tap := addTunTap(t, port, nil, unix.IFF_TAP)
-		enslave(t, port, bridge)
+		if bond == "" {
+			enslave(t, port, bridge)
+		} else {
+			setLinkDown(t, port) // a bond takes only a slave that is down
+			enslave(t, port, bond)
+			setLinkUp(t, bond)
+			enslave(t, bond, bridge)
+		}
 		own := netip.AddrFrom4([4]byte{10, 60, n, 1})
 		setAddr(t, netip.PrefixFrom(own, 24), netip.Addr{}, bridge, "")
 		setAddr(t, netip.MustParsePrefix(fmt.Sprintf("fd60:%d::1/64", n)), netip.Addr{}, bridge, "")
@@ -70,25 +78,37 @@ func TestOwnedAddrs_GuardAdmitsBridgesButUplinks(t *testing.T) {
 		require.Equal(t, "control", got, "%s must deliver to its own address", bridge)
 		return c
 	}
-	custom := bridged("custom0", "tap0", 1) // com.docker.network.bridge.name=custom0
-	uplink := bridged("br0", "tap1", 2)     // a host whose uplink is bridged
+	type bridgeCase struct {
+		name  string
+		link  link
+		admit bool
+	}
+	cases := []bridgeCase{
+		{"custom0", bridged("custom0", "", "tap0", 1), true},      // com.docker.network.bridge.name=custom0
+		{"br0, the uplink", bridged("br0", "", "tap1", 2), false}, // a host whose uplink is bridged
+	}
 	plain := addTun(t, "cw0", net.IPv4(10, 56, 0, 1))
 	assert.Equal(t, []string{"tap1", "br0"}, Uplinks("tap1"), "a bridge port's bridge is an uplink too")
 	assert.Equal(t, []string{"cw0"}, Uplinks("cw0"))
 	assert.Empty(t, Uplinks("lo"))
+	uplinks := Uplinks("tap1")
+	if err := newLink("bond0", "bond", "", nil); err != nil {
+		t.Logf("no bond here (%v): the Proxmox stack goes untested", err)
+	} else {
+		// A Proxmox-stacked uplink: tap2 in bond0 in vmbr0.
+		cases = append(cases, bridgeCase{"vmbr0, the uplink by way of bond0", bridged("vmbr0", "bond0", "tap2", 3), false})
+		assert.Equal(t, []string{"tap2", "bond0", "vmbr0"}, Uplinks("tap2"), "the walk goes to the top of the chain")
+		uplinks = append(uplinks, Uplinks("tap2")...)
+	}
 
-	owned := NewOwnedAddrs(netip.Addr{}, []string{"br0"}, discardLogger())
+	owned := NewOwnedAddrs(netip.Addr{}, uplinks, discardLogger())
 	t.Cleanup(func() { _ = owned.Remove() })
 	for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
 		require.NoError(t, owned.Add(addr))
 	}
 	l, l6 := listenUDP(t, containerAddr(ContainerDNSIPv4)), listenUDP(t, containerAddr(ContainerDNSIPv6))
 	v4, v6 := net.IP(ContainerDNSIPv4.AsSlice()), net.IP(ContainerDNSIPv6.AsSlice())
-	for _, c := range []struct {
-		name  string
-		link  link
-		admit bool
-	}{{"custom0", custom, true}, {"br0, the uplink", uplink, false}} {
+	for _, c := range cases {
 		wait := map[bool]time.Duration{true: arrives, false: absent}[c.admit]
 		_, err := c.link.port.Write(ether(c.link.mac, peer, 0x0800, udp4(c.link.src, v4, 5000, 53, c.name)))
 		require.NoError(t, err)
@@ -275,6 +295,72 @@ func TestOwnedAddrs_ARPGuardBestEffort(t *testing.T) {
 	}
 }
 
+// Uplinks walks to the top of each chain it starts from: the TC
+// interface's, and each family's default route's, multipath included. A
+// default route on a bridge above a VLAN (eth0.100 in br100) is one, as is
+// a Proxmox stack (eno1 in bond0 in vmbr0).
+func TestUplinks(t *testing.T) {
+	enterNetns(t)
+	assert.Empty(t, Uplinks(""), "no interface and no default route")
+
+	require.NoError(t, newLink("eth0", "dummy", "", nil))
+	require.NoError(t, newLink("eth0.100", "vlan", "eth0", func(data *netlink.AttributeEncoder) error {
+		data.Uint16(unix.IFLA_VLAN_ID, 100)
+		return nil
+	}))
+	newBridge(t, "br100")
+	enslave(t, "eth0.100", "br100")
+	for _, name := range []string{"wan4", "wan6"} {
+		require.NoError(t, newLink(name, "dummy", "", nil))
+		setLinkUp(t, name)
+	}
+	addMultipathRoute(t, netip.MustParsePrefix("0.0.0.0/0"), "br100", "wan4")
+	addRoute(t, netip.MustParsePrefix("::/0"), "wan6")
+	assert.Equal(t, []string{"eth0", "br100", "wan4", "wan6"}, Uplinks("eth0"),
+		"each family's default-route links, every next hop's, beside the TC interface")
+
+	require.NoError(t, newLink("eno1", "dummy", "", nil))
+	if err := newLink("bond0", "bond", "", nil); err != nil {
+		t.Skipf("no bond here: %v", err)
+	}
+	enslave(t, "eno1", "bond0")
+	newBridge(t, "vmbr0")
+	enslave(t, "bond0", "vmbr0")
+	assert.Equal(t, []string{"eno1", "bond0", "vmbr0", "br100", "wan4", "wan6"}, Uplinks("eno1"))
+}
+
+// addMultipathRoute adds a unicast route for prefix to the main table with a
+// next hop through each interface named. It goes with the test's namespace.
+func addMultipathRoute(t *testing.T, prefix netip.Prefix, devs ...string) {
+	t.Helper()
+	var hops []byte
+	for _, dev := range devs {
+		ifi, err := net.InterfaceByName(dev)
+		require.NoError(t, err)
+		// struct rtnexthop: len, flags, hops, ifindex.
+		hop := make([]byte, unix.SizeofRtNexthop)
+		binary.NativeEndian.PutUint16(hop, unix.SizeofRtNexthop)
+		binary.NativeEndian.PutUint32(hop[4:], uint32(ifi.Index))
+		hops = append(hops, hop...)
+	}
+	rtm := make([]byte, unix.SizeofRtMsg)
+	rtm[0], rtm[1] = unix.AF_INET, byte(prefix.Bits())
+	rtm[4], rtm[5], rtm[6], rtm[7] = unix.RT_TABLE_MAIN, unix.RTPROT_STATIC, unix.RT_SCOPE_LINK, unix.RTN_UNICAST
+	ae := netlink.NewAttributeEncoder()
+	ae.Bytes(unix.RTA_DST, prefix.Addr().AsSlice())
+	ae.Bytes(unix.RTA_MULTIPATH, hops)
+	attrs, err := ae.Encode()
+	require.NoError(t, err)
+	_, err = rtnetlink(netlink.Message{
+		Header: netlink.Header{
+			Type:  unix.RTM_NEWROUTE,
+			Flags: netlink.Request | netlink.Acknowledge | netlink.Create | netlink.Excl,
+		},
+		Data: append(rtm, attrs...),
+	})
+	require.NoError(t, err)
+}
+
 // answered reports whether a frame match accepts comes out of tap within
 // wait.
 func answered(t *testing.T, tap *os.File, wait time.Duration, match func([]byte) bool) bool {
@@ -333,18 +419,37 @@ func neighborSolicit(dstMAC, mac net.HardwareAddr, src, dst, target net.IP) []by
 	return ether(dstMAC, mac, 0x86dd, b)
 }
 
-// newBridge creates a Linux bridge named name, up, and removes it at the
-// end of the test.
+// newBridge creates a Linux bridge named name, up. It goes with the test's
+// namespace.
 func newBridge(t *testing.T, name string) {
 	t.Helper()
+	require.NoError(t, newLink(name, "bridge", "", nil))
+	setLinkUp(t, name)
+}
+
+// newLink creates a link named name of kind, down, on the link named parent
+// where one is given, with data as its kind's IFLA_INFO_DATA where given.
+func newLink(name, kind, parent string, data func(*netlink.AttributeEncoder) error) error {
 	ae := netlink.NewAttributeEncoder()
 	ae.String(unix.IFLA_IFNAME, name)
+	if parent != "" {
+		p, err := net.InterfaceByName(parent)
+		if err != nil {
+			return err
+		}
+		ae.Uint32(unix.IFLA_LINK, uint32(p.Index))
+	}
 	ae.Nested(unix.IFLA_LINKINFO, func(info *netlink.AttributeEncoder) error {
-		info.String(unix.IFLA_INFO_KIND, "bridge")
+		info.String(unix.IFLA_INFO_KIND, kind)
+		if data != nil {
+			info.Nested(unix.IFLA_INFO_DATA, data)
+		}
 		return nil
 	})
 	attrs, err := ae.Encode()
-	require.NoError(t, err)
+	if err != nil {
+		return err
+	}
 	_, err = rtnetlink(netlink.Message{
 		Header: netlink.Header{
 			Type:  unix.RTM_NEWLINK,
@@ -352,8 +457,20 @@ func newBridge(t *testing.T, name string) {
 		},
 		Data: append(make([]byte, unix.SizeofIfInfomsg), attrs...),
 	})
+	return err
+}
+
+// setLinkDown takes the interface named name down.
+func setLinkDown(t *testing.T, name string) {
+	t.Helper()
+	sock, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	require.NoError(t, err)
-	setLinkUp(t, name)
+	defer unix.Close(sock)
+	ifr, err := unix.NewIfreq(name)
+	require.NoError(t, err)
+	require.NoError(t, unix.IoctlIfreq(sock, unix.SIOCGIFFLAGS, ifr))
+	ifr.SetUint16(ifr.Uint16() &^ unix.IFF_UP)
+	require.NoError(t, unix.IoctlIfreq(sock, unix.SIOCSIFFLAGS, ifr))
 }
 
 // enslave makes the interface named port a port of the bridge named master.

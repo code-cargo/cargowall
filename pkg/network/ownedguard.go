@@ -39,19 +39,59 @@ import (
 // it, so it dies with the process however that ends.
 const GuardTable = "cargowall_guard"
 
-// Uplinks is what an address's guard drops on even though it is a bridge:
-// the interface TC attaches to (ifname), and the bridge it is a port of, if
-// it is one, where what it receives arrives. A host whose uplink is bridged
-// (br0, vmbr0, br-ex) would otherwise admit its whole LAN.
+// maxMasterHops bounds the walk up an interface's masters: port, bond,
+// bridge, VRF is as deep as hosts stack them.
+const maxMasterHops = 8
+
+// Uplinks is what an address's guard drops on even though it may be a
+// bridge, read once at startup: the interface TC attaches to (ifname) and
+// each family's default-route interface, with every master above each, up
+// to the top of the chain (a port's bond, the bond's bridge). What arrives
+// from the LAN arrives on the top one, so a host whose uplink is bridged
+// (br0, vmbr0) would otherwise admit its whole LAN: eno1 in bond0 in vmbr0,
+// as Proxmox stacks them, or a default route on br100 above eth0.100.
+//
+// What it misses is no worse than main, whose bridge-IP listener every
+// link could reach: a bridged LAN that is neither on the TC interface's
+// chain nor the default route's, a bridge named br-* (OVS's br-ex), which
+// the guard admits by name as the redirect's DNAT sends from it, and an
+// uplink moved into a bridge mid-job.
 func Uplinks(ifname string) []string {
-	if ifname == "" || ifname == "lo" {
-		return nil
-	}
-	uplinks := []string{ifname}
-	if master := masterOf(ifname); master != "" {
-		uplinks = append(uplinks, master)
+	var uplinks []string
+	seen := map[string]bool{"": true, "lo": true}
+	for _, start := range append([]string{ifname}, defaultRouteLinks()...) {
+		for name, hops := start, 0; !seen[name] && hops < maxMasterHops; name, hops = masterOf(name), hops+1 {
+			seen[name] = true
+			uplinks = append(uplinks, name)
+		}
 	}
 	return uplinks
+}
+
+// defaultRouteLinks names the interfaces each family's default route
+// leaves by, as the kernel matches the route for an address on no network
+// (a documentation one), policy routing included; none for a family
+// without a default route.
+func defaultRouteLinks() []string {
+	var names []string
+	for _, dst := range []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")} {
+		replies, err := fibMatch(dst)
+		if err != nil {
+			continue
+		}
+		for _, m := range replies {
+			if len(m.Data) < unix.SizeofRtMsg || m.Data[1] != 0 || m.Data[7] != unix.RTN_UNICAST {
+				continue
+			}
+			_, oifs := routeAttrs(m.Data[unix.SizeofRtMsg:])
+			for _, index := range oifs {
+				if ifi, err := net.InterfaceByIndex(index); err == nil {
+					names = append(names, ifi.Name)
+				}
+			}
+		}
+	}
+	return names
 }
 
 // masterOf names the device the interface named name is a port of, "" for

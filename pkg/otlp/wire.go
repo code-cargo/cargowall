@@ -27,8 +27,11 @@ import (
 // ExportLogsServiceResponse, are encoded here by hand. Their generated Go
 // package (go.opentelemetry.io/proto/otlp/collector/logs/v1) also holds the
 // gRPC service stubs and the grpc-gateway handler, so importing it links
-// grpc into the binary for messages that are one and two fields deep. The
-// field numbers are from opentelemetry/proto/collector/logs/v1/logs_service.proto.
+// grpc into the binary for messages that are one and two fields deep.
+// go.opentelemetry.io/proto/slim/otlp has no grpc, but it registers the
+// same proto paths as the full module, so a program that links both (the
+// SDK links the full one) panics at init. The field numbers are from
+// opentelemetry/proto/collector/logs/v1/logs_service.proto.
 const (
 	requestResourceLogs   protowire.Number = 1 // ExportLogsServiceRequest.resource_logs
 	responsePartial       protowire.Number = 1 // ExportLogsServiceResponse.partial_success
@@ -102,7 +105,7 @@ func parseExportResponse(b []byte) (partialSuccess, error) {
 func walkFields(b []byte, fn func(protowire.Number, protowire.Type, []byte) error) error {
 	for len(b) > 0 {
 		num, typ, n := protowire.ConsumeTag(b)
-		if n < 0 {
+		if n < 0 || num > protowire.MaxValidNumber {
 			return errMalformed
 		}
 		b = b[n:]

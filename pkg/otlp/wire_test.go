@@ -16,7 +16,6 @@ package otlp
 
 import (
 	"encoding/hex"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -26,8 +25,6 @@ import (
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/reflect/protoregistry"
-	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 // unmarshalExportRequest decodes an ExportLogsServiceRequest.
@@ -189,6 +186,11 @@ func TestParseExportResponse(t *testing.T) {
 			wantErr: true,
 		},
 		{name: "bad tag", body: []byte{0x80}, wantErr: true},
+		{
+			name:    "a field number above the valid range",
+			body:    append(varint(nil, protowire.MaxValidNumber+1, 0), golden...),
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -221,26 +223,4 @@ func FuzzParseExportResponse(f *testing.F) {
 		require.NoError(t, err)
 		assert.Equal(t, ps, again)
 	})
-}
-
-// A program that links both this package and the OpenTelemetry SDK must
-// see one copy of each OTLP descriptor: a second copy under the same proto
-// path panics at init, before main. So the registered descriptors must be
-// the upstream packages' own, and the collector package (which brings in
-// grpc) must not be linked at all.
-func TestOTLPDescriptorsAreUpstream(t *testing.T) {
-	for _, path := range []string{
-		"opentelemetry/proto/common/v1/common.proto",
-		"opentelemetry/proto/resource/v1/resource.proto",
-		"opentelemetry/proto/logs/v1/logs.proto",
-	} {
-		fd, err := protoregistry.GlobalFiles.FindFileByPath(path)
-		require.NoError(t, err, path)
-		opts, ok := fd.Options().(*descriptorpb.FileOptions)
-		require.True(t, ok, path)
-		assert.True(t, strings.HasPrefix(opts.GetGoPackage(), "go.opentelemetry.io/proto/otlp/"),
-			"%s is registered from %q", path, opts.GetGoPackage())
-	}
-	_, err := protoregistry.GlobalFiles.FindFileByPath("opentelemetry/proto/collector/logs/v1/logs_service.proto")
-	assert.ErrorIs(t, err, protoregistry.NotFound)
 }

@@ -17,6 +17,7 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -178,8 +180,8 @@ func TestInstallHint(t *testing.T) {
 
 // TestRedirectChains_Order pins each chain's rule order and targets: the
 // mark returns come ahead of every DNAT, every DNAT sends to the proxy, the
-// nat chains run ahead of dstnat, prerouting exists only with a bridge
-// listener, and IPv6 rules exist only with ipv6.
+// nat chains run ahead of dstnat, prerouting and forward exist only with a
+// container listener, and IPv6 rules exist only with ipv6.
 func TestRedirectChains_Order(t *testing.T) {
 	kinds := func(rules [][]expr.Any) (returns, dnats, drops int, order string) {
 		for _, rule := range rules {
@@ -201,7 +203,7 @@ func TestRedirectChains_Order(t *testing.T) {
 	}
 	target := func(rule []expr.Any) net.IP { return net.IP(rule[len(rule)-3].(*expr.Immediate).Data) }
 
-	chains := redirectChains(false, nil)
+	chains := redirectChains(false, containerListeners{})
 	if len(chains) != 2 || chains[0].name != "output" || chains[1].name != "input" {
 		t.Fatalf("without a bridge want output and input chains, got %+v", chains)
 	}
@@ -220,7 +222,7 @@ func TestRedirectChains_Order(t *testing.T) {
 		}
 	}
 
-	chains = redirectChains(true, nil)
+	chains = redirectChains(true, containerListeners{})
 	if returns, dnats, _, order := kinds(chains[0].rules); returns != 2 || dnats != 8 || order != "RRNNNNNNNN" {
 		t.Errorf("IPv6 output rules = %q, want the 2 mark returns ahead of 8 DNATs", order)
 	}
@@ -233,22 +235,96 @@ func TestRedirectChains_Order(t *testing.T) {
 		t.Error("the input guard reads no address, so its 2 rules guard IPv6 as they are")
 	}
 
-	bridge := net.IPv4(172, 17, 0, 1).To4()
-	chains = redirectChains(false, bridge)
-	if len(chains) != 3 || chains[2].name != "prerouting" || chains[2].priority != -101 {
-		t.Fatalf("with a bridge want a prerouting chain at -101 third, got %+v", chains)
+	both := containerListeners{v4: net.IP(ContainerDNSIPv4.AsSlice()), v6: net.IP(ContainerDNSIPv6.AsSlice())}
+	chains = redirectChains(false, both)
+	if len(chains) != 4 || chains[2].name != "prerouting" || chains[2].priority != -101 ||
+		chains[3].name != "forward" || chains[3].hook != unix.NF_INET_FORWARD {
+		t.Fatalf("with a container listener want prerouting at -101 third and forward fourth, got %+v", chains)
 	}
 	if _, dnats, drops, _ := kinds(chains[2].rules); dnats != 4 || drops != 0 {
-		t.Errorf("prerouting has %d DNATs and %d drops, want 4 DNATs (docker0 and br-*, UDP and TCP)", dnats, drops)
+		t.Errorf("prerouting has %d DNATs and %d drops, want 4 DNATs (docker0 and br-*, UDP and TCP) and no IPv6 "+
+			"in an ip table", dnats, drops)
 	}
 	for _, rule := range chains[2].rules {
-		if !target(rule).Equal(bridge) {
-			t.Errorf("a prerouting DNAT does not send to the bridge listener: %+v", rule[len(rule)-3])
+		if !target(rule).Equal(both.v4) {
+			t.Errorf("a prerouting DNAT does not send to the IPv4 container listener: %+v", rule[len(rule)-3])
 		}
 	}
-	chains = redirectChains(true, bridge)
-	if _, _, _, order := kinds(chains[2].rules); order != "NNNNDDDD" {
-		t.Errorf("IPv6 prerouting rules = %q, want the 4 IPv4 DNATs, then 4 IPv6 drops", order)
+	if _, _, drops, order := kinds(chains[1].rules); drops != 3 || order != "DDD" {
+		t.Errorf("input rules = %q, want the 2 guards and the IPv4 listener's", order)
+	}
+	if _, _, drops, _ := kinds(chains[3].rules); drops != 1 {
+		t.Errorf("forward has %d drops, want the IPv4 listener's", drops)
+	}
+
+	chains = redirectChains(true, both)
+	if _, _, drops, order := kinds(chains[2].rules); order != "NNNNNNNN" || drops != 0 {
+		t.Errorf("IPv6 prerouting rules = %q, want 4 IPv4 DNATs, then 4 IPv6 ones, and no drop", order)
+	}
+	for i, rule := range chains[2].rules[4:] {
+		if !target(rule).Equal(both.v6) {
+			t.Errorf("IPv6 prerouting rule %d does not send to the IPv6 container listener: %+v", i, rule[len(rule)-3])
+		}
+	}
+	if _, _, drops, _ := kinds(chains[1].rules); drops != 4 {
+		t.Errorf("input has %d drops, want the 2 guards and each listener's", drops)
+	}
+	if _, _, drops, _ := kinds(chains[3].rules); drops != 2 {
+		t.Errorf("forward has %d drops, want each listener's", drops)
+	}
+
+	// A family whose listener the proxy does not hold gets no rule at all,
+	// neither a DNAT nor a drop.
+	chains = redirectChains(true, containerListeners{v6: both.v6})
+	if _, dnats, drops, _ := kinds(chains[2].rules); dnats != 4 || drops != 0 {
+		t.Errorf("with the IPv6 listener alone prerouting has %d DNATs and %d drops, want its 4 DNATs", dnats, drops)
+	}
+	if chains = redirectChains(false, containerListeners{v6: both.v6}); len(chains) != 2 {
+		t.Errorf("an ip table has no IPv6 to redirect, so the IPv6 listener alone adds no chain, got %+v", chains)
+	}
+}
+
+// The container listeners' addresses answer only what arrives on lo or a
+// docker bridge, and nothing is forwarded to them: input drops a packet for
+// one arriving on any other interface, forward drops any packet for one.
+func TestRedirectChains_ContainerListenersGuarded(t *testing.T) {
+	both := containerListeners{v4: net.IP(ContainerDNSIPv4.AsSlice()), v6: net.IP(ContainerDNSIPv6.AsSlice())}
+	chains := redirectChains(true, both)
+	ifnames := func(rule []expr.Any) (names []string, ops []expr.CmpOp) {
+		for i, e := range rule {
+			if m, ok := e.(*expr.Meta); ok && m.Key == expr.MetaKeyIIFNAME {
+				cmp := rule[i+1].(*expr.Cmp)
+				names = append(names, string(bytes.TrimRight(cmp.Data, "\x00")))
+				ops = append(ops, cmp.Op)
+			}
+		}
+		return names, ops
+	}
+	daddrOf := func(rule []expr.Any) net.IP {
+		for i, e := range rule {
+			if p, ok := e.(*expr.Payload); ok && p.Base == expr.PayloadBaseNetworkHeader {
+				return net.IP(rule[i+1].(*expr.Cmp).Data)
+			}
+		}
+		return nil
+	}
+	for i, addr := range []net.IP{both.v4, both.v6} {
+		guard := chains[1].rules[2+i]
+		names, ops := ifnames(guard)
+		if !daddrOf(guard).Equal(addr) || !slices.Equal(names, []string{"lo", "docker0", "br-"}) ||
+			!slices.Equal(ops, []expr.CmpOp{expr.CmpOpNeq, expr.CmpOpNeq, expr.CmpOpNeq}) {
+			t.Errorf("input guard for %s matches %v %v on %s, want != lo, docker0, br-*", addr, names, ops, daddrOf(guard))
+		}
+		if v, ok := guard[len(guard)-1].(*expr.Verdict); !ok || v.Kind != expr.VerdictDrop {
+			t.Errorf("input guard for %s does not drop", addr)
+		}
+		fwd := chains[3].rules[i]
+		if !daddrOf(fwd).Equal(addr) {
+			t.Errorf("forward rule %d matches %s, want %s", i, daddrOf(fwd), addr)
+		}
+		if names, _ := ifnames(fwd); len(names) != 0 {
+			t.Errorf("forward drop for %s is limited to %v, want every interface", addr, names)
+		}
 	}
 }
 
@@ -258,8 +334,8 @@ func TestRedirectChains_Order(t *testing.T) {
 // source address instead. An ip table's packets are all IPv4, and its rules
 // carry no such match.
 func TestRedirectChains_FamilyGated(t *testing.T) {
-	bridge := net.IPv4(172, 17, 0, 1).To4()
-	for _, c := range redirectChains(true, bridge) {
+	both := containerListeners{v4: net.IP(ContainerDNSIPv4.AsSlice()), v6: net.IP(ContainerDNSIPv6.AsSlice())}
+	for _, c := range redirectChains(true, both) {
 		for i, rule := range c.rules {
 			var want byte
 			for _, e := range rule {
@@ -275,9 +351,6 @@ func TestRedirectChains_FamilyGated(t *testing.T) {
 					want = byte(e.Family)
 				}
 			}
-			if v, ok := rule[len(rule)-1].(*expr.Verdict); ok && v.Kind == expr.VerdictDrop && c.name == "prerouting" {
-				want = unix.NFPROTO_IPV6 // the bridge drops are IPv6's alone
-			}
 			if want == 0 {
 				continue
 			}
@@ -288,7 +361,7 @@ func TestRedirectChains_FamilyGated(t *testing.T) {
 			}
 		}
 	}
-	for _, c := range redirectChains(false, bridge) {
+	for _, c := range redirectChains(false, both) {
 		for i, rule := range c.rules {
 			for _, e := range rule {
 				if m, ok := e.(*expr.Meta); ok && m.Key == expr.MetaKeyNFPROTO {

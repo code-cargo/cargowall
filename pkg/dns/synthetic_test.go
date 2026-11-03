@@ -462,7 +462,7 @@ func TestServeSynthetic_StubListenersUntracked(t *testing.T) {
 	assert.Empty(t, s.hostnameIPs)
 }
 
-// containerListenerWriter answers on the docker-bridge listener.
+// containerListenerWriter answers on a container listener.
 type containerListenerWriter struct{ MockResponseWriter }
 
 func (c *containerListenerWriter) LocalAddr() net.Addr {

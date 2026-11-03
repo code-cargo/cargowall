@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -25,8 +26,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sys/unix"
 
+	"github.com/code-cargo/cargowall/pkg/network"
 	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
@@ -36,28 +37,49 @@ type bindErrs map[string]error
 
 func (b bindErrs) BindError(addr string) error { return b[addr] }
 
-// The address container DNS may be sent to, and allowed at, is the bridge's
-// only once the proxy holds its listener there. Without a bridge, or with
-// the feature off, there is none, and the proxy is not asked about an
-// address it was never given.
-func TestDockerDNS_ListeningIP(t *testing.T) {
-	held := listenErr("udp4", "172.17.0.1:53", unix.EADDRINUSE)
+// The container listeners' addresses as BindError keys them, and a refusal
+// of one, as network.OwnedAddrs words it.
+var (
+	listen4     = "169.254.0.53:53"
+	listen6     = "[fd97:d1fb:f215::53]:53"
+	errRefused4 = errors.New("it is already assigned to eth0")
+)
+
+// The addresses container DNS may be sent to, and allowed at, are the
+// container listeners' the proxy holds, each family on its own. With the
+// feature off there are none.
+func TestDockerDNS_Listening(t *testing.T) {
+	refusal6 := errors.New("it is routed through tun0 by fd97:d1fb:f215::/48")
 	for _, c := range []struct {
-		name string
-		d    *dockerDNS
-		err  error
-		ip   string
+		name    string
+		d       *dockerDNS
+		ip, ip6 string
 	}{
-		{name: "bound", d: &dockerDNS{bridgeIP: "172.17.0.1", proxy: bindErrs{}}, ip: "172.17.0.1"},
-		{name: "unbound", d: &dockerDNS{bridgeIP: "172.17.0.1", proxy: bindErrs{"172.17.0.1:53": held}}, err: held},
-		{name: "no bridge", d: &dockerDNS{proxy: bindErrs{":53": held}}},
+		{name: "both bound", d: &dockerDNS{proxy: bindErrs{}}, ip: "169.254.0.53", ip6: "fd97:d1fb:f215::53"},
+		{name: "IPv4 refused", d: &dockerDNS{proxy: bindErrs{listen4: errRefused4}}, ip6: "fd97:d1fb:f215::53"},
+		{name: "IPv6 refused", d: &dockerDNS{proxy: bindErrs{listen6: refusal6}}, ip: "169.254.0.53"},
+		{name: "both refused", d: &dockerDNS{proxy: bindErrs{listen4: errRefused4, listen6: refusal6}}},
 		{name: "interception off"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			assert.Equal(t, c.err, c.d.listenerErr())
 			assert.Equal(t, c.ip, c.d.listeningIP())
+			assert.Equal(t, c.ip6, c.d.listeningIPv6())
+			assert.Equal(t, c.ip != "" || c.ip6 != "", c.d.serving())
 		})
 	}
+	assert.Equal(t, errRefused4, (&dockerDNS{proxy: bindErrs{listen4: errRefused4}}).listenerErr(network.ContainerDNSIPv4))
+	assert.NoError(t, (*dockerDNS)(nil).listenerErr(network.ContainerDNSIPv4))
+}
+
+// Off, the feature adds nothing. On, it registers the addresses' removal
+// before anything is added: the addresses go on lo only once the proxy holds
+// its primary.
+func TestStartDockerDNS(t *testing.T) {
+	teardowns := &teardownList{}
+	d, undo := startDockerDNS(&StartCmd{}, nil, podenv.Dockerd{}, teardowns, slog.New(slog.DiscardHandler))
+	assert.Nil(t, d)
+	assert.Empty(t, teardowns.fns)
+	undo()
 }
 
 // useListenerRun is one useListener call against stand-ins for daemon.json:
@@ -81,9 +103,8 @@ func runUseListener(kind podenv.DockerdKind, errs bindErrs, redirect, leftover b
 	run := &useListenerRun{teardowns: &teardownList{}}
 	var buf bytes.Buffer
 	run.d = &dockerDNS{
-		bridgeIP: "172.17.0.1",
-		dockerd:  podenv.Dockerd{Kind: kind},
-		proxy:    errs,
+		dockerd: podenv.Dockerd{Kind: kind},
+		proxy:   errs,
 		configure: func(dnsIP string, _ *slog.Logger) error {
 			run.configured = append(run.configured, dnsIP)
 			run.undosBefore = len(run.teardowns.fns)
@@ -102,17 +123,19 @@ func runUseListener(kind podenv.DockerdKind, errs bindErrs, redirect, leftover b
 }
 
 // Only a listener the proxy holds is put to use: for a local daemon,
-// daemon.json is rewritten to point at it, with the undo registered first,
-// and the restart that applies it is due; the rewrite undoes a previous
-// run's leftover itself. A foreign daemon is left alone, and its line claims
-// no redirect: whether one is in place is the redirect's to say once it is.
+// daemon.json is rewritten to point at the IPv4 one, with the undo
+// registered first, and the restart that applies it is due; the rewrite
+// undoes a previous run's leftover itself. A foreign daemon is left alone,
+// and its line claims no redirect: whether one is in place is the
+// redirect's to say once it is.
 func TestDockerDNS_UseListenerBound(t *testing.T) {
 	run := runUseListener(podenv.DockerdLocal, bindErrs{}, true, true)
-	assert.Equal(t, []string{"172.17.0.1"}, run.configured)
+	assert.Equal(t, []string{"169.254.0.53"}, run.configured)
 	assert.Equal(t, 1, run.undosBefore, "the undo must be registered before the rewrite")
 	assert.Zero(t, run.recoveries, "the rewrite recovers a leftover on its way")
 	assert.True(t, run.d.restart)
 	assert.Contains(t, run.log, "Docker DNS interception enabled")
+	assert.Contains(t, run.log, "listen=169.254.0.53:53")
 	run.undo()
 	assert.Equal(t, 1, run.restored)
 
@@ -122,25 +145,26 @@ func TestDockerDNS_UseListenerBound(t *testing.T) {
 		assert.Zero(t, run.recoveries, "nor is a foreign daemon's leftover")
 		assert.Empty(t, run.teardowns.fns)
 		assert.False(t, run.d.restart)
-		assert.Contains(t, run.log, "only through the DNS redirect or by naming it")
+		assert.Contains(t, run.log, "only through the DNS redirect or by naming its listener")
 		assert.NotContains(t, run.log, "redirected at the bridge")
 	}
 }
 
-// A listener the proxy could not bind is pointed at by nothing: daemon.json
-// is not rewritten, so there is nothing to undo. It warns, whatever the
-// redirect, saying containers resolve around the proxy, and that this loses
-// the dns-redirect posture only when the redirect is requested. A local
-// daemon's daemon.json is still rid of a rewrite a previous run left, which
-// points containers at the address the proxy does not hold, and then the
-// restart that applies the original is due; the warning says which.
+// An IPv4 listener the proxy could not bind is pointed at by nothing:
+// daemon.json is not rewritten, so there is nothing to undo. It warns,
+// whatever the redirect, saying containers resolve around the proxy, and
+// that this loses the dns-redirect posture only when the redirect is
+// requested. A local daemon's daemon.json is still rid of a rewrite a
+// previous run left, which points containers at an address the proxy does
+// not listen on, and then the restart that applies the original is due; the
+// warning says which.
 func TestDockerDNS_UseListenerUnbound(t *testing.T) {
-	held := bindErrs{"172.17.0.1:53": listenErr("tcp4", "172.17.0.1:53", unix.EADDRINUSE)}
+	refused := bindErrs{listen4: errRefused4}
 	for _, kind := range []podenv.DockerdKind{podenv.DockerdLocal, podenv.DockerdForeign} {
 		for _, redirect := range []bool{true, false} {
 			for _, leftover := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/redirect=%v/leftover=%v", kind, redirect, leftover), func(t *testing.T) {
-					run := runUseListener(kind, held, redirect, leftover)
+					run := runUseListener(kind, refused, redirect, leftover)
 					local := kind == podenv.DockerdLocal
 					assert.Empty(t, run.configured, "nothing may point containers at an address the proxy does not hold")
 					assert.Empty(t, run.teardowns.fns)
@@ -148,7 +172,8 @@ func TestDockerDNS_UseListenerUnbound(t *testing.T) {
 					assert.Equal(t, local && leftover, run.d.restart, "a restart is due only to apply an undone leftover")
 					require.Equal(t, 1, strings.Count(run.log, "level=WARN"), run.log)
 					assert.Contains(t, run.log, "around the proxy")
-					assert.Contains(t, run.log, "addr=172.17.0.1:53")
+					assert.Contains(t, run.log, "addr=169.254.0.53:53")
+					assert.Contains(t, run.log, "already assigned to eth0")
 					assert.Equal(t, local && !leftover, strings.Contains(run.log, "daemon.json is left alone"))
 					assert.Equal(t, local && leftover, strings.Contains(run.log, "the rewrite a previous run left there is undone"))
 					assert.Equal(t, redirect, strings.Contains(run.log, "a lost dns-redirect posture"))
@@ -164,8 +189,8 @@ func TestDockerDNS_UseListenerUnbound(t *testing.T) {
 func TestDockerDNS_RecoverLeftoverFails(t *testing.T) {
 	var buf bytes.Buffer
 	d := &dockerDNS{
-		bridgeIP: "172.17.0.1", dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal},
-		proxy:   bindErrs{"172.17.0.1:53": listenErr("udp4", "172.17.0.1:53", unix.EADDRINUSE)},
+		dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal},
+		proxy:   bindErrs{listen4: errRefused4},
 		recover: func(*slog.Logger) (bool, error) { return false, fmt.Errorf("read-only /etc/docker") },
 		logger:  slog.New(slog.NewTextHandler(&buf, nil)),
 	}
@@ -175,18 +200,17 @@ func TestDockerDNS_RecoverLeftoverFails(t *testing.T) {
 	assert.Contains(t, buf.String(), "daemon.json is left alone")
 }
 
-// Port 53 is allowed at the proxy, its upstream, and the docker bridge
-// listener only once the proxy holds it: otherwise port 53 there is
-// another process's.
+// Port 53 is allowed at the proxy, its upstream, and each container
+// listener the proxy holds: port 53 at one it does not is another process's,
+// or no one's.
 func TestDNSInfraIPs(t *testing.T) {
-	held := listenErr("udp4", "172.17.0.1:53", unix.EADDRINUSE)
 	for _, c := range []struct {
 		name string
 		d    *dockerDNS
 		want []string
 	}{
-		{"bound", &dockerDNS{bridgeIP: "172.17.0.1", proxy: bindErrs{}}, []string{"127.0.0.1", "10.0.0.2", "172.17.0.1"}},
-		{"unbound", &dockerDNS{bridgeIP: "172.17.0.1", proxy: bindErrs{"172.17.0.1:53": held}}, []string{"127.0.0.1", "10.0.0.2"}},
+		{"both bound", &dockerDNS{proxy: bindErrs{}}, []string{"127.0.0.1", "10.0.0.2", "169.254.0.53", "fd97:d1fb:f215::53"}},
+		{"IPv4 refused", &dockerDNS{proxy: bindErrs{listen4: errRefused4}}, []string{"127.0.0.1", "10.0.0.2", "fd97:d1fb:f215::53"}},
 		{"interception off", nil, []string{"127.0.0.1", "10.0.0.2"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -196,14 +220,10 @@ func TestDNSInfraIPs(t *testing.T) {
 	assert.Equal(t, []string{"127.0.0.1"}, dnsInfraIPs("", nil), "an upstream that is no address adds none")
 }
 
-// No bridge, or the feature off, has nothing to put to use or report.
-func TestDockerDNS_UseListenerIdle(t *testing.T) {
-	var buf bytes.Buffer
-	d := &dockerDNS{dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal}, proxy: bindErrs{}, logger: slog.New(slog.NewTextHandler(&buf, nil))}
+// The feature off has nothing to put to use or report.
+func TestDockerDNS_UseListenerOff(t *testing.T) {
 	assert.NotPanics(t, func() {
-		d.useListener(&teardownList{}, true)()
 		(*dockerDNS)(nil).useListener(&teardownList{}, true)()
 		(*dockerDNS)(nil).restartDaemon()
 	})
-	assert.Empty(t, buf.String())
 }

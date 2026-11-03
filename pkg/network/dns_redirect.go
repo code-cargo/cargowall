@@ -93,33 +93,50 @@ type RedirectSpec struct {
 	// ProxyAddrIPv6, in a table of family inet. Without it the table is of
 	// family ip, IPv4 only.
 	IPv6 bool
-	// BridgeIP is the proxy's container listener on the docker bridge, ""
-	// for none. Name one only once the proxy is known to hold it: the DNAT
-	// to it hands container DNS to whatever holds the address.
-	BridgeIP string
+	// ContainerIPv4 and ContainerIPv6 are the proxy's listeners for container
+	// DNS (ContainerDNSIPv4, ContainerDNSIPv6), the zero Addr for none: DNS
+	// arriving on a docker bridge goes to the one of its family. Name one
+	// only once the proxy is known to hold it: the DNAT to it hands container
+	// DNS to whatever does. ContainerIPv6 counts only in a table that covers
+	// IPv6.
+	ContainerIPv4, ContainerIPv6 netip.Addr
 }
 
-// HostIPv6 reports whether this network namespace has an IPv6 address
-// other than loopback's, link-local included, since DNS to an on-link
-// resolver leaves by one: whether IPv6 DNS can leave it, and so whether a
-// redirect that does not cover IPv6 leaves a way around the proxy. Addresses
-// that cannot be listed count as IPv6, the side that leaves no gap
-// unreported.
+// containerListeners is RedirectSpec's container DNS listeners as the
+// chains take them, nil for none.
+type containerListeners struct{ v4, v6 net.IP }
+
+// HostIPv6 reports whether this network namespace has an IPv6 address on
+// an interface other than loopback, link-local included, since DNS to an
+// on-link resolver leaves by one: whether IPv6 DNS can leave it, and so
+// whether a redirect that does not cover IPv6 leaves a way around the proxy.
+// An address on lo, such as the container DNS one cargowall adds, leaves by
+// no link. Interfaces or addresses that cannot be listed count as IPv6, the
+// side that leaves no gap unreported.
 func HostIPv6() bool {
-	addrs, err := net.InterfaceAddrs()
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return true
 	}
-	for _, a := range addrs {
-		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() == nil && !ipnet.IP.IsLoopback() {
+	for _, ifi := range ifaces {
+		if ifi.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifi.Addrs()
+		if err != nil {
 			return true
+		}
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() == nil {
+				return true
+			}
 		}
 	}
 	return false
 }
 
 // redirectChains is the redirect for traffic this netns originates, plus,
-// with a docker bridge IP, for DNS that containers send through a docker
+// with a container listener, for DNS that containers send through a docker
 // bridge. With ipv6 the table is inet, and a rule that reads an address, or
 // rewrites to one, first matches the packet's family (nfproto): there an
 // IPv4 offset read on an IPv6 packet would compare bytes of its source
@@ -154,20 +171,28 @@ func HostIPv6() bool {
 // client its full resolver timeout. Its rules read no address, so in an inet
 // table they guard IPv6 as well.
 //
-// prerouting, only with a bridge IP: DNS arriving on docker0 or a
+// prerouting, with a container listener: DNS arriving on docker0 or a
 // user-defined br-* bridge (which also matches bridges created later) goes
-// to the proxy's container listener on that IP. That traffic is forwarded,
-// not originated here, so the output chain never sees it: a container that
-// names its own resolver (--dns, a hard-coded 8.8.8.8, a dockerd whose
-// daemon.json cargowall cannot rewrite) would otherwise resolve around the
-// proxy. DNAT keeps the source address, so the proxy still attributes the
-// query by container IP. With ipv6, IPv6 DNS arriving there is dropped:
-// daemon.json points containers at the IPv4 listener, so only a container
-// naming an IPv6 resolver of its own sends any, and there is no IPv6
-// listener to send it to. A bridge's IPv6 address is not one cargowall can
-// count on holding, and DNAT to an address it does not hold hands the query
-// to whatever does.
-func redirectChains(ipv6 bool, bridgeIP net.IP) []redirectChain {
+// to the proxy's container listener of its family. That traffic is
+// forwarded, not originated here, so the output chain never sees it: a
+// container that names its own resolver (--dns, a hard-coded 8.8.8.8, a
+// dockerd whose daemon.json cargowall cannot rewrite) would otherwise
+// resolve around the proxy. DNAT keeps the source address, so the proxy
+// still attributes the query by container IP. A family whose listener the
+// proxy does not hold gets no rule: a DNAT would hand its DNS to whatever
+// holds the address, and a drop would block DNS under an auditing policy,
+// which promises to block nothing. An ip table sees no IPv6, so it has no
+// IPv6 rule either.
+//
+// The container listeners' addresses are guarded as well. They are on lo,
+// and the kernel delivers a packet for a local address whichever interface
+// it arrives on, and answers ARP for one on every link (arp_ignore 0): a
+// neighbour on the uplink could reach the proxy through them. So input
+// drops what arrives for them on anything but lo or a docker bridge. And
+// forward, a filter hook, drops what would be forwarded to them, which
+// happens only were one gone while the redirect stands: the container DNS
+// DNAT'd to it would then leave by the default route.
+func redirectChains(ipv6 bool, container containerListeners) []redirectChain {
 	var v4, v6 []expr.Any
 	if ipv6 {
 		v4, v6 = nfproto(unix.NFPROTO_IPV4), nfproto(unix.NFPROTO_IPV6)
@@ -198,30 +223,43 @@ func redirectChains(ipv6 bool, bridgeIP net.IP) []redirectChain {
 	input := udpAndTCP(func(proto []expr.Any) []expr.Any {
 		return slices.Concat(proto, iifname(expr.CmpOpNeq, "lo"), port(srcPort, 53), ctStateNew(), verdict(expr.VerdictDrop))
 	})
+	if !ipv6 {
+		container.v6 = nil
+	}
+	bridges := [][]expr.Any{iifname(expr.CmpOpEq, "docker0"), iifnamePrefix(expr.CmpOpEq, "br-")}
+	notBridgeOrLo := slices.Concat(iifname(expr.CmpOpNeq, "lo"), iifname(expr.CmpOpNeq, "docker0"),
+		iifnamePrefix(expr.CmpOpNeq, "br-"))
+	var prerouting, forward [][]expr.Any
+	for _, l := range []struct {
+		family []expr.Any
+		addr   net.IP
+		daddr  []expr.Any
+	}{
+		{v4, container.v4, daddr(expr.CmpOpEq, container.v4.To4())},
+		{v6, container.v6, daddr6(expr.CmpOpEq, container.v6)},
+	} {
+		if l.addr == nil {
+			continue
+		}
+		for _, bridge := range bridges {
+			prerouting = append(prerouting, udpAndTCP(func(proto []expr.Any) []expr.Any {
+				return slices.Concat(l.family, bridge, proto, port(dstPort, 53), dnat(l.addr, 53))
+			})...)
+		}
+		input = append(input, slices.Concat(l.family, l.daddr, notBridgeOrLo, verdict(expr.VerdictDrop)))
+		forward = append(forward, slices.Concat(l.family, l.daddr, verdict(expr.VerdictDrop)))
+	}
 	chains := []redirectChain{
 		{name: "output", kind: "nat", hook: unix.NF_INET_LOCAL_OUT, priority: natPriority, rules: output},
 		{name: "input", kind: "filter", hook: unix.NF_INET_LOCAL_IN, priority: filterPriority, rules: input},
 	}
-	if bridgeIP == nil {
+	if prerouting == nil {
 		return chains
 	}
-	bridges := [][]expr.Any{iifname(expr.CmpOpEq, "docker0"), iifnamePrefix("br-")}
-	var prerouting [][]expr.Any
-	for _, bridge := range bridges {
-		prerouting = append(prerouting, udpAndTCP(func(proto []expr.Any) []expr.Any {
-			return slices.Concat(v4, bridge, proto, port(dstPort, 53), dnat(bridgeIP, 53))
-		})...)
-	}
-	if ipv6 {
-		for _, bridge := range bridges {
-			prerouting = append(prerouting, udpAndTCP(func(proto []expr.Any) []expr.Any {
-				return slices.Concat(v6, bridge, proto, port(dstPort, 53), verdict(expr.VerdictDrop))
-			})...)
-		}
-	}
-	return append(chains, redirectChain{
-		name: "prerouting", kind: "nat", hook: unix.NF_INET_PRE_ROUTING, priority: natPriority, rules: prerouting,
-	})
+	return append(chains,
+		redirectChain{name: "prerouting", kind: "nat", hook: unix.NF_INET_PRE_ROUTING, priority: natPriority, rules: prerouting},
+		redirectChain{name: "forward", kind: "filter", hook: unix.NF_INET_FORWARD, priority: filterPriority, rules: forward},
+	)
 }
 
 // DNSRedirect is the redirect. Once installed it keeps the netlink socket
@@ -276,8 +314,8 @@ func NewDNSRedirect(logger *slog.Logger) *DNSRedirect {
 // (UDP+TCP port 53) goes to the local proxy at 127.0.0.1:53, and with
 // spec.IPv6 IPv6 DNS to ProxyAddrIPv6, except the proxy's own marked
 // queries, and the input guard keeps flushed flows from being re-picked-up
-// in reverse. A bridge IP in spec, where the proxy has a container
-// listener, also redirects container DNS crossing a docker bridge.
+// in reverse. A container listener in spec also redirects container DNS
+// crossing a docker bridge.
 //
 // One transaction builds the table, so a failure leaves the host as it
 // was. It first replaces a table of the same name that no socket owns (add,
@@ -298,11 +336,18 @@ func NewDNSRedirect(logger *slog.Logger) *DNSRedirect {
 // IPv4 redirect is never lost to a part of the kernel only IPv6 needs. When
 // the ip table fails the same way, that is the error returned.
 func (r *DNSRedirect) Install(spec RedirectSpec) error {
-	var bridge net.IP
-	if spec.BridgeIP != "" {
-		if bridge = net.ParseIP(spec.BridgeIP).To4(); bridge == nil {
-			return fmt.Errorf("docker bridge IP %q is not an IPv4 address", spec.BridgeIP)
+	var container containerListeners
+	if a := spec.ContainerIPv4; a.IsValid() {
+		if !a.Is4() {
+			return fmt.Errorf("container DNS address %s is not an IPv4 address", a)
 		}
+		container.v4 = net.IP(a.AsSlice())
+	}
+	if a := spec.ContainerIPv6; a.IsValid() {
+		if !a.Is6() || a.Is4In6() {
+			return fmt.Errorf("container DNS address %s is not an IPv6 address", a)
+		}
+		container.v6 = net.IP(a.AsSlice())
 	}
 
 	r.mu.Lock()
@@ -321,11 +366,11 @@ func (r *DNSRedirect) Install(spec RedirectSpec) error {
 			fam = familyInet
 		}
 	}
-	conn, owned, err := r.installFamily(fam, ipv6, bridge)
+	conn, owned, err := r.installFamily(fam, ipv6, container)
 	if err != nil && ipv6 && !errors.Is(err, unix.EPERM) && !errors.Is(err, errLeftover) {
 		r.ipv6Refused = err
 		fam, ipv6 = familyIP, false
-		conn, owned, err = r.installFamily(fam, ipv6, bridge)
+		conn, owned, err = r.installFamily(fam, ipv6, container)
 	}
 	if err != nil {
 		r.mu.Unlock()
@@ -333,7 +378,8 @@ func (r *DNSRedirect) Install(spec RedirectSpec) error {
 	}
 	r.conn, r.family, r.owned = conn, fam, owned
 	r.logger.Info("DNS redirect installed", "nftables_table", fam.String()+" "+RedirectTable, "owned", r.owned,
-		"ipv6", ipv6, "container_bridge_redirect", bridge != nil)
+		"ipv6", ipv6, "container_bridge_redirect", container.v4 != nil,
+		"container_bridge_redirect_ipv6", ipv6 && container.v6 != nil)
 	r.mu.Unlock()
 
 	// Purge DNS flow state predating the redirect — nat verdicts are
@@ -376,8 +422,8 @@ var errLeftover = errors.New("other family's table")
 // another process's table. That refusal takes the new table back out: on
 // the socket that made it, and failing that on a new one, since an unowned
 // table outlives its socket. One that still stands is named in the error.
-func (r *DNSRedirect) installFamily(fam tableFamily, ipv6 bool, bridge net.IP) (*netlink.Conn, bool, error) {
-	conn, owned, err := r.installOwned(fam, ipv6, bridge)
+func (r *DNSRedirect) installFamily(fam tableFamily, ipv6 bool, container containerListeners) (*netlink.Conn, bool, error) {
+	conn, owned, err := r.installOwned(fam, ipv6, container)
 	if err != nil {
 		return nil, false, err
 	}
@@ -403,9 +449,9 @@ func (r *DNSRedirect) installFamily(fam tableFamily, ipv6 bool, bridge net.IP) (
 
 // installOwned installs the table as family fam, owned unless the kernel
 // refuses the flag, which it then is not asked for again.
-func (r *DNSRedirect) installOwned(fam tableFamily, ipv6 bool, bridge net.IP) (*netlink.Conn, bool, error) {
+func (r *DNSRedirect) installOwned(fam tableFamily, ipv6 bool, container containerListeners) (*netlink.Conn, bool, error) {
 	var chains []netlink.Message
-	for _, c := range redirectChains(ipv6, bridge) {
+	for _, c := range redirectChains(ipv6, container) {
 		msgs, err := chainMsgs(fam, c)
 		if err != nil {
 			return nil, false, fmt.Errorf("nftables: %w", err)

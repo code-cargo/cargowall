@@ -89,61 +89,74 @@ func TestIPv6Gap(t *testing.T) {
 	}
 }
 
-// Container DNS reaches the proxy when the proxy holds its listener on the
-// docker bridge. The reason it does not names the address once, and why:
-// the bind error repeats the address, and only its protocol and cause are
-// kept. Without a bridge, or with the feature off, there is nothing to
-// reach.
-func TestBridgeGap(t *testing.T) {
+// Container DNS reaches the proxy when the proxy holds its container
+// listener of its family. The reason one does not names its address once,
+// and why: another process's bind, net's own error with the address it
+// repeats left out, or the refusal of the address itself
+// (network.OwnedAddrs). The IPv6 listener counts only where the redirect
+// covers IPv6; with the feature off there is nothing to reach.
+func TestContainerGap(t *testing.T) {
+	held := listenErr("udp4", "169.254.0.53:53", unix.EADDRINUSE)
+	gone := listenErr("udp4", "169.254.0.53:53", unix.EADDRNOTAVAIL)
+	routed := errors.New("it is routed through tun0 by fd97:d1fb:f215::/48")
 	for _, c := range []struct {
 		name string
-		err  error
+		errs bindErrs
+		ipv6 bool
 		gap  string
 	}{
-		{name: "bound"},
-		{name: "port held", err: listenErr("tcp4", "172.17.0.1:53", unix.EADDRINUSE), gap: "another process holds 172.17.0.1:53"},
+		{name: "both bound", errs: bindErrs{}, ipv6: true},
+		{name: "IPv4 port held", errs: bindErrs{listen4: held}, gap: "another process holds 169.254.0.53:53"},
 		{
-			name: "address gone", err: listenErr("udp4", "172.17.0.1:53", unix.EADDRNOTAVAIL),
-			gap: "the proxy cannot listen on 172.17.0.1:53: udp4 bind: cannot assign requested address",
+			name: "IPv4 address gone", errs: bindErrs{listen4: gone},
+			gap: "the proxy cannot listen on 169.254.0.53:53: udp4 bind: cannot assign requested address",
 		},
 		{
-			name: "not a net error", err: fmt.Errorf("udp4: %w", unix.EACCES),
-			gap: "the proxy cannot listen on 172.17.0.1:53: udp4: permission denied",
+			name: "IPv4 refused", errs: bindErrs{listen4: errRefused4},
+			gap: "the proxy cannot listen on 169.254.0.53:53: it is already assigned to eth0",
+		},
+		{
+			name: "IPv6 refused, IPv6 covered", errs: bindErrs{listen6: routed}, ipv6: true,
+			gap: "the proxy cannot listen on [fd97:d1fb:f215::53]:53: it is routed through tun0 by fd97:d1fb:f215::/48",
+		},
+		{name: "IPv6 refused, IPv6 not covered", errs: bindErrs{listen6: routed}},
+		{
+			name: "both refused", errs: bindErrs{listen4: errRefused4, listen6: routed}, ipv6: true,
+			gap: "the proxy cannot listen on 169.254.0.53:53: it is already assigned to eth0; " +
+				"the proxy cannot listen on [fd97:d1fb:f215::53]:53: it is routed through tun0 by fd97:d1fb:f215::/48",
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			d := &dockerDNS{bridgeIP: "172.17.0.1", proxy: bindErrs{"172.17.0.1:53": c.err}}
-			assert.Equal(t, c.gap, bridgeGap(d))
+			assert.Equal(t, c.gap, containerGap(&dockerDNS{proxy: c.errs}, c.ipv6))
 		})
 	}
-	assert.Empty(t, bridgeGap(&dockerDNS{proxy: bindErrs{":53": unix.EADDRINUSE}}))
-	assert.Empty(t, bridgeGap(nil))
+	assert.Empty(t, containerGap(nil, true))
 }
 
 // A redirect in place but not whole is active, so the resolved cache flush
 // it gates still runs, and is a lost posture: fatal under an enforcing
 // policy, recorded under an auditing one. It is recorded at what it still
 // covers, with every gap's reason: ipv4 when IPv6 DNS goes around the
-// proxy, host when container DNS does, for want of the bridge listener,
+// proxy, host when container DNS does, for want of a container listener,
 // host-ipv4 for both.
 func TestDNSRedirect_PartialIsALoss(t *testing.T) {
 	const (
-		ipv6   = "loopback has no IPv6 address for the proxy to listen on"
-		bridge = "another process holds 172.17.0.1:53"
+		ipv6      = "loopback has no IPv6 address for the proxy to listen on"
+		container = "another process holds 169.254.0.53:53"
 	)
 	ipv6Reason := "IPv6 DNS is not redirected: " + ipv6
-	bridgeReason := "container DNS is not redirected: " + bridge
+	containerReason := "container DNS is not redirected: " + container
 	logger := slog.New(slog.DiscardHandler)
 	for _, c := range []struct {
-		name, ipv6, bridge, applied string
-		reason                      string
+		name, ipv6, container, applied string
+		reason                         string
 	}{
 		{"IPv6 gap", ipv6, "", "ipv4", ipv6Reason},
-		{"bridge gap", "", bridge, "host", bridgeReason},
-		{"both", ipv6, bridge, "host-ipv4", bridgeReason + "; " + ipv6Reason},
+		{"container gap", "", container, "host", containerReason},
+		{"both", ipv6, container, "host-ipv4", containerReason + "; " + ipv6Reason},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			partial := installed(c.ipv6, c.bridge, logger)
+			partial := installed(c.ipv6, c.container, logger)
 			assert.True(t, partial.isActive())
 			for _, enforcing := range []bool{true, false} {
 				redirectStateFiles(t)
@@ -170,23 +183,38 @@ func TestDNSRedirect_PartialIsALoss(t *testing.T) {
 	assert.NoError(t, whole.settle(nil), "a whole redirect has nothing to report")
 }
 
-// The record keeps only the first maxPostureReasonBytes of a reason, and
-// both gaps' causes survive it at their longest: the kernel refusing the
-// inet table, with its hint, and the longest bridge address the bind cannot
-// assign.
-func TestDNSRedirect_BothGapsKeepTheirCauses(t *testing.T) {
+// The record keeps a lost dns-redirect's reasons whole at their longest,
+// within maxPostureReasonBytes. One case is the kernel refusing the inet
+// table, with its hint, beside the IPv4 container listener's address
+// refused for a route through an interface whose name is as long as one
+// gets. The other is both container listeners refused that way, beside
+// another process holding [::1]:53.
+func TestDNSRedirect_GapsKeptWhole(t *testing.T) {
 	refused := errors.New("nftables: installing table inet cargowall: netlink receive: address family not supported " +
 		"by protocol (the kernel may lack inet tables or IPv6 nat: CONFIG_NF_TABLES_INET, or nf_nat for IPv6)")
-	const bridge = "255.255.255.255:53"
-	d := &dockerDNS{bridgeIP: "255.255.255.255", proxy: bindErrs{bridge: listenErr("udp4", bridge, unix.EADDRNOTAVAIL)}}
-	r := installed(ipv6Gap(nil, refused, func() bool { return true }), bridgeGap(d), slog.New(slog.DiscardHandler))
-	require.Greater(t, len(r.err.Error()), maxPostureReasonBytes, "the worst case must be one the record cuts")
-
-	redirectStateFiles(t)
-	p := newPostures(&StartCmd{DNSRedirect: true}, "6.6.141", false, slog.New(slog.DiscardHandler))
-	require.NoError(t, r.settle(p))
-	line := p.lines()[0]
-	assert.Equal(t, "host-ipv4", line.Applied)
-	assert.Contains(t, line.Reason, "cannot assign requested address")
-	assert.Contains(t, line.Reason, "address family not supported by protocol")
+	routed4 := errors.New("it is routed through a-15-char-link by 169.254.0.0/17")
+	routed6 := errors.New("it is routed through a-15-char-link by fd97:d1fb:f215::/48")
+	for _, c := range []struct {
+		name    string
+		ipv6Gap string
+		errs    bindErrs
+		ipv6    bool
+	}{
+		{name: "inet refused", ipv6Gap: ipv6Gap(nil, refused, func() bool { return true }), errs: bindErrs{listen4: routed4}},
+		{
+			name: "both refused, [::1]:53 held", ipv6: true,
+			ipv6Gap: ipv6Gap(listenErr("udp6", "[::1]:53", unix.EADDRINUSE), nil, func() bool { return true }),
+			errs:    bindErrs{listen4: routed4, listen6: routed6},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := installed(c.ipv6Gap, containerGap(&dockerDNS{proxy: c.errs}, c.ipv6), slog.New(slog.DiscardHandler))
+			redirectStateFiles(t)
+			p := newPostures(&StartCmd{DNSRedirect: true}, "6.6.141", false, slog.New(slog.DiscardHandler))
+			require.NoError(t, r.settle(p))
+			line := p.lines()[0]
+			assert.Equal(t, "host-ipv4", line.Applied)
+			assert.Equal(t, r.err.Error(), line.Reason, "the reasons must fit whole")
+		})
+	}
 }

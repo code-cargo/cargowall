@@ -20,6 +20,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"testing"
@@ -34,70 +35,124 @@ import (
 	"github.com/code-cargo/cargowall/pkg/dns"
 	"github.com/code-cargo/cargowall/pkg/firewall"
 	"github.com/code-cargo/cargowall/pkg/network"
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // Root-only tests, run in a network namespace of their own (the sudo test
 // pass selects them by the Netns suffix).
 
-// startDNSRedirect's wiring against a real proxy and the kernel's nf_tables:
-// a bridge listener the proxy holds gets the bridge DNAT, over UDP and TCP
-// from docker0 and br-*, and one another process holds gets no bridge rule
-// at all, and is recorded as the redirect applied for the host alone. The
-// bridge address is a loopback one, which the namespace holds as a docker
-// bridge's would be held.
-func TestStartDNSRedirect_BridgeListenerNetns(t *testing.T) {
+// startDNSRedirect's wiring, from startDockerDNS on, against a real proxy
+// and the kernel's nf_tables. The container listeners go on cargowall's own
+// addresses on lo once the proxy holds its primary, and the bridges' DNS of
+// both families is DNAT'd to them, over UDP and TCP from docker0 and br-*.
+// An address refused, here the IPv4 one for being the proxy's upstream, is
+// not added and gets no rule for its family, and the redirect is recorded as
+// applied for the host alone. The teardown takes the addresses off again.
+func TestStartDNSRedirect_ContainerListenersNetns(t *testing.T) {
+	netns := newNetns(t)
+	logger := slog.New(slog.DiscardHandler)
+	for _, refused := range []bool{false, true} {
+		t.Run(map[bool]string{false: "added", true: "refused"}[refused], func(t *testing.T) {
+			// Each case's cleanups run on its own goroutine, which is in
+			// the namespace, before the next case: the proxy, the table and
+			// the addresses never outlive a failed one.
+			enterNetns(t, netns)
+			cmd := &StartCmd{DNSRedirect: true, DockerDNSInterception: true, DNSUpstream: "192.0.2.1:53"}
+			if refused {
+				cmd.DNSUpstream = "169.254.0.53:53"
+			}
+			srv := dns.NewServer(config.NewConfigManager(), new(firewall.MockFirewall), cmd.DNSUpstream, "127.0.0.1:53", logger)
+			addIPv6Listener(cmd, srv)
+			teardowns := &teardownList{}
+			d, removeAddrs := startDockerDNS(cmd, srv, podenv.Dockerd{}, teardowns, logger)
+			t.Cleanup(removeAddrs)
+			t.Cleanup(startProxyIn(t, netns, srv))
+
+			r, undo := startDNSRedirect(srv, d, teardowns, logger)
+			t.Cleanup(undo)
+			require.True(t, r.isActive())
+			assert.Equal(t, !refused, onLo(t, network.ContainerDNSIPv4))
+			assert.True(t, onLo(t, network.ContainerDNSIPv6))
+			assert.NotEmpty(t, redirectChainRules(t, "output"), "the host's DNS is redirected either way")
+			dnats := map[string]int{}
+			for _, rule := range redirectChainRules(t, "prerouting") {
+				for _, addr := range []netip.Addr{network.ContainerDNSIPv4, network.ContainerDNSIPv6} {
+					if dnatsTo(rule, net.IP(addr.AsSlice())) {
+						dnats[addr.String()]++
+					}
+				}
+			}
+			want := map[string]int{"169.254.0.53": 4, "fd97:d1fb:f215::53": 4} // docker0 and br-*, UDP and TCP
+			if refused {
+				delete(want, "169.254.0.53")
+				assert.Equal(t, dnsRedirectHost, r.applied)
+				assert.ErrorContains(t, r.err, "container DNS is not redirected: the proxy cannot listen on 169.254.0.53:53: "+
+					"it is the DNS upstream, so the proxy would forward container DNS to itself")
+			} else {
+				require.NoError(t, r.err)
+			}
+			assert.Equal(t, want, dnats, "a DNAT to each container listener the proxy holds, and none to one it does not")
+
+			undo()
+			removeAddrs()
+			assert.False(t, onLo(t, network.ContainerDNSIPv4), "the teardown takes the addresses off")
+			assert.False(t, onLo(t, network.ContainerDNSIPv6), "the teardown takes the addresses off")
+		})
+	}
+}
+
+// A second cargowall in the namespace cannot hold the primary, so its Start
+// fails before it adds the container addresses, and its teardown, which
+// removes only what it added, leaves the first's in place.
+func TestStartDockerDNS_SecondInstanceNetns(t *testing.T) {
+	netns := newNetns(t)
+	logger := slog.New(slog.DiscardHandler)
+	cmd := &StartCmd{DockerDNSInterception: true, DNSUpstream: "192.0.2.1:53"}
+	first := dns.NewServer(config.NewConfigManager(), new(firewall.MockFirewall), cmd.DNSUpstream, "127.0.0.1:53", logger)
+	_, removeFirst := startDockerDNS(cmd, first, podenv.Dockerd{}, &teardownList{}, logger)
+	t.Cleanup(removeFirst)
+	t.Cleanup(startProxyIn(t, netns, first))
+	require.True(t, onLo(t, network.ContainerDNSIPv4))
+
+	second := dns.NewServer(config.NewConfigManager(), new(firewall.MockFirewall), cmd.DNSUpstream, "127.0.0.1:53", logger)
+	_, removeSecond := startDockerDNS(cmd, second, podenv.Dockerd{}, &teardownList{}, logger)
+	require.ErrorContains(t, second.Start(t.Context()), "127.0.0.1:53", "the second proxy cannot hold the primary")
+	removeSecond()
+	assert.True(t, onLo(t, network.ContainerDNSIPv4), "the second's teardown must leave the first's addresses")
+	assert.True(t, onLo(t, network.ContainerDNSIPv6), "the second's teardown must leave the first's addresses")
+}
+
+// newNetns moves the test's goroutine into a network namespace of its own,
+// with loopback up, and returns it for others to enter. Locked for good:
+// the thread exits with the test, and the namespace with it, rather than
+// going back to the scheduler's pool.
+func newNetns(t *testing.T) *os.File {
+	t.Helper()
 	if os.Geteuid() != 0 {
 		t.Skip("needs root for a network namespace and nftables; covered by the sudo test pass")
 	}
-	// Locked for good: the thread exits with the test, and the namespace
-	// with it, rather than going back to the scheduler's pool.
 	runtime.LockOSThread()
 	require.NoError(t, unix.Unshare(unix.CLONE_NEWNET))
 	setLoopbackUp(t)
 	netns, err := os.Open("/proc/thread-self/ns/net")
 	require.NoError(t, err)
 	t.Cleanup(func() { netns.Close() })
+	return netns
+}
 
-	const bridgeIP = "127.0.0.2"
-	logger := slog.New(slog.DiscardHandler)
-	for _, held := range []bool{false, true} {
-		t.Run(map[bool]string{false: "bound", true: "held"}[held], func(t *testing.T) {
-			// Each case's cleanups run on its own goroutine, which is in
-			// the namespace, before the next case: the proxy, the table and
-			// the holder never outlive a failed one.
-			enterNetns(t, netns)
-			if held {
-				holder, err := net.ListenPacket("udp4", bridgeIP+":53")
-				require.NoError(t, err)
-				t.Cleanup(func() { holder.Close() })
-			}
-			srv := dns.NewServer(config.NewConfigManager(), new(firewall.MockFirewall), "192.0.2.1:53", "127.0.0.1:53", logger)
-			addIPv6Listener(&StartCmd{DNSRedirect: true}, srv)
-			d := &dockerDNS{bridgeIP: bridgeIP, proxy: srv, logger: logger}
-			srv.AddContainerListenAddr(d.listenAddr())
-			t.Cleanup(startProxyIn(t, netns, srv))
-
-			r, undo := startDNSRedirect(srv, d, &teardownList{}, logger)
-			t.Cleanup(undo)
-			require.True(t, r.isActive())
-			assert.NotEmpty(t, redirectChainRules(t, "output"), "the host's DNS is redirected either way")
-			prerouting := redirectChainRules(t, "prerouting")
-			if held {
-				assert.Empty(t, prerouting, "no bridge rule may name an address another process holds, nor drop in its place")
-				assert.Equal(t, dnsRedirectHost, r.applied)
-				assert.ErrorContains(t, r.err, "container DNS is not redirected: another process holds 127.0.0.2:53")
-				return
-			}
-			require.NoError(t, r.err)
-			var dnats int
-			for _, rule := range prerouting {
-				if dnatsTo(rule, net.ParseIP(bridgeIP).To4()) {
-					dnats++
-				}
-			}
-			assert.Equal(t, 4, dnats, "a DNAT to the bridge listener for docker0 and br-*, UDP and TCP")
-		})
+// onLo reports whether addr is on lo.
+func onLo(t *testing.T, addr netip.Addr) bool {
+	t.Helper()
+	lo, err := net.InterfaceByName("lo")
+	require.NoError(t, err)
+	addrs, err := lo.Addrs()
+	require.NoError(t, err)
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.Equal(net.IP(addr.AsSlice())) {
+			return true
+		}
 	}
+	return false
 }
 
 // enterNetns moves the calling goroutine into the network namespace netns,

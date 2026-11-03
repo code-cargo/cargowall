@@ -148,10 +148,10 @@ func iifname(op expr.CmpOp, name string) []expr.Any {
 
 // iifnamePrefix compares only the prefix's bytes: nft's "br-*", iptables'
 // "br-+".
-func iifnamePrefix(prefix string) []expr.Any {
+func iifnamePrefix(op expr.CmpOp, prefix string) []expr.Any {
 	return []expr.Any{
 		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(prefix)},
+		&expr.Cmp{Op: op, Register: 1, Data: []byte(prefix)},
 	}
 }
 

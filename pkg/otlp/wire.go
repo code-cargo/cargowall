@@ -16,6 +16,7 @@ package otlp
 
 import (
 	"errors"
+	"strings"
 
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -60,8 +61,9 @@ type partialSuccess struct {
 }
 
 // parseExportResponse decodes an ExportLogsServiceResponse with proto3
-// semantics: unknown fields and fields of an unexpected wire type are
-// skipped, a repeated message merges, and the last scalar wins.
+// semantics: unknown fields (groups included) and fields of an unexpected
+// wire type are skipped, a repeated message merges, and the last scalar
+// wins. A truncated field or an unmatched end-group is an error.
 func parseExportResponse(b []byte) (partialSuccess, error) {
 	var ps partialSuccess
 	err := walkFields(b, func(num protowire.Number, typ protowire.Type, v []byte) error {
@@ -85,7 +87,9 @@ func parseExportResponse(b []byte) (partialSuccess, error) {
 				if n < 0 {
 					return errMalformed
 				}
-				ps.errorMessage = string(s)
+				// proto.Unmarshal rejects a string that isn't UTF-8, which
+				// would lose the rejected count with it; keep the count.
+				ps.errorMessage = strings.ToValidUTF8(string(s), "\uFFFD")
 			}
 			return nil
 		})

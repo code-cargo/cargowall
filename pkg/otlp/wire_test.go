@@ -165,6 +165,23 @@ func TestParseExportResponse(t *testing.T) {
 			body: partial(varint(nil, partialRejectedRecord, uint64(1<<64-1))),
 			want: partialSuccess{rejectedLogRecords: -1},
 		},
+		{
+			name: "an unknown group is skipped",
+			body: append(tag(varint(tag(nil, 7, protowire.StartGroupType), 1, 9), 7, protowire.EndGroupType), golden...),
+			want: partialSuccess{1, "attribute limit exceeded"},
+		},
+		{
+			name: "invalid UTF-8 in error_message keeps the count",
+			body: partial(protowire.AppendString(
+				tag(varint(nil, partialRejectedRecord, 2), partialErrorMessage, protowire.BytesType), "bad\xffmsg")),
+			want: partialSuccess{2, "bad�msg"},
+		},
+		{name: "an unmatched end-group", body: tag(nil, 7, protowire.EndGroupType), wantErr: true},
+		{
+			name:    "an unmatched end-group inside partial_success",
+			body:    partial(tag(nil, 7, protowire.EndGroupType)),
+			wantErr: true,
+		},
 		{name: "truncated", body: golden[:len(golden)-1], wantErr: true},
 		{
 			name:    "truncated unknown field",
@@ -184,6 +201,26 @@ func TestParseExportResponse(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// FuzzParseExportResponse checks that no response body panics the decoder,
+// and that whatever it decodes re-encodes to the same values.
+func FuzzParseExportResponse(f *testing.F) {
+	golden, err := hex.DecodeString(goldenResponse)
+	require.NoError(f, err)
+	f.Add(golden)
+	f.Add([]byte{})
+	f.Add([]byte{0x80})
+	f.Add(exportResponse(-1, "bad\xffmsg"))
+	f.Fuzz(func(t *testing.T, body []byte) {
+		ps, err := parseExportResponse(body)
+		if err != nil {
+			return
+		}
+		again, err := parseExportResponse(exportResponse(ps.rejectedLogRecords, ps.errorMessage))
+		require.NoError(t, err)
+		assert.Equal(t, ps, again)
+	})
 }
 
 // A program that links both this package and the OpenTelemetry SDK must

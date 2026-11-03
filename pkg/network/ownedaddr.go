@@ -63,11 +63,15 @@ const ownedLabel = "lo:cargowall"
 // progress, and an Add after Remove refuses.
 type OwnedAddrs struct {
 	upstream netip.Addr // the DNS upstream: an owned address equal to it is refused
+	uplinks  []string   // what the guards drop on though it is a bridge (Uplinks)
 	logger   *slog.Logger
 	// ownerFlag is the flag the guard tables are asked for with:
 	// NFT_TABLE_F_OWNER, or zero when a test stands in for a kernel without
 	// owned tables.
 	ownerFlag uint32
+	// deleteAddr removes an address from lo: loopbackAddr's RTM_DELADDR, or
+	// a failure when a test stands in for one.
+	deleteAddr func(netip.Addr) error
 
 	mu    sync.Mutex
 	added []ownedAddr
@@ -81,9 +85,13 @@ type ownedAddr struct {
 }
 
 // NewOwnedAddrs returns the addresses to Add, for a proxy whose upstream is
-// upstream (the zero Addr for none). Register its Remove first.
-func NewOwnedAddrs(upstream netip.Addr, logger *slog.Logger) *OwnedAddrs {
-	return &OwnedAddrs{upstream: upstream, logger: logger, ownerFlag: nftTableFOwner}
+// upstream (the zero Addr for none), on a host whose uplinks are uplinks
+// (Uplinks). Register its Remove first.
+func NewOwnedAddrs(upstream netip.Addr, uplinks []string, logger *slog.Logger) *OwnedAddrs {
+	return &OwnedAddrs{
+		upstream: upstream, uplinks: uplinks, logger: logger, ownerFlag: nftTableFOwner,
+		deleteAddr: func(addr netip.Addr) error { return loopbackAddr(unix.RTM_DELADDR, 0, addr, "") },
+	}
 }
 
 // Add adds addr to lo, as a host route, unless something already holds it
@@ -91,8 +99,10 @@ func NewOwnedAddrs(upstream netip.Addr, logger *slog.Logger) *OwnedAddrs {
 // host may already answer for it, or the proxy's listener would take that
 // over, or container DNS would be handed to that instead. Its guard goes in
 // first, so the address is never there unguarded, and an address whose
-// guard cannot be installed is refused too. An address already added is
-// not added again.
+// guard cannot be installed is refused too: Docker DNS interception needs
+// nf_tables for it, with or without the DNS redirect. A leftover is added
+// afresh, as this run would add it. An address already added is not added
+// again.
 func (o *OwnedAddrs) Add(addr netip.Addr) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -106,9 +116,14 @@ func (o *OwnedAddrs) Add(addr netip.Addr) error {
 	if err != nil {
 		return err
 	}
-	guard, err := installGuard(addr, o.ownerFlag, o.logger)
+	guard, err := installGuard(addr, o.uplinks, o.ownerFlag, o.logger)
 	if err != nil {
-		return fmt.Errorf("its guard cannot be installed: %w", err)
+		return fmt.Errorf("its guard cannot be installed (Docker DNS interception needs nf_tables for it): %w", err)
+	}
+	if leftover {
+		if err := o.deleteAddr(addr); err != nil && !errors.Is(err, unix.EADDRNOTAVAIL) {
+			return errors.Join(err, guard.remove())
+		}
 	}
 	if err := loopbackAddr(unix.RTM_NEWADDR, netlink.Create|netlink.Replace, addr, ownedLabel); err != nil {
 		return errors.Join(err, guard.remove())
@@ -121,8 +136,10 @@ func (o *OwnedAddrs) Add(addr netip.Addr) error {
 }
 
 // Remove removes the addresses Add added, each before its guard, so none is
-// there unguarded. An address already gone is no error. Safe to call more
-// than once, and nil-safe.
+// there unguarded: an address that cannot be removed keeps its guard, which
+// below 5.12, where the guard is unowned, outlives the process with it. An
+// address already gone is no error. Safe to call more than once, and
+// nil-safe.
 func (o *OwnedAddrs) Remove() error {
 	if o == nil {
 		return nil
@@ -132,9 +149,10 @@ func (o *OwnedAddrs) Remove() error {
 	o.done = true
 	var errs []error
 	for _, a := range o.added {
-		err := loopbackAddr(unix.RTM_DELADDR, 0, a.addr, "")
+		err := o.deleteAddr(a.addr)
 		if err != nil && !errors.Is(err, unix.EADDRNOTAVAIL) && !errors.Is(err, unix.ENOENT) {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("%w; its guard stays", err))
+			continue
 		}
 		errs = append(errs, a.guard.remove())
 	}
@@ -232,8 +250,12 @@ func ifaddrAttrs(b []byte) (addr netip.Addr, label string) {
 // The route is the one the kernel matches for addr (RTM_F_FIB_MATCH, which
 // reports its own prefix rather than the host route a plain lookup clones),
 // so policy routing is taken into account. Only a unicast route through a
-// link counts: a local, blackhole or unreachable one leaves the address to
-// no one, and no route at all is no holder.
+// link counts: a local, blackhole, prohibit, unreachable or throw one
+// leaves the address to no one, and the local route its addition makes
+// wins over it; no route at all is no holder either. The kernel answers the
+// lookup of all but the local one with the error the route stands for:
+// EINVAL for blackhole, EACCES for prohibit, EHOSTUNREACH for unreachable,
+// ENETUNREACH for throw and for none.
 func specificRoute(addr netip.Addr) error {
 	family, generic := byte(unix.AF_INET), 16
 	if addr.Is6() {
@@ -254,7 +276,8 @@ func specificRoute(addr netip.Addr) error {
 		Header: netlink.Header{Type: unix.RTM_GETROUTE, Flags: netlink.Request},
 		Data:   append(rtm, attrs...),
 	})
-	if errors.Is(err, unix.ENETUNREACH) || errors.Is(err, unix.EHOSTUNREACH) {
+	if errors.Is(err, unix.ENETUNREACH) || errors.Is(err, unix.EHOSTUNREACH) ||
+		errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EACCES) {
 		return nil
 	}
 	if err != nil {
@@ -292,9 +315,16 @@ func routeAttrs(b []byte) (dst netip.Addr, oif int) {
 }
 
 // loopbackAddr adds (RTM_NEWADDR) or removes (RTM_DELADDR) addr on lo, as a
-// host route, with label for an IPv4 address where one is given. An IPv6
-// address skips duplicate address detection, which could hold it tentative,
-// unbindable, for a second or more.
+// host route, with label for an IPv4 address where one is given. Neither may
+// become a source address the kernel picks for traffic of its own: for a
+// route out of an interface with no address of its family (a Calico
+// workload's cali*), it falls back to lo's, and that traffic would leave
+// from an address whose guard drops the reply. So the IPv4 address is of
+// host scope, which no such route takes, and the IPv6 one is deprecated
+// (preferred lifetime 0, valid for ever), which source selection passes
+// over for any other. Neither stops a socket bound to it from answering
+// from it. An IPv6 address skips duplicate address detection, which could
+// hold it tentative, unbindable, for a second or more.
 func loopbackAddr(typ netlink.HeaderType, flags netlink.HeaderFlags, addr netip.Addr, label string) error {
 	lo, err := net.InterfaceByName("lo")
 	if err != nil {
@@ -306,13 +336,23 @@ func loopbackAddr(typ netlink.HeaderType, flags netlink.HeaderFlags, addr netip.
 	if addr.Is6() {
 		ifa[0], ifa[1], ifa[2] = unix.AF_INET6, 128, unix.IFA_F_NODAD
 	}
-	ifa[3] = unix.RT_SCOPE_UNIVERSE
+	ifa[3] = unix.RT_SCOPE_HOST
+	if addr.Is6() {
+		ifa[3] = unix.RT_SCOPE_UNIVERSE // IPv6 takes its scope from the address
+	}
 	binary.NativeEndian.PutUint32(ifa[4:], uint32(lo.Index))
 	ae := netlink.NewAttributeEncoder()
 	ae.Bytes(unix.IFA_LOCAL, addr.AsSlice())
 	ae.Bytes(unix.IFA_ADDRESS, addr.AsSlice())
 	if label != "" && addr.Is4() {
 		ae.String(unix.IFA_LABEL, label)
+	}
+	if typ == unix.RTM_NEWADDR && addr.Is6() {
+		// struct ifa_cacheinfo: preferred and valid lifetimes, then the
+		// timestamps the kernel keeps.
+		info := make([]byte, unix.SizeofIfaCacheinfo)
+		binary.NativeEndian.PutUint32(info[4:], ^uint32(0)) // INFINITY_LIFE_TIME
+		ae.Bytes(unix.IFA_CACHEINFO, info)
 	}
 	attrs, err := ae.Encode()
 	if err != nil {

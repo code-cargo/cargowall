@@ -157,28 +157,38 @@ func TestDockerDNS_UseListenerBound(t *testing.T) {
 // requested. A local daemon's daemon.json is still rid of a rewrite a
 // previous run left, which points containers at an address the proxy does
 // not listen on, and then the restart that applies the original is due; the
-// warning says which.
+// warning says which. With the IPv6 listener held, it says interception is
+// off for IPv4 alone, and with the redirect, that IPv6 container DNS still
+// reaches the proxy.
 func TestDockerDNS_UseListenerUnbound(t *testing.T) {
-	refused := bindErrs{listen4: errRefused4}
 	for _, kind := range []podenv.DockerdKind{podenv.DockerdLocal, podenv.DockerdForeign} {
 		for _, redirect := range []bool{true, false} {
 			for _, leftover := range []bool{false, true} {
-				t.Run(fmt.Sprintf("%s/redirect=%v/leftover=%v", kind, redirect, leftover), func(t *testing.T) {
-					run := runUseListener(kind, refused, redirect, leftover)
-					local := kind == podenv.DockerdLocal
-					assert.Empty(t, run.configured, "nothing may point containers at an address the proxy does not hold")
-					assert.Empty(t, run.teardowns.fns)
-					assert.Equal(t, local, run.recoveries == 1, "a local daemon's leftover is looked for, and only a local one's")
-					assert.Equal(t, local && leftover, run.d.restart, "a restart is due only to apply an undone leftover")
-					require.Equal(t, 1, strings.Count(run.log, "level=WARN"), run.log)
-					assert.Contains(t, run.log, "around the proxy")
-					assert.Contains(t, run.log, "addr=169.254.0.53:53")
-					assert.Contains(t, run.log, "already assigned to eth0")
-					assert.Equal(t, local && !leftover, strings.Contains(run.log, "daemon.json is left alone"))
-					assert.Equal(t, local && leftover, strings.Contains(run.log, "the rewrite a previous run left there is undone"))
-					assert.Equal(t, redirect, strings.Contains(run.log, "a lost dns-redirect posture"))
-					assert.NotContains(t, run.log, "interception enabled")
-				})
+				for _, ipv6 := range []bool{true, false} {
+					name := fmt.Sprintf("%s/redirect=%v/leftover=%v/ipv6=%v", kind, redirect, leftover, ipv6)
+					t.Run(name, func(t *testing.T) {
+						refused := bindErrs{listen4: errRefused4}
+						if !ipv6 {
+							refused[listen6] = errors.New("it is routed through tun0 by fd97:d1fb:f215::/48")
+						}
+						run := runUseListener(kind, refused, redirect, leftover)
+						local := kind == podenv.DockerdLocal
+						assert.Empty(t, run.configured, "nothing may point containers at an address the proxy does not hold")
+						assert.Empty(t, run.teardowns.fns)
+						assert.Equal(t, local, run.recoveries == 1, "a local daemon's leftover is looked for, and only a local one's")
+						assert.Equal(t, local && leftover, run.d.restart, "a restart is due only to apply an undone leftover")
+						require.Equal(t, 1, strings.Count(run.log, "level=WARN"), run.log)
+						assert.Contains(t, run.log, "around the proxy")
+						assert.Contains(t, run.log, "addr=169.254.0.53:53")
+						assert.Contains(t, run.log, "already assigned to eth0")
+						assert.Equal(t, local && !leftover, strings.Contains(run.log, "daemon.json is left alone"))
+						assert.Equal(t, local && leftover, strings.Contains(run.log, "the rewrite a previous run left there is undone"))
+						assert.Equal(t, redirect, strings.Contains(run.log, "a lost dns-redirect posture"))
+						assert.NotContains(t, run.log, "interception enabled")
+						assert.Equal(t, ipv6, strings.Contains(run.log, "unavailable for IPv4"))
+						assert.Equal(t, ipv6 && redirect, strings.Contains(run.log, "IPv6 DNS to the IPv6 listener"))
+					})
+				}
 			}
 		}
 	}

@@ -152,8 +152,16 @@ func startDNSRedirect(dnsServer *dns.Server, containerDNS *dockerDNS, teardowns 
 	if err := redirect.Install(spec); err != nil {
 		return notInstalled(err, logger), undo
 	}
-	ipv6 := spec.IPv6 && redirect.IPv6Refused() == nil
-	return installed(ipv6Gap(bindErr, redirect.IPv6Refused(), network.HostIPv6), containerGap(containerDNS, ipv6), logger), undo
+	ipv6, container := redirectGaps(bindErr, redirect.IPv6Refused(), network.HostIPv6, containerDNS)
+	return installed(ipv6, container, logger), undo
+}
+
+// redirectGaps is what an installed redirect leaves uncovered: ipv6Gap's
+// and containerGap's reasons. IPv6 is covered, and the IPv6 container
+// listener counts, only where the proxy holds its IPv6 listener (bindErr
+// nil) and the kernel took the inet table (refused nil).
+func redirectGaps(bindErr, refused error, hostIPv6 func() bool, containerDNS *dockerDNS) (ipv6, container string) {
+	return ipv6Gap(bindErr, refused, hostIPv6), containerGap(containerDNS, bindErr == nil && refused == nil)
 }
 
 // installed records a redirect in place, whole unless it has a gap: ipv6

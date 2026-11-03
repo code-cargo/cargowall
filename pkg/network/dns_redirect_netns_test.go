@@ -85,11 +85,18 @@ func setLinkUp(t *testing.T, name string) {
 // so the runtime's poller serves it and a read can time out.
 func addTun(t *testing.T, name string, addr net.IP) *os.File {
 	t.Helper()
+	return addTunTap(t, name, addr, unix.IFF_TUN)
+}
+
+// addTunTap is addTun for a device of kind, IFF_TUN for IP packets or
+// IFF_TAP for Ethernet frames, and with no address where addr is nil.
+func addTunTap(t *testing.T, name string, addr net.IP, kind uint16) *os.File {
+	t.Helper()
 	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	require.NoError(t, err)
 	ifr, err := unix.NewIfreq(name)
 	if err == nil {
-		ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
+		ifr.SetUint16(kind | unix.IFF_NO_PI)
 		err = unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr)
 	}
 	if err != nil {
@@ -106,6 +113,9 @@ func addTun(t *testing.T, name string, addr net.IP) *os.File {
 		req uint
 		ip  net.IP
 	}{{unix.SIOCSIFADDR, addr}, {unix.SIOCSIFNETMASK, net.IPv4(255, 255, 255, 0)}} {
+		if addr == nil {
+			break
+		}
 		ifr, err := unix.NewIfreq(name)
 		require.NoError(t, err)
 		require.NoError(t, ifr.SetInet4Addr(set.ip.To4()))
@@ -552,7 +562,7 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 	for name, addr := range map[string]string{"docker0": "fd54::1", "br-test": "fd55::1", "cw0": "fd56::1"} {
 		addAddr6(t, name, net.ParseIP(addr))
 	}
-	owned := NewOwnedAddrs(netip.Addr{}, discardLogger())
+	owned := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())
 	t.Cleanup(func() { _ = owned.Remove() })
 	require.NoError(t, owned.Add(ContainerDNSIPv4))
 	require.NoError(t, owned.Add(ContainerDNSIPv6))
@@ -958,6 +968,7 @@ func tableRules(t *testing.T, table string) map[string]int {
 	out := map[string]int{}
 	for family, name := range map[nftables.TableFamily]string{
 		nftables.TableFamilyIPv4: "ip", nftables.TableFamilyIPv6: "ip6", nftables.TableFamilyINet: "inet",
+		nftables.TableFamilyARP: "arp",
 	} {
 		chains, err := conn.ListChainsOfTableFamily(family)
 		require.NoError(t, err)

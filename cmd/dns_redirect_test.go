@@ -183,12 +183,34 @@ func TestDNSRedirect_PartialIsALoss(t *testing.T) {
 	assert.NoError(t, whole.settle(nil), "a whole redirect has nothing to report")
 }
 
+// IPv6 is covered, and the IPv6 container listener's gap counts with it,
+// only where the proxy holds [::1]:53 and the kernel took the inet table:
+// otherwise the IPv6 gap speaks for the host and its containers alike.
+func TestRedirectGaps(t *testing.T) {
+	d := &dockerDNS{proxy: bindErrs{listen6: errors.New("it is routed through tun0 by fd97:d1fb:f215::/48")}}
+	held := listenErr("udp6", "[::1]:53", unix.EADDRINUSE)
+	refused := errors.New("nftables: installing table inet cargowall: netlink receive: address family not supported")
+	for _, c := range []struct {
+		name                  string
+		bindErr, refused      error
+		ipv6Gap, containerGap bool
+	}{
+		{name: "IPv6 covered", containerGap: true},
+		{name: "[::1]:53 held", bindErr: held, ipv6Gap: true},
+		{name: "inet refused", refused: refused, ipv6Gap: true},
+	} {
+		ipv6, container := redirectGaps(c.bindErr, c.refused, func() bool { return true }, d)
+		assert.Equal(t, c.ipv6Gap, ipv6 != "", "%s: the IPv6 gap", c.name)
+		assert.Equal(t, c.containerGap, container != "", "%s: the IPv6 container listener's gap", c.name)
+	}
+}
+
 // The record keeps a lost dns-redirect's reasons whole at their longest,
 // within maxPostureReasonBytes. One case is the kernel refusing the inet
 // table, with its hint, beside the IPv4 container listener's address
 // refused for a route through an interface whose name is as long as one
-// gets. The other is both container listeners refused that way, beside
-// another process holding [::1]:53.
+// gets. The other is both container listeners refused that way, with IPv6
+// covered: were it not, the IPv6 listener would not count.
 func TestDNSRedirect_GapsKeptWhole(t *testing.T) {
 	refused := errors.New("nftables: installing table inet cargowall: netlink receive: address family not supported " +
 		"by protocol (the kernel may lack inet tables or IPv6 nat: CONFIG_NF_TABLES_INET, or nf_nat for IPv6)")
@@ -196,24 +218,21 @@ func TestDNSRedirect_GapsKeptWhole(t *testing.T) {
 	routed6 := errors.New("it is routed through a-15-char-link by fd97:d1fb:f215::/48")
 	for _, c := range []struct {
 		name    string
-		ipv6Gap string
+		refused error
 		errs    bindErrs
-		ipv6    bool
+		applied string
 	}{
-		{name: "inet refused", ipv6Gap: ipv6Gap(nil, refused, func() bool { return true }), errs: bindErrs{listen4: routed4}},
-		{
-			name: "both refused, [::1]:53 held", ipv6: true,
-			ipv6Gap: ipv6Gap(listenErr("udp6", "[::1]:53", unix.EADDRINUSE), nil, func() bool { return true }),
-			errs:    bindErrs{listen4: routed4, listen6: routed6},
-		},
+		{name: "inet refused", refused: refused, errs: bindErrs{listen4: routed4}, applied: "host-ipv4"},
+		{name: "both refused", errs: bindErrs{listen4: routed4, listen6: routed6}, applied: "host"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			r := installed(c.ipv6Gap, containerGap(&dockerDNS{proxy: c.errs}, c.ipv6), slog.New(slog.DiscardHandler))
+			ipv6, container := redirectGaps(nil, c.refused, func() bool { return true }, &dockerDNS{proxy: c.errs})
+			r := installed(ipv6, container, slog.New(slog.DiscardHandler))
 			redirectStateFiles(t)
 			p := newPostures(&StartCmd{DNSRedirect: true}, "6.6.141", false, slog.New(slog.DiscardHandler))
 			require.NoError(t, r.settle(p))
 			line := p.lines()[0]
-			assert.Equal(t, "host-ipv4", line.Applied)
+			assert.Equal(t, c.applied, line.Applied)
 			assert.Equal(t, r.err.Error(), line.Reason, "the reasons must fit whole")
 		})
 	}

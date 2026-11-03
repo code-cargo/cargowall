@@ -50,14 +50,26 @@ const nftTimeout = 2 * time.Second
 
 // tableFamily is a table's nf_tables family. The redirect's is inet when it
 // covers IPv6 as well as IPv4, ip when it covers IPv4 alone (see
-// RedirectSpec); a guard's is its address's, ip or ip6.
+// RedirectSpec); a guard's is its address's, ip or ip6, or arp for the
+// IPv4 address's neighbour answers.
 type tableFamily byte
 
 const (
 	familyIP   tableFamily = unix.NFPROTO_IPV4
 	familyIP6  tableFamily = unix.NFPROTO_IPV6
 	familyInet tableFamily = unix.NFPROTO_INET
+	familyARP  tableFamily = unix.NFPROTO_ARP
 )
+
+// nfARPIn is NF_ARP_IN (include/uapi/linux/netfilter_arp.h), the arp
+// family's input hook, which x/sys/unix does not carry.
+const nfARPIn = 0
+
+// metaKeyIIFKIND is NFT_META_IIFKIND (include/uapi/linux/netfilter/
+// nf_tables.h, kernel 5.1): the rtnetlink kind of the interface a packet
+// arrived on, such as "bridge" or "veth". Neither x/sys/unix nor
+// google/nftables carries it.
+const metaKeyIIFKIND expr.MetaKey = 26
 
 // String is the family as nft spells it, for messages that name the table.
 func (f tableFamily) String() string {
@@ -66,6 +78,8 @@ func (f tableFamily) String() string {
 		return "inet"
 	case familyIP6:
 		return "ip6"
+	case familyARP:
+		return "arp"
 	}
 	return "ip"
 }
@@ -148,6 +162,18 @@ func iifname(op expr.CmpOp, name string) []expr.Any {
 	copy(padded, name)
 	return []expr.Any{
 		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Cmp{Op: op, Register: 1, Data: padded},
+	}
+}
+
+// iifkind compares the kind of the interface a packet arrived on, NUL
+// padded as the kernel loads it. An interface without a kind, such as a
+// physical NIC, matches no kind: the expression breaks off the rule.
+func iifkind(op expr.CmpOp, kind string) []expr.Any {
+	padded := make([]byte, unix.IFNAMSIZ)
+	copy(padded, kind)
+	return []expr.Any{
+		&expr.Meta{Key: metaKeyIIFKIND, Register: 1},
 		&expr.Cmp{Op: op, Register: 1, Data: padded},
 	}
 }

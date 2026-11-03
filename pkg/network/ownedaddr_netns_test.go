@@ -33,20 +33,21 @@ import (
 )
 
 // bothGuarded is the guard tables' rules with both addresses added.
-var bothGuarded = map[string]int{"ip input": 1, "ip forward": 1, "ip6 input": 1, "ip6 forward": 1}
+var bothGuarded = map[string]int{"ip input": 4, "ip forward": 1, "arp input": 4, "ip6 input": 4, "ip6 forward": 1}
 
 // The container DNS addresses go on lo, the IPv4 one labelled as cargowall's,
 // each with its guard, and come off again, guards and all; one added twice
 // is added once, and once removed, none is added.
 func TestOwnedAddrs_AddRemove(t *testing.T) {
 	enterNetns(t)
-	owned := NewOwnedAddrs(netip.Addr{}, discardLogger())
+	owned := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())
 	for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
 		require.NoError(t, owned.Add(addr))
 	}
 	require.NoError(t, owned.Add(ContainerDNSIPv4), "an address already added is not added again")
 	assert.Equal(t, map[netip.Addr]string{ContainerDNSIPv4: ownedLabel, ContainerDNSIPv6: ""}, ownedOnLo(t))
 	assert.Equal(t, bothGuarded, guardRules(t))
+	requireNoSource(t)
 
 	require.NoError(t, owned.Remove())
 	assert.Empty(t, ownedOnLo(t))
@@ -64,18 +65,20 @@ func TestOwnedAddrs_AddRemove(t *testing.T) {
 func TestOwnedAddrs_TakesOverALeftover(t *testing.T) {
 	enterNetns(t)
 	for _, unowned := range []bool{false, true} {
-		killed := NewOwnedAddrs(netip.Addr{}, discardLogger())
+		killed := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())
 		if unowned {
 			killed.ownerFlag = 0 // a kernel that cannot own tables
 		}
-		next := NewOwnedAddrs(netip.Addr{}, discardLogger())
+		next := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())
 		for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
 			require.NoError(t, killed.Add(addr))
 		}
-		owned := killed.added[0].guard.owned
+		owned := killed.added[0].guard.tables[0].owned
 		require.Equal(t, !unowned && ownsTables(t), owned, "a guard is owned wherever the kernel can own one")
 		for _, a := range killed.added {
-			require.NoError(t, a.guard.conn.Close(), "the process dies")
+			for _, table := range a.guard.tables {
+				require.NoError(t, table.conn.Close(), "the process dies")
+			}
 		}
 		if owned {
 			assert.Empty(t, guardRules(t), "an owned guard dies with its socket")
@@ -90,6 +93,49 @@ func TestOwnedAddrs_TakesOverALeftover(t *testing.T) {
 		assert.Empty(t, ownedOnLo(t))
 		assert.Empty(t, guardRules(t))
 	}
+
+	// A leftover from a run that added the addresses otherwise, here as
+	// sources the kernel could pick, is added afresh as this run adds it.
+	setAddr(t, netip.PrefixFrom(ContainerDNSIPv4, 32), netip.Addr{}, "lo", ownedLabel)
+	setAddr(t, netip.PrefixFrom(ContainerDNSIPv6, 128), netip.Addr{}, "lo", "")
+	next := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())
+	for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
+		require.NoError(t, next.Add(addr))
+	}
+	requireNoSource(t)
+	require.NoError(t, next.Remove())
+	assert.Empty(t, ownedOnLo(t))
+}
+
+// requireNoSource fails unless the addresses are on lo as no source the
+// kernel picks: the IPv4 one of host scope, the IPv6 one deprecated.
+func requireNoSource(t *testing.T) {
+	t.Helper()
+	lo, err := net.InterfaceByName("lo")
+	require.NoError(t, err)
+	found := 0
+	for _, family := range []byte{unix.AF_INET, unix.AF_INET6} {
+		replies, err := rtnetlink(netlink.Message{
+			Header: netlink.Header{Type: unix.RTM_GETADDR, Flags: netlink.Request | netlink.Dump},
+			Data:   []byte{family, 0, 0, 0, 0, 0, 0, 0},
+		})
+		require.NoError(t, err)
+		for _, m := range replies {
+			if int(binary.NativeEndian.Uint32(m.Data[4:8])) != lo.Index {
+				continue
+			}
+			// struct ifaddrmsg: family, prefixlen, flags, scope, index.
+			switch addr, _ := ifaddrAttrs(m.Data[unix.SizeofIfAddrmsg:]); addr {
+			case ContainerDNSIPv4:
+				found++
+				assert.Equal(t, byte(unix.RT_SCOPE_HOST), m.Data[3], "%s's scope", addr)
+			case ContainerDNSIPv6:
+				found++
+				assert.NotZero(t, m.Data[2]&unix.IFA_F_DEPRECATED, "%s must be deprecated", addr)
+			}
+		}
+	}
+	require.Equal(t, 2, found, "both addresses on lo")
 }
 
 // An address whose guard cannot be installed is refused, and not added:
@@ -98,10 +144,10 @@ func TestOwnedAddrs_TakesOverALeftover(t *testing.T) {
 func TestOwnedAddrs_RefusedWithoutItsGuard(t *testing.T) {
 	enterNetns(t)
 	requireOwnedTables(t)
-	other, err := installGuard(ContainerDNSIPv4, nftTableFOwner, discardLogger())
+	other, err := installGuard(ContainerDNSIPv4, nil, nftTableFOwner, discardLogger())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = other.remove() })
-	owned := NewOwnedAddrs(netip.Addr{}, discardLogger())
+	owned := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())
 	t.Cleanup(func() { _ = owned.Remove() })
 
 	err = owned.Add(ContainerDNSIPv4)
@@ -166,7 +212,7 @@ func TestOwnedAddrs_GuardWithoutRedirect(t *testing.T) {
 		require.NoError(t, loopbackAddr(unix.RTM_DELADDR, 0, addr, ""))
 	}
 
-	owned := NewOwnedAddrs(netip.Addr{}, discardLogger())
+	owned := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())
 	t.Cleanup(func() { _ = owned.Remove() })
 	for _, addr := range []netip.Addr{ContainerDNSIPv4, ContainerDNSIPv6} {
 		require.NoError(t, owned.Add(addr))
@@ -184,11 +230,13 @@ func TestOwnedAddrs_GuardWithoutRedirect(t *testing.T) {
 }
 
 // An address something else holds is refused, with the reason, and not
-// added: the proxy's upstream, an address on another interface or on lo
-// without cargowall's label, and one a route more specific than its range's
-// generic one sends through a link. The generic routes themselves, a
-// link-local /16 on the uplink, as NetworkManager and cloud images add,
-// and a ULA /8, hold nothing.
+// added: the proxy's upstream, an address on another interface, as a
+// point-to-point link's local end too, or on lo without cargowall's label,
+// and one a route more specific than its range's generic one sends through
+// a link. The generic routes themselves, a link-local /16 on the uplink, as
+// NetworkManager and cloud images add, and a ULA /8, hold nothing, and nor
+// does a route that delivers to no one: blackhole, prohibit, unreachable or
+// throw, whose lookups the kernel answers with errors.
 func TestOwnedAddrs_RefusesAHolder(t *testing.T) {
 	enterNetns(t)
 	addTun(t, "cw1", net.IPv4(10, 57, 0, 1))
@@ -205,17 +253,24 @@ func TestOwnedAddrs_RefusesAHolder(t *testing.T) {
 		},
 		{
 			name: "assigned to another interface", addr: ContainerDNSIPv4,
-			set:     func() func() { return setAddr(t, netip.PrefixFrom(ContainerDNSIPv4, 32), "cw1", "") },
+			set:     func() func() { return setAddr(t, netip.PrefixFrom(ContainerDNSIPv4, 32), netip.Addr{}, "cw1", "") },
+			refusal: "it is already assigned to cw1",
+		},
+		{
+			name: "assigned as a point-to-point link's local end", addr: ContainerDNSIPv4,
+			set: func() func() {
+				return setAddr(t, netip.PrefixFrom(ContainerDNSIPv4, 32), netip.MustParseAddr("10.57.0.99"), "cw1", "")
+			},
 			refusal: "it is already assigned to cw1",
 		},
 		{
 			name: "assigned to lo by something else", addr: ContainerDNSIPv4,
-			set:     func() func() { return setAddr(t, netip.PrefixFrom(ContainerDNSIPv4, 32), "lo", "lo") },
+			set:     func() func() { return setAddr(t, netip.PrefixFrom(ContainerDNSIPv4, 32), netip.Addr{}, "lo", "lo") },
 			refusal: "it is already assigned to lo by something other than cargowall",
 		},
 		{
 			name: "IPv6, assigned to another interface", addr: ContainerDNSIPv6,
-			set:     func() func() { return setAddr(t, netip.PrefixFrom(ContainerDNSIPv6, 64), "cw1", "") },
+			set:     func() func() { return setAddr(t, netip.PrefixFrom(ContainerDNSIPv6, 64), netip.Addr{}, "cw1", "") },
 			refusal: "it is already assigned to cw1",
 		},
 		{
@@ -242,6 +297,44 @@ func TestOwnedAddrs_RefusesAHolder(t *testing.T) {
 			set: func() func() { return addRoute(t, netip.MustParsePrefix("fd00::/8"), "cw1") },
 		},
 		{
+			name: "a blackhole /24", addr: ContainerDNSIPv4,
+			set: func() func() {
+				return addTypedRoute(t, netip.MustParsePrefix("169.254.0.0/24"), "", unix.RTN_BLACKHOLE)
+			},
+		},
+		{
+			name: "a prohibit /24", addr: ContainerDNSIPv4,
+			set: func() func() { return addTypedRoute(t, netip.MustParsePrefix("169.254.0.0/24"), "", unix.RTN_PROHIBIT) },
+		},
+		{
+			name: "an unreachable /24", addr: ContainerDNSIPv4,
+			set: func() func() {
+				return addTypedRoute(t, netip.MustParsePrefix("169.254.0.0/24"), "", unix.RTN_UNREACHABLE)
+			},
+		},
+		{
+			name: "a throw /24", addr: ContainerDNSIPv4,
+			set: func() func() { return addTypedRoute(t, netip.MustParsePrefix("169.254.0.0/24"), "", unix.RTN_THROW) },
+		},
+		{
+			name: "IPv6, a blackhole /48", addr: ContainerDNSIPv6,
+			set: func() func() {
+				return addTypedRoute(t, netip.MustParsePrefix("fd97:d1fb:f215::/48"), "", unix.RTN_BLACKHOLE)
+			},
+		},
+		{
+			name: "IPv6, a prohibit /48", addr: ContainerDNSIPv6,
+			set: func() func() {
+				return addTypedRoute(t, netip.MustParsePrefix("fd97:d1fb:f215::/48"), "", unix.RTN_PROHIBIT)
+			},
+		},
+		{
+			name: "IPv6, an unreachable /48", addr: ContainerDNSIPv6,
+			set: func() func() {
+				return addTypedRoute(t, netip.MustParsePrefix("fd97:d1fb:f215::/48"), "", unix.RTN_UNREACHABLE)
+			},
+		},
+		{
 			name: "IPv6, a /47 holding more than the ULA's /48", addr: ContainerDNSIPv6,
 			set: func() func() { return addRoute(t, netip.MustParsePrefix("fd97:d1fb:f214::/47"), "cw1") },
 		},
@@ -251,7 +344,7 @@ func TestOwnedAddrs_RefusesAHolder(t *testing.T) {
 			undo = c.set()
 		}
 		before := ownedOnLo(t)
-		owned := NewOwnedAddrs(c.upstream, discardLogger())
+		owned := NewOwnedAddrs(c.upstream, nil, discardLogger())
 		err := owned.Add(c.addr)
 		if c.refusal == "" {
 			require.NoError(t, err, c.name)
@@ -270,7 +363,7 @@ func TestOwnedAddrs_RefusesAHolder(t *testing.T) {
 // host IPv6: an IPv6 address on a link does.
 func TestHostIPv6_NotFromLo(t *testing.T) {
 	enterNetns(t)
-	owned := NewOwnedAddrs(netip.Addr{}, discardLogger())
+	owned := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())
 	t.Cleanup(func() { _ = owned.Remove() })
 	require.NoError(t, owned.Add(ContainerDNSIPv6))
 	assert.False(t, HostIPv6(), "::1 and the container DNS address are lo's")
@@ -301,7 +394,7 @@ func TestOwnedAddrs_ForwardDrop(t *testing.T) {
 	send(v4, 5000)
 	require.True(t, forwardedOut(t, uplink, v4, arrives), "without the guard, the packet is forwarded out of cw0")
 
-	owned := NewOwnedAddrs(netip.Addr{}, discardLogger())
+	owned := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())
 	t.Cleanup(func() { _ = owned.Remove() })
 	require.NoError(t, owned.Add(ContainerDNSIPv4))
 	require.NoError(t, loopbackAddr(unix.RTM_DELADDR, 0, ContainerDNSIPv4, ""), "the address gone from under cargowall")
@@ -371,12 +464,16 @@ func ownedOnLo(t *testing.T) map[netip.Addr]string {
 	return out
 }
 
-// setAddr assigns prefix's address to the interface named dev, with label
-// for an IPv4 one where given, and returns its removal.
-func setAddr(t *testing.T, prefix netip.Prefix, dev, label string) func() {
+// setAddr assigns prefix's address to the interface named dev, with peer as
+// its point-to-point peer where given, and label for an IPv4 one where
+// given, and returns its removal.
+func setAddr(t *testing.T, prefix netip.Prefix, peer netip.Addr, dev, label string) func() {
 	t.Helper()
 	ifi, err := net.InterfaceByName(dev)
 	require.NoError(t, err)
+	if !peer.IsValid() {
+		peer = prefix.Addr()
+	}
 	msg := func(typ netlink.HeaderType, flags netlink.HeaderFlags) netlink.Message {
 		ifa := make([]byte, unix.SizeofIfAddrmsg)
 		ifa[0], ifa[1] = unix.AF_INET, byte(prefix.Bits())
@@ -386,7 +483,7 @@ func setAddr(t *testing.T, prefix netip.Prefix, dev, label string) func() {
 		binary.NativeEndian.PutUint32(ifa[4:], uint32(ifi.Index))
 		ae := netlink.NewAttributeEncoder()
 		ae.Bytes(unix.IFA_LOCAL, prefix.Addr().AsSlice())
-		ae.Bytes(unix.IFA_ADDRESS, prefix.Addr().AsSlice())
+		ae.Bytes(unix.IFA_ADDRESS, peer.AsSlice())
 		if label != "" {
 			ae.String(unix.IFA_LABEL, label)
 		}
@@ -409,30 +506,47 @@ func setAddr(t *testing.T, prefix netip.Prefix, dev, label string) func() {
 // to the main table, and returns its removal.
 func addRoute(t *testing.T, prefix netip.Prefix, dev string) func() {
 	t.Helper()
-	ifi, err := net.InterfaceByName(dev)
-	require.NoError(t, err)
-	msg := func(typ netlink.HeaderType, flags netlink.HeaderFlags) netlink.Message {
+	return addTypedRoute(t, prefix, dev, unix.RTN_UNICAST)
+}
+
+// addTypedRoute adds a route of type typ for prefix to the main table,
+// through the interface named dev where one is given, and returns its
+// removal.
+func addTypedRoute(t *testing.T, prefix netip.Prefix, dev string, typ byte) func() {
+	t.Helper()
+	oif := 0
+	if dev != "" {
+		ifi, err := net.InterfaceByName(dev)
+		require.NoError(t, err)
+		oif = ifi.Index
+	}
+	msg := func(msgType netlink.HeaderType, flags netlink.HeaderFlags) netlink.Message {
 		// struct rtmsg: family, dst_len, src_len, tos, table, protocol,
 		// scope, type, flags.
 		rtm := make([]byte, unix.SizeofRtMsg)
 		rtm[0], rtm[1] = unix.AF_INET, byte(prefix.Bits())
-		rtm[6] = unix.RT_SCOPE_LINK
-		if prefix.Addr().Is6() {
-			rtm[0], rtm[6] = unix.AF_INET6, unix.RT_SCOPE_UNIVERSE
+		rtm[6] = unix.RT_SCOPE_UNIVERSE
+		if typ == unix.RTN_UNICAST && !prefix.Addr().Is6() {
+			rtm[6] = unix.RT_SCOPE_LINK
 		}
-		rtm[4], rtm[5], rtm[7] = unix.RT_TABLE_MAIN, unix.RTPROT_STATIC, unix.RTN_UNICAST
+		if prefix.Addr().Is6() {
+			rtm[0] = unix.AF_INET6
+		}
+		rtm[4], rtm[5], rtm[7] = unix.RT_TABLE_MAIN, unix.RTPROT_STATIC, typ
 		ae := netlink.NewAttributeEncoder()
 		ae.Bytes(unix.RTA_DST, prefix.Addr().AsSlice())
-		ae.Uint32(unix.RTA_OIF, uint32(ifi.Index))
+		if oif != 0 {
+			ae.Uint32(unix.RTA_OIF, uint32(oif))
+		}
 		attrs, err := ae.Encode()
 		require.NoError(t, err)
 		return netlink.Message{
-			Header: netlink.Header{Type: typ, Flags: netlink.Request | netlink.Acknowledge | flags},
+			Header: netlink.Header{Type: msgType, Flags: netlink.Request | netlink.Acknowledge | flags},
 			Data:   append(rtm, attrs...),
 		}
 	}
-	_, err = rtnetlink(msg(unix.RTM_NEWROUTE, netlink.Create|netlink.Excl))
-	require.NoError(t, err)
+	_, err := rtnetlink(msg(unix.RTM_NEWROUTE, netlink.Create|netlink.Excl))
+	require.NoError(t, err, "adding a type %d route for %s", typ, prefix)
 	return func() {
 		_, err := rtnetlink(msg(unix.RTM_DELROUTE, 0))
 		require.NoError(t, err)

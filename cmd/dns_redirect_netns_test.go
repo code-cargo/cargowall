@@ -123,12 +123,13 @@ func TestStartDockerDNS_SecondInstanceNetns(t *testing.T) {
 }
 
 // Docker DNS interception without the DNS redirect: the container DNS
-// addresses still come with their guards, whose tables the teardown takes
-// off with the addresses, and there is no redirect table.
+// addresses still come with their guards, which drop on the interface TC
+// attaches to, and whose tables the teardown takes off with the addresses;
+// there is no redirect table.
 func TestStartDockerDNS_GuardedWithoutRedirectNetns(t *testing.T) {
 	netns := newNetns(t)
 	logger := slog.New(slog.DiscardHandler)
-	cmd := &StartCmd{DockerDNSInterception: true, DNSUpstream: "192.0.2.1:53"}
+	cmd := &StartCmd{DockerDNSInterception: true, DNSUpstream: "192.0.2.1:53", Interface: "eth9"}
 	srv := dns.NewServer(config.NewConfigManager(), new(firewall.MockFirewall), cmd.DNSUpstream, "127.0.0.1:53", logger)
 	d, removeAddrs := startDockerDNS(cmd, srv, podenv.Dockerd{}, &teardownList{}, logger)
 	t.Cleanup(removeAddrs)
@@ -137,8 +138,8 @@ func TestStartDockerDNS_GuardedWithoutRedirectNetns(t *testing.T) {
 	require.True(t, d.serving())
 	assert.True(t, onLo(t, network.ContainerDNSIPv4))
 	assert.True(t, onLo(t, network.ContainerDNSIPv6))
-	assert.Equal(t, map[string]int{"ip input": 1, "ip forward": 1, "ip6 input": 1, "ip6 forward": 1},
-		tableRuleCounts(t, network.GuardTable), "each address guarded, the redirect or none")
+	assert.Equal(t, map[string]int{"ip input": 5, "ip forward": 1, "arp input": 5, "ip6 input": 5, "ip6 forward": 1},
+		tableRuleCounts(t, network.GuardTable), "each address guarded, the uplink dropped, the redirect or none")
 	assert.Empty(t, tableRuleCounts(t, network.RedirectTable), "no redirect")
 
 	removeAddrs()
@@ -261,6 +262,7 @@ func tableRuleCounts(t *testing.T, table string) map[string]int {
 	out := map[string]int{}
 	for family, name := range map[nftables.TableFamily]string{
 		nftables.TableFamilyIPv4: "ip", nftables.TableFamilyIPv6: "ip6", nftables.TableFamilyINet: "inet",
+		nftables.TableFamilyARP: "arp",
 	} {
 		chains, err := conn.ListChainsOfTableFamily(family)
 		require.NoError(t, err)

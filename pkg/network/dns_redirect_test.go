@@ -27,7 +27,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -280,65 +279,113 @@ func TestRedirectChains_Order(t *testing.T) {
 	}
 }
 
-// A container DNS address's guard, in a table of its family: input drops a
-// packet for it arriving on anything but lo or a docker bridge, forward
-// drops any packet for it, and neither reads the family, which the table
-// is.
+// A container DNS address's guard, in a table of its family: input drops
+// what arrives for it on an uplink, admits it on docker0, br-* and any
+// bridge, and drops it on anything else but lo; forward drops any packet for it; and neither reads
+// the family, which the table is. The IPv4 address's arp table admits a
+// request for it the same way.
 func TestGuardChains(t *testing.T) {
-	ifnames := func(rule []expr.Any) (names []string, ops []expr.CmpOp) {
-		for i, e := range rule {
-			if m, ok := e.(*expr.Meta); ok && m.Key == expr.MetaKeyIIFNAME {
-				cmp := rule[i+1].(*expr.Cmp)
-				names = append(names, string(bytes.TrimRight(cmp.Data, "\x00")))
-				ops = append(ops, cmp.Op)
-			}
-		}
-		return names, ops
+	uplinks := []string{"eth0", "br0"}
+	type ifmatch struct {
+		key  expr.MetaKey
+		op   expr.CmpOp
+		name string
 	}
-	daddrOf := func(rule []expr.Any) (net.IP, uint32) {
+	ifmatches := func(rule []expr.Any) (out []ifmatch) {
 		for i, e := range rule {
-			if p, ok := e.(*expr.Payload); ok && p.Base == expr.PayloadBaseNetworkHeader {
-				return net.IP(rule[i+1].(*expr.Cmp).Data), p.Offset
+			if m, ok := e.(*expr.Meta); ok && (m.Key == expr.MetaKeyIIFNAME || m.Key == metaKeyIIFKIND) {
+				cmp := rule[i+1].(*expr.Cmp)
+				out = append(out, ifmatch{m.Key, cmp.Op, string(bytes.TrimRight(cmp.Data, "\x00"))})
 			}
 		}
-		return nil, 0
+		return out
+	}
+	payload := func(rule []expr.Any, offset uint32) []byte {
+		for i, e := range rule {
+			if p, ok := e.(*expr.Payload); ok && p.Base == expr.PayloadBaseNetworkHeader && p.Offset == offset {
+				return rule[i+1].(*expr.Cmp).Data
+			}
+		}
+		return nil
+	}
+	lastVerdict := func(rule []expr.Any) expr.VerdictKind {
+		if v, ok := rule[len(rule)-1].(*expr.Verdict); ok {
+			return v.Kind
+		}
+		return -100
+	}
+	// admits checks rules against admitted's order: each uplink dropped,
+	// docker0, br-* and any bridge accepted, then anything but lo dropped.
+	admits := func(t *testing.T, what string, rules [][]expr.Any) {
+		t.Helper()
+		want := []struct {
+			match   ifmatch
+			verdict expr.VerdictKind
+		}{
+			{ifmatch{expr.MetaKeyIIFNAME, expr.CmpOpEq, "eth0"}, expr.VerdictDrop},
+			{ifmatch{expr.MetaKeyIIFNAME, expr.CmpOpEq, "br0"}, expr.VerdictDrop},
+			{ifmatch{expr.MetaKeyIIFNAME, expr.CmpOpEq, "docker0"}, expr.VerdictAccept},
+			{ifmatch{expr.MetaKeyIIFNAME, expr.CmpOpEq, "br-"}, expr.VerdictAccept},
+			{ifmatch{metaKeyIIFKIND, expr.CmpOpEq, "bridge"}, expr.VerdictAccept},
+			{ifmatch{expr.MetaKeyIIFNAME, expr.CmpOpNeq, "lo"}, expr.VerdictDrop},
+		}
+		if len(rules) != len(want) {
+			t.Fatalf("%s: %d rules, want %d", what, len(rules), len(want))
+		}
+		for i, w := range want {
+			if got := ifmatches(rules[i]); len(got) != 1 || got[0] != w.match || lastVerdict(rules[i]) != w.verdict {
+				t.Errorf("%s rule %d matches %+v with verdict %d, want %+v and %d", what, i, got,
+					lastVerdict(rules[i]), w.match, w.verdict)
+			}
+		}
 	}
 	for _, c := range []struct {
 		addr   netip.Addr
 		offset uint32 // the destination's, in the family's header
 	}{{ContainerDNSIPv4, 16}, {ContainerDNSIPv6, 24}} {
-		chains := guardChains(c.addr)
+		chains := guardChains(c.addr, uplinks)
 		if len(chains) != 2 || chains[0].name != "input" || chains[0].hook != unix.NF_INET_LOCAL_IN ||
 			chains[1].name != "forward" || chains[1].hook != unix.NF_INET_FORWARD {
 			t.Fatalf("%s: want input and forward chains, got %+v", c.addr, chains)
 		}
 		want := net.IP(c.addr.AsSlice())
 		for _, ch := range chains {
-			if len(ch.rules) != 1 || ch.kind != "filter" {
-				t.Fatalf("%s: %s wants one filter rule, got %+v", c.addr, ch.name, ch)
+			if ch.kind != "filter" {
+				t.Errorf("%s: %s is a %s chain, want filter", c.addr, ch.name, ch.kind)
 			}
-			rule := ch.rules[0]
-			if got, offset := daddrOf(rule); !got.Equal(want) || offset != c.offset {
-				t.Errorf("%s: %s matches %s at %d, want %s at %d", c.addr, ch.name, got, offset, want, c.offset)
-			}
-			if v, ok := rule[len(rule)-1].(*expr.Verdict); !ok || v.Kind != expr.VerdictDrop {
-				t.Errorf("%s: %s does not drop", c.addr, ch.name)
-			}
-			for _, e := range rule {
-				if m, ok := e.(*expr.Meta); ok && m.Key == expr.MetaKeyNFPROTO {
-					t.Errorf("%s: %s matches nfproto, which its table's family settles", c.addr, ch.name)
+			for i, rule := range ch.rules {
+				if got := net.IP(payload(rule, c.offset)); !got.Equal(want) {
+					t.Errorf("%s: %s rule %d matches %s, want %s", c.addr, ch.name, i, got, want)
+				}
+				for _, e := range rule {
+					if m, ok := e.(*expr.Meta); ok && m.Key == expr.MetaKeyNFPROTO {
+						t.Errorf("%s: %s matches nfproto, which its table's family settles", c.addr, ch.name)
+					}
 				}
 			}
 		}
-		names, ops := ifnames(chains[0].rules[0])
-		if !slices.Equal(names, []string{"lo", "docker0", "br-"}) ||
-			!slices.Equal(ops, []expr.CmpOp{expr.CmpOpNeq, expr.CmpOpNeq, expr.CmpOpNeq}) {
-			t.Errorf("%s: input matches %v %v, want != lo, docker0, br-*", c.addr, names, ops)
-		}
-		if names, _ := ifnames(chains[1].rules[0]); len(names) != 0 {
-			t.Errorf("%s: forward is limited to %v, want every interface", c.addr, names)
+		admits(t, c.addr.String()+" input", chains[0].rules)
+		if fwd := chains[1].rules; len(fwd) != 1 || len(ifmatches(fwd[0])) != 0 || lastVerdict(fwd[0]) != expr.VerdictDrop {
+			t.Errorf("%s: forward wants one drop on every interface, got %+v", c.addr, fwd)
 		}
 	}
+
+	arp := arpChains(ContainerDNSIPv4, uplinks)
+	if len(arp) != 1 || arp[0].name != "input" || arp[0].hook != nfARPIn || arp[0].kind != "filter" {
+		t.Fatalf("want one arp input filter chain, got %+v", arp)
+	}
+	for i, rule := range arp[0].rules {
+		if got := payload(rule, 24); !net.IP(got).Equal(net.IP(ContainerDNSIPv4.AsSlice())) {
+			t.Errorf("arp rule %d matches target %v, want %s", i, got, ContainerDNSIPv4)
+		}
+		if got := payload(rule, 6); !bytes.Equal(got, []byte{0, 1}) {
+			t.Errorf("arp rule %d matches operation %v, want a request", i, got)
+		}
+		if got := payload(rule, 4); !bytes.Equal(got, []byte{6, 4}) {
+			t.Errorf("arp rule %d matches hlen and plen %v, want Ethernet and IPv4", i, got)
+		}
+	}
+	admits(t, "arp input", arp[0].rules)
 }
 
 // With ipv6 the table is inet, and every rule that reads an address,

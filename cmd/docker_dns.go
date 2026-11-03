@@ -43,7 +43,7 @@ const dockerSocket = "/var/run/docker.sock"
 // containers' DNS.
 //
 // Each address is added (network.OwnedAddrs), with the guard that keeps it
-// from every link but lo and the docker bridges, only once the proxy holds
+// from the uplink and every link but lo and a bridge, only once the proxy holds
 // its primary listener, so a second cargowall in the netns, which never gets
 // that far, never touches the first's. One something else already holds is
 // not added, and its listener does not bind. Each listener binds over UDP
@@ -89,10 +89,13 @@ func startDockerDNS(cmd *StartCmd, dnsServer *dns.Server, dockerd podenv.Dockerd
 		restore: network.RestoreDockerDNS, recover: network.RecoverDockerDNS, logger: logger,
 	}
 	upstream, _ := netip.ParseAddrPort(cmd.DNSUpstream)
-	owned := network.NewOwnedAddrs(upstream.Addr().Unmap(), logger)
+	// An interface not found leaves the guards nothing to drop on by name;
+	// startup then fails finding it for TC.
+	uplink, _ := tcInterface(cmd)
+	owned := network.NewOwnedAddrs(upstream.Addr().Unmap(), network.Uplinks(uplink), logger)
 	undo := teardowns.add(func() {
 		if err := owned.Remove(); err != nil {
-			logger.Warn("Failed to remove the container DNS addresses from lo", "error", err)
+			logger.Warn("Failed to remove the container DNS addresses from lo, or their guards", "error", err)
 		}
 	})
 	for _, addr := range []netip.Addr{network.ContainerDNSIPv4, network.ContainerDNSIPv6} {
@@ -124,7 +127,8 @@ func (d *dockerDNS) useListener(teardowns *teardownList, redirect bool) func() {
 	local := d.dockerd.Kind == podenv.DockerdLocal
 	listen := containerListenAddr(network.ContainerDNSIPv4)
 	if err := d.listenerErr(network.ContainerDNSIPv4); err != nil {
-		d.logger.Warn(unboundListener(local, local && d.recoverLeftover(), redirect), "addr", listen, "error", err)
+		d.logger.Warn(unboundListener(local, local && d.recoverLeftover(), redirect, d.listeningIPv6() != ""),
+			"addr", listen, "error", err)
 		return func() {}
 	}
 	d.logger.Info("Docker DNS interception enabled", "listen", listen,
@@ -168,10 +172,15 @@ func (d *dockerDNS) recoverLeftover() bool {
 // unboundListener is useListener's warning for an IPv4 container listener
 // the proxy could not bind: what containers resolve through instead, which
 // turns on whether daemon.json was the proxy's to rewrite, whether a
-// previous run's rewrite of it was undone, and whether the redirect is
-// requested.
-func unboundListener(local, restored, redirect bool) string {
+// previous run's rewrite of it was undone, whether the redirect is
+// requested, and whether the IPv6 listener holds (ipv6), which leaves
+// interception off for IPv4 alone.
+func unboundListener(local, restored, redirect, ipv6 bool) string {
 	msg := "Docker DNS interception unavailable: the proxy could not listen on its container DNS address"
+	if ipv6 {
+		msg = "Docker DNS interception unavailable for IPv4: the proxy could not listen on its IPv4 container DNS " +
+			"address, though it holds the IPv6 one"
+	}
 	switch {
 	case restored:
 		msg += ", so daemon.json is not pointed at it, and the rewrite a previous run left there is undone"
@@ -181,8 +190,20 @@ func unboundListener(local, restored, redirect bool) string {
 	msg += "; containers resolve as their daemon configures them, around the proxy"
 	if redirect {
 		msg += ", which the DNS redirect does not cover either (a lost dns-redirect posture)"
+		if ipv6 {
+			msg += "; it still sends their IPv6 DNS to the IPv6 listener"
+		}
 	}
 	return msg
+}
+
+// tcInterface is the interface TC attaches to: --interface, or the one
+// network.FindPodInterface picks.
+func tcInterface(cmd *StartCmd) (string, error) {
+	if cmd.Interface != "" {
+		return cmd.Interface, nil
+	}
+	return network.FindPodInterface()
 }
 
 // listenerErr is why the proxy is not listening for container DNS at addr,

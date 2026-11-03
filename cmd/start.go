@@ -467,13 +467,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	}
 
 	// Find network interface
-	ifname := cmd.Interface
-	if ifname == "" {
-		var err error
-		ifname, err = network.FindPodInterface()
-		if err != nil {
-			return err
-		}
+	ifname, err := tcInterface(cmd)
+	if err != nil {
+		return err
 	}
 	logger.Info("Using network interface", "interface", ifname)
 

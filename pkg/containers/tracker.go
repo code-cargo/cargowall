@@ -93,6 +93,11 @@ type Options struct {
 	// transient and retried on the network's next container. Nil disables
 	// discovery. Called without the tracker lock held.
 	AllowLocalSubnet func(prefix netip.Prefix) error
+	// OnConnect is called once each event-stream session has connected and
+	// reconciled, first for the first session the daemon answered, with
+	// the bridge subnets that session's reconcile carved. Nil for none.
+	// Called on the stream goroutine: it must not block.
+	OnConnect func(first bool, carved []netip.Prefix)
 }
 
 type containerInfo struct {
@@ -167,6 +172,9 @@ type Tracker struct {
 	latencies     []float64 // tag latencies (ms), bounded
 
 	lastEventNano atomic.Int64
+	// connected is set once a session has connected: before it, the daemon
+	// may simply not be up yet, and failing to reach it is no news.
+	connected bool
 
 	// pidsVisible is set by the first identity check that passes: it proves
 	// this /proc sees the daemon's pids, so a missing one has exited (see
@@ -210,9 +218,10 @@ const (
 	reconcileInspectConcurrency = 4
 )
 
-// Start connects to the Docker daemon and begins tracking. An error means
-// container attribution is unavailable (no daemon, no socket access) and the
-// caller degrades with a warning — same posture as steps.Start.
+// Start begins tracking, and returns at once: it does not wait for the
+// daemon, which on some hosts answers only seconds after its socket
+// accepts. The stream connects whenever the daemon answers (run), and
+// Options.OnConnect says when. An error is a caller's mistake.
 func Start(ctx context.Context, opts Options, tagger StepTagger, observer *origin.Observer, auditLogger *events.AuditLogger, logger *slog.Logger) (*Tracker, error) {
 	if tagger == nil {
 		return nil, errors.New("nil step tagger")
@@ -253,13 +262,6 @@ func Start(ctx context.Context, opts Options, tagger StepTagger, observer *origi
 		t.observer = observer
 	}
 
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	err := t.client.ping(pingCtx)
-	cancel()
-	if err != nil {
-		return nil, fmt.Errorf("docker daemon unreachable: %w", err)
-	}
-
 	runCtx, cancelRun := context.WithCancel(ctx)
 	t.cancel = cancelRun
 	go t.run(runCtx)
@@ -278,7 +280,10 @@ func (t *Tracker) Close() {
 
 // run is the reconnect loop: stream events, and on any error reconnect with
 // backoff, resuming from the last seen event so nothing in the gap is lost.
-// One mechanism covers daemon restarts and transient socket errors alike.
+// One mechanism covers daemon restarts and transient socket errors alike,
+// and a daemon not up yet: until a session has connected, a failure to
+// reach it is logged at Debug, since a socket left by a daemon that has
+// not started refuses every 5s for as long as it takes.
 func (t *Tracker) run(ctx context.Context) {
 	defer close(t.done)
 	backoff := reconnectBackoff
@@ -298,7 +303,11 @@ func (t *Tracker) run(ctx context.Context) {
 			// session, which would reset even a flapping daemon).
 			backoff = reconnectBackoff
 		}
-		t.logger.Warn("Docker event stream interrupted; reconnecting", "error", err, "backoff", backoff)
+		if t.connected {
+			t.logger.Warn("Docker event stream interrupted; reconnecting", "error", err, "backoff", backoff)
+		} else {
+			t.logger.Debug("Docker daemon not answering yet; retrying", "error", err, "backoff", backoff)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -320,7 +329,12 @@ func (t *Tracker) streamOnce(ctx context.Context) (healthy bool, err error) {
 	}
 	defer body.Close()
 
-	t.reconcile(ctx)
+	carved := t.reconcile(ctx)
+	first := !t.connected
+	t.connected = true
+	if t.opts.OnConnect != nil {
+		t.opts.OnConnect(first, carved)
+	}
 
 	decodeStart := time.Now()
 	defer func() { healthy = time.Since(decodeStart) >= streamHealthyAfter }()

@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // dockerClient is a deliberately minimal Docker Engine API client over the
@@ -190,6 +191,24 @@ func (c *dockerClient) ping(ctx context.Context) error {
 		return fmt.Errorf("docker ping: unexpected status %s", resp.Status)
 	}
 	return nil
+}
+
+// WaitAnswer blocks until the daemon at socket answers GET /_ping, and
+// returns nil then, or ctx's error. A socket that accepts holds the request
+// until its daemon serves it; one that refuses, or is not there yet, is
+// asked again every second.
+func WaitAnswer(ctx context.Context, socket string) error {
+	c := newDockerClient(socket)
+	for {
+		if err := c.ping(ctx); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 func (c *dockerClient) get(ctx context.Context, path string, out any) error {

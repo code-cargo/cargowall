@@ -96,14 +96,19 @@ type useListenerRun struct {
 	log         string
 }
 
-// runUseListener runs useListener for a daemon of the given kind whose
-// proxy failed to bind what errs names; leftover is whether daemon.json
-// holds a rewrite a previous run left.
+// runUseListener runs useListener for an answering daemon of the given kind
+// whose proxy failed to bind what errs names; leftover is whether
+// daemon.json holds a rewrite a previous run left.
 func runUseListener(kind podenv.DockerdKind, errs bindErrs, redirect, leftover bool) *useListenerRun {
+	return runUseListenerFor(podenv.Dockerd{Kind: kind, Answers: true}, errs, redirect, leftover)
+}
+
+// runUseListenerFor is runUseListener for the daemon dockerd describes.
+func runUseListenerFor(dockerd podenv.Dockerd, errs bindErrs, redirect, leftover bool) *useListenerRun {
 	run := &useListenerRun{teardowns: &teardownList{}}
 	var buf bytes.Buffer
 	run.d = &dockerDNS{
-		dockerd: podenv.Dockerd{Kind: kind},
+		dockerd: dockerd,
 		proxy:   errs,
 		configure: func(dnsIP string, _ *slog.Logger) error {
 			run.configured = append(run.configured, dnsIP)
@@ -194,12 +199,27 @@ func TestDockerDNS_UseListenerUnbound(t *testing.T) {
 	}
 }
 
+// A local daemon still to come up is left alone, a previous run's
+// leftover in its daemon.json included, whether its listener holds or
+// not: nothing is rewritten or undone, and no restart is due.
+func TestDockerDNS_UseListenerPending(t *testing.T) {
+	pending := podenv.Dockerd{Kind: podenv.DockerdLocal}
+	for _, errs := range []bindErrs{{}, {listen4: errRefused4}} {
+		run := runUseListenerFor(pending, errs, true, true)
+		assert.Empty(t, run.configured)
+		assert.Zero(t, run.recoveries, "a pending daemon's leftover is left too")
+		assert.False(t, run.d.restart)
+		assert.Empty(t, run.teardowns.fns)
+		assert.NotContains(t, run.log, "not proven local")
+	}
+}
+
 // A leftover that cannot be undone is warned, and no restart is due for
 // it.
 func TestDockerDNS_RecoverLeftoverFails(t *testing.T) {
 	var buf bytes.Buffer
 	d := &dockerDNS{
-		dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal},
+		dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Answers: true},
 		proxy:   bindErrs{listen4: errRefused4},
 		recover: func(*slog.Logger) (bool, error) { return false, fmt.Errorf("read-only /etc/docker") },
 		logger:  slog.New(slog.NewTextHandler(&buf, nil)),

@@ -87,8 +87,10 @@ func (c *SummaryCmd) Run() error {
 	}
 
 	// Postures `cargowall start` could not apply: what it was allowed to lose
-	// (see renderPostures). Rendered near the top of every summary shape.
+	// (see renderPostures), and, for a Docker still to come up at startup,
+	// whether it did. Rendered near the top of every summary shape.
 	postures := readPostures()
+	docker := dockerLine()
 
 	// Read audit log
 	auditEvents, err := c.readAuditLog()
@@ -163,6 +165,7 @@ func (c *SummaryCmd) Run() error {
 		fmt.Fprintln(c.output, "## CargoWall")
 		fmt.Fprintln(c.output)
 		renderPostures(c.output, postures)
+		renderDocker(c.output, docker)
 		if workflowRunLink != "" {
 			fmt.Fprintf(c.output, "[View full details on CodeCargo](%s)\n", workflowRunLink)
 		} else {
@@ -224,6 +227,7 @@ func (c *SummaryCmd) Run() error {
 		auditMode:       auditMode,
 		workflowRunLink: workflowRunLink,
 		postures:        postures,
+		docker:          docker,
 	})
 
 	return nil

@@ -51,12 +51,15 @@ func quietLogger() *slog.Logger {
 // real paths on cleanup.
 func redirectStateFiles(t *testing.T) (modePath, downgradePath string) {
 	t.Helper()
-	oldMode, oldDowngrade, oldPostures := modeFile, downgradeFile, posturesFile
+	oldMode, oldDowngrade, oldPostures, oldDocker := modeFile, downgradeFile, posturesFile, dockerFile
 	dir := t.TempDir()
 	modeFile = filepath.Join(dir, "cargowall-mode")
 	downgradeFile = filepath.Join(dir, "cargowall-downgrade")
 	posturesFile = filepath.Join(dir, "cargowall-postures")
-	t.Cleanup(func() { modeFile, downgradeFile, posturesFile = oldMode, oldDowngrade, oldPostures })
+	dockerFile = filepath.Join(dir, "cargowall-docker")
+	t.Cleanup(func() {
+		modeFile, downgradeFile, posturesFile, dockerFile = oldMode, oldDowngrade, oldPostures, oldDocker
+	})
 	return modeFile, downgradeFile
 }
 
@@ -412,7 +415,7 @@ func TestRemoveStaleStateFiles(t *testing.T) {
 		FailureFile: filepath.Join(dir, "failed"),
 	}
 
-	stale := []string{cmd.ReadyFile, cmd.FailureFile, modePath, downgradePath}
+	stale := []string{cmd.ReadyFile, cmd.FailureFile, modePath, downgradePath, dockerFile}
 	for _, p := range stale {
 		require.NoError(t, os.WriteFile(p, []byte("stale"), 0o644))
 	}

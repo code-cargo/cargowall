@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/code-cargo/cargowall/pkg/origin"
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // The mode ladder is the safety gate for phase 3b: enforcement must be
@@ -61,7 +62,7 @@ func TestContainerAttributionNilSafe(t *testing.T) {
 		a.enableMode()
 		a.ensureLoopbackAllowed(nil)
 		a.wireVerdicts(nil, nil, nil, nil, nil)
-		a.preallowLocalNetworks(t.Context())
+		a.preallowLocalNetworks(t.Context(), podenv.Dockerd{})
 		assert.NoError(t, a.allowLocalNetwork(netip.Prefix{}))
 		a.Close()
 		assert.Nil(t, a.enricherArg())

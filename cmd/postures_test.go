@@ -298,7 +298,7 @@ func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
 	assert.Nil(t, a.observerProgram())
 	assert.Nil(t, a.subnetCarver(a.allowLocalNetwork), "no hook: bridge-subnet discovery stays off")
 	require.NoError(t, a.allowLocalNetwork(netip.MustParsePrefix("172.17.0.0/16")))
-	a.preallowLocalNetworks(context.Background())
+	a.preallowLocalNetworks(context.Background(), podenv.Dockerd{Kind: podenv.DockerdLocal, Answers: true})
 	a.wireVerdicts(nil, nil, nil, nil, nil)
 	require.NoError(t, a.enableMode(), "nothing to raise, and the loss is already recorded")
 	assert.Equal(t, 1, strings.Count(buf.String(), "could not be applied"), "the loss is logged once")

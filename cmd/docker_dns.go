@@ -119,12 +119,16 @@ func startDockerDNS(cmd *StartCmd, dnsServer *dns.Server, dockerd podenv.Dockerd
 // daemon.json; the caller defers it. It is registered before the rewrite,
 // so a signal landing mid-write still has one: the second-signal path runs
 // it on another goroutine, and pkg/network serializes the two, so it either
-// undoes a finished rewrite or stops one from starting. Nil-safe.
+// undoes a finished rewrite or stops one from starting. A daemon still to
+// come up (podenv.Dockerd.Pending) is left alone, a previous run's leftover
+// in its daemon.json included: no restart is due for it (see dockerUp).
+// Nil-safe.
 func (d *dockerDNS) useListener(teardowns *teardownList, redirect bool) func() {
 	if d == nil {
 		return func() {}
 	}
-	local := d.dockerd.Kind == podenv.DockerdLocal
+	pending := d.dockerd.Pending()
+	local := d.dockerd.Kind == podenv.DockerdLocal && !pending
 	listen := containerListenAddr(network.ContainerDNSIPv4)
 	if err := d.listenerErr(network.ContainerDNSIPv4); err != nil {
 		d.logger.Warn(unboundListener(local, local && d.recoverLeftover(), redirect, d.listeningIPv6() != ""),
@@ -133,6 +137,9 @@ func (d *dockerDNS) useListener(teardowns *teardownList, redirect bool) func() {
 	}
 	d.logger.Info("Docker DNS interception enabled", "listen", listen,
 		"listen_ipv6", containerListenAddr(network.ContainerDNSIPv6), "ipv6_bound", d.listeningIPv6() != "")
+	if pending {
+		return func() {}
+	}
 	if !local {
 		d.logger.Info("Docker daemon not proven local; leaving its config alone, so its containers reach the proxy "+
 			"only through the DNS redirect or by naming its listener", "dockerd", d.dockerd.Kind.String(), "reason", d.dockerd.Reason)

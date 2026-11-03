@@ -62,6 +62,7 @@ type summaryData struct {
 	auditMode       bool
 	workflowRunLink string
 	postures        []postureLine
+	docker          string // dockerLine
 }
 
 // tallyEvents counts events by outcome class.
@@ -113,6 +114,16 @@ func renderPostures(w io.Writer, recs []postureLine) {
 	fmt.Fprintln(w)
 }
 
+// renderDocker writes the neutral line about a Docker that was still to
+// come up at startup (dockerLine), nothing for "".
+func renderDocker(w io.Writer, line string) {
+	if line == "" {
+		return
+	}
+	fmt.Fprintln(w, line)
+	fmt.Fprintln(w)
+}
+
 func (c *SummaryCmd) generateSummary(d summaryData) {
 	auditMode := d.auditMode
 
@@ -148,6 +159,7 @@ func (c *SummaryCmd) generateSummary(d summaryData) {
 	// Above the link: a posture the run did not have is not a detail to
 	// click through to.
 	renderPostures(c.output, d.postures)
+	renderDocker(c.output, d.docker)
 
 	// When a SaaS link is available, condense output: just header + link
 	if d.workflowRunLink != "" {

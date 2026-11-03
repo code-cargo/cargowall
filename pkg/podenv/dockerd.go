@@ -104,6 +104,12 @@ type Dockerd struct {
 	// itself (runtimePid). 0 when it could not be shown, and Reason says
 	// why. Read only where the scope depends on it.
 	Runtime int32
+	// Bridges are the bridges Docker has made in our network namespace,
+	// docker0 and br-<network id> (network.DockerBridge), at the probe.
+	Bridges []string
+	// Answers is whether the daemon answered, asked only where it has
+	// bridges to show for it (probeUp).
+	Answers bool
 	// pid is the pid, in our pid namespace, of the process serving the
 	// socket, looked for only where the scope reads the daemon's runtime
 	// (probeDockerd), and 0 elsewhere or when it could not be shown.

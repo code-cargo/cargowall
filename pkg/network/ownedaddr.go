@@ -90,8 +90,16 @@ type ownedAddr struct {
 
 // NewOwnedAddrs returns the addresses to Add, for a proxy whose upstream is
 // upstream (the zero Addr for none), on a host whose uplinks are uplinks
-// (Uplinks). Register its Remove first.
+// (Uplinks). Register its Remove first. An uplink that is a Docker bridge,
+// which the guards drop on, is warned about here, once (dockerBridgeUplink).
 func NewOwnedAddrs(upstream netip.Addr, uplinks []string, logger *slog.Logger) *OwnedAddrs {
+	for _, name := range uplinks {
+		if dockerBridgeUplink(name) {
+			logger.Warn("A Docker bridge carries this host's uplink or default route, so the guard drops DNS from "+
+				"its containers to the container DNS addresses: on that link it cannot tell a container from a "+
+				"neighbour", "bridge", name)
+		}
+	}
 	return &OwnedAddrs{
 		upstream: upstream, uplinks: uplinks, logger: logger, ownerFlag: nftTableFOwner, arpFamily: familyARP,
 		deleteAddr: func(addr netip.Addr) error { return loopbackAddr(unix.RTM_DELADDR, 0, addr, "") },

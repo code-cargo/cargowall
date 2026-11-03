@@ -388,6 +388,31 @@ func TestGuardChains(t *testing.T) {
 	admits(t, "arp input", arp[0].rules)
 }
 
+// An uplink that is a Docker bridge, docker0 or br-*, is warned about once
+// at startup, naming it: the guard drops its containers' DNS to the owned
+// addresses. Other bridges, such as Proxmox's vmbr0, are not.
+func TestOwnedAddrs_DockerBridgeUplinkWarned(t *testing.T) {
+	for _, c := range []struct {
+		uplinks []string
+		warned  []string
+	}{
+		{uplinks: []string{"eth0", "vmbr0", "br0", "bond0"}},
+		{uplinks: []string{"eth0", "docker0"}, warned: []string{"docker0"}},
+		{uplinks: []string{"br-1a2b3c", "eno1", "br-ex"}, warned: []string{"br-1a2b3c", "br-ex"}},
+	} {
+		var buf bytes.Buffer
+		NewOwnedAddrs(netip.Addr{}, c.uplinks, slog.New(slog.NewTextHandler(&buf, nil)))
+		if got := strings.Count(buf.String(), "level=WARN"); got != len(c.warned) {
+			t.Errorf("uplinks %v: %d warnings, want %d:\n%s", c.uplinks, got, len(c.warned), buf.String())
+		}
+		for _, name := range c.warned {
+			if !strings.Contains(buf.String(), "bridge="+name) {
+				t.Errorf("uplinks %v: no warning names %s:\n%s", c.uplinks, name, buf.String())
+			}
+		}
+	}
+}
+
 // With ipv6 the table is inet, and every rule that reads an address,
 // rewrites to one, or acts on one family alone first matches the packet's
 // family: there an IPv4 offset read on an IPv6 packet compares bytes of its

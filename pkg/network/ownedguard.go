@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strings"
 
 	"github.com/google/nftables/expr"
 	"github.com/mdlayher/netlink"
@@ -66,6 +67,15 @@ func Uplinks(ifname string) []string {
 		}
 	}
 	return uplinks
+}
+
+// dockerBridgeUplink reports whether the uplink named name is one of the
+// bridges the redirect's DNAT treats as Docker's, docker0 or br-*: a
+// default route or a TC interface there puts the guard's uplink drop ahead
+// of its containers' DNS. Other bridges, such as Proxmox's vmbr0, are
+// uplinks with no containers on them.
+func dockerBridgeUplink(name string) bool {
+	return name == "docker0" || strings.HasPrefix(name, "br-")
 }
 
 // defaultRouteLinks names the interfaces each family's default route

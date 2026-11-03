@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -85,39 +86,30 @@ func (c *daemonConfig) dnsServers() ([]string, error) {
 	return cfg.DNS, nil
 }
 
-// GetDockerBridgeSubnet returns the default bridge's IPv4 network in CIDR
-// form (e.g. "172.17.0.0/16"). The cgroup egress hook adjudicates bridge
-// traffic TC never saw — host→published-port via docker-proxy, container→
-// container — and under shadow/enforce that local-only class is carved out
-// by subnet (pkg/origin's local-nets map), not discovered one denial at a
-// time.
-func GetDockerBridgeSubnet() (string, error) {
-	ipnet, err := dockerBridgeIPNet()
+// BridgeSubnet is the IPv4 network of the bridge called name, from its
+// first IPv4 address (172.17.0.0/16 for a default docker0). The cgroup
+// egress hook adjudicates bridge traffic TC never saw — host→published-port
+// via docker-proxy, container→container — and under shadow/enforce that
+// local-only class is carved out by subnet (pkg/origin's local-nets map),
+// not discovered one denial at a time.
+func BridgeSubnet(name string) (netip.Prefix, error) {
+	iface, err := net.InterfaceByName(name)
 	if err != nil {
-		return "", err
-	}
-	network := &net.IPNet{IP: ipnet.IP.Mask(ipnet.Mask), Mask: ipnet.Mask}
-	return network.String(), nil
-}
-
-// dockerBridgeIPNet is docker0's first IPv4 address, with its network.
-func dockerBridgeIPNet() (*net.IPNet, error) {
-	iface, err := net.InterfaceByName("docker0")
-	if err != nil {
-		return nil, fmt.Errorf("docker0 interface not found: %w", err)
+		return netip.Prefix{}, fmt.Errorf("%s interface not found: %w", name, err)
 	}
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get docker0 addresses: %w", err)
+		return netip.Prefix{}, fmt.Errorf("failed to get %s addresses: %w", name, err)
 	}
 	for _, addr := range addrs {
 		if ipnet, ok := addr.(*net.IPNet); ok {
 			if ip4 := ipnet.IP.To4(); ip4 != nil {
-				return &net.IPNet{IP: ip4, Mask: ipnet.Mask}, nil
+				ones, _ := ipnet.Mask.Size()
+				return netip.PrefixFrom(netip.AddrFrom4([4]byte(ip4)), ones).Masked(), nil
 			}
 		}
 	}
-	return nil, fmt.Errorf("no IPv4 address found on docker0")
+	return netip.Prefix{}, fmt.Errorf("no IPv4 address found on %s", name)
 }
 
 // ConfigureDockerDNS configures Docker to use the specified DNS server.

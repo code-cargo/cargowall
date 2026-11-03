@@ -19,6 +19,7 @@ package network
 import (
 	"encoding/json"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -364,4 +365,14 @@ func TestDockerDNSServers(t *testing.T) {
 	require.NoError(t, os.WriteFile(c.path, []byte(`{"dns": `), 0o644))
 	_, err = c.dnsServers()
 	require.ErrorContains(t, err, c.path)
+}
+
+// A bridge's subnet is its first IPv4 address's network, masked; one that
+// is not there names itself.
+func TestBridgeSubnet(t *testing.T) {
+	subnet, err := BridgeSubnet("lo")
+	require.NoError(t, err)
+	require.Equal(t, netip.MustParsePrefix("127.0.0.0/8"), subnet)
+	_, err = BridgeSubnet("br-ffffffffffff")
+	require.ErrorContains(t, err, "br-ffffffffffff interface not found")
 }

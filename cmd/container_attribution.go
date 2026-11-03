@@ -21,7 +21,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
-	"slices"
 
 	"github.com/cilium/ebpf"
 
@@ -273,35 +272,50 @@ func (a *containerAttribution) ensureLoopbackAllowed(configMgr *config.Manager) 
 //
 // Only a daemon that answered is asked for its networks
 // (podenv.Dockerd.Answers, the one ping startup makes), with Docker's
-// bridges or none. With no Docker there is nothing to carve. With a Docker
-// still to come up (Pending) the tracker's first session carves every
-// bridge network once the daemon answers; only a docker0 already up is
-// carved here, from its address.
+// bridges or none, and its docker0 is carved from its address too, as host
+// config. With no Docker there is nothing to carve. A daemon that has not
+// answered, still to come up (Pending) or with no socket to ask
+// (Unreachable), may have containers on its bridges already: dockerd starts
+// a restart-policy container before it serves the API. Each Docker bridge
+// up at startup is then carved here from its own address, docker0 alone
+// when they could not be listed, and once a pending daemon answers the
+// tracker's first session carves every bridge network.
 func (a *containerAttribution) preallowLocalNetworks(ctx context.Context, dockerd podenv.Dockerd) {
-	if a == nil || a.observer == nil || a.mode == origin.ModeObserve || dockerd.None() {
+	if a == nil || a.observer == nil || a.mode == origin.ModeObserve {
 		return
 	}
-	if dockerd.Pending() && !slices.Contains(dockerd.Bridges, "docker0") {
+	preallowNetworks(ctx, dockerd, a.allowLocalNetwork, a.logger)
+}
+
+// bridgeSubnet and discoverBridgeSubnets read one bridge's IPv4 network
+// from its address, and every bridge network's from the daemon:
+// network.BridgeSubnet and containers.DiscoverBridgeSubnets, or a test's
+// stand-ins.
+var (
+	bridgeSubnet          = network.BridgeSubnet
+	discoverBridgeSubnets = containers.DiscoverBridgeSubnets
+)
+
+// preallowNetworks is preallowLocalNetworks' carving, with carve writing
+// one subnet's carve-out.
+func preallowNetworks(ctx context.Context, dockerd podenv.Dockerd, carve func(netip.Prefix) error, logger *slog.Logger) {
+	if dockerd.None() {
 		return
-	}
-	if subnet, err := network.GetDockerBridgeSubnet(); err == nil {
-		if prefix, perr := netip.ParsePrefix(subnet); perr == nil {
-			if aerr := a.allowLocalNetwork(prefix); aerr != nil && !errors.Is(aerr, origin.ErrLocalNetworkRefused) {
-				a.logger.Warn("Default bridge carve-out failed", "subnet", subnet, "error", aerr)
-			}
-		}
-	} else {
-		// Warn, not Debug: under shadow/enforce this carve-out is what keeps
-		// published ports and default-bridge container traffic alive.
-		a.logger.Warn("Docker bridge subnet not discovered; default-bridge traffic stays adjudicated",
-			"error", err)
 	}
 	if !dockerd.Answers {
+		bridges := dockerd.Bridges
+		if dockerd.BridgesErr != nil {
+			bridges = []string{"docker0"}
+		}
+		for _, name := range bridges {
+			carveBridge(name, carve, logger)
+		}
 		return
 	}
-	subnets, err := containers.DiscoverBridgeSubnets(ctx, "")
+	carveBridge("docker0", carve, logger)
+	subnets, err := discoverBridgeSubnets(ctx, "")
 	if err != nil {
-		a.logger.Warn("Cannot pre-scan bridge subnets; pre-existing user-defined bridges stay adjudicated until tracking starts",
+		logger.Warn("Cannot pre-scan bridge subnets; pre-existing user-defined bridges stay adjudicated until tracking starts",
 			"error", err)
 		return
 	}
@@ -309,9 +323,24 @@ func (a *containerAttribution) preallowLocalNetworks(ctx context.Context, docker
 		// Refusals are the policy's decision and already logged by the
 		// write; transient failures are warned and left for the tracker's
 		// discovery paths to retry.
-		if err := a.allowLocalNetwork(prefix); err != nil && !errors.Is(err, origin.ErrLocalNetworkRefused) {
-			a.logger.Warn("Bridge subnet carve-out failed; tracking will retry", "subnet", prefix.String(), "error", err)
+		if err := carve(prefix); err != nil && !errors.Is(err, origin.ErrLocalNetworkRefused) {
+			logger.Warn("Bridge subnet carve-out failed; tracking will retry", "subnet", prefix.String(), "error", err)
 		}
+	}
+}
+
+// carveBridge carves out the bridge called name's IPv4 network, read from
+// its address. Warn, not Debug, when it cannot be: under shadow/enforce
+// this carve-out is what keeps published ports and the bridge's container
+// traffic alive.
+func carveBridge(name string, carve func(netip.Prefix) error, logger *slog.Logger) {
+	subnet, err := bridgeSubnet(name)
+	if err != nil {
+		logger.Warn("Docker bridge subnet not discovered; its traffic stays adjudicated", "bridge", name, "error", err)
+		return
+	}
+	if err := carve(subnet); err != nil && !errors.Is(err, origin.ErrLocalNetworkRefused) {
+		logger.Warn("Docker bridge carve-out failed", "bridge", name, "subnet", subnet.String(), "error", err)
 	}
 }
 

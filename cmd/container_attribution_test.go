@@ -17,6 +17,11 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/netip"
 	"testing"
 
@@ -69,4 +74,114 @@ func TestContainerAttributionNilSafe(t *testing.T) {
 		assert.Nil(t, a.observerProgram())
 		a.startUserspace(t.Context(), nil, false, nil, nil)
 	})
+}
+
+// preallowRun is what preallowNetworks did: what it carved, the bridges
+// whose network it read, how often it asked the daemon, and its log.
+type preallowRun struct {
+	carved []netip.Prefix
+	read   []string
+	asked  int
+	log    string
+}
+
+// runPreallow is preallowNetworks for dockerd, with each bridge's network
+// from subnets (a bridge missing there has none to read), the daemon's
+// networks one of their own, and every carve failing with carveErr.
+func runPreallow(t *testing.T, dockerd podenv.Dockerd, subnets map[string]string, carveErr error) *preallowRun {
+	t.Helper()
+	run := &preallowRun{}
+	oldBridge, oldDiscover := bridgeSubnet, discoverBridgeSubnets
+	t.Cleanup(func() { bridgeSubnet, discoverBridgeSubnets = oldBridge, oldDiscover })
+	bridgeSubnet = func(name string) (netip.Prefix, error) {
+		run.read = append(run.read, name)
+		if s, ok := subnets[name]; ok {
+			return netip.MustParsePrefix(s), nil
+		}
+		return netip.Prefix{}, fmt.Errorf("%s interface not found", name)
+	}
+	discoverBridgeSubnets = func(context.Context, string) ([]netip.Prefix, error) {
+		run.asked++
+		return []netip.Prefix{netip.MustParsePrefix("172.30.0.0/16")}, nil
+	}
+	var buf bytes.Buffer
+	preallowNetworks(t.Context(), dockerd, func(p netip.Prefix) error {
+		run.carved = append(run.carved, p)
+		return carveErr
+	}, slog.New(slog.NewTextHandler(&buf, nil)))
+	run.log = buf.String()
+	return run
+}
+
+// Before the hook's mode is raised, a daemon that answered is asked for its
+// networks, and its docker0 is carved from its address too. One that has
+// not, still to come up or with no socket to ask, is never asked, which
+// would cost startup the daemon's silence: each Docker bridge up is carved
+// from its own address instead, a user network's included, since dockerd
+// starts restart-policy containers on them before it serves the API, and
+// docker0 alone when the bridges could not be listed. With no bridge,
+// nothing is read or warned about; with no Docker, nothing at all.
+func TestPreallowNetworks(t *testing.T) {
+	subnets := map[string]string{"docker0": "172.17.0.0/16", "br-0123456789ab": "172.18.0.0/16"}
+	docker0, user := netip.MustParsePrefix("172.17.0.0/16"), netip.MustParsePrefix("172.18.0.0/16")
+	discovered := netip.MustParsePrefix("172.30.0.0/16")
+	both := []string{"docker0", "br-0123456789ab"}
+	for _, c := range []struct {
+		name    string
+		dockerd podenv.Dockerd
+		read    []string
+		carved  []netip.Prefix
+		asked   int
+		warn    string
+	}{
+		{name: "no Docker", dockerd: podenv.Dockerd{Kind: podenv.DockerdAbsent}},
+		{name: "pending, no bridge", dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal}},
+		{
+			name: "pending, bridges up", dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Bridges: both},
+			read: both, carved: []netip.Prefix{docker0, user},
+		},
+		{
+			name:    "pending, bridges not listed",
+			dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, BridgesErr: errors.New("netlink: permission denied")},
+			read:    []string{"docker0"}, carved: []netip.Prefix{docker0},
+		},
+		{
+			name:    "unreachable, a user network's bridge",
+			dockerd: podenv.Dockerd{Kind: podenv.DockerdAbsent, Bridges: []string{"br-0123456789ab"}},
+			read:    []string{"br-0123456789ab"}, carved: []netip.Prefix{user},
+		},
+		{
+			name:    "unreachable, a bridge with no address",
+			dockerd: podenv.Dockerd{Kind: podenv.DockerdAbsent, Bridges: []string{"br-ffffffffffff", "docker0"}},
+			read:    []string{"br-ffffffffffff", "docker0"}, carved: []netip.Prefix{docker0},
+			warn: "Docker bridge subnet not discovered; its traffic stays adjudicated\" bridge=br-ffffffffffff",
+		},
+		{
+			name: "up", dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Bridges: both, Answers: true},
+			read: []string{"docker0"}, carved: []netip.Prefix{docker0, discovered}, asked: 1,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			run := runPreallow(t, c.dockerd, subnets, nil)
+			assert.Equal(t, c.read, run.read)
+			assert.Equal(t, c.carved, run.carved)
+			assert.Equal(t, c.asked, run.asked, "only a daemon that answered is asked for its networks")
+			if c.warn == "" {
+				assert.NotContains(t, run.log, "level=WARN")
+			} else {
+				assert.Contains(t, run.log, c.warn)
+			}
+		})
+	}
+
+	renamed := runPreallow(t, podenv.Dockerd{Kind: podenv.DockerdLocal, Answers: true}, nil, nil)
+	assert.Contains(t, renamed.log, "Docker bridge subnet not discovered", "an up daemon's docker0 is looked for")
+	assert.Equal(t, []netip.Prefix{discovered}, renamed.carved, "and its networks carved without it")
+
+	pending := podenv.Dockerd{Kind: podenv.DockerdLocal, Bridges: []string{"docker0"}}
+	failed := runPreallow(t, pending, subnets, errors.New("map full"))
+	assert.Contains(t, failed.log, "Docker bridge carve-out failed")
+	assert.Contains(t, failed.log, "bridge=docker0")
+	refused := runPreallow(t, pending, subnets, origin.ErrLocalNetworkRefused)
+	assert.NotContains(t, refused.log, "level=WARN", "a refusal is the policy's, already logged by the write")
 }

@@ -49,12 +49,12 @@ type dockerRecord struct {
 // for a Docker still to come up (Pending), its arrival. On some hosts
 // (Blacksmith's) the socket accepts connections seconds before dockerd
 // answers on it, and before it has made a bridge. Nothing waits for it:
-// a daemon that has not answered has started no container cargowall could
-// ask about, so nothing needs carving before the cgroup hook adjudicates
-// (a docker0 already up is carved from its address), and the container DNS
-// addresses and the redirect's DNAT on docker0 and br-* cover bridges made
-// later. What does wait for the daemon, container tracking and the
-// carve-outs it makes, starts when it answers, and is logged then.
+// what needs carving before the cgroup hook adjudicates is on a bridge
+// already up, which is carved from its address (preallowLocalNetworks),
+// and the container DNS addresses and the redirect's DNAT on docker0 and
+// br-* cover bridges made later. What does wait for the daemon, container
+// tracking and the carve-outs it makes, starts when it answers, and is
+// logged then.
 //
 // daemon.json is left alone for such a daemon, now and when it answers:
 // it may be reading it already, restarting it once it has answered would

@@ -69,13 +69,19 @@ func Uplinks(ifname string) []string {
 	return uplinks
 }
 
-// dockerBridgeUplink reports whether the uplink named name is one of the
-// bridges the redirect's DNAT treats as Docker's, docker0 or br-*: a
-// default route or a TC interface there puts the guard's uplink drop ahead
-// of its containers' DNS. Other bridges, such as Proxmox's vmbr0, are
-// uplinks with no containers on them.
+// dockerBridgeUplink reports whether the uplink named name is a bridge
+// Docker made, as Docker names them: docker0, or br- and the 12 lowercase
+// hex characters that start a network's ID. A default route or a TC
+// interface there puts the guard's uplink drop ahead of its containers'
+// DNS. Other bridges, br-* ones too (OVS's br-ex, OpenWrt's br-lan), and
+// Proxmox's vmbr0, are uplinks with no containers on them; the guard's
+// br-* admission and the DNAT's br-+ match stay as they are.
 func dockerBridgeUplink(name string) bool {
-	return name == "docker0" || strings.HasPrefix(name, "br-")
+	id, ok := strings.CutPrefix(name, "br-")
+	if !ok {
+		return name == "docker0"
+	}
+	return len(id) == 12 && strings.Trim(id, "0123456789abcdef") == ""
 }
 
 // defaultRouteLinks names the interfaces each family's default route

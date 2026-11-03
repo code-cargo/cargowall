@@ -95,9 +95,10 @@ type ownedAddr struct {
 func NewOwnedAddrs(upstream netip.Addr, uplinks []string, logger *slog.Logger) *OwnedAddrs {
 	for _, name := range uplinks {
 		if dockerBridgeUplink(name) {
-			logger.Warn("A Docker bridge carries this host's uplink or default route, so the guard drops DNS from "+
-				"its containers to the container DNS addresses: on that link it cannot tell a container from a "+
-				"neighbour", "bridge", name)
+			logger.Warn(fmt.Sprintf("Containers on this bridge cannot resolve names: it carries the host's "+
+				"default route or is the interface cargowall attaches to, so DNS arriving on it for %s and %s, "+
+				"where daemon.json and the DNS redirect send it, is dropped; on that link cargowall cannot tell a "+
+				"container from a LAN neighbour", ContainerDNSIPv4, ContainerDNSIPv6), "bridge", name)
 		}
 	}
 	return &OwnedAddrs{

@@ -388,17 +388,19 @@ func TestGuardChains(t *testing.T) {
 	admits(t, "arp input", arp[0].rules)
 }
 
-// An uplink that is a Docker bridge, docker0 or br-*, is warned about once
-// at startup, naming it: the guard drops its containers' DNS to the owned
-// addresses. Other bridges, such as Proxmox's vmbr0, are not.
+// An uplink that is a bridge Docker made, docker0 or br- and the 12
+// lowercase hex characters that start a network's ID, is warned about once
+// at startup, naming it and the addresses its containers' DNS goes to. Other
+// bridges, br-* ones and near misses of Docker's naming included, are not.
 func TestOwnedAddrs_DockerBridgeUplinkWarned(t *testing.T) {
 	for _, c := range []struct {
 		uplinks []string
 		warned  []string
 	}{
-		{uplinks: []string{"eth0", "vmbr0", "br0", "bond0"}},
+		{uplinks: []string{"eth0", "vmbr0", "br0", "bond0", "br-ex", "br-lan"}},
+		{uplinks: []string{"br-1a2b3c4d5e6", "br-1A2B3C4D5E6F", "br-1a2b3c4d5e6g", "br-1a2b3c4d5e6f0"}},
 		{uplinks: []string{"eth0", "docker0"}, warned: []string{"docker0"}},
-		{uplinks: []string{"br-1a2b3c", "eno1", "br-ex"}, warned: []string{"br-1a2b3c", "br-ex"}},
+		{uplinks: []string{"br-1a2b3c4d5e6f", "eno1", "br-ex"}, warned: []string{"br-1a2b3c4d5e6f"}},
 	} {
 		var buf bytes.Buffer
 		NewOwnedAddrs(netip.Addr{}, c.uplinks, slog.New(slog.NewTextHandler(&buf, nil)))
@@ -409,6 +411,9 @@ func TestOwnedAddrs_DockerBridgeUplinkWarned(t *testing.T) {
 			if !strings.Contains(buf.String(), "bridge="+name) {
 				t.Errorf("uplinks %v: no warning names %s:\n%s", c.uplinks, name, buf.String())
 			}
+		}
+		if c.warned != nil && !strings.Contains(buf.String(), "for 169.254.0.53 and fd97:d1fb:f215::53") {
+			t.Errorf("uplinks %v: the warning does not name the addresses:\n%s", c.uplinks, buf.String())
 		}
 	}
 }

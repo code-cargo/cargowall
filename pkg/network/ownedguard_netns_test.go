@@ -17,9 +17,12 @@
 package network
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -226,6 +229,50 @@ func TestOwnedAddrs_NotAdvertised(t *testing.T) {
 	assert.False(t, arpFor(net.IP(ContainerDNSIPv4.AsSlice()), absent), "ARP for the guarded IPv4 address")
 	assert.False(t, ndFor(net.IP(ContainerDNSIPv6.AsSlice()), absent), "neighbour discovery for the IPv6 address")
 	assert.True(t, arpFor(net.IPv4(10, 56, 0, 1), arrives), "ARP for the link's own address, guard or none")
+}
+
+// The arp table is best-effort: a kernel without the arp family, here one
+// the kernel refuses standing in for it, or an arp table another live socket
+// owns, leaves the IPv4 address added and guarded by its ip table, with an
+// Info line for the one and a Warn for the other, and Remove takes off what
+// went in.
+func TestOwnedAddrs_ARPGuardBestEffort(t *testing.T) {
+	enterNetns(t)
+	ipOnly := map[string]int{"ip input": 4, "ip forward": 1}
+	for _, c := range []struct {
+		name, level string
+		setup       func(t *testing.T, o *OwnedAddrs)
+	}{
+		{"no arp family", "level=INFO", func(_ *testing.T, o *OwnedAddrs) { o.arpFamily = 0x7f }},
+		{"arp table held", "level=WARN", func(t *testing.T, _ *OwnedAddrs) {
+			requireOwnedTables(t)
+			var msgs []netlink.Message
+			for _, ch := range arpChains(ContainerDNSIPv4, nil) {
+				m, err := chainMsgs(familyARP, GuardTable, ch)
+				require.NoError(t, err)
+				msgs = append(msgs, m...)
+			}
+			conn, _, _, err := installOwnedTable(familyARP, GuardTable, nftTableFOwner, msgs)
+			require.NoError(t, err)
+			t.Cleanup(func() { conn.Close() })
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			owned := NewOwnedAddrs(netip.Addr{}, nil, slog.New(slog.NewTextHandler(&buf, nil)))
+			c.setup(t, owned)
+			before := guardRules(t)
+			require.NoError(t, owned.Add(ContainerDNSIPv4), "the address goes in without its arp table")
+			assert.Contains(t, ownedOnLo(t), ContainerDNSIPv4)
+			want := maps.Clone(ipOnly)
+			maps.Copy(want, before)
+			assert.Equal(t, want, guardRules(t), "the ip table guards it")
+			assert.Contains(t, buf.String(), c.level)
+			assert.Contains(t, buf.String(), "ARP guard")
+			require.NoError(t, owned.Remove())
+			assert.Equal(t, before, guardRules(t), "Remove takes off what went in")
+		})
+	}
 }
 
 // answered reports whether a frame match accepts comes out of tap within

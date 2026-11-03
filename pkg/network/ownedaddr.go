@@ -69,6 +69,10 @@ type OwnedAddrs struct {
 	// NFT_TABLE_F_OWNER, or zero when a test stands in for a kernel without
 	// owned tables.
 	ownerFlag uint32
+	// arpFamily is the family the IPv4 address's arp table is asked for in:
+	// familyARP, or one the kernel refuses when a test stands in for a
+	// kernel without it.
+	arpFamily tableFamily
 	// deleteAddr removes an address from lo: loopbackAddr's RTM_DELADDR, or
 	// a failure when a test stands in for one.
 	deleteAddr func(netip.Addr) error
@@ -89,7 +93,7 @@ type ownedAddr struct {
 // (Uplinks). Register its Remove first.
 func NewOwnedAddrs(upstream netip.Addr, uplinks []string, logger *slog.Logger) *OwnedAddrs {
 	return &OwnedAddrs{
-		upstream: upstream, uplinks: uplinks, logger: logger, ownerFlag: nftTableFOwner,
+		upstream: upstream, uplinks: uplinks, logger: logger, ownerFlag: nftTableFOwner, arpFamily: familyARP,
 		deleteAddr: func(addr netip.Addr) error { return loopbackAddr(unix.RTM_DELADDR, 0, addr, "") },
 	}
 }
@@ -116,7 +120,7 @@ func (o *OwnedAddrs) Add(addr netip.Addr) error {
 	if err != nil {
 		return err
 	}
-	guard, err := installGuard(addr, o.uplinks, o.ownerFlag, o.logger)
+	guard, err := installGuard(addr, o.uplinks, o.ownerFlag, o.arpFamily, o.logger)
 	if err != nil {
 		return fmt.Errorf("its guard cannot be installed (Docker DNS interception needs nf_tables for it): %w", err)
 	}

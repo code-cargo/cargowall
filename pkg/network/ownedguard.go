@@ -32,7 +32,8 @@ import (
 
 // GuardTable names the tables that guard the container DNS addresses
 // cargowall adds to lo, of each address's family: ip for ContainerDNSIPv4,
-// with an arp one beside it, and ip6 for ContainerDNSIPv6. A guard comes and
+// with an arp one beside it where the kernel has the family, and ip6 for
+// ContainerDNSIPv6. A guard comes and
 // goes with its address (OwnedAddrs), whether or not the DNS redirect is in
 // place, and is owned, like the redirect's table, by the socket that made
 // it, so it dies with the process however that ends.
@@ -118,6 +119,8 @@ func guardChains(addr netip.Addr, uplinks []string) []redirectChain {
 // real holder of the address on the link, traffic meant for it. So input
 // admits a request for addr as admitted says. IPv6 needs no such table:
 // neighbour discovery answers only for the receiving link's own addresses.
+// The table is best-effort (installGuard): the ip table is the boundary,
+// and drops what arrives for addr either way.
 func arpChains(addr netip.Addr, uplinks []string) []redirectChain {
 	request := []expr.Any{
 		// hlen and plen: an Ethernet and IPv4 request, which puts the
@@ -171,16 +174,25 @@ type guardTable struct {
 // ownerFlag (zero for unowned): a kernel that refuses the flag, before
 // 5.12, gets them unowned, which a run that dies without removing them
 // leaves until the next run's replace them. A table of the name another
-// live socket owns refuses the install, and a guard is installed whole or
-// not at all.
-func installGuard(addr netip.Addr, uplinks []string, ownerFlag uint32, logger *slog.Logger) (*ownedGuard, error) {
+// live socket owns refuses the install, and the guard's ip or ip6 table is
+// installed or the guard is not. Its arp table, in family arp
+// (familyARP, or one the kernel refuses when a test stands in for a kernel
+// without it), is best-effort: CONFIG_NF_TABLES_ARP is a kernel option of
+// its own, off by default and missing from minimal guest kernels, and ARP
+// answered for the address is hygiene, not a way past the ip table. One
+// that cannot be installed is logged, Info for a kernel without the family
+// and Warn for anything else, and the guard goes without it.
+func installGuard(addr netip.Addr, uplinks []string, ownerFlag uint32, arp tableFamily, logger *slog.Logger) (
+	*ownedGuard, error,
+) {
 	type table struct {
-		fam    tableFamily
-		chains []redirectChain
+		fam        tableFamily
+		chains     []redirectChain
+		bestEffort bool
 	}
-	tables := []table{{familyIP, guardChains(addr, uplinks)}, {familyARP, arpChains(addr, uplinks)}}
+	tables := []table{{familyIP, guardChains(addr, uplinks), false}, {arp, arpChains(addr, uplinks), true}}
 	if addr.Is6() {
-		tables = []table{{familyIP6, guardChains(addr, uplinks)}}
+		tables = []table{{familyIP6, guardChains(addr, uplinks), false}}
 	}
 	g := &ownedGuard{}
 	for _, t := range tables {
@@ -193,6 +205,10 @@ func installGuard(addr netip.Addr, uplinks []string, ownerFlag uint32, logger *s
 			msgs = append(msgs, m...)
 		}
 		conn, owned, refused, err := installOwnedTable(t.fam, GuardTable, ownerFlag, msgs)
+		if err != nil && t.bestEffort {
+			noARPGuard(addr, err, logger)
+			continue
+		}
 		if err != nil {
 			return nil, errors.Join(err, g.remove())
 		}
@@ -203,6 +219,18 @@ func installGuard(addr netip.Addr, uplinks []string, ownerFlag uint32, logger *s
 		g.tables = append(g.tables, guardTable{conn: conn, fam: t.fam, owned: owned})
 	}
 	return g, nil
+}
+
+// noARPGuard logs addr going without its arp table, which err kept out.
+func noARPGuard(addr netip.Addr, err error, logger *slog.Logger) {
+	const cost = "the IP guard still drops what arrives for it, but a neighbour asking for it by ARP gets this host's MAC"
+	if errors.Is(err, unix.EAFNOSUPPORT) || errors.Is(err, unix.EOPNOTSUPP) {
+		logger.Info("The kernel has no nftables arp family (CONFIG_NF_TABLES_ARP), so the container DNS address "+
+			"goes without its ARP guard: "+cost, "addr", addr, "error", err)
+		return
+	}
+	logger.Warn("The container DNS address's ARP guard could not be installed, so it goes without one: "+cost,
+		"addr", addr, "error", err)
 }
 
 // remove deletes the guard's tables and closes the sockets that made them.

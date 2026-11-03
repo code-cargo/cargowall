@@ -144,7 +144,7 @@ func requireNoSource(t *testing.T) {
 func TestOwnedAddrs_RefusedWithoutItsGuard(t *testing.T) {
 	enterNetns(t)
 	requireOwnedTables(t)
-	other, err := installGuard(ContainerDNSIPv4, nil, nftTableFOwner, discardLogger())
+	other, err := installGuard(ContainerDNSIPv4, nil, nftTableFOwner, familyARP, discardLogger())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = other.remove() })
 	owned := NewOwnedAddrs(netip.Addr{}, nil, discardLogger())

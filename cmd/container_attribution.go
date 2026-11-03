@@ -21,6 +21,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"slices"
 
 	"github.com/cilium/ebpf"
 
@@ -272,8 +273,9 @@ func (a *containerAttribution) ensureLoopbackAllowed(configMgr *config.Manager) 
 //
 // Only a daemon that answered is asked for its networks
 // (podenv.Dockerd.Answers, the one ping startup makes), with Docker's
-// bridges or none, and its docker0 is carved from its address too, as host
-// config. With no Docker there is nothing to carve. A daemon that has not
+// bridges or none, and its docker0, where up or the bridges could not be
+// listed, is carved from its address too, as host config. With no Docker
+// there is nothing to carve. A daemon that has not
 // answered, still to come up (Pending) or with no socket to ask
 // (Unreachable), may have containers on its bridges already: dockerd starts
 // a restart-policy container before it serves the API. Each Docker bridge
@@ -312,7 +314,12 @@ func preallowNetworks(ctx context.Context, dockerd podenv.Dockerd, carve func(ne
 		}
 		return
 	}
-	carveBridge("docker0", carve, logger)
+	// docker0 is carved from its address only where it is up, or may be: a
+	// daemon up with its default bridge renamed, --bridge=none or Podman's
+	// socket has none, and the pre-scan carves its default network anyway.
+	if dockerd.BridgesErr != nil || slices.Contains(dockerd.Bridges, "docker0") {
+		carveBridge("docker0", carve, logger)
+	}
 	subnets, err := discoverBridgeSubnets(ctx, "")
 	if err != nil {
 		logger.Warn("Cannot pre-scan bridge subnets; pre-existing user-defined bridges stay adjudicated until tracking starts",

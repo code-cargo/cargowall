@@ -114,7 +114,9 @@ func runPreallow(t *testing.T, dockerd podenv.Dockerd, subnets map[string]string
 }
 
 // Before the hook's mode is raised, a daemon that answered is asked for its
-// networks, and its docker0 is carved from its address too. One that has
+// networks, and its docker0 is carved from its address too, where it is up
+// or the bridges could not be listed: one up with no docker0 (a renamed
+// default bridge, --bridge=none, Podman) reads and warns of none. One that has
 // not, still to come up or with no socket to ask, is never asked, which
 // would cost startup the daemon's silence: each Docker bridge up is carved
 // from its own address instead, a user network's included, since dockerd
@@ -160,6 +162,20 @@ func TestPreallowNetworks(t *testing.T) {
 			name: "up", dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Bridges: both, Answers: true},
 			read: []string{"docker0"}, carved: []netip.Prefix{docker0, discovered}, asked: 1,
 		},
+		{
+			name:    "up, no docker0",
+			dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Bridges: []string{"br-0123456789ab"}, Answers: true},
+			carved:  []netip.Prefix{discovered}, asked: 1,
+		},
+		{
+			name: "up, no bridge", dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Answers: true},
+			carved: []netip.Prefix{discovered}, asked: 1,
+		},
+		{
+			name: "up, bridges not listed", asked: 1,
+			dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, BridgesErr: errors.New("netlink: denied"), Answers: true},
+			read:    []string{"docker0"}, carved: []netip.Prefix{docker0, discovered},
+		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			run := runPreallow(t, c.dockerd, subnets, nil)
@@ -174,9 +190,10 @@ func TestPreallowNetworks(t *testing.T) {
 		})
 	}
 
-	renamed := runPreallow(t, podenv.Dockerd{Kind: podenv.DockerdLocal, Answers: true}, nil, nil)
-	assert.Contains(t, renamed.log, "Docker bridge subnet not discovered", "an up daemon's docker0 is looked for")
-	assert.Equal(t, []netip.Prefix{discovered}, renamed.carved, "and its networks carved without it")
+	unlisted := podenv.Dockerd{Kind: podenv.DockerdLocal, BridgesErr: errors.New("netlink: denied"), Answers: true}
+	missing := runPreallow(t, unlisted, nil, nil)
+	assert.Contains(t, missing.log, "Docker bridge subnet not discovered", "with the bridges unknown, docker0 is looked for")
+	assert.Equal(t, []netip.Prefix{discovered}, missing.carved, "and the networks carved without it")
 
 	pending := podenv.Dockerd{Kind: podenv.DockerdLocal, Bridges: []string{"docker0"}}
 	failed := runPreallow(t, pending, subnets, errors.New("map full"))

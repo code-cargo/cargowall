@@ -29,7 +29,6 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
-	"time"
 
 	"github.com/code-cargo/cargowall/pkg/origin"
 )
@@ -114,10 +113,11 @@ func collectSubnets(insp containerInspect) []localSubnet {
 // interface enumeration, map write — leaves the subnet unstamped so the
 // network's next container retries. A non-bridge resolution is also NOT
 // stamped: it is a decision about the network, not the prefix, and lives
-// in the driver cache (see the comment at the gate below).
-func (t *Tracker) carvePrefix(ctx context.Context, networkName string, prefix netip.Prefix) {
+// in the driver cache (see the comment at the gate below). It reports
+// whether it carved the prefix now.
+func (t *Tracker) carvePrefix(ctx context.Context, networkName string, prefix netip.Prefix) bool {
 	if t.opts.AllowLocalSubnet == nil {
-		return
+		return false
 	}
 	prefix = prefix.Masked()
 	key := prefix.String()
@@ -125,7 +125,7 @@ func (t *Tracker) carvePrefix(ctx context.Context, networkName string, prefix ne
 	seen := t.seenSubnets[key]
 	t.mu.Unlock()
 	if seen {
-		return
+		return false
 	}
 
 	name := networkName
@@ -142,7 +142,7 @@ func (t *Tracker) carvePrefix(ctx context.Context, networkName string, prefix ne
 		if err != nil {
 			t.logger.Warn("Cannot inspect network for subnet carve-out; subnet stays adjudicated for now",
 				"network", name, "subnet", key, "error", err)
-			return
+			return false
 		}
 		isBridge = nw.Driver == "bridge"
 		t.mu.Lock()
@@ -162,7 +162,7 @@ func (t *Tracker) carvePrefix(ctx context.Context, networkName string, prefix ne
 		// re-evaluate then. The driver cache keeps the repeat cost at a map
 		// hit, and its destroy-eviction / reconcile-clear is the recovery
 		// point a prefix-keyed stamp would not have.
-		return
+		return false
 	}
 
 	if err := t.opts.AllowLocalSubnet(prefix); err != nil {
@@ -170,15 +170,54 @@ func (t *Tracker) carvePrefix(ctx context.Context, networkName string, prefix ne
 			t.mu.Lock()
 			t.seenSubnets[key] = true
 			t.mu.Unlock()
-			return
+			return false
 		}
 		t.logger.Warn("Local subnet carve-out failed; will retry on the network's next container",
 			"subnet", key, "error", err)
-		return
+		return false
 	}
 	t.mu.Lock()
 	t.seenSubnets[key] = true
 	t.mu.Unlock()
+	return true
+}
+
+// carveNetworks carves every bridge network's subnets, the default bridge
+// network's included, from one list of the daemon's networks, and caches
+// each network's driver on the way, so carvePrefix inspects none of them.
+// It runs at the top of every session (reconcile): the first, before any
+// container of a daemon that came up after cargowall can have produced
+// traffic but for the window between its coming up and that first list,
+// and every later one, which picks up networks created during a stream
+// gap. It returns the prefixes it carved now.
+func (t *Tracker) carveNetworks(ctx context.Context) []netip.Prefix {
+	if t.opts.AllowLocalSubnet == nil {
+		return nil
+	}
+	lctx, cancel := context.WithTimeout(ctx, unaryTimeout)
+	nets, err := t.client.listNetworks(lctx)
+	cancel()
+	if err != nil {
+		t.logger.Warn("Cannot list networks for subnet carve-outs; they wait for each network's containers",
+			"error", err)
+		return nil
+	}
+	var carved []netip.Prefix
+	for _, nw := range nets {
+		isBridge := nw.Driver == "bridge"
+		t.mu.Lock()
+		t.netDrivers[nw.Name] = isBridge
+		t.mu.Unlock()
+		if !isBridge {
+			continue
+		}
+		for _, cfg := range nw.IPAM.Config {
+			if prefix, perr := netip.ParsePrefix(cfg.Subnet); perr == nil && t.carvePrefix(ctx, nw.Name, prefix) {
+				carved = append(carved, prefix.Masked())
+			}
+		}
+	}
+	return carved
 }
 
 // handleNetworkCreate carves a just-created bridge network's subnets
@@ -326,12 +365,6 @@ func DiscoverBridgeSubnets(ctx context.Context, socket string) ([]netip.Prefix, 
 		socket = "/var/run/docker.sock"
 	}
 	c := newDockerClient(socket)
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	err := c.ping(pingCtx)
-	cancel()
-	if err != nil {
-		return nil, fmt.Errorf("docker daemon unreachable: %w", err)
-	}
 	lctx, cancel := context.WithTimeout(ctx, unaryTimeout)
 	nets, err := c.listNetworks(lctx)
 	cancel()

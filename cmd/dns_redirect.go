@@ -43,7 +43,8 @@ import (
 // reports it. A redirect that covers IPv4 but not the IPv6 the host has is
 // a loss too: IPv6 DNS then goes around the proxy the same way. So is one
 // that leaves container DNS alone for want of the proxy's container
-// listener: containers then resolve around the proxy.
+// listener, wherever Docker could be present: containers then resolve
+// around the proxy.
 type dnsRedirect struct {
 	active bool  // the redirect is in place, for the host's IPv4 at least
 	err    error // why it is not, or not whole; nil when it is whole
@@ -92,8 +93,12 @@ func ipv6Gap(bindErr, refused error, hostIPv6 func() bool) string {
 // redirect then leaves that family's container DNS alone
 // (dockerDNS.listeningIP). The IPv6 one counts only where the redirect
 // covers IPv6 (ipv6); where it does not, ipv6Gap speaks for the host and its
-// containers alike.
+// containers alike. On a host with no Docker neither counts: there is no
+// container DNS to cover at startup (dockerDNS.noDocker).
 func containerGap(containerDNS *dockerDNS, ipv6 bool) string {
+	if containerDNS.noDocker() {
+		return ""
+	}
 	addrs := []netip.Addr{network.ContainerDNSIPv4}
 	if ipv6 {
 		addrs = append(addrs, network.ContainerDNSIPv6)

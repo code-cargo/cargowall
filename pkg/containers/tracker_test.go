@@ -195,9 +195,19 @@ type fakeDaemon struct {
 	networkInspects int
 
 	eventCh chan dockerEvent
+	// endCh ends the event stream being served, as a daemon that goes
+	// away does (endStream).
+	endCh chan struct{}
 }
 
 func newFakeDaemon(t *testing.T) *fakeDaemon {
+	t.Helper()
+	return newFakeDaemonAfter(t, nil)
+}
+
+// newFakeDaemonAfter is newFakeDaemon for a daemon that answers only once
+// ready closes (startUnixServerAfter).
+func newFakeDaemonAfter(t *testing.T, ready <-chan struct{}) *fakeDaemon {
 	t.Helper()
 	d := &fakeDaemon{
 		containers:   make(map[string]containerInspect),
@@ -208,6 +218,7 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		inspects:     make(map[string]int),
 		networks:     make(map[string]networkInspect),
 		eventCh:      make(chan dockerEvent, 16),
+		endCh:        make(chan struct{}, 1),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_ping", func(w http.ResponseWriter, _ *http.Request) {
@@ -272,7 +283,7 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		}
 		_ = json.NewEncoder(w).Encode(nw)
 	})
-	d.sock = startUnixServer(t, mux)
+	d.sock = startUnixServerAfter(t, mux, ready)
 	return d
 }
 
@@ -308,11 +319,16 @@ func (d *fakeDaemon) serveEvents(w http.ResponseWriter, r *http.Request) {
 		case ev := <-d.eventCh:
 			_ = enc.Encode(ev)
 			fl.Flush()
+		case <-d.endCh:
+			return
 		case <-r.Context().Done():
 			return
 		}
 	}
 }
+
+// endStream ends the event stream being served, or the next one.
+func (d *fakeDaemon) endStream() { d.endCh <- struct{}{} }
 
 func (d *fakeDaemon) setContainer(insp containerInspect) {
 	d.mu.Lock()
@@ -432,6 +448,8 @@ type fixture struct {
 	cgroupRoot string
 	// allowLocal, when set before start, becomes Options.AllowLocalSubnet.
 	allowLocal func(netip.Prefix) error
+	// onConnect, when set before start, becomes Options.OnConnect.
+	onConnect func(first bool, carved []netip.Prefix)
 	// logs holds the tracker's log, Debug included.
 	logs *lockedBuffer
 }
@@ -480,6 +498,7 @@ func (f *fixture) start(t *testing.T) {
 		ProcRoot:         f.procRoot,
 		CgroupRoot:       f.cgroupRoot,
 		AllowLocalSubnet: f.allowLocal,
+		OnConnect:        f.onConnect,
 	}, f.tagger, nil, auditLogger, slog.New(slog.NewTextHandler(f.logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	require.NoError(t, err)
 	f.tracker = tr
@@ -513,13 +532,19 @@ func (f *fixture) waitAttribution(t *testing.T, kind, containerID string) events
 	return got
 }
 
-func TestStartFailsWithoutDaemon(t *testing.T) {
-	// No socket means no daemon: the caller must get an error to degrade
-	// on, never a tracker that spins.
-	_, err := Start(context.Background(), Options{
+// Start does not wait for a daemon, nor complain of one not up yet: with no
+// socket it returns a tracker that retries, logging that at Debug alone,
+// and closes cleanly.
+func TestStartWithoutDaemonStaysQuiet(t *testing.T) {
+	logs := &lockedBuffer{}
+	tr, err := Start(context.Background(), Options{
 		Socket: filepath.Join(t.TempDir(), "none.sock"),
-	}, &fakeTagger{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	require.ErrorContains(t, err, "docker daemon unreachable")
+	}, &fakeTagger{}, nil, nil, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return strings.Contains(logs.String(), "Docker daemon not answering yet") },
+		waitFor, tick)
+	tr.Close()
+	assert.NotContains(t, logs.String(), "level=WARN", "a daemon not up yet is no news")
 }
 
 func TestStartEventTagsAndIndexes(t *testing.T) {

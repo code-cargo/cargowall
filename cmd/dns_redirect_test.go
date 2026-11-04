@@ -30,6 +30,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"github.com/code-cargo/cargowall/pkg/podenv"
 )
 
 // listenErr is a bind failure as the proxy reports it (dns.Server's
@@ -181,6 +183,68 @@ func TestDNSRedirect_PartialIsALoss(t *testing.T) {
 	whole := installed("", "", logger)
 	assert.True(t, whole.isActive())
 	assert.NoError(t, whole.settle(nil), "a whole redirect has nothing to report")
+}
+
+// A container listener the proxy could not bind costs the dns-redirect
+// posture only where Docker could be present. With no socket and no bridge
+// there is no container DNS to cover at startup, so neither family's
+// refusal is a loss, under an enforcing policy or an auditing one.
+// A daemon still to come up, one up, bridges with no socket, and bridges
+// that could not be listed all still lose it to host: fatal under an
+// enforcing policy, recorded under an auditing one.
+func TestDNSRedirect_ContainerGapNeedsDocker(t *testing.T) {
+	routed6 := errors.New("it is routed through tun0 by fd97:d1fb:f215::/48")
+	for _, c := range []struct {
+		name    string
+		dockerd podenv.Dockerd
+		lost    bool
+	}{
+		{name: "none", dockerd: podenv.Dockerd{Kind: podenv.DockerdAbsent}},
+		{name: "pending", dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal}, lost: true},
+		{name: "up", dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Bridges: []string{"docker0"}, Answers: true}, lost: true},
+		{name: "up, no bridge", dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Answers: true}, lost: true},
+		{name: "unreachable", dockerd: podenv.Dockerd{Kind: podenv.DockerdAbsent, Bridges: []string{"docker0"}}, lost: true},
+		{
+			name: "bridges not listed", lost: true,
+			dockerd: podenv.Dockerd{Kind: podenv.DockerdAbsent, BridgesErr: errors.New("netlink: permission denied")},
+		},
+	} {
+		for _, refused := range []struct {
+			family string
+			errs   bindErrs
+		}{
+			{"IPv4", bindErrs{listen4: errRefused4}},
+			{"IPv6", bindErrs{listen6: routed6}},
+		} {
+			for _, enforcing := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%s/%s/enforcing=%v", c.name, refused.family, enforcing), func(t *testing.T) {
+					d := &dockerDNS{dockerd: c.dockerd, proxy: refused.errs}
+					ipv6, container := redirectGaps(nil, nil, func() bool { return true }, d)
+					assert.Empty(t, ipv6)
+					r := installed(ipv6, container, slog.New(slog.DiscardHandler))
+					redirectStateFiles(t)
+					cmd := &StartCmd{DNSRedirect: true}
+					p := newPostures(cmd, "6.6.141", enforcing, slog.New(slog.DiscardHandler))
+					err := r.settle(p)
+					line := p.lines()[0]
+					if !c.lost {
+						require.NoError(t, err)
+						assert.False(t, line.degraded(), "no Docker, so no container DNS to cover: %+v", line)
+						assert.Empty(t, cmd.refusedPosture)
+						return
+					}
+					if enforcing {
+						require.ErrorContains(t, err, "--dns-redirect=true requested but applied only as host: ")
+						assert.Equal(t, postureDNSRedirect, cmd.refusedPosture)
+					} else {
+						require.NoError(t, err)
+					}
+					assert.Equal(t, dnsRedirectHost, line.Applied)
+					assert.Contains(t, line.Reason, "container DNS is not redirected: ")
+				})
+			}
+		}
+	}
 }
 
 // IPv6 is covered, and the IPv6 container listener's gap counts with it,

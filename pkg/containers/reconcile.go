@@ -23,6 +23,7 @@ package containers
 
 import (
 	"context"
+	"net/netip"
 	"sync"
 )
 
@@ -38,19 +39,23 @@ import (
 // dockerd restart empties the daemon's event buffer). Without the removal
 // its stale byIP entry keeps answering DNS attribution lookups, crediting
 // whatever later occupies that bridge address to a dead container.
-func (t *Tracker) reconcile(ctx context.Context) {
+//
+// Before either, it carves every bridge network's subnets (carveNetworks),
+// and returns the prefixes carved.
+func (t *Tracker) reconcile(ctx context.Context) []netip.Prefix {
 	// The network-driver cache can be stale across a stream gap (a destroy
 	// whose event was lost, then a same-name recreate with a different
 	// driver); reconcile is the recovery point for exactly that class, so
-	// the cache resets here and rebuilds on demand.
+	// the cache resets here and rebuilds, from the network list first.
 	t.mu.Lock()
 	clear(t.netDrivers)
 	t.mu.Unlock()
+	carved := t.carveNetworks(ctx)
 
 	list, err := t.client.listContainers(ctx)
 	if err != nil {
 		t.logger.Warn("Cannot list containers for reconciliation", "error", err)
-		return
+		return carved
 	}
 	live := make(map[string]bool, len(list))
 	for _, c := range list {
@@ -132,7 +137,7 @@ func (t *Tracker) reconcile(ctx context.Context) {
 	if len(list) == 0 && tracked > 0 {
 		t.logger.Warn("Reconciliation list empty while containers are tracked; keeping indexes (initializing daemon?)",
 			"tracked", tracked)
-		return
+		return carved
 	}
 
 	// Absence must be seen on TWO consecutive passes before the sweep
@@ -171,4 +176,5 @@ func (t *Tracker) reconcile(ctx context.Context) {
 		}
 	}
 	t.mu.Unlock()
+	return carved
 }

@@ -37,12 +37,28 @@ import (
 // is 104/108 bytes and the temp dir already spends most of that budget.
 func startUnixServer(t *testing.T, handler http.Handler) string {
 	t.Helper()
+	return startUnixServerAfter(t, handler, nil)
+}
+
+// startUnixServerAfter is startUnixServer for a daemon that answers only
+// once ready closes, nil for at once: its socket listens from the start,
+// so connections queue unanswered, as a socket-activated daemon's do.
+func startUnixServerAfter(t *testing.T, handler http.Handler, ready <-chan struct{}) string {
+	t.Helper()
 	sock := filepath.Join(t.TempDir(), "d.sock")
 	ln, err := net.Listen("unix", sock)
 	require.NoError(t, err)
 	srv := &http.Server{Handler: handler}
-	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() { _ = srv.Close() })
+	go func() {
+		if ready != nil {
+			<-ready
+		}
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		_ = ln.Close()
+	})
 	return sock
 }
 

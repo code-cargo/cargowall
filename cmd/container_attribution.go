@@ -21,6 +21,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"slices"
 
 	"github.com/cilium/ebpf"
 
@@ -269,25 +270,59 @@ func (a *containerAttribution) ensureLoopbackAllowed(configMgr *config.Manager) 
 // tracking starts only after the dockerd restart, and service containers or
 // compose stacks must not lose bridge-local traffic to enforce-mode EPERM
 // (or pollute shadow telemetry with false would-blocks) in that window.
-func (a *containerAttribution) preallowLocalNetworks(ctx context.Context) {
+//
+// Only a daemon that answered is asked for its networks
+// (podenv.Dockerd.Answers, the one ping startup makes), with Docker's
+// bridges or none, and its docker0, where up or the bridges could not be
+// listed, is carved from its address too, as host config. With no Docker
+// there is nothing to carve. A daemon that has not
+// answered, still to come up (Pending) or with no socket to ask
+// (Unreachable), may have containers on its bridges already: dockerd starts
+// a restart-policy container before it serves the API. Each Docker bridge
+// up at startup is then carved here from its own address, docker0 alone
+// when they could not be listed, and once a pending daemon answers the
+// tracker's first session carves every bridge network.
+func (a *containerAttribution) preallowLocalNetworks(ctx context.Context, dockerd podenv.Dockerd) {
 	if a == nil || a.observer == nil || a.mode == origin.ModeObserve {
 		return
 	}
-	if subnet, err := network.GetDockerBridgeSubnet(); err == nil {
-		if prefix, perr := netip.ParsePrefix(subnet); perr == nil {
-			if aerr := a.allowLocalNetwork(prefix); aerr != nil && !errors.Is(aerr, origin.ErrLocalNetworkRefused) {
-				a.logger.Warn("Default bridge carve-out failed", "subnet", subnet, "error", aerr)
-			}
-		}
-	} else {
-		// Warn, not Debug: under shadow/enforce this carve-out is what keeps
-		// published ports and default-bridge container traffic alive.
-		a.logger.Warn("Docker bridge subnet not discovered; default-bridge traffic stays adjudicated",
-			"error", err)
+	preallowNetworks(ctx, dockerd, a.allowLocalNetwork, a.logger)
+}
+
+// bridgeSubnet and discoverBridgeSubnets read one bridge's IPv4 network
+// from its address, and every bridge network's from the daemon:
+// network.BridgeSubnet and containers.DiscoverBridgeSubnets, or a test's
+// stand-ins.
+var (
+	bridgeSubnet          = network.BridgeSubnet
+	discoverBridgeSubnets = containers.DiscoverBridgeSubnets
+)
+
+// preallowNetworks is preallowLocalNetworks' carving, with carve writing
+// one subnet's carve-out.
+func preallowNetworks(ctx context.Context, dockerd podenv.Dockerd, carve func(netip.Prefix) error, logger *slog.Logger) {
+	if dockerd.None() {
+		return
 	}
-	subnets, err := containers.DiscoverBridgeSubnets(ctx, "")
+	if !dockerd.Answers {
+		bridges := dockerd.Bridges
+		if dockerd.BridgesErr != nil {
+			bridges = []string{"docker0"}
+		}
+		for _, name := range bridges {
+			carveBridge(name, carve, logger)
+		}
+		return
+	}
+	// docker0 is carved from its address only where it is up, or may be: a
+	// daemon up with its default bridge renamed, --bridge=none or Podman's
+	// socket has none, and the pre-scan carves its default network anyway.
+	if dockerd.BridgesErr != nil || slices.Contains(dockerd.Bridges, "docker0") {
+		carveBridge("docker0", carve, logger)
+	}
+	subnets, err := discoverBridgeSubnets(ctx, "")
 	if err != nil {
-		a.logger.Warn("Cannot pre-scan bridge subnets; pre-existing user-defined bridges stay adjudicated until tracking starts",
+		logger.Warn("Cannot pre-scan bridge subnets; pre-existing user-defined bridges stay adjudicated until tracking starts",
 			"error", err)
 		return
 	}
@@ -295,9 +330,24 @@ func (a *containerAttribution) preallowLocalNetworks(ctx context.Context) {
 		// Refusals are the policy's decision and already logged by the
 		// write; transient failures are warned and left for the tracker's
 		// discovery paths to retry.
-		if err := a.allowLocalNetwork(prefix); err != nil && !errors.Is(err, origin.ErrLocalNetworkRefused) {
-			a.logger.Warn("Bridge subnet carve-out failed; tracking will retry", "subnet", prefix.String(), "error", err)
+		if err := carve(prefix); err != nil && !errors.Is(err, origin.ErrLocalNetworkRefused) {
+			logger.Warn("Bridge subnet carve-out failed; tracking will retry", "subnet", prefix.String(), "error", err)
 		}
+	}
+}
+
+// carveBridge carves out the bridge called name's IPv4 network, read from
+// its address. Warn, not Debug, when it cannot be: under shadow/enforce
+// this carve-out is what keeps published ports and the bridge's container
+// traffic alive.
+func carveBridge(name string, carve func(netip.Prefix) error, logger *slog.Logger) {
+	subnet, err := bridgeSubnet(name)
+	if err != nil {
+		logger.Warn("Docker bridge subnet not discovered; its traffic stays adjudicated", "bridge", name, "error", err)
+		return
+	}
+	if err := carve(subnet); err != nil && !errors.Is(err, origin.ErrLocalNetworkRefused) {
+		logger.Warn("Docker bridge carve-out failed", "bridge", name, "subnet", subnet.String(), "error", err)
 	}
 }
 
@@ -333,23 +383,40 @@ func (a *containerAttribution) subnetCarver(allow func(prefix netip.Prefix) erro
 
 // startUserspace is the late phase: docker-events tracking, tagging, DNS
 // client attribution (only meaningful when the proxy holds a container
-// listener, containerDNS), and bridge-subnet discovery (allowLocalSubnet,
-// may be nil).
-func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dns.Server, containerDNS bool, auditLogger *events.AuditLogger, allowLocalSubnet func(prefix netip.Prefix) error) {
-	if a == nil {
-		return
+// listener, containerDNS), and bridge-subnet discovery for the hook. It
+// reports whether a tracker started: none on a host with no Docker, and
+// none for bridges with no socket to ask about them, which is warned. A
+// tracker for a Docker still to come up connects once it answers, and
+// docker logs that (dockerUp.connected).
+func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dns.Server, containerDNS bool,
+	auditLogger *events.AuditLogger, docker *dockerUp,
+) bool {
+	switch {
+	case a == nil || docker.dockerd.None():
+		return false
+	case docker.dockerd.Unreachable():
+		a.logger.Warn("Container attribution disabled: there is no Docker socket to ask about containers on its "+
+			"bridges, which are up or could not be listed", "socket", dockerSocket, "bridges", docker.dockerd.Bridges,
+			"bridges_error", docker.dockerd.BridgesErr)
+		return false
 	}
-	ctr, err := containers.Start(ctx, containers.Options{AllowLocalSubnet: a.subnetCarver(allowLocalSubnet)}, a.stepTracker, a.observer, auditLogger, a.logger)
+	ctr, err := containers.Start(ctx, containers.Options{
+		AllowLocalSubnet: a.subnetCarver(a.allowLocalNetwork),
+		OnConnect:        docker.connected,
+	}, a.stepTracker, a.observer, auditLogger, a.logger)
 	if err != nil {
 		a.logger.Warn("Container attribution disabled", "error", err)
-		return
+		return false
 	}
 	a.tracker = ctr
 	a.enricher.Bind(ctr)
 	if dnsServer != nil && containerDNS {
 		dnsServer.SetContainerLookup(ctr.LookupClient)
 	}
-	a.logger.Info("Container attribution enabled")
+	if !docker.dockerd.Pending() {
+		a.logger.Info("Container attribution enabled")
+	}
+	return true
 }
 
 // Close stops the tracker before the observer: the tracker's shutdown

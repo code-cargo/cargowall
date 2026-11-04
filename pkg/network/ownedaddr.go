@@ -91,10 +91,12 @@ type ownedAddr struct {
 // NewOwnedAddrs returns the addresses to Add, for a proxy whose upstream is
 // upstream (the zero Addr for none), on a host whose uplinks are uplinks
 // (Uplinks). Register its Remove first. An uplink that is a Docker bridge,
-// which the guards drop on, is warned about here, once (dockerBridgeUplink).
+// which the guards drop on, is warned about here, once (DockerBridge): a
+// default route or a TC interface there puts the guard's uplink drop ahead of
+// its containers' DNS.
 func NewOwnedAddrs(upstream netip.Addr, uplinks []string, logger *slog.Logger) *OwnedAddrs {
 	for _, name := range uplinks {
-		if dockerBridgeUplink(name) {
+		if DockerBridge(name) {
 			logger.Warn(fmt.Sprintf("Containers on this bridge cannot resolve names: it carries the host's "+
 				"default route or is the interface cargowall attaches to, so DNS arriving on it for %s and %s, "+
 				"where daemon.json and the DNS redirect send it, is dropped; on that link cargowall cannot tell a "+

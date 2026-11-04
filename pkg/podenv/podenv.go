@@ -691,6 +691,7 @@ func (s Shape) LogArgs() []any {
 		"dockerd", s.Dockerd.Kind.String(), "dockerd_reason", s.Dockerd.Reason,
 		"dockerd_cgroup", s.Dockerd.Cgroup, "dockerd_cgroup_driver", s.Dockerd.CgroupDriver,
 		"dockerd_container_tree", s.Dockerd.ContainerTree, "dockerd_runtime", s.Dockerd.Runtime,
+		"docker_bridges", s.Dockerd.Bridges, "dockerd_answers", s.Dockerd.Answers,
 		"docker_host", s.DockerHost, "docker_host_setting", s.DockerHostSetting,
 		"docker_host_reason", s.DockerHostReason, "kernel", s.Kernel,
 		"socket_cgroups", s.SocketCgroups.String(), "socket_cgroups_reason", s.SocketCgroupsReason,
@@ -767,6 +768,7 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 	if private && visible {
 		s.Dockerd.probeContainerTree(dockerSocket)
 	}
+	s.Dockerd.probeUp(dockerSocket)
 	if private && s.CgroupPath != "" && s.CgroupPath != "/" && s.PidNS == PidNSPrivate && !s.inPod() {
 		s.CgroupTree, s.CgroupTreeReason = probeCgroupTree(CgroupRoot)
 	} else {

@@ -275,5 +275,5 @@ func TestDiscoverBridgeSubnets(t *testing.T) {
 
 func TestDiscoverBridgeSubnets_DaemonUnreachable(t *testing.T) {
 	_, err := DiscoverBridgeSubnets(context.Background(), filepath.Join(t.TempDir(), "none.sock"))
-	require.ErrorContains(t, err, "docker daemon unreachable")
+	require.ErrorContains(t, err, "list networks")
 }

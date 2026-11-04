@@ -102,7 +102,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 }
 
 func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) error {
-	logger := cmd.Logger
+	logger, began := cmd.Logger, time.Now()
 
 	// Clear stale state files from a previous run FIRST, before any fallible
 	// startup work. These files are how the action observes this process:
@@ -248,11 +248,11 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		os.Exit(1)
 	}()
 
-	// What container this runs in decides whether the daemon's config is
-	// ours to rewrite and whether the cgroup hook would judge only this
-	// job (see podenv.Shape.HookScope).
+	// What container this runs in decides whether the daemon's config is ours to rewrite, whether
+	// the cgroup hook would judge only this job (podenv.Shape.HookScope), and what waits on Docker.
 	shape := podenv.Detect(dockerSocket, caps.KernelVersion, cmd.ContainerEgress != ContainerEgressOff)
-	logger.Info("Runtime environment", shape.LogArgs()...)
+	docker := newDockerUp(shape, cmd, began, logger)
+	defer docker.close()
 
 	var dnsServer *dns.Server
 	var containerDNS *dockerDNS
@@ -791,7 +791,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// bridge, bridges of pre-existing containers) are carved out first, for
 	// the same reason the allowlist is: the hook must be correct from its
 	// first adjudicated packet.
-	attribution.preallowLocalNetworks(ctx)
+	attribution.preallowLocalNetworks(ctx, shape.Dockerd)
 	// L7 rides the same hook but its gate is its own map key, and the kernel's
 	// L7 drop keys off the L7 mode and audit_mode_active() — never ORIGIN_MODE
 	// — so a failed origin SetMode says nothing about whether L7 can
@@ -871,7 +871,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// of the cgroup hook only (one LPM write — cheap enough for the event
 	// stream goroutine), never added to the shared policy: TC's off-host
 	// enforcement must be un-widenable by workload-influenced input.
-	attribution.startUserspace(ctx, dnsServer, containerDNS.serving(), auditLogger, attribution.allowLocalNetwork)
+	docker.track(ctx, attribution, dnsServer, containerDNS.serving(), auditLogger)
 
 	if startupInterrupted(ctx, logger, "pre-ready") {
 		return nil
@@ -1051,7 +1051,7 @@ func startupInterrupted(ctx context.Context, logger *slog.Logger, phase string) 
 // removeStaleStateFiles clears the state files a previous run may have left
 // behind, warning (not failing) on anything but absence.
 func removeStaleStateFiles(cmd *StartCmd, logger *slog.Logger) {
-	for _, path := range []string{cmd.ReadyFile, cmd.FailureFile, modeFile, downgradeFile, posturesFile} {
+	for _, path := range []string{cmd.ReadyFile, cmd.FailureFile, modeFile, downgradeFile, posturesFile, dockerFile} {
 		if path == "" {
 			continue
 		}

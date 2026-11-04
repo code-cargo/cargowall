@@ -96,14 +96,19 @@ type useListenerRun struct {
 	log         string
 }
 
-// runUseListener runs useListener for a daemon of the given kind whose
-// proxy failed to bind what errs names; leftover is whether daemon.json
-// holds a rewrite a previous run left.
+// runUseListener runs useListener for an answering daemon of the given kind
+// whose proxy failed to bind what errs names; leftover is whether
+// daemon.json holds a rewrite a previous run left.
 func runUseListener(kind podenv.DockerdKind, errs bindErrs, redirect, leftover bool) *useListenerRun {
+	return runUseListenerFor(podenv.Dockerd{Kind: kind, Answers: true}, errs, redirect, leftover)
+}
+
+// runUseListenerFor is runUseListener for the daemon dockerd describes.
+func runUseListenerFor(dockerd podenv.Dockerd, errs bindErrs, redirect, leftover bool) *useListenerRun {
 	run := &useListenerRun{teardowns: &teardownList{}}
 	var buf bytes.Buffer
 	run.d = &dockerDNS{
-		dockerd: podenv.Dockerd{Kind: kind},
+		dockerd: dockerd,
 		proxy:   errs,
 		configure: func(dnsIP string, _ *slog.Logger) error {
 			run.configured = append(run.configured, dnsIP)
@@ -194,12 +199,76 @@ func TestDockerDNS_UseListenerUnbound(t *testing.T) {
 	}
 }
 
+// On a host with no Docker, a container listener the proxy could not bind
+// is no warning: one Info names each unheld address with its reason, and
+// says it does not count unless Docker is started later, the dns-redirect
+// posture kept when the redirect is requested. Docker that could be present, as bridges with no
+// socket or bridges that could not be listed, still warns.
+func TestDockerDNS_UseListenerNoDocker(t *testing.T) {
+	routed6 := errors.New("it is routed through tun0 by fd97:d1fb:f215::/48")
+	none := podenv.Dockerd{Kind: podenv.DockerdAbsent}
+	for _, c := range []struct {
+		name   string
+		errs   bindErrs
+		unheld []string
+	}{
+		{name: "IPv4", errs: bindErrs{listen4: errRefused4}, unheld: []string{"169.254.0.53:53: it is already assigned to eth0"}},
+		{name: "IPv6", errs: bindErrs{listen6: routed6}, unheld: []string{"[fd97:d1fb:f215::53]:53: it is routed through tun0"}},
+		{
+			name: "both", errs: bindErrs{listen4: errRefused4, listen6: routed6},
+			unheld: []string{"169.254.0.53:53: it is already assigned to eth0", "[fd97:d1fb:f215::53]:53: it is routed"},
+		},
+	} {
+		for _, redirect := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/redirect=%v", c.name, redirect), func(t *testing.T) {
+				run := runUseListenerFor(none, c.errs, redirect, false)
+				assert.NotContains(t, run.log, "level=WARN")
+				require.Equal(t, 1, strings.Count(run.log, "does not count"), run.log)
+				assert.Contains(t, run.log, "level=INFO msg=\"Container DNS listener not held, which does not count: "+
+					"there was no Docker socket or bridge at startup, so it costs nothing unless Docker is started later")
+				for _, u := range c.unheld {
+					assert.Contains(t, run.log, u)
+				}
+				assert.Equal(t, redirect, strings.Contains(run.log, "the dns-redirect posture is kept"))
+				assert.Empty(t, run.configured)
+				assert.Zero(t, run.recoveries)
+			})
+		}
+	}
+	assert.NotContains(t, runUseListenerFor(none, bindErrs{}, true, false).log, "not held", "nothing unheld, nothing to say")
+
+	for _, dockerd := range []podenv.Dockerd{
+		{Kind: podenv.DockerdAbsent, Bridges: []string{"docker0"}},
+		{Kind: podenv.DockerdAbsent, BridgesErr: errors.New("netlink: permission denied")},
+	} {
+		run := runUseListenerFor(dockerd, bindErrs{listen4: errRefused4}, true, false)
+		assert.Contains(t, run.log, "level=WARN", "%+v", dockerd)
+		assert.Contains(t, run.log, "a lost dns-redirect posture")
+		assert.NotContains(t, run.log, "does not count")
+	}
+}
+
+// A local daemon still to come up is left alone, a previous run's
+// leftover in its daemon.json included, whether its listener holds or
+// not: nothing is rewritten or undone, and no restart is due.
+func TestDockerDNS_UseListenerPending(t *testing.T) {
+	pending := podenv.Dockerd{Kind: podenv.DockerdLocal}
+	for _, errs := range []bindErrs{{}, {listen4: errRefused4}} {
+		run := runUseListenerFor(pending, errs, true, true)
+		assert.Empty(t, run.configured)
+		assert.Zero(t, run.recoveries, "a pending daemon's leftover is left too")
+		assert.False(t, run.d.restart)
+		assert.Empty(t, run.teardowns.fns)
+		assert.NotContains(t, run.log, "not proven local")
+	}
+}
+
 // A leftover that cannot be undone is warned, and no restart is due for
 // it.
 func TestDockerDNS_RecoverLeftoverFails(t *testing.T) {
 	var buf bytes.Buffer
 	d := &dockerDNS{
-		dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal},
+		dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Answers: true},
 		proxy:   bindErrs{listen4: errRefused4},
 		recover: func(*slog.Logger) (bool, error) { return false, fmt.Errorf("read-only /etc/docker") },
 		logger:  slog.New(slog.NewTextHandler(&buf, nil)),

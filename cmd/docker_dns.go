@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 
 	"github.com/code-cargo/cargowall/pkg/dns"
 	"github.com/code-cargo/cargowall/pkg/network"
@@ -119,20 +120,33 @@ func startDockerDNS(cmd *StartCmd, dnsServer *dns.Server, dockerd podenv.Dockerd
 // daemon.json; the caller defers it. It is registered before the rewrite,
 // so a signal landing mid-write still has one: the second-signal path runs
 // it on another goroutine, and pkg/network serializes the two, so it either
-// undoes a finished rewrite or stops one from starting. Nil-safe.
+// undoes a finished rewrite or stops one from starting. A daemon still to
+// come up (podenv.Dockerd.Pending) is left alone, a previous run's leftover
+// in its daemon.json included: no restart is due for it (see dockerUp). On
+// a host with no Docker (noDocker), a listener the proxy could not bind
+// costs nothing, and an Info says so in place of the warning. Nil-safe.
 func (d *dockerDNS) useListener(teardowns *teardownList, redirect bool) func() {
 	if d == nil {
 		return func() {}
 	}
-	local := d.dockerd.Kind == podenv.DockerdLocal
+	pending := d.dockerd.Pending()
+	local := d.dockerd.Kind == podenv.DockerdLocal && !pending
 	listen := containerListenAddr(network.ContainerDNSIPv4)
+	if d.noDocker() {
+		d.unheldWithoutDocker(redirect)
+	}
 	if err := d.listenerErr(network.ContainerDNSIPv4); err != nil {
-		d.logger.Warn(unboundListener(local, local && d.recoverLeftover(), redirect, d.listeningIPv6() != ""),
-			"addr", listen, "error", err)
+		if !d.noDocker() {
+			d.logger.Warn(unboundListener(local, local && d.recoverLeftover(), redirect, d.listeningIPv6() != ""),
+				"addr", listen, "error", err)
+		}
 		return func() {}
 	}
 	d.logger.Info("Docker DNS interception enabled", "listen", listen,
 		"listen_ipv6", containerListenAddr(network.ContainerDNSIPv6), "ipv6_bound", d.listeningIPv6() != "")
+	if pending {
+		return func() {}
+	}
 	if !local {
 		d.logger.Info("Docker daemon not proven local; leaving its config alone, so its containers reach the proxy "+
 			"only through the DNS redirect or by naming its listener", "dockerd", d.dockerd.Kind.String(), "reason", d.dockerd.Reason)
@@ -195,6 +209,37 @@ func unboundListener(local, restored, redirect, ipv6 bool) string {
 		}
 	}
 	return msg
+}
+
+// noDocker reports a host with no Docker: no socket and no bridge at start
+// (podenv.Dockerd.None). It has no container DNS to cover, so a container
+// listener the proxy does not hold costs no dns-redirect posture
+// (containerGap). Only a Docker the job starts later could have containers
+// there, with no tracker and its daemon.json not rewritten: that family's
+// container DNS would then go around the proxy, unrecorded, which the
+// Info says (unheldWithoutDocker). A socket, a bridge, or bridges that
+// could not be listed are Docker that could be present. Nil-safe.
+func (d *dockerDNS) noDocker() bool { return d != nil && d.dockerd.None() }
+
+// unheldWithoutDocker logs, on a host with no Docker, the container
+// listeners the proxy does not hold, each with its reason, in one Info that
+// says why none of them counts, and what one would cost.
+func (d *dockerDNS) unheldWithoutDocker(redirect bool) {
+	var unheld []string
+	for _, addr := range []netip.Addr{network.ContainerDNSIPv4, network.ContainerDNSIPv6} {
+		if err := d.listenerErr(addr); err != nil {
+			unheld = append(unheld, listenGap(containerListenAddr(addr), err))
+		}
+	}
+	if len(unheld) == 0 {
+		return
+	}
+	msg := "Container DNS listener not held, which does not count: there was no Docker socket or bridge " +
+		"at startup, so it costs nothing unless Docker is started later"
+	if redirect {
+		msg += "; the dns-redirect posture is kept"
+	}
+	d.logger.Info(msg, "unheld", strings.Join(unheld, "; "))
 }
 
 // tcInterface is the interface TC attaches to: --interface, or the one

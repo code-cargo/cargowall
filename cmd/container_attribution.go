@@ -131,7 +131,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 	var obs *origin.Observer
 	scope, pending, err := shape.HookScopeOrPending()
 	if err == nil {
-		obs, err = origin.Start(tcObjs, scope, logger)
+		obs, err = startObserver(tcObjs, scope, logger)
 	}
 	if err != nil {
 		// Fatal under enforce. Under observe only the hook is lost: the
@@ -151,6 +151,10 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		"scoped", scope.Limited(), "subtree", scope.Subtree, "docker_pending", pending)
 	return a, nil
 }
+
+// startObserver loads and attaches the hook (origin.Start), or a test's
+// stand-in.
+var startObserver = origin.Start
 
 // wireVerdicts routes the cgroup hook's verdicts into the shared
 // post-verdict pipeline in pkg/events — the same one TC events flow
@@ -406,10 +410,7 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 	}
 	ctr, err := containers.Start(ctx, containers.Options{
 		AllowLocalSubnet: a.subnetCarver(a.allowLocalNetwork),
-		OnConnect: func(first bool, carved []netip.Prefix) {
-			docker.connected(first, carved)
-			a.daemonAnswered()
-		},
+		OnConnect:        a.onConnect(docker),
 	}, a.stepTracker, a.observer, auditLogger, a.logger)
 	if err != nil {
 		a.logger.Warn("Container attribution disabled", "error", err)
@@ -424,6 +425,15 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 		a.logger.Info("Container attribution enabled")
 	}
 	return true
+}
+
+// onConnect is the tracker's Options.OnConnect: each connect is docker's to
+// log as an arrival, and the daemon's answer for the scope's decision.
+func (a *containerAttribution) onConnect(docker *dockerUp) func(first bool, carved []netip.Prefix) {
+	return func(first bool, carved []netip.Prefix) {
+		docker.connected(first, carved)
+		a.daemonAnswered()
+	}
 }
 
 // Close settles the scope's decision, then stops the tracker before the

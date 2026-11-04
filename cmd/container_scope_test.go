@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/origin"
 	"github.com/code-cargo/cargowall/pkg/podenv"
 	"github.com/code-cargo/cargowall/pkg/steps"
@@ -250,16 +251,19 @@ func TestScopeDecision_ConnectDuringRecheck(t *testing.T) {
 	assert.Equal(t, postureContainerEgress, run.cmd.refusedLate)
 }
 
-// A daemon that never answers its tracker made no container: teardown says
-// the hook judged the job's traffic throughout, and the posture stands as
-// applied.
-// Nothing is decided after teardown, and a hook with nothing pending says
-// nothing at it.
-func TestScopeDecision_NeverAnswered(t *testing.T) {
+// Teardown settles a decision still to make by what is known. A daemon
+// that never answered its tracker made no container: the hook judged the
+// job's traffic throughout, and the posture stands as applied. One that
+// answered its tracker but never the probe may have had containers
+// outside the hook's scope: the posture is lost, and the probing stops.
+// Before startup was done nothing was put to use, and nothing is said or
+// lost. Nothing is decided after teardown, and a hook with nothing pending
+// says nothing at it.
+func TestScopeDecision_Teardown(t *testing.T) {
 	run := newScopeRun(t, ContainerEgressEnforce, true, outside)
 	run.a.ready()
 	run.a.Close()
-	assert.Equal(t, 1, strings.Count(run.log.String(), "Docker never answered while cargowall ran"), run.log.String())
+	assert.Equal(t, 1, strings.Count(run.log.String(), "Docker never answered its tracker while cargowall ran"), run.log.String())
 	assert.Contains(t, run.log.String(), "the posture stands as applied")
 	run.a.daemonAnswered()
 	run.settled(t)
@@ -275,9 +279,6 @@ func TestScopeDecision_NeverAnswered(t *testing.T) {
 	assert.Zero(t, run.rechecks.Load())
 	assert.Empty(t, run.log.String())
 
-	// A daemon that answered its tracker but never the probe may have had
-	// containers outside the hook's scope: the posture is lost at teardown,
-	// and the probing stops.
 	run = newScopeRun(t, ContainerEgressEnforce, true, stillToCome)
 	run.a.ready()
 	run.a.daemonAnswered()
@@ -286,15 +287,143 @@ func TestScopeDecision_NeverAnswered(t *testing.T) {
 	assert.Equal(t, "off", readPostures()[0].Applied)
 	assert.Contains(t, readPostures()[0].Reason, "Docker answered its tracker, but not the probe")
 	assert.Equal(t, postureContainerEgress, run.cmd.refusedLate)
-	assert.NotContains(t, run.log.String(), "never answered while")
+	assert.NotContains(t, run.log.String(), "never answered its tracker while")
 	after := run.rechecks.Load()
 	time.Sleep(20 * time.Millisecond)
-	assert.LessOrEqual(t, run.rechecks.Load(), after+1, "no probing after teardown")
+	assert.Equal(t, after, run.rechecks.Load(), "no probing after teardown")
+
+	// Startup did not finish: the daemon answered, but nothing was put to
+	// use, and there is nothing to say of it.
+	run = newScopeRun(t, ContainerEgressEnforce, true, outside)
+	run.a.daemonAnswered()
+	run.a.Close()
+	assert.Zero(t, run.rechecks.Load())
+	assert.Empty(t, run.log.String())
+	assert.False(t, readPostures()[0].degraded())
+	assert.Empty(t, run.cmd.refusedLate)
 
 	assert.NotPanics(t, func() {
 		(*containerAttribution)(nil).daemonAnswered()
 		(*containerAttribution)(nil).ready()
 	})
+}
+
+// blockRecheck makes the run's first recheck wait for release, once
+// inFlight says it has begun.
+func (r *scopeRun) blockRecheck() (inFlight, release chan struct{}) {
+	inFlight, release = make(chan struct{}), make(chan struct{})
+	stub := recheckShape
+	var first sync.Once
+	recheckShape = func(s podenv.Shape) podenv.Shape {
+		first.Do(func() {
+			close(inFlight)
+			<-release
+		})
+		return stub(s)
+	}
+	return inFlight, release
+}
+
+// A recheck still running at teardown is waited for, and decides as it
+// would have: one that confirms leaves the posture applied, refusing
+// nothing, and one that finds the daemon still to come up is a recheck
+// done, which loses it, with no other started after.
+func TestScopeDecision_TeardownDuringRecheck(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		finds   podenv.Dockerd
+		applied string
+	}{
+		{name: "it confirms", finds: confirmed, applied: "enforce"},
+		{name: "it finds the daemon still to come up", finds: stillToCome, applied: "off"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			run := newScopeRun(t, ContainerEgressEnforce, true, c.finds)
+			inFlight, release := run.blockRecheck()
+			run.a.ready()
+			run.a.daemonAnswered()
+			<-inFlight
+			closed := make(chan struct{})
+			go func() {
+				run.a.Close()
+				close(closed)
+			}()
+			select {
+			case <-closed:
+				t.Fatal("teardown did not wait for the recheck running")
+			case <-time.After(50 * time.Millisecond):
+			}
+			close(release)
+			select {
+			case <-closed:
+			case <-time.After(2 * time.Second):
+				t.Fatal("teardown never ended")
+			}
+			assert.Equal(t, c.applied, readPostures()[0].Applied, run.log.String())
+			assert.EqualValues(t, 1, run.rechecks.Load(), "none after teardown")
+			if c.applied == "enforce" {
+				assert.Contains(t, run.log.String(), "Container egress hook confirmed")
+				assert.NotContains(t, run.log.String(), "level=ERROR")
+				assert.Empty(t, run.cmd.refusedLate)
+				return
+			}
+			assert.Contains(t, readPostures()[0].Reason, "but not the probe that decides")
+			assert.Equal(t, postureContainerEgress, run.cmd.refusedLate)
+		})
+	}
+}
+
+// A recheck that has not finished within the bound teardown gives it is a
+// probe that did not decide: the posture is lost, saying so. Its result,
+// when it comes after teardown, decides nothing and probes no more.
+func TestScopeDecision_TeardownRecheckUnfinished(t *testing.T) {
+	saved := recheckAtTeardown
+	t.Cleanup(func() { recheckAtTeardown = saved })
+	recheckAtTeardown = 20 * time.Millisecond
+	run := newScopeRun(t, ContainerEgressEnforce, true, confirmed)
+	inFlight, release := run.blockRecheck()
+	run.a.ready()
+	run.a.daemonAnswered()
+	<-inFlight
+	run.a.Close()
+	assert.Equal(t, "off", readPostures()[0].Applied)
+	assert.Contains(t, readPostures()[0].Reason, "had not finished by teardown")
+	assert.Equal(t, postureContainerEgress, run.cmd.refusedLate)
+	close(release)
+	run.settled(t)
+	time.Sleep(20 * time.Millisecond)
+	assert.NotContains(t, run.log.String(), "Container egress hook confirmed", "nothing is decided after teardown")
+	assert.EqualValues(t, 1, run.rechecks.Load(), "and nothing probed")
+	assert.Equal(t, "off", readPostures()[0].Applied)
+}
+
+// Startup's half of the decision: a hook loaded with the daemon still to
+// come up leaves its rules pending (newContainerAttribution), and the
+// tracker's connect (onConnect), once startup is done, is what rechecks and
+// decides them.
+func TestScopeDecision_Wiring(t *testing.T) {
+	run := newScopeRun(t, ContainerEgressEnforce, true, outside)
+	saved := startObserver
+	t.Cleanup(func() { startObserver = saved })
+	startObserver = func(*bpf.TcBpfObjects, podenv.Scope, *slog.Logger) (*origin.Observer, error) {
+		return &origin.Observer{}, nil
+	}
+	a, err := newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, privileged(stillToCome), nil,
+		run.a.postures, run.a.logger)
+	require.NoError(t, err)
+	a.observer = nil // a stand-in, with nothing to close
+	run.a = a
+	assert.True(t, a.scope.pending, "the daemon's rules are left to decide")
+	u, _ := dockerUpFor(t, podenv.Dockerd{Kind: podenv.DockerdLocal}, &StartCmd{})
+	a.ready()
+	assert.True(t, run.settled(t))
+	assert.Zero(t, run.rechecks.Load())
+	a.onConnect(u)(true, nil)
+	assert.False(t, run.settled(t))
+	assert.EqualValues(t, 1, run.rechecks.Load())
+	assert.Equal(t, "off", readPostures()[0].Applied)
+	assert.Equal(t, postureContainerEgress, run.cmd.refusedLate)
+	a.Close()
 }
 
 // The hook loads at once with a daemon still to come up, leaving its rules

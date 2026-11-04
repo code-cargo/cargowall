@@ -647,7 +647,9 @@ refusing, has shown nothing of where its containers' tasks will be, and has
 started none. The hook is not refused for it: it loads at once with the
 scope every other rule gives (`podenv.Shape.HookScopeOrPending`), limited to
 our own cgroup and the cgroups our pid namespace's tasks enter where a tree
-read as ours alone would otherwise be judged whole, and is raised as ever.
+read as ours alone would otherwise be judged whole (whatever cgroup our
+init is in, as systemd's `/init.scope` beside the job's: the tree shows
+its every task ours), and is raised as ever.
 The daemon's rules are decided when it answers its tracker, once startup is
 done (`scopeDecision`, which probes it again with `Recheck`): they confirm
 the hook, with one Info, or find the daemon's containers outside its scope.
@@ -671,7 +673,10 @@ only where the action's post step reads the sentinel. A daemon that never
 answers its tracker made no container: the posture stands as applied, with
 one teardown Info. One that answered it but never the probe may have had
 containers outside the hook's scope, so at teardown the posture is lost, as
-above. Between the daemon answering and the recheck (unix_diag, `GET /info`:
+above. A recheck still running at teardown is waited for, up to 3s, and
+decides as it would have; one that has not finished by then is a probe
+that did not decide, and the posture is lost, saying so. Before startup was
+done nothing was put to use, and teardown says nothing of it. Between the daemon answering and the recheck (unix_diag, `GET /info`:
 well under a second), its containers are judged by the hook as loaded.
 
 **One post-verdict pipeline.** Both hooks feed the same steps in

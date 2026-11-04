@@ -21,6 +21,7 @@ package podenv
 // before it has made a bridge.
 
 import (
+	"errors"
 	"net"
 	"time"
 
@@ -46,12 +47,57 @@ const (
 	pingWithoutBridges = 300 * time.Millisecond
 )
 
+// probeDaemon probes the daemon behind socket: what it is (probeDockerd),
+// whether it is up (probeUp, the one ping), and, where HookScope reads
+// them (readsRuntime) and only once it has answered, the process serving
+// the socket, its runtime, and in a private cgroup namespace the tree it
+// makes its containers in. A daemon that has not answered is asked
+// nothing more: what those would show is the daemon's to show once it
+// answers (Recheck), and waiting on it would cost startup its silence.
+func (s *Shape) probeDaemon(socket string, egressHook bool) {
+	readsRuntime := s.readsRuntime(egressHook)
+	s.Dockerd = probeDockerd(socket)
+	s.Dockerd.probeUp(socket)
+	visible := s.Dockerd.Kind == DockerdLocal || s.Dockerd.Kind == DockerdForeign
+	switch {
+	case !readsRuntime || !visible:
+	case !s.Dockerd.Answers:
+		s.Dockerd.note("its runtime", errors.New("not looked for until it answers"))
+	default:
+		s.Dockerd.probeServer(socket)
+		s.Dockerd.probeRuntime(socket)
+		if s.CgroupNS == CgroupNSPrivate {
+			s.Dockerd.probeContainerTree(socket)
+		}
+	}
+}
+
+// Recheck is the shape with the daemon behind socket probed again, as
+// Detect probes it for a hook that may load, and every other fact as
+// Detect found it: the scope's daemon rules decided again once a daemon
+// that was still to come up answers (HookScopeOrPending).
+func (s Shape) Recheck(socket string) Shape {
+	s.probeDaemon(socket, true)
+	return s
+}
+
+// daemonPending reports a daemon behind the socket that has not answered,
+// one still to come up, which has told the scope's daemon rules nothing
+// yet: one we could not identify, its listener refusing or silent, or one
+// whose listener's pid we see. A hidden one is outside our pid namespace
+// however it answers, and a kind with no rule is refused.
+func (s Shape) daemonPending() bool {
+	switch s.Dockerd.Kind {
+	case DockerdUnknown, DockerdLocal, DockerdForeign:
+		return !s.Dockerd.Answers
+	}
+	return false
+}
+
 // probeUp reads whether the daemon is up: the bridges it has made in our
 // network namespace (Bridges, or BridgesErr when they could not be
 // listed), and, where there is a socket, whether it answers GET /_ping in
-// time (pingWithBridges, pingWithoutBridges). One that has already
-// answered, its GET /info or the request servingPid made, is not asked
-// again.
+// time (pingWithBridges, pingWithoutBridges), the first thing it is asked.
 func (d *Dockerd) probeUp(socket string) {
 	if ifaces, err := interfaces(); err != nil {
 		d.BridgesErr = err
@@ -64,10 +110,6 @@ func (d *Dockerd) probeUp(socket string) {
 		}
 	}
 	if d.Kind == DockerdAbsent {
-		return
-	}
-	if d.pid != 0 || (d.info != nil && d.infoErr == nil) {
-		d.Answers = true
 		return
 	}
 	within := pingWithBridges

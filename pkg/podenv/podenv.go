@@ -276,41 +276,62 @@ func (s Scope) Limited() bool { return s.Subtree != "" }
 // cannot be shown. Every leaf returns its own answer, an unidentified fact
 // refuses wherever it could change who the hook judges, and a kind with no
 // rule here is refused. design.md (Docker Integration) gives the rules,
-// with the premises and limits they accept.
+// with the premises and limits they accept. A daemon still to come up is
+// judged as it stands, which refuses wherever the scope reads it: see
+// HookScopeOrPending.
 func (s Shape) HookScope() (Scope, error) {
+	scope, _, err := s.hookScope(false)
+	return scope, err
+}
+
+// HookScopeOrPending is HookScope, but where the scope reads a daemon that
+// has not answered (daemonPending), whose containers are still to come, it
+// returns the scope every other rule gives, and pending: the daemon's rules
+// are for the caller to decide again once it answers (Recheck). Every other
+// rule decides as in HookScope, and its refusal is final.
+func (s Shape) HookScopeOrPending() (scope Scope, pending bool, err error) {
+	return s.hookScope(true)
+}
+
+// hookScope is HookScope, deferring a daemon still to come up when
+// deferDaemon.
+func (s Shape) hookScope(deferDaemon bool) (Scope, bool, error) {
 	switch s.CgroupNS {
 	case CgroupNSUnknown:
-		return Scope{}, fmt.Errorf("cgroup namespace unknown (%s)", s.CgroupNSReason)
+		return Scope{}, false, fmt.Errorf("cgroup namespace unknown (%s)", s.CgroupNSReason)
 	case CgroupNSHost, CgroupNSPrivate:
 	default:
-		return Scope{}, fmt.Errorf("cgroup namespace kind %d has no hook-scope rule", s.CgroupNS)
+		return Scope{}, false, fmt.Errorf("cgroup namespace kind %d has no hook-scope rule", s.CgroupNS)
 	}
 	if err := s.attachPointRefusal(); err != nil {
-		return Scope{}, err
+		return Scope{}, false, err
 	}
 	if s.CgroupNS == CgroupNSPrivate {
-		return s.privateScope()
+		return s.privateScope(deferDaemon)
 	}
 	// /sys/fs/cgroup is the machine's root, which every pod and daemon on
 	// it shares.
 	pod := s.inPod()
 	if scope, done, err := s.sharedPidNS(pod, "the host cgroup namespace", "the host"); done {
-		return scope, err // the host pid namespace outside a pod is machineFirewall
+		return scope, false, err // the host pid namespace outside a pod is machineFirewall
 	}
 	if err := s.partialRefusal(); err != nil {
-		return Scope{}, err
+		return Scope{}, false, err
 	}
 	scope, err := s.limitedScope(pod)
 	if err != nil {
-		return Scope{}, err
+		return Scope{}, false, err
 	}
 	// Under the machine's root every daemon's containers reach the hook,
 	// and those of one whose runtime is in our pid namespace are recorded
 	// as they start.
-	if err := s.daemonRefusal(false); err != nil {
-		return Scope{}, err
+	if deferDaemon && s.daemonPending() {
+		return scope, true, nil
 	}
-	return scope, nil
+	if err := s.daemonRefusal(false); err != nil {
+		return Scope{}, false, err
+	}
+	return scope, false, nil
 }
 
 // daemonRefusal says why the daemon behind the socket may make containers
@@ -371,20 +392,24 @@ func (s Shape) runtimeRefusal() error {
 // it is our own container's, and the hook judges all of it; where the root
 // is above us it is a tree others may share, such as a nested node's
 // (kind, minikube's docker driver), whose privileged pods share the node
-// container's namespace.
-func (s Shape) privateScope() (Scope, error) {
+// container's namespace. A daemon deferred (deferDaemon, daemonPending)
+// leaves every other rule to decide, and pending.
+func (s Shape) privateScope(deferDaemon bool) (Scope, bool, error) {
 	if err := s.partialRefusal(); err != nil {
-		return Scope{}, err
+		return Scope{}, false, err
 	}
-	if err := s.daemonRefusal(true); err != nil {
-		return Scope{}, err
+	pending := deferDaemon && s.daemonPending()
+	if !pending {
+		if err := s.daemonRefusal(true); err != nil {
+			return Scope{}, false, err
+		}
 	}
 	if s.CgroupPath == "/" {
-		return Scope{}, nil
+		return Scope{}, pending, nil
 	}
 	pod := s.inPod()
 	if scope, done, err := s.sharedPidNS(pod, "a cgroup namespace rooted above our cgroup", "the node's"); done {
-		return scope, err
+		return scope, pending && err == nil, err
 	}
 	// A tree with no task outside our pid namespace anywhere in it is our
 	// container's alone, below whose root it moved its own tasks (an
@@ -392,9 +417,13 @@ func (s Shape) privateScope() (Scope, error) {
 	// and the hook judges all of it, as at "/". A nested node always has
 	// some: its kubelet and runtime are outside every pod's pid namespace.
 	if !pod && s.KubeletHostsReason == "" && s.CgroupTree == CgroupTreeOurs {
-		return Scope{}, nil
+		return Scope{}, pending, nil
 	}
-	return s.limitedScope(pod)
+	scope, err := s.limitedScope(pod)
+	if err != nil {
+		return Scope{}, false, err
+	}
+	return scope, pending, nil
 }
 
 // sharedPidNS decides for every pid namespace but a private one, the same
@@ -758,17 +787,8 @@ func Detect(dockerSocket, kernel string, egressHook bool) Shape {
 	// The daemon's server and runtime are looked for only where HookScope
 	// reads them (readsRuntime), and a private cgroup namespace also reads
 	// where the daemon makes its containers, and who else is in the tree.
-	readsRuntime := s.readsRuntime(egressHook)
-	private := readsRuntime && s.CgroupNS == CgroupNSPrivate
-	s.Dockerd = probeDockerd(dockerSocket, readsRuntime)
-	visible := s.Dockerd.Kind == DockerdLocal || s.Dockerd.Kind == DockerdForeign
-	if readsRuntime && visible {
-		s.Dockerd.probeRuntime(dockerSocket)
-	}
-	if private && visible {
-		s.Dockerd.probeContainerTree(dockerSocket)
-	}
-	s.Dockerd.probeUp(dockerSocket)
+	private := s.readsRuntime(egressHook) && s.CgroupNS == CgroupNSPrivate
+	s.probeDaemon(dockerSocket, egressHook)
 	if private && s.CgroupPath != "" && s.CgroupPath != "/" && s.PidNS == PidNSPrivate && !s.inPod() {
 		s.CgroupTree, s.CgroupTreeReason = probeCgroupTree(CgroupRoot)
 	} else {

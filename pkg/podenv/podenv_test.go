@@ -242,12 +242,109 @@ func TestHookScope(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("%s: HookScope() = %+v, want %+v", tc.name, got, tc.want)
 		}
+		// With the daemon answering, nothing is deferred: the decision is
+		// HookScope's.
+		answered := tc.shape
+		answered.Dockerd.Answers = true
+		if got, pending, err := answered.HookScopeOrPending(); pending || (err == nil) != tc.ok || got != tc.want {
+			t.Errorf("%s, daemon answering: HookScopeOrPending() = %+v, %v, %v; want HookScope's", tc.name, got, pending, err)
+		}
 	}
 
 	// An unknown fact carries its probe error into the posture reason.
 	_, err := Shape{CgroupNS: CgroupNSHost, CgroupPathReason: "open /proc/self/cgroup: permission denied"}.HookScope()
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("unread cgroup path: HookScope() = %v, want the read error in it", err)
+	}
+}
+
+// A daemon that has not answered, still to come up, has told the scope's
+// daemon rules nothing, in either shape that reads it: a private cgroup
+// namespace, and a pid namespace of our own in the host's. There the
+// deferring decision gives the scope every other rule gives, and pending,
+// whatever the daemon's kind, unidentified or with its listener's pid in
+// sight; a hidden one, or a kind with no rule, still refuses, and so does
+// any other rule, however the daemon stands. Where nothing reads the
+// daemon (a runner VM), or there is no daemon, nothing is pending. HookScope
+// judges a daemon as it stands, and refuses one that has not answered.
+func TestHookScopePending(t *testing.T) {
+	const podCg = "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod0e4b1f2a_7c3d_4e5f_8a9b_0c1d2e3f4a5b.slice"
+	pod, own := podCg+"/cri-containerd-a.scope", "/system.slice/docker-a.scope"
+	host := func(path string, pidns PidNS, d Dockerd) Shape {
+		return Shape{CgroupNS: CgroupNSHost, CgroupPath: path, CgroupMount: CgroupMountOurs, PidNS: pidns, InitCgroup: path, OwnTree: CgroupTreeOurs, Dockerd: d, SocketCgroups: SocketCgroupsKept}
+	}
+	private := func(path string, d Dockerd) Shape {
+		s := host(path, PidNSPrivate, d)
+		s.CgroupNS = CgroupNSPrivate
+		return s
+	}
+	with := func(s Shape, f func(*Shape)) Shape { f(&s); return s }
+	treeOurs := func(s *Shape) { s.CgroupTree = CgroupTreeOurs }
+	pendingKinds := map[string]Dockerd{
+		"unidentified": {Kind: DockerdUnknown, Reason: "dial unix /var/run/docker.sock: connect: connection refused"},
+		"local":        {Kind: DockerdLocal, Reason: "its answer: context deadline exceeded"},
+		"foreign":      {Kind: DockerdForeign, Reason: "pid 7 has another mount namespace; its answer: context deadline exceeded"},
+	}
+	shapes := []struct {
+		name  string
+		shape func(Dockerd) Shape
+		want  Scope
+	}{
+		{"ARC runner pod", func(d Dockerd) Shape { return host(pod, PidNSPrivate, d) }, Scope{Subtree: podCg}},
+		{"privileged container outside Kubernetes", func(d Dockerd) Shape { return host(own, PidNSPrivate, d) }, Scope{Subtree: own}},
+		{"private cgroupns at its root", func(d Dockerd) Shape { return private("/", d) }, Scope{}},
+		{"private cgroupns below its root", func(d Dockerd) Shape { return private("/init", d) }, Scope{Subtree: "/init"}},
+		{"private cgroupns below its root, tree ours alone", func(d Dockerd) Shape { return with(private("/init", d), treeOurs) }, Scope{}},
+		{"private cgroupns, host pid namespace", func(d Dockerd) Shape { return with(private("/", d), func(s *Shape) { s.PidNS = PidNSHost }) }, Scope{}},
+	}
+	for _, sh := range shapes {
+		for kind, d := range pendingKinds {
+			s := sh.shape(d)
+			got, pending, err := s.HookScopeOrPending()
+			if err != nil || !pending || got != sh.want {
+				t.Errorf("%s, %s daemon not answering: = %+v, %v, %v; want %+v, pending", sh.name, kind, got, pending, err, sh.want)
+			}
+			if _, err := s.HookScope(); err == nil {
+				t.Errorf("%s, %s daemon not answering: HookScope() accepted it, want it judged as it stands", sh.name, kind)
+			}
+		}
+		for name, d := range map[string]Dockerd{
+			"hidden, not answering":     {Kind: DockerdHidden, Reason: "its pid is outside our pid namespace"},
+			"unidentified, answering":   {Kind: DockerdUnknown, Reason: "peer credentials: EINVAL", Answers: true},
+			"local, answering, unread":  {Kind: DockerdLocal, Answers: true, Reason: "its runtime: no such file"},
+			"a kind with no rule":       {Kind: DockerdKind(99)},
+			"a kind with no rule, live": {Kind: DockerdKind(99), Answers: true},
+		} {
+			if _, pending, err := sh.shape(d).HookScopeOrPending(); err == nil || pending {
+				t.Errorf("%s, %s: pending %v, %v; want refused", sh.name, name, pending, err)
+			}
+		}
+		if got, pending, err := sh.shape(Dockerd{Kind: DockerdAbsent}).HookScopeOrPending(); err != nil || pending || got != sh.want {
+			t.Errorf("%s, no daemon: = %+v, %v, %v; want %+v, nothing pending", sh.name, got, pending, err, sh.want)
+		}
+	}
+
+	// Every other rule refuses however the daemon stands.
+	waiting := pendingKinds["local"]
+	for name, s := range map[string]Shape{
+		"private cgroupns, socket cgroups shared":            with(private("/", waiting), func(s *Shape) { s.SocketCgroups = SocketCgroupsShared }),
+		"private cgroupns, DOCKER_HOST elsewhere":            with(private("/", waiting), func(s *Shape) { s.DockerHost, s.DockerHostSetting = "tcp://localhost:2376", "DOCKER_HOST" }),
+		"private cgroupns, mount another tree":               with(private("/", waiting), func(s *Shape) { s.CgroupMount = CgroupMountOther }),
+		"private cgroupns below its root, our cgroup shared": with(private("/init", waiting), func(s *Shape) { s.OwnTree = CgroupTreeShared }),
+		"ARC runner pod, init another pod's":                 with(host(pod, PidNSPrivate, waiting), func(s *Shape) { s.InitCgroup = "/kubepods.slice/kubepods-pod1.slice/x.scope" }),
+		"privileged container, our cgroup shared":            with(host(own, PidNSPrivate, waiting), func(s *Shape) { s.OwnTree = CgroupTreeShared }),
+		"privileged pod, no pod cgroup":                      host("/kubepods.slice/cri-containerd-a.scope", PidNSPrivate, waiting),
+		"hostPID pod":                                        host(pod, PidNSHost, waiting),
+		"pid namespace unknown":                              host(pod, PidNSUnknown, waiting),
+	} {
+		if _, pending, err := s.HookScopeOrPending(); err == nil || pending {
+			t.Errorf("%s, daemon not answering: pending %v, %v; want refused", name, pending, err)
+		}
+	}
+
+	// A runner VM's hook reads no daemon, so none is pending there.
+	if got, pending, err := host("/system.slice/runner.service", PidNSHost, waiting).HookScopeOrPending(); err != nil || pending || got != (Scope{}) {
+		t.Errorf("runner VM, daemon not answering: = %+v, %v, %v; want the whole machine, nothing pending", got, pending, err)
 	}
 }
 
@@ -631,7 +728,7 @@ func TestProbeCgroupMount(t *testing.T) {
 }
 
 func TestProbeDockerd_NoSocket(t *testing.T) {
-	if d := probeDockerd(filepath.Join(t.TempDir(), "docker.sock"), true); d.Kind != DockerdAbsent {
+	if d := probeDockerd(filepath.Join(t.TempDir(), "docker.sock")); d.Kind != DockerdAbsent {
 		t.Fatalf("absent socket: got %+v, want absent", d)
 	}
 }
@@ -639,7 +736,7 @@ func TestProbeDockerd_NoSocket(t *testing.T) {
 // A dial failing with anything but ENOENT (here EINVAL, a path longer than
 // sun_path) is unknown, with the error kept.
 func TestProbeDockerd_Unknown(t *testing.T) {
-	d := probeDockerd("/"+strings.Repeat("x", 200), true)
+	d := probeDockerd("/" + strings.Repeat("x", 200))
 	if d.Kind != DockerdUnknown || d.Reason == "" {
 		t.Fatalf("non-socket path: got %+v, want unknown with a reason", d)
 	}
@@ -655,7 +752,7 @@ func TestProbeDockerd_Refused(t *testing.T) {
 	}
 	l.SetUnlinkOnClose(false)
 	l.Close()
-	if d := probeDockerd(sock, true); d.Kind != DockerdUnknown || !strings.Contains(d.Reason, "refused") {
+	if d := probeDockerd(sock); d.Kind != DockerdUnknown || !strings.Contains(d.Reason, "refused") {
 		t.Fatalf("socket with no listener: got %+v, want unknown, refused", d)
 	}
 }
@@ -668,30 +765,25 @@ func TestProbeDockerd_NotASocket(t *testing.T) {
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if d := probeDockerd(dir, true); d.Kind != DockerdAbsent {
+	if d := probeDockerd(dir); d.Kind != DockerdAbsent {
 		t.Errorf("directory at the socket path: got %+v, want absent", d)
 	}
 	file := filepath.Join(t.TempDir(), "docker.sock")
 	if err := os.WriteFile(file, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if d := probeDockerd(file, true); d.Kind != DockerdAbsent {
+	if d := probeDockerd(file); d.Kind != DockerdAbsent {
 		t.Errorf("file at the socket path: got %+v, want absent", d)
 	}
 }
 
-// A daemon in our own process shares our mount namespace: local, and
-// where the scope reads its runtime, found serving. A listener that
-// accepts and does not answer is local by its mount namespace, with no
-// server shown to look for a runtime by; where nothing reads the runtime,
-// it is not asked.
+// A daemon in our own process shares our mount namespace: local, by its
+// listener, which asks the daemon nothing: a listener that accepts and
+// does not answer is local too.
 func TestProbeDockerd_Local(t *testing.T) {
 	served := fakeDaemon(t, http.StatusOK, `{}`)
-	if d := probeDockerd(served, true); d.Kind != DockerdLocal || d.pid != int32(os.Getpid()) {
-		t.Errorf("local daemon: got %+v, want local, this process", d)
-	}
-	if d := probeDockerd(served, false); d.Kind != DockerdLocal || d.pid != 0 || d.Reason != "" {
-		t.Errorf("local daemon, no runtime read: got %+v, want local, no server looked for", d)
+	if d := probeDockerd(served); d.Kind != DockerdLocal || d.pid != 0 || d.Reason != "" {
+		t.Errorf("local daemon: got %+v, want local, no server looked for", d)
 	}
 	sock := filepath.Join(t.TempDir(), "docker.sock")
 	l, err := net.Listen("unix", sock)
@@ -699,12 +791,7 @@ func TestProbeDockerd_Local(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	go func() {
-		if c, err := l.Accept(); err == nil {
-			c.Close()
-		}
-	}()
-	if d := probeDockerd(sock, true); d.Kind != DockerdLocal || d.pid != 0 || !strings.Contains(d.Reason, "the process serving it") || !strings.Contains(d.Reason, "_ping") {
-		t.Errorf("silent listener: got %+v, want local by the listener, unanswered, no server", d)
+	if d := probeDockerd(sock); d.Kind != DockerdLocal || d.Reason != "" {
+		t.Errorf("silent listener: got %+v, want local by the listener", d)
 	}
 }

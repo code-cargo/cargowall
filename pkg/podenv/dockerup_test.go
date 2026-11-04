@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -166,18 +168,6 @@ func TestProbeUp(t *testing.T) {
 	}
 }
 
-// A daemon that has already answered, its /info or servingPid's request, is
-// not asked again.
-func TestProbeUpAnsweredAlready(t *testing.T) {
-	withInterfaces(t, "docker0")
-	sock, pings := pingCounter(t, nil)
-	d := Dockerd{Kind: DockerdForeign, info: &daemonInfo{}}
-	d.probeUp(sock)
-	if !d.Answers || pings.Load() != 0 {
-		t.Fatalf("answers %v after %d pings; want true after none", d.Answers, pings.Load())
-	}
-}
-
 // What startup makes of the daemon's state.
 func TestDockerdUpClasses(t *testing.T) {
 	for _, c := range []struct {
@@ -198,5 +188,86 @@ func TestDockerdUpClasses(t *testing.T) {
 			t.Errorf("%s: none %v pending %v unreachable %v, want %v %v %v", c.name, c.d.None(), c.d.Pending(),
 				c.d.Unreachable(), c.none, c.pending, c.unreachable)
 		}
+	}
+}
+
+// readsDaemon is a shape whose hook scope reads the daemon's runtime: a
+// privileged container's, outside Kubernetes, in a pid namespace of its own.
+func readsDaemon(d Dockerd) Shape {
+	const own = "/system.slice/docker-a.scope"
+	return Shape{
+		CgroupNS: CgroupNSHost, PidNS: PidNSPrivate, CgroupPath: own, CgroupMount: CgroupMountOurs,
+		SocketCgroups: SocketCgroupsKept, InitCgroup: own, OwnTree: CgroupTreeOurs, Dockerd: d,
+	}
+}
+
+// Before a daemon has answered, it is asked only the one ping: a socket
+// that accepts and never answers costs a probe that reads the runtime only
+// the ping's 300ms, not a wait for its server, and its server, runtime and
+// tree go unread. The daemon is pending, which HookScopeOrPending defers
+// and HookScope refuses. One that answers is found serving; where nothing
+// reads the runtime, nothing is looked for past the ping.
+func TestProbeDaemon(t *testing.T) {
+	withInterfaces(t)
+	silent, _ := pingCounter(t, make(chan struct{}))
+	s := readsDaemon(Dockerd{})
+	if !s.readsRuntime(true) {
+		t.Fatal("the shape must read the daemon's runtime")
+	}
+	began := time.Now()
+	s.probeDaemon(silent, true)
+	if took := time.Since(began); took > time.Second {
+		t.Errorf("a silent socket took %v, want only the one ping", took)
+	}
+	d := s.Dockerd
+	if d.Kind != DockerdLocal || d.Answers || d.pid != 0 || d.Runtime != 0 ||
+		!strings.Contains(d.Reason, "its runtime: not looked for until it answers") {
+		t.Errorf("silent socket: %+v, want local by its listener, no answer, nothing more read", d)
+	}
+	if _, pending, err := s.HookScopeOrPending(); !pending || err != nil {
+		t.Errorf("silent socket: pending %v, %v; want the daemon's rules deferred", pending, err)
+	}
+	if _, err := s.HookScope(); err == nil || !strings.Contains(err.Error(), "not looked for until it answers") {
+		t.Errorf("silent socket: HookScope() = %v, want the refusal, saying why", err)
+	}
+
+	served := fakeDaemon(t, http.StatusOK, `{}`)
+	s = readsDaemon(Dockerd{})
+	s.probeDaemon(served, true)
+	if !s.Dockerd.Answers || s.Dockerd.pid != int32(os.Getpid()) {
+		t.Errorf("answering daemon: %+v, want it answering, this process serving", s.Dockerd)
+	}
+	s = readsDaemon(Dockerd{})
+	s.probeDaemon(served, false)
+	if !s.Dockerd.Answers || s.Dockerd.pid != 0 || s.Dockerd.Reason != "" {
+		t.Errorf("answering daemon, the hook off: %+v, want only its answer read", s.Dockerd)
+	}
+}
+
+// Recheck probes the daemon again, as Detect does for a hook that may load,
+// and keeps every other fact: a daemon still to come up when found, now
+// answering, is the daemon's rules' to decide, no longer pending, with no
+// trace of the first probe's failure. The shape it was given is unchanged.
+func TestRecheck(t *testing.T) {
+	withInterfaces(t, "docker0")
+	served := fakeDaemon(t, http.StatusOK, `{}`)
+	s := readsDaemon(Dockerd{Kind: DockerdUnknown, Reason: "dial: connection refused"})
+	if _, pending, err := s.HookScopeOrPending(); !pending || err != nil {
+		t.Fatalf("before: pending %v, %v; want the daemon's rules deferred", pending, err)
+	}
+	r := s.Recheck(served)
+	d := r.Dockerd
+	if d.Kind != DockerdLocal || !d.Answers || strings.Contains(d.Reason, "refused") || !slices.Equal(d.Bridges, []string{"docker0"}) {
+		t.Errorf("rechecked: %+v, want local, answering, docker0, no stale reason", d)
+	}
+	if _, pending, _ := r.HookScopeOrPending(); pending {
+		t.Error("rechecked: still pending, want the daemon's rules decided")
+	}
+	if s.Dockerd.Kind != DockerdUnknown {
+		t.Errorf("Recheck changed the shape it was given: %+v", s.Dockerd)
+	}
+	r.Dockerd = s.Dockerd
+	if !reflect.DeepEqual(r, s) {
+		t.Errorf("Recheck changed facts that are not the daemon's: %+v, want %+v", r, s)
 	}
 }

@@ -195,7 +195,7 @@ func probeDockerd(socket string) Dockerd {
 // two) leaves no runtime to look for, and the scope refuses. Asked only of
 // a daemon that has answered (probeDaemon).
 func (d *Dockerd) probeServer(socket string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), answerWithin)
 	defer cancel()
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", socket)
@@ -451,10 +451,15 @@ func (d *Dockerd) askInfo(socket string) (daemonInfo, error) {
 	return *d.info, d.infoErr
 }
 
-// dockerGet asks the daemon at socket for path, within 2s, and decodes
+// answerWithin is how long a daemon is given for each request asked of it
+// once it has answered the one ping (probeServer, servingPid, dockerGet):
+// one that answers does so in milliseconds.
+const answerWithin = 2 * time.Second
+
+// dockerGet asks the daemon at socket for path, within answerWithin, and decodes
 // its JSON answer into out, unless out is nil.
 func dockerGet(socket, path string, out any) error {
-	return dockerGetWithin(socket, path, out, 2*time.Second)
+	return dockerGetWithin(socket, path, out, answerWithin)
 }
 
 // dockerGetWithin is dockerGet within timeout.
@@ -486,11 +491,11 @@ func dockerGetWithin(socket, path string, out any, timeout time.Duration) error 
 // one holding the connection its listener accepted, found by the inode
 // unix_diag gives as conn's peer, among every process's descriptors. Only
 // a server that has accepted holds it, which its answer shows (GET
-// /_ping), within 2s as every request of a daemon that has answered once.
+// /_ping), within answerWithin.
 // Whatever serves is the daemon, whatever its name: a podman service, or a
 // stand-in.
 func servingPid(conn *net.UnixConn) (int32, error) {
-	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(answerWithin)); err != nil {
 		return 0, err
 	}
 	req, err := http.NewRequest(http.MethodGet, "http://docker/_ping", nil)

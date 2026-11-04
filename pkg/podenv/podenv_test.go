@@ -308,6 +308,15 @@ func TestHookScopePending(t *testing.T) {
 		// is judged only as far as our pid namespace's tasks while it is
 		// pending: a runtime outside it would make containers in the tree.
 		{"private cgroupns below its root, tree ours alone", func(d Dockerd) Shape { return with(private("/init", d), treeOurs) }, Scope{Subtree: "/init"}},
+		// The tree ours alone shows its every task is ours, init's
+		// included wherever its cgroup is: a systemd or sysbox runner's,
+		// pid 1 in /init.scope and the job in a cgroup of its own, its own
+		// tree not looked at, is limited to the job's cgroup, not refused.
+		{"private cgroupns below its root, tree ours alone, init in a cgroup of its own", func(d Dockerd) Shape {
+			return with(with(private("/job", d), treeOurs), func(s *Shape) {
+				s.InitCgroup, s.OwnTree, s.OwnTreeReason = "/init.scope", CgroupTreeUnknown, "not probed"
+			})
+		}, Scope{Subtree: "/job"}},
 		{"private cgroupns, host pid namespace", func(d Dockerd) Shape { return with(private("/", d), func(s *Shape) { s.PidNS = PidNSHost }) }, Scope{}},
 	}
 	for _, sh := range shapes {

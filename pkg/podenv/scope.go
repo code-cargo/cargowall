@@ -195,10 +195,16 @@ func (s Shape) privateScope(deferDaemon bool) (Scope, bool, error) {
 	// That is read once, before a daemon still to come up has made any
 	// container, and one whose runtime turns out outside our pid namespace
 	// would make them in this tree with tasks outside it, which the whole
-	// tree's hook would judge: with the daemon pending the scope is limited
-	// as below, where such a daemon's containers are never recorded and
-	// only go unjudged.
-	if !pod && s.KubeletHostsReason == "" && s.CgroupTree == CgroupTreeOurs && !pending {
+	// tree's hook would judge. With the daemon pending the scope is limited
+	// instead, to our own cgroup and the cgroups our pid namespace's tasks
+	// enter, where such a daemon's containers are never recorded and only
+	// go unjudged. Every task in the tree is already shown to be ours,
+	// wherever our init's cgroup is (systemd's /init.scope beside the job's),
+	// so none of limitedScope's own rules for that is needed.
+	if !pod && s.KubeletHostsReason == "" && s.CgroupTree == CgroupTreeOurs {
+		if pending {
+			return Scope{Subtree: s.CgroupPath}, true, nil
+		}
 		return Scope{}, false, nil
 	}
 	scope, err := s.limitedScope(pod)

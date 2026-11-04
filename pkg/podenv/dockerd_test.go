@@ -381,6 +381,36 @@ func TestServingPid(t *testing.T) {
 	}
 }
 
+// A server that accepts and never answers is given answerWithin, and no
+// longer: servingPid is asked only of a daemon that has answered the one
+// ping, which answers in milliseconds.
+func TestServingPidGivesUp(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "docker.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		if c, err := l.Accept(); err == nil {
+			<-done
+			c.Close()
+		}
+	}()
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	began := time.Now()
+	_, err = servingPid(conn.(*net.UnixConn))
+	if took := time.Since(began); err == nil || took < answerWithin-100*time.Millisecond || took > answerWithin+time.Second {
+		t.Errorf("silent server: servingPid gave up after %v (%v), want an error after %v", took, err, answerWithin)
+	}
+}
+
 // The runtime is the containerd at the other end of a connection the
 // daemon made, whatever its flags or the sockets there would pick, and,
 // with the daemon in a network namespace of its own, the connection is

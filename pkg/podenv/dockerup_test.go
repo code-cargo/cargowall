@@ -263,6 +263,9 @@ func TestRecheck(t *testing.T) {
 	if _, pending, _ := r.HookScopeOrPending(); pending {
 		t.Error("rechecked: still pending, want the daemon's rules decided")
 	}
+	if d.pid != int32(os.Getpid()) {
+		t.Errorf("rechecked: no server found (%s), want the runtime the scope reads probed as Detect probes it", d.Reason)
+	}
 	if s.Dockerd.Kind != DockerdUnknown {
 		t.Errorf("Recheck changed the shape it was given: %+v", s.Dockerd)
 	}

@@ -249,7 +249,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	}()
 
 	// What container this runs in decides whether the daemon's config is ours to rewrite, whether
-	// the cgroup hook would judge only this job (podenv.Shape.HookScope), and what waits on Docker.
+	// the cgroup hook would judge only this job (podenv.Shape.HookScopeOrPending), and what waits on Docker.
 	shape := podenv.Detect(dockerSocket, caps.KernelVersion, cmd.ContainerEgress != ContainerEgressOff)
 	docker := newDockerUp(shape, cmd, began, logger)
 	defer docker.close()

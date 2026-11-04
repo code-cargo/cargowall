@@ -426,7 +426,7 @@ func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
 func TestPostures_ContainerAttributionHookScope(t *testing.T) {
 	nodeRoot := runnerVM
 	nodeRoot.CgroupPath = "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd"
-	_, scope := nodeRoot.HookScope()
+	_, _, scope := nodeRoot.HookScopeOrPending()
 	require.ErrorContains(t, scope, "the cgroup hook would attach at the node root")
 
 	p, _ := ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)

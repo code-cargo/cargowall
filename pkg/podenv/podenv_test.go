@@ -45,6 +45,14 @@ func TestParseCgroupV2Path(t *testing.T) {
 	}
 }
 
+// HookScope is the scope's decision with a daemon still to come up judged
+// as it stands, and so refused: the oracle the deferring decision,
+// HookScopeOrPending, is held to wherever the daemon has answered.
+func (s Shape) HookScope() (Scope, error) {
+	scope, _, err := s.hookScope(false)
+	return scope, err
+}
+
 // The hook loads only when the facts that decide who it judges are proven.
 // An unknown that decides that refuses; one that cannot change it (a runner
 // VM's daemon or DOCKER_HOST, a private cgroup namespace's pid namespace)

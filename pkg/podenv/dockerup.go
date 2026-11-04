@@ -48,7 +48,7 @@ const (
 )
 
 // probeDaemon probes the daemon behind socket: what it is (probeDockerd),
-// whether it is up (probeUp, the one ping), and, where HookScope reads
+// whether it is up (probeUp, the one ping), and, where the scope reads
 // them (readsRuntime) and only once it has answered, the process serving
 // the socket, its runtime, and in a private cgroup namespace the tree it
 // makes its containers in. A daemon that has not answered is asked

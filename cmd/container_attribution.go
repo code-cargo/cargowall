@@ -408,7 +408,7 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 			"bridges_error", docker.dockerd.BridgesErr)
 		return false
 	}
-	ctr, err := containers.Start(ctx, containers.Options{
+	ctr, err := startTracker(ctx, containers.Options{
 		AllowLocalSubnet: a.subnetCarver(a.allowLocalNetwork),
 		OnConnect:        a.onConnect(docker),
 	}, a.stepTracker, a.observer, auditLogger, a.logger)
@@ -426,6 +426,10 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 	}
 	return true
 }
+
+// startTracker starts docker-events tracking (containers.Start), or a
+// test's stand-in.
+var startTracker = containers.Start
 
 // onConnect is the tracker's Options.OnConnect: each connect is docker's to
 // log as an arrival, and the daemon's answer for the scope's decision.

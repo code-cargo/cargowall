@@ -18,6 +18,8 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -32,6 +34,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/cargowall/bpf"
+	"github.com/code-cargo/cargowall/pkg/containers"
+	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/origin"
 	"github.com/code-cargo/cargowall/pkg/podenv"
 	"github.com/code-cargo/cargowall/pkg/steps"
@@ -395,6 +399,31 @@ func TestScopeDecision_TeardownRecheckUnfinished(t *testing.T) {
 	assert.NotContains(t, run.log.String(), "Container egress hook confirmed", "nothing is decided after teardown")
 	assert.EqualValues(t, 1, run.rechecks.Load(), "and nothing probed")
 	assert.Equal(t, "off", readPostures()[0].Applied)
+}
+
+// The tracker startUserspace starts is handed the connect that decides:
+// its connect reaches the scope's decision, as well as docker's arrival.
+func TestScopeDecision_TrackerConnect(t *testing.T) {
+	run := newScopeRun(t, ContainerEgressEnforce, true, outside)
+	saved := startTracker
+	t.Cleanup(func() { startTracker = saved })
+	var handed containers.Options
+	startTracker = func(_ context.Context, opts containers.Options, _ containers.StepTagger, _ *origin.Observer,
+		_ *events.AuditLogger, _ *slog.Logger,
+	) (*containers.Tracker, error) {
+		handed = opts
+		return nil, errors.New("a stand-in for the tracker")
+	}
+	u, _ := dockerUpFor(t, podenv.Dockerd{Kind: podenv.DockerdLocal}, &StartCmd{})
+	run.a.startUserspace(t.Context(), nil, false, nil, u)
+	require.NotNil(t, handed.OnConnect, "the tracker is handed a connect callback")
+	run.a.ready()
+	handed.OnConnect(true, nil)
+	assert.False(t, run.settled(t))
+	assert.EqualValues(t, 1, run.rechecks.Load(), "the connect reached the decision")
+	assert.Equal(t, "off", readPostures()[0].Applied)
+	rec, recorded := readDockerRecord()
+	assert.True(t, recorded && rec.Answered, "and docker's arrival")
 }
 
 // Startup's half of the decision: a hook loaded with the daemon still to

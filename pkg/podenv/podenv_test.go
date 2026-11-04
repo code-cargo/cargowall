@@ -263,7 +263,9 @@ func TestHookScope(t *testing.T) {
 // namespace, and a pid namespace of our own in the host's. There the
 // deferring decision gives the scope every other rule gives, and pending,
 // whatever the daemon's kind, unidentified or with its listener's pid in
-// sight; a hidden one, or a kind with no rule, still refuses, and so does
+// sight, limited to our pid namespace's tasks where a tree read as ours
+// alone would otherwise be judged whole; a hidden one, or a kind with no
+// rule, still refuses, and so does
 // any other rule, however the daemon stands. Where nothing reads the
 // daemon (a runner VM), or there is no daemon, nothing is pending. HookScope
 // judges a daemon as it stands, and refuses one that has not answered.
@@ -294,7 +296,10 @@ func TestHookScopePending(t *testing.T) {
 		{"privileged container outside Kubernetes", func(d Dockerd) Shape { return host(own, PidNSPrivate, d) }, Scope{Subtree: own}},
 		{"private cgroupns at its root", func(d Dockerd) Shape { return private("/", d) }, Scope{}},
 		{"private cgroupns below its root", func(d Dockerd) Shape { return private("/init", d) }, Scope{Subtree: "/init"}},
-		{"private cgroupns below its root, tree ours alone", func(d Dockerd) Shape { return with(private("/init", d), treeOurs) }, Scope{}},
+		// Our tree, read as ours alone before the daemon made a container,
+		// is judged only as far as our pid namespace's tasks while it is
+		// pending: a runtime outside it would make containers in the tree.
+		{"private cgroupns below its root, tree ours alone", func(d Dockerd) Shape { return with(private("/init", d), treeOurs) }, Scope{Subtree: "/init"}},
 		{"private cgroupns, host pid namespace", func(d Dockerd) Shape { return with(private("/", d), func(s *Shape) { s.PidNS = PidNSHost }) }, Scope{}},
 	}
 	for _, sh := range shapes {
@@ -319,8 +324,10 @@ func TestHookScopePending(t *testing.T) {
 				t.Errorf("%s, %s: pending %v, %v; want refused", sh.name, name, pending, err)
 			}
 		}
-		if got, pending, err := sh.shape(Dockerd{Kind: DockerdAbsent}).HookScopeOrPending(); err != nil || pending || got != sh.want {
-			t.Errorf("%s, no daemon: = %+v, %v, %v; want %+v, nothing pending", sh.name, got, pending, err, sh.want)
+		none := sh.shape(Dockerd{Kind: DockerdAbsent})
+		want, _ := none.HookScope()
+		if got, pending, err := none.HookScopeOrPending(); err != nil || pending || got != want {
+			t.Errorf("%s, no daemon: = %+v, %v, %v; want %+v, nothing pending", sh.name, got, pending, err, want)
 		}
 	}
 

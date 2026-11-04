@@ -288,7 +288,10 @@ func (s Shape) HookScope() (Scope, error) {
 // has not answered (daemonPending), whose containers are still to come, it
 // returns the scope every other rule gives, and pending: the daemon's rules
 // are for the caller to decide again once it answers (Recheck). Every other
-// rule decides as in HookScope, and its refusal is final.
+// rule decides as in HookScope, and its refusal is final. The scope given
+// with a daemon pending never reaches a task outside our pid namespace that
+// the daemon's rules would keep it from (privateScope), so a refusal once
+// the daemon answers only leaves its containers unjudged.
 func (s Shape) HookScopeOrPending() (scope Scope, pending bool, err error) {
 	return s.hookScope(true)
 }
@@ -416,8 +419,14 @@ func (s Shape) privateScope(deferDaemon bool) (Scope, bool, error) {
 	// entrypoint making room for nested cgroups, or systemd as its init),
 	// and the hook judges all of it, as at "/". A nested node always has
 	// some: its kubelet and runtime are outside every pod's pid namespace.
-	if !pod && s.KubeletHostsReason == "" && s.CgroupTree == CgroupTreeOurs {
-		return Scope{}, pending, nil
+	// That is read once, before a daemon still to come up has made any
+	// container, and one whose runtime turns out outside our pid namespace
+	// would make them in this tree with tasks outside it, which the whole
+	// tree's hook would judge: with the daemon pending the scope is limited
+	// as below, where such a daemon's containers are never recorded and
+	// only go unjudged.
+	if !pod && s.KubeletHostsReason == "" && s.CgroupTree == CgroupTreeOurs && !pending {
+		return Scope{}, false, nil
 	}
 	scope, err := s.limitedScope(pod)
 	if err != nil {

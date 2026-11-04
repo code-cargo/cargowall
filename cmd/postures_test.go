@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -254,6 +255,85 @@ func TestPostures_LockdownLossIsNotFatal(t *testing.T) {
 		assert.True(t, l.degraded(), "%s is recorded as lost", l.Posture)
 	}
 	assert.Empty(t, cmd.refusedPosture, "lockdown fails the job itself")
+}
+
+// A loss decided after startup never fails: the job is already running.
+// It is recorded at the layer's off rung, the first reason kept, as an
+// Error for a fail-closed rung (enforce under an enforcing policy, in
+// policy lockdown too) and a Warn for one that is not (the enforce rung
+// under an auditing policy), and the record is rewritten for the summary.
+// Nothing names a refused posture.
+func TestPostures_LoseLate(t *testing.T) {
+	const reason = "the daemon's runtime is outside our pid namespace"
+	for _, c := range []struct {
+		name                string
+		enforcing, lockdown bool
+		level               string
+	}{
+		{name: "enforce", enforcing: true, level: "ERROR"},
+		{name: "enforce rung under an auditing policy", level: "WARN"},
+		{name: "enforce in policy lockdown", enforcing: true, lockdown: true, level: "ERROR"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			redirectStateFiles(t)
+			var buf bytes.Buffer
+			cmd := &StartCmd{ContainerEgress: ContainerEgressEnforce, policyLockdown: c.lockdown}
+			p := newPostures(cmd, "6.6.141", c.enforcing, slog.New(slog.NewTextHandler(&buf, nil)))
+			p.write()
+			require.Len(t, readPostures(), 1)
+			assert.False(t, readPostures()[0].degraded())
+
+			assert.NotPanics(t, func() { p.loseLate(postureContainerEgress, reason) })
+			assert.Contains(t, buf.String(),
+				"level="+c.level+` msg="--container-egress=enforce requested but could not be applied, decided after startup"`)
+			assert.Equal(t, 1, strings.Count(buf.String(), "level="), buf.String())
+			assert.Empty(t, cmd.refusedPosture, "a loss after startup refuses nothing")
+			want := []postureLine{{Posture: postureContainerEgress, Requested: "enforce", Applied: "off", Reason: reason}}
+			assert.Equal(t, want, readPostures(), "the record is rewritten")
+
+			p.loseLate(postureContainerEgress, "a second reason")
+			assert.Equal(t, want, readPostures(), "the first reason is kept")
+		})
+	}
+}
+
+// Startup publishes the record only once both raises succeed, so a loss
+// decided before then changes only the ledger, and startup's write carries
+// it. A layer never requested has nothing to lose, and says nothing.
+func TestPostures_LoseLateBeforePublished(t *testing.T) {
+	redirectStateFiles(t)
+	p, buf := ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
+	p.loseLate(postureContainerEgress, "the hook's scope")
+	_, err := os.Stat(posturesFile)
+	assert.ErrorIs(t, err, os.ErrNotExist, "nothing published before startup does")
+	p.write()
+	require.Len(t, readPostures(), 1)
+	assert.Equal(t, "off", readPostures()[0].Applied)
+
+	buf.Reset()
+	p.loseLate(postureTLSSNI, "never requested")
+	assert.Empty(t, buf.String())
+	assert.Len(t, readPostures(), 1)
+}
+
+// Late losses and startup's write race safely, and the record left is the
+// ledger's last state: no write marshalled before a loss lands after it.
+func TestPostures_LoseLateConcurrent(t *testing.T) {
+	redirectStateFiles(t)
+	cmd := &StartCmd{ContainerEgress: ContainerEgressObserve, TLSSNI: TLSSNIObserve, DNSRedirect: true}
+	p := newPostures(cmd, "6.6.141", true, slog.New(slog.DiscardHandler))
+	var wg sync.WaitGroup
+	for _, posture := range []string{postureContainerEgress, postureTLSSNI, postureDNSRedirect} {
+		wg.Add(2)
+		go func() { defer wg.Done(); p.loseLate(posture, "late") }()
+		go func() { defer wg.Done(); p.write(); _ = p.lines() }()
+	}
+	wg.Wait()
+	recs := readPostures()
+	require.Len(t, recs, 3)
+	for _, r := range recs {
+		assert.True(t, r.degraded(), "%s is recorded as lost", r.Posture)
+	}
 }
 
 // Without step attribution the hook never starts: fatal under enforce, a

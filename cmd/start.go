@@ -523,10 +523,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		attach ebpf.AttachType
 		name   string
 	}{
-		{objs.CwCgConnect4, ebpf.AttachCGroupInet4Connect, "connect4"},
-		{objs.CwCgConnect6, ebpf.AttachCGroupInet6Connect, "connect6"},
-		{objs.CwCgSendmsg4, ebpf.AttachCGroupUDP4Sendmsg, "sendmsg4"},
-		{objs.CwCgSendmsg6, ebpf.AttachCGroupUDP6Sendmsg, "sendmsg6"},
+		{objs.CwCgConnect4, ebpf.AttachCGroupInet4Connect, bpf.TcBpfProgCwCgConnect4},
+		{objs.CwCgConnect6, ebpf.AttachCGroupInet6Connect, bpf.TcBpfProgCwCgConnect6},
+		{objs.CwCgSendmsg4, ebpf.AttachCGroupUDP4Sendmsg, bpf.TcBpfProgCwCgSendmsg4},
+		{objs.CwCgSendmsg6, ebpf.AttachCGroupUDP6Sendmsg, bpf.TcBpfProgCwCgSendmsg6},
 	}
 	for _, cp := range cgroupProgs {
 		l, err := link.AttachCgroup(link.CgroupOptions{
@@ -627,9 +627,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		} else {
 			defer statsCloser.Close()
 			defer func() {
-				logProgStats(logger, "cw_tc_egress", objs.CwTcEgress)
+				logProgStats(logger, bpf.TcBpfProgCwTcEgress, objs.CwTcEgress)
 				if p := attribution.observerProgram(); p != nil {
-					logProgStats(logger, "cw_cg_egress", p)
+					logProgStats(logger, bpf.OriginBpfProgCwCgEgress, p)
 				}
 			}()
 		}

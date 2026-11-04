@@ -19,6 +19,7 @@ package bpf
 import (
 	"bytes"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -71,16 +72,21 @@ func TestLoadObjects(t *testing.T) {
 // tell cargowall's programs from other tools' (GitHub's Azure runner images
 // attach their own clsact filter, tc_egress_traffic). And it fits the
 // kernel's name field whole: a longer one is cut to its first 15 bytes,
-// which can cut off the part that tells two programs apart.
+// which can cut off the part that tells two programs apart. It reads every
+// compiled object here, both byte orders, so a new collection is held to
+// the rules without being listed.
 func TestProgramNames(t *testing.T) {
-	for _, load := range []func() (*ebpf.CollectionSpec, error){LoadTcBpf, LoadStepBpf, LoadOriginBpf, LoadScopeBpf} {
-		spec, err := load()
-		require.NoError(t, err)
-		require.NotEmpty(t, spec.Programs)
-		for name := range spec.Programs {
-			assert.True(t, strings.HasPrefix(name, "cw_"), "program %s: no cw_ prefix", name)
-			assert.Less(t, len(name), unix.BPF_OBJ_NAME_LEN, "program %s: the kernel cuts it to %d bytes",
-				name, unix.BPF_OBJ_NAME_LEN-1)
+	objects, err := filepath.Glob("*.o")
+	require.NoError(t, err)
+	require.NotEmpty(t, objects)
+	for _, obj := range objects {
+		spec, err := ebpf.LoadCollectionSpec(obj)
+		require.NoError(t, err, obj)
+		require.NotEmpty(t, spec.Programs, obj)
+		for _, p := range spec.Programs {
+			assert.True(t, strings.HasPrefix(p.Name, "cw_"), "%s: program %s: no cw_ prefix", obj, p.Name)
+			assert.Less(t, len(p.Name), unix.BPF_OBJ_NAME_LEN, "%s: program %s: the kernel cuts it to %d bytes",
+				obj, p.Name, unix.BPF_OBJ_NAME_LEN-1)
 		}
 	}
 }

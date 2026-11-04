@@ -160,7 +160,7 @@ const (
 	OriginBpfMapMapPorts             = "map_ports"
 	OriginBpfMapMapPortsV6           = "map_ports_v6"
 	OriginBpfMapMapScopeCgroups      = "map_scope_cgroups"
-	OriginBpfProgCgOriginEgress      = "cg_origin_egress"
+	OriginBpfProgCwCgEgress          = "cw_cg_egress"
 	OriginBpfVarBtfAnchorL7Event     = "btf_anchor_l7_event"
 	OriginBpfVarBtfAnchorOriginEvent = "btf_anchor_origin_event"
 	OriginBpfVarScopeSubtreeCgroup   = "scope_subtree_cgroup"
@@ -209,7 +209,7 @@ type OriginBpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type OriginBpfProgramSpecs struct {
-	CgOriginEgress *ebpf.ProgramSpec `ebpf:"cg_origin_egress"`
+	CwCgEgress *ebpf.ProgramSpec `ebpf:"cw_cg_egress"`
 }
 
 // OriginBpfMapSpecs contains maps before they are loaded into the kernel.
@@ -326,12 +326,12 @@ type OriginBpfVariables struct {
 //
 // It can be passed to LoadOriginBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type OriginBpfPrograms struct {
-	CgOriginEgress *ebpf.Program `ebpf:"cg_origin_egress"`
+	CwCgEgress *ebpf.Program `ebpf:"cw_cg_egress"`
 }
 
 func (p *OriginBpfPrograms) Close() error {
 	return _OriginBpfClose(
-		p.CgOriginEgress,
+		p.CwCgEgress,
 	)
 }
 

@@ -392,7 +392,7 @@ func loadWalkScope(t *testing.T, ino, maxEntries uint32) *cgroupScope {
 	t.Cleanup(s.release)
 	s.mount, err = os.Open(podenv.CgroupRoot)
 	require.NoError(t, err)
-	s.iter, err = link.AttachIter(link.IterOptions{Program: s.objs.ScopeTaskIter})
+	s.iter, err = link.AttachIter(link.IterOptions{Program: s.objs.CwScopeIter})
 	require.NoError(t, err)
 	s.links = append(s.links, s.iter)
 	return s

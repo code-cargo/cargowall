@@ -60,7 +60,7 @@ import (
 
 // logProgStats logs one BPF program's kernel runtime counters (meaningful
 // only while --bpf-stats had accounting enabled). The avg-ns-per-run figure
-// is the 3a per-packet-overhead deliverable; tc_egress is logged alongside
+// is the 3a per-packet-overhead deliverable; cw_tc_egress is logged alongside
 // the observer as the in-house baseline.
 func logProgStats(logger *slog.Logger, name string, prog *ebpf.Program) {
 	stats, err := prog.Stats()
@@ -523,10 +523,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		attach ebpf.AttachType
 		name   string
 	}{
-		{objs.CgConnect4, ebpf.AttachCGroupInet4Connect, "connect4"},
-		{objs.CgConnect6, ebpf.AttachCGroupInet6Connect, "connect6"},
-		{objs.CgSendmsg4, ebpf.AttachCGroupUDP4Sendmsg, "sendmsg4"},
-		{objs.CgSendmsg6, ebpf.AttachCGroupUDP6Sendmsg, "sendmsg6"},
+		{objs.CwCgConnect4, ebpf.AttachCGroupInet4Connect, "connect4"},
+		{objs.CwCgConnect6, ebpf.AttachCGroupInet6Connect, "connect6"},
+		{objs.CwCgSendmsg4, ebpf.AttachCGroupUDP4Sendmsg, "sendmsg4"},
+		{objs.CwCgSendmsg6, ebpf.AttachCGroupUDP6Sendmsg, "sendmsg6"},
 	}
 	for _, cp := range cgroupProgs {
 		l, err := link.AttachCgroup(link.CgroupOptions{
@@ -627,9 +627,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		} else {
 			defer statsCloser.Close()
 			defer func() {
-				logProgStats(logger, "tc_egress", objs.TcEgress)
+				logProgStats(logger, "cw_tc_egress", objs.CwTcEgress)
 				if p := attribution.observerProgram(); p != nil {
-					logProgStats(logger, "cg_origin_egress", p)
+					logProgStats(logger, "cw_cg_egress", p)
 				}
 			}()
 		}
@@ -767,7 +767,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// attach-before-program race). Programming first makes the firewall correct
 	// from its first enforced packet; dynamic DNS-resolved hosts are still handled
 	// in-band by the late-add path in processEvent.
-	egressLink, err := tc.AttachEgress(ifname, objs.TcEgress, logger)
+	egressLink, err := tc.AttachEgress(ifname, objs.CwTcEgress, logger)
 	if err != nil {
 		return fmt.Errorf("failed to attach TC egress: %w", err)
 	}

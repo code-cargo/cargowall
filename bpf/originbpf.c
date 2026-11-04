@@ -15,7 +15,7 @@
 //go:build ignore
 
 // Flow-origin recorder and primary egress verdict (issue #106).
-// Bridge-networked container packets cross a netns and NAT before tc_egress
+// Bridge-networked container packets cross a netns and NAT before cw_tc_egress
 // sees them, so the cookie→pid/step lookup there finds nothing — container
 // traffic arrives unattributed, and no per-step policy could ever select on
 // it. cgroup_skb/egress runs in socket context inside the originating netns,
@@ -27,14 +27,14 @@
 //   shadow   — compute the verdict, record would-blocks, still pass.
 //   enforce  — DROP denied traffic here (return 0). This program is then the
 //              primary egress enforcement point for traffic with a local
-//              socket; tc_egress remains attached as the fail-closed
+//              socket; cw_tc_egress remains attached as the fail-closed
 //              backstop for traffic that never traversed one (AF_PACKET,
 //              non-IP frames, forwarded packets, TCP minisockets) and for
 //              the case where this program fails to load or attach.
 // Userspace raises the mode only AFTER the allowlist is programmed, so
 // attaching early can never run this live against empty maps.
 //
-// The allow/deny decision and its rule maps are SHARED with tc_egress via
+// The allow/deny decision and its rule maps are SHARED with cw_tc_egress via
 // verdict.h, wired to one set of kernel maps by MapReplacements. That
 // deliberately reverses phase 3a's standalone-collection isolation (whose
 // point was that a verifier rejection could only cost attribution): a
@@ -53,7 +53,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// The allow/deny decision and its rule maps are shared with tc_egress so the
+// The allow/deny decision and its rule maps are shared with cw_tc_egress so the
 // enforcing hook and its backstop can never diverge. See bpf/verdict.h.
 #include "verdict.h"
 
@@ -188,7 +188,7 @@ struct {
 
 // Local-only networks (docker bridge subnets), carved out of adjudication
 // the way loopback is. OWNED by this collection and deliberately NOT in
-// verdict.h: an entry here must never widen tc_egress. Subnets are
+// verdict.h: an entry here must never widen cw_tc_egress. Subnets are
 // discovered from network config at runtime — i.e. they are
 // workload-influenced — so the blast radius of a hostile entry must be
 // bounded: carving a subnet out of THIS hook returns that traffic to its
@@ -364,7 +364,7 @@ static __always_inline void origin_emit(struct __sk_buff *skb, __u8 ip_version,
     bpf_ringbuf_submit(evt, 0);
 }
 
-// Emission policy, chosen to shadow what tc_egress can emit so every TC
+// Emission policy, chosen to shadow what cw_tc_egress can emit so every TC
 // verdict event has a joinable origin record and little else is produced:
 //   - TCP: connection-opening SYNs only (mirrors TC's allowed-event policy;
 //     blocked-flow SYN retransmits re-emit past the dedup interval, which
@@ -379,7 +379,7 @@ static __always_inline void origin_emit(struct __sk_buff *skb, __u8 ip_version,
 //     ICMPv6 (TC allows both silently — nothing to join).
 
 // Carve-outs — traffic this hook never adjudicates, because it sees traffic
-// tc_egress never did and denying it would break the host:
+// cw_tc_egress never did and denying it would break the host:
 //   - Local-only traffic, i.e. the class "never leaves the machine". Matched
 //     two ways: by egress device (skb->ifindex == lo, gated by
 //     origin_lo_carveout — this is what catches a flow to the host's OWN
@@ -390,7 +390,7 @@ static __always_inline void origin_emit(struct __sk_buff *skb, __u8 ip_version,
 //     DNATs port 53 to 127.0.0.1 BEFORE this hook runs, so we also see the
 //     proxy's own inbound-side loopback. Belt-and-suspenders with the
 //     userspace 127.0.0.0/8 allow (cmd/start.go).
-//   - ICMP / ICMPv6: path-MTU discovery and NDP. tc_egress treats ICMPv4 as
+//   - ICMP / ICMPv6: path-MTU discovery and NDP. cw_tc_egress treats ICMPv4 as
 //     a protocol-block candidate and always allows ICMPv6; dropping either
 //     here would break connectivity for traffic that is otherwise allowed.
 // L7 (TLS SNI / HTTP Host / QUIC) narrowing layer. Included here, after
@@ -403,7 +403,7 @@ static __always_inline void origin_emit(struct __sk_buff *skb, __u8 ip_version,
 // path and the unparsed (parse-fail) path so the two can never drift:
 //   - 127/8 destinations, and lo-device traffic (config-gated): TC is not
 //     on lo, so denying here would break flows TC always passed.
-//   - ICMP: path-MTU discovery; tc_egress adjudicates it as a
+//   - ICMP: path-MTU discovery; cw_tc_egress adjudicates it as a
 //     protocol-block candidate under its own rules.
 //   - bridge-local destinations (map_local_nets): container↔container
 //     traffic TC never saw.
@@ -422,7 +422,7 @@ static __always_inline __u8 origin_carved_v4(struct __sk_buff *skb, __u32 dst_ip
 // craft one) is still loopback traffic TC never adjudicates, and failing
 // closed on it would deny a carved class — with no record anywhere, since
 // the drop happens before the TC qdisc. Outside the carve-outs it fails
-// closed exactly like tc_egress, but WITH a record (ports 0): under
+// closed exactly like cw_tc_egress, but WITH a record (ports 0): under
 // enforce this record is the drop's only evidence. Observe passes
 // untouched and unrecorded, as the parse-fail paths always did
 // (verdict_action never drops below enforce).
@@ -442,7 +442,7 @@ static __always_inline int origin_finish_unparsed_v4(struct __sk_buff *skb, __u8
 static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
     struct iphdr ip_hdr;
     if (bpf_skb_load_bytes(skb, 0, &ip_hdr, sizeof(ip_hdr)) < 0)
-        return verdict_action(mode, 0);  // nothing parsed: silent fail-closed, as at tc_egress
+        return verdict_action(mode, 0);  // nothing parsed: silent fail-closed, as at cw_tc_egress
 
     __u32 src_ip = bpf_ntohl(ip_hdr.saddr);
     __u32 dst_ip = bpf_ntohl(ip_hdr.daddr);
@@ -475,7 +475,7 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
 
     if (non_first_frag) {
         // No L4 header: ports stay 0 and the verdict falls to the LPM/default
-        // path, exactly as in tc_egress. The flow's opening packet already
+        // path, exactly as in cw_tc_egress. The flow's opening packet already
         // produced a record, so nothing new to emit.
         emit = 0;
     } else if (ip_proto == IPPROTO_TCP) {
@@ -526,7 +526,7 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
         }
         if (!carve_out) {
             if (ip_proto != IPPROTO_TCP && ip_proto != IPPROTO_UDP) {
-                // tc_egress protocol-gates before any map lookup
+                // cw_tc_egress protocol-gates before any map lookup
                 // (handle_ipv4: everything not TCP/UDP/ICMP is denied
                 // outright). ICMP is a carve-out class above, so parity
                 // here is exactly "deny non-TCP/UDP". Without this the
@@ -539,7 +539,7 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
             }
             verdict = verdict_label(mode, allowed);
             // Surface our own denials (dedup still applies), for exactly the
-            // shapes tc_egress reports for the same denial: connection
+            // shapes cw_tc_egress reports for the same denial: connection
             // attempts (SYN), killed established flows (midstream), UDP, and
             // other protocols. Deliberately silent, as at TC: kernel RST
             // replies to inbound port scans and SYN-ACK replies to inbound
@@ -622,7 +622,7 @@ static __always_inline int origin_finish_unparsed_v6(struct __sk_buff *skb, __u8
 static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
     struct ipv6hdr ip6_hdr;
     if (bpf_skb_load_bytes(skb, 0, &ip6_hdr, sizeof(ip6_hdr)) < 0)
-        return verdict_action(mode, 0);  // nothing parsed: silent fail-closed, as at tc_egress
+        return verdict_action(mode, 0);  // nothing parsed: silent fail-closed, as at cw_tc_egress
 
     __u8 src_ip6[16];
     __u8 dst_ip6[16];
@@ -630,7 +630,7 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
     __builtin_memcpy(dst_ip6, &ip6_hdr.addrs.daddr.in6_u.u6_addr8, 16);
 
     // Multicast (NDP/MLD) and loopback: always allowed, never emitted —
-    // matching tc_egress's unconditional multicast pass.
+    // matching cw_tc_egress's unconditional multicast pass.
     if (dst_ip6[0] == 0xff || is_ipv6_loopback(dst_ip6))
         return 1;
 
@@ -663,7 +663,7 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
         }
     }
 
-    // ICMPv6 is required for NDP — tc_egress allows it unconditionally and
+    // ICMPv6 is required for NDP — cw_tc_egress allows it unconditionally and
     // pkg/firewall stripICMPForV6 depends on that invariant.
     if (nexthdr == IPPROTO_ICMPV6)
         return 1;
@@ -715,7 +715,7 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
             emit = 0;  // unjoinable local-only record — see the v4 handler
         } else {
             if (nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP) {
-                // tc_egress protocol-gate parity — see the v4 handler.
+                // cw_tc_egress protocol-gate parity — see the v4 handler.
                 // ICMPv6 already returned above, matching TC's
                 // unconditional allow.
                 allowed = 0;
@@ -749,7 +749,7 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
 }
 
 SEC("cgroup_skb/egress")
-int cg_origin_egress(struct __sk_buff *skb) {
+int cw_cg_egress(struct __sk_buff *skb) {
     // The DNS proxy marks its own upstream queries; never adjudicate them,
     // so a policy race can't make the proxy self-block the very lookups that
     // populate the allowlist. Checked before anything else, including parse —
@@ -795,7 +795,7 @@ int cg_origin_egress(struct __sk_buff *skb) {
 
     __u8 first_byte;
     if (bpf_skb_load_bytes(skb, 0, &first_byte, 1) != 0)
-        return 1;  // unreadable: not IP-shaped, and tc_egress passes non-IP too
+        return 1;  // unreadable: not IP-shaped, and cw_tc_egress passes non-IP too
 
     __u8 version = first_byte >> 4;
     if (version == 4)
@@ -803,14 +803,14 @@ int cg_origin_egress(struct __sk_buff *skb) {
     if (version == 6)
         return origin_handle_v6(skb, mode);
 
-    // Non-IP (ARP etc.) — allowed, matching tc_egress. Under ALLOW_MULTI the
+    // Non-IP (ARP etc.) — allowed, matching cw_tc_egress. Under ALLOW_MULTI the
     // effective egress verdict is the AND of every attached program, so a 1
     // here is the identity element and never overrides a peer's decision;
     // conversely our 0 in enforce mode cannot be vetoed by a peer, which is
     // why every drop of a connection attempt or established flow emits a
     // record (userspace turns it into a blocked audit event) — otherwise
     // cargowall would inherit blame for drops it did not make. The only
-    // drops deliberately left silent mirror tc_egress's own reporting
+    // drops deliberately left silent mirror cw_tc_egress's own reporting
     // policy: kernel RST / SYN-ACK replies to inbound scans, and non-first
     // fragments of an already-reported flow.
     return 1;

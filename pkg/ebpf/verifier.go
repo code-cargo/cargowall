@@ -40,7 +40,7 @@ const InsnLimit = 1_000_000
 var processedRe = regexp.MustCompile(`(?i)processed (\d+) insns?`)
 
 // programRe finds the program name in cilium/ebpf's wrapping of a collection
-// load failure ("... program cg_origin_egress: load program: ..."). The
+// load failure ("... program cw_cg_egress: load program: ..."). The
 // verifier log itself never names the program.
 var programRe = regexp.MustCompile(`program ([A-Za-z0-9_]+): load program`)
 
@@ -49,7 +49,7 @@ var programRe = regexp.MustCompile(`program ([A-Za-z0-9_]+): load program`)
 // is no stats line to read) or the log is otherwise unparseable.
 //
 // The number is a property of the kernel as much as of the program: the
-// inlined cg_origin_egress verified in 657k instructions on 6.17 and was
+// inlined cw_cg_egress verified in 657k instructions on 6.17 and was
 // rejected at the limit on 6.6; as a global function it is 114k on 6.17 and
 // 52k on 6.6. So it is worth surfacing on every kernel the daemon runs on,
 // not only the one CI measures.
@@ -131,7 +131,7 @@ func ParseRejection(err error) (r Rejection, ok bool) {
 }
 
 // String is the one-line form a degraded posture reports as its reason —
-// "verifier rejected cg_origin_egress: 1,000,001 insns" — short enough for a
+// "verifier rejected cw_cg_egress: 1,000,001 insns" — short enough for a
 // job-summary table cell, unlike the error, which can carry the whole log.
 func (r Rejection) String() string { return r.On("") }
 

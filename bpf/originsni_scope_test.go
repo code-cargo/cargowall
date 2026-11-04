@@ -43,7 +43,7 @@ func TestOriginL7ModeOffIsInert(t *testing.T) {
 	require.NoError(t, objs.MapL7Scope.Put(ipToU32(edgeIP), uint8(L7ScopeTLS)))
 	// L7 mode left OFF (unset).
 
-	ret, _, err := objs.CgOriginEgress.Test(craftIPv4TLSData(edgeIP, "evil.attacker.example"))
+	ret, _, err := objs.CwCgEgress.Test(craftIPv4TLSData(edgeIP, "evil.attacker.example"))
 	require.NoError(t, err)
 	require.Equal(t, 1, int(ret), "L7 OFF must pass everything the L4 verdict allowed")
 }
@@ -57,7 +57,7 @@ func TestOriginL7UnscopedIPUntouched(t *testing.T) {
 	require.NoError(t, objs.MapOriginConfig.Put(uint32(l7CfgKeyMode), uint8(l7ModeEnforce)))
 
 	// 140.82.114.12 is L4-allowed but NOT in map_l7_scope.
-	ret, _, err := objs.CgOriginEgress.Test(craftIPv4TLSData("140.82.114.12", "evil.attacker.example"))
+	ret, _, err := objs.CwCgEgress.Test(craftIPv4TLSData("140.82.114.12", "evil.attacker.example"))
 	require.NoError(t, err)
 	require.Equal(t, 1, int(ret), "an unscoped IP must pass regardless of SNI")
 }
@@ -77,7 +77,7 @@ func TestOriginL7PortScoped(t *testing.T) {
 	require.NoError(t, objs.MapL7Scope.Put(ipToU32(edgeIP), uint8(L7ScopeTLS)))
 
 	run := func(frame []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(frame)
+		ret, _, err := objs.CwCgEgress.Test(frame)
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -114,7 +114,7 @@ func TestOriginL7CarveOutExempt(t *testing.T) {
 	require.NoError(t, objs.MapOriginConfig.Put(uint32(l7CfgKeyMode), uint8(l7ModeEnforce)))
 	require.NoError(t, objs.MapL7Scope.Put(ipToU32(loIP), uint8(L7ScopeTLS)))
 
-	ret, _, err := objs.CgOriginEgress.Test(craftIPv4TLSData(loIP, "evil.attacker.example"))
+	ret, _, err := objs.CwCgEgress.Test(craftIPv4TLSData(loIP, "evil.attacker.example"))
 	require.NoError(t, err)
 	require.Equal(t, 1, int(ret), "a carved-class destination must never be L7-denied")
 }
@@ -144,7 +144,7 @@ func TestOriginL7AlternateHTTPSPortAdjudicated(t *testing.T) {
 	defer rd.Close()
 
 	run := func(frame []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(frame)
+		ret, _, err := objs.CwCgEgress.Test(frame)
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -188,7 +188,7 @@ func TestOriginL7AlternateHTTPPortAdjudicated(t *testing.T) {
 	defer rd.Close()
 
 	run := func(frame []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(frame)
+		ret, _, err := objs.CwCgEgress.Test(frame)
 		require.NoError(t, err)
 		return int(ret)
 	}

@@ -88,7 +88,7 @@ func TestStartScoped(t *testing.T) {
 	require.NoError(t, o.objs.ScopeSubtreeLevel.Get(&level))
 	require.Equal(t, ownID, id, "the hook's subtree is the scope's")
 	require.Equal(t, podenv.CgroupLevel(own), level, "at the level the walk read, in the host cgroup namespace the path's depth")
-	progInfo, err := o.objs.CgOriginEgress.Info()
+	progInfo, err := o.objs.CwCgEgress.Info()
 	require.NoError(t, err)
 	progID, _ := progInfo.ID()
 	attached := func(path string) bool {

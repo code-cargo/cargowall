@@ -49,7 +49,7 @@ func TestOriginL7FlowStateMachine(t *testing.T) {
 	defer rd.Close()
 
 	run := func(frame []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(frame)
+		ret, _, err := objs.CwCgEgress.Test(frame)
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -130,7 +130,7 @@ func TestOriginL7HTTPStateMachine(t *testing.T) {
 	defer rd.Close()
 
 	run := func(frame []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(frame)
+		ret, _, err := objs.CwCgEgress.Test(frame)
 		require.NoError(t, err)
 		return int(ret)
 	}

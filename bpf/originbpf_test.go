@@ -114,7 +114,7 @@ func originV6Key(t *testing.T, prefixlen uint32, addr string) OriginBpfLpmKeyV6 
 // TestOriginEgressPassesInNonEnforcingModes pins the safety property the
 // mode ladder rests on: in observe (phase 3a) and shadow, whatever the
 // packet — valid, truncated, malformed, fragmented, garbage — and whatever
-// the policy, cg_origin_egress must return 1 (pass). Only enforce mode may
+// the policy, cw_cg_egress must return 1 (pass). Only enforce mode may
 // ever drop. If this fails, turning container attribution on has silently
 // started blocking traffic.
 func TestOriginEgressPassesInNonEnforcingModes(t *testing.T) {
@@ -157,7 +157,7 @@ func TestOriginEgressPassesInNonEnforcingModes(t *testing.T) {
 		setOriginMode(t, objs, mode)
 		for _, tt := range tests {
 			t.Run(fmt.Sprintf("mode%d/%s", mode, tt.name), func(t *testing.T) {
-				ret, _, err := objs.CgOriginEgress.Test(tt.packet)
+				ret, _, err := objs.CwCgEgress.Test(tt.packet)
 				require.NoError(t, err)
 				require.Equal(t, uint32(1), ret, "non-enforcing modes must pass every packet")
 			})
@@ -199,7 +199,7 @@ func TestOriginEmission(t *testing.T) {
 
 	run := func(t *testing.T, pkt []byte, repeat int) {
 		t.Helper()
-		ret, err := objs.CgOriginEgress.Run(&ebpf.RunOptions{
+		ret, err := objs.CwCgEgress.Run(&ebpf.RunOptions{
 			Data:   pkt,
 			Repeat: uint32(repeat),
 		})
@@ -288,7 +288,7 @@ func TestOriginEmission(t *testing.T) {
 
 // TestOriginEgressEnforceVerdicts is the phase-3b enforcement contract: in
 // enforce mode the hook drops denied destinations (0) and passes allowed
-// ones (1), and malformed packets fail closed exactly as tc_egress does.
+// ones (1), and malformed packets fail closed exactly as cw_tc_egress does.
 func TestOriginEgressEnforceVerdicts(t *testing.T) {
 	objs := loadOriginObjects(t)
 	seedOriginRules(t, objs)
@@ -323,7 +323,7 @@ func TestOriginEgressEnforceVerdicts(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ret, _, err := objs.CgOriginEgress.Test(tt.packet)
+			ret, _, err := objs.CwCgEgress.Test(tt.packet)
 			require.NoError(t, err)
 			require.Equal(t, tt.wantRet, ret)
 		})
@@ -367,7 +367,7 @@ func TestOriginEgressVerdictLabels(t *testing.T) {
 			setOriginMode(t, objs, tt.mode)
 			require.NoError(t, objs.MapAuditMode.Put(uint32(0), tt.auditMode))
 
-			_, _, err := objs.CgOriginEgress.Test(craftIPv4TCP(t, tt.dst, 443))
+			_, _, err := objs.CwCgEgress.Test(craftIPv4TCP(t, tt.dst, 443))
 			require.NoError(t, err)
 
 			recs := collectOriginRecords(t, rd, 500*time.Millisecond)
@@ -394,18 +394,18 @@ func TestOriginEgressLoopbackDeviceCarveOut(t *testing.T) {
 	pkt4 := craftIPv4TCP(t, "93.184.216.34", 443) // denied dst
 	pkt6 := craftIPv6TCP(t, "2001:db8::1", 443)   // denied dst
 
-	ret, _, err := objs.CgOriginEgress.Test(pkt4)
+	ret, _, err := objs.CwCgEgress.Test(pkt4)
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), ret, "unarmed: denied v4 dst must drop")
-	ret, _, err = objs.CgOriginEgress.Test(pkt6)
+	ret, _, err = objs.CwCgEgress.Test(pkt6)
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), ret, "unarmed: denied v6 dst must drop")
 
 	require.NoError(t, objs.MapOriginConfig.Put(uint32(originCfgKeyLoCarveout), uint8(1)))
-	ret, _, err = objs.CgOriginEgress.Test(pkt4)
+	ret, _, err = objs.CwCgEgress.Test(pkt4)
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), ret, "armed: test skbs ride lo, local-only v4 traffic must pass")
-	ret, _, err = objs.CgOriginEgress.Test(pkt6)
+	ret, _, err = objs.CwCgEgress.Test(pkt6)
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), ret, "armed: test skbs ride lo, local-only v6 traffic must pass")
 }
@@ -414,7 +414,7 @@ func TestOriginEgressLoopbackDeviceCarveOut(t *testing.T) {
 // exempt from THIS hook's adjudication — and, critically, from this hook
 // ONLY. The map is owned by the origin collection and never shared, so a
 // workload-influenced subnet (docker bridge discovery) can exempt local
-// traffic this hook alone sees but can never widen tc_egress's off-host
+// traffic this hook alone sees but can never widen cw_tc_egress's off-host
 // enforcement; the parity test's premise (shared decision) is about the
 // verdict maps, which this deliberately is not part of.
 func TestOriginEgressLocalNetworkCarveOut(t *testing.T) {
@@ -433,10 +433,10 @@ func TestOriginEgressLocalNetworkCarveOut(t *testing.T) {
 	pkt4 := craftIPv4TCP(t, "10.99.7.3", 443)  // denied dst
 	pkt6 := craftIPv6TCP(t, "fd00:77::3", 443) // denied dst
 
-	ret, _, err := objs.CgOriginEgress.Test(pkt4)
+	ret, _, err := objs.CwCgEgress.Test(pkt4)
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), ret, "denied v4 dst must drop before the carve-out exists")
-	ret, _, err = objs.CgOriginEgress.Test(pkt6)
+	ret, _, err = objs.CwCgEgress.Test(pkt6)
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), ret, "denied v6 dst must drop before the carve-out exists")
 
@@ -446,10 +446,10 @@ func TestOriginEgressLocalNetworkCarveOut(t *testing.T) {
 	copy(key6.Ip[:], net.ParseIP("fd00:77::").To16())
 	require.NoError(t, objs.MapLocalNetsV6.Put(key6, uint8(1)))
 
-	ret, _, err = objs.CgOriginEgress.Test(pkt4)
+	ret, _, err = objs.CwCgEgress.Test(pkt4)
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), ret, "carved-out v4 subnet must pass at the cgroup hook")
-	ret, _, err = objs.CgOriginEgress.Test(pkt6)
+	ret, _, err = objs.CwCgEgress.Test(pkt6)
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), ret, "carved-out v6 subnet must pass at the cgroup hook")
 
@@ -457,13 +457,13 @@ func TestOriginEgressLocalNetworkCarveOut(t *testing.T) {
 	// TC, which reads the SAME shared verdict maps but must not see
 	// map_local_nets — this is what makes workload-influenced subnet
 	// discovery safe to wire at all.
-	tcRet, _, err := tcObjs.TcEgress.Test(pkt4)
+	tcRet, _, err := tcObjs.CwTcEgress.Test(pkt4)
 	require.NoError(t, err)
 	require.NotEqual(t, uint32(tcActOK), tcRet,
 		"a local-net carve-out must never widen TC's off-host enforcement")
 }
 
-// Denial reporting must mirror tc_egress's policy, not just its verdict: a
+// Denial reporting must mirror cw_tc_egress's policy, not just its verdict: a
 // killed established flow is emitted (flagged mid-stream), while kernel RST
 // replies to inbound port scans and SYN-ACK replies to inbound handshakes
 // stay silent — on a public CI runner those arrive constantly and would
@@ -478,7 +478,7 @@ func TestOriginDenialEmissionMirrorsTC(t *testing.T) {
 	t.Cleanup(func() { rd.Close() })
 
 	t.Run("denied established ACK emits mid-stream", func(t *testing.T) {
-		_, _, err := objs.CgOriginEgress.Test(craftIPv4TCPWithFlags(t, "203.0.113.20", 443, 0x10))
+		_, _, err := objs.CwCgEgress.Test(craftIPv4TCPWithFlags(t, "203.0.113.20", 443, 0x10))
 		require.NoError(t, err)
 		recs := collectOriginRecords(t, rd, 500*time.Millisecond)
 		require.Len(t, recs, 1)
@@ -487,12 +487,12 @@ func TestOriginDenialEmissionMirrorsTC(t *testing.T) {
 	})
 
 	t.Run("denied RST and SYN-ACK replies are silent", func(t *testing.T) {
-		_, _, err := objs.CgOriginEgress.Test(craftIPv4TCPWithFlags(t, "203.0.113.21", 443, 0x14)) // ACK|RST
+		_, _, err := objs.CwCgEgress.Test(craftIPv4TCPWithFlags(t, "203.0.113.21", 443, 0x14)) // ACK|RST
 		require.NoError(t, err)
-		_, _, err = objs.CgOriginEgress.Test(craftIPv4TCPWithFlags(t, "203.0.113.22", 443, 0x12)) // SYN|ACK
+		_, _, err = objs.CwCgEgress.Test(craftIPv4TCPWithFlags(t, "203.0.113.22", 443, 0x12)) // SYN|ACK
 		require.NoError(t, err)
 		// Marker packet proves the pipeline is live and orders the assertion.
-		_, _, err = objs.CgOriginEgress.Test(craftIPv4TCP(t, "10.99.0.3", 997))
+		_, _, err = objs.CwCgEgress.Test(craftIPv4TCP(t, "10.99.0.3", 997))
 		require.NoError(t, err)
 		recs := collectOriginRecords(t, rd, 500*time.Millisecond)
 		require.Len(t, recs, 1)
@@ -518,7 +518,7 @@ func TestOriginVerdictChangeReemitsWithinInterval(t *testing.T) {
 	l, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    cgPath,
 		Attach:  ebpf.AttachCGroupInetEgress,
-		Program: objs.CgOriginEgress,
+		Program: objs.CwCgEgress,
 	})
 	if err != nil {
 		t.Skipf("cannot attach cgroup_skb/egress at test cgroup: %v", err)
@@ -613,7 +613,7 @@ func TestOriginEgressAuditModeNeverDrops(t *testing.T) {
 	setOriginMode(t, objs, originModeEnforce)
 	require.NoError(t, objs.MapAuditMode.Put(uint32(0), uint8(1)))
 
-	ret, _, err := objs.CgOriginEgress.Test(craftIPv4TCP(t, "93.184.216.34", 443))
+	ret, _, err := objs.CwCgEgress.Test(craftIPv4TCP(t, "93.184.216.34", 443))
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), ret, "audit mode must pass traffic enforce mode would drop")
 }
@@ -672,13 +672,13 @@ func TestOriginEgressSkipsDNSProxyMark(t *testing.T) {
 
 	// Without the mark the same packet is dropped — so a pass below can only
 	// be the mark carve-out, not a lenient policy.
-	ret, _, err := objs.CgOriginEgress.Test(pkt)
+	ret, _, err := objs.CwCgEgress.Test(pkt)
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), ret, "unmarked traffic to a denied dst must drop")
 
 	in := skBuffCtx{Mark: dnsProxyFWMark}
 	out := skBuffCtx{}
-	ret, err = objs.CgOriginEgress.Run(&ebpf.RunOptions{
+	ret, err = objs.CwCgEgress.Run(&ebpf.RunOptions{
 		Data:       pkt,
 		Context:    in,
 		ContextOut: &out,
@@ -787,16 +787,16 @@ func TestVerdictParityWithTcEgress(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tcRet, _, err := tcObjs.TcEgress.Test(tc.packet)
+			tcRet, _, err := tcObjs.CwTcEgress.Test(tc.packet)
 			require.NoError(t, err)
-			cgRet, _, err := originObjs.CgOriginEgress.Test(tc.packet)
+			cgRet, _, err := originObjs.CwCgEgress.Test(tc.packet)
 			require.NoError(t, err)
 
 			// TC: 0 = pass, 2 = drop. cgroup: 1 = pass, 0 = drop.
 			tcAllowed := tcRet == tcActOK
 			cgAllowed := cgRet == 1
 			require.Equal(t, tcAllowed, cgAllowed,
-				"tc_egress and cg_origin_egress disagree (tc=%d cgroup=%d)", tcRet, cgRet)
+				"cw_tc_egress and cw_cg_egress disagree (tc=%d cgroup=%d)", tcRet, cgRet)
 		})
 	}
 }
@@ -876,7 +876,7 @@ func TestOriginRealSocket(t *testing.T) {
 	originLink, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    "/sys/fs/cgroup",
 		Attach:  ebpf.AttachCGroupInetEgress,
-		Program: objs.CgOriginEgress,
+		Program: objs.CwCgEgress,
 	})
 	if err != nil {
 		t.Skipf("cannot attach cgroup_skb/egress at root cgroup: %v", err)
@@ -886,7 +886,7 @@ func TestOriginRealSocket(t *testing.T) {
 	connectLink, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    "/sys/fs/cgroup",
 		Attach:  ebpf.AttachCGroupInet4Connect,
-		Program: tcObjs.CgConnect4,
+		Program: tcObjs.CwCgConnect4,
 	})
 	require.NoError(t, err, "attach cgroup connect4")
 	t.Cleanup(func() { connectLink.Close() })

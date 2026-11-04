@@ -14,7 +14,7 @@
 
 // Shared egress verdict surface (issue #106 phase 3b). The allow/deny
 // decision and the maps that carry it are the single source of truth for
-// BOTH enforcing hooks: tc_egress (bpf/tcbpf.c) and cg_origin_egress
+// BOTH enforcing hooks: cw_tc_egress (bpf/tcbpf.c) and cw_cg_egress
 // (bpf/originbpf.c). A divergence between the primary hook and its backstop
 // would be a security bug, so the decision lives here once, not copied.
 //
@@ -193,7 +193,7 @@ static __always_inline void rule_net_v6(__u8 out[16], const __u8 ip[16], __u8 ho
 
 // verdict_allowed_v4 returns 1 if a packet to dst (network byte order) on
 // dst_port (host order) / proto is allowed, 0 if denied. This is the exact
-// decision tc_egress made inline before phase 3b: LPM rule match →
+// decision cw_tc_egress made inline before phase 3b: LPM rule match →
 // port-specific check → 0.0.0.0 wildcard port → default action. A no-LPM
 // match consults only the wildcard-port entry, never a specific-IP port —
 // preserving the original asymmetry. The port-specific check looks under

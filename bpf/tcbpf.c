@@ -19,7 +19,7 @@
 #include <bpf/bpf_endian.h>
 
 // The allow/deny decision, its rule/config maps, and their key/value structs
-// are shared with cg_origin_egress (bpf/originbpf.c) so the enforcing hook
+// are shared with cw_cg_egress (bpf/originbpf.c) so the enforcing hook
 // and its backstop can never diverge. See bpf/verdict.h.
 #include "verdict.h"
 
@@ -61,7 +61,7 @@
 #define TCP_FLAG_URG 0x20
 
 // The rule/config structs (lpm_key, lpm_val, port_key, port_val, and the v6
-// variants) now live in verdict.h, shared with cg_origin_egress.
+// variants) now live in verdict.h, shared with cw_cg_egress.
 
 // ---- Event struct with version discriminator ----
 
@@ -93,8 +93,8 @@ const struct blocked_event *btf_anchor_blocked_event __attribute__((unused));
 
 // The rule/config maps (map_default_action, map_cidrs, map_ports,
 // map_cidrs_v6, map_ports_v6, map_audit_mode) now live in verdict.h, shared
-// with cg_origin_egress. map_events and map_sock_pid below stay owned here:
-// tc_egress emission is TC-specific and unchanged.
+// with cw_cg_egress. map_events and map_sock_pid below stay owned here:
+// cw_tc_egress emission is TC-specific and unchanged.
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -138,7 +138,7 @@ struct {
 // ---- Step attribution (per-workflow-step audit) ----
 //
 // Runner.Worker forks one direct child process per workflow step. The
-// step_fork tracepoint (stepbpf.c, loaded separately because it needs kernel
+// cw_step_fork tracepoint (stepbpf.c, loaded separately because it needs kernel
 // BTF) tags each such child with a monotonically increasing step ordinal;
 // every other fork inherits the forking thread's tag, so a step's entire
 // process subtree — including daemonized survivors — carries its ordinal.
@@ -212,7 +212,7 @@ static __always_inline __u32 sock_owner_pid(void) {
 
 // Helper: copy the calling thread's step tag onto a socket cookie.
 // Shared by the connect/sendmsg hooks below (fallback for sockets created
-// before attach) and cg_sock_create in stepbpf.c (primary path).
+// before attach) and cw_cg_sock_new in stepbpf.c (primary path).
 static __always_inline void step_tag_socket(__u64 cookie) {
     __u32 sk = 0;
     struct step_state *st = bpf_map_lookup_elem(&map_step_state, &sk);
@@ -406,7 +406,7 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
     }
 
     // The allow/deny decision (map_cidrs → map_ports → wildcard → default)
-    // is shared with cg_origin_egress via verdict.h.
+    // is shared with cw_cg_egress via verdict.h.
     __u8 allowed = verdict_allowed_v4(dst_ip_nbo, dst_port, ip_proto);
 
     if (!allowed) {
@@ -544,7 +544,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
     }
 
     // The allow/deny decision (map_cidrs_v6 → map_ports_v6 → wildcard →
-    // default) is shared with cg_origin_egress via verdict.h.
+    // default) is shared with cw_cg_egress via verdict.h.
     __u8 allowed = verdict_allowed_v6(dst_ip6, dst_port, nexthdr);
 
     if (!allowed) {
@@ -568,7 +568,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
 // Cgroup programs to track socket cookie → PID mapping
 // These fire on connect() and have process context available
 SEC("cgroup/connect4")
-int cg_connect4(struct bpf_sock_addr *ctx) {
+int cw_cg_connect4(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
     __u32 pid = sock_owner_pid();
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
@@ -577,7 +577,7 @@ int cg_connect4(struct bpf_sock_addr *ctx) {
 }
 
 SEC("cgroup/connect6")
-int cg_connect6(struct bpf_sock_addr *ctx) {
+int cw_cg_connect6(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
     __u32 pid = sock_owner_pid();
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
@@ -588,7 +588,7 @@ int cg_connect6(struct bpf_sock_addr *ctx) {
 // sendmsg hooks for UDP sockets that use sendto()/sendmsg() without connect().
 // Without these, connectionless UDP traffic won't have a cookie→PID entry.
 SEC("cgroup/sendmsg4")
-int cg_sendmsg4(struct bpf_sock_addr *ctx) {
+int cw_cg_sendmsg4(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
     __u32 pid = sock_owner_pid();
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
@@ -597,7 +597,7 @@ int cg_sendmsg4(struct bpf_sock_addr *ctx) {
 }
 
 SEC("cgroup/sendmsg6")
-int cg_sendmsg6(struct bpf_sock_addr *ctx) {
+int cw_cg_sendmsg6(struct bpf_sock_addr *ctx) {
     __u64 cookie = bpf_get_socket_cookie(ctx);
     __u32 pid = sock_owner_pid();
     bpf_map_update_elem(&map_sock_pid, &cookie, &pid, BPF_ANY);
@@ -606,7 +606,7 @@ int cg_sendmsg6(struct bpf_sock_addr *ctx) {
 }
 
 SEC("classifier/egress")
-int tc_egress(struct __sk_buff *skb) {
+int cw_tc_egress(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
 
@@ -648,7 +648,7 @@ int tc_egress(struct __sk_buff *skb) {
 
 // Handle ingress traffic - currently just allows everything
 SEC("classifier/ingress")
-int tc_ingress(struct __sk_buff *skb) {
+int cw_tc_ingress(struct __sk_buff *skb) {
     // Allow all ingress traffic
     return TC_ACT_OK;
 }

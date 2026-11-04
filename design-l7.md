@@ -112,7 +112,7 @@ and a 0-RTT/Handshake belonging to some other connection. Packets with the
 together.
 
 **The cap is verifier budget, not protocol shape.** `L7_QUIC_MAX_COALESCED`
-(pinned equal to `sni.MaxCoalescedPackets`) costs ~20k of `cg_origin_egress`'s
+(pinned equal to `sni.MaxCoalescedPackets`) costs ~20k of `cw_cg_egress`'s
 1M instruction limit per rung. Raising it to 12 took the program from 236k to
 450k on a 6.8 kernel and past 1,000,001 on the newer kernel CI runs — where it
 fails to load and the whole cgroup hook, L4 enforcement included, does not

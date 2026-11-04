@@ -19,11 +19,13 @@ package bpf
 import (
 	"bytes"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 )
@@ -46,12 +48,12 @@ func TestLoadObjects(t *testing.T) {
 	}, &objs))
 	t.Cleanup(func() { objs.Close() })
 
-	require.NotNil(t, objs.TcEgress)
-	info, err := objs.TcEgress.Info()
+	require.NotNil(t, objs.CwTcEgress)
+	info, err := objs.CwTcEgress.Info()
 	require.NoError(t, err, "assigned program must be live after the collection is closed")
-	assert.Equal(t, "tc_egress", info.Name)
+	assert.Equal(t, "cw_tc_egress", info.Name)
 	require.NotNil(t, objs.MapCidrs)
-	assert.Contains(t, buf.String(), "program=tc_egress")
+	assert.Contains(t, buf.String(), "program=cw_tc_egress")
 	assert.Contains(t, buf.String(), "processed_insns=")
 
 	// A struct that names something the collection lacks: error, and the
@@ -62,4 +64,23 @@ func TestLoadObjects(t *testing.T) {
 	spec2, err := LoadTcBpf()
 	require.NoError(t, err)
 	assert.Error(t, cargowallEbpf.LoadObjects(logger, "tcbpf", spec2, ebpf.CollectionOptions{}, &wrong))
+}
+
+// TestProgramNames holds every program's kernel-visible name to two rules.
+// It starts with cw_, so `bpftool prog`, `bpftool net` and `tc filter show`
+// tell cargowall's programs from other tools' (GitHub's Azure runner images
+// attach their own clsact filter, tc_egress_traffic). And it fits the
+// kernel's name field whole: a longer one is cut to its first 15 bytes,
+// which can cut off the part that tells two programs apart.
+func TestProgramNames(t *testing.T) {
+	for _, load := range []func() (*ebpf.CollectionSpec, error){LoadTcBpf, LoadStepBpf, LoadOriginBpf, LoadScopeBpf} {
+		spec, err := load()
+		require.NoError(t, err)
+		require.NotEmpty(t, spec.Programs)
+		for name := range spec.Programs {
+			assert.True(t, strings.HasPrefix(name, "cw_"), "program %s: no cw_ prefix", name)
+			assert.Less(t, len(name), unix.BPF_OBJ_NAME_LEN, "program %s: the kernel cuts it to %d bytes",
+				name, unix.BPF_OBJ_NAME_LEN-1)
+		}
+	}
 }

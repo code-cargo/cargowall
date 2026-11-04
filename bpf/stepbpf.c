@@ -28,8 +28,8 @@
 // pids as numbered in the daemon's own pid namespace, and the two differ
 // whenever cargowall runs inside a container (ARC runners are Kubernetes
 // pods). map_task_nspid is the bridge — global tid → daemon-namespace
-// tgid — seeded for pre-existing tasks by step_task_iter and kept current
-// by step_fork, step_exec (a de_thread moves it) and step_exit. It is what lets the reconciler read
+// tgid — seeded for pre-existing tasks by cw_step_iter and kept current
+// by cw_step_fork, cw_step_exec (a de_thread moves it) and cw_step_exit. It is what lets the reconciler read
 // /proc/<tgid>/cmdline for a boundary event, lets userspace resolve the
 // process behind a socket, and lets pkg/steps translate the /proc-numbered
 // pids it discovers into the global ids the kernel needs.
@@ -135,7 +135,7 @@ struct {
 } map_step_events SEC(".maps");
 
 // Step roots between fork and their first exec: global tgid → ordinal.
-// step_fork adds one, and step_exec or step_exit takes it out, so a
+// cw_step_fork adds one, and cw_step_exec or cw_step_exit takes it out, so a
 // recycled tgid never finds an entry. Steps run a few at a time.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -145,10 +145,10 @@ struct {
 } map_step_exec_pending SEC(".maps");
 
 // One record per task in the daemon's pid-namespace subtree, streamed by
-// step_task_iter. tid/tgid/ppid are global; ns_tgid is the process id
+// cw_step_iter. tid/tgid/ppid are global; ns_tgid is the process id
 // userspace sees. pkg/steps builds its process-tree views from these
 // instead of scanning /proc, which cannot reveal global ids from inside a
-// namespace. exiting is 1 for a task already in do_exit: step_exit has run
+// namespace. exiting is 1 for a task already in do_exit: cw_step_exit has run
 // or is about to, so a tag written to it would outlive it.
 struct task_iter_rec {
     __u32 tid;
@@ -171,7 +171,7 @@ static __always_inline struct step_state *step_state(void) {
 }
 
 // clear_entry deletes key from map if it is there. A delete takes the
-// bucket's lock even for an absent key, and step_fork clears an entry for
+// bucket's lock even for an absent key, and cw_step_fork clears an entry for
 // most tasks the host creates; a lookup takes none.
 static __always_inline void clear_entry(void *map, __u32 *key)
 {
@@ -205,11 +205,11 @@ static __always_inline void clear_entry(void *map, __u32 *key)
 // The child's entries are set outright, cleared where there is nothing to
 // copy and while attribution is off: the child's tid can be a recycled one
 // that still holds an entry. Userspace tags tasks from a task walk, and a
-// task that exits between the walk and the write keeps a tag step_exit has
+// task that exits between the walk and the write keeps a tag cw_step_exit has
 // already run for; the iterator can likewise re-seed a namespace entry for
 // a task it caught exiting.
 SEC("tp_btf/task_newtask")
-int BPF_PROG(step_fork, struct task_struct *child, __u64 clone_flags)
+int BPF_PROG(cw_step_fork, struct task_struct *child, __u64 clone_flags)
 {
     __u64 parent = bpf_get_current_pid_tgid();
     __u32 parent_tid = (__u32)parent;
@@ -311,7 +311,7 @@ static __always_inline void move_entry(void *map, __u32 *from, __u32 *to)
 // program's arguments are in place in its memory, which a /proc read from
 // userspace can only race. A lookup or two per exec anywhere on the host.
 SEC("tp_btf/sched_process_exec")
-int BPF_PROG(step_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
+int BPF_PROG(cw_step_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
 {
     __u32 tid = p->pid;
     __u32 old = old_pid;
@@ -330,7 +330,7 @@ int BPF_PROG(step_exec, struct task_struct *p, pid_t old_pid, struct linux_binpr
 // exiting is a pthread_exit, or a de_thread whose exec is still to come.
 // do_exit counts the thread out of signal->live before this fires.
 SEC("tp_btf/sched_process_exit")
-int BPF_PROG(step_exit, struct task_struct *task)
+int BPF_PROG(cw_step_exit, struct task_struct *task)
 {
     __u32 tid = task->pid;
     if (BPF_CORE_READ(task, signal, live.counter) == 0)
@@ -345,7 +345,7 @@ int BPF_PROG(step_exit, struct task_struct *task)
 // socket's whole life. The connect/sendmsg hooks in tcbpf.c re-tag as a
 // fallback for sockets created before attach.
 SEC("cgroup/sock_create")
-int cg_sock_create(struct bpf_sock *ctx)
+int cw_cg_sock_new(struct bpf_sock *ctx)
 {
     struct step_state *st = step_state();
     if (!st || !st->enabled)
@@ -367,9 +367,9 @@ int cg_sock_create(struct bpf_sock *ctx)
 // subtree is visited — and ns_tgid_of filters, defensively, anything it
 // cannot map. Re-running it is idempotent, so container tagging takes a
 // fresh pass per call. A task already exiting is listed, flagged, but not
-// seeded: step_exit may have deleted its entry already.
+// seeded: cw_step_exit may have deleted its entry already.
 SEC("iter/task")
-int step_task_iter(struct bpf_iter__task *ctx)
+int cw_step_iter(struct bpf_iter__task *ctx)
 {
     struct task_struct *t = ctx->task;
     if (!t)

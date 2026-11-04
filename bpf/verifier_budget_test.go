@@ -34,7 +34,7 @@ import (
 // verifierBudgetPct is the share of the verifier's instruction limit any one
 // program may use on the kernel running this suite. It is deliberately well
 // under 100%: the count is kernel-specific and the two kernels we measure do
-// not even agree on the direction (the inlined cg_origin_egress was 657k on
+// not even agree on the direction (the inlined cw_cg_egress was 657k on
 // the 6.17 kernel CI runs on and over the limit on Blacksmith's 6.6; as a
 // global function it is 114k on 6.17 and 52k on 6.6), so creep that is still
 // comfortable here can be what another verifier turns into a load failure.
@@ -89,7 +89,7 @@ func TestVerifierBudget(t *testing.T) {
 	}{
 		{"tcbpf", LoadTcBpf, nil},
 		// pidns_ino gates the namespace walk; at its zero default the
-		// verifier prunes that code as dead and step_fork would be
+		// verifier prunes that code as dead and cw_step_fork would be
 		// under-counted. Set it the way steps.Start does.
 		{"stepbpf", LoadStepBpf, func(spec *ebpf.CollectionSpec) error {
 			return spec.Variables[StepBpfVarPidnsIno].Set(pidnsInode(t))

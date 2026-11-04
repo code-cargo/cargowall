@@ -47,7 +47,7 @@ import (
 // Blacksmith runner: cilium's wrapping names the program, the verifier log
 // carries the count.
 func verifierTooLarge() error {
-	return fmt.Errorf("failed to load origin BPF objects: program cg_origin_egress: load program: %w",
+	return fmt.Errorf("failed to load origin BPF objects: program cw_cg_egress: load program: %w",
 		&ebpf.VerifierError{Cause: unix.E2BIG, Log: []string{"BPF program is too large. Processed 1000001 insn"}})
 }
 
@@ -77,7 +77,7 @@ func TestPostures_LostEnforceFailsStartup(t *testing.T) {
 		{
 			ContainerEgressEnforce, TLSSNIOff, postureContainerEgress, "",
 			"--container-egress=enforce requested but could not be applied: " +
-				"verifier rejected cg_origin_egress on 6.6.141: 1,000,001 insns",
+				"verifier rejected cw_cg_egress on 6.6.141: 1,000,001 insns",
 		},
 		{
 			ContainerEgressEnforce, TLSSNIEnforce, postureTLSSNI, "mode gate could not be raised: EPERM",
@@ -122,7 +122,7 @@ func TestPostures_LostObserveIsRecordedNotFatal(t *testing.T) {
 	assert.Equal(t, []postureLine{
 		{
 			Posture: postureContainerEgress, Requested: "observe", Applied: "off",
-			Reason: "verifier rejected cg_origin_egress on 6.6.141: 1,000,001 insns",
+			Reason: "verifier rejected cw_cg_egress on 6.6.141: 1,000,001 insns",
 		},
 		{
 			Posture: postureTLSSNI, Requested: "observe", Applied: "off",
@@ -379,7 +379,7 @@ func TestRenderPostures(t *testing.T) {
 func TestSummary_Run_LostPostureRenderedAboveLink(t *testing.T) {
 	redirectStateFiles(t)
 	p, _ := ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
-	require.NoError(t, p.lose(postureContainerEgress, "verifier rejected cg_origin_egress on 6.6.141: 1,000,001 insns"))
+	require.NoError(t, p.lose(postureContainerEgress, "verifier rejected cw_cg_egress on 6.6.141: 1,000,001 insns"))
 	p.write()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

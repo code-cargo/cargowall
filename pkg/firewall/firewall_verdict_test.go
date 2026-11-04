@@ -43,7 +43,7 @@ type verdictProbe struct {
 }
 
 // TestUpdateAllowlistTC_Verdict drives policy through the real writer into
-// the real TC maps and reads the decision back from tc_egress. The mock-map
+// the real TC maps and reads the decision back from cw_tc_egress. The mock-map
 // tests above pin which entries get written and bpf/ pins how the verdict
 // reads hand-written entries; this is the seam between them, where a subnet
 // rule's port entries were once keyed where the verdict never looked —
@@ -164,7 +164,7 @@ func TestUpdateAllowlistTC_Verdict(t *testing.T) {
 			require.NoError(t, fw.UpdateAllowlistTC(cm))
 
 			for _, p := range tt.probes {
-				ret, _, err := objs.TcEgress.Test(tcpSYN(t, p.dst, p.port))
+				ret, _, err := objs.CwTcEgress.Test(tcpSYN(t, p.dst, p.port))
 				require.NoError(t, err)
 				require.Equal(t, p.want, ret, "%s port %d", p.dst, p.port)
 			}
@@ -204,12 +204,12 @@ func TestRemoveIP_Verdict(t *testing.T) {
 			ip := net.ParseIP(tt.ip)
 			_, err := fw.AddIP(ip, config.ActionAllow, tt.ports)
 			require.NoError(t, err)
-			ret, _, err := objs.TcEgress.Test(tcpSYN(t, tt.ip, 443))
+			ret, _, err := objs.CwTcEgress.Test(tcpSYN(t, tt.ip, 443))
 			require.NoError(t, err)
 			require.Equal(t, uint32(verdictPass), ret, "allowed once added")
 
 			require.NoError(t, fw.RemoveIP(ip))
-			ret, _, err = objs.TcEgress.Test(tcpSYN(t, tt.ip, 443))
+			ret, _, err = objs.CwTcEgress.Test(tcpSYN(t, tt.ip, 443))
 			require.NoError(t, err)
 			require.Equal(t, uint32(verdictDrop), ret, "nothing left allowing it once removed")
 

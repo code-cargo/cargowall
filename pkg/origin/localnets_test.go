@@ -71,7 +71,7 @@ func TestValidateLocalSubnet(t *testing.T) {
 	}
 }
 
-// AllowLocalNetwork writes the entry the hook reads: cg_origin_egress looks
+// AllowLocalNetwork writes the entry the hook reads: cw_cg_egress looks
 // up map_local_nets with {prefixlen 32 (128), destination}, so an address
 // inside a carved subnet must hit and one outside must not — which also
 // pins the key's byte order. A refused prefix must write nothing.

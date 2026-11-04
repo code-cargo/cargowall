@@ -99,7 +99,7 @@ type scopeRecord struct {
 // id, a process id and the cgroup's level.
 func scopeWalk(t *testing.T, objs *ScopeBpfObjects) []scopeRecord {
 	t.Helper()
-	it, err := link.AttachIter(link.IterOptions{Program: objs.ScopeTaskIter})
+	it, err := link.AttachIter(link.IterOptions{Program: objs.CwScopeIter})
 	require.NoError(t, err)
 	defer it.Close()
 	rd, err := it.Open()
@@ -263,7 +263,7 @@ func TestScopeAttachRecordsMoves(t *testing.T) {
 		dst := siblingCgroup(t, "dst")
 		ino, enter := heldPidNamespace(t)
 		objs := loadScope(t, ino, 0)
-		attachScopeTracing(t, objs.ScopeAttach)
+		attachScopeTracing(t, objs.CwScopeAttach)
 		pid := enter()
 		moveInto(t, dst, pid)
 		require.True(t, scopeRecorded(t, objs, dst), "moving into a cgroup records it")
@@ -274,7 +274,7 @@ func TestScopeAttachRecordsMoves(t *testing.T) {
 	})
 	t.Run("another pid namespace", func(t *testing.T) {
 		objs := loadScope(t, 1, 0)
-		attachScopeTracing(t, objs.ScopeAttach)
+		attachScopeTracing(t, objs.CwScopeAttach)
 		cg := enterTestCgroup(t)
 		require.False(t, scopeRecorded(t, objs, cg), "a task outside the pid namespace records nothing")
 	})
@@ -316,7 +316,7 @@ func TestScopeAttachRecordsDestinationPastAZombieLeader(t *testing.T) {
 	dst := siblingCgroup(t, "dst")
 	pid := zombieLeader(t)
 
-	attachScopeTracing(t, objs.ScopeAttach)
+	attachScopeTracing(t, objs.CwScopeAttach)
 	moveInto(t, dst, pid)
 	tasks, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
 	require.NoError(t, err)
@@ -347,7 +347,7 @@ func TestScopeForkRecordsCloneIntoCgroup(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			objs := loadScope(t, tc.ino(t), 0)
 			cg := enterTestCgroup(t) // before attach: the move is not the fork path's
-			attachScopeTracing(t, objs.ScopeFork)
+			attachScopeTracing(t, objs.CwScopeFork)
 
 			require.NoError(t, exec.Command("/bin/true").Run())
 			require.False(t, scopeRecorded(t, objs, cg), "a child in its parent's cgroup records nothing")
@@ -377,7 +377,7 @@ func TestScopeForkIgnoresAParentMovedMidFork(t *testing.T) {
 	moveSelf(t, a)
 	ino, nsInit := heldPidNamespaceInit(t)
 	objs := loadScope(t, ino, 0)
-	attachScopeTracing(t, objs.ScopeFork)
+	attachScopeTracing(t, objs.CwScopeFork)
 
 	ns, err := os.Open(fmt.Sprintf("/proc/%d/ns/pid", nsInit))
 	require.NoError(t, err)
@@ -520,8 +520,8 @@ func TestScopeIgnoresARuntimesCgroup(t *testing.T) {
 	runtimeCg := enterTestCgroup(t)
 	ino, enter := heldPidNamespace(t)
 	objs := loadScope(t, ino, 0)
-	attachScopeTracing(t, objs.ScopeFork)
-	attachScopeTracing(t, objs.ScopeAttach)
+	attachScopeTracing(t, objs.CwScopeFork)
+	attachScopeTracing(t, objs.CwScopeAttach)
 	pid := enter()
 	require.False(t, scopeRecorded(t, objs, runtimeCg), "a cgroup shared with a parent outside the namespace")
 
@@ -535,7 +535,7 @@ func TestScopeIgnoresARuntimesCgroup(t *testing.T) {
 func TestScopeReleaseForgetsCgroups(t *testing.T) {
 	requireBPF(t)
 	objs := loadScope(t, pidnsInode(t), 0)
-	attachScopeTracing(t, objs.ScopeRelease)
+	attachScopeTracing(t, objs.CwScopeRel)
 	recorded := func(id uint64) bool {
 		var v uint8
 		return objs.MapScopeCgroups.Lookup(id, &v) == nil
@@ -616,8 +616,8 @@ func TestScopeLeavesCgroupsOthersEnter(t *testing.T) {
 	other := siblingCgroup(t, "other")
 	ino, enter := heldPidNamespace(t)
 	objs := loadScope(t, ino, 0)
-	attachScopeTracing(t, objs.ScopeAttach)
-	attachScopeTracing(t, objs.ScopeFork)
+	attachScopeTracing(t, objs.CwScopeAttach)
+	attachScopeTracing(t, objs.CwScopeFork)
 	ours := enter()
 	moveInto(t, moved, ours)
 	moveInto(t, cloned, ours)
@@ -669,8 +669,8 @@ func TestScopeLeavesTheSubtreeAlone(t *testing.T) {
 	objs := &ScopeBpfObjects{}
 	require.NoError(t, spec.LoadAndAssign(objs, nil))
 	t.Cleanup(func() { objs.Close() })
-	attachScopeTracing(t, objs.ScopeAttach)
-	attachScopeTracing(t, objs.ScopeFork)
+	attachScopeTracing(t, objs.CwScopeAttach)
+	attachScopeTracing(t, objs.CwScopeFork)
 
 	ours := enter()
 	moveInto(t, inside, ours)
@@ -697,7 +697,7 @@ func TestScopeFullIsCounted(t *testing.T) {
 	second := siblingCgroup(t, "second")
 	ino, enter := heldPidNamespace(t)
 	objs := loadScope(t, ino, 1)
-	attachScopeTracing(t, objs.ScopeAttach)
+	attachScopeTracing(t, objs.CwScopeAttach)
 	pid := enter()
 	moveInto(t, first, pid)
 	require.True(t, scopeRecorded(t, objs, first))

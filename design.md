@@ -495,7 +495,7 @@ The DNS proxy handles Kubernetes service discovery by:
   - Bridges with no socket, or bridges that could not be listed and no socket (another container's daemon whose socket is not shared): container attribution is off, with a warning; each Docker bridge up is still carved from its own address, `docker0` alone when they could not be listed.
   - Residual window: between a pending daemon coming up and the tracker's first session, a container could start before its bridge is carved. The tracker's request is already queued on the socket, so the window is the time the daemon takes to serve it.
   - daemon.json is left alone for a pending daemon, at startup and once it answers: the daemon may be reading it already, restarting it once it has answered would kill the job's `services:` containers, and the redirect's DNAT sends its containers' DNS to `169.254.0.53` and `fd97:d1fb:f215::53` without either. Without `--dns-redirect`, daemon.json as the daemon read it decides, and the startup and arrival lines say which: already pointed at `169.254.0.53` by a previous run's rewrite left in it, around the proxy (a Warn), not known when it cannot be read (a Warn), or around the proxy for a daemon whose daemon.json is not ours.
-  - Nothing that happens once it answers is a posture: the tracker and the carve-outs it makes are best-effort, as for an up daemon, and container DNS was settled at startup. So there is no late-loss path.
+  - The tracker and the carve-outs it makes are best-effort, as for an up daemon, and container DNS was settled at startup. The one posture decided once it answers is the cgroup hook's scope over its containers, where that scope reads the daemon (see A scope decided once Docker answers).
 - The same probe, with the pid namespace, decides what the cgroup egress hook (`--container-egress`) may judge. Outside the host pid namespace, where `/sys/fs/cgroup` is a tree other workloads share, it is the root of that tree, so the hook judges only this job's sockets. That tree is the node's in the host cgroup namespace (a privileged pod, such as an ARC runner). It is also a nested node's (kind, minikube's docker driver) in a private cgroup namespace rooted above our cgroup, whose privileged pods share the node container's namespace: in Lima, the hook there judged a neighbour pod's traffic, and blocked it under enforce, until such a namespace stopped counting as our own. A private cgroup namespace counts as our container's own only where our cgroup is its root (`/`). In the shared tree `/sys/fs/cgroup` is the node root, so the hook judges only this job's sockets and passes any other without a verdict or a record; TC on the pod's interface still polices whatever leaves through it. This job's sockets are those under the job's subtree, and those in a cgroup a task in cargowall's pid namespace has entered outside it. The subtree is our pod's cgroup, the pod level of kubelet's tree in `/proc/self/cgroup`, or outside Kubernetes our own container's cgroup. With `shareProcessNamespace`, that namespace holds the runner, the dind daemon and every container the daemon starts, and no other pod's tasks; the daemon's containers live at the node-root `/docker/<id>`, outside the pod's cgroup.
   - Why the cgroup: every socket the job gives rise to lives in a cgroup one of its tasks entered. That covers sockets made from any thread (an io_uring worker's included), sockets the kernel makes for the job (an MPTCP subflow takes its parent's cgroup, an SMC connection's TCP socket is made in the caller's context), which never pass `cgroup/sock_create`, and sockets that predate cargowall in a cgroup a task of ours is still in. Stamping sockets at `cgroup/sock_create` missed the kernel-made ones, io_uring's, and any whose stamp an LRU evicted.
   - Why the pod's cgroup as well: every container in the pod is the job's, whichever pid namespace it shares and whoever started it, and the pid namespace alone misses two kinds. One is a container that does not share it: a sidecar in a pod without `shareProcessNamespace`, or the workload beside the SaaS sidecar. The other is one the node's runtime starts into it after cargowall has started, such as a restarted dind sidecar or a `kubectl debug` container: runc moves its first stage, still outside our pid namespace, into the container's cgroup, and the stages that enter the namespace inherit that cgroup, so no task of ours ever enters it. The hook checks the pod's cgroup as an ancestor (`bpf_skb_ancestor_cgroup_id`) rather than recording what is under it, so a container made later needs no event.
@@ -639,6 +639,34 @@ firewall. The exit status needs no file, so a sentinel that could not be
 written (a full `/tmp`, a directory planted at its path) does not lose the
 refusal. The sentinel's format, writer and readers, lives in
 `cmd/sentinel.go`.
+
+**A scope decided once Docker answers.** Where the hook's scope reads the
+daemon's runtime (a private cgroup namespace, or a pid namespace of our own
+in the host's), a daemon still starting at startup, its socket silent or
+refusing, has shown nothing of where its containers' tasks will be, and has
+started none. The hook is not refused for it: it loads at once with the
+scope every other rule gives (`podenv.Shape.HookScopeOrPending`), limited to
+our own cgroup and the cgroups our pid namespace's tasks enter where a tree
+read as ours alone would otherwise be judged whole, and is raised as ever.
+The daemon's rules are decided when it answers its tracker, once startup is
+done (`scopeDecision`, which probes it again with `Recheck`): they confirm
+the hook, with one Info, or find the daemon's containers outside its scope.
+That scope never reaches a task outside our pid namespace, so a refusal then
+only leaves the daemon's containers unjudged by the hook, which stays up,
+and `--tls-sni` riding it, for everything it reaches. The posture is lost
+all the same (`postureLedger.loseLate`): recorded at off with its reason,
+the posture record rewritten for the summary, an Error for a fail-closed
+rung and a Warn otherwise, and never a refused startup, the job being under
+way. A fail-closed rung's loss is a refusal too late to refuse startup: the
+failure sentinel names it, `refused=container-egress`, written when it is
+decided, with a reason that is not a startup's, and `cargowall start` exits
+with status 3 at shutdown. The decision waits for the ready sentinel, so no
+reader waiting on either takes it for a refused startup. On GitHub-hosted
+runners nothing stops cargowall before the VM goes, so the job fails on it
+only where the action's post step reads the sentinel. A daemon that never
+answers made no container: the posture stands as applied, with one teardown
+Info. Between the daemon answering and the recheck (unix_diag, `GET /info`:
+well under a second), its containers are judged by the hook as loaded.
 
 **One post-verdict pipeline.** Both hooks feed the same steps in
 `pkg/events` (`outcome.go`): hostname/CNAME resolution, late-allow

@@ -110,7 +110,12 @@ type postureLedger struct {
 	kernel   string  // uname release, for verifier reasons: the budget is per-kernel
 	lockdown bool    // policy lockdown: no loss fails startup
 	refused  *string // StartCmd.refusedPosture: where a fatal loss names its posture
-	logger   *slog.Logger
+	// refusedLate is StartCmd.refusedLate, where a fail-closed loss after
+	// startup names its posture, and failureFile StartCmd.FailureFile,
+	// the sentinel that says so when it is decided (loseLate).
+	refusedLate *string
+	failureFile string
+	logger      *slog.Logger
 
 	mu     sync.Mutex
 	layers []postureLayer
@@ -127,7 +132,10 @@ type postureLedger struct {
 // and the redirect matter to what is allowed. The redirect only does
 // anything while DNS tracking runs.
 func newPostures(cmd *StartCmd, kernel string, enforcing bool, logger *slog.Logger) *postureLedger {
-	p := &postureLedger{kernel: kernel, lockdown: cmd.policyLockdown, refused: &cmd.refusedPosture, logger: logger}
+	p := &postureLedger{
+		kernel: kernel, lockdown: cmd.policyLockdown, refused: &cmd.refusedPosture,
+		refusedLate: &cmd.refusedLate, failureFile: cmd.FailureFile, logger: logger,
+	}
 	p.register(postureContainerEgress, cmd.ContainerEgress, ContainerEgressOff,
 		enforcing && cmd.ContainerEgress == ContainerEgressEnforce)
 	p.register(postureTLSSNI, cmd.TLSSNI, TLSSNIOff,
@@ -237,7 +245,13 @@ func (p *postureLedger) loseTo(posture, applied, reason string) error {
 // job is already running, and its steps are past refusing. A fail-closed
 // rung's loss is an Error, any other a Warn, as at startup, and the record
 // is rewritten for the summary once startup has published it; before that,
-// startup's write carries it.
+// startup's write carries it. A fail-closed rung's loss is a refusal all
+// the same, only too late to refuse startup: it is named as one where a
+// refused startup is, in the failure sentinel, written now with the reason,
+// and the exit status at shutdown (refusalExit), so that the job can still
+// fail on it. Policy lockdown has already failed the job, and names none.
+// The caller decides only once startup is done, or the sentinel would beat
+// the ready one to a reader waiting on either.
 func (p *postureLedger) loseLate(posture, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -257,6 +271,16 @@ func (p *postureLedger) loseLate(posture, reason string) {
 	}
 	if p.published {
 		p.writeLocked()
+	}
+	if !r.failClosed || p.lockdown || *p.refusedLate != "" {
+		return
+	}
+	*p.refusedLate = posture
+	if p.failureFile == "" {
+		return
+	}
+	if err := writeFailureSentinel(p.failureFile, "cargowall: "+msg+": "+reason, posture); err != nil {
+		p.logger.Warn("Failed to write failure sentinel", "path", p.failureFile, "error", err)
 	}
 }
 
@@ -278,12 +302,16 @@ func (refusalError) ExitCode() int { return exitRefused }
 func (e refusalError) Unwrap() error { return e.error }
 
 // refusalExit is err as StartCargoWall returns it: carrying exitRefused
-// when refused names a posture.
-func refusalExit(err error, refused string) error {
-	if err == nil || refused == "" {
-		return err
+// when startup was refused for a posture, and, for a run that stopped
+// cleanly, when a fail-closed posture was lost after startup (loseLate).
+func refusalExit(err error, cmd *StartCmd) error {
+	switch {
+	case err != nil && cmd.refusedPosture != "":
+		return refusalError{err}
+	case err == nil && cmd.refusedLate != "":
+		return refusalError{fmt.Errorf("--%s could not be applied, decided after startup (see the failure sentinel)", cmd.refusedLate)}
 	}
-	return refusalError{err}
+	return err
 }
 
 // errReason condenses a failure into a posture reason. A verifier rejection

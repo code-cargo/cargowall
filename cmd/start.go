@@ -98,7 +98,7 @@ func StartCargoWall(cmd *StartCmd, hooks *StartHooks) error {
 			cmd.Logger.Warn("Failed to remove pidfile on shutdown", "path", cmd.Pidfile, "error", rerr)
 		}
 	}
-	return refusalExit(err, cmd.refusedPosture)
+	return refusalExit(err, cmd)
 }
 
 func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) error {
@@ -577,9 +577,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// two-phase boot order — observer before the event reader, docker
 	// tracking after the dockerd restart — lives in containerAttribution;
 	// a nil value is the disabled feature and every call below no-ops.
-	hookScope, hookScopeErr := shape.HookScope()
 	attribution, err := newContainerAttribution(cmd.ContainerEgress != ContainerEgressOff,
-		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, hookScope, hookScopeErr, &objs, postures, logger)
+		resolveMode(cmd.ContainerEgress), stepTracker, stepErr, shape, &objs, postures, logger)
 	if err != nil {
 		return err
 	}
@@ -914,6 +913,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		})()
 		logger.Info("CargoWall ready")
 	}
+	attribution.ready()
 
 	// Block until the signal goroutine (armed at the top of startup) cancels
 	// the context on SIGINT/SIGTERM.

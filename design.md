@@ -651,6 +651,10 @@ read as ours alone would otherwise be judged whole, and is raised as ever.
 The daemon's rules are decided when it answers its tracker, once startup is
 done (`scopeDecision`, which probes it again with `Recheck`): they confirm
 the hook, with one Info, or find the daemon's containers outside its scope.
+A recheck that finds it answering its tracker but not the probe probes it
+again on its own, from 250ms doubling to 5s, until it decides: the
+tracker's event stream stays up once connected, so no later connect can be
+counted on.
 That scope never reaches a task outside our pid namespace, so a refusal then
 only leaves the daemon's containers unjudged by the hook, which stays up,
 and `--tls-sni` riding it, for everything it reaches. The posture is lost
@@ -664,8 +668,10 @@ with status 3 at shutdown. The decision waits for the ready sentinel, so no
 reader waiting on either takes it for a refused startup. On GitHub-hosted
 runners nothing stops cargowall before the VM goes, so the job fails on it
 only where the action's post step reads the sentinel. A daemon that never
-answers made no container: the posture stands as applied, with one teardown
-Info. Between the daemon answering and the recheck (unix_diag, `GET /info`:
+answers its tracker made no container: the posture stands as applied, with
+one teardown Info. One that answered it but never the probe may have had
+containers outside the hook's scope, so at teardown the posture is lost, as
+above. Between the daemon answering and the recheck (unix_diag, `GET /info`:
 well under a second), its containers are judged by the hook as loaded.
 
 **One post-verdict pipeline.** Both hooks feed the same steps in

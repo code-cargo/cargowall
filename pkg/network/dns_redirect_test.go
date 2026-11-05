@@ -121,27 +121,31 @@ func TestFlushResolvedCache_Timeout(t *testing.T) {
 }
 
 // TestContainerDNSRedirectRules: DNS arriving on docker0, over UDP and TCP,
-// is sent to the bridge listener unless it is for docker0's own subnet; DNS
-// arriving on any br-* bridge is sent there only when it is for a public
-// resolver.
+// is sent to the bridge listener unless it is for docker0's own subnet or
+// this host; DNS arriving on any br-* bridge is sent there when it is for
+// the proxy's upstream, or for a public resolver other than this host.
 func TestContainerDNSRedirectRules(t *testing.T) {
+	notLocal := []string{"-m", "addrtype", "!", "--dst-type", "LOCAL"}
+	dnat := []string{"-j", "DNAT", "--to-destination", "172.17.0.1:53"}
 	private := []string{
 		"-m", "iprange", "!", "--dst-range", "10.0.0.0-10.255.255.255",
 		"-m", "iprange", "!", "--dst-range", "172.16.0.0-172.31.255.255",
 		"-m", "iprange", "!", "--dst-range", "192.168.0.0-192.168.255.255",
 	}
-	br := func(proto string) []string {
-		rule := append([]string{"-t", "nat", "-i", "br-+", "-p", proto, "--dport", "53"}, private...)
-		return append(rule, "-j", "DNAT", "--to-destination", "172.17.0.1:53")
-	}
+	rule := func(parts ...[]string) []string { return slices.Concat(parts...) }
 	want := [][]string{
-		{"-t", "nat", "-i", "docker0", "-p", "udp", "--dport", "53", "!", "-d", "172.17.0.0/16", "-j", "DNAT", "--to-destination", "172.17.0.1:53"},
-		{"-t", "nat", "-i", "docker0", "-p", "tcp", "--dport", "53", "!", "-d", "172.17.0.0/16", "-j", "DNAT", "--to-destination", "172.17.0.1:53"},
-		br("udp"),
-		br("tcp"),
+		rule([]string{"-t", "nat", "-i", "docker0", "-p", "udp", "--dport", "53", "!", "-d", "172.17.0.0/16"}, notLocal, dnat),
+		rule([]string{"-t", "nat", "-i", "docker0", "-p", "tcp", "--dport", "53", "!", "-d", "172.17.0.0/16"}, notLocal, dnat),
+		rule([]string{"-t", "nat", "-i", "br-+", "-p", "udp", "--dport", "53", "-d", "10.0.0.10"}, dnat),
+		rule([]string{"-t", "nat", "-i", "br-+", "-p", "tcp", "--dport", "53", "-d", "10.0.0.10"}, dnat),
+		rule([]string{"-t", "nat", "-i", "br-+", "-p", "udp", "--dport", "53"}, private, notLocal, dnat),
+		rule([]string{"-t", "nat", "-i", "br-+", "-p", "tcp", "--dport", "53"}, private, notLocal, dnat),
 	}
-	bridge := &net.IPNet{IP: net.IPv4(172, 17, 0, 1).To4(), Mask: net.CIDRMask(16, 32)}
-	if got := containerDNSRedirectRules(bridge); !slices.EqualFunc(got, want, slices.Equal) {
+	c := ContainerDNS{
+		Bridge:    &net.IPNet{IP: net.IPv4(172, 17, 0, 1).To4(), Mask: net.CIDRMask(16, 32)},
+		Upstreams: []net.IP{net.IPv4(10, 0, 0, 10).To4()},
+	}
+	if got := containerDNSRedirectRules(c); !slices.EqualFunc(got, want, slices.Equal) {
 		t.Fatalf("containerDNSRedirectRules = %q, want %q", got, want)
 	}
 }

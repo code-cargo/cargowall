@@ -306,22 +306,30 @@ func TestDNSRedirect_Output(t *testing.T) {
 }
 
 // TestDNSRedirect_ContainerBridges: DNS arriving on docker0 for a resolver
-// outside docker0's subnet, private or public, and DNS arriving on a br-*
-// bridge for a public resolver, reaches the proxy's listener on the docker0
-// address with the container's source kept, and its answer leaves as if
-// from the resolver the container asked. DNS for docker0's own subnet, for a
-// private resolver from a br-* bridge, or arriving on any other interface is
-// left alone, and the teardown removes the redirect.
+// outside docker0's subnet and this host, private or public, and DNS
+// arriving on a br-* bridge for the proxy's upstream or a public resolver,
+// reaches the proxy's listener on the docker0 address with the container's
+// source kept, and its answer leaves as if from the resolver the container
+// asked. DNS for docker0's own subnet, for this host (where Docker's DNAT
+// for a published port answers), for any other private resolver from a
+// br-* bridge, or arriving on any other interface is left alone, and the
+// teardown removes the redirect.
 func TestDNSRedirect_ContainerBridges(t *testing.T) {
 	enterNetns(t)
 	public := net.IPv4(8, 8, 8, 8)
-	cluster := net.IPv4(10, 96, 0, 10) // a private resolver, as a pod's cluster DNS is
+	upstream := net.IPv4(10, 96, 0, 10) // the proxy's upstream: a pod's cluster DNS
+	otherPrivate := net.IPv4(10, 97, 0, 10)
+	host := net.IPv4(10, 56, 0, 1) // cw0's address, so this host's
 	docker0 := addTun(t, "docker0", net.IPv4(10, 54, 0, 1))
 	user := addTun(t, "br-test", net.IPv4(10, 55, 0, 1))
-	other := addTun(t, "cw0", net.IPv4(10, 56, 0, 1))
-	bridge := &net.IPNet{IP: net.IPv4(10, 54, 0, 1).To4(), Mask: net.CIDRMask(24, 32)}
+	other := addTun(t, "cw0", host)
+	c := ContainerDNS{
+		Bridge:    &net.IPNet{IP: net.IPv4(10, 54, 0, 1).To4(), Mask: net.CIDRMask(24, 32)},
+		Upstreams: []net.IP{upstream},
+	}
 	l := listenUDP(t, "10.54.0.1:53")
 	listenTCP(t, "10.54.0.1:53")
+	published := listenUDP(t, "10.56.0.1:53") // stands in for a port Docker published on this host
 
 	_, err := docker0.Write(udp4(net.IPv4(10, 54, 0, 2), public, 4000, 53, "before"))
 	require.NoError(t, err)
@@ -329,9 +337,9 @@ func TestDNSRedirect_ContainerBridges(t *testing.T) {
 	require.Empty(t, got, "container DNS for an outside resolver reached the listener with no redirect installed")
 
 	logger := discardLogger()
-	require.NoError(t, SetupContainerDNSRedirect(bridge, logger))
-	t.Cleanup(func() { _ = TeardownContainerDNSRedirect(bridge, logger) }) // a failure below skips the Teardown
-	require.Len(t, natDNATs(t, "PREROUTING"), 4, "a UDP and a TCP rule for each of docker0 and br-+")
+	require.NoError(t, SetupContainerDNSRedirect(c, logger))
+	t.Cleanup(func() { _ = TeardownContainerDNSRedirect(c, logger) }) // a failure below skips the Teardown
+	require.Len(t, natDNATs(t, "PREROUTING"), 6, "UDP and TCP rules for docker0, the upstream on br-+, and br-+")
 
 	sport := uint16(6000) // a port per TCP handshake: none reuses a half-open one
 	for _, c := range []struct {
@@ -344,13 +352,13 @@ func TestDNSRedirect_ContainerBridges(t *testing.T) {
 		// what a container asks when Docker points it at cargowall.
 		{
 			docker0, net.IPv4(10, 54, 0, 2),
-			[]net.IP{public, cluster, net.IPv4(10, 54, 0, 1)},
+			[]net.IP{public, upstream, otherPrivate, net.IPv4(10, 54, 0, 1)},
 			[]net.IP{net.IPv4(10, 54, 0, 53)},
 		},
 		{
 			user, net.IPv4(10, 55, 0, 2),
-			[]net.IP{public},
-			[]net.IP{cluster, net.IPv4(10, 55, 0, 53), net.IPv4(10, 55, 0, 1)},
+			[]net.IP{public, upstream},
+			[]net.IP{otherPrivate, net.IPv4(10, 55, 0, 53), net.IPv4(10, 55, 0, 1)},
 		},
 	} {
 		name := c.wire.Name()
@@ -373,6 +381,14 @@ func TestDNSRedirect_ContainerBridges(t *testing.T) {
 			got, _ := received(t, l, absent)
 			require.Empty(t, got, "DNS on %s for %s must not be redirected", name, dst)
 		}
+
+		_, err := c.wire.Write(udp4(c.src, host, 5000, 53, name+"-host"))
+		require.NoError(t, err)
+		got, _ := received(t, published, arrives)
+		require.Equal(t, name+"-host", got, "DNS on %s for this host must reach what listens there", name)
+		got, _ = received(t, l, absent)
+		require.Empty(t, got, "DNS on %s for this host must not be redirected", name)
+
 		sport++
 		require.True(t, synAcked(t, c.wire, c.src, public, sport, 53),
 			"TCP DNS on %s must reach the bridge listener", name)
@@ -383,7 +399,7 @@ func TestDNSRedirect_ContainerBridges(t *testing.T) {
 	got, _ = received(t, l, absent)
 	require.Empty(t, got, "DNS arriving off a docker bridge must not be redirected")
 
-	require.NoError(t, TeardownContainerDNSRedirect(bridge, logger))
+	require.NoError(t, TeardownContainerDNSRedirect(c, logger))
 	require.Empty(t, natDNATs(t, "PREROUTING"), "the teardown must remove every rule")
 	// A fresh source port: the flow above keeps its DNAT for as long as
 	// conntrack remembers it.
@@ -402,7 +418,7 @@ func TestDNSRedirect_ContainerBridges(t *testing.T) {
 func TestDNSRedirect_BridgedDNSLeftAlone(t *testing.T) {
 	enterNetns(t)
 	enableBridgeNetfilter(t)
-	bridge := &net.IPNet{IP: net.IPv4(10, 54, 0, 1).To4(), Mask: net.CIDRMask(24, 32)}
+	c := ContainerDNS{Bridge: &net.IPNet{IP: net.IPv4(10, 54, 0, 1).To4(), Mask: net.CIDRMask(24, 32)}}
 	macA := net.HardwareAddr{0x02, 0, 0, 0, 0, 0x0a}
 	macB := net.HardwareAddr{0x02, 0, 0, 0, 0, 0x0b}
 
@@ -424,8 +440,8 @@ func TestDNSRedirect_BridgedDNSLeftAlone(t *testing.T) {
 	l := listenUDP(t, "10.54.0.1:53")
 
 	logger := discardLogger()
-	require.NoError(t, SetupContainerDNSRedirect(bridge, logger))
-	t.Cleanup(func() { _ = TeardownContainerDNSRedirect(bridge, logger) })
+	require.NoError(t, SetupContainerDNSRedirect(c, logger))
+	t.Cleanup(func() { _ = TeardownContainerDNSRedirect(c, logger) })
 
 	for _, s := range sides {
 		iface, err := net.InterfaceByName(s.bridge)

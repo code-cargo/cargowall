@@ -321,7 +321,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 				dnsRedirectActive = true
 			}
 			// Container DNS is forwarded, so the OUTPUT rules above never see it.
-			if undo := redirectContainerDNS(dnsCtx, dnsServer, dockerBridgeIP, teardowns, logger); undo != nil {
+			if undo := redirectContainerDNS(ctx, dnsServer, dockerBridgeIP, upstream, teardowns, logger); undo != nil {
 				defer undo()
 			}
 		}

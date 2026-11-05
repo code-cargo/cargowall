@@ -34,7 +34,7 @@ import (
 )
 
 // daemonConfig is the daemon.json rewrite and its undo. The paths and the
-// daemon restart are fields so the crash and failure paths can be driven
+// daemon restarts are fields so the crash and failure paths can be driven
 // against a temp dir.
 //
 // Three records sit beside daemon.json while it is rewritten: the original
@@ -48,11 +48,15 @@ type daemonConfig struct {
 	backup  string // the original, when there was one
 	absent  string // marker recording that there was no original
 	rewrite string // the bytes the rewrite wrote
-	restart func(*slog.Logger) error
+	// restart restarts the daemon and waits for it; queueRestart only asks
+	// systemd for a restart, which carries on after cargowall exits.
+	restart      func(*slog.Logger) error
+	queueRestart func(*slog.Logger) error
 
-	// mu serializes configure, the daemon restart and restore: the undo is
-	// registered before configure, and a second signal runs it on another
-	// goroutine.
+	// mu serializes configure, restore and the check before a restart: the
+	// undo is registered before configure, and a second signal runs it on
+	// another goroutine. A restart itself runs outside it, so a forced
+	// teardown never waits on one.
 	mu sync.Mutex
 	// restored is set by the first restore, so a configure the undo has
 	// already overtaken does not rewrite what nothing will then undo.
@@ -67,7 +71,9 @@ var dockerDaemonConfig = &daemonConfig{
 	backup:  "/etc/docker/daemon.json.cargowall.bak",
 	absent:  "/etc/docker/daemon.json.cargowall.absent",
 	rewrite: "/etc/docker/daemon.json.cargowall.rewrite",
-	restart: restartDockerDaemon,
+
+	restart:      restartDockerDaemon,
+	queueRestart: queueDockerRestart,
 }
 
 // DockerDNSServers is daemon.json's "dns": the servers the daemon gives
@@ -125,8 +131,8 @@ func ConfigureDockerDNS(dnsIP string, logger *slog.Logger) error {
 }
 
 // RestoreDockerDNS restores the original Docker daemon configuration, and
-// restarts the daemon onto it when RestartDockerDaemon had restarted it onto
-// the rewrite. It is safe whether or not ConfigureDockerDNS ran or got as
+// queues a daemon restart onto it when RestartDockerDaemon had restarted the
+// daemon onto the rewrite. It is safe whether or not ConfigureDockerDNS ran or got as
 // far as the rewrite: with nothing recorded, daemon.json is left alone.
 func RestoreDockerDNS(logger *slog.Logger) error {
 	return dockerDaemonConfig.restore(logger)
@@ -243,25 +249,32 @@ func (c *daemonConfig) restore(logger *slog.Logger) error {
 	// and is left alone. One that did keeps pointing its containers at the
 	// listener, which goes with cargowall, until it restarts: a reload does
 	// not undo it, and with no "dns" in daemon.json leaves the daemon handing
-	// its containers an empty nameserver.
+	// its containers an empty nameserver. The restart is only queued: a
+	// teardown, forced ones included, does not wait on the daemon, and
+	// systemd finishes the restart after cargowall has gone. One queued while
+	// startup's restart still runs makes systemd run that one again, so the
+	// daemon comes up on the original either way.
 	if c.applied {
-		if err := c.restart(logger); err != nil {
-			logger.Warn("Failed to restart Docker daemon onto its restored configuration; "+
+		if err := c.queueRestart(logger); err != nil {
+			logger.Warn("Failed to queue a Docker daemon restart onto its restored daemon.json; "+
 				"its containers resolve through an address cargowall no longer serves until it restarts", "error", err)
+		} else {
+			logger.Info("Queued a Docker daemon restart onto its restored daemon.json")
 		}
 	}
 	return nil
 }
 
-// restartDaemon is RestartDockerDaemon. It records whether the daemon now
-// runs the rewrite before restarting it: a restart that fails or times out
-// may have applied it all the same.
+// restartDaemon is RestartDockerDaemon. It records whether the daemon is
+// about to run the rewrite before restarting it: a restart that fails or
+// times out may have applied it all the same. A restore that gets in
+// between has put the original back, and the restart applies that.
 func (c *daemonConfig) restartDaemon(logger *slog.Logger) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.holdsRewrite() {
 		c.applied = true
 	}
+	c.mu.Unlock()
 	return c.restart(logger)
 }
 
@@ -423,20 +436,13 @@ const dockerRestartTimeout = 60 * time.Second
 // restartDockerDaemon restarts the daemon through systemd and waits for it to
 // answer, within dockerRestartTimeout. A start job systemctl stops waiting on
 // carries on in systemd.
-//
-// The unit's start rate limit is flushed first. docker.service allows three
-// starts a minute (StartLimitBurst=3), and the restart onto the rewrite, the
-// one onto the original and any a job makes itself can go past it: systemd
-// then refuses the start and leaves the daemon stopped.
 func restartDockerDaemon(logger *slog.Logger) error {
 	logger.Info("Restarting Docker daemon to apply DNS configuration")
 	ctx, cancel := context.WithTimeout(context.Background(), dockerRestartTimeout)
 	defer cancel()
 	started := time.Now()
 
-	if err := exec.CommandContext(ctx, "systemctl", "reset-failed", "docker").Run(); err != nil {
-		logger.Debug("systemctl reset-failed docker failed; restarting regardless", "error", err)
-	}
+	resetDockerStartLimit(ctx, logger)
 	if err := exec.CommandContext(ctx, "systemctl", "restart", "docker").Run(); err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("systemctl restart docker did not finish within %s", dockerRestartTimeout)
@@ -454,5 +460,29 @@ func restartDockerDaemon(logger *slog.Logger) error {
 			return fmt.Errorf("timeout waiting for Docker daemon to be ready after restart")
 		case <-time.After(time.Second):
 		}
+	}
+}
+
+// queueDockerRestart asks systemd to restart the daemon and returns without
+// waiting for it. A docker command meanwhile waits on docker.socket, which
+// systemd holds open through the restart.
+func queueDockerRestart(logger *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resetDockerStartLimit(ctx, logger)
+	if err := exec.CommandContext(ctx, "systemctl", "restart", "--no-block", "docker").Run(); err != nil {
+		return fmt.Errorf("systemctl restart --no-block docker failed: %w", err)
+	}
+	return nil
+}
+
+// resetDockerStartLimit flushes docker.service's start rate limit before a
+// restart. The unit allows three starts a minute (StartLimitBurst=3), and the
+// restart onto the rewrite, the one onto the original and any a job makes
+// itself can go past it: systemd then refuses the start and leaves the
+// daemon stopped.
+func resetDockerStartLimit(ctx context.Context, logger *slog.Logger) {
+	if err := exec.CommandContext(ctx, "systemctl", "reset-failed", "docker").Run(); err != nil {
+		logger.Debug("systemctl reset-failed docker failed; restarting regardless", "error", err)
 	}
 }

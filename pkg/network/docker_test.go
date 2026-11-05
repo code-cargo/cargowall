@@ -23,31 +23,44 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
 // newTestDaemonConfig points a daemonConfig at a temp dir and records, for
 // each daemon restart, what daemon.json held as it ran ("" for no file): what
-// the daemon came up on.
+// the daemon came up on. A queued restart is recorded as queued(...).
 func newTestDaemonConfig(t *testing.T) (*daemonConfig, *[]string) {
 	t.Helper()
 	dir := t.TempDir()
-	var restarts []string
+	var (
+		mu       sync.Mutex
+		restarts []string
+	)
 	c := &daemonConfig{
 		path:    filepath.Join(dir, "daemon.json"),
 		backup:  filepath.Join(dir, "daemon.json.cargowall.bak"),
 		absent:  filepath.Join(dir, "daemon.json.cargowall.absent"),
 		rewrite: filepath.Join(dir, "daemon.json.cargowall.rewrite"),
 	}
-	c.restart = func(*slog.Logger) error {
-		data, _ := os.ReadFile(c.path)
-		restarts = append(restarts, string(data))
-		return nil
+	record := func(wrap func(string) string) func(*slog.Logger) error {
+		return func(*slog.Logger) error {
+			mu.Lock()
+			defer mu.Unlock()
+			data, _ := os.ReadFile(c.path)
+			restarts = append(restarts, wrap(string(data)))
+			return nil
+		}
 	}
+	c.restart = record(func(s string) string { return s })
+	c.queueRestart = record(queued)
 	return c, &restarts
 }
+
+func queued(daemonJSON string) string { return "queued(" + daemonJSON + ")" }
 
 func requireContent(t *testing.T, path string, want []byte) {
 	t.Helper()
@@ -124,8 +137,8 @@ func TestDaemonConfig_RestoreWithoutRewriteLeavesFileAlone(t *testing.T) {
 }
 
 // A daemon restarted onto the rewrite points its containers at the listener
-// until it restarts again, so restore restarts it onto the original: a reload
-// leaves it handing them an empty nameserver. That holds when the restart
+// until it restarts again, so restore queues a restart onto the original: a
+// reload leaves it handing them an empty nameserver. That holds when the restart
 // onto the rewrite failed too, since a failed or timed-out restart may still
 // have applied it. A daemon only ever restarted onto the original still runs
 // its own settings, and restore leaves it alone.
@@ -164,7 +177,7 @@ func TestDaemonConfig_RestoreRestartsADaemonOnTheRewrite(t *testing.T) {
 				require.NoError(t, err)
 			}
 			require.NoError(t, dc.restore(logger))
-			require.Equal(t, []string{string(rewrite), c.original}, *restarts,
+			require.Equal(t, []string{string(rewrite), queued(c.original)}, *restarts,
 				"the daemon comes up on the rewrite, then on the original")
 		})
 	}
@@ -185,10 +198,51 @@ func TestDaemonConfig_RestoreRestartsADaemonOnTheRewrite(t *testing.T) {
 	})
 }
 
+// A second signal's teardown runs inside a short bound, so restore must not
+// wait on startup's restart, which can take most of a minute: it puts the
+// original back and queues its own restart while that one still runs.
+func TestDaemonConfig_RestoreDoesNotWaitOnARunningRestart(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	c, restarts := newTestDaemonConfig(t)
+	original := `{"log-driver": "json-file"}`
+	require.NoError(t, os.WriteFile(c.path, []byte(original), 0o644))
+	require.NoError(t, c.configure("169.254.0.53", logger))
+	rewrite, err := os.ReadFile(c.path)
+	require.NoError(t, err)
+
+	running, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	restart := c.restart
+	c.restart = func(l *slog.Logger) error {
+		err := restart(l)
+		close(running)
+		<-release
+		return err
+	}
+	go func() {
+		defer close(finished)
+		_ = c.restartDaemon(logger)
+	}()
+	<-running
+
+	restored := make(chan error, 1)
+	go func() { restored <- c.restore(logger) }()
+	select {
+	case err := <-restored:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("restore waited on the running restart")
+	}
+	close(release)
+	<-finished
+	requireContent(t, c.path, []byte(original))
+	require.Equal(t, []string{string(rewrite), queued(original)}, *restarts)
+}
+
 // The restart onto the rewrite runs in startup, and a second signal can run
 // the restore on another goroutine meanwhile. Whichever gets there first, the
 // daemon comes up last on the original: a restore first leaves the restart
 // applying the original, and a restart first is followed by restore's own.
+// (systemd re-runs a restart that is still running when another is queued.)
 func TestDaemonConfig_ConcurrentRestartAndRestoreEndOnOriginal(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	original := `{"log-driver": "json-file"}`
@@ -206,7 +260,8 @@ func TestDaemonConfig_ConcurrentRestartAndRestoreEndOnOriginal(t *testing.T) {
 		<-done
 		requireContent(t, c.path, []byte(original))
 		require.NotEmpty(t, *restarts)
-		require.Equal(t, original, (*restarts)[len(*restarts)-1])
+		last := (*restarts)[len(*restarts)-1]
+		require.Contains(t, []string{original, queued(original)}, last)
 	}
 }
 

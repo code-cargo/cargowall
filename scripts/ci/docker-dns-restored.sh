@@ -14,12 +14,13 @@
 #   limitations under the License.
 
 # Asserts, once cargowall has exited, that it gave Docker its DNS back: no
-# daemon.json records left beside it, the daemon restarted at teardown as well
-# as at startup, and a container started now gets a real nameserver. A daemon
-# restarted onto cargowall's rewrite keeps pointing containers at cargowall's
-# listener until it restarts again, and one only reloaded after the restore
-# hands them "nameserver invalid IP". The image must be pulled beforehand: the
-# container only reads its resolv.conf, so nothing here needs the network.
+# daemon.json records left beside it, a daemon restart queued at teardown for
+# the one startup ran onto the rewrite, and a container started now gets a
+# real nameserver. A daemon restarted onto cargowall's rewrite keeps pointing
+# containers at cargowall's listener until it restarts again, and one only
+# reloaded after the restore hands them "nameserver invalid IP". The image
+# must be pulled beforehand: the container only reads its resolv.conf, so
+# nothing here needs the network.
 # usage: docker-dns-restored.sh <cargowall log> <when, for the error text> <image>
 set -euo pipefail
 log=$1
@@ -32,16 +33,25 @@ for record in /etc/docker/daemon.json.cargowall.{bak,absent,rewrite}; do
   fi
 done
 
-# One restart onto the rewrite at startup, one onto the original at teardown.
-restarts=$(grep -c "Restarting Docker daemon" "$log" || true)
-if [ "$restarts" -lt 2 ]; then
-  echo "::error::Docker daemon restarted $restarts time(s); expected once at startup and once at teardown $when"
-  tail -30 "$log"; exit 1
-fi
-if grep -q "Failed to restart Docker daemon" "$log"; then
+# A restart onto the rewrite at startup, and one queued onto the original at
+# teardown.
+for line in "Docker daemon ready after restart" "Queued a Docker daemon restart onto its restored daemon.json"; do
+  grep -q "$line" "$log" \
+    || { echo "::error::cargowall never logged \"$line\" $when"; tail -30 "$log"; exit 1; }
+done
+if grep -qE "Failed to (restart|queue a) Docker daemon" "$log"; then
   echo "::error::a Docker daemon restart failed $when"
-  grep "Failed to restart Docker daemon" "$log"; exit 1
+  grep -E "Failed to (restart|queue a) Docker daemon" "$log"; exit 1
 fi
+# The queued restart may not have run yet, and until it has, the old daemon
+# still answers: wait until systemd has no job left for the daemon and the
+# daemon answers.
+for _ in $(seq 1 60); do
+  if [ -z "$(systemctl list-jobs --no-legend docker.service)" ] && docker info > /dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
 
 servers=$(docker run --rm "$image" sed -n 's/^nameserver[[:space:]]*//p' /etc/resolv.conf) \
   || { echo "::error::a container failed to start $when"; exit 1; }

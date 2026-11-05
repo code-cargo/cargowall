@@ -58,13 +58,21 @@ func redirectContainerDNS(ctx context.Context, proxy listeningProxy, bridgeIP st
 		return nil
 	}
 
+	// The rules exempt docker0's own subnet; teardown deletes them by the
+	// same prefix, so it is read once, here.
+	bridge, err := network.DockerBridgeNet(bridgeIP)
+	if err != nil {
+		logger.Warn("Container DNS not redirected: cannot read the Docker bridge subnet", "error", err)
+		return nil
+	}
+
 	// Registered BEFORE the mutation, like the host redirect's undo.
 	undo := teardowns.add(func() {
-		if err := network.TeardownContainerDNSRedirect(bridgeIP, logger); err != nil {
+		if err := network.TeardownContainerDNSRedirect(bridge, logger); err != nil {
 			logger.Warn("Failed to tear down container DNS redirect", "error", err)
 		}
 	})
-	if err := network.SetupContainerDNSRedirect(bridgeIP, logger); err != nil {
+	if err := network.SetupContainerDNSRedirect(bridge, logger); err != nil {
 		logger.Warn("Failed to set up container DNS redirect (iptables)", "error", err)
 	}
 	return undo

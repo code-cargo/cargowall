@@ -56,6 +56,29 @@ func GetDockerBridgeIP() (string, error) {
 	return "", fmt.Errorf("no IPv4 address found on docker0")
 }
 
+// DockerBridgeNet returns ip, an address docker0 holds, with docker0's
+// prefix length for it: the subnet of the default bridge's containers.
+func DockerBridgeNet(ip string) (*net.IPNet, error) {
+	want := net.ParseIP(ip).To4()
+	if want == nil {
+		return nil, fmt.Errorf("not an IPv4 address: %q", ip)
+	}
+	iface, err := net.InterfaceByName("docker0")
+	if err != nil {
+		return nil, fmt.Errorf("docker0 interface not found: %w", err)
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get docker0 addresses: %w", err)
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.Equal(want) {
+			return &net.IPNet{IP: want, Mask: ipnet.Mask}, nil
+		}
+	}
+	return nil, fmt.Errorf("docker0 does not hold %s", ip)
+}
+
 // ConfigureDockerDNS configures Docker to use the specified DNS server.
 // This modifies /etc/docker/daemon.json. A full Docker restart via
 // RestartDockerDaemon is required for the changes to take effect.

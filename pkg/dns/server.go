@@ -361,29 +361,36 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 			// Check the run's posture (single source of truth on the config
 			// manager) - in audit mode, log but don't block
 			isAuditMode := s.config.IsAuditMode()
+			expansion := s.isAllowedSearchExpansion(domain)
 
-			if isAuditMode {
+			switch {
+			case expansion:
+				s.logger.Debug("DNS query is a search expansion of an allowed name, not reported",
+					"domain", domain,
+					"from", w.RemoteAddr().String())
+			case isAuditMode:
 				s.logger.Info("DNS query would be blocked (audit mode)",
 					"domain", domain,
 					"from", w.RemoteAddr().String())
-			} else {
+			default:
 				s.logger.Info("DNS query blocked (domain not allowed)",
 					"domain", domain,
 					"from", w.RemoteAddr().String())
 			}
 
 			// Log to audit file if configured
-			if s.auditLogger != nil {
+			if s.auditLogger != nil && !expansion {
 				if err := s.auditLogger.LogDNSBlocked(domain); err != nil {
 					s.logger.Error("Failed to write DNS audit log", "error", err)
 				}
 			}
 
-			// In enforce mode, return REFUSED - don't forward to upstream
+			// In enforce mode, answer here (REFUSED, or NXDOMAIN in the
+			// cluster domain) - don't forward to upstream.
 			// In audit mode, fall through to forward the query normally
 			if !isAuditMode {
 				m := new(dns.Msg)
-				m.SetRcode(r, dns.RcodeRefused)
+				m.SetRcode(r, deniedRcode(domain))
 				w.WriteMsg(m)
 				return
 			}

@@ -46,9 +46,17 @@ var dnsRedirectRules = [][]string{
 	{"-t", "nat", "-p", "tcp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"},
 }
 
+// privateDstExclusions are iptables matches excluding the RFC 1918 ranges,
+// which every Docker bridge network lives in, as destinations.
+var privateDstExclusions = []string{
+	"-m", "iprange", "!", "--dst-range", "10.0.0.0-10.255.255.255",
+	"-m", "iprange", "!", "--dst-range", "172.16.0.0-172.31.255.255",
+	"-m", "iprange", "!", "--dst-range", "192.168.0.0-192.168.255.255",
+}
+
 // containerDNSRedirectRules are the nat PREROUTING rules that send DNS
 // arriving on docker0 or a user-defined br-* bridge to the proxy's listener
-// at bridgeIP:53.
+// at the docker0 address bridge.IP, port 53.
 //
 // Container DNS is forwarded, not originated here, so the OUTPUT rules never
 // see it. A container that names its own resolver therefore resolves around
@@ -59,16 +67,29 @@ var dnsRedirectRules = [][]string{
 // are blocked as bare IPs. DNAT keeps the container's source address, and
 // the answer leaves the listener rewritten back to the resolver the
 // container asked, so the container sees an ordinary reply.
-func containerDNSRedirectRules(bridgeIP string) [][]string {
-	listener := net.JoinHostPort(bridgeIP, "53")
+//
+// DNS between containers on one bridge must be left alone: a compose
+// service or a kind node may run a DNS server. Where br_netfilter is loaded
+// (every Kubernetes node, so every ARC pod) bridged frames pass these rules
+// too, and nothing here tells a bridged frame from a routed one. So the
+// destination decides. On docker0, whose subnet is known, only that subnet
+// is exempt; its gateway is the listener itself. A br-* bridge may be
+// created after the rules are installed, so every RFC 1918 destination is
+// exempt there, and only DNS for public resolvers is redirected.
+func containerDNSRedirectRules(bridge *net.IPNet) [][]string {
+	listener := net.JoinHostPort(bridge.IP.String(), "53")
+	subnet := (&net.IPNet{IP: bridge.IP.Mask(bridge.Mask), Mask: bridge.Mask}).String()
 	var rules [][]string
-	for _, iface := range []string{"docker0", "br-+"} {
-		for _, proto := range []string{"udp", "tcp"} {
-			rules = append(rules, []string{
-				"-t", "nat", "-i", iface, "-p", proto, "--dport", "53",
-				"-j", "DNAT", "--to-destination", listener,
-			})
-		}
+	for _, proto := range []string{"udp", "tcp"} {
+		rules = append(rules, []string{
+			"-t", "nat", "-i", "docker0", "-p", proto, "--dport", "53", "!", "-d", subnet,
+			"-j", "DNAT", "--to-destination", listener,
+		})
+	}
+	for _, proto := range []string{"udp", "tcp"} {
+		rule := []string{"-t", "nat", "-i", "br-+", "-p", proto, "--dport", "53"}
+		rule = append(rule, privateDstExclusions...)
+		rules = append(rules, append(rule, "-j", "DNAT", "--to-destination", listener))
 	}
 	return rules
 }
@@ -85,14 +106,16 @@ func SetupDNSRedirect(logger *slog.Logger) error {
 }
 
 // SetupContainerDNSRedirect adds the iptables DNAT rules that send DNS from
-// containers on docker0 and br-* bridges to the proxy's listener at
-// bridgeIP:53. The caller must already hold that listener: the DNAT hands
-// container DNS to whatever is bound there.
-func SetupContainerDNSRedirect(bridgeIP string, logger *slog.Logger) error {
-	if err := appendRules("PREROUTING", containerDNSRedirectRules(bridgeIP)); err != nil {
+// containers on docker0 and br-* bridges to the proxy's listener on
+// docker0's address bridge.IP, port 53; bridge.Mask is docker0's prefix. The
+// caller must already hold that listener: the DNAT hands container DNS to
+// whatever is bound there.
+func SetupContainerDNSRedirect(bridge *net.IPNet, logger *slog.Logger) error {
+	if err := appendRules("PREROUTING", containerDNSRedirectRules(bridge)); err != nil {
 		return err
 	}
-	logger.Info("Container DNS redirect iptables rules installed", "listener", net.JoinHostPort(bridgeIP, "53"))
+	logger.Info("Container DNS redirect iptables rules installed",
+		"listener", net.JoinHostPort(bridge.IP.String(), "53"), "docker0", bridge.String())
 	return nil
 }
 
@@ -203,9 +226,9 @@ func TeardownDNSRedirect(logger *slog.Logger) error {
 }
 
 // TeardownContainerDNSRedirect removes the iptables DNAT rules added by
-// SetupContainerDNSRedirect for the same bridgeIP.
-func TeardownContainerDNSRedirect(bridgeIP string, logger *slog.Logger) error {
-	err := deleteRules("PREROUTING", containerDNSRedirectRules(bridgeIP), logger)
+// SetupContainerDNSRedirect for the same bridge.
+func TeardownContainerDNSRedirect(bridge *net.IPNet, logger *slog.Logger) error {
+	err := deleteRules("PREROUTING", containerDNSRedirectRules(bridge), logger)
 	if err == nil {
 		logger.Info("Container DNS redirect iptables rules removed")
 	}

@@ -305,44 +305,56 @@ func TestDNSRedirect_Output(t *testing.T) {
 	require.Empty(t, got, "DNS must not reach the proxy once the redirect is torn down")
 }
 
-// TestDNSRedirect_ContainerBridges: DNS arriving on docker0 or a br-*
-// bridge, whatever resolver it names, reaches the proxy's listener on the
-// docker bridge address with the container's source kept, and its answer
-// leaves as if from the resolver the container asked. DNS arriving on any
-// other interface is left alone, and the teardown removes the redirect.
+// TestDNSRedirect_ContainerBridges: DNS arriving on docker0 for a resolver
+// outside docker0's subnet, private or public, and DNS arriving on a br-*
+// bridge for a public resolver, reaches the proxy's listener on the docker0
+// address with the container's source kept, and its answer leaves as if
+// from the resolver the container asked. DNS for docker0's own subnet, for a
+// private resolver from a br-* bridge, or arriving on any other interface is
+// left alone, and the teardown removes the redirect.
 func TestDNSRedirect_ContainerBridges(t *testing.T) {
 	enterNetns(t)
-	resolver := net.IPv4(8, 8, 8, 8)
+	public := net.IPv4(8, 8, 8, 8)
+	cluster := net.IPv4(10, 96, 0, 10) // a private resolver, as a pod's cluster DNS is
 	docker0 := addTun(t, "docker0", net.IPv4(10, 54, 0, 1))
 	user := addTun(t, "br-test", net.IPv4(10, 55, 0, 1))
 	other := addTun(t, "cw0", net.IPv4(10, 56, 0, 1))
-	bridgeIP := "10.54.0.1"
-	l := listenUDP(t, bridgeIP+":53")
-	listenTCP(t, bridgeIP+":53")
+	bridge := &net.IPNet{IP: net.IPv4(10, 54, 0, 1).To4(), Mask: net.CIDRMask(24, 32)}
+	l := listenUDP(t, "10.54.0.1:53")
+	listenTCP(t, "10.54.0.1:53")
 
-	_, err := docker0.Write(udp4(net.IPv4(10, 54, 0, 2), resolver, 4000, 53, "before"))
+	_, err := docker0.Write(udp4(net.IPv4(10, 54, 0, 2), public, 4000, 53, "before"))
 	require.NoError(t, err)
 	got, _ := received(t, l, absent)
 	require.Empty(t, got, "container DNS for an outside resolver reached the listener with no redirect installed")
 
 	logger := discardLogger()
-	require.NoError(t, SetupContainerDNSRedirect(bridgeIP, logger))
-	t.Cleanup(func() { _ = TeardownContainerDNSRedirect(bridgeIP, logger) }) // a failure below skips the Teardown
+	require.NoError(t, SetupContainerDNSRedirect(bridge, logger))
+	t.Cleanup(func() { _ = TeardownContainerDNSRedirect(bridge, logger) }) // a failure below skips the Teardown
 	require.Len(t, natDNATs(t, "PREROUTING"), 4, "a UDP and a TCP rule for each of docker0 and br-+")
 
 	sport := uint16(6000) // a port per TCP handshake: none reuses a half-open one
 	for _, c := range []struct {
-		wire    *os.File
-		src, gw net.IP
+		wire       *os.File
+		src        net.IP
+		redirected []net.IP // the listener answers, as these
+		alone      []net.IP // not redirected
 	}{
-		{docker0, net.IPv4(10, 54, 0, 2), net.IPv4(10, 54, 0, 1)},
-		{user, net.IPv4(10, 55, 0, 2), net.IPv4(10, 55, 0, 1)},
+		// docker0's gateway is the listener itself, reached with no DNAT:
+		// what a container asks when Docker points it at cargowall.
+		{
+			docker0, net.IPv4(10, 54, 0, 2),
+			[]net.IP{public, cluster, net.IPv4(10, 54, 0, 1)},
+			[]net.IP{net.IPv4(10, 54, 0, 53)},
+		},
+		{
+			user, net.IPv4(10, 55, 0, 2),
+			[]net.IP{public},
+			[]net.IP{cluster, net.IPv4(10, 55, 0, 53), net.IPv4(10, 55, 0, 1)},
+		},
 	} {
 		name := c.wire.Name()
-		// The bridge's own address is what a container asks when Docker
-		// points it at cargowall; the outside resolver is what one asks
-		// when Docker could not, or the container chose its own.
-		for _, dst := range []net.IP{resolver, c.gw} {
+		for _, dst := range c.redirected {
 			_, err := c.wire.Write(udp4(c.src, dst, 5000, 53, name))
 			require.NoError(t, err)
 			got, from := received(t, l, arrives)
@@ -355,22 +367,165 @@ func TestDNSRedirect_ContainerBridges(t *testing.T) {
 			require.NotNil(t, reply, "the answer to %s's query must leave %s as if from %s:53", c.src, name, dst)
 			require.Equal(t, "answer", string(reply[8:]))
 		}
+		for _, dst := range c.alone {
+			_, err := c.wire.Write(udp4(c.src, dst, 5000, 53, name))
+			require.NoError(t, err)
+			got, _ := received(t, l, absent)
+			require.Empty(t, got, "DNS on %s for %s must not be redirected", name, dst)
+		}
 		sport++
-		require.True(t, synAcked(t, c.wire, c.src, resolver, sport, 53),
+		require.True(t, synAcked(t, c.wire, c.src, public, sport, 53),
 			"TCP DNS on %s must reach the bridge listener", name)
 	}
 
-	_, err = other.Write(udp4(net.IPv4(10, 56, 0, 2), resolver, 5000, 53, "other"))
+	_, err = other.Write(udp4(net.IPv4(10, 56, 0, 2), public, 5000, 53, "other"))
 	require.NoError(t, err)
 	got, _ = received(t, l, absent)
 	require.Empty(t, got, "DNS arriving off a docker bridge must not be redirected")
 
-	require.NoError(t, TeardownContainerDNSRedirect(bridgeIP, logger))
+	require.NoError(t, TeardownContainerDNSRedirect(bridge, logger))
 	require.Empty(t, natDNATs(t, "PREROUTING"), "the teardown must remove every rule")
 	// A fresh source port: the flow above keeps its DNAT for as long as
 	// conntrack remembers it.
-	_, err = docker0.Write(udp4(net.IPv4(10, 54, 0, 2), resolver, 5001, 53, "after"))
+	_, err = docker0.Write(udp4(net.IPv4(10, 54, 0, 2), public, 5001, 53, "after"))
 	require.NoError(t, err)
 	got, _ = received(t, l, absent)
 	require.Empty(t, got, "container DNS must not reach the listener once the redirect is torn down")
+}
+
+// TestDNSRedirect_BridgedDNSLeftAlone: with br_netfilter running iptables on
+// bridged frames, as on every Kubernetes node, DNS one container sends
+// another on the same bridge (a compose service, a kind node) still reaches
+// it, on docker0 and on a br-* bridge, while DNS sent to the bridge for a
+// public resolver is redirected. TAPs stand in for the containers' veths:
+// a frame written to one enters the bridge as from that container.
+func TestDNSRedirect_BridgedDNSLeftAlone(t *testing.T) {
+	enterNetns(t)
+	enableBridgeNetfilter(t)
+	bridge := &net.IPNet{IP: net.IPv4(10, 54, 0, 1).To4(), Mask: net.CIDRMask(24, 32)}
+	macA := net.HardwareAddr{0x02, 0, 0, 0, 0, 0x0a}
+	macB := net.HardwareAddr{0x02, 0, 0, 0, 0, 0x0b}
+
+	type side struct {
+		bridge     string
+		gw, a, b   net.IP
+		tapA, tapB *os.File
+	}
+	sides := []side{
+		{bridge: "docker0", gw: net.IPv4(10, 54, 0, 1), a: net.IPv4(10, 54, 0, 2), b: net.IPv4(10, 54, 0, 53)},
+		{bridge: "br-test", gw: net.IPv4(10, 55, 0, 1), a: net.IPv4(10, 55, 0, 2), b: net.IPv4(10, 55, 0, 53)},
+	}
+	for i := range sides {
+		s := &sides[i]
+		s.tapA = addTap(t, s.bridge+"-a")
+		s.tapB = addTap(t, s.bridge+"-b")
+		addBridge(t, s.bridge, s.gw, s.bridge+"-a", s.bridge+"-b")
+	}
+	l := listenUDP(t, "10.54.0.1:53")
+
+	logger := discardLogger()
+	require.NoError(t, SetupContainerDNSRedirect(bridge, logger))
+	t.Cleanup(func() { _ = TeardownContainerDNSRedirect(bridge, logger) })
+
+	for _, s := range sides {
+		iface, err := net.InterfaceByName(s.bridge)
+		require.NoError(t, err)
+
+		_, err = s.tapA.Write(ether(macB, macA, udp4(s.a, s.b, 5000, 53, "bridged")))
+		require.NoError(t, err)
+		got, _ := received(t, l, absent)
+		require.Empty(t, got, "DNS from one container to another on %s must not be redirected", s.bridge)
+		require.NotNil(t, bridgedOut(t, s.tapB, s.a, s.b, "bridged"),
+			"DNS from one container to another on %s must reach it", s.bridge)
+
+		_, err = s.tapA.Write(ether(iface.HardwareAddr, macA, udp4(s.a, net.IPv4(8, 8, 8, 8), 5001, 53, "routed")))
+		require.NoError(t, err)
+		got, _ = received(t, l, arrives)
+		require.Equal(t, "routed", got, "DNS on %s for a public resolver must reach the bridge listener", s.bridge)
+	}
+}
+
+// enableBridgeNetfilter loads br_netfilter and turns on its iptables pass
+// for bridged IPv4 in this namespace. The module stays loaded: removing it
+// with modprobe -r also removes the bridge module, which no bridge device
+// pins, and that deletes every bridge on the host, docker0 included.
+func enableBridgeNetfilter(t *testing.T) {
+	t.Helper()
+	if out, err := exec.Command("modprobe", "br_netfilter").CombinedOutput(); err != nil {
+		t.Skipf("br_netfilter unavailable: %v: %s", err, out)
+	}
+	// Net sysctls are the writing thread's namespace's.
+	require.NoError(t, os.WriteFile("/proc/sys/net/bridge/bridge-nf-call-iptables", []byte("1"), 0))
+}
+
+// addTap creates TAP interface name, up and with no address, and returns
+// the file whose writes arrive on it as Ethernet frames and whose reads are
+// the frames the kernel sends out of it.
+func addTap(t *testing.T, name string) *os.File {
+	t.Helper()
+	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	require.NoError(t, err)
+	ifr, err := unix.NewIfreq(name)
+	if err == nil {
+		ifr.SetUint16(unix.IFF_TAP | unix.IFF_NO_PI)
+		err = unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr)
+	}
+	if err != nil {
+		unix.Close(fd)
+		require.NoError(t, err)
+	}
+	f := os.NewFile(uintptr(fd), name)
+	t.Cleanup(func() { f.Close() })
+	setLinkUp(t, name)
+	return f
+}
+
+// addBridge creates bridge name holding addr/24, enslaves ports to it, and
+// brings it up.
+func addBridge(t *testing.T, name string, addr net.IP, ports ...string) {
+	t.Helper()
+	ip := func(args ...string) {
+		out, err := exec.Command("ip", args...).CombinedOutput()
+		require.NoError(t, err, "ip %v: %s", args, out)
+	}
+	ip("link", "add", "name", name, "type", "bridge")
+	ip("addr", "add", addr.String()+"/24", "dev", name)
+	for _, port := range ports {
+		ip("link", "set", port, "master", name)
+	}
+	ip("link", "set", name, "up")
+}
+
+// ether frames an IPv4 packet for dst from src.
+func ether(dst, src net.HardwareAddr, packet []byte) []byte {
+	b := make([]byte, 14, 14+len(packet))
+	copy(b[0:6], dst)
+	copy(b[6:12], src)
+	binary.BigEndian.PutUint16(b[12:], 0x0800)
+	return append(b, packet...)
+}
+
+// bridgedOut reads frames out of wire until an IPv4/UDP one from src to dst
+// carrying payload turns up, and returns it, or nil when none does within
+// arrives.
+func bridgedOut(t *testing.T, wire *os.File, src, dst net.IP, payload string) []byte {
+	t.Helper()
+	buf := make([]byte, 1514)
+	require.NoError(t, wire.SetReadDeadline(time.Now().Add(arrives)))
+	for {
+		n, err := wire.Read(buf)
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil
+		}
+		require.NoError(t, err)
+		f := buf[:n]
+		if n < 14+28 || binary.BigEndian.Uint16(f[12:]) != 0x0800 {
+			continue // not IPv4: the IPv6 the interfaces send of their own accord
+		}
+		p := f[14:]
+		if p[9] == unix.IPPROTO_UDP && net.IP(p[12:16]).Equal(src) && net.IP(p[16:20]).Equal(dst) &&
+			strings.HasSuffix(string(p), payload) {
+			return f
+		}
+	}
 }

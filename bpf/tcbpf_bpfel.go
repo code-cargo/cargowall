@@ -80,12 +80,12 @@ const (
 	TcBpfMapMapStepState          = "map_step_state"
 	TcBpfMapMapTaskNspid          = "map_task_nspid"
 	TcBpfMapMapTaskStep           = "map_task_step"
-	TcBpfProgCgConnect4           = "cg_connect4"
-	TcBpfProgCgConnect6           = "cg_connect6"
-	TcBpfProgCgSendmsg4           = "cg_sendmsg4"
-	TcBpfProgCgSendmsg6           = "cg_sendmsg6"
-	TcBpfProgTcEgress             = "tc_egress"
-	TcBpfProgTcIngress            = "tc_ingress"
+	TcBpfProgCwCgConnect4         = "cw_cg_connect4"
+	TcBpfProgCwCgConnect6         = "cw_cg_connect6"
+	TcBpfProgCwCgSendmsg4         = "cw_cg_sendmsg4"
+	TcBpfProgCwCgSendmsg6         = "cw_cg_sendmsg6"
+	TcBpfProgCwTcEgress           = "cw_tc_egress"
+	TcBpfProgCwTcIngress          = "cw_tc_ingress"
 	TcBpfVarBtfAnchorBlockedEvent = "btf_anchor_blocked_event"
 )
 
@@ -131,12 +131,12 @@ type TcBpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TcBpfProgramSpecs struct {
-	CgConnect4 *ebpf.ProgramSpec `ebpf:"cg_connect4"`
-	CgConnect6 *ebpf.ProgramSpec `ebpf:"cg_connect6"`
-	CgSendmsg4 *ebpf.ProgramSpec `ebpf:"cg_sendmsg4"`
-	CgSendmsg6 *ebpf.ProgramSpec `ebpf:"cg_sendmsg6"`
-	TcEgress   *ebpf.ProgramSpec `ebpf:"tc_egress"`
-	TcIngress  *ebpf.ProgramSpec `ebpf:"tc_ingress"`
+	CwCgConnect4 *ebpf.ProgramSpec `ebpf:"cw_cg_connect4"`
+	CwCgConnect6 *ebpf.ProgramSpec `ebpf:"cw_cg_connect6"`
+	CwCgSendmsg4 *ebpf.ProgramSpec `ebpf:"cw_cg_sendmsg4"`
+	CwCgSendmsg6 *ebpf.ProgramSpec `ebpf:"cw_cg_sendmsg6"`
+	CwTcEgress   *ebpf.ProgramSpec `ebpf:"cw_tc_egress"`
+	CwTcIngress  *ebpf.ProgramSpec `ebpf:"cw_tc_ingress"`
 }
 
 // TcBpfMapSpecs contains maps before they are loaded into the kernel.
@@ -232,22 +232,22 @@ type TcBpfVariables struct {
 //
 // It can be passed to LoadTcBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TcBpfPrograms struct {
-	CgConnect4 *ebpf.Program `ebpf:"cg_connect4"`
-	CgConnect6 *ebpf.Program `ebpf:"cg_connect6"`
-	CgSendmsg4 *ebpf.Program `ebpf:"cg_sendmsg4"`
-	CgSendmsg6 *ebpf.Program `ebpf:"cg_sendmsg6"`
-	TcEgress   *ebpf.Program `ebpf:"tc_egress"`
-	TcIngress  *ebpf.Program `ebpf:"tc_ingress"`
+	CwCgConnect4 *ebpf.Program `ebpf:"cw_cg_connect4"`
+	CwCgConnect6 *ebpf.Program `ebpf:"cw_cg_connect6"`
+	CwCgSendmsg4 *ebpf.Program `ebpf:"cw_cg_sendmsg4"`
+	CwCgSendmsg6 *ebpf.Program `ebpf:"cw_cg_sendmsg6"`
+	CwTcEgress   *ebpf.Program `ebpf:"cw_tc_egress"`
+	CwTcIngress  *ebpf.Program `ebpf:"cw_tc_ingress"`
 }
 
 func (p *TcBpfPrograms) Close() error {
 	return _TcBpfClose(
-		p.CgConnect4,
-		p.CgConnect6,
-		p.CgSendmsg4,
-		p.CgSendmsg6,
-		p.TcEgress,
-		p.TcIngress,
+		p.CwCgConnect4,
+		p.CwCgConnect6,
+		p.CwCgSendmsg4,
+		p.CwCgSendmsg6,
+		p.CwTcEgress,
+		p.CwTcIngress,
 	)
 }
 

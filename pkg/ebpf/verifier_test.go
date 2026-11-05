@@ -60,24 +60,24 @@ func TestLogVerifierRejection(t *testing.T) {
 		Cause: unix.E2BIG,
 		Log:   []string{"; some source line", "BPF program is too large. Processed 1000001 insn", "stack depth 456"},
 	}
-	err := fmt.Errorf("program cg_origin_egress: load program: %w", verr)
+	err := fmt.Errorf("program cw_cg_egress: load program: %w", verr)
 
 	assert.True(t, LogVerifierRejection(logger, "originbpf", err))
 	out := buf.String()
 	assert.Contains(t, out, `msg="BPF program rejected by the verifier"`)
 	assert.Contains(t, out, "collection=originbpf")
-	assert.Contains(t, out, "program=cg_origin_egress")
+	assert.Contains(t, out, "program=cw_cg_egress")
 	assert.Contains(t, out, "processed_insns=1000001")
 	assert.Contains(t, out, "limit=1000000")
 
 	// A rejection whose log carries no count must not invent one.
 	buf.Reset()
-	bare := fmt.Errorf("program tc_egress: load program: %w", &ebpf.VerifierError{
+	bare := fmt.Errorf("program cw_tc_egress: load program: %w", &ebpf.VerifierError{
 		Cause: unix.EINVAL, Log: []string{"R6 invalid mem access 'mem_or_null'"},
 	})
 	assert.True(t, LogVerifierRejection(logger, "tcbpf", bare))
 	out = buf.String()
-	assert.Contains(t, out, "program=tc_egress")
+	assert.Contains(t, out, "program=cw_tc_egress")
 	assert.NotContains(t, out, "processed_insns")
 	assert.NotContains(t, out, "pct=")
 
@@ -89,21 +89,21 @@ func TestLogVerifierRejection(t *testing.T) {
 
 func TestRejectionString(t *testing.T) {
 	// The Blacksmith rejection, as a degraded posture reports it.
-	err := fmt.Errorf("program cg_origin_egress: load program: %w", &ebpf.VerifierError{
+	err := fmt.Errorf("program cw_cg_egress: load program: %w", &ebpf.VerifierError{
 		Cause: unix.E2BIG,
 		Log:   []string{"BPF program is too large. Processed 1000001 insn"},
 	})
 	r, ok := ParseRejection(err)
 	assert.True(t, ok)
-	assert.Equal(t, "verifier rejected cg_origin_egress: 1,000,001 insns", r.String())
-	assert.Equal(t, "verifier rejected cg_origin_egress on 6.6.141: 1,000,001 insns", r.On("6.6.141"))
+	assert.Equal(t, "verifier rejected cw_cg_egress: 1,000,001 insns", r.String())
+	assert.Equal(t, "verifier rejected cw_cg_egress on 6.6.141: 1,000,001 insns", r.On("6.6.141"))
 
 	// No count in the log: the cause stands in, never a zero.
-	r, ok = ParseRejection(fmt.Errorf("program tc_egress: load program: %w", &ebpf.VerifierError{
+	r, ok = ParseRejection(fmt.Errorf("program cw_tc_egress: load program: %w", &ebpf.VerifierError{
 		Cause: unix.EINVAL, Log: []string{"R6 invalid mem access 'mem_or_null'"},
 	}))
 	assert.True(t, ok)
-	assert.Equal(t, "verifier rejected tc_egress: "+unix.EINVAL.Error(), r.String())
+	assert.Equal(t, "verifier rejected cw_tc_egress: "+unix.EINVAL.Error(), r.String())
 
 	_, ok = ParseRejection(errors.New("open /sys/fs/bpf: permission denied"))
 	assert.False(t, ok)

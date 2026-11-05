@@ -16,7 +16,7 @@
 
 // Package steps provides causal per-workflow-step attribution of network
 // traffic. Runner.Worker forks one direct child process per workflow step;
-// the step_fork tracepoint (bpf/stepbpf.c) tags each such child with a
+// the cw_step_fork tracepoint (bpf/stepbpf.c) tags each such child with a
 // monotonically increasing ordinal, every other fork inherits the forking
 // thread's tag, and the cgroup hooks copy the tag onto each socket cookie —
 // so every TC event carries the step that (transitively) created its socket.
@@ -26,7 +26,7 @@
 // ids; everything this package reads from /proc — the worker pid, the
 // daemon's own pid, container leaders reported by dockerd — is numbered in
 // the daemon's pid namespace, a different space whenever cargowall runs
-// inside a container (ARC runners are Kubernetes pods). The step_task_iter
+// inside a container (ARC runners are Kubernetes pods). The cw_step_iter
 // BPF iterator bridges the two: it walks the daemon's namespace subtree,
 // seeds the kernel's global→namespace table (map_task_nspid, which is what
 // makes boundary events and socket pids resolvable) and streams the
@@ -87,11 +87,11 @@ const maxOrdinalBase = uint64(events.MaxRealStepOrdinal)
 // goroutine that turns new-step ringbuf notifications into audit events.
 type Tracker struct {
 	workerPID     int    // as numbered in the daemon's pid namespace (/proc)
-	workerTgid    uint32 // the same process, global — what step_fork compares
+	workerTgid    uint32 // the same process, global — what cw_step_fork compares
 	workerCmdline string
 	objs          bpf.StepBpfObjects
 	links         []link.Link
-	iter          *link.Iter // step_task_iter; also in links for Close
+	iter          *link.Iter // cw_step_iter; also in links for Close
 	reader        *ringbuf.Reader
 	stateMap      *ebpf.Map
 	taskMap       *ebpf.Map
@@ -205,7 +205,7 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 	// First task walk: seeds map_task_nspid for everything that predates the
 	// attach (the tracepoints keep it current from here on) and hands back
 	// the process tree in global ids — which is how the worker's /proc pid
-	// becomes the global tgid step_fork compares against.
+	// becomes the global tgid cw_step_fork compares against.
 	snap, err := t.snapshotFn()
 	if err != nil {
 		t.Close()
@@ -306,7 +306,7 @@ func clearMap(m *ebpf.Map) {
 
 func (t *Tracker) attach() error {
 	forkLink, err := link.AttachTracing(link.TracingOptions{
-		Program:    t.objs.StepFork,
+		Program:    t.objs.CwStepFork,
 		AttachType: ebpf.AttachTraceRawTp,
 	})
 	if err != nil {
@@ -315,7 +315,7 @@ func (t *Tracker) attach() error {
 	t.links = append(t.links, forkLink)
 
 	exitLink, err := link.AttachTracing(link.TracingOptions{
-		Program:    t.objs.StepExit,
+		Program:    t.objs.CwStepExit,
 		AttachType: ebpf.AttachTraceRawTp,
 	})
 	if err != nil {
@@ -324,7 +324,7 @@ func (t *Tracker) attach() error {
 	t.links = append(t.links, exitLink)
 
 	execLink, err := link.AttachTracing(link.TracingOptions{
-		Program:    t.objs.StepExec,
+		Program:    t.objs.CwStepExec,
 		AttachType: ebpf.AttachTraceRawTp,
 	})
 	if err != nil {
@@ -337,14 +337,14 @@ func (t *Tracker) attach() error {
 	sockLink, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    podenv.CgroupRoot,
 		Attach:  ebpf.AttachCGroupInetSockCreate,
-		Program: t.objs.CgSockCreate,
+		Program: t.objs.CwCgSockNew,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to attach cgroup sock_create: %w", err)
 	}
 	t.links = append(t.links, sockLink)
 
-	iter, err := link.AttachIter(link.IterOptions{Program: t.objs.StepTaskIter})
+	iter, err := link.AttachIter(link.IterOptions{Program: t.objs.CwStepIter})
 	if err != nil {
 		return fmt.Errorf("failed to attach task iterator: %w", err)
 	}
@@ -448,7 +448,7 @@ func (t *Tracker) tagTasks(snap *procSnapshot, tgid, ordinal uint32, flags ebpf.
 // when only children of an exiting leader took it. 0 with a nil error
 // means the walk listed none of it alive: the task had exited, or was
 // exiting, when the walk ran. One that exits between the walk and the write
-// still counts as tagged, and its entry stays until step_fork clears it for
+// still counts as tagged, and its entry stays until cw_step_fork clears it for
 // the tid's next task. An error means the walk or the writes failed, which
 // says nothing of the task.
 //
@@ -508,7 +508,7 @@ func (t *Tracker) tagSubtree(pid int, ordinal uint32, leaderFlags ebpf.MapUpdate
 	}
 }
 
-// procSnapshot is one pass of the step_task_iter walk: every task in the
+// procSnapshot is one pass of the cw_step_iter walk: every task in the
 // daemon's pid-namespace subtree, keyed by the global ids the step maps
 // use, plus the translation from the daemon-namespace pids userspace
 // discovers.

@@ -82,7 +82,7 @@ func TestOriginL7NoInlineAdmit(t *testing.T) {
 	defer rd.Close()
 
 	run := func(frame []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(frame)
+		ret, _, err := objs.CwCgEgress.Test(frame)
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -149,7 +149,7 @@ func TestOriginL7EstablishedFlowPasses(t *testing.T) {
 	require.NoError(t, objs.MapL7Scope.Put(ipToU32(edgeIP), uint8(L7ScopeTLS)))
 
 	run := func(frame []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(frame)
+		ret, _, err := objs.CwCgEgress.Test(frame)
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -195,7 +195,7 @@ func TestOriginL7HandshakeMsgTypeDiscrimination(t *testing.T) {
 	require.NoError(t, objs.MapL7Scope.Put(ipToU32(edgeIP), uint8(L7ScopeTLS)))
 
 	run := func(frame []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(frame)
+		ret, _, err := objs.CwCgEgress.Test(frame)
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -318,7 +318,7 @@ func TestOriginL7GateRefusedCounted(t *testing.T) {
 	defer rd.Close()
 
 	run := func(frame []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(frame)
+		ret, _, err := objs.CwCgEgress.Test(frame)
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -388,7 +388,7 @@ func TestOriginL7RejectsSubMinimumTCPDataOffset(t *testing.T) {
 
 	frame := craftIPv4TCPDataRaw(edgeIP, 443, 0x1601, 0x00010000, 0,
 		[]byte("SSH-2.0-OpenSSH_9.7\r\n"))
-	ret, _, err := objs.CgOriginEgress.Test(frame)
+	ret, _, err := objs.CwCgEgress.Test(frame)
 	require.NoError(t, err)
 	require.Equal(t, 1, int(ret),
 		"a sub-minimum data offset must fall through to the L4 verdict, not be adjudicated")

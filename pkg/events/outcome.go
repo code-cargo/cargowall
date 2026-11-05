@@ -15,7 +15,7 @@
 //go:build linux
 
 // The post-verdict pipeline shared by every enforcement hook. cargowall has
-// two: tc_egress, whose events arrive as packets on a ring buffer
+// two: cw_tc_egress, whose events arrive as packets on a ring buffer
 // (processEvent), and the root-cgroup hook, whose events arrive as verdict
 // records in socket context (ReportVerdict). Both must produce the same
 // thing — a connection outcome with a resolved hostname, CNAME attribution,
@@ -505,7 +505,7 @@ type VerdictRecord struct {
 // late-allow reconciliation, the audit record, and the block notification.
 //
 // This is the only event source for traffic the cgroup hook drops — such a
-// packet dies at ip_finish_output, before the TC qdisc, so tc_egress never
+// packet dies at ip_finish_output, before the TC qdisc, so cw_tc_egress never
 // sees it and there is nothing to join against. That is exactly why it must
 // not be a thinner path: a denial reported here has to self-heal via
 // late-allow and carry a hostname just like any other.

@@ -15,7 +15,7 @@
 //go:build linux
 
 // The cgroup hook's protocol gate and unparsed (parse-fail) paths — the
-// two places where cg_origin_egress must agree with tc_egress about
+// two places where cw_cg_egress must agree with cw_tc_egress about
 // traffic neither can fully parse or does not speak TCP/UDP.
 
 package bpf
@@ -42,7 +42,7 @@ func craftGREv6(dst string) []byte {
 	return append(append(eth, ip6...), gre...)
 }
 
-// The protocol gate must match tc_egress: everything that is not
+// The protocol gate must match cw_tc_egress: everything that is not
 // TCP/UDP/ICMP(v6) is denied before any map lookup, even to an
 // allowed-CIDR destination — TC drops those packets wherever it sees them,
 // and on paths TC does not cover this gate is the only one. Without it an
@@ -58,17 +58,17 @@ func TestOriginProtocolGateMatchesTC(t *testing.T) {
 
 	setOriginMode(t, objs, originModeEnforce)
 
-	ret, _, err := objs.CgOriginEgress.Test(craftGREv4("140.82.114.3")) // allowed CIDR
+	ret, _, err := objs.CwCgEgress.Test(craftGREv4("140.82.114.3")) // allowed CIDR
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), ret, "GRE to an allowed v4 CIDR must drop, as at TC")
 
-	ret, _, err = objs.CgOriginEgress.Test(craftGREv6("2606:4700::1")) // allowed CIDR
+	ret, _, err = objs.CwCgEgress.Test(craftGREv6("2606:4700::1")) // allowed CIDR
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), ret, "GRE to an allowed v6 CIDR must drop, as at TC")
 
 	// Carved classes are exempt: GRE to loopback is local-only traffic TC
 	// never adjudicated, and the gate must not newly deny it.
-	ret, _, err = objs.CgOriginEgress.Test(craftGREv4("127.0.0.1"))
+	ret, _, err = objs.CwCgEgress.Test(craftGREv4("127.0.0.1"))
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), ret, "the protocol gate must not override the carve-outs")
 
@@ -84,7 +84,7 @@ func TestOriginProtocolGateMatchesTC(t *testing.T) {
 
 	// Shadow: passed, recorded as a would-block for the same shape.
 	setOriginMode(t, objs, originModeShadow)
-	ret, _, err = objs.CgOriginEgress.Test(craftGREv4("140.82.114.4"))
+	ret, _, err = objs.CwCgEgress.Test(craftGREv4("140.82.114.4"))
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), ret, "shadow never drops")
 	recs = collectOriginRecords(t, rd, 500*time.Millisecond)
@@ -109,8 +109,8 @@ func TestOriginUnparsedDropEmitsRecordAndHonorsCarveOuts(t *testing.T) {
 	t.Cleanup(func() { rd.Close() })
 
 	// Truncated TCP to a non-carved destination (140.82.114.3 — allowed,
-	// which must not matter: unparseable fails closed as at tc_egress).
-	ret, _, err := objs.CgOriginEgress.Test(craftTruncatedTCP(t))
+	// which must not matter: unparseable fails closed as at cw_tc_egress).
+	ret, _, err := objs.CwCgEgress.Test(craftTruncatedTCP(t))
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), ret)
 	recs := collectOriginRecords(t, rd, 500*time.Millisecond)
@@ -124,13 +124,13 @@ func TestOriginUnparsedDropEmitsRecordAndHonorsCarveOuts(t *testing.T) {
 	eth := craftEthHeader(ethPIP)
 	ip := craftIPv4Header("127.0.0.1", ipprotoTCP, 10)
 	loopbackTruncated := append(append(eth, ip...), make([]byte, 10)...)
-	ret, _, err = objs.CgOriginEgress.Test(loopbackTruncated)
+	ret, _, err = objs.CwCgEgress.Test(loopbackTruncated)
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), ret, "carve-outs are honored even for malformed packets")
 	require.Empty(t, collectOriginRecords(t, rd, 300*time.Millisecond))
 
 	// Invalid IHL (dst 0.0.0.0 — not carved): drop + record.
-	ret, _, err = objs.CgOriginEgress.Test(craftInvalidIHLIPv4(t))
+	ret, _, err = objs.CwCgEgress.Test(craftInvalidIHLIPv4(t))
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), ret)
 	recs = collectOriginRecords(t, rd, 500*time.Millisecond)

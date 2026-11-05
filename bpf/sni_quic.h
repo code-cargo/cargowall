@@ -32,7 +32,7 @@
 // The coalesced walk is capped because the verifier forbids unbounded loops.
 //
 // INVARIANT FOR ANYONE RAISING THIS: the cap is set by VERIFIER BUDGET, not by
-// protocol shape — roughly 20k of cg_origin_egress's 1M instructions per rung.
+// protocol shape — roughly 20k of cw_cg_egress's 1M instructions per rung.
 // Measure on CI's kernel before changing it (a 6.8 kernel under-reports by
 // ~3x), because busting the limit does not fail this feature, it fails the
 // whole program to load and takes L4 enforcement down with it. design-l7.md

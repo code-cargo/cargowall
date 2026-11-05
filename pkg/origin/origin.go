@@ -117,7 +117,7 @@ type Record struct {
 	StepOrdinal uint32
 	TCPSyn      bool
 	// Midstream marks a denial of an established flow (ACK set, no SYN/RST,
-	// mirroring tc_egress's guard) rather than a connection attempt.
+	// mirroring cw_tc_egress's guard) rather than a connection attempt.
 	Midstream bool
 	// Verdict is what the hook decided. VerdictWouldBlock/VerdictBlock
 	// records are handed to the verdict sink, but the two differ in what
@@ -354,7 +354,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		// one number that predicts whether this program loads on an older
 		// verifier, and the daemon's own log is the only place to read it on
 		// a runner kernel CI does not have. Branch-level logging is
-		// deliberately off — cg_origin_egress is over 100k verified
+		// deliberately off — cw_cg_egress is over 100k verified
 		// instructions on 6.17 (657k before the adjudicator became a global
 		// function), so a branch trace would be MBs held in
 		// Program.VerifierLog for the life of the process, and on a kernel
@@ -409,7 +409,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		// record.
 		Path:    cgroupAttachPath,
 		Attach:  ebpf.AttachCGroupInetEgress,
-		Program: o.objs.CgOriginEgress,
+		Program: o.objs.CwCgEgress,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to attach cgroup_skb/egress observer: %w", err)
@@ -504,7 +504,7 @@ func (o *Observer) Close() {
 }
 
 // Program exposes the observer program for BPF runtime-stats logging.
-func (o *Observer) Program() *ebpf.Program { return o.objs.CgOriginEgress }
+func (o *Observer) Program() *ebpf.Program { return o.objs.CwCgEgress }
 
 // ResolveCookie resolves a socket cookie against the tcbpf pid/step identity
 // maps — the same join insert applies to every origin record, exposed so the

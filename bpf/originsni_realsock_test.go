@@ -93,7 +93,7 @@ func newL7RealSocketHarness(t *testing.T, l7mode uint8, port uint16, scope uint8
 	lnk, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    "/sys/fs/cgroup",
 		Attach:  ebpf.AttachCGroupInetEgress,
-		Program: objs.CgOriginEgress,
+		Program: objs.CwCgEgress,
 	})
 	if err != nil {
 		t.Skipf("cannot attach cgroup_skb/egress at root cgroup: %v", err)
@@ -495,7 +495,7 @@ func TestOriginL7RealSocketQUICIdentity(t *testing.T) {
 	lnk, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    "/sys/fs/cgroup",
 		Attach:  ebpf.AttachCGroupInetEgress,
-		Program: objs.CgOriginEgress,
+		Program: objs.CwCgEgress,
 	})
 	if err != nil {
 		t.Skipf("cannot attach cgroup_skb/egress at root cgroup: %v", err)
@@ -664,7 +664,7 @@ func TestOriginL7RealSocketQUICGSOHiddenInitial(t *testing.T) {
 	lnk, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    "/sys/fs/cgroup",
 		Attach:  ebpf.AttachCGroupInetEgress,
-		Program: objs.CgOriginEgress,
+		Program: objs.CwCgEgress,
 	})
 	if err != nil {
 		t.Skipf("cannot attach cgroup_skb/egress at root cgroup: %v", err)

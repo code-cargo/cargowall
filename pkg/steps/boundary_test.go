@@ -38,14 +38,14 @@ const (
 	evExit = uint32(bpf.StepBpfStepEventKindSTEP_EV_EXIT)
 )
 
-// forkEvent encodes a step event as step_fork streams it.
+// forkEvent encodes a step event as cw_step_fork streams it.
 func forkEvent(tgid, ordinal uint32) []byte {
 	var buf bytes.Buffer
 	_ = binary.Write(&buf, binary.NativeEndian, bpf.StepBpfStepChildEvent{Kind: evFork, Tgid: tgid, Ordinal: ordinal})
 	return buf.Bytes()
 }
 
-// execEvent encodes a step event as step_exec or step_exit streams it:
+// execEvent encodes a step event as cw_step_exec or cw_step_exit streams it:
 // argv is the bytes the kernel copied, argvLen the argument area's length,
 // comm the program's name.
 func execEvent(kind, tgid, ordinal uint32, argv string, argvLen uint32, comm string) []byte {

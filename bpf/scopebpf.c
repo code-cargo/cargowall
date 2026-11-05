@@ -31,8 +31,8 @@
 // scope and nothing else.
 //
 // A cgroup is recorded once a task of ours enters it: moves there
-// (scope_attach) or is created there by clone3's CLONE_INTO_CGROUP
-// (scope_fork). It leaves the scope as soon as a task outside our pid
+// (cw_scope_attach) or is created there by clone3's CLONE_INTO_CGROUP
+// (cw_scope_fork). It leaves the scope as soon as a task outside our pid
 // namespace enters it the same way, such as a node service systemd
 // restarts into the cgroup a job of ours was left in: it is no longer this
 // job's alone. A cgroup a task of ours merely inherits is never recorded
@@ -40,7 +40,7 @@
 // (runc exec, kubectl exec) creates it in our pid namespace while it is
 // still in the runtime's own cgroup, and only then moves it; recording that
 // cgroup would judge every socket of containerd. Tasks that predate the
-// tracepoints are listed by the startup walk (scope_task_iter), and
+// tracepoints are listed by the startup walk (cw_scope_iter), and
 // pkg/origin records each cgroup it lists that no task outside our pid
 // namespace is in. Membership is read from the task's own pid chain, and
 // the root cgroup is never recorded (see scope_enter).
@@ -60,7 +60,7 @@ const volatile __u64 subtree_cgroup = 0;
 
 // cargowall's own process id in the daemon's pid namespace, written by
 // userspace before load: the one process in the subtree that the walk
-// lists (scope_task_iter).
+// lists (cw_scope_iter).
 const volatile __u32 self_tgid = 0;
 
 #include "pidns.h"
@@ -74,7 +74,7 @@ const volatile __u32 self_tgid = 0;
 
 // Cgroup v2 ids a task of ours has entered, and those the startup walk
 // found only our tasks in. An entry lives until its cgroup is released
-// (scope_release), which is after every socket made in it is gone, and a
+// (cw_scope_rel), which is after every socket made in it is gone, and a
 // removed cgroup whose memory is still charged (page cache written to a
 // volume, say) is not released until that memory is reclaimed. So the map
 // is large and allocated as it fills. A hash, not an LRU: nothing is ever
@@ -234,7 +234,7 @@ static __always_inline void scope_entered(struct task_struct *task, struct cgrou
 // so a parent moved in that instant would make an inherited cgroup look
 // entered. Every other fork returns after one test.
 SEC("tp_btf/task_newtask")
-int BPF_PROG(scope_fork, struct task_struct *task, __u64 clone_flags)
+int BPF_PROG(cw_scope_fork, struct task_struct *task, __u64 clone_flags)
 {
     if (!(clone_flags & CLONE_INTO_CGROUP))
         return 0;
@@ -249,7 +249,7 @@ int BPF_PROG(scope_fork, struct task_struct *task, __u64 clone_flags)
 // the default one decides socket cgroups. dst, not the leader's own cgroup:
 // a leader that has exited stays where it was while its live threads move.
 SEC("tp_btf/cgroup_attach_task")
-int BPF_PROG(scope_attach, struct cgroup *dst, const char *path,
+int BPF_PROG(cw_scope_attach, struct cgroup *dst, const char *path,
              struct task_struct *task, bool threadgroup)
 {
     if (BPF_CORE_READ(dst, root, hierarchy_id) != 0)
@@ -266,7 +266,7 @@ int BPF_PROG(scope_attach, struct cgroup *dst, const char *path,
 // that fails other than for want of one is counted: the entry keeps its
 // place in the map for good.
 SEC("tp_btf/cgroup_release")
-int BPF_PROG(scope_release, struct cgroup *cg, const char *path)
+int BPF_PROG(cw_scope_rel, struct cgroup *cg, const char *path)
 {
     if (BPF_CORE_READ(cg, root, hierarchy_id) != 0)
         return 0;
@@ -297,7 +297,7 @@ int BPF_PROG(scope_release, struct cgroup *cg, const char *path)
 // subtree's level. The kernel scopes the walk to the opener's pid
 // namespace.
 SEC("iter/task")
-int scope_task_iter(struct bpf_iter__task *ctx)
+int cw_scope_iter(struct bpf_iter__task *ctx)
 {
     struct task_struct *t = ctx->task;
     if (!t)

@@ -105,7 +105,7 @@ func TestOriginL7QUICWalkContract(t *testing.T) {
 			require.NoError(t, err)
 			defer rd.Close()
 
-			ret, _, err := objs.CgOriginEgress.Test(craftIPv4UDPData(edgeIP, 443, datagram))
+			ret, _, err := objs.CwCgEgress.Test(craftIPv4UDPData(edgeIP, 443, datagram))
 			require.NoError(t, err)
 			require.Equal(t, 0, int(ret), "under enforce a punt and a refusal both drop the datagram")
 

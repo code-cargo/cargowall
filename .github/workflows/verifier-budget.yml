@@ -4,7 +4,7 @@ name: verifier-budget
 # 5.15, Blacksmith 6.6) and on the newest LTS for the trend, not just on the
 # one ubuntu-latest happens to boot. The verifier's instruction count is
 # kernel-specific and does not even move in one direction across versions:
-# the inlined cg_origin_egress verified in 657k on CI's 6.17 and was rejected
+# the inlined cw_cg_egress verified in 657k on CI's 6.17 and was rejected
 # at the 1M limit on Blacksmith's 6.6. A program that is comfortable on the
 # CI kernel can be a load failure on a runner's, so the gate has to measure
 # those kernels.

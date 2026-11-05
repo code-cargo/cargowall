@@ -175,7 +175,7 @@ func (a *containerAttribution) wireVerdicts(configMgr *config.Manager, notificat
 			StepOrdinal: rec.StepOrdinal,
 			Dropped:     rec.Verdict == origin.VerdictBlock,
 			// Mid-stream comes from the BPF flag, which applies the same
-			// guard as tc_egress's EVENT_FLAG_MIDSTREAM (ACK set, no
+			// guard as cw_tc_egress's EVENT_FLAG_MIDSTREAM (ACK set, no
 			// SYN/RST). Re-deriving it as "TCP and not SYN" would re-include
 			// the kernel RST / SYN-ACK replies that guard exists to exclude.
 			MidStream: rec.Midstream,

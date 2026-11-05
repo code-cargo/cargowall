@@ -54,7 +54,7 @@ func TestReadCmdline_GoneFallsBackEmpty(t *testing.T) {
 	assert.Empty(t, readCmdline(0))
 }
 
-// encodeRec encodes one task_iter_rec as the step_task_iter iterator
+// encodeRec encodes one task_iter_rec as the cw_step_iter iterator
 // streams it.
 func encodeRec(r bpf.StepBpfTaskIterRec) []byte {
 	var buf bytes.Buffer
@@ -444,7 +444,7 @@ func TestStart_TagsWorkerChild(t *testing.T) {
 	// The connect hook is attached by cmd/start.go, not by Start; mirror
 	// that so the socket-owner path is exercised too.
 	connectLink, err := link.AttachCgroup(link.CgroupOptions{
-		Path: "/sys/fs/cgroup", Attach: ebpf.AttachCGroupInet4Connect, Program: objs.CgConnect4,
+		Path: "/sys/fs/cgroup", Attach: ebpf.AttachCGroupInet4Connect, Program: objs.CwCgConnect4,
 	})
 	require.NoError(t, err, "attach cgroup/connect4")
 	t.Cleanup(func() { _ = connectLink.Close() })

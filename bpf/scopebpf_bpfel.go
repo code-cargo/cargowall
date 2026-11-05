@@ -19,10 +19,10 @@ const (
 	ScopeBpfMapMapScopeCgroups = "map_scope_cgroups"
 	ScopeBpfMapMapScopeShared  = "map_scope_shared"
 	ScopeBpfMapMapScopeStats   = "map_scope_stats"
-	ScopeBpfProgScopeAttach    = "scope_attach"
-	ScopeBpfProgScopeFork      = "scope_fork"
-	ScopeBpfProgScopeRelease   = "scope_release"
-	ScopeBpfProgScopeTaskIter  = "scope_task_iter"
+	ScopeBpfProgCwScopeAttach  = "cw_scope_attach"
+	ScopeBpfProgCwScopeFork    = "cw_scope_fork"
+	ScopeBpfProgCwScopeIter    = "cw_scope_iter"
+	ScopeBpfProgCwScopeRel     = "cw_scope_rel"
 	ScopeBpfVarPidnsIno        = "pidns_ino"
 	ScopeBpfVarSelfTgid        = "self_tgid"
 	ScopeBpfVarSubtreeCgroup   = "subtree_cgroup"
@@ -70,10 +70,10 @@ type ScopeBpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type ScopeBpfProgramSpecs struct {
-	ScopeAttach   *ebpf.ProgramSpec `ebpf:"scope_attach"`
-	ScopeFork     *ebpf.ProgramSpec `ebpf:"scope_fork"`
-	ScopeRelease  *ebpf.ProgramSpec `ebpf:"scope_release"`
-	ScopeTaskIter *ebpf.ProgramSpec `ebpf:"scope_task_iter"`
+	CwScopeAttach *ebpf.ProgramSpec `ebpf:"cw_scope_attach"`
+	CwScopeFork   *ebpf.ProgramSpec `ebpf:"cw_scope_fork"`
+	CwScopeIter   *ebpf.ProgramSpec `ebpf:"cw_scope_iter"`
+	CwScopeRel    *ebpf.ProgramSpec `ebpf:"cw_scope_rel"`
 }
 
 // ScopeBpfMapSpecs contains maps before they are loaded into the kernel.
@@ -140,18 +140,18 @@ type ScopeBpfVariables struct {
 //
 // It can be passed to LoadScopeBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type ScopeBpfPrograms struct {
-	ScopeAttach   *ebpf.Program `ebpf:"scope_attach"`
-	ScopeFork     *ebpf.Program `ebpf:"scope_fork"`
-	ScopeRelease  *ebpf.Program `ebpf:"scope_release"`
-	ScopeTaskIter *ebpf.Program `ebpf:"scope_task_iter"`
+	CwScopeAttach *ebpf.Program `ebpf:"cw_scope_attach"`
+	CwScopeFork   *ebpf.Program `ebpf:"cw_scope_fork"`
+	CwScopeIter   *ebpf.Program `ebpf:"cw_scope_iter"`
+	CwScopeRel    *ebpf.Program `ebpf:"cw_scope_rel"`
 }
 
 func (p *ScopeBpfPrograms) Close() error {
 	return _ScopeBpfClose(
-		p.ScopeAttach,
-		p.ScopeFork,
-		p.ScopeRelease,
-		p.ScopeTaskIter,
+		p.CwScopeAttach,
+		p.CwScopeFork,
+		p.CwScopeIter,
+		p.CwScopeRel,
 	)
 }
 

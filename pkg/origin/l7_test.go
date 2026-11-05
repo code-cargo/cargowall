@@ -113,7 +113,7 @@ func TestL7OracleEndToEnd(t *testing.T) {
 	defer reader.Close()
 
 	run := func(frame []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(frame)
+		ret, _, err := objs.CwCgEgress.Test(frame)
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -290,9 +290,9 @@ func TestL7ReaderGoroutine(t *testing.T) {
 	defer l.close()
 
 	// SYN + ClientHello: the hello punts (every hello does).
-	_, _, err := objs.CgOriginEgress.Test(craftIPv4TLS(edgeIP, "", true))
+	_, _, err := objs.CwCgEgress.Test(craftIPv4TLS(edgeIP, "", true))
 	require.NoError(t, err)
-	_, _, err = objs.CgOriginEgress.Test(craftIPv4TLS(edgeIP, "auth.docker.io", false))
+	_, _, err = objs.CwCgEgress.Test(craftIPv4TLS(edgeIP, "auth.docker.io", false))
 	require.NoError(t, err)
 
 	// The reader goroutine adjudicates asynchronously; its verdict writeback

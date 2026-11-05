@@ -225,7 +225,7 @@ func loadCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, err
 	}
 	// The walk's iterator runs only when read, so attaching it hooks
 	// nothing.
-	if s.iter, err = link.AttachIter(link.IterOptions{Program: s.objs.ScopeTaskIter}); err != nil {
+	if s.iter, err = link.AttachIter(link.IterOptions{Program: s.objs.CwScopeIter}); err != nil {
 		s.release()
 		return nil, fmt.Errorf("cgroup scope: failed to attach the task walk: %w", err)
 	}
@@ -242,7 +242,7 @@ func loadCgroupScope(logger *slog.Logger, subtreePath string) (*cgroupScope, err
 // recorded by one or the other, and watches from then on. On an error the
 // caller closes the scope.
 func (s *cgroupScope) start() error {
-	for _, p := range []*ebpf.Program{s.objs.ScopeFork, s.objs.ScopeAttach, s.objs.ScopeRelease} {
+	for _, p := range []*ebpf.Program{s.objs.CwScopeFork, s.objs.CwScopeAttach, s.objs.CwScopeRel} {
 		l, err := link.AttachTracing(link.TracingOptions{Program: p, AttachType: ebpf.AttachTraceRawTp})
 		if err != nil {
 			return fmt.Errorf("cgroup scope: failed to attach %s: %w", p, err)

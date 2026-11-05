@@ -170,27 +170,27 @@ func loadStepObjects(t *testing.T) (*TcBpfObjects, *StepBpfObjects, *link.Iter) 
 	t.Cleanup(func() { objs.Close() })
 
 	forkLink, err := link.AttachTracing(link.TracingOptions{
-		Program:    objs.StepFork,
+		Program:    objs.CwStepFork,
 		AttachType: ebpf.AttachTraceRawTp,
 	})
 	require.NoError(t, err, "attach sched_process_fork")
 	t.Cleanup(func() { forkLink.Close() })
 
 	exitLink, err := link.AttachTracing(link.TracingOptions{
-		Program:    objs.StepExit,
+		Program:    objs.CwStepExit,
 		AttachType: ebpf.AttachTraceRawTp,
 	})
 	require.NoError(t, err, "attach sched_process_exit")
 	t.Cleanup(func() { exitLink.Close() })
 
 	execLink, err := link.AttachTracing(link.TracingOptions{
-		Program:    objs.StepExec,
+		Program:    objs.CwStepExec,
 		AttachType: ebpf.AttachTraceRawTp,
 	})
 	require.NoError(t, err, "attach sched_process_exec")
 	t.Cleanup(func() { execLink.Close() })
 
-	iter, err := link.AttachIter(link.IterOptions{Program: objs.StepTaskIter})
+	iter, err := link.AttachIter(link.IterOptions{Program: objs.CwStepIter})
 	require.NoError(t, err, "attach task iterator")
 	t.Cleanup(func() { iter.Close() })
 
@@ -217,7 +217,7 @@ func TestStepFork(t *testing.T) {
 	t.Cleanup(func() { rd.Close() })
 
 	// Declare this test process as the worker — by global tgid, which is
-	// what step_fork compares parent->tgid against — so its next direct
+	// what cw_step_fork compares parent->tgid against — so its next direct
 	// child gets ordinal 5. Uses the bpf2go-generated state struct so kernel
 	// and Go layouts cannot drift.
 	selfTgid, ok := globalTgid(t, iter, os.Getpid())
@@ -508,7 +508,7 @@ func readProcInt(t *testing.T, path string) int {
 // onRecycledTid plants a stale tag at a free pid, steers the pid allocator
 // onto it through ns_last_pid, runs spawn, and returns the lookup of that
 // tid in map_task_step while spawn's task still lives (once it exits,
-// step_exit deletes the entry whatever step_fork did). spawn reports
+// cw_step_exit deletes the entry whatever cw_step_fork did). spawn reports
 // whether its new task drew the pid, and returns how to end it. Something
 // else on the host can take the pid first, so it tries again; it skips
 // after 20 misses.
@@ -561,7 +561,7 @@ func untagSelf(t *testing.T, tcObjs *TcBpfObjects, iter *link.Iter) {
 
 // TestStepFork_RecycledTidStartsClean: a tid can come back from the pid
 // allocator still holding a tag, one userspace wrote to a task that exited
-// between its task walk and its map write, after step_exit had run. A
+// between its task walk and its map write, after cw_step_exit had run. A
 // child of an untagged parent must come out untagged all the same, and so
 // must any child while attribution is off, when a create-only seed pass
 // would keep the stale value. No worker is set, so every fork is case 2.
@@ -581,7 +581,7 @@ func TestStepFork_RecycledTidStartsClean(t *testing.T) {
 
 // TestStepFork_RecycledTidStartsClean_IoWorker: an io_uring worker never
 // reaches sched_process_fork, so the tid it draws is cleared only because
-// step_fork runs at task_newtask. An SQPOLL ring makes one, a thread of
+// cw_step_fork runs at task_newtask. An SQPOLL ring makes one, a thread of
 // this process, when it is set up.
 func TestStepFork_RecycledTidStartsClean_IoWorker(t *testing.T) {
 	tcObjs, _, iter := loadStepObjects(t)
@@ -602,7 +602,7 @@ func TestStepFork_RecycledTidStartsClean_IoWorker(t *testing.T) {
 }
 
 // TestStepTaskIter_FlagsExitingTask: the walk lists a zombie, flagged as
-// exiting, and does not put back the namespace entry step_exit deleted.
+// exiting, and does not put back the namespace entry cw_step_exit deleted.
 // Userspace must not tag such a task: the tag would outlive it.
 func TestStepTaskIter_FlagsExitingTask(t *testing.T) {
 	tcObjs, _, iter := loadStepObjects(t)

@@ -47,7 +47,7 @@ func TestOriginL7QUICNonIdentityPasses(t *testing.T) {
 	require.NoError(t, objs.MapL7Scope.Put(ipToU32(edgeIP), uint8(0x04))) // QUIC scope
 
 	run := func(payload []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(craftIPv4UDPData(edgeIP, 443, payload))
+		ret, _, err := objs.CwCgEgress.Test(craftIPv4UDPData(edgeIP, 443, payload))
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -84,7 +84,7 @@ func TestOriginL7QUICUnknownVersionFailsClosed(t *testing.T) {
 	defer rd.Close()
 
 	unknown := append([]byte{0xc0, 0xde, 0xad, 0xbe, 0xef, 0x08, 1, 2, 3, 4, 5, 6, 7, 8, 0x00}, make([]byte, 32)...)
-	ret, _, err := objs.CgOriginEgress.Test(craftIPv4UDPData(edgeIP, 443, unknown))
+	ret, _, err := objs.CwCgEgress.Test(craftIPv4UDPData(edgeIP, 443, unknown))
 	require.NoError(t, err)
 	require.Equal(t, 0, int(ret), "an unknown-version long header must fail closed, not pass")
 	refusal := readL7Sample(t, rd)
@@ -117,7 +117,7 @@ func TestOriginL7QUICCoalescedInitial(t *testing.T) {
 	defer rd.Close()
 
 	run := func(payload []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(craftIPv4UDPData(edgeIP, 443, payload))
+		ret, _, err := objs.CwCgEgress.Test(craftIPv4UDPData(edgeIP, 443, payload))
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -177,7 +177,7 @@ func TestOriginL7QUICSecondInitialDifferentDCID(t *testing.T) {
 	defer rd.Close()
 
 	run := func(payload []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(craftIPv4UDPData(edgeIP, 443, payload))
+		ret, _, err := objs.CwCgEgress.Test(craftIPv4UDPData(edgeIP, 443, payload))
 		require.NoError(t, err)
 		return int(ret)
 	}
@@ -223,7 +223,7 @@ func TestOriginL7QUICMixedConnectionIDs(t *testing.T) {
 	defer rd.Close()
 
 	run := func(payload []byte) int {
-		ret, _, err := objs.CgOriginEgress.Test(craftIPv4UDPData(edgeIP, 443, payload))
+		ret, _, err := objs.CwCgEgress.Test(craftIPv4UDPData(edgeIP, 443, payload))
 		require.NoError(t, err)
 		return int(ret)
 	}

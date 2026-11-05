@@ -64,11 +64,11 @@ const (
 	StepBpfMapMapStepState            = "map_step_state"
 	StepBpfMapMapTaskNspid            = "map_task_nspid"
 	StepBpfMapMapTaskStep             = "map_task_step"
-	StepBpfProgCgSockCreate           = "cg_sock_create"
-	StepBpfProgStepExec               = "step_exec"
-	StepBpfProgStepExit               = "step_exit"
-	StepBpfProgStepFork               = "step_fork"
-	StepBpfProgStepTaskIter           = "step_task_iter"
+	StepBpfProgCwCgSockNew            = "cw_cg_sock_new"
+	StepBpfProgCwStepExec             = "cw_step_exec"
+	StepBpfProgCwStepExit             = "cw_step_exit"
+	StepBpfProgCwStepFork             = "cw_step_fork"
+	StepBpfProgCwStepIter             = "cw_step_iter"
 	StepBpfVarBtfAnchorStepChildEvent = "btf_anchor_step_child_event"
 	StepBpfVarBtfAnchorStepEventKind  = "btf_anchor_step_event_kind"
 	StepBpfVarBtfAnchorStepExecEvent  = "btf_anchor_step_exec_event"
@@ -118,11 +118,11 @@ type StepBpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type StepBpfProgramSpecs struct {
-	CgSockCreate *ebpf.ProgramSpec `ebpf:"cg_sock_create"`
-	StepExec     *ebpf.ProgramSpec `ebpf:"step_exec"`
-	StepExit     *ebpf.ProgramSpec `ebpf:"step_exit"`
-	StepFork     *ebpf.ProgramSpec `ebpf:"step_fork"`
-	StepTaskIter *ebpf.ProgramSpec `ebpf:"step_task_iter"`
+	CwCgSockNew *ebpf.ProgramSpec `ebpf:"cw_cg_sock_new"`
+	CwStepExec  *ebpf.ProgramSpec `ebpf:"cw_step_exec"`
+	CwStepExit  *ebpf.ProgramSpec `ebpf:"cw_step_exit"`
+	CwStepFork  *ebpf.ProgramSpec `ebpf:"cw_step_fork"`
+	CwStepIter  *ebpf.ProgramSpec `ebpf:"cw_step_iter"`
 }
 
 // StepBpfMapSpecs contains maps before they are loaded into the kernel.
@@ -202,20 +202,20 @@ type StepBpfVariables struct {
 //
 // It can be passed to LoadStepBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type StepBpfPrograms struct {
-	CgSockCreate *ebpf.Program `ebpf:"cg_sock_create"`
-	StepExec     *ebpf.Program `ebpf:"step_exec"`
-	StepExit     *ebpf.Program `ebpf:"step_exit"`
-	StepFork     *ebpf.Program `ebpf:"step_fork"`
-	StepTaskIter *ebpf.Program `ebpf:"step_task_iter"`
+	CwCgSockNew *ebpf.Program `ebpf:"cw_cg_sock_new"`
+	CwStepExec  *ebpf.Program `ebpf:"cw_step_exec"`
+	CwStepExit  *ebpf.Program `ebpf:"cw_step_exit"`
+	CwStepFork  *ebpf.Program `ebpf:"cw_step_fork"`
+	CwStepIter  *ebpf.Program `ebpf:"cw_step_iter"`
 }
 
 func (p *StepBpfPrograms) Close() error {
 	return _StepBpfClose(
-		p.CgSockCreate,
-		p.StepExec,
-		p.StepExit,
-		p.StepFork,
-		p.StepTaskIter,
+		p.CwCgSockNew,
+		p.CwStepExec,
+		p.CwStepExit,
+		p.CwStepFork,
+		p.CwStepIter,
 	)
 }
 

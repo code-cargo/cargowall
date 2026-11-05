@@ -88,7 +88,7 @@ func loadBPFObjects(t *testing.T) *TcBpfObjects {
 	return &objs
 }
 
-// Test cases for tc_egress program using BPF_PROG_TEST_RUN
+// Test cases for cw_tc_egress program using BPF_PROG_TEST_RUN
 func TestTcEgress(t *testing.T) {
 	objs := loadBPFObjects(t)
 
@@ -334,7 +334,7 @@ func TestTcEgress(t *testing.T) {
 		// 7.0, and carrying a Fixes: tag, so headed for stable) the kernel
 		// EINVALs that input before the program runs. The truncated-L3 cases
 		// therefore ride a VLAN tag, which the kernel leaves alone and
-		// tc_egress parses to the same handle_ipv4/handle_ipv6 load failure.
+		// cw_tc_egress parses to the same handle_ipv4/handle_ipv6 load failure.
 		{
 			name:    "Truncated IP header",
 			packet:  craftTruncatedIPv4(t),
@@ -446,7 +446,7 @@ func TestTcEgress(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ret, _, err := objs.TcEgress.Test(tt.packet)
+			ret, _, err := objs.CwTcEgress.Test(tt.packet)
 			require.NoError(t, err, "test run failed")
 			require.Equal(t, tt.wantRet, ret, "unexpected return value")
 		})
@@ -488,7 +488,7 @@ func TestTcEgressAuditMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ret, _, err := objs.TcEgress.Test(tt.packet)
+			ret, _, err := objs.CwTcEgress.Test(tt.packet)
 			require.NoError(t, err, "test run failed")
 			require.Equal(t, tt.wantRet, ret, "unexpected return value")
 		})
@@ -500,7 +500,7 @@ func TestTcIngress(t *testing.T) {
 
 	// Ingress should always allow traffic
 	packet := craftIPv4TCP(t, "93.184.216.34", 80)
-	ret, _, err := objs.TcIngress.Test(packet)
+	ret, _, err := objs.CwTcIngress.Test(packet)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActOK), ret, "ingress should always allow")
 }
@@ -543,7 +543,7 @@ func TestTcEgressDefaultAllow(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ret, _, err := objs.TcEgress.Test(tt.packet)
+			ret, _, err := objs.CwTcEgress.Test(tt.packet)
 			require.NoError(t, err, "test run failed")
 			require.Equal(t, tt.wantRet, ret, "unexpected return value")
 		})
@@ -607,7 +607,7 @@ func TestTcEgressExplicitDeny(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ret, _, err := objs.TcEgress.Test(tt.packet)
+			ret, _, err := objs.CwTcEgress.Test(tt.packet)
 			require.NoError(t, err, "test run failed")
 			require.Equal(t, tt.wantRet, ret, "unexpected return value")
 		})
@@ -673,7 +673,7 @@ func TestTcEgressDefaultAllowWithDeny(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ret, _, err := objs.TcEgress.Test(tt.packet)
+			ret, _, err := objs.CwTcEgress.Test(tt.packet)
 			require.NoError(t, err, "test run failed")
 			require.Equal(t, tt.wantRet, ret, "unexpected return value")
 		})
@@ -819,7 +819,7 @@ func TestTcEgressPortSpecificRules(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ret, _, err := objs.TcEgress.Test(tt.packet)
+			ret, _, err := objs.CwTcEgress.Test(tt.packet)
 			require.NoError(t, err, "test run failed")
 			require.Equal(t, tt.wantRet, ret, "unexpected return value")
 		})
@@ -924,7 +924,7 @@ func TestTcEgressProtocolEnforcement(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ret, _, err := objs.TcEgress.Test(tt.packet)
+			ret, _, err := objs.CwTcEgress.Test(tt.packet)
 			require.NoError(t, err)
 			require.Equal(t, tt.wantRet, ret)
 		})
@@ -934,17 +934,17 @@ func TestTcEgressProtocolEnforcement(t *testing.T) {
 func TestCgroupProgramsLoad(t *testing.T) {
 	objs := loadBPFObjects(t)
 
-	require.NotNil(t, objs.CgConnect4, "cg_connect4 program should be loaded")
-	require.NotNil(t, objs.CgConnect6, "cg_connect6 program should be loaded")
-	require.NotNil(t, objs.CgSendmsg4, "cg_sendmsg4 program should be loaded")
-	require.NotNil(t, objs.CgSendmsg6, "cg_sendmsg6 program should be loaded")
+	require.NotNil(t, objs.CwCgConnect4, "cw_cg_connect4 program should be loaded")
+	require.NotNil(t, objs.CwCgConnect6, "cw_cg_connect6 program should be loaded")
+	require.NotNil(t, objs.CwCgSendmsg4, "cw_cg_sendmsg4 program should be loaded")
+	require.NotNil(t, objs.CwCgSendmsg6, "cw_cg_sendmsg6 program should be loaded")
 	require.NotNil(t, objs.MapSockPid, "map_sock_pid should be loaded")
 
 	// Verify program types
-	require.Equal(t, ebpf.CGroupSockAddr, objs.CgConnect4.Type(), "cg_connect4 should be CGroupSockAddr type")
-	require.Equal(t, ebpf.CGroupSockAddr, objs.CgConnect6.Type(), "cg_connect6 should be CGroupSockAddr type")
-	require.Equal(t, ebpf.CGroupSockAddr, objs.CgSendmsg4.Type(), "cg_sendmsg4 should be CGroupSockAddr type")
-	require.Equal(t, ebpf.CGroupSockAddr, objs.CgSendmsg6.Type(), "cg_sendmsg6 should be CGroupSockAddr type")
+	require.Equal(t, ebpf.CGroupSockAddr, objs.CwCgConnect4.Type(), "cw_cg_connect4 should be CGroupSockAddr type")
+	require.Equal(t, ebpf.CGroupSockAddr, objs.CwCgConnect6.Type(), "cw_cg_connect6 should be CGroupSockAddr type")
+	require.Equal(t, ebpf.CGroupSockAddr, objs.CwCgSendmsg4.Type(), "cw_cg_sendmsg4 should be CGroupSockAddr type")
+	require.Equal(t, ebpf.CGroupSockAddr, objs.CwCgSendmsg6.Type(), "cw_cg_sendmsg6 should be CGroupSockAddr type")
 
 	// Verify map type
 	info, err := objs.MapSockPid.Info()
@@ -1016,7 +1016,7 @@ func TestEventPidZeroWhenNoCookieMapping(t *testing.T) {
 
 	// Send a blocked TCP SYN to trigger an event
 	pkt := craftIPv4TCP(t, "93.184.216.34", 80)
-	ret, _, err := objs.TcEgress.Test(pkt)
+	ret, _, err := objs.CwTcEgress.Test(pkt)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActShot), ret)
 
@@ -1043,7 +1043,7 @@ func TestEventPidZeroWhenNoCookieMappingIPv6(t *testing.T) {
 
 	// Send a blocked IPv6 TCP SYN
 	pkt := craftIPv6TCP(t, "2001:db8::1", 80)
-	ret, _, err := objs.TcEgress.Test(pkt)
+	ret, _, err := objs.CwTcEgress.Test(pkt)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActShot), ret)
 
@@ -1094,7 +1094,7 @@ func TestMidStreamDropEmitsEvent(t *testing.T) {
 
 	// ACK segment (0x10) to a blocked host: dropped and flagged mid-stream.
 	pkt := craftIPv4TCPWithFlags(t, "93.184.216.34", 80, 0x10)
-	ret, _, err := objs.TcEgress.Test(pkt)
+	ret, _, err := objs.CwTcEgress.Test(pkt)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActShot), ret)
 
@@ -1106,14 +1106,14 @@ func TestMidStreamDropEmitsEvent(t *testing.T) {
 	require.Equal(t, uint16(80), evt.DstPort)
 
 	// Same tuple again: rate-limited, no second event.
-	ret, _, err = objs.TcEgress.Test(pkt)
+	ret, _, err = objs.CwTcEgress.Test(pkt)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActShot), ret)
 	requireNoEvent(t, rd, "repeat drop on the same dst tuple must be rate-limited")
 
 	// Different dst port = different tuple: emits.
 	pkt2 := craftIPv4TCPWithFlags(t, "93.184.216.34", 8080, 0x10)
-	ret, _, err = objs.TcEgress.Test(pkt2)
+	ret, _, err = objs.CwTcEgress.Test(pkt2)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActShot), ret)
 	evt = readOneEvent(t, rd)
@@ -1134,7 +1134,7 @@ func TestMidStreamDropEmitsEvent(t *testing.T) {
 		{"SYN-ACK", 0x12, 9003},
 	} {
 		pkt := craftIPv4TCPWithFlags(t, "93.184.216.34", tc.port, tc.flags)
-		ret, _, err = objs.TcEgress.Test(pkt)
+		ret, _, err = objs.CwTcEgress.Test(pkt)
 		require.NoError(t, err)
 		require.Equal(t, uint32(tcActShot), ret, "%s still dropped", tc.name)
 		requireNoEvent(t, rd, tc.name+" must not emit a mid-stream event (inbound-scan reply, not a killed connection)")
@@ -1142,7 +1142,7 @@ func TestMidStreamDropEmitsEvent(t *testing.T) {
 
 	// SYN blocks are unflagged (regression guard for the flags byte).
 	synPkt := craftIPv4TCP(t, "93.184.216.34", 443)
-	ret, _, err = objs.TcEgress.Test(synPkt)
+	ret, _, err = objs.CwTcEgress.Test(synPkt)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActShot), ret)
 	evt = readOneEvent(t, rd)
@@ -1159,7 +1159,7 @@ func TestMidStreamDropEmitsEventIPv6(t *testing.T) {
 	defer rd.Close()
 
 	pkt := craftIPv6TCPWithFlags(t, "2001:db8::1", 80, 0x10)
-	ret, _, err := objs.TcEgress.Test(pkt)
+	ret, _, err := objs.CwTcEgress.Test(pkt)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActShot), ret)
 
@@ -1170,7 +1170,7 @@ func TestMidStreamDropEmitsEventIPv6(t *testing.T) {
 	require.NotZero(t, evt.Flags&0x1, "mid-stream drop must carry EVENT_FLAG_MIDSTREAM")
 	require.Equal(t, uint16(80), evt.DstPort)
 
-	ret, _, err = objs.TcEgress.Test(pkt)
+	ret, _, err = objs.CwTcEgress.Test(pkt)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActShot), ret)
 	requireNoEvent(t, rd, "repeat drop on the same dst tuple must be rate-limited")
@@ -1188,7 +1188,7 @@ func TestMidStreamDropEmitsEventIPv6(t *testing.T) {
 		{"SYN-ACK", 0x12, 9003},
 	} {
 		pkt := craftIPv6TCPWithFlags(t, "2001:db8::1", tc.port, tc.flags)
-		ret, _, err = objs.TcEgress.Test(pkt)
+		ret, _, err = objs.CwTcEgress.Test(pkt)
 		require.NoError(t, err)
 		require.Equal(t, uint32(tcActShot), ret, "%s still dropped", tc.name)
 		requireNoEvent(t, rd, tc.name+" must not emit a mid-stream event (inbound-scan reply, not a killed connection)")
@@ -1210,7 +1210,7 @@ func TestMidStreamDropAuditMode(t *testing.T) {
 	defer rd.Close()
 
 	pkt := craftIPv4TCPWithFlags(t, "93.184.216.34", 80, 0x10)
-	ret, _, err := objs.TcEgress.Test(pkt)
+	ret, _, err := objs.CwTcEgress.Test(pkt)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActOK), ret, "audit mode must pass the packet")
 
@@ -1218,7 +1218,7 @@ func TestMidStreamDropAuditMode(t *testing.T) {
 	require.NotZero(t, evt.Flags&0x1, "audit mode still emits the flagged event")
 
 	// Continuous data segments must not flood the ring buffer.
-	ret, _, err = objs.TcEgress.Test(pkt)
+	ret, _, err = objs.CwTcEgress.Test(pkt)
 	require.NoError(t, err)
 	require.Equal(t, uint32(tcActOK), ret)
 	requireNoEvent(t, rd, "audit-mode repeats must be rate-limited too")

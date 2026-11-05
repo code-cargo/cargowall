@@ -102,7 +102,7 @@ func TestOriginScopedPassesOtherCgroups(t *testing.T) {
 	}
 	// The default program first, so a pass below can only be the scope.
 	for _, d := range denied {
-		ret, _, err := all.CgOriginEgress.Test(d.packet)
+		ret, _, err := all.CwCgEgress.Test(d.packet)
 		require.NoError(t, err)
 		require.Equal(t, uint32(0), ret, "%s: the default program must drop it", d.name)
 	}
@@ -111,7 +111,7 @@ func TestOriginScopedPassesOtherCgroups(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { rd.Close() })
 	for _, d := range denied {
-		ret, _, err := scoped.CgOriginEgress.Test(d.packet)
+		ret, _, err := scoped.CwCgEgress.Test(d.packet)
 		require.NoError(t, err)
 		require.Equal(t, uint32(1), ret, "%s: a socket outside the recorded cgroups must pass a scoped program", d.name)
 	}
@@ -205,7 +205,7 @@ func TestOriginScopeRealSocket(t *testing.T) {
 	l, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    cg,
 		Attach:  ebpf.AttachCGroupInetEgress,
-		Program: objs.CgOriginEgress,
+		Program: objs.CwCgEgress,
 	})
 	if err != nil {
 		t.Skipf("cannot attach cgroup_skb/egress at test cgroup: %v", err)
@@ -309,7 +309,7 @@ func TestOriginScopePodSubtree(t *testing.T) {
 	l, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    root,
 		Attach:  ebpf.AttachCGroupInetEgress,
-		Program: objs.CgOriginEgress,
+		Program: objs.CwCgEgress,
 	})
 	if err != nil {
 		t.Skipf("cannot attach cgroup_skb/egress at test cgroup: %v", err)

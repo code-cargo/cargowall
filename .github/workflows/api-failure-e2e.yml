@@ -387,6 +387,13 @@ jobs:
 
       - name: Stop cargowall and assert clean teardown
         run: |
+          # The block above can land before startup restarts Docker onto the
+          # daemon.json rewrite. Stopping only after that restart gives the
+          # teardown one to undo.
+          for i in $(seq 1 60); do
+            grep -q "Docker daemon ready after restart" /tmp/cargowall.log && break
+            sleep 1
+          done
           sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
           bash scripts/ci/dns-redirect-gone.sh /tmp/cargowall.log "after stop"
           bash scripts/ci/docker-dns-restored.sh /tmp/cargowall.log "after stop" alpine:3.20

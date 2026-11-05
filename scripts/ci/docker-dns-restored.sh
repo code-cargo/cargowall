@@ -53,7 +53,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-servers=$(docker run --rm "$image" sed -n 's/^nameserver[[:space:]]*//p' /etc/resolv.conf) \
+servers=$(docker run --rm --pull=never "$image" sed -n 's/^nameserver[[:space:]]*//p' /etc/resolv.conf) \
   || { echo "::error::a container failed to start $when"; exit 1; }
 echo "Container nameservers $when: $servers"
 [ -n "$servers" ] || { echo "::error::a container got no nameserver $when"; exit 1; }

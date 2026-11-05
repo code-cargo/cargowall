@@ -198,6 +198,74 @@ func TestDaemonConfig_RestoreRestartsADaemonOnTheRewrite(t *testing.T) {
 	})
 }
 
+// nextRun is a later cargowall run against c's files, with none of c's state:
+// what it knows of the daemon comes from the records alone.
+func nextRun(c *daemonConfig) *daemonConfig {
+	return &daemonConfig{
+		path: c.path, backup: c.backup, absent: c.absent, rewrite: c.rewrite,
+		restart: c.restart, queueRestart: c.queueRestart,
+	}
+}
+
+// A run killed after its restart onto the rewrite leaves the daemon on it.
+// The next run undoes the records, but the daemon still runs that rewrite
+// until something restarts it, so a teardown that gets in before the next
+// run's own restart restarts it onto the original. That holds whether the
+// next run rewrote daemon.json again or only undid the leftover.
+func TestDaemonConfig_RestoreRestartsADaemonOnALeftover(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	original := `{"log-driver": "json-file"}`
+	for name, undo := range map[string]func(*daemonConfig) error{
+		"configure": func(c *daemonConfig) error { return c.configure("169.254.0.53", logger) },
+		"recover": func(c *daemonConfig) error {
+			recovered, err := c.recover(logger)
+			require.True(t, recovered)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			killed, restarts := newTestDaemonConfig(t)
+			require.NoError(t, os.WriteFile(killed.path, []byte(original), 0o644))
+			require.NoError(t, killed.configure("169.254.0.53", logger))
+			require.NoError(t, killed.restartDaemon(logger))
+			// No restore: that run was killed.
+
+			next := nextRun(killed)
+			require.NoError(t, undo(next))
+			require.NoError(t, next.restore(logger)) // interrupted before its own restart
+			requireContent(t, next.path, []byte(original))
+			require.Equal(t, queued(original), (*restarts)[len(*restarts)-1])
+		})
+	}
+
+	t.Run("restarted onto the original before teardown", func(t *testing.T) {
+		killed, restarts := newTestDaemonConfig(t)
+		require.NoError(t, os.WriteFile(killed.path, []byte(original), 0o644))
+		require.NoError(t, killed.configure("169.254.0.53", logger))
+		require.NoError(t, killed.restartDaemon(logger))
+
+		next := nextRun(killed)
+		_, err := next.recover(logger)
+		require.NoError(t, err)
+		require.NoError(t, next.restartDaemon(logger))
+		require.NoError(t, next.restore(logger))
+		require.Len(t, *restarts, 2, "the restart onto the original is all the daemon needs")
+		require.Equal(t, original, (*restarts)[1])
+	})
+}
+
+// Once teardown has begun, restore has seen to the daemon: a restart startup
+// reaches afterwards would only stop its containers again.
+func TestDaemonConfig_RestartAfterRestoreSkipped(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	c, restarts := newTestDaemonConfig(t)
+	require.NoError(t, os.WriteFile(c.path, []byte(`{"log-driver": "json-file"}`), 0o644))
+	require.NoError(t, c.configure("169.254.0.53", logger))
+	require.NoError(t, c.restore(logger))
+	require.NoError(t, c.restartDaemon(logger))
+	require.Empty(t, *restarts)
+}
+
 // A second signal's teardown runs inside a short bound, so restore must not
 // wait on startup's restart, which can take most of a minute: it puts the
 // original back and queues its own restart while that one still runs.

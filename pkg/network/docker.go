@@ -61,8 +61,10 @@ type daemonConfig struct {
 	// restored is set by the first restore, so a configure the undo has
 	// already overtaken does not rewrite what nothing will then undo.
 	restored bool
-	// applied is set once the daemon has been restarted onto the rewrite,
-	// so restore restarts it onto the original as well.
+	// applied is set while the daemon may run a rewrite: once it is
+	// restarted onto ours, or once a rewrite a previous run left is undone,
+	// since a daemon started after that run's restart runs it. A restart onto
+	// anything else clears it. restore restarts the daemon while it is set.
 	applied bool
 }
 
@@ -158,6 +160,9 @@ func (c *daemonConfig) recover(logger *slog.Logger) (bool, error) {
 // hold the real original. Caller holds c.mu.
 func (c *daemonConfig) recoverLocked(logger *slog.Logger) (bool, error) {
 	recovered, err := c.restoreFiles(logger)
+	if recovered {
+		c.applied = true
+	}
 	if err != nil {
 		return recovered, fmt.Errorf("undo the daemon.json rewrite a previous run left: %w", err)
 	}
@@ -237,24 +242,26 @@ func (c *daemonConfig) restore(logger *slog.Logger) error {
 	c.restored = true
 	logger.Info("Restoring Docker DNS configuration")
 	restored, err := c.restoreFiles(logger)
-	if err != nil {
-		return err
-	}
-	if !restored {
+	switch {
+	case err != nil:
+	case restored:
+		logger.Info("Docker DNS configuration restored")
+	default:
 		logger.Debug("daemon.json holds no rewrite of ours; nothing to restore")
-		return nil
 	}
-	logger.Info("Docker DNS configuration restored")
-	// A daemon that never ran the rewrite still runs its original settings,
-	// and is left alone. One that did keeps pointing its containers at the
+	// A daemon that never ran a rewrite still runs its original settings,
+	// and is left alone. One that may keeps pointing its containers at the
 	// listener, which goes with cargowall, until it restarts: a reload does
 	// not undo it, and with no "dns" in daemon.json leaves the daemon handing
-	// its containers an empty nameserver. The restart is only queued: a
-	// teardown, forced ones included, does not wait on the daemon, and
-	// systemd finishes the restart after cargowall has gone. One queued while
-	// startup's restart still runs makes systemd run that one again, so the
-	// daemon comes up on the original either way.
-	if c.applied {
+	// its containers an empty nameserver. That holds when restoreFiles fails
+	// after putting the original back, and when a previous run's rewrite was
+	// undone earlier in this run, so restore finds nothing of its own; a
+	// daemon.json that still holds the rewrite has nothing to restart onto.
+	// The restart is only queued: a teardown, forced ones included, does not
+	// wait on the daemon, and systemd finishes the restart after cargowall
+	// has gone. One queued while startup's restart still runs makes systemd
+	// run that one again, so the daemon comes up on the original either way.
+	if c.applied && !c.holdsRewrite() {
 		if err := c.queueRestart(logger); err != nil {
 			logger.Warn("Failed to queue a Docker daemon restart onto its restored daemon.json; "+
 				"its containers resolve through an address cargowall no longer serves until it restarts", "error", err)
@@ -262,20 +269,35 @@ func (c *daemonConfig) restore(logger *slog.Logger) error {
 			logger.Info("Queued a Docker daemon restart onto its restored daemon.json")
 		}
 	}
-	return nil
+	return err
 }
 
 // restartDaemon is RestartDockerDaemon. It records whether the daemon is
 // about to run the rewrite before restarting it: a restart that fails or
 // times out may have applied it all the same. A restore that gets in
-// between has put the original back, and the restart applies that.
+// between has put the original back, and the restart applies that. Once
+// teardown has begun, restore has seen to the daemon, and there is no
+// restart.
 func (c *daemonConfig) restartDaemon(logger *slog.Logger) error {
 	c.mu.Lock()
-	if c.holdsRewrite() {
+	if c.restored {
+		c.mu.Unlock()
+		logger.Debug("Docker daemon restart skipped; teardown has begun")
+		return nil
+	}
+	rewrite := c.holdsRewrite()
+	if rewrite {
 		c.applied = true
 	}
 	c.mu.Unlock()
-	return c.restart(logger)
+
+	err := c.restart(logger)
+	if err == nil && !rewrite {
+		c.mu.Lock()
+		c.applied = false
+		c.mu.Unlock()
+	}
+	return err
 }
 
 // holdsRewrite reports whether daemon.json holds the rewrite recorded

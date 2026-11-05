@@ -35,7 +35,7 @@ done
 
 # A restart onto the rewrite at startup, and one queued onto the original at
 # teardown.
-for line in "Docker daemon ready after restart" "Queued a Docker daemon restart onto its restored daemon.json"; do
+for line in "Docker daemon ready after restart" "Queued a Docker daemon restart off cargowall's daemon.json rewrite"; do
   grep -q "$line" "$log" \
     || { echo "::error::cargowall never logged \"$line\" $when"; tail -30 "$log"; exit 1; }
 done

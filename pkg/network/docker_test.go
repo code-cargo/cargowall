@@ -254,6 +254,53 @@ func TestDaemonConfig_RestoreRestartsADaemonOnALeftover(t *testing.T) {
 	})
 }
 
+// restore queues the restart only while daemon.json no longer holds the
+// rewrite: when restoreFiles fails after putting the original back, it still
+// restarts the daemon and reports the failure, and when it fails before
+// that, a restart would only bring the rewrite back up. A daemon.json the
+// job changed since the rewrite is left alone and restarted onto.
+func TestDaemonConfig_RestoreRestartsOffTheRewriteOnly(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	applied := func(t *testing.T, original string) (*daemonConfig, *[]string, string) {
+		c, restarts := newTestDaemonConfig(t)
+		if original != "" {
+			require.NoError(t, os.WriteFile(c.path, []byte(original), 0o644))
+		}
+		require.NoError(t, c.configure("169.254.0.53", logger))
+		require.NoError(t, c.restartDaemon(logger))
+		rewrite, err := os.ReadFile(c.path)
+		require.NoError(t, err)
+		return c, restarts, string(rewrite)
+	}
+
+	t.Run("cleanup fails after the original is back", func(t *testing.T) {
+		c, restarts, rewrite := applied(t, "")
+		// The absent marker can't be removed, after daemon.json already was.
+		require.NoError(t, os.Remove(c.absent))
+		require.NoError(t, os.MkdirAll(filepath.Join(c.absent, "busy"), 0o755))
+		require.Error(t, c.restore(logger))
+		requireNotExist(t, c.path)
+		require.Equal(t, []string{rewrite, queued("")}, *restarts)
+	})
+	t.Run("restore fails before the original is back", func(t *testing.T) {
+		c, restarts, rewrite := applied(t, `{"log-driver": "json-file"}`)
+		// The backup can't be read.
+		require.NoError(t, os.Remove(c.backup))
+		require.NoError(t, os.Mkdir(c.backup, 0o755))
+		require.Error(t, c.restore(logger))
+		requireContent(t, c.path, []byte(rewrite))
+		require.Equal(t, []string{rewrite}, *restarts, "a restart would bring the rewrite back up")
+	})
+	t.Run("daemon.json changed since the rewrite", func(t *testing.T) {
+		c, restarts, rewrite := applied(t, `{"log-driver": "json-file"}`)
+		installed := `{"registry-mirrors": ["https://mirror.example"]}`
+		require.NoError(t, os.WriteFile(c.path, []byte(installed), 0o644))
+		require.NoError(t, c.restore(logger))
+		requireContent(t, c.path, []byte(installed))
+		require.Equal(t, []string{rewrite, queued(installed)}, *restarts)
+	})
+}
+
 // Once teardown has begun, restore has seen to the daemon: a restart startup
 // reaches afterwards would only stop its containers again.
 func TestDaemonConfig_RestartAfterRestoreSkipped(t *testing.T) {
@@ -308,9 +355,10 @@ func TestDaemonConfig_RestoreDoesNotWaitOnARunningRestart(t *testing.T) {
 
 // The restart onto the rewrite runs in startup, and a second signal can run
 // the restore on another goroutine meanwhile. Whichever gets there first, the
-// daemon comes up last on the original: a restore first leaves the restart
-// applying the original, and a restart first is followed by restore's own.
-// (systemd re-runs a restart that is still running when another is queued.)
+// daemon ends on the original: a restore first leaves a daemon that never ran
+// the rewrite, and no restart at all, and a restart first is followed by
+// restore's own. (systemd re-runs a restart that is still running when
+// another is queued.)
 func TestDaemonConfig_ConcurrentRestartAndRestoreEndOnOriginal(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	original := `{"log-driver": "json-file"}`
@@ -327,9 +375,9 @@ func TestDaemonConfig_ConcurrentRestartAndRestoreEndOnOriginal(t *testing.T) {
 		_ = c.restartDaemon(logger)
 		<-done
 		requireContent(t, c.path, []byte(original))
-		require.NotEmpty(t, *restarts)
-		last := (*restarts)[len(*restarts)-1]
-		require.Contains(t, []string{original, queued(original)}, last)
+		if n := len(*restarts); n > 0 {
+			require.Equal(t, queued(original), (*restarts)[n-1])
+		}
 	}
 }
 

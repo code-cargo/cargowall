@@ -120,11 +120,15 @@ func startDockerDNS(cmd *StartCmd, dnsServer *dns.Server, dockerd podenv.Dockerd
 // daemon.json; the caller defers it. It is registered before the rewrite,
 // so a signal landing mid-write still has one: the second-signal path runs
 // it on another goroutine, and pkg/network serializes the two, so it either
-// undoes a finished rewrite or stops one from starting. A daemon still to
-// come up (podenv.Dockerd.Pending) is left alone, a previous run's leftover
-// in its daemon.json included: no restart is due for it (see dockerUp). On
-// a host with no Docker (noDocker), a listener the proxy could not bind
-// costs nothing, and an Info says so in place of the warning. Nil-safe.
+// undoes a finished rewrite or stops one from starting. A local daemon gets
+// it beside an unbound listener too, before a previous run's leftover is
+// undone: the daemon runs that leftover until startup's restart, and a
+// teardown that comes first restarts it (network.RestoreDockerDNS). A
+// daemon still to come up (podenv.Dockerd.Pending) is left alone, a
+// previous run's leftover in its daemon.json included: no restart is due
+// for it (see dockerUp). On a host with no Docker (noDocker), a listener the
+// proxy could not bind costs nothing, and an Info says so in place of the
+// warning. Nil-safe.
 func (d *dockerDNS) useListener(teardowns *teardownList, redirect bool) func() {
 	if d == nil {
 		return func() {}
@@ -136,11 +140,15 @@ func (d *dockerDNS) useListener(teardowns *teardownList, redirect bool) func() {
 		d.unheldWithoutDocker(redirect)
 	}
 	if err := d.listenerErr(network.ContainerDNSIPv4); err != nil {
+		undo := func() {}
+		if local {
+			undo = d.restoreUndo(teardowns)
+		}
 		if !d.noDocker() {
 			d.logger.Warn(unboundListener(local, local && d.recoverLeftover(), redirect, d.listeningIPv6() != ""),
 				"addr", listen, "error", err)
 		}
-		return func() {}
+		return undo
 	}
 	d.logger.Info("Docker DNS interception enabled", "listen", listen,
 		"listen_ipv6", containerListenAddr(network.ContainerDNSIPv6), "ipv6_bound", d.listeningIPv6() != "")
@@ -152,17 +160,23 @@ func (d *dockerDNS) useListener(teardowns *teardownList, redirect bool) func() {
 			"only through the DNS redirect or by naming its listener", "dockerd", d.dockerd.Kind.String(), "reason", d.dockerd.Reason)
 		return func() {}
 	}
-	undo := teardowns.add(func() {
-		if err := d.restore(d.logger); err != nil {
-			d.logger.Warn("Failed to restore Docker DNS", "error", err)
-		}
-	})
+	undo := d.restoreUndo(teardowns)
 	if err := d.configure(d.listeningIP(), d.logger); err != nil {
 		d.logger.Warn("Failed to configure Docker DNS", "error", err)
 		return undo
 	}
 	d.restart = true
 	return undo
+}
+
+// restoreUndo registers the undo that restores daemon.json and restarts a
+// daemon that may run a rewrite, and returns it for the caller to defer.
+func (d *dockerDNS) restoreUndo(teardowns *teardownList) func() {
+	return teardowns.add(func() {
+		if err := d.restore(d.logger); err != nil {
+			d.logger.Warn("Failed to restore Docker DNS", "error", err)
+		}
+	})
 }
 
 // recoverLeftover undoes the daemon.json rewrite a run that did not shut

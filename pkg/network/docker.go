@@ -255,19 +255,21 @@ func (c *daemonConfig) restore(logger *slog.Logger) error {
 	// listener, which goes with cargowall, until it restarts: a reload does
 	// not undo it, and with no "dns" in daemon.json leaves the daemon handing
 	// its containers an empty nameserver. That holds when restoreFiles fails
-	// after putting the original back, and when a previous run's rewrite was
-	// undone earlier in this run, so restore finds nothing of its own; a
-	// daemon.json that still holds the rewrite has nothing to restart onto.
+	// after putting the original back, when a previous run's rewrite was
+	// undone earlier in this run, so restore finds nothing of its own, and
+	// when daemon.json was changed since the rewrite, which restoreFiles
+	// leaves alone and the restart then applies. A daemon.json that still
+	// holds the rewrite has nothing to restart onto.
 	// The restart is only queued: a teardown, forced ones included, does not
 	// wait on the daemon, and systemd finishes the restart after cargowall
 	// has gone. One queued while startup's restart still runs makes systemd
 	// run that one again, so the daemon comes up on the original either way.
 	if c.applied && !c.holdsRewrite() {
 		if err := c.queueRestart(logger); err != nil {
-			logger.Warn("Failed to queue a Docker daemon restart onto its restored daemon.json; "+
+			logger.Warn("Failed to queue a Docker daemon restart off cargowall's daemon.json rewrite; "+
 				"its containers resolve through an address cargowall no longer serves until it restarts", "error", err)
 		} else {
-			logger.Info("Queued a Docker daemon restart onto its restored daemon.json")
+			logger.Info("Queued a Docker daemon restart off cargowall's daemon.json rewrite")
 		}
 	}
 	return err

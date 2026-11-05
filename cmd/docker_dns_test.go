@@ -86,14 +86,15 @@ func TestStartDockerDNS(t *testing.T) {
 // what it rewrote, how many undos were registered when it did, how often a
 // previous run's leftover was looked for, and its log.
 type useListenerRun struct {
-	configured  []string
-	undosBefore int
-	restored    int
-	recoveries  int
-	undo        func()
-	d           *dockerDNS
-	teardowns   *teardownList
-	log         string
+	configured      []string
+	undosBefore     int
+	undosAtRecovery int
+	restored        int
+	recoveries      int
+	undo            func()
+	d               *dockerDNS
+	teardowns       *teardownList
+	log             string
 }
 
 // runUseListener runs useListener for an answering daemon of the given kind
@@ -118,6 +119,7 @@ func runUseListenerFor(dockerd podenv.Dockerd, errs bindErrs, redirect, leftover
 		restore: func(*slog.Logger) error { run.restored++; return nil },
 		recover: func(*slog.Logger) (bool, error) {
 			run.recoveries++
+			run.undosAtRecovery = len(run.teardowns.fns)
 			return leftover, nil
 		},
 		logger: slog.New(slog.NewTextHandler(&buf, nil)),
@@ -156,7 +158,10 @@ func TestDockerDNS_UseListenerBound(t *testing.T) {
 }
 
 // An IPv4 listener the proxy could not bind is pointed at by nothing:
-// daemon.json is not rewritten, so there is nothing to undo. It warns,
+// daemon.json is not rewritten. A local daemon's restore is registered all
+// the same, before its leftover is looked for, since the daemon runs an
+// undone leftover until startup's restart and a teardown that comes first
+// must restart it; a foreign daemon has nothing to undo. It warns,
 // whatever the redirect, saying containers resolve around the proxy, and
 // that this loses the dns-redirect posture only when the redirect is
 // requested. A local daemon's daemon.json is still rid of a rewrite a
@@ -179,7 +184,14 @@ func TestDockerDNS_UseListenerUnbound(t *testing.T) {
 						run := runUseListener(kind, refused, redirect, leftover)
 						local := kind == podenv.DockerdLocal
 						assert.Empty(t, run.configured, "nothing may point containers at an address the proxy does not hold")
-						assert.Empty(t, run.teardowns.fns)
+						if local {
+							require.Len(t, run.teardowns.fns, 1)
+							assert.Equal(t, 1, run.undosAtRecovery, "the restore must be registered before the leftover is undone")
+							run.undo()
+							assert.Equal(t, 1, run.restored)
+						} else {
+							assert.Empty(t, run.teardowns.fns)
+						}
 						assert.Equal(t, local, run.recoveries == 1, "a local daemon's leftover is looked for, and only a local one's")
 						assert.Equal(t, local && leftover, run.d.restart, "a restart is due only to apply an undone leftover")
 						require.Equal(t, 1, strings.Count(run.log, "level=WARN"), run.log)
@@ -270,6 +282,7 @@ func TestDockerDNS_RecoverLeftoverFails(t *testing.T) {
 	d := &dockerDNS{
 		dockerd: podenv.Dockerd{Kind: podenv.DockerdLocal, Answers: true},
 		proxy:   bindErrs{listen4: errRefused4},
+		restore: func(*slog.Logger) error { return nil },
 		recover: func(*slog.Logger) (bool, error) { return false, fmt.Errorf("read-only /etc/docker") },
 		logger:  slog.New(slog.NewTextHandler(&buf, nil)),
 	}

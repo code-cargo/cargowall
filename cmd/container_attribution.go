@@ -65,6 +65,7 @@ type containerAttribution struct {
 	enricher    *containers.Enricher
 	tracker     *containers.Tracker // nil until startUserspace succeeds
 	postures    *postureLedger      // decides what losing the posture means
+	scope       scopeDecision       // the daemon's rules, left for it to decide once it answers
 	logger      *slog.Logger
 }
 
@@ -95,18 +96,20 @@ func resolveMode(containerEgress string) origin.Mode {
 // the observer's ordinals would always be zero, and the step-map shrink for
 // disabled attribution makes container tagging meaningless anyway. stepErr
 // is why step attribution failed, carried into the lost posture's reason.
-// scope and scopeErr are podenv.Shape.HookScope's one decision. scopeErr,
-// when set, is why a hook at /sys/fs/cgroup would not judge exactly this
+// shape decides the hook's scope (podenv.Shape.HookScopeOrPending). A
+// refusal is why a hook at /sys/fs/cgroup would not judge exactly this
 // job's traffic, or why that could not be shown: the hook is then never
 // loaded, the same loss as a load failure. A Limited scope means the hook
 // may judge only this job's sockets, under the job's cgroup (its pod's, or
 // its own container's) or in the cgroups our pid namespace's tasks have
 // entered, which origin.Start
 // records before it attaches; a failure to record them is the same loss,
-// never a hook that judges every socket under a shared root. A non-nil
-// error means a requested enforce posture was lost and startup must fail.
+// never a hook that judges every socket under a shared root. A daemon still
+// to come up leaves its rules to decide once it answers (scopeDecision): the
+// hook loads now, with the scope every other rule gives. A non-nil error
+// means a requested enforce posture was lost and startup must fail.
 func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.Tracker, stepErr error,
-	scope podenv.Scope, scopeErr error, tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
+	shape podenv.Shape, tcObjs *bpf.TcBpfObjects, p *postureLedger, logger *slog.Logger,
 ) (*containerAttribution, error) {
 	if !enabled {
 		return nil, nil
@@ -126,9 +129,9 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		logger:      logger,
 	}
 	var obs *origin.Observer
-	err := scopeErr
+	scope, pending, err := shape.HookScopeOrPending()
 	if err == nil {
-		obs, err = origin.Start(tcObjs, scope, logger)
+		obs, err = startObserver(tcObjs, scope, logger)
 	}
 	if err != nil {
 		// Fatal under enforce. Under observe only the hook is lost: the
@@ -143,10 +146,15 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		return a, nil
 	}
 	a.observer = obs
+	a.scope = scopeDecision{shape: shape, pending: pending}
 	logger.Info("Container egress hook attached", "target_mode", mode.String(),
-		"scoped", scope.Limited(), "subtree", scope.Subtree)
+		"scoped", scope.Limited(), "subtree", scope.Subtree, "docker_pending", pending)
 	return a, nil
 }
+
+// startObserver loads and attaches the hook (origin.Start), or a test's
+// stand-in.
+var startObserver = origin.Start
 
 // wireVerdicts routes the cgroup hook's verdicts into the shared
 // post-verdict pipeline in pkg/events — the same one TC events flow
@@ -400,9 +408,9 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 			"bridges_error", docker.dockerd.BridgesErr)
 		return false
 	}
-	ctr, err := containers.Start(ctx, containers.Options{
+	ctr, err := startTracker(ctx, containers.Options{
 		AllowLocalSubnet: a.subnetCarver(a.allowLocalNetwork),
-		OnConnect:        docker.connected,
+		OnConnect:        a.onConnect(docker),
 	}, a.stepTracker, a.observer, auditLogger, a.logger)
 	if err != nil {
 		a.logger.Warn("Container attribution disabled", "error", err)
@@ -419,12 +427,27 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 	return true
 }
 
-// Close stops the tracker before the observer: the tracker's shutdown
-// telemetry summary reads the observer's record counter.
+// startTracker starts docker-events tracking (containers.Start), or a
+// test's stand-in.
+var startTracker = containers.Start
+
+// onConnect is the tracker's Options.OnConnect: each connect is docker's to
+// log as an arrival, and the daemon's answer for the scope's decision.
+func (a *containerAttribution) onConnect(docker *dockerUp) func(first bool, carved []netip.Prefix) {
+	return func(first bool, carved []netip.Prefix) {
+		docker.connected(first, carved)
+		a.daemonAnswered()
+	}
+}
+
+// Close settles the scope's decision, then stops the tracker before the
+// observer: the tracker's shutdown telemetry summary reads the observer's
+// record counter.
 func (a *containerAttribution) Close() {
 	if a == nil {
 		return
 	}
+	a.closeScope()
 	if a.tracker != nil {
 		a.tracker.Close()
 	}

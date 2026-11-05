@@ -76,6 +76,10 @@ type StartCmd struct {
 	// failure sentinel and the exit status (see exitRefused). Unexported:
 	// internal state, not a flag.
 	refusedPosture string
+	// refusedLate names the fail-closed posture lost after startup, set by
+	// postureLedger.loseLate: the failure sentinel names it when the loss
+	// is decided, and the exit status at shutdown is exitRefused.
+	refusedLate string
 
 	// Configuration
 	Config    string `help:"Path to configuration file" default:"/etc/cargowall/config.json" env:"CARGOWALL_CONFIG"`

@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -155,19 +156,28 @@ func TestPostures_EnforceRungUnderAuditPolicyIsNotFatal(t *testing.T) {
 	}
 }
 
-// Only a refused posture changes the exit status; the error itself, its
-// message and its chain, is what startup returned.
+// Only a refused posture changes the exit status: a startup refused for
+// one, where the error itself, its message and its chain, is what startup
+// returned, and a run that stopped cleanly once a fail-closed posture was
+// lost after startup, whose error names it.
 func TestRefusalExit(t *testing.T) {
-	assert.NoError(t, refusalExit(nil, postureTLSSNI))
+	assert.NoError(t, refusalExit(nil, &StartCmd{refusedPosture: postureTLSSNI}))
 	plain := errors.New("failed to attach TC program")
-	assert.Same(t, plain, refusalExit(plain, ""), "any other failure keeps kong's exit status 1")
+	assert.Same(t, plain, refusalExit(plain, &StartCmd{}), "any other failure keeps kong's exit status 1")
 
-	err := refusalExit(plain, postureDNSRedirect)
+	err := refusalExit(plain, &StartCmd{refusedPosture: postureDNSRedirect})
 	var coder interface{ ExitCode() int }
 	require.ErrorAs(t, fmt.Errorf("run: %w", err), &coder, "kong finds the status through wrapping")
 	assert.Equal(t, exitRefused, coder.ExitCode())
 	assert.ErrorIs(t, err, plain)
 	assert.EqualError(t, err, plain.Error())
+
+	late := refusalExit(nil, &StartCmd{refusedLate: postureContainerEgress})
+	require.ErrorAs(t, late, &coder)
+	assert.Equal(t, exitRefused, coder.ExitCode())
+	assert.ErrorContains(t, late, "--container-egress could not be applied, decided after startup")
+	assert.Same(t, plain, refusalExit(plain, &StartCmd{refusedLate: postureContainerEgress}),
+		"a failed run's own error decides its status")
 }
 
 // The action reads a refused= line only in this shape (sentinelRefusal in
@@ -256,19 +266,117 @@ func TestPostures_LockdownLossIsNotFatal(t *testing.T) {
 	assert.Empty(t, cmd.refusedPosture, "lockdown fails the job itself")
 }
 
+// A loss decided after startup never fails: the job is already running.
+// It is recorded at the layer's off rung, the first reason kept, as an
+// Error for a fail-closed rung (enforce under an enforcing policy, in
+// policy lockdown too) and a Warn for one that is not (the enforce rung
+// under an auditing policy), and the record is rewritten for the summary.
+// Startup is never refused for it, but a fail-closed rung's loss is named
+// as refused, in the failure sentinel, written then, and so for the exit
+// status; in policy lockdown, which has failed the job already, it is not.
+func TestPostures_LoseLate(t *testing.T) {
+	const reason = "the daemon's runtime is outside our pid namespace"
+	for _, c := range []struct {
+		name                string
+		enforcing, lockdown bool
+		level               string
+		refused             bool
+	}{
+		{name: "enforce", enforcing: true, level: "ERROR", refused: true},
+		{name: "enforce rung under an auditing policy", level: "WARN"},
+		{name: "enforce in policy lockdown", enforcing: true, lockdown: true, level: "ERROR"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			redirectStateFiles(t)
+			var buf bytes.Buffer
+			failed := filepath.Join(t.TempDir(), "failed")
+			cmd := &StartCmd{ContainerEgress: ContainerEgressEnforce, policyLockdown: c.lockdown, FailureFile: failed}
+			p := newPostures(cmd, "6.6.141", c.enforcing, slog.New(slog.NewTextHandler(&buf, nil)))
+			p.write()
+			require.Len(t, readPostures(), 1)
+			assert.False(t, readPostures()[0].degraded())
+
+			assert.NotPanics(t, func() { p.loseLate(postureContainerEgress, reason) })
+			assert.Contains(t, buf.String(),
+				"level="+c.level+` msg="--container-egress=enforce requested but could not be applied, decided after startup"`)
+			assert.Equal(t, 1, strings.Count(buf.String(), "level="), buf.String())
+			assert.Empty(t, cmd.refusedPosture, "a loss after startup refuses no startup")
+			_, err := os.Stat(failed)
+			if c.refused {
+				assert.Equal(t, postureContainerEgress, cmd.refusedLate)
+				assert.NoError(t, err, "the failure sentinel names the refusal")
+			} else {
+				assert.Empty(t, cmd.refusedLate)
+				assert.ErrorIs(t, err, os.ErrNotExist)
+			}
+			want := []postureLine{{Posture: postureContainerEgress, Requested: "enforce", Applied: "off", Reason: reason}}
+			assert.Equal(t, want, readPostures(), "the record is rewritten")
+
+			p.loseLate(postureContainerEgress, "a second reason")
+			assert.Equal(t, want, readPostures(), "the first reason is kept")
+		})
+	}
+}
+
+// Startup publishes the record only once both raises succeed, so a loss
+// decided before then changes only the ledger, and startup's write carries
+// it. A layer never requested has nothing to lose, and says nothing.
+func TestPostures_LoseLateBeforePublished(t *testing.T) {
+	redirectStateFiles(t)
+	p, buf := ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
+	p.loseLate(postureContainerEgress, "the hook's scope")
+	_, err := os.Stat(posturesFile)
+	assert.ErrorIs(t, err, os.ErrNotExist, "nothing published before startup does")
+	p.write()
+	require.Len(t, readPostures(), 1)
+	assert.Equal(t, "off", readPostures()[0].Applied)
+
+	buf.Reset()
+	p.loseLate(postureTLSSNI, "never requested")
+	assert.Empty(t, buf.String())
+	assert.Len(t, readPostures(), 1)
+}
+
+// Late losses and startup's write race safely, and the record left is the
+// ledger's last state: no write marshalled before a loss lands after it.
+func TestPostures_LoseLateConcurrent(t *testing.T) {
+	redirectStateFiles(t)
+	cmd := &StartCmd{ContainerEgress: ContainerEgressObserve, TLSSNI: TLSSNIObserve, DNSRedirect: true}
+	p := newPostures(cmd, "6.6.141", true, slog.New(slog.DiscardHandler))
+	var wg sync.WaitGroup
+	for _, posture := range []string{postureContainerEgress, postureTLSSNI, postureDNSRedirect} {
+		wg.Add(2)
+		go func() { defer wg.Done(); p.loseLate(posture, "late") }()
+		go func() { defer wg.Done(); p.write(); _ = p.lines() }()
+	}
+	wg.Wait()
+	recs := readPostures()
+	require.Len(t, recs, 3)
+	for _, r := range recs {
+		assert.True(t, r.degraded(), "%s is recorded as lost", r.Posture)
+	}
+}
+
+// runnerVM is a shape whose hook judges the whole machine, a runner VM's,
+// and reads nothing of the daemon's.
+var runnerVM = podenv.Shape{
+	CgroupNS: podenv.CgroupNSHost, PidNS: podenv.PidNSHost, CgroupPath: "/system.slice/runner.service",
+	CgroupMount: podenv.CgroupMountOurs,
+}
+
 // Without step attribution the hook never starts: fatal under enforce, a
 // recorded warning under observe. The reason carries why.
 func TestPostures_ContainerAttributionWithoutStepTracker(t *testing.T) {
 	stepErr := errors.New("kernel BTF not found\nsecond line")
 
 	p, _ := ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
-	a, err := newContainerAttribution(true, origin.ModeEnforce, nil, stepErr, podenv.Scope{}, nil, nil, p, p.logger)
+	a, err := newContainerAttribution(true, origin.ModeEnforce, nil, stepErr, runnerVM, nil, p, p.logger)
 	assert.Nil(t, a)
 	assert.EqualError(t, err, "--container-egress=enforce requested but could not be applied: "+
 		"step attribution unavailable: kernel BTF not found")
 
 	p, _ = ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
-	a, err = newContainerAttribution(true, origin.ModeShadow, nil, stepErr, podenv.Scope{}, nil, nil, p, p.logger)
+	a, err = newContainerAttribution(true, origin.ModeShadow, nil, stepErr, runnerVM, nil, p, p.logger)
 	assert.Nil(t, a)
 	require.NoError(t, err)
 	assert.Equal(t, "step attribution unavailable: kernel BTF not found", p.layers[0].Reason)
@@ -282,7 +390,7 @@ func TestPostures_ContainerAttributionWithoutStepTracker(t *testing.T) {
 // which stands in for a verifier rejection here.)
 func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
 	p, buf := ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
-	a, err := newContainerAttribution(true, origin.ModeShadow, &steps.Tracker{}, nil, podenv.Scope{}, nil, nil, p, p.logger)
+	a, err := newContainerAttribution(true, origin.ModeShadow, &steps.Tracker{}, nil, runnerVM, nil, p, p.logger)
 	require.NoError(t, err)
 	require.NotNil(t, a, "docker tracking does not need the hook")
 	assert.Nil(t, a.originObserver())
@@ -305,7 +413,7 @@ func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
 	a.Close()
 
 	p, _ = ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
-	a, err = newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, podenv.Scope{}, nil, nil, p, p.logger)
+	a, err = newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, runnerVM, nil, p, p.logger)
 	assert.Nil(t, a)
 	assert.EqualError(t, err, "--container-egress=enforce requested but could not be applied: nil TC BPF objects")
 }
@@ -316,15 +424,18 @@ func TestPostures_ContainerAttributionHookLoadFailure(t *testing.T) {
 // prove origin.Start was never reached: it would have recorded their
 // refusal instead.
 func TestPostures_ContainerAttributionHookScope(t *testing.T) {
-	scope := errors.New("the cgroup hook would attach at the node root")
+	nodeRoot := runnerVM
+	nodeRoot.CgroupPath = "/kubepods/besteffort/pod0e4b1f2a-7c3d-4e5f-8a9b-0c1d2e3f4a5b/0123abcd"
+	_, _, scope := nodeRoot.HookScopeOrPending()
+	require.ErrorContains(t, scope, "the cgroup hook would attach at the node root")
 
 	p, _ := ledgerWithLog(t, ContainerEgressEnforce, TLSSNIOff)
-	a, err := newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, podenv.Scope{}, scope, nil, p, p.logger)
+	a, err := newContainerAttribution(true, origin.ModeEnforce, &steps.Tracker{}, nil, nodeRoot, nil, p, p.logger)
 	assert.Nil(t, a)
 	assert.EqualError(t, err, "--container-egress=enforce requested but could not be applied: "+scope.Error())
 
 	p, _ = ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)
-	a, err = newContainerAttribution(true, origin.ModeShadow, &steps.Tracker{}, nil, podenv.Scope{}, scope, nil, p, p.logger)
+	a, err = newContainerAttribution(true, origin.ModeShadow, &steps.Tracker{}, nil, nodeRoot, nil, p, p.logger)
 	require.NoError(t, err)
 	require.NotNil(t, a, "docker tracking does not need the hook")
 	assert.Nil(t, a.originObserver())

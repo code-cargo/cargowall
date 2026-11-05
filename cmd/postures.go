@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 )
@@ -103,13 +104,25 @@ type postureLayer struct {
 // it means. Only layers requested above off are tracked: an off layer
 // promised nothing. Not nil-safe on purpose — the ledger is what turns a lost
 // enforce rung into a failed start, and a missing one must not quietly
-// degrade instead.
+// degrade instead. Safe for use from more than one goroutine: a loss can be
+// decided after startup (loseLate).
 type postureLedger struct {
-	layers   []postureLayer
 	kernel   string  // uname release, for verifier reasons: the budget is per-kernel
 	lockdown bool    // policy lockdown: no loss fails startup
 	refused  *string // StartCmd.refusedPosture: where a fatal loss names its posture
-	logger   *slog.Logger
+	// refusedLate is StartCmd.refusedLate, where a fail-closed loss after
+	// startup names its posture, and failureFile StartCmd.FailureFile,
+	// the sentinel that says so when it is decided (loseLate).
+	refusedLate *string
+	failureFile string
+	logger      *slog.Logger
+
+	mu     sync.Mutex
+	layers []postureLayer
+	// published is whether write has run: a loss decided after startup
+	// rewrites the record only once there is one, since startup publishes
+	// it only once both raises succeed.
+	published bool
 }
 
 // newPostures registers each layer against its OWN flag's constants: the
@@ -119,7 +132,10 @@ type postureLedger struct {
 // and the redirect matter to what is allowed. The redirect only does
 // anything while DNS tracking runs.
 func newPostures(cmd *StartCmd, kernel string, enforcing bool, logger *slog.Logger) *postureLedger {
-	p := &postureLedger{kernel: kernel, lockdown: cmd.policyLockdown, refused: &cmd.refusedPosture, logger: logger}
+	p := &postureLedger{
+		kernel: kernel, lockdown: cmd.policyLockdown, refused: &cmd.refusedPosture,
+		refusedLate: &cmd.refusedLate, failureFile: cmd.FailureFile, logger: logger,
+	}
 	p.register(postureContainerEgress, cmd.ContainerEgress, ContainerEgressOff,
 		enforcing && cmd.ContainerEgress == ContainerEgressEnforce)
 	p.register(postureTLSSNI, cmd.TLSSNI, TLSSNIOff,
@@ -154,6 +170,13 @@ func (p *postureLedger) find(posture string) *postureLayer {
 
 // lines is what write publishes.
 func (p *postureLedger) lines() []postureLine {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.linesLocked()
+}
+
+// linesLocked is lines, with mu held.
+func (p *postureLedger) linesLocked() []postureLine {
 	out := make([]postureLine, len(p.layers))
 	for i, l := range p.layers {
 		out[i] = l.postureLine
@@ -184,6 +207,8 @@ func (p *postureLedger) lose(posture, reason string) error {
 // but not for the host's IPv6. What it costs is lose's: a requirement met in
 // part is not met.
 func (p *postureLedger) loseTo(posture, applied, reason string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	r := p.find(posture)
 	if r == nil {
 		return nil // never requested: nothing was promised
@@ -214,6 +239,51 @@ func (p *postureLedger) loseTo(posture, applied, reason string) error {
 	return nil
 }
 
+// loseLate reports that posture was lost once startup had finished, as a
+// decision made mid-job can lose it. It is recorded as lose records it, at
+// the layer's off rung with the first reason kept, but it never fails: the
+// job is already running, and its steps are past refusing. A fail-closed
+// rung's loss is an Error, any other a Warn, as at startup, and the record
+// is rewritten for the summary once startup has published it; before that,
+// startup's write carries it. A fail-closed rung's loss is a refusal all
+// the same, only too late to refuse startup: it is named as one where a
+// refused startup is, in the failure sentinel, written now with the reason,
+// and the exit status at shutdown (refusalExit), so that the job can still
+// fail on it. Policy lockdown has already failed the job, and names none.
+// The caller decides only once startup is done, or the sentinel would beat
+// the ready one to a reader waiting on either.
+func (p *postureLedger) loseLate(posture, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r := p.find(posture)
+	if r == nil {
+		return // never requested: nothing was promised
+	}
+	if !r.degraded() {
+		r.Applied = r.off
+		r.Reason = truncateReason(reason)
+	}
+	msg := fmt.Sprintf("--%s=%s requested but could not be applied, decided after startup", posture, r.Requested)
+	if r.failClosed {
+		p.logger.Error(msg, "reason", reason)
+	} else {
+		p.logger.Warn(msg, "reason", reason)
+	}
+	if p.published {
+		p.writeLocked()
+	}
+	if !r.failClosed || p.lockdown || *p.refusedLate != "" {
+		return
+	}
+	*p.refusedLate = posture
+	if p.failureFile == "" {
+		return
+	}
+	if err := writeFailureSentinel(p.failureFile, "cargowall: "+msg+": "+reason, posture); err != nil {
+		p.logger.Warn("Failed to write failure sentinel", "path", p.failureFile, "error", err)
+	}
+}
+
 // exitRefused is `cargowall start`'s exit status when startup failed on a
 // refused posture. The failure sentinel names the posture too (see
 // writeFailureSentinel); the status is the channel that needs no file, for
@@ -232,12 +302,16 @@ func (refusalError) ExitCode() int { return exitRefused }
 func (e refusalError) Unwrap() error { return e.error }
 
 // refusalExit is err as StartCargoWall returns it: carrying exitRefused
-// when refused names a posture.
-func refusalExit(err error, refused string) error {
-	if err == nil || refused == "" {
-		return err
+// when startup was refused for a posture, and, for a run that stopped
+// cleanly, when a fail-closed posture was lost after startup (loseLate).
+func refusalExit(err error, cmd *StartCmd) error {
+	switch {
+	case err != nil && cmd.refusedPosture != "":
+		return refusalError{err}
+	case err == nil && cmd.refusedLate != "":
+		return refusalError{fmt.Errorf("--%s could not be applied, decided after startup (see the failure sentinel)", cmd.refusedLate)}
 	}
-	return refusalError{err}
+	return err
 }
 
 // errReason condenses a failure into a posture reason. A verifier rejection
@@ -257,8 +331,19 @@ func (p *postureLedger) errReason(err error) string {
 
 // write publishes the record for the summary step. Best-effort like the
 // mode file: a failed write only costs the summary its Postures block.
+// Held under mu throughout, so of two writes the later one's record is
+// the one left: a loss decided after startup is never overwritten by a
+// record marshalled before it.
 func (p *postureLedger) write() {
-	data, err := json.Marshal(p.lines())
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.writeLocked()
+}
+
+// writeLocked is write, with mu held.
+func (p *postureLedger) writeLocked() {
+	p.published = true
+	data, err := json.Marshal(p.linesLocked())
 	if err == nil {
 		err = writeSentinel(posturesFile, data)
 	}

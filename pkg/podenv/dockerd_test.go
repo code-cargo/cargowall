@@ -354,8 +354,12 @@ func TestServingPid(t *testing.T) {
 	if got, err := servingPid(conn.(*net.UnixConn)); err != nil || got != server {
 		t.Errorf("servingPid = %d, %v; want the stand-in serving it, %d", got, err, server)
 	}
-	if d := probeDockerd(sock, true); d.Kind != DockerdLocal || d.pid != server {
-		t.Errorf("probeDockerd = %+v, want the stand-in %d, local", d, server)
+	if d := probeDockerd(sock); d.Kind != DockerdLocal {
+		t.Errorf("probeDockerd = %+v, want local, by the listener", d)
+	}
+	var d Dockerd
+	if d.probeServer(sock); d.pid != server {
+		t.Errorf("probeServer: pid %d (%s), want the stand-in %d", d.pid, d.Reason, server)
 	}
 	if os.Geteuid() != 0 {
 		return
@@ -368,8 +372,42 @@ func TestServingPid(t *testing.T) {
 	}
 	apart := standInWith(t, &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}, "dockerd", "serve", nil, private)
 	private.Close()
-	if d := probeDockerd(sock, true); d.Kind != DockerdLocal || (d.pid != server && d.pid != apart) {
+	if d := probeDockerd(sock); d.Kind != DockerdLocal {
 		t.Errorf("served from a mount namespace of its own: probeDockerd = %+v, want local, by the listener", d)
+	}
+	d = Dockerd{}
+	if d.probeServer(sock); d.pid != server && d.pid != apart {
+		t.Errorf("served from a mount namespace of its own: pid %d (%s), want a stand-in", d.pid, d.Reason)
+	}
+}
+
+// A server that accepts and never answers is given answerWithin, and no
+// longer: servingPid is asked only of a daemon that has answered the one
+// ping, which answers in milliseconds.
+func TestServingPidGivesUp(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "docker.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		if c, err := l.Accept(); err == nil {
+			<-done
+			c.Close()
+		}
+	}()
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	began := time.Now()
+	_, err = servingPid(conn.(*net.UnixConn))
+	if took := time.Since(began); err == nil || took < answerWithin-100*time.Millisecond || took > answerWithin+time.Second {
+		t.Errorf("silent server: servingPid gave up after %v (%v), want an error after %v", took, err, answerWithin)
 	}
 }
 

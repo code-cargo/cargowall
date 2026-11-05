@@ -114,7 +114,8 @@ type Dockerd struct {
 	Answers bool
 	// pid is the pid, in our pid namespace, of the process serving the
 	// socket, looked for only where the scope reads the daemon's runtime
-	// (probeDockerd), and 0 elsewhere or when it could not be shown.
+	// and once it has answered (probeServer), and 0 elsewhere or when it
+	// could not be shown.
 	pid int32
 	// info is the daemon's GET /info, asked once (askInfo).
 	info    *daemonInfo
@@ -139,14 +140,9 @@ func (d *Dockerd) note(fact string, err error) {
 // the daemon a mount namespace of its own (PrivateTmp) over the same
 // config. A visible pid can still be another container's process once the
 // pod shares one pid namespace, so the mount namespace is the decisive
-// comparison.
-//
-// With findServer, where the scope reads the daemon's runtime, it also
-// finds the process serving the socket (servingPid), the daemon itself
-// whatever made its listener. One that cannot be shown (no unix_diag, a
-// daemon still starting, a connection held by none or by two) leaves no
-// runtime to look for, and the scope refuses.
-func probeDockerd(socket string, findServer bool) Dockerd {
+// comparison. Nothing here waits on the daemon's answer: a listener accepts
+// for a daemon still starting.
+func probeDockerd(socket string) Dockerd {
 	unknown := func(err error) Dockerd { return Dockerd{Kind: DockerdUnknown, Reason: err.Error()} }
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -190,14 +186,30 @@ func probeDockerd(socket string, findServer bool) Dockerd {
 		daemon = Dockerd{Kind: DockerdForeign, Reason: fmt.Sprintf("pid %d has another mount namespace", pid)}
 		daemon.Cgroup, _ = ReadCgroupPath("/proc/" + strconv.Itoa(int(pid)) + "/cgroup")
 	}
-	if findServer {
-		if server, err := servingPid(conn.(*net.UnixConn)); err != nil {
-			daemon.note("the process serving it", err)
-		} else {
-			daemon.pid = server
-		}
-	}
 	return daemon
+}
+
+// probeServer finds the process serving the socket (servingPid), the
+// daemon itself whatever made its listener, over a connection of its own.
+// One that cannot be shown (no unix_diag, a connection held by none or by
+// two) leaves no runtime to look for, and the scope refuses. Asked only of
+// a daemon that has answered (probeDaemon).
+func (d *Dockerd) probeServer(socket string) {
+	ctx, cancel := context.WithTimeout(context.Background(), answerWithin)
+	defer cancel()
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "unix", socket)
+	if err != nil {
+		d.note("the process serving it", err)
+		return
+	}
+	defer conn.Close()
+	server, err := servingPid(conn.(*net.UnixConn))
+	if err != nil {
+		d.note("the process serving it", err)
+		return
+	}
+	d.pid = server
 }
 
 // probeRuntime finds the daemon's runtime (runtimePid), asking the daemon
@@ -439,10 +451,15 @@ func (d *Dockerd) askInfo(socket string) (daemonInfo, error) {
 	return *d.info, d.infoErr
 }
 
-// dockerGet asks the daemon at socket for path, within 2s, and decodes
+// answerWithin is how long a daemon is given for each request asked of it
+// once it has answered the one ping (probeServer, servingPid, dockerGet):
+// one that answers does so in milliseconds.
+const answerWithin = 2 * time.Second
+
+// dockerGet asks the daemon at socket for path, within answerWithin, and decodes
 // its JSON answer into out, unless out is nil.
 func dockerGet(socket, path string, out any) error {
-	return dockerGetWithin(socket, path, out, 2*time.Second)
+	return dockerGetWithin(socket, path, out, answerWithin)
 }
 
 // dockerGetWithin is dockerGet within timeout.
@@ -474,11 +491,11 @@ func dockerGetWithin(socket, path string, out any, timeout time.Duration) error 
 // one holding the connection its listener accepted, found by the inode
 // unix_diag gives as conn's peer, among every process's descriptors. Only
 // a server that has accepted holds it, which its answer shows (GET
-// /_ping), and a socket-activated daemon may be starting, so it is given a
-// while. Whatever serves is the daemon, whatever its name: a podman
-// service, or a stand-in.
+// /_ping), within answerWithin.
+// Whatever serves is the daemon, whatever its name: a podman service, or a
+// stand-in.
 func servingPid(conn *net.UnixConn) (int32, error) {
-	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(answerWithin)); err != nil {
 		return 0, err
 	}
 	req, err := http.NewRequest(http.MethodGet, "http://docker/_ping", nil)

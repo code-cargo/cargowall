@@ -58,7 +58,7 @@ import (
 )
 
 // cgroupAttachPath is where Start attaches the hook: the tree
-// podenv.Shape.HookScope showed this process is in. A test attaches below
+// podenv.Shape.HookScopeOrPending showed this process is in. A test attaches below
 // it, where only its own sockets reach the program.
 var cgroupAttachPath = podenv.CgroupRoot
 
@@ -270,7 +270,7 @@ func (o *Observer) EnableL7(opts L7Options) (*L7, error) {
 // cgroup, and starts the reader. Nothing here can affect enforcement; any
 // error means the caller runs without container attribution.
 //
-// scope is podenv.Shape.HookScope's answer. Limited, the hook judges only
+// scope is podenv.Shape.HookScopeOrPending's answer. Limited, the hook judges only
 // sockets under scope.Subtree and those in the cgroups tasks in our pid
 // namespace have entered, which Start records first (cgroupScope), and every
 // other socket under the root cgroup passes the hook untouched. Otherwise
@@ -399,7 +399,7 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 	// ALLOW_MULTI before anything else. The pre/post program query logged
 	// below is the observational check that nobody was displaced.
 	l, err := link.AttachCgroup(link.CgroupOptions{
-		// The tree podenv.Shape.HookScope showed this process is in: the
+		// The tree podenv.Shape.HookScopeOrPending showed this process is in: the
 		// machine's root in the host cgroup namespace, our container's
 		// subtree in a private one. Every socket under it reaches the
 		// program. Unscoped it judges all of them (a runner VM, or our own

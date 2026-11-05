@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -115,5 +116,19 @@ func TestFlushResolvedCache_Timeout(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("FlushResolvedCache did not honor its timeout")
+	}
+}
+
+// TestContainerDNSRedirectRules: DNS arriving on docker0 or any br-* bridge,
+// over UDP and TCP, is sent to the bridge listener.
+func TestContainerDNSRedirectRules(t *testing.T) {
+	want := [][]string{
+		{"-t", "nat", "-i", "docker0", "-p", "udp", "--dport", "53", "-j", "DNAT", "--to-destination", "172.17.0.1:53"},
+		{"-t", "nat", "-i", "docker0", "-p", "tcp", "--dport", "53", "-j", "DNAT", "--to-destination", "172.17.0.1:53"},
+		{"-t", "nat", "-i", "br-+", "-p", "udp", "--dport", "53", "-j", "DNAT", "--to-destination", "172.17.0.1:53"},
+		{"-t", "nat", "-i", "br-+", "-p", "tcp", "--dport", "53", "-j", "DNAT", "--to-destination", "172.17.0.1:53"},
+	}
+	if got := containerDNSRedirectRules("172.17.0.1"); !slices.EqualFunc(got, want, slices.Equal) {
+		t.Fatalf("containerDNSRedirectRules = %q, want %q", got, want)
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"time"
@@ -45,19 +46,80 @@ var dnsRedirectRules = [][]string{
 	{"-t", "nat", "-p", "tcp", "--dport", "53", "!", "-d", "127.0.0.0/8", "-j", "DNAT", "--to-destination", "127.0.0.1:53"},
 }
 
+// containerDNSRedirectRules are the nat PREROUTING rules that send DNS
+// arriving on docker0 or a user-defined br-* bridge to the proxy's listener
+// at bridgeIP:53.
+//
+// Container DNS is forwarded, not originated here, so the OUTPUT rules never
+// see it. A container that names its own resolver therefore resolves around
+// the proxy: one started with --dns, one given Docker's 8.8.8.8 fallback
+// because the host lists only a loopback resolver, or any container of a
+// docker-in-docker daemon whose daemon.json cargowall cannot rewrite. The
+// addresses such a container resolves are never allowed, so its connections
+// are blocked as bare IPs. DNAT keeps the container's source address, and
+// the answer leaves the listener rewritten back to the resolver the
+// container asked, so the container sees an ordinary reply.
+func containerDNSRedirectRules(bridgeIP string) [][]string {
+	listener := net.JoinHostPort(bridgeIP, "53")
+	var rules [][]string
+	for _, iface := range []string{"docker0", "br-+"} {
+		for _, proto := range []string{"udp", "tcp"} {
+			rules = append(rules, []string{
+				"-t", "nat", "-i", iface, "-p", proto, "--dport", "53",
+				"-j", "DNAT", "--to-destination", listener,
+			})
+		}
+	}
+	return rules
+}
+
 // SetupDNSRedirect adds iptables DNAT rules to redirect all outbound DNS
 // (UDP+TCP port 53) to the local proxy at 127.0.0.1:53.
 // Packets marked with DNSProxyFWMark (the DNS proxy's upstream queries) are exempted.
 func SetupDNSRedirect(logger *slog.Logger) error {
-	for _, rule := range dnsRedirectRules {
-		args := append([]string{"-A", "OUTPUT"}, rule...)
-		cmd := exec.Command("iptables", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("iptables -A OUTPUT %v failed: %w (output: %s)", rule, err, out)
-		}
+	if err := appendRules("OUTPUT", dnsRedirectRules); err != nil {
+		return err
 	}
 	logger.Info("DNS redirect iptables rules installed")
 	return nil
+}
+
+// SetupContainerDNSRedirect adds the iptables DNAT rules that send DNS from
+// containers on docker0 and br-* bridges to the proxy's listener at
+// bridgeIP:53. The caller must already hold that listener: the DNAT hands
+// container DNS to whatever is bound there.
+func SetupContainerDNSRedirect(bridgeIP string, logger *slog.Logger) error {
+	if err := appendRules("PREROUTING", containerDNSRedirectRules(bridgeIP)); err != nil {
+		return err
+	}
+	logger.Info("Container DNS redirect iptables rules installed", "listener", net.JoinHostPort(bridgeIP, "53"))
+	return nil
+}
+
+// appendRules appends each rule to chain, stopping at the first failure.
+// Rules already added stay in place; the caller's teardown removes them.
+func appendRules(chain string, rules [][]string) error {
+	for _, rule := range rules {
+		args := append([]string{"-A", chain}, rule...)
+		if out, err := exec.Command("iptables", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("iptables -A %s %v failed: %w (output: %s)", chain, rule, err, out)
+		}
+	}
+	return nil
+}
+
+// deleteRules deletes each rule from chain, continuing past failures (a rule
+// that was never added is one), and returns the last failure.
+func deleteRules(chain string, rules [][]string, logger *slog.Logger) error {
+	var lastErr error
+	for _, rule := range rules {
+		args := append([]string{"-D", chain}, rule...)
+		if out, err := exec.Command("iptables", args...).CombinedOutput(); err != nil {
+			lastErr = fmt.Errorf("iptables -D %s %v failed: %w (output: %s)", chain, rule, err, out)
+			logger.Warn("Failed to remove DNS redirect rule", "chain", chain, "rule", rule, "error", err)
+		}
+	}
+	return lastErr
 }
 
 // resolvedRuntimeDir exists only while systemd-resolved is running. Its
@@ -133,17 +195,19 @@ func FlushResolvedCache(ctx context.Context, logger *slog.Logger) error {
 
 // TeardownDNSRedirect removes the iptables DNAT rules added by SetupDNSRedirect.
 func TeardownDNSRedirect(logger *slog.Logger) error {
-	var lastErr error
-	for _, rule := range dnsRedirectRules {
-		args := append([]string{"-D", "OUTPUT"}, rule...)
-		cmd := exec.Command("iptables", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			lastErr = fmt.Errorf("iptables -D OUTPUT %v failed: %w (output: %s)", rule, err, out)
-			logger.Warn("Failed to remove DNS redirect rule", "rule", rule, "error", err)
-		}
-	}
-	if lastErr == nil {
+	err := deleteRules("OUTPUT", dnsRedirectRules, logger)
+	if err == nil {
 		logger.Info("DNS redirect iptables rules removed")
 	}
-	return lastErr
+	return err
+}
+
+// TeardownContainerDNSRedirect removes the iptables DNAT rules added by
+// SetupContainerDNSRedirect for the same bridgeIP.
+func TeardownContainerDNSRedirect(bridgeIP string, logger *slog.Logger) error {
+	err := deleteRules("PREROUTING", containerDNSRedirectRules(bridgeIP), logger)
+	if err == nil {
+		logger.Info("Container DNS redirect iptables rules removed")
+	}
+	return err
 }

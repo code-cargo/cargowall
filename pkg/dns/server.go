@@ -48,6 +48,7 @@ type Server struct {
 	// Additional listen addresses (e.g., docker bridge IP for container DNS)
 	additionalAddrs []string
 	servers         []*dns.Server // All running servers
+	binds           listenerBinds // Which listen addresses the proxy holds
 
 	// DNS query filtering (blocks DNS tunneling)
 	filterQueries bool // When true, only forward queries for allowed domains
@@ -294,12 +295,13 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Create and start a server for each address (both UDP and TCP)
 	for _, addr := range allAddrs {
-		for _, proto := range []string{"udp4", "tcp4"} {
+		for _, proto := range listenProtocols {
 			server := &dns.Server{
 				Addr:    addr,
 				Net:     proto,
 				Handler: dns.HandlerFunc(s.handleDNSQuery),
 				NotifyStartedFunc: func() {
+					s.binds.listening(addr)
 					s.logger.Debug("DNS server is now listening", "addr", addr, "proto", proto)
 				},
 			}
@@ -308,6 +310,7 @@ func (s *Server) Start(ctx context.Context) error {
 			// Start server in background
 			go func(srv *dns.Server, address string) {
 				if err := srv.ListenAndServe(); err != nil {
+					s.binds.failed(address, err)
 					s.logger.Error("DNS server error", "error", err, "addr", address)
 				}
 			}(server, addr)

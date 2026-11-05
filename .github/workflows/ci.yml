@@ -21,7 +21,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -56,7 +56,7 @@ jobs:
       id-token: write
       checks: write
     steps:
-      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -95,7 +95,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -157,7 +157,7 @@ jobs:
           echo "Warmed resolver cache for raw.githubusercontent.com"
 
       - name: Start CargoWall via Action
-        uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8
         with:
           mode: enforce
           offline: 'true'
@@ -313,7 +313,7 @@ jobs:
         run: chmod +x bin/cargowall
 
       - name: Start CargoWall via Action
-        uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+        uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8
         with:
           mode: audit
           offline: 'true'
@@ -405,7 +405,7 @@ jobs:
             echo "❌ apt-get should be blocked by sudo lockdown"
             exit 1
           }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required|afraid I can't do that"; then
             echo "✅ Blocked command (apt-get) denied by sudo"
           else
             echo "❌ apt-get failed but not due to sudoers denial: $OUTPUT"
@@ -418,7 +418,7 @@ jobs:
             echo "❌ sudo bash should be blocked"
             exit 1
           }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required|afraid I can't do that"; then
             echo "✅ sudo bash denied"
           else
             echo "❌ bash failed but not due to sudoers denial: $OUTPUT"
@@ -431,7 +431,7 @@ jobs:
             echo "❌ sudo kill should be blocked (not in allow list)"
             exit 1
           }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required|afraid I can't do that"; then
             echo "✅ sudo kill denied"
           else
             echo "❌ kill failed but not due to sudoers denial: $OUTPUT"
@@ -588,7 +588,7 @@ jobs:
             echo "❌ iptables should be blocked with no allowed commands"
             exit 1
           }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required|afraid I can't do that"; then
             echo "✅ iptables denied (full block mode)"
           else
             echo "❌ iptables failed but not due to sudoers denial: $OUTPUT"
@@ -601,7 +601,7 @@ jobs:
             echo "❌ apt-get should be blocked"
             exit 1
           }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required|afraid I can't do that"; then
             echo "✅ apt-get denied (full block mode)"
           else
             echo "❌ apt-get failed but not due to sudoers denial: $OUTPUT"
@@ -614,7 +614,7 @@ jobs:
             echo "❌ sudo bash should be blocked"
             exit 1
           }
-          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required"; then
+          if echo "$OUTPUT" | grep -qiE "not allowed|not in sudoers|may not run|a password is required|afraid I can't do that"; then
             echo "✅ sudo bash denied (full block mode)"
           else
             echo "❌ bash failed but not due to sudoers denial: $OUTPUT"
@@ -918,6 +918,6 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
-      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
+      - uses: code-cargo/cargowall-action@e5ed6c46902e295d7a791a15564056e9a3d1aafb # v1.3.8
         with:
           binary-path: ./bin/cargowall

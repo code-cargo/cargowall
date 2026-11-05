@@ -356,9 +356,10 @@ func TestDaemonConfig_RestoreDoesNotWaitOnARunningRestart(t *testing.T) {
 // The restart onto the rewrite runs in startup, and a second signal can run
 // the restore on another goroutine meanwhile. Whichever gets there first, the
 // daemon ends on the original: a restore first leaves a daemon that never ran
-// the rewrite, and no restart at all, and a restart first is followed by
-// restore's own. (systemd re-runs a restart that is still running when
-// another is queued.)
+// the rewrite, and no restart at all; a restore between startup's check and
+// its restart queues one that startup's then follows, onto the original; and
+// a restart first is followed by restore's own. (systemd re-runs a restart
+// that is still running when another is queued.)
 func TestDaemonConfig_ConcurrentRestartAndRestoreEndOnOriginal(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	original := `{"log-driver": "json-file"}`
@@ -376,7 +377,7 @@ func TestDaemonConfig_ConcurrentRestartAndRestoreEndOnOriginal(t *testing.T) {
 		<-done
 		requireContent(t, c.path, []byte(original))
 		if n := len(*restarts); n > 0 {
-			require.Equal(t, queued(original), (*restarts)[n-1])
+			require.Contains(t, []string{original, queued(original)}, (*restarts)[n-1])
 		}
 	}
 }

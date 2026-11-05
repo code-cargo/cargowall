@@ -35,9 +35,9 @@ all: fmt vet test build
 ci: install-tools fmt-check vet build test-ci
 
 install-tools:
-	go install honnef.co/go/tools/cmd/staticcheck@latest
-	go install -v github.com/incu6us/goimports-reviser/v3@latest
-	go install mvdan.cc/gofumpt@latest
+	go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+	go install -v github.com/incu6us/goimports-reviser/v3@v3.13.2
+	go install mvdan.cc/gofumpt@v0.11.0
 	go install github.com/vektra/mockery/v2@v2.53.3
 	@printf "${GREEN}Ensure tools directory is on PATH - default: $${HOME}/go/bin${RESET}\n"
 

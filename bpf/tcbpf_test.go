@@ -329,7 +329,12 @@ func TestTcEgress(t *testing.T) {
 
 		// Malformed packets (should block)
 		// Note: truncated ethernet header (<14 bytes) can't be tested via BPF_PROG_TEST_RUN
-		// because the kernel requires minimum ETH_HLEN (14) bytes.
+		// because the kernel requires minimum ETH_HLEN (14) bytes. Nor can an
+		// IPv4/IPv6 ethertype with a short L3 header: since 12bec2bd4b76 (in
+		// 7.0, and carrying a Fixes: tag, so headed for stable) the kernel
+		// EINVALs that input before the program runs. The truncated-L3 cases
+		// therefore ride a VLAN tag, which the kernel leaves alone and
+		// tc_egress parses to the same handle_ipv4/handle_ipv6 load failure.
 		{
 			name:    "Truncated IP header",
 			packet:  craftTruncatedIPv4(t),
@@ -1434,13 +1439,15 @@ func craftIPv6FragmentedICMPv6(t *testing.T, firstFragment bool) []byte {
 	return pkt
 }
 
+// craftTruncatedIPv4 is VLAN tagged: see the malformed-packet note in
+// TestTcEgress.
 func craftTruncatedIPv4(t *testing.T) []byte {
 	t.Helper()
-	eth := craftEthHeader(ethPIP)
+	pkt := append(craftEthHeader(ethP8021Q), craftVLANHeader(ethPIP, 100)...)
 	// Only 10 bytes of IP header (needs 20 minimum)
 	ip := make([]byte, 10)
 	ip[0] = 0x45
-	return append(eth, ip...)
+	return append(pkt, ip...)
 }
 
 func craftInvalidIHLIPv4(t *testing.T) []byte {
@@ -1687,13 +1694,15 @@ func craftTruncatedUDP(t *testing.T) []byte {
 	return append(append(eth, ip...), udp...)
 }
 
+// craftTruncatedIPv6 is VLAN tagged: see the malformed-packet note in
+// TestTcEgress.
 func craftTruncatedIPv6(t *testing.T) []byte {
 	t.Helper()
-	eth := craftEthHeader(ethPIPv6)
+	pkt := append(craftEthHeader(ethP8021Q), craftVLANHeader(ethPIPv6, 100)...)
 	// Only 20 bytes of IPv6 header (needs 40)
 	ip6 := make([]byte, 20)
 	ip6[0] = 0x60 // Version 6
-	return append(eth, ip6...)
+	return append(pkt, ip6...)
 }
 
 func craftTruncatedIPv6TCP(t *testing.T) []byte {

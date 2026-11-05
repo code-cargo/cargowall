@@ -133,9 +133,10 @@ func ConfigureDockerDNS(dnsIP string, logger *slog.Logger) error {
 }
 
 // RestoreDockerDNS restores the original Docker daemon configuration, and
-// queues a daemon restart onto it when RestartDockerDaemon had restarted the
-// daemon onto the rewrite. It is safe whether or not ConfigureDockerDNS ran or got as
-// far as the rewrite: with nothing recorded, daemon.json is left alone.
+// queues a daemon restart onto it when the daemon may run a rewrite: this
+// run's, or one a previous run left. It is safe whether or not
+// ConfigureDockerDNS ran or got as far as the rewrite: with nothing recorded,
+// daemon.json is left alone.
 func RestoreDockerDNS(logger *slog.Logger) error {
 	return dockerDaemonConfig.restore(logger)
 }
@@ -486,8 +487,10 @@ func restartDockerDaemon(logger *slog.Logger) error {
 }
 
 // queueDockerRestart asks systemd to restart the daemon and returns without
-// waiting for it. A docker command meanwhile waits on docker.socket, which
-// systemd holds open through the restart.
+// waiting for it. Where the daemon is socket-activated, as the distribution
+// and Docker packages set it up, a docker command meanwhile waits on
+// docker.socket, which systemd holds open through the restart; elsewhere it
+// fails until the daemon is back.
 func queueDockerRestart(logger *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

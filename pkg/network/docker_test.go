@@ -18,6 +18,7 @@ package network
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -27,18 +28,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newTestDaemonConfig points a daemonConfig at a temp dir and counts reloads.
-func newTestDaemonConfig(t *testing.T) (*daemonConfig, *int) {
+// newTestDaemonConfig points a daemonConfig at a temp dir and records, for
+// each daemon restart, what daemon.json held as it ran ("" for no file): what
+// the daemon came up on.
+func newTestDaemonConfig(t *testing.T) (*daemonConfig, *[]string) {
 	t.Helper()
 	dir := t.TempDir()
-	reloads := 0
-	return &daemonConfig{
+	var restarts []string
+	c := &daemonConfig{
 		path:    filepath.Join(dir, "daemon.json"),
 		backup:  filepath.Join(dir, "daemon.json.cargowall.bak"),
 		absent:  filepath.Join(dir, "daemon.json.cargowall.absent"),
 		rewrite: filepath.Join(dir, "daemon.json.cargowall.rewrite"),
-		reload:  func(*slog.Logger) error { reloads++; return nil },
-	}, &reloads
+	}
+	c.restart = func(*slog.Logger) error {
+		data, _ := os.ReadFile(c.path)
+		restarts = append(restarts, string(data))
+		return nil
+	}
+	return c, &restarts
 }
 
 func requireContent(t *testing.T, path string, want []byte) {
@@ -72,7 +80,7 @@ func requireNotExist(t *testing.T, path string) {
 }
 
 func TestDaemonConfig_RewritesAndRestoresOriginal(t *testing.T) {
-	c, reloads := newTestDaemonConfig(t)
+	c, restarts := newTestDaemonConfig(t)
 	original := []byte(`{"log-driver": "json-file", "dns": ["8.8.8.8"]}`)
 	require.NoError(t, os.WriteFile(c.path, original, 0o644))
 
@@ -86,7 +94,7 @@ func TestDaemonConfig_RewritesAndRestoresOriginal(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, original, got)
 	requireNotExist(t, c.backup)
-	require.Equal(t, 1, *reloads)
+	require.Empty(t, *restarts, "a daemon never restarted onto the rewrite is left alone")
 }
 
 func TestDaemonConfig_NoOriginalIsRemovedOnRestore(t *testing.T) {
@@ -104,7 +112,7 @@ func TestDaemonConfig_NoOriginalIsRemovedOnRestore(t *testing.T) {
 // before configure, or after configure failed: with nothing recorded it must
 // leave the operator's daemon.json alone, not delete it.
 func TestDaemonConfig_RestoreWithoutRewriteLeavesFileAlone(t *testing.T) {
-	c, reloads := newTestDaemonConfig(t)
+	c, restarts := newTestDaemonConfig(t)
 	original := []byte(`{"log-driver": "json-file"}`)
 	require.NoError(t, os.WriteFile(c.path, original, 0o644))
 
@@ -112,7 +120,94 @@ func TestDaemonConfig_RestoreWithoutRewriteLeavesFileAlone(t *testing.T) {
 	got, err := os.ReadFile(c.path)
 	require.NoError(t, err)
 	require.Equal(t, original, got)
-	require.Zero(t, *reloads)
+	require.Empty(t, *restarts)
+}
+
+// A daemon restarted onto the rewrite points its containers at the listener
+// until it restarts again, so restore restarts it onto the original: a reload
+// leaves it handing them an empty nameserver. That holds when the restart
+// onto the rewrite failed too, since a failed or timed-out restart may still
+// have applied it. A daemon only ever restarted onto the original still runs
+// its own settings, and restore leaves it alone.
+func TestDaemonConfig_RestoreRestartsADaemonOnTheRewrite(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	original := `{"log-driver": "json-file"}`
+	for _, c := range []struct {
+		name     string
+		original string // "" for no daemon.json
+		fail     bool   // the restart onto the rewrite reports failure
+	}{
+		{"original existed", original, false},
+		{"no original", "", false},
+		{"restart onto the rewrite failed", original, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dc, restarts := newTestDaemonConfig(t)
+			if c.original != "" {
+				require.NoError(t, os.WriteFile(dc.path, []byte(c.original), 0o644))
+			}
+			require.NoError(t, dc.configure("169.254.0.53", logger))
+			rewrite, err := os.ReadFile(dc.path)
+			require.NoError(t, err)
+			if c.fail {
+				restart := dc.restart
+				dc.restart = func(l *slog.Logger) error {
+					_ = restart(l)
+					return errors.New("timeout waiting for Docker daemon to be ready after restart")
+				}
+			}
+
+			err = dc.restartDaemon(logger)
+			if c.fail {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.NoError(t, dc.restore(logger))
+			require.Equal(t, []string{string(rewrite), c.original}, *restarts,
+				"the daemon comes up on the rewrite, then on the original")
+		})
+	}
+
+	t.Run("restarted only onto the original", func(t *testing.T) {
+		dc, restarts := newTestDaemonConfig(t)
+		require.NoError(t, os.WriteFile(dc.path, []byte(original), 0o644))
+		require.NoError(t, dc.configure("169.254.0.53", logger))
+		recovered, err := dc.recover(logger) // a killed run's leftover, undone
+		require.NoError(t, err)
+		require.True(t, recovered)
+		require.NoError(t, dc.restartDaemon(logger))
+		require.NoError(t, dc.configure("169.254.0.53", logger))
+
+		require.NoError(t, dc.restore(logger))
+		requireContent(t, dc.path, []byte(original))
+		require.Equal(t, []string{original}, *restarts, "no restart is due for a daemon that never ran the rewrite")
+	})
+}
+
+// The restart onto the rewrite runs in startup, and a second signal can run
+// the restore on another goroutine meanwhile. Whichever gets there first, the
+// daemon comes up last on the original: a restore first leaves the restart
+// applying the original, and a restart first is followed by restore's own.
+func TestDaemonConfig_ConcurrentRestartAndRestoreEndOnOriginal(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	original := `{"log-driver": "json-file"}`
+	for range 50 {
+		c, restarts := newTestDaemonConfig(t)
+		require.NoError(t, os.WriteFile(c.path, []byte(original), 0o644))
+		require.NoError(t, c.configure("169.254.0.53", logger))
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = c.restore(logger)
+		}()
+		_ = c.restartDaemon(logger)
+		<-done
+		requireContent(t, c.path, []byte(original))
+		require.NotEmpty(t, *restarts)
+		require.Equal(t, original, (*restarts)[len(*restarts)-1])
+	}
 }
 
 // A run that dies without restoring leaves its rewrite and its record. The
@@ -149,8 +244,8 @@ func TestDaemonConfig_RecoversRewriteLeftByUncleanExit(t *testing.T) {
 // recover undoes the rewrite a killed run left and writes none of its own,
 // so a run that will not point the daemon at its listener still puts the
 // original back. It says whether there was a rewrite to undo, leaves a
-// daemon.json with no record of ours alone, and reloads nothing: only a
-// restart applies the original to a daemon started on the rewrite.
+// daemon.json with no record of ours alone, and restarts nothing: the
+// caller's restart applies the original to a daemon started on the rewrite.
 func TestDaemonConfig_RecoverUndoesOnlyALeftover(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	for _, c := range []struct {
@@ -158,7 +253,7 @@ func TestDaemonConfig_RecoverUndoesOnlyALeftover(t *testing.T) {
 		original []byte
 	}{{"original existed", []byte(`{"log-driver": "json-file"}`)}, {"no original", nil}} {
 		t.Run(c.name, func(t *testing.T) {
-			dc, reloads := newTestDaemonConfig(t)
+			dc, restarts := newTestDaemonConfig(t)
 			if c.original != nil {
 				require.NoError(t, os.WriteFile(dc.path, c.original, 0o644))
 			}
@@ -176,7 +271,7 @@ func TestDaemonConfig_RecoverUndoesOnlyALeftover(t *testing.T) {
 			for _, record := range []string{dc.backup, dc.absent, dc.rewrite} {
 				requireNotExist(t, record)
 			}
-			require.Zero(t, *reloads)
+			require.Empty(t, *restarts)
 
 			recovered, err = dc.recover(logger)
 			require.NoError(t, err)
@@ -246,7 +341,7 @@ func TestDaemonConfig_FileChangedSinceRewriteIsLeftAlone(t *testing.T) {
 		requireContent(t, c.path, installed)
 	})
 	t.Run("edited after the rewrite, then restored", func(t *testing.T) {
-		c, reloads := newTestDaemonConfig(t)
+		c, restarts := newTestDaemonConfig(t)
 		original := []byte(`{"log-driver": "json-file"}`)
 		require.NoError(t, os.WriteFile(c.path, original, 0o644))
 		require.NoError(t, c.configure("172.17.0.1", slog.New(slog.DiscardHandler)))
@@ -254,7 +349,7 @@ func TestDaemonConfig_FileChangedSinceRewriteIsLeftAlone(t *testing.T) {
 
 		require.NoError(t, c.restore(slog.New(slog.DiscardHandler)))
 		requireContent(t, c.path, installed)
-		require.Zero(t, *reloads)
+		require.Empty(t, *restarts)
 		aside := setAside(t, c)
 		require.Len(t, aside, 1, "the pre-cargowall original is kept, not deleted")
 		requireContent(t, aside[0], original)

@@ -213,7 +213,7 @@ verify_audit() {
 }
 
 stop() {
-  sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid --timeout 15s
+  sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
   echo "✅ stop subcommand returned cleanly"
 }
 

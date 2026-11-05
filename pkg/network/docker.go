@@ -18,6 +18,7 @@ package network
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,8 +34,8 @@ import (
 )
 
 // daemonConfig is the daemon.json rewrite and its undo. The paths and the
-// reload are fields so the crash and failure paths can be driven against a
-// temp dir.
+// daemon restart are fields so the crash and failure paths can be driven
+// against a temp dir.
 //
 // Three records sit beside daemon.json while it is rewritten: the original
 // (backup) or the fact there was none (absent), and the exact bytes the
@@ -47,14 +48,18 @@ type daemonConfig struct {
 	backup  string // the original, when there was one
 	absent  string // marker recording that there was no original
 	rewrite string // the bytes the rewrite wrote
-	reload  func(*slog.Logger) error
+	restart func(*slog.Logger) error
 
-	// mu serializes configure and restore: the undo is registered before
-	// configure, and a second signal runs it on another goroutine.
+	// mu serializes configure, the daemon restart and restore: the undo is
+	// registered before configure, and a second signal runs it on another
+	// goroutine.
 	mu sync.Mutex
 	// restored is set by the first restore, so a configure the undo has
 	// already overtaken does not rewrite what nothing will then undo.
 	restored bool
+	// applied is set once the daemon has been restarted onto the rewrite,
+	// so restore restarts it onto the original as well.
+	applied bool
 }
 
 var dockerDaemonConfig = &daemonConfig{
@@ -62,7 +67,7 @@ var dockerDaemonConfig = &daemonConfig{
 	backup:  "/etc/docker/daemon.json.cargowall.bak",
 	absent:  "/etc/docker/daemon.json.cargowall.absent",
 	rewrite: "/etc/docker/daemon.json.cargowall.rewrite",
-	reload:  reloadDockerDaemon,
+	restart: restartDockerDaemon,
 }
 
 // DockerDNSServers is daemon.json's "dns": the servers the daemon gives
@@ -119,9 +124,10 @@ func ConfigureDockerDNS(dnsIP string, logger *slog.Logger) error {
 	return dockerDaemonConfig.configure(dnsIP, logger)
 }
 
-// RestoreDockerDNS restores the original Docker daemon configuration. It is
-// safe whether or not ConfigureDockerDNS ran or got as far as the rewrite:
-// with nothing recorded, daemon.json is left alone.
+// RestoreDockerDNS restores the original Docker daemon configuration, and
+// restarts the daemon onto it when RestartDockerDaemon had restarted it onto
+// the rewrite. It is safe whether or not ConfigureDockerDNS ran or got as
+// far as the rewrite: with nothing recorded, daemon.json is left alone.
 func RestoreDockerDNS(logger *slog.Logger) error {
 	return dockerDaemonConfig.restore(logger)
 }
@@ -232,11 +238,42 @@ func (c *daemonConfig) restore(logger *slog.Logger) error {
 		logger.Debug("daemon.json holds no rewrite of ours; nothing to restore")
 		return nil
 	}
-	if err := c.reload(logger); err != nil {
-		logger.Warn("Failed to reload Docker daemon during restore", "error", err)
-	}
 	logger.Info("Docker DNS configuration restored")
+	// A daemon that never ran the rewrite still runs its original settings,
+	// and is left alone. One that did keeps pointing its containers at the
+	// listener, which goes with cargowall, until it restarts: a reload does
+	// not undo it, and with no "dns" in daemon.json leaves the daemon handing
+	// its containers an empty nameserver.
+	if c.applied {
+		if err := c.restart(logger); err != nil {
+			logger.Warn("Failed to restart Docker daemon onto its restored configuration; "+
+				"its containers resolve through an address cargowall no longer serves until it restarts", "error", err)
+		}
+	}
 	return nil
+}
+
+// restartDaemon is RestartDockerDaemon. It records whether the daemon now
+// runs the rewrite before restarting it: a restart that fails or times out
+// may have applied it all the same.
+func (c *daemonConfig) restartDaemon(logger *slog.Logger) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.holdsRewrite() {
+		c.applied = true
+	}
+	return c.restart(logger)
+}
+
+// holdsRewrite reports whether daemon.json holds the rewrite recorded
+// beside it.
+func (c *daemonConfig) holdsRewrite() bool {
+	ours, err := os.ReadFile(c.rewrite)
+	if err != nil {
+		return false
+	}
+	current, err := os.ReadFile(c.path)
+	return err == nil && bytes.Equal(current, ours)
 }
 
 // restoreFiles puts back what configure recorded — the backup over
@@ -373,60 +410,49 @@ func writeFileReplace(path string, data []byte, perm os.FileMode) error {
 // RestartDockerDaemon performs a full Docker daemon restart and waits for it
 // to become ready. This is required for DNS configuration changes — Docker's
 // SIGHUP handler only reloads a subset of settings (debug, labels, registries,
-// etc.) and does NOT reload DNS settings from daemon.json.
-func RestartDockerDaemon(logger *slog.Logger) error {
-	logger.Info("Restarting Docker daemon to apply DNS configuration")
+// etc.) and does NOT reload DNS settings from daemon.json. A restart onto the
+// rewrite is recorded, so RestoreDockerDNS restarts the daemon onto the
+// original too.
+func RestartDockerDaemon(logger *slog.Logger) error { return dockerDaemonConfig.restartDaemon(logger) }
 
-	cmd := exec.Command("systemctl", "restart", "docker")
-	if err := cmd.Run(); err != nil {
+// dockerRestartTimeout bounds a daemon restart, teardown's included: systemctl
+// waits on the start job, which docker.service gives no timeout of its own
+// (TimeoutStartSec=0), and the daemon has then to answer.
+const dockerRestartTimeout = 60 * time.Second
+
+// restartDockerDaemon restarts the daemon through systemd and waits for it to
+// answer, within dockerRestartTimeout. A start job systemctl stops waiting on
+// carries on in systemd.
+//
+// The unit's start rate limit is flushed first. docker.service allows three
+// starts a minute (StartLimitBurst=3), and the restart onto the rewrite, the
+// one onto the original and any a job makes itself can go past it: systemd
+// then refuses the start and leaves the daemon stopped.
+func restartDockerDaemon(logger *slog.Logger) error {
+	logger.Info("Restarting Docker daemon to apply DNS configuration")
+	ctx, cancel := context.WithTimeout(context.Background(), dockerRestartTimeout)
+	defer cancel()
+	started := time.Now()
+
+	if err := exec.CommandContext(ctx, "systemctl", "reset-failed", "docker").Run(); err != nil {
+		logger.Debug("systemctl reset-failed docker failed; restarting regardless", "error", err)
+	}
+	if err := exec.CommandContext(ctx, "systemctl", "restart", "docker").Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("systemctl restart docker did not finish within %s", dockerRestartTimeout)
+		}
 		return fmt.Errorf("systemctl restart docker failed: %w", err)
 	}
 
-	// Wait for Docker to be ready (up to 30 seconds)
-	for i := range 30 {
-		cmd := exec.Command("docker", "info")
-		if err := cmd.Run(); err == nil {
-			logger.Info("Docker daemon ready after restart", "seconds", i+1)
+	for {
+		if exec.CommandContext(ctx, "docker", "info").Run() == nil {
+			logger.Info("Docker daemon ready after restart", "seconds", int(time.Since(started).Seconds())+1)
 			return nil
 		}
-		time.Sleep(1 * time.Second)
-	}
-
-	return fmt.Errorf("timeout waiting for Docker daemon to be ready after restart")
-}
-
-// reloadDockerDaemon sends SIGHUP to the Docker daemon to reload configuration.
-func reloadDockerDaemon(logger *slog.Logger) error {
-	// Try to find dockerd PID
-	pidBytes, err := os.ReadFile("/var/run/docker.pid")
-	if err != nil {
-		// Try using systemctl if available
-		logger.Debug("Could not read docker.pid, trying systemctl")
-		cmd := exec.Command("systemctl", "reload", "docker")
-		if err := cmd.Run(); err != nil {
-			// Last resort: try pkill
-			logger.Debug("systemctl reload failed, trying SIGHUP via pkill")
-			cmd = exec.Command("pkill", "-HUP", "dockerd")
-			return cmd.Run()
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for Docker daemon to be ready after restart")
+		case <-time.After(time.Second):
 		}
-		return nil
 	}
-
-	var pid int
-	if _, err := fmt.Sscanf(string(pidBytes), "%d", &pid); err != nil {
-		return fmt.Errorf("failed to parse docker PID: %w", err)
-	}
-
-	// Send SIGHUP to reload config
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("failed to find docker process: %w", err)
-	}
-
-	if err := process.Signal(syscall.SIGHUP); err != nil {
-		return fmt.Errorf("failed to send SIGHUP to docker: %w", err)
-	}
-
-	logger.Debug("Sent SIGHUP to Docker daemon", "pid", pid)
-	return nil
 }

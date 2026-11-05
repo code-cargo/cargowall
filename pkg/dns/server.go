@@ -48,6 +48,7 @@ type Server struct {
 	// Additional listen addresses (e.g., docker bridge IP for container DNS)
 	additionalAddrs []string
 	servers         []*dns.Server // All running servers
+	binds           listenerBinds // Which listen addresses the proxy holds
 
 	// DNS query filtering (blocks DNS tunneling)
 	filterQueries bool // When true, only forward queries for allowed domains
@@ -294,12 +295,13 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Create and start a server for each address (both UDP and TCP)
 	for _, addr := range allAddrs {
-		for _, proto := range []string{"udp4", "tcp4"} {
+		for _, proto := range listenProtocols {
 			server := &dns.Server{
 				Addr:    addr,
 				Net:     proto,
 				Handler: dns.HandlerFunc(s.handleDNSQuery),
 				NotifyStartedFunc: func() {
+					s.binds.listening(addr)
 					s.logger.Debug("DNS server is now listening", "addr", addr, "proto", proto)
 				},
 			}
@@ -308,6 +310,7 @@ func (s *Server) Start(ctx context.Context) error {
 			// Start server in background
 			go func(srv *dns.Server, address string) {
 				if err := srv.ListenAndServe(); err != nil {
+					s.binds.failed(address, err)
 					s.logger.Error("DNS server error", "error", err, "addr", address)
 				}
 			}(server, addr)
@@ -358,29 +361,36 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 			// Check the run's posture (single source of truth on the config
 			// manager) - in audit mode, log but don't block
 			isAuditMode := s.config.IsAuditMode()
+			expansion := s.isAllowedSearchExpansion(domain)
 
-			if isAuditMode {
+			switch {
+			case expansion:
+				s.logger.Debug("DNS query is a search expansion of an allowed name, not reported",
+					"domain", domain,
+					"from", w.RemoteAddr().String())
+			case isAuditMode:
 				s.logger.Info("DNS query would be blocked (audit mode)",
 					"domain", domain,
 					"from", w.RemoteAddr().String())
-			} else {
+			default:
 				s.logger.Info("DNS query blocked (domain not allowed)",
 					"domain", domain,
 					"from", w.RemoteAddr().String())
 			}
 
 			// Log to audit file if configured
-			if s.auditLogger != nil {
+			if s.auditLogger != nil && !expansion {
 				if err := s.auditLogger.LogDNSBlocked(domain); err != nil {
 					s.logger.Error("Failed to write DNS audit log", "error", err)
 				}
 			}
 
-			// In enforce mode, return REFUSED - don't forward to upstream
+			// In enforce mode, answer here (REFUSED, or NXDOMAIN in the
+			// cluster domain) - don't forward to upstream.
 			// In audit mode, fall through to forward the query normally
 			if !isAuditMode {
 				m := new(dns.Msg)
-				m.SetRcode(r, dns.RcodeRefused)
+				m.SetRcode(r, deniedRcode(domain))
 				w.WriteMsg(m)
 				return
 			}

@@ -227,6 +227,28 @@ jobs:
           fi
           echo "✅ Docker container blocked from example.com"
 
+      - name: Test container DNS cannot resolve around the proxy
+        run: |
+          # A container that names its own resolver sends DNS through the
+          # FORWARD path, which the host's OUTPUT redirect never sees. The
+          # Azure wireserver is allowed on 53/udp for cargowall's own
+          # upstream queries, so without the container redirect it would
+          # answer a denied name here: an unfiltered DNS channel out.
+          OUT=$(docker run --rm --dns 168.63.129.16 alpine:latest nslookup -type=a example.com 2>&1 || true)
+          echo "$OUT"
+          if echo "$OUT" | grep -E '^Address:' | grep -vqE ':53$'; then
+            echo "❌ container resolved a denied name through the wireserver, around the proxy"
+            exit 1
+          fi
+          echo "✅ denied name not resolved via --dns 168.63.129.16"
+
+          # 8.8.8.8 is not allowed on 53, so this resolves only if the
+          # redirect hands the query to the proxy, which allows github.com.
+          docker run --rm --dns 8.8.8.8 alpine:latest sh -c "
+            wget -q --spider --timeout=15 https://github.com && echo 'CONNECTION_SUCCESS' || echo 'CONNECTION_FAILED'
+          " 2>&1 | grep -q "CONNECTION_SUCCESS"
+          echo "✅ container with --dns 8.8.8.8 reached github.com through the proxy"
+
       - name: Validate audit log events
         run: |
           AUDIT_LOG=/tmp/cargowall-audit.json
@@ -292,6 +314,18 @@ jobs:
             echo "❌ Summary command output missing expected content"
             exit 1
           fi
+
+      - name: Stop CargoWall and verify the DNS redirect is removed
+        run: |
+          # Last step: DNS on this runner stops working once the proxy is gone.
+          sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid
+          LEFT=$(sudo iptables -t nat -S | grep -E -- '--dport 53 .*-j DNAT' || true)
+          if [ -n "$LEFT" ]; then
+            echo "❌ DNS redirect rules left behind after stop:"
+            echo "$LEFT"
+            exit 1
+          fi
+          echo "✅ host and container DNS redirect rules removed on stop"
 
   test-cargowall-audit:
     name: Integration Test (Audit Mode)

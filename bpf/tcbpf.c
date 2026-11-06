@@ -159,8 +159,8 @@ struct {
 // BTF) tags each such child with a monotonically increasing step ordinal;
 // every other fork inherits the forking thread's tag, so a step's entire
 // process subtree — including daemonized survivors — carries its ordinal.
-// The cgroup hooks below copy the tag onto each socket cookie at creation,
-// and TC embeds it in events. The verdict reads a socket's tag only to find
+// The cgroup hooks copy the tag onto each socket cookie at creation and at
+// each connect or addressed send, and TC embeds it in events. The verdict reads a socket's tag only to find
 // its step's own allow rules (map_sock_step and map_step_policy, in
 // verdict.h); the kernel otherwise only ever increments and copies.
 
@@ -222,9 +222,17 @@ static __always_inline __u32 sock_owner_pid(void) {
     return ns ? *ns : (__u32)(pid_tgid >> 32);
 }
 
-// Helper: copy the calling thread's step tag onto a socket cookie.
-// Shared by the connect/sendmsg hooks below (fallback for sockets created
-// before attach) and cw_cg_sock_new in stepbpf.c (primary path).
+// Helper: copy the calling thread's step tag onto a socket cookie, over
+// whatever tag it had. Shared by the connect/sendmsg hooks below and
+// cw_cg_sock_new in stepbpf.c: a socket's tag is the step of the thread
+// that last chose its destination (connect, or a send to an address), and
+// until one has, of the thread that created it. The verdict judges a
+// socket by its tag's step, so the step whose thread aimed it is the step
+// judged, never one whose socket it merely borrowed. Steps of one job that
+// share a socket (an unconnected UDP socket sent on by two steps' threads,
+// whose tags can cross between one's send and the other's packet) are
+// beyond it: they share a uid and the workspace, and the job is the
+// boundary between them.
 static __always_inline void step_tag_socket(__u64 cookie) {
     __u32 sk = 0;
     struct step_state *st = bpf_map_lookup_elem(&map_step_state, &sk);

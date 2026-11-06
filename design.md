@@ -809,25 +809,43 @@ to select policy with.
   `map_step_policy`, once, when the step is identified. Both hooks decide
   the same way (`verdict_allowed_v4`/`_v6` in `verdict.h`): the job's
   rules first; where they decide nothing (no match, or a port-specific
-  match whose port is not listed), the rules of the step whose process made
-  the socket, read through its tag in `map_sock_step` and the tag's
-  binding, may allow; the job's default action decides the rest. A step's
-  rules can only turn the job's silence into an allow, never into a deny,
-  so a step gets all the job gets and never less, and anything with no
-  step policy — an untagged socket, a sentinel or unbound ordinal, a step
-  not yet identified — gets the job's rules alone: every gap is
+  match whose port is not listed and no wildcard port entry), the rules of
+  the step tagged on the socket, read through `map_sock_step` and the
+  tag's binding, may allow; the job's default action decides the rest. A
+  step's rules can only turn the job's silence into an allow, never into a
+  deny, so a step gets all the job gets and never less, and anything with
+  no step policy (an untagged socket, a sentinel or unbound ordinal, a
+  step not yet identified) gets the job's rules alone: every gap is
   fail-closed. Explicit job denies hold for every step. A load-time
   constant (`step_rules_enabled`) prunes the step lookup from both hooks
   when no step has rules; the data plane is in place, and until the
-  policy's own `steps` arrive nothing turns it on or binds a step. What follows from the tagging model: sockets and
-  container processes keep their *creating* step's tag, so a service
-  container started in step 2 is governed by step 2's policy for its
-  lifetime unless re-tagged by exec — "the policy of the step that created
-  it", not "the step active now". Parity: both hooks read the same tag for
-  the same socket, but TC sees a container's packets post-NAT with no
-  socket, so there it judges them by the job's rules; per-step rules reach
-  container traffic at the cgroup hook. The denial UX above applies — UDP
-  fails fast with `EPERM`, TCP times out.
+  policy's own `steps` arrive nothing turns it on or binds a step.
+  - *Which step a socket is judged as.* Its tag: the step of the thread
+    that last chose its destination (a `connect`, or a send to an address
+    of its own choosing), and until one has, of the thread that created
+    it. The step whose thread aimed a socket is the step judged, never one
+    whose socket it merely borrowed. A container's processes are tagged
+    when dockerd reports the container started, or an exec run in it,
+    with the step running at that moment (see Container Attribution), so
+    a service container started in step 2 is governed by step 2's policy
+    for its lifetime unless an exec re-tags it.
+  - *What per-step rules do not separate.* They bound what each step's own
+    processes reach. Steps of one job share a uid, the workspace and
+    dockerd, so a step can shape what a later one runs, or share a socket
+    with another (two steps' threads sending on one unconnected UDP socket
+    can each re-tag it between the other's send and its packet's verdict):
+    between steps that do not trust each other, the boundary is the job.
+  - *Where the two hooks differ.* Both read the same tag for the same
+    socket, with two exceptions. TC sees a bridge-networked container's
+    packets post-NAT with no socket, and judges them by the job's rules:
+    a destination only the container's step allows passes the cgroup hook
+    and is still dropped at TC, until the bridge stamp carries the step's
+    policy past NAT. And a SYN-ACK is sent from a request socket, which TC
+    reads as untagged (the job's rules) while the cgroup hook reads the
+    listener's tag; the stricter wins, fail-closed. Accepted sockets carry
+    no tag, so both hooks judge them by the job's rules.
+  - The denial UX above applies: UDP fails fast with `EPERM`, TCP times
+    out.
 
 **Follow-ups deliberately NOT adopted as written** (each has a verified
 flaw; redesign before building):

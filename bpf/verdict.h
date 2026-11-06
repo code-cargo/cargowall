@@ -179,8 +179,9 @@ struct {
 // A step's own allow rules live in the rule maps under a policy of their
 // own, never under POLICY_JOB. map_step_policy binds a step's ordinal to
 // that policy, written once, by userspace, when the step is identified, and
-// a socket finds its step's ordinal in map_sock_step, by the tag the process
-// that made it carried. An ordinal with no binding (not identified yet, or
+// a socket finds its step's ordinal in map_sock_step: the step of the
+// thread that last chose its destination, or that created it (see
+// step_tag_socket in tcbpf.c). An ordinal with no binding (not identified yet, or
 // never: a sentinel, a runner helper, an unknown step) and a socket with no
 // tag have no step policy, and the job's rules alone judge them.
 
@@ -190,8 +191,8 @@ struct {
 const volatile __u8 step_rules_enabled = 0;
 
 // socket cookie → step ordinal, written at socket creation (cw_cg_sock_new
-// in stepbpf.c, which declares the same map) and by the connect/sendmsg
-// fallbacks in tcbpf.c.
+// in stepbpf.c, which declares the same map) and again at each connect or
+// addressed send (the connect/sendmsg hooks in tcbpf.c).
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, __u64);
@@ -342,9 +343,14 @@ __noinline int rules_v6(__u32 policy, __u64 dst_hi, __u64 dst_lo, __u32 dst_port
     return RULE_NONE;
 }
 
-// step_policy_of is the policy holding the own rules of the step whose
-// process made the socket skb was sent from, or POLICY_JOB for none: no
-// socket, no tag, or no binding for the tag.
+// step_policy_of is the policy holding the own rules of the step tagged on
+// the socket skb was sent from, or POLICY_JOB for none: no socket, no tag,
+// or no binding for the tag. The two lookups are not one atomic read: the
+// tag map is an LRU, whose element a concurrent re-tag or eviction can
+// recycle between them, judging the packet by another socket's step. TC
+// reads its own way, so both hooks would have to lose that race on the
+// same packet, and steps that race each other's sockets so are beyond the
+// step rules: the job is the boundary between them.
 static __always_inline __u32 step_policy_of(struct __sk_buff *skb) {
     __u64 cookie = bpf_get_socket_cookie(skb);
     if (!cookie)
@@ -358,8 +364,8 @@ static __always_inline __u32 step_policy_of(struct __sk_buff *skb) {
 
 // verdict_allowed_v4 returns 1 if a packet to dst (network byte order) on
 // dst_port (host order) / proto is allowed, 0 if denied. The job's rules
-// decide first. Where they decide nothing, the own rules of the step whose
-// process made the socket may allow it, and the job's default action
+// decide first. Where they decide nothing, the own rules of the step tagged
+// on the socket (step_policy_of) may allow it, and the job's default action
 // decides the rest. A step's rules only ever turn the job's silence into an
 // allow, never into a deny, whatever the maps hold, so a step gets all the
 // job gets and never less. *step_tier is set when a step's rules were asked.

@@ -25,7 +25,9 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -73,8 +75,9 @@ const (
 // In both families (10.99.0.x and fd99::x) the job allows .10 on all ports
 // and .12 on TCP 443, and denies .11. Step policy A allows .11 (the job's
 // deny must win), .12 on all ports (filling the job's port miss), .20 and
-// TCP 9000 anywhere, and denies .31, which must deny nothing: a step's
-// rules only ever add to the job's. B allows .21 alone. Every destination is checked under every tag and
+// TCP 9000 anywhere, and .40 on TCP 443 alone, whose port miss falls to A's
+// wildcard; and it denies .31, which must deny nothing: a step's rules only
+// ever add to the job's. B allows .21 alone. Every destination is checked under every tag and
 // under both default actions, so a lookup that ignored its policy, or asked
 // the wrong one, or let a step's rules deny, fails some row: A's entries
 // are not B's, nor the job's.
@@ -112,11 +115,15 @@ func TestStepPolicyVerdicts(t *testing.T) {
 	put(tcObjs.MapCidrs, RuleKey(stepPolicyA, 32, host("10.99.0.20")), allow)
 	put(tcObjs.MapPorts, RulePortKey(stepPolicyA, 0, 9000, ipprotoTCP, 0), portAllow)
 	put(tcObjs.MapCidrs, RuleKey(stepPolicyA, 32, host("10.99.0.31")), deny)
+	put(tcObjs.MapCidrs, RuleKey(stepPolicyA, 32, host("10.99.0.40")), portSpecific)
+	put(tcObjs.MapPorts, RulePortKey(stepPolicyA, host("10.99.0.40"), 443, ipprotoTCP, 0), portAllow)
 	put(tcObjs.MapCidrsV6, RuleKeyV6(stepPolicyA, 128, host6("fd99::11")), allow)
 	put(tcObjs.MapCidrsV6, RuleKeyV6(stepPolicyA, 128, host6("fd99::12")), allow)
 	put(tcObjs.MapCidrsV6, RuleKeyV6(stepPolicyA, 128, host6("fd99::20")), allow)
 	put(tcObjs.MapPortsV6, RulePortKeyV6(stepPolicyA, [16]byte{}, 9000, ipprotoTCP, 0), portAllow)
 	put(tcObjs.MapCidrsV6, RuleKeyV6(stepPolicyA, 128, host6("fd99::31")), deny)
+	put(tcObjs.MapCidrsV6, RuleKeyV6(stepPolicyA, 128, host6("fd99::40")), portSpecific)
+	put(tcObjs.MapPortsV6, RulePortKeyV6(stepPolicyA, host6("fd99::40"), 443, ipprotoTCP, 0), portAllow)
 
 	put(tcObjs.MapCidrs, RuleKey(stepPolicyB, 32, host("10.99.0.21")), allow)
 	put(tcObjs.MapCidrsV6, RuleKeyV6(stepPolicyB, 128, host6("fd99::21")), allow)
@@ -177,6 +184,9 @@ func TestStepPolicyVerdicts(t *testing.T) {
 		{"10.99.0.30", 9000, ruleNone, stepPolicyA},
 		{"10.99.0.30", 80, ruleNone, 0},
 		{"10.99.0.31", 80, ruleNone, 0}, // A denies it
+		{"10.99.0.40", 443, ruleNone, stepPolicyA},
+		{"10.99.0.40", 9000, ruleNone, stepPolicyA}, // A's port miss, then A's wildcard
+		{"10.99.0.40", 80, ruleNone, 0},
 		{"fd99::10", 443, ruleAllow, 0},
 		{"fd99::11", 443, ruleDeny, stepPolicyA},
 		{"fd99::12", 443, ruleAllow, stepPolicyA},
@@ -186,6 +196,9 @@ func TestStepPolicyVerdicts(t *testing.T) {
 		{"fd99::30", 9000, ruleNone, stepPolicyA},
 		{"fd99::30", 80, ruleNone, 0},
 		{"fd99::31", 80, ruleNone, 0}, // A denies it
+		{"fd99::40", 443, ruleNone, stepPolicyA},
+		{"fd99::40", 9000, ruleNone, stepPolicyA},
+		{"fd99::40", 80, ruleNone, 0},
 	}
 
 	for _, defaultAllow := range []bool{false, true} {
@@ -239,11 +252,19 @@ func newStepNetns(t *testing.T) string {
 	if _, err := exec.LookPath("ip"); err != nil {
 		t.Skip("needs iproute2's ip")
 	}
-	name := fmt.Sprintf("cwstep-%d", os.Getpid())
 	ip := func(args ...string) {
 		out, err := exec.Command("ip", args...).CombinedOutput()
 		require.NoError(t, err, "ip %v: %s", args, out)
 	}
+	// One a run that died left behind, its process gone, is no one's.
+	stale, _ := filepath.Glob("/run/netns/cwstep-*")
+	for _, path := range stale {
+		pid := strings.TrimPrefix(filepath.Base(path), "cwstep-")
+		if _, err := os.Stat("/proc/" + pid); errors.Is(err, os.ErrNotExist) {
+			_ = exec.Command("ip", "netns", "del", filepath.Base(path)).Run()
+		}
+	}
+	name := fmt.Sprintf("cwstep-%d", os.Getpid())
 	ip("netns", "add", name)
 	t.Cleanup(func() { _ = exec.Command("ip", "netns", "del", name).Run() })
 	ip("-n", name, "link", "set", "lo", "up")

@@ -560,10 +560,7 @@ func TestTcEgressExplicitDeny(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add IPv4 allow rule for 140.82.114.0/24
-	key4Allow := TcBpfLpmKey{
-		Prefixlen: 24,
-		Ip:        ipToU32("140.82.114.0"),
-	}
+	key4Allow := RuleKey(PolicyJob, 24, ipToU32("140.82.114.0"))
 	allowVal := TcBpfLpmVal{
 		Action:       1, // allow
 		PortSpecific: 0,
@@ -572,10 +569,7 @@ func TestTcEgressExplicitDeny(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add IPv4 explicit deny rule for 10.0.0.0/24
-	key4Deny := TcBpfLpmKey{
-		Prefixlen: 24,
-		Ip:        ipToU32("10.0.0.0"),
-	}
+	key4Deny := RuleKey(PolicyJob, 24, ipToU32("10.0.0.0"))
 	denyVal := TcBpfLpmVal{
 		Action:       0, // explicit deny
 		PortSpecific: 0,
@@ -624,10 +618,7 @@ func TestTcEgressDefaultAllowWithDeny(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add IPv4 explicit deny rule for 10.0.0.0/24
-	key4Deny := TcBpfLpmKey{
-		Prefixlen: 24,
-		Ip:        ipToU32("10.0.0.0"),
-	}
+	key4Deny := RuleKey(PolicyJob, 24, ipToU32("10.0.0.0"))
 	denyVal := TcBpfLpmVal{
 		Action:       0, // explicit deny
 		PortSpecific: 0,
@@ -636,9 +627,7 @@ func TestTcEgressDefaultAllowWithDeny(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add IPv6 explicit deny rule for 2001:db8::/32
-	key6Deny := TcBpfLpmKeyV6{
-		Prefixlen: 32,
-	}
+	key6Deny := RuleKeyV6(PolicyJob, 32, [16]byte{})
 	ip6 := net.ParseIP("2001:db8::")
 	copy(key6Deny.Ip[:], ip6.To16())
 	err = objs.MapCidrsV6.Update(&key6Deny, &denyVal, ebpf.UpdateAny)
@@ -840,35 +829,35 @@ func TestTcEgressProtocolEnforcement(t *testing.T) {
 	// entries are keyed by the address itself (host bits 0).
 	val := TcBpfLpmVal{Action: 1, PortSpecific: 1}
 	for _, host := range []string{"10.0.0.1", "10.0.0.2"} {
-		key4 := TcBpfLpmKey{Prefixlen: 32, Ip: ipToU32(host)}
+		key4 := RuleKey(PolicyJob, 32, ipToU32(host))
 		require.NoError(t, objs.MapCidrs.Update(&key4, &val, ebpf.UpdateAny))
 	}
 
 	// Allow 10.0.0.1:443 TCP ONLY (no UDP entry)
 	portVal := TcBpfPortVal{Action: 1}
-	portKey := TcBpfPortKey{Ip: ipToU32("10.0.0.1"), Port: 443, Proto: ipprotoTCP}
+	portKey := RulePortKey(PolicyJob, ipToU32("10.0.0.1"), 443, ipprotoTCP, 0)
 	err = objs.MapPorts.Update(&portKey, &portVal, ebpf.UpdateAny)
 	require.NoError(t, err)
 
 	// Allow 10.0.0.1:53 UDP ONLY (no TCP entry)
-	portKey2 := TcBpfPortKey{Ip: ipToU32("10.0.0.1"), Port: 53, Proto: ipprotoUDP}
+	portKey2 := RulePortKey(PolicyJob, ipToU32("10.0.0.1"), 53, ipprotoUDP, 0)
 	err = objs.MapPorts.Update(&portKey2, &portVal, ebpf.UpdateAny)
 	require.NoError(t, err)
 
 	// Allow 10.0.0.2 ICMP ONLY (port=0, proto=1, no TCP/UDP entries)
-	portKeyICMP := TcBpfPortKey{Ip: ipToU32("10.0.0.2"), Port: 0, Proto: ipprotoICMP}
+	portKeyICMP := RulePortKey(PolicyJob, ipToU32("10.0.0.2"), 0, ipprotoICMP, 0)
 	err = objs.MapPorts.Update(&portKeyICMP, &portVal, ebpf.UpdateAny)
 	require.NoError(t, err)
 
 	// Host route 2001:db8:1::1/128 with port_specific=1
-	key6 := TcBpfLpmKeyV6{Prefixlen: 128}
+	key6 := RuleKeyV6(PolicyJob, 128, [16]byte{})
 	ip6 := net.ParseIP("2001:db8:1::1")
 	copy(key6.Ip[:], ip6.To16())
 	err = objs.MapCidrsV6.Update(&key6, &val, ebpf.UpdateAny)
 	require.NoError(t, err)
 
 	// Allow [2001:db8:1::1]:443 TCP ONLY
-	portKey6 := TcBpfPortKeyV6{Port: 443, Proto: ipprotoTCP}
+	portKey6 := RulePortKeyV6(PolicyJob, [16]byte{}, 443, ipprotoTCP, 0)
 	ip6Addr := net.ParseIP("2001:db8:1::1")
 	copy(portKey6.Ip[:], ip6Addr.To16())
 	err = objs.MapPortsV6.Update(&portKey6, &portVal, ebpf.UpdateAny)
@@ -878,19 +867,19 @@ func TestTcEgressProtocolEnforcement(t *testing.T) {
 	// firewall writes them: by network address and host bits, so the proto
 	// byte is looked up under the masked destination. 10.1.0.0/24 allows TCP
 	// 443, UDP 53 and ICMP; 2001:db8:2::/48 allows TCP 443.
-	subnet4 := TcBpfLpmKey{Prefixlen: 24, Ip: ipToU32("10.1.0.0")}
+	subnet4 := RuleKey(PolicyJob, 24, ipToU32("10.1.0.0"))
 	require.NoError(t, objs.MapCidrs.Update(&subnet4, &TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 8}, ebpf.UpdateAny))
-	for _, pk := range []TcBpfPortKey{
-		{Ip: ipToU32("10.1.0.0"), Port: 443, Proto: ipprotoTCP, HostBits: 8},
-		{Ip: ipToU32("10.1.0.0"), Port: 53, Proto: ipprotoUDP, HostBits: 8},
-		{Ip: ipToU32("10.1.0.0"), Port: 0, Proto: ipprotoICMP, HostBits: 8},
+	for _, pk := range []TcBpfRulePortKey{
+		RulePortKey(PolicyJob, ipToU32("10.1.0.0"), 443, ipprotoTCP, 8),
+		RulePortKey(PolicyJob, ipToU32("10.1.0.0"), 53, ipprotoUDP, 8),
+		RulePortKey(PolicyJob, ipToU32("10.1.0.0"), 0, ipprotoICMP, 8),
 	} {
 		require.NoError(t, objs.MapPorts.Update(&pk, &portVal, ebpf.UpdateAny))
 	}
-	subnet6 := TcBpfLpmKeyV6{Prefixlen: 48}
+	subnet6 := RuleKeyV6(PolicyJob, 48, [16]byte{})
 	copy(subnet6.Ip[:], net.ParseIP("2001:db8:2::").To16())
 	require.NoError(t, objs.MapCidrsV6.Update(&subnet6, &TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 80}, ebpf.UpdateAny))
-	subnetPort6 := TcBpfPortKeyV6{Ip: subnet6.Ip, Port: 443, Proto: ipprotoTCP, HostBits: 80}
+	subnetPort6 := RulePortKeyV6(PolicyJob, subnet6.Ip, 443, ipprotoTCP, 80)
 	require.NoError(t, objs.MapPortsV6.Update(&subnetPort6, &portVal, ebpf.UpdateAny))
 
 	tests := []struct {
@@ -1238,10 +1227,7 @@ func setupTestRules(t *testing.T, objs *TcBpfObjects) {
 	require.NoError(t, err)
 
 	// Add IPv4 allow rule for 140.82.114.0/24
-	key4 := TcBpfLpmKey{
-		Prefixlen: 24,
-		Ip:        ipToU32("140.82.114.0"),
-	}
+	key4 := RuleKey(PolicyJob, 24, ipToU32("140.82.114.0"))
 	val := TcBpfLpmVal{
 		Action:       1, // allow
 		PortSpecific: 0, // all ports
@@ -1250,9 +1236,7 @@ func setupTestRules(t *testing.T, objs *TcBpfObjects) {
 	require.NoError(t, err)
 
 	// Add IPv6 allow rule for 2606:4700::/32
-	key6 := TcBpfLpmKeyV6{
-		Prefixlen: 32,
-	}
+	key6 := RuleKeyV6(PolicyJob, 32, [16]byte{})
 	ip6 := net.ParseIP("2606:4700::")
 	copy(key6.Ip[:], ip6.To16())
 	err = objs.MapCidrsV6.Update(&key6, &val, ebpf.UpdateAny)
@@ -1565,7 +1549,7 @@ func addPortV4(t *testing.T, m *ebpf.Map, ip uint32, hostBits uint8, port uint16
 	t.Helper()
 	val := TcBpfPortVal{Action: action}
 	for _, proto := range []uint8{ipprotoTCP, ipprotoUDP} {
-		key := TcBpfPortKey{Ip: ip, Port: port, Proto: proto, HostBits: hostBits}
+		key := RulePortKey(PolicyJob, ip, port, proto, hostBits)
 		require.NoError(t, m.Update(&key, &val, ebpf.UpdateAny))
 	}
 }
@@ -1575,7 +1559,7 @@ func addPortV6(t *testing.T, m *ebpf.Map, ipStr string, hostBits uint8, port uin
 	t.Helper()
 	val := TcBpfPortVal{Action: action}
 	for _, proto := range []uint8{ipprotoTCP, ipprotoUDP} {
-		key := TcBpfPortKeyV6{Port: port, Proto: proto, HostBits: hostBits}
+		key := RulePortKeyV6(PolicyJob, [16]byte{}, port, proto, hostBits)
 		if ipStr != "" {
 			ip6 := net.ParseIP(ipStr)
 			copy(key.Ip[:], ip6.To16())
@@ -1602,7 +1586,7 @@ func setupPortSpecificRules(t *testing.T, objs *TcBpfObjects) {
 	require.NoError(t, err)
 
 	// Add IPv4 CIDR 10.0.0.0/24 with port_specific=1
-	key4 := TcBpfLpmKey{Prefixlen: 24, Ip: ipToU32("10.0.0.0")}
+	key4 := RuleKey(PolicyJob, 24, ipToU32("10.0.0.0"))
 	val4 := TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 8}
 	err = objs.MapCidrs.Update(&key4, &val4, ebpf.UpdateAny)
 	require.NoError(t, err)
@@ -1614,7 +1598,7 @@ func setupPortSpecificRules(t *testing.T, objs *TcBpfObjects) {
 	addPortV4(t, objs.MapPorts, 0, 0, 9090, 0)                  // wildcard deny
 
 	// Add IPv6 CIDR 2001:db8:1::/48 with port_specific=1
-	key6 := TcBpfLpmKeyV6{Prefixlen: 48}
+	key6 := RuleKeyV6(PolicyJob, 48, [16]byte{})
 	ip6 := net.ParseIP("2001:db8:1::")
 	copy(key6.Ip[:], ip6.To16())
 	val6 := TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 80}

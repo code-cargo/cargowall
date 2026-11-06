@@ -13,18 +13,6 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type TcBpfLpmKey struct {
-	_         structs.HostLayout
-	Prefixlen uint32
-	Ip        uint32
-}
-
-type TcBpfLpmKeyV6 struct {
-	_         structs.HostLayout
-	Prefixlen uint32
-	Ip        [16]uint8
-}
-
 type TcBpfLpmVal struct {
 	_            structs.HostLayout
 	Action       uint8
@@ -53,6 +41,38 @@ type TcBpfPortVal struct {
 	_      structs.HostLayout
 	Action uint8
 	Pad    [3]uint8
+}
+
+type TcBpfRuleKey struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Policy    uint32
+	Ip        uint32
+}
+
+type TcBpfRuleKeyV6 struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Policy    uint32
+	Ip        [16]uint8
+}
+
+type TcBpfRulePortKey struct {
+	_        structs.HostLayout
+	Policy   uint32
+	Ip       uint32
+	Port     uint16
+	Proto    uint8
+	HostBits uint8
+}
+
+type TcBpfRulePortKeyV6 struct {
+	_        structs.HostLayout
+	Policy   uint32
+	Ip       [16]uint8
+	Port     uint16
+	Proto    uint8
+	HostBits uint8
 }
 
 type TcBpfStepState struct {

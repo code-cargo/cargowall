@@ -38,11 +38,32 @@
 // Go definition by a layout test.
 #define DNS_PROXY_FW_MARK 0xCA12
 
+// ---- Rule policies ----
+//
+// The rule maps hold rules by policy as well as by address, so one set of
+// maps can carry more than one rule set. POLICY_JOB is the job's own rules.
+// An LPM key's prefix length counts the policy field's RULE_POLICY_BITS ahead
+// of the address bits, and every lookup asks for all of them: an entry can
+// only ever answer a lookup made under its own policy, a 0.0.0.0/0 rule
+// included. Port entries carry the policy in their key the same way.
+#define POLICY_JOB 0
+#define RULE_POLICY_BITS 32
+
+// What a policy's rules decide about a packet. RULE_NONE is no rule
+// deciding: no LPM match and no wildcard port, or a port-specific match
+// whose port is not listed and no wildcard. The default action is then the
+// caller's to apply.
+#define RULE_NONE  0
+#define RULE_DENY  1
+#define RULE_ALLOW 2
+
 // ---- IPv4 rule structs ----
 
-// LPM trie key for CIDR matching
-struct lpm_key {
+// LPM trie key for CIDR matching. prefixlen is RULE_POLICY_BITS plus the
+// rule's own prefix length.
+struct rule_key {
     __u32 prefixlen;  // Must be first member for LPM trie
+    __u32 policy;
     __u32 ip;
 } __attribute__((packed));
 
@@ -51,8 +72,8 @@ struct lpm_key {
 // host_bits is the address width the rule leaves open: 32 (128 for IPv6)
 // minus its prefix length, so 0 is a host route. A port-specific rule's
 // port entries are keyed by the rule's network address plus host_bits (see
-// port_key), and the LPM lookup returns only this value, not the key that
-// matched — host_bits is how the verdict recovers which prefix that was.
+// rule_port_key), and the LPM lookup returns only this value, not the key
+// that matched — host_bits is how the verdict recovers which prefix that was.
 struct lpm_val {
     __u8 action;      // 0 = deny, 1 = allow
     __u8 port_specific; // 0 = all ports, 1 = check port map
@@ -60,12 +81,14 @@ struct lpm_val {
     __u8 pad;
 } __attribute__((packed));
 
-// Key for port-specific rules: the owning rule's network address and
+// Key for port-specific rules: the owning rule's policy, network address and
 // host_bits (see lpm_val), so a subnet's entries are found from any address
 // inside it and a host route's from its own. The wildcard-port entries are
-// ip 0 / host_bits 0. For ICMP (proto=1) the port field is always 0; ICMP
-// has no L4 port, so the protocol byte alone discriminates the rule.
-struct port_key {
+// ip 0 / host_bits 0, under their policy. For ICMP (proto=1) the port field
+// is always 0; ICMP has no L4 port, so the protocol byte alone discriminates
+// the rule.
+struct rule_port_key {
+    __u32 policy;
     __u32 ip;
     __u16 port;
     __u8 proto;           // IPPROTO_TCP (6), IPPROTO_UDP (17), or IPPROTO_ICMP (1)
@@ -80,15 +103,17 @@ struct port_val {
 
 // ---- IPv6 rule structs ----
 
-// IPv6 LPM trie key (128-bit IP)
-struct lpm_key_v6 {
+// IPv6 LPM trie key (128-bit IP), its prefix counted as in rule_key.
+struct rule_key_v6 {
     __u32 prefixlen;
+    __u32 policy;
     __u8 ip[16];
 } __attribute__((packed));
 
-// IPv6 port key — the network address and host_bits of the owning rule, as
-// in port_key.
-struct port_key_v6 {
+// IPv6 port key — the policy, network address and host_bits of the owning
+// rule, as in rule_port_key.
+struct rule_port_key_v6 {
+    __u32 policy;
     __u8 ip[16];
     __u16 port;
     __u8 proto;           // IPPROTO_TCP (6) or IPPROTO_UDP (17)
@@ -108,7 +133,7 @@ struct {
 // LPM trie map for IPv4 CIDR-based allow/deny rules
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
-    __type(key, struct lpm_key);
+    __type(key, struct rule_key);
     __type(value, struct lpm_val);
     __uint(max_entries, 4096);
     __uint(map_flags, BPF_F_NO_PREALLOC);
@@ -117,7 +142,7 @@ struct {
 // Hash map for IPv4 port-specific rules
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct port_key);
+    __type(key, struct rule_port_key);
     __type(value, struct port_val);
     __uint(max_entries, 4096);
     __uint(map_flags, BPF_F_NO_PREALLOC);
@@ -126,7 +151,7 @@ struct {
 // LPM trie map for IPv6 CIDR-based allow/deny rules
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
-    __type(key, struct lpm_key_v6);
+    __type(key, struct rule_key_v6);
     __type(value, struct lpm_val);
     __uint(max_entries, 4096);
     __uint(map_flags, BPF_F_NO_PREALLOC);
@@ -135,7 +160,7 @@ struct {
 // Hash map for IPv6 port-specific rules
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct port_key_v6);
+    __type(key, struct rule_port_key_v6);
     __type(value, struct port_val);
     __uint(max_entries, 4096);
     __uint(map_flags, BPF_F_NO_PREALLOC);
@@ -191,146 +216,116 @@ static __always_inline void rule_net_v6(__u8 out[16], const __u8 ip[16], __u8 ho
     __builtin_memcpy(out + 8, &lo, 8);
 }
 
-// verdict_allowed_v4 returns 1 if a packet to dst (network byte order) on
-// dst_port (host order) / proto is allowed, 0 if denied. This is the exact
-// decision cw_tc_egress made inline before phase 3b: LPM rule match →
-// port-specific check → 0.0.0.0 wildcard port → default action. A no-LPM
-// match consults only the wildcard-port entry, never a specific-IP port —
-// preserving the original asymmetry. The port-specific check looks under
-// the MATCHED rule's network address, so a subnet rule's ports cover every
-// address inside it, not only the network address itself.
-static __always_inline __u8 verdict_allowed_v4(__u32 dst_ip_nbo, __u16 dst_port, __u8 proto) {
-    struct lpm_key key = {
-        .prefixlen = 32,
-        .ip = dst_ip_nbo
+// rule_result maps a matched entry's action byte onto a RULE_* result.
+static __always_inline int rule_result(__u8 action) {
+    return action == 1 ? RULE_ALLOW : RULE_DENY;
+}
+
+// default_allows reports the job's default action, for a packet no rule
+// decides: 1 for allow.
+static __always_inline __u8 default_allows(void) {
+    __u32 def_key = 0;
+    __u8 *default_action = bpf_map_lookup_elem(&map_default_action, &def_key);
+    return (default_action && *default_action == 1) ? 1 : 0;
+}
+
+// rules_v4 is what policy's rules decide about a packet to dst (network
+// byte order) on dst_port (host order) / proto: the LPM rule match, then,
+// for a port-specific rule, its port entry under the MATCHED rule's network
+// address, so a subnet rule's ports cover every address inside it, then the
+// 0.0.0.0 wildcard port. A no-LPM match consults only the wildcard-port
+// entry, never a specific-IP port. RULE_NONE leaves the default action to
+// the caller.
+//
+// A global function rather than an inlined one, so the verifier walks it
+// once however many times a hook asks it. Global functions date from 5.6,
+// under the 5.8 floor; before 5.12 one could take no pointer but its
+// program's context, hence the scalar arguments.
+__noinline int rules_v4(__u32 policy, __u32 dst_ip_nbo, __u32 dst_port, __u32 proto) {
+    struct rule_key key = {
+        .prefixlen = RULE_POLICY_BITS + 32,
+        .policy = policy,
+        .ip = dst_ip_nbo,
+    };
+    struct rule_port_key pkey = {
+        .policy = policy,
+        .port = (__u16)dst_port,
+        .proto = (__u8)proto,
     };
 
     struct lpm_val *rule = bpf_map_lookup_elem(&map_cidrs, &key);
-    __u8 decision_made = 0;
-    __u8 allowed = 0;
-
     if (rule) {
-        if (rule->port_specific == 0) {
-            decision_made = 1;
-            if (rule->action == 1) {
-                allowed = 1;
-            }
-        } else {
-            struct port_key pkey = {
-                .ip = rule_net_v4(dst_ip_nbo, rule->host_bits),
-                .port = dst_port,
-                .proto = proto,
-                .host_bits = rule->host_bits
-            };
-            struct port_val *pval = bpf_map_lookup_elem(&map_ports, &pkey);
-            if (pval) {
-                decision_made = 1;
-                if (pval->action == 1) {
-                    allowed = 1;
-                }
-            } else {
-                pkey.ip = 0;  // 0.0.0.0
-                pkey.host_bits = 0;
-                pval = bpf_map_lookup_elem(&map_ports, &pkey);
-                if (pval) {
-                    decision_made = 1;
-                    if (pval->action == 1) {
-                        allowed = 1;
-                    }
-                }
-            }
-        }
-    } else {
-        struct port_key pkey = {
-            .ip = 0,  // 0.0.0.0 wildcard
-            .port = dst_port,
-            .proto = proto,
-            .host_bits = 0
-        };
+        if (rule->port_specific == 0)
+            return rule_result(rule->action);
+        pkey.ip = rule_net_v4(dst_ip_nbo, rule->host_bits);
+        pkey.host_bits = rule->host_bits;
         struct port_val *pval = bpf_map_lookup_elem(&map_ports, &pkey);
-        if (pval) {
-            decision_made = 1;
-            if (pval->action == 1) {
-                allowed = 1;
-            }
-        }
+        if (pval)
+            return rule_result(pval->action);
+        pkey.ip = 0;  // 0.0.0.0
+        pkey.host_bits = 0;
     }
 
-    if (!decision_made) {
-        __u32 def_key = 0;
-        __u8 *default_action = bpf_map_lookup_elem(&map_default_action, &def_key);
-        if (default_action && *default_action == 1) {
-            allowed = 1;
-        }
+    struct port_val *wildcard = bpf_map_lookup_elem(&map_ports, &pkey);
+    if (wildcard)
+        return rule_result(wildcard->action);
+    return RULE_NONE;
+}
+
+// rules_v6 is the IPv6 analogue of rules_v4. The destination comes as its
+// two 8-byte halves, in network byte order, so the function keeps to scalar
+// arguments.
+__noinline int rules_v6(__u32 policy, __u64 dst_hi, __u64 dst_lo, __u32 dst_port, __u32 proto) {
+    struct rule_key_v6 key;
+    __builtin_memset(&key, 0, sizeof(key));
+    key.prefixlen = RULE_POLICY_BITS + 128;
+    key.policy = policy;
+    __builtin_memcpy(key.ip, &dst_hi, 8);
+    __builtin_memcpy(key.ip + 8, &dst_lo, 8);
+
+    struct rule_port_key_v6 pkey;
+    __builtin_memset(&pkey, 0, sizeof(pkey));
+    pkey.policy = policy;
+    pkey.port = (__u16)dst_port;
+    pkey.proto = (__u8)proto;
+
+    struct lpm_val *rule = bpf_map_lookup_elem(&map_cidrs_v6, &key);
+    if (rule) {
+        if (rule->port_specific == 0)
+            return rule_result(rule->action);
+        rule_net_v6(pkey.ip, key.ip, rule->host_bits);
+        pkey.host_bits = rule->host_bits;
+        struct port_val *pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
+        if (pval)
+            return rule_result(pval->action);
+        __builtin_memset(pkey.ip, 0, 16);
+        pkey.host_bits = 0;
     }
-    return allowed;
+
+    struct port_val *wildcard = bpf_map_lookup_elem(&map_ports_v6, &pkey);
+    if (wildcard)
+        return rule_result(wildcard->action);
+    return RULE_NONE;
+}
+
+// verdict_allowed_v4 returns 1 if a packet to dst (network byte order) on
+// dst_port (host order) / proto is allowed, 0 if denied: the job's rules,
+// then its default action where they do not decide.
+static __always_inline __u8 verdict_allowed_v4(__u32 dst_ip_nbo, __u16 dst_port, __u8 proto) {
+    int r = rules_v4(POLICY_JOB, dst_ip_nbo, dst_port, proto);
+    if (r == RULE_NONE)
+        return default_allows();
+    return r == RULE_ALLOW;
 }
 
 // verdict_allowed_v6 is the IPv6 analogue of verdict_allowed_v4, dst_ip6 in
 // network byte order.
 static __always_inline __u8 verdict_allowed_v6(const __u8 dst_ip6[16], __u16 dst_port, __u8 proto) {
-    struct lpm_key_v6 key;
-    __builtin_memset(&key, 0, sizeof(key));
-    key.prefixlen = 128;
-    __builtin_memcpy(key.ip, dst_ip6, 16);
-
-    struct lpm_val *rule = bpf_map_lookup_elem(&map_cidrs_v6, &key);
-    __u8 decision_made = 0;
-    __u8 allowed = 0;
-
-    if (rule) {
-        if (rule->port_specific == 0) {
-            decision_made = 1;
-            if (rule->action == 1) {
-                allowed = 1;
-            }
-        } else {
-            struct port_key_v6 pkey;
-            __builtin_memset(&pkey, 0, sizeof(pkey));
-            rule_net_v6(pkey.ip, dst_ip6, rule->host_bits);
-            pkey.port = dst_port;
-            pkey.proto = proto;
-            pkey.host_bits = rule->host_bits;
-
-            struct port_val *pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
-            if (pval) {
-                decision_made = 1;
-                if (pval->action == 1) {
-                    allowed = 1;
-                }
-            } else {
-                __builtin_memset(pkey.ip, 0, 16);
-                pkey.host_bits = 0;
-                pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
-                if (pval) {
-                    decision_made = 1;
-                    if (pval->action == 1) {
-                        allowed = 1;
-                    }
-                }
-            }
-        }
-    } else {
-        struct port_key_v6 pkey;
-        __builtin_memset(&pkey, 0, sizeof(pkey));
-        pkey.port = dst_port;
-        pkey.proto = proto;
-
-        struct port_val *pval = bpf_map_lookup_elem(&map_ports_v6, &pkey);
-        if (pval) {
-            decision_made = 1;
-            if (pval->action == 1) {
-                allowed = 1;
-            }
-        }
-    }
-
-    if (!decision_made) {
-        __u32 def_key = 0;
-        __u8 *default_action = bpf_map_lookup_elem(&map_default_action, &def_key);
-        if (default_action && *default_action == 1) {
-            allowed = 1;
-        }
-    }
-    return allowed;
+    __u64 hi, lo;
+    __builtin_memcpy(&hi, dst_ip6, 8);
+    __builtin_memcpy(&lo, dst_ip6 + 8, 8);
+    int r = rules_v6(POLICY_JOB, hi, lo, dst_port, proto);
+    if (r == RULE_NONE)
+        return default_allows();
+    return r == RULE_ALLOW;
 }

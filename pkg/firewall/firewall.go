@@ -274,11 +274,7 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 				// Don't add to LPM trie, only to port map
 				if rule.Value == "0.0.0.0/0" && len(portValues) > 0 {
 					for _, pp := range portValues {
-						portKey := bpf.TcBpfPortKey{
-							Ip:    0,
-							Port:  pp.Port,
-							Proto: pp.Proto,
-						}
+						portKey := bpf.RulePortKey(bpf.PolicyJob, 0, pp.Port, pp.Proto, 0)
 						portVal := bpf.TcBpfPortVal{
 							Action: actionVal,
 						}
@@ -302,10 +298,7 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 				// Special handling for ::/0 with specific ports
 				if rule.Value == "::/0" && len(portValues) > 0 {
 					for _, pp := range portValues {
-						portKey := bpf.TcBpfPortKeyV6{
-							Port:  pp.Port,
-							Proto: pp.Proto,
-						}
+						portKey := bpf.RulePortKeyV6(bpf.PolicyJob, [16]byte{}, pp.Port, pp.Proto, 0)
 						portVal := bpf.TcBpfPortVal{
 							Action: actionVal,
 						}
@@ -362,10 +355,7 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 	// the entries are keyed by (network address, host_bits) — ip4 is already
 	// the network address, net.ParseCIDR masks it.
 	hostBits := uint8(32 - prefixLen)
-	key := bpf.TcBpfLpmKey{
-		Prefixlen: prefixLen,
-		Ip:        ipUint32,
-	}
+	key := bpf.RuleKey(bpf.PolicyJob, prefixLen, ipUint32)
 	val := bpf.TcBpfLpmVal{
 		Action:       actionVal,
 		PortSpecific: 0,
@@ -375,12 +365,7 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 	if len(ports) > 0 {
 		val.PortSpecific = 1
 		for _, pp := range ports {
-			portKey := bpf.TcBpfPortKey{
-				Ip:       ipUint32,
-				Port:     pp.Port,
-				Proto:    pp.Proto,
-				HostBits: hostBits,
-			}
+			portKey := bpf.RulePortKey(bpf.PolicyJob, ipUint32, pp.Port, pp.Proto, hostBits)
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
 			}
@@ -413,9 +398,9 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 
 	// Keyed by (network address, host_bits), as in addCIDRv4.
 	hostBits := uint8(128 - prefixLen)
-	var key bpf.TcBpfLpmKeyV6
-	key.Prefixlen = prefixLen
-	copy(key.Ip[:], ip6)
+	var ip16 [16]byte
+	copy(ip16[:], ip6)
+	key := bpf.RuleKeyV6(bpf.PolicyJob, prefixLen, ip16)
 
 	val := bpf.TcBpfLpmVal{
 		Action:       actionVal,
@@ -426,11 +411,7 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 	if len(ports) > 0 {
 		val.PortSpecific = 1
 		for _, pp := range ports {
-			var portKey bpf.TcBpfPortKeyV6
-			copy(portKey.Ip[:], ip6)
-			portKey.Port = pp.Port
-			portKey.Proto = pp.Proto
-			portKey.HostBits = hostBits
+			portKey := bpf.RulePortKeyV6(bpf.PolicyJob, ip16, pp.Port, pp.Proto, hostBits)
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
 			}
@@ -555,10 +536,7 @@ func (f *FirewallImpl) AddIP(ip net.IP, action config.Action, ports []config.Por
 func (f *FirewallImpl) addIPv4Locked(ip4 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
 
-	key := bpf.TcBpfLpmKey{
-		Prefixlen: 32,
-		Ip:        ipUint32,
-	}
+	key := bpf.RuleKey(bpf.PolicyJob, 32, ipUint32)
 
 	var existingVal bpf.TcBpfLpmVal
 	ipExists := f.cidrsMap.Lookup(&key, &existingVal) == nil
@@ -618,11 +596,7 @@ func (f *FirewallImpl) writePortsV4(ipUint32 uint32, ipStr string, actionVal uin
 
 	var portsChanged bool
 	for _, pp := range ports {
-		portKey := bpf.TcBpfPortKey{
-			Ip:    ipUint32,
-			Port:  pp.Port,
-			Proto: pp.Proto,
-		}
+		portKey := bpf.RulePortKey(bpf.PolicyJob, ipUint32, pp.Port, pp.Proto, 0)
 		var existingPortVal bpf.TcBpfPortVal
 		if errLookup := f.portsMap.Lookup(&portKey, &existingPortVal); errLookup != nil || existingPortVal.Action != actionVal {
 			portsChanged = true
@@ -694,9 +668,9 @@ func (f *FirewallImpl) addIPv6Locked(ip6 net.IP, ipStr string, actionVal uint8, 
 		return false, nil
 	}
 
-	var key bpf.TcBpfLpmKeyV6
-	key.Prefixlen = 128
-	copy(key.Ip[:], ip6)
+	var ip16 [16]byte
+	copy(ip16[:], ip6)
+	key := bpf.RuleKeyV6(bpf.PolicyJob, 128, ip16)
 
 	var existingVal bpf.TcBpfLpmVal
 	ipExists := f.cidrsV6Map.Lookup(&key, &existingVal) == nil
@@ -711,7 +685,7 @@ func (f *FirewallImpl) addIPv6Locked(ip6 net.IP, ipStr string, actionVal uint8, 
 		f.ipPorts[ipStr] = st
 	}
 
-	portsChanged, err := f.writePortsV6(ip6, ipStr, actionVal, ports, st)
+	portsChanged, err := f.writePortsV6(ip16, ipStr, actionVal, ports, st)
 	if err != nil {
 		return false, err
 	}
@@ -730,7 +704,7 @@ func (f *FirewallImpl) addIPv6Locked(ip6 net.IP, ipStr string, actionVal uint8, 
 
 // writePortsV6 is the IPv6 twin of writePortsV4 — see it for the inert-port
 // skip, conflict warning, and disjoint-port rationale.
-func (f *FirewallImpl) writePortsV6(ip6 net.IP, ipStr string, actionVal uint8, ports []portProto, st *ipPortState) (bool, error) {
+func (f *FirewallImpl) writePortsV6(ip16 [16]byte, ipStr string, actionVal uint8, ports []portProto, st *ipPortState) (bool, error) {
 	if len(ports) == 0 {
 		st.recordAllPorts(actionVal)
 		return false, nil
@@ -742,10 +716,7 @@ func (f *FirewallImpl) writePortsV6(ip6 net.IP, ipStr string, actionVal uint8, p
 
 	var portsChanged bool
 	for _, pp := range ports {
-		var portKey bpf.TcBpfPortKeyV6
-		copy(portKey.Ip[:], ip6)
-		portKey.Port = pp.Port
-		portKey.Proto = pp.Proto
+		portKey := bpf.RulePortKeyV6(bpf.PolicyJob, ip16, pp.Port, pp.Proto, 0)
 		var existingPortVal bpf.TcBpfPortVal
 		if errLookup := f.portsV6Map.Lookup(&portKey, &existingPortVal); errLookup != nil || existingPortVal.Action != actionVal {
 			portsChanged = true
@@ -778,10 +749,7 @@ func (f *FirewallImpl) removeIPv4(ip4 net.IP, origIP net.IP) error {
 
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
 
-	key := bpf.TcBpfLpmKey{
-		Prefixlen: 32,
-		Ip:        ipUint32,
-	}
+	key := bpf.RuleKey(bpf.PolicyJob, 32, ipUint32)
 
 	if err := f.cidrsMap.Delete(&key); err != nil {
 		if !errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -792,11 +760,7 @@ func (f *FirewallImpl) removeIPv4(ip4 net.IP, origIP net.IP) error {
 	ipStr := origIP.String()
 	if st, exists := f.ipPorts[ipStr]; exists {
 		for _, pp := range st.ports {
-			portKey := bpf.TcBpfPortKey{
-				Ip:    ipUint32,
-				Port:  pp.Port,
-				Proto: pp.Proto,
-			}
+			portKey := bpf.RulePortKey(bpf.PolicyJob, ipUint32, pp.Port, pp.Proto, 0)
 			if err := f.portsMap.Delete(&portKey); err != nil {
 				if !errors.Is(err, ebpf.ErrKeyNotExist) {
 					f.logger.Debug("Failed to remove port entry",
@@ -817,9 +781,9 @@ func (f *FirewallImpl) removeIPv6(ip6 net.IP, origIP net.IP) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	var key bpf.TcBpfLpmKeyV6
-	key.Prefixlen = 128
-	copy(key.Ip[:], ip6)
+	var ip16 [16]byte
+	copy(ip16[:], ip6)
+	key := bpf.RuleKeyV6(bpf.PolicyJob, 128, ip16)
 
 	if err := f.cidrsV6Map.Delete(&key); err != nil {
 		if !errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -830,10 +794,7 @@ func (f *FirewallImpl) removeIPv6(ip6 net.IP, origIP net.IP) error {
 	ipStr := origIP.String()
 	if st, exists := f.ipPorts[ipStr]; exists {
 		for _, pp := range st.ports {
-			var portKey bpf.TcBpfPortKeyV6
-			copy(portKey.Ip[:], ip6)
-			portKey.Port = pp.Port
-			portKey.Proto = pp.Proto
+			portKey := bpf.RulePortKeyV6(bpf.PolicyJob, ip16, pp.Port, pp.Proto, 0)
 			if err := f.portsV6Map.Delete(&portKey); err != nil {
 				if !errors.Is(err, ebpf.ErrKeyNotExist) {
 					f.logger.Debug("Failed to remove v6 port entry",

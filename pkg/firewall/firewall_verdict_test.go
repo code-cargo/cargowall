@@ -148,6 +148,47 @@ func TestUpdateAllowlistTC_Verdict(t *testing.T) {
 				{"2001:db8:1:ffff::5", 22, verdictPass},
 			},
 		},
+		// A catch-all with ports has no LPM entry: its ports go straight in
+		// as wildcard entries, which the verdict finds at address 0 and
+		// host_bits 0 under any address.
+		{
+			name:  "IPv4 0.0.0.0/0 allow on one port",
+			def:   config.ActionDeny,
+			rules: []config.Rule{{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: tcp443, Action: config.ActionAllow}},
+			probes: []verdictProbe{
+				{"198.51.100.7", 443, verdictPass},
+				{"10.0.0.5", 443, verdictPass},
+				{"198.51.100.7", 22, verdictDrop},
+			},
+		},
+		{
+			name:  "IPv4 0.0.0.0/0 deny on one port under default allow",
+			def:   config.ActionAllow,
+			rules: []config.Rule{{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: tcp443, Action: config.ActionDeny}},
+			probes: []verdictProbe{
+				{"198.51.100.7", 443, verdictDrop},
+				{"198.51.100.7", 22, verdictPass},
+			},
+		},
+		{
+			name:  "IPv6 ::/0 allow on one port",
+			def:   config.ActionDeny,
+			rules: []config.Rule{{Type: config.RuleTypeCIDR, Value: "::/0", Ports: tcp443, Action: config.ActionAllow}},
+			probes: []verdictProbe{
+				{"2001:db8:9::1", 443, verdictPass},
+				{"2606:4700::1", 443, verdictPass},
+				{"2001:db8:9::1", 22, verdictDrop},
+			},
+		},
+		{
+			name:  "IPv6 ::/0 deny on one port under default allow",
+			def:   config.ActionAllow,
+			rules: []config.Rule{{Type: config.RuleTypeCIDR, Value: "::/0", Ports: tcp443, Action: config.ActionDeny}},
+			probes: []verdictProbe{
+				{"2001:db8:9::1", 443, verdictDrop},
+				{"2001:db8:9::1", 22, verdictPass},
+			},
+		},
 	}
 
 	for _, tt := range tests {

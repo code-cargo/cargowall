@@ -61,6 +61,9 @@ func TestIdentify(t *testing.T) {
 		{name: "longest", env: envArea("GITHUB_ACTION=" + strings.Repeat("a", maxStepIDLen)), want: step(strings.Repeat("a", maxStepIDLen))},
 		{name: "two entries", env: envArea("GITHUB_ACTION=a", "GITHUB_ACTION=b"), want: unknown},
 		{name: "prefix only", env: envArea("XGITHUB_ACTION=a", "GITHUB_ACTIONS=true"), want: runner},
+		// Past envLen the buffer holds whatever an older ring record left.
+		{name: "stale bytes past the area", env: envArea("HOME=/root", "GITHUB_ACTION=older"), envLen: len("HOME=/root\x00"), want: runner},
+		{name: "stale duplicate past the area", env: envArea("GITHUB_ACTION=build", "GITHUB_ACTION=older"), envLen: len("GITHUB_ACTION=build\x00"), want: step("build")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			n := tc.envLen

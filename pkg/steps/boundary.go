@@ -138,14 +138,13 @@ func (t *Tracker) run() {
 
 // reportLost reports the steps forked before cutoff whose exec or exit
 // event never came, with what /proc shows for the root by now: a lost
-// event's step must not vanish from the audit stream. It is unidentified:
-// /proc shows the root's environment as the step may since have rewritten
-// it.
+// event's step must not vanish from the audit stream. It is reported
+// unidentified, and not identified at all: /proc shows the root's
+// environment as the step may since have rewritten it. Should the exec
+// event come after all, it identifies the step then.
 func (t *Tracker) reportLost(cutoff time.Time) {
 	for _, b := range t.unreported(cutoff) {
-		id := Identity{Class: events.StepClassUnknown}
-		t.identified(b.ordinal, id)
-		t.reportStep(b, sanitizeCmdline(readCmdline(int(b.pid))), id)
+		t.reportStep(b, sanitizeCmdline(readCmdline(int(b.pid))), Identity{Class: events.StepClassUnknown})
 	}
 }
 
@@ -166,34 +165,42 @@ func (t *Tracker) handleStepEvent(raw []byte, now time.Time) {
 		}
 		ev := (*bpf.StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
 		t.recordBoundary(boundary{ordinal: ev.Ordinal, at: now, pid: ev.Tgid})
-	case bpf.StepBpfStepEventKindSTEP_EV_EXEC, bpf.StepBpfStepEventKindSTEP_EV_EXIT:
+	case bpf.StepBpfStepEventKindSTEP_EV_EXIT:
+		if len(raw) < int(unsafe.Sizeof(bpf.StepBpfStepChildEvent{})) {
+			return
+		}
+		ev := (*bpf.StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
+		if b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now); ok {
+			t.reportStep(b, sanitizeCmdline(t.workerCmdline), Identity{})
+		}
+	case bpf.StepBpfStepEventKindSTEP_EV_EXEC:
 		if len(raw) < int(unsafe.Sizeof(bpf.StepBpfStepExecEvent{})) {
 			return
 		}
+		// The record carries the step's environment and arguments, its
+		// secrets among them. Nothing taken from it below shares its
+		// memory, so it is wiped once read rather than left in the heap.
+		defer clear(raw)
 		ev := (*bpf.StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
-		exec := bpf.StepBpfStepEventKind(ev.Kind) == bpf.StepBpfStepEventKindSTEP_EV_EXEC
-		var id Identity
-		if exec {
-			id = identify(cBytes(ev.Env[:]), int(ev.EnvLen))
-			// The rest of the environment is the step's secrets: don't
-			// leave them in the heap.
-			clear(ev.Env[:])
-		}
+		id := identify(cBytes(ev.Env[:]), int(ev.EnvLen))
 		b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now)
+		t.identified(ev.Ordinal, id)
 		if !ok {
-			return // reported, and identified, as lost already
+			// Reported as lost already, unidentified: the kernel's copy
+			// came late, and still names the step.
+			t.logger.Info("Workflow step identified after it was reported",
+				"step_ordinal", ev.Ordinal,
+				"step_id", id.StepID,
+				"step_class", id.Class)
+			return
 		}
-		cmdline := t.workerCmdline
-		if exec {
-			t.identified(ev.Ordinal, id)
-			n := min(int(ev.ArgvLen), len(ev.Argv))
-			cmdline = formatCmdline(cBytes(ev.Argv[:n]), int(ev.ArgvLen) > len(ev.Argv))
-			if cmdline == "" {
-				// The kernel could not read the arguments: the program's
-				// name, from the same exec. /proc could by now show
-				// another exec, or another process on a reused pid.
-				cmdline = strings.TrimRight(string(cBytes(ev.Comm[:])), "\x00")
-			}
+		n := min(int(ev.ArgvLen), len(ev.Argv))
+		cmdline := formatCmdline(cBytes(ev.Argv[:n]), int(ev.ArgvLen) > len(ev.Argv))
+		if cmdline == "" {
+			// The kernel could not read the arguments: the program's
+			// name, from the same exec. /proc could by now show
+			// another exec, or another process on a reused pid.
+			cmdline = strings.TrimRight(string(cBytes(ev.Comm[:])), "\x00")
 		}
 		t.reportStep(b, sanitizeCmdline(cmdline), id)
 	}

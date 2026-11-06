@@ -35,7 +35,13 @@ var stepIDVar = []byte("GITHUB_ACTION=")
 // wrote.
 const maxStepIDLen = 256
 
-// Identity is what a step root's environment says it is.
+// Identity is what a step root's environment says it is: the step the
+// runner started the process for. It names that step and no other, but it
+// says nothing of the code the process runs. Steps of one job share a
+// user, the workspace and the runner's state between steps, so an earlier
+// step can shape what a later one runs. Policy keyed on it bounds what each
+// step reaches; between steps that don't trust each other, the boundary is
+// the job.
 type Identity struct {
 	StepID string           // the runner's name for the step; set only for events.StepClassStep
 	Class  events.StepClass // see events.StepClass

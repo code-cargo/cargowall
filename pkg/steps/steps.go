@@ -74,11 +74,14 @@ type Options struct {
 	// correlation happens downstream by matching step_boundary cmdlines,
 	// never by assuming ordinal == plan index.
 	OrdinalBase uint64
-	// OnIdentified, if set, is told each step's identity once: at its
-	// root's first exec, or as unknown when that exec's event was lost. It
-	// runs on the step-event reader, ahead of the step's report, while the
-	// root is still starting, and must not block. A root that exits
-	// without exec'ing is never identified.
+	// OnIdentified, if set, is told each step's identity once, when its
+	// root's first exec event is read, however late. It runs on the
+	// step-event reader, ahead of the step's report, and must not block.
+	// The step's program is already running by then: nothing orders the
+	// call ahead of the step's first connection. A step whose exec event
+	// never comes, and a root that exits without exec'ing, are never
+	// identified. Only events.StepClassStep identifies a step, and see
+	// Identity for what it does and doesn't vouch for.
 	OnIdentified func(ordinal uint32, id Identity)
 }
 

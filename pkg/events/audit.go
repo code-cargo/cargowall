@@ -155,16 +155,17 @@ const (
 
 // StepClass says what a step root is, by its environment as the kernel
 // read it at the root's first exec (pkg/steps). It rides step_boundary
-// events with StepID; policy keyed on step ids must treat anything but
-// StepClassStep as an unidentified step.
+// events with StepID. Policy keyed on step ids must treat anything but
+// StepClassStep as an unidentified step, and no class grants anything.
 type StepClass string
 
 const (
 	// StepClassStep: a workflow step; StepID is the runner's name for it.
 	StepClassStep StepClass = "step"
-	// StepClassRunner: a process Runner.Worker starts for itself, not for a
-	// step (the hashFiles() helper): its whole environment was read and
-	// names no step.
+	// StepClassRunner: the whole environment was read and names no step,
+	// as the runner's own helpers' environments (hashFiles()) don't. An
+	// observation, not a vouching: it confers nothing, and in particular
+	// no allowance meant for the runner's own traffic.
 	StepClassRunner StepClass = "runner"
 	// StepClassUnknown: the environment could not be read, or was cut
 	// before the step's name, or the exec event was lost.

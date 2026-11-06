@@ -40,14 +40,24 @@ const (
 
 // forkEvent encodes a step event as cw_step_fork streams it.
 func forkEvent(tgid, ordinal uint32) []byte {
+	return childEvent(evFork, tgid, ordinal)
+}
+
+// exitEvent encodes a step root's exit before any exec, as cw_step_exit
+// streams it.
+func exitEvent(tgid, ordinal uint32) []byte {
+	return childEvent(evExit, tgid, ordinal)
+}
+
+func childEvent(kind, tgid, ordinal uint32) []byte {
 	var buf bytes.Buffer
-	_ = binary.Write(&buf, binary.NativeEndian, bpf.StepBpfStepChildEvent{Kind: evFork, Tgid: tgid, Ordinal: ordinal})
+	_ = binary.Write(&buf, binary.NativeEndian, bpf.StepBpfStepChildEvent{Kind: kind, Tgid: tgid, Ordinal: ordinal})
 	return buf.Bytes()
 }
 
-// execEvent encodes a step event as cw_step_exec or cw_step_exit streams it:
-// argv is the bytes the kernel copied, argvLen the argument area's length,
-// comm the program's name. Its environment is unreadable.
+// execEvent encodes a step event as cw_step_exec streams it: argv is the
+// bytes the kernel copied, argvLen the argument area's length, comm the
+// program's name. Its environment is unreadable.
 func execEvent(kind, tgid, ordinal uint32, argv string, argvLen uint32, comm string) []byte {
 	return execEventEnv(kind, tgid, ordinal, argv, argvLen, comm, "", 0)
 }
@@ -135,14 +145,30 @@ func TestHandleStepEvent_IdentifiesTheStep(t *testing.T) {
 	tr.onIdentified = ids.record
 
 	env := "HOME=/home/runner\x00GITHUB_ACTION=build\x00SECRET=hunter2\x00"
-	raw := execEventEnv(evExec, 42, 7, "bash\x00", 5, "bash", env, uint32(len(env)))
+	argv := "curl\x00--oauth2-bearer\x00s3cret\x00"
+	raw := execEventEnv(evExec, 42, 7, argv, uint32(len(argv)), "curl", env, uint32(len(env)))
 	tr.handleStepEvent(raw, time.Unix(1000, 0))
 
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, "build", sink.events[0].StepID)
 	assert.Equal(t, events.StepClassStep, sink.events[0].StepClass)
+	assert.Equal(t, "curl --oauth2-bearer ...", sink.events[0].Process)
 	assert.Equal(t, []identified{{7, Identity{StepID: "build", Class: events.StepClassStep}, 0}}, ids.got)
 	assert.NotContains(t, string(raw), "hunter2")
+	assert.NotContains(t, string(raw), "s3cret")
+}
+
+// The record holds the whole of the kernel's copy, and past the
+// environment's length that is whatever an older record left in the ring:
+// another step's name, say. Only the environment's own bytes count.
+func TestHandleStepEvent_StaleBytesPastTheEnvironment(t *testing.T) {
+	tr, sink := newBoundaryTracker(t)
+	env := "HOME=/home/runner\x00"
+	stale := env + "GITHUB_ACTION=older-step\x00"
+	tr.handleStepEvent(execEventEnv(evExec, 42, 7, "node\x00", 5, "node", stale, uint32(len(env))), time.Unix(1000, 0))
+	require.Len(t, sink.events, 1)
+	assert.Equal(t, events.StepClassRunner, sink.events[0].StepClass)
+	assert.Empty(t, sink.events[0].StepID)
 }
 
 // What each other outcome reports, and tells OnIdentified.
@@ -178,7 +204,7 @@ func TestHandleStepEvent_ExitWithoutExecReportsWorker(t *testing.T) {
 	ids := &identities{sink: sink}
 	tr.onIdentified = ids.record
 	tr.handleStepEvent(forkEvent(43, 8), time.Unix(1000, 0))
-	tr.handleStepEvent(execEvent(evExit, 43, 8, "", 0, ""), time.Unix(1001, 0))
+	tr.handleStepEvent(exitEvent(43, 8), time.Unix(1001, 0))
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, sanitizeCmdline(tr.workerCmdline), sink.events[0].Process)
 	assert.True(t, sink.events[0].Timestamp.Equal(time.Unix(1000, 0)))
@@ -230,19 +256,23 @@ func TestReportLost_ReportsAStepWhoseEventNeverCame(t *testing.T) {
 	assert.Len(t, sink.events, 1)
 }
 
-// A lost step is identified once, as unknown, and its event, should it come
-// after all, changes nothing.
-func TestReportLost_IdentifiesAsUnknownOnce(t *testing.T) {
+// A step reported as lost is not identified then: /proc can't say which step
+// it is. Its exec event, should it come after all, identifies it, once,
+// without reporting the step again.
+func TestReportLost_LateExecStillIdentifies(t *testing.T) {
 	tr, sink := newBoundaryTracker(t)
 	ids := &identities{sink: sink}
 	tr.onIdentified = ids.record
 	forked := time.Unix(1000, 0)
 	tr.handleStepEvent(forkEvent(uint32(os.Getpid()), 12), forked)
 	tr.reportLost(forked.Add(reportAfter + time.Millisecond))
+	require.Len(t, sink.events, 1)
+	assert.Empty(t, ids.got)
 
 	env := "GITHUB_ACTION=build\x00"
 	tr.handleStepEvent(execEventEnv(evExec, uint32(os.Getpid()), 12, "late\x00", 5, "late", env, uint32(len(env))), forked.Add(time.Minute))
-	assert.Equal(t, []identified{{12, Identity{Class: events.StepClassUnknown}, 0}}, ids.got)
+	assert.Equal(t, []identified{{12, Identity{StepID: "build", Class: events.StepClassStep}, 1}}, ids.got)
+	assert.Len(t, sink.events, 1, "reported once")
 }
 
 func TestHandleStepEvent_IgnoresShortAndUnknownRecords(t *testing.T) {

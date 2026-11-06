@@ -96,7 +96,8 @@ const enum step_event_kind *btf_anchor_step_event_kind __attribute__((unused));
 
 // New-step notifications for the userspace reconciler, emitted once per new
 // direct child process of Runner.Worker, before the child runs user code
-// (STEP_EV_FORK). tgid is the child's pid as numbered in the daemon's
+// (STEP_EV_FORK), and again should the child exit before it execs
+// (STEP_EV_EXIT). tgid is the child's pid as numbered in the daemon's
 // namespace (0 if untranslatable).
 struct step_child_event {
     __u32 kind;
@@ -126,8 +127,9 @@ const struct step_child_event *btf_anchor_step_child_event __attribute__((unused
 // userspace takes the name and keeps nothing else. A fork event cannot
 // carry these: the child is still a copy of Runner.Worker. Nor can /proc,
 // whose read races the exec, and reads what the program may since have
-// rewritten. A root that exits without exec'ing reports STEP_EV_EXIT, with
-// none of them.
+// rewritten. A root that exits without exec'ing reports STEP_EV_EXIT in a
+// step_child_event, which has room for none of them, so an exit record
+// can't carry what an older record left in the ring.
 struct step_exec_event {
     __u32 kind;
     __u32 tgid;
@@ -141,11 +143,12 @@ struct step_exec_event {
 
 const struct step_exec_event *btf_anchor_step_exec_event __attribute__((unused));
 
-// Room for several exec events, each over STEP_ENV_MAX: steps start one
-// at a time, and a lost one is still reported (from /proc), unidentified.
+// Room for about 60 exec events, each over STEP_ENV_MAX, so a reader that
+// falls behind a burst of steps loses none; a lost one is still reported
+// (from /proc), unidentified. Allocated only with step attribution on.
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, 2 * 1024 * 1024);
 } map_step_events SEC(".maps");
 
 // Step roots between fork and their first exec: global tgid → ordinal.
@@ -279,34 +282,45 @@ int BPF_PROG(cw_step_fork, struct task_struct *child, __u64 clone_flags)
 // the leader's own exit has deleted it (userspace has it from the fork).
 static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid, __u32 kind)
 {
-    __u32 *ord = bpf_map_lookup_elem(&map_step_exec_pending, &tgid);
-    if (!ord)
+    __u32 *pending = bpf_map_lookup_elem(&map_step_exec_pending, &tgid);
+    if (!pending)
         return;
+    __u32 ord = *pending;
+    __u32 *ns = bpf_map_lookup_elem(&map_task_nspid, &tgid);
+    __u32 ns_tgid = ns ? *ns : 0;
+    if (kind == STEP_EV_EXIT) {
+        struct step_child_event *ev = bpf_ringbuf_reserve(&map_step_events, sizeof(*ev), 0);
+        if (ev) {
+            ev->kind = kind;
+            ev->tgid = ns_tgid;
+            ev->ordinal = ord;
+            bpf_ringbuf_submit(ev, 0);
+        }
+        bpf_map_delete_elem(&map_step_exec_pending, &tgid);
+        return;
+    }
     struct step_exec_event *ev = bpf_ringbuf_reserve(&map_step_events, sizeof(*ev), 0);
     if (ev) {
-        __u32 *ns = bpf_map_lookup_elem(&map_task_nspid, &tgid);
         ev->kind = kind;
-        ev->tgid = ns ? *ns : 0;
-        ev->ordinal = *ord;
+        ev->tgid = ns_tgid;
+        ev->ordinal = ord;
         __u64 len = 0, env_len = 0;
-        if (kind == STEP_EV_EXEC) {
-            __u64 start = BPF_CORE_READ(task, mm, arg_start);
-            __u64 end = BPF_CORE_READ(task, mm, arg_end);
-            if (end > start)
-                len = end - start;
-            __u64 n = len > STEP_ARGV_MAX ? STEP_ARGV_MAX : len;
-            if (bpf_probe_read_user(ev->argv, n, (const void *)start))
-                len = 0;
-            bpf_get_current_comm(ev->comm, sizeof(ev->comm));
+        __u64 start = BPF_CORE_READ(task, mm, arg_start);
+        __u64 end = BPF_CORE_READ(task, mm, arg_end);
+        if (end > start)
+            len = end - start;
+        __u64 n = len > STEP_ARGV_MAX ? STEP_ARGV_MAX : len;
+        if (bpf_probe_read_user(ev->argv, n, (const void *)start))
+            len = 0;
+        bpf_get_current_comm(ev->comm, sizeof(ev->comm));
 
-            start = BPF_CORE_READ(task, mm, env_start);
-            end = BPF_CORE_READ(task, mm, env_end);
-            if (end > start)
-                env_len = end - start;
-            n = env_len > STEP_ENV_MAX ? STEP_ENV_MAX : env_len;
-            if (bpf_probe_read_user(ev->env, n, (const void *)start))
-                env_len = 0;
-        }
+        start = BPF_CORE_READ(task, mm, env_start);
+        end = BPF_CORE_READ(task, mm, env_end);
+        if (end > start)
+            env_len = end - start;
+        n = env_len > STEP_ENV_MAX ? STEP_ENV_MAX : env_len;
+        if (bpf_probe_read_user(ev->env, n, (const void *)start))
+            env_len = 0;
         ev->argv_len = len > 0xffffffff ? 0xffffffff : len;
         ev->env_len = env_len > 0xffffffff ? 0xffffffff : env_len;
         bpf_ringbuf_submit(ev, 0);

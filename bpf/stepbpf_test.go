@@ -47,7 +47,8 @@ const (
 )
 
 // readStepEvent reads the next step event: its kind, and the event decoded
-// as the fork or the exec/exit struct its kind says it is.
+// as the struct its kind says it is: a fork or an exit is a child event,
+// exactly that size, and an exec an exec event.
 func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEvent, StepBpfStepExecEvent) {
 	t.Helper()
 	record, err := rd.Read()
@@ -57,11 +58,11 @@ func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEv
 	var fork StepBpfStepChildEvent
 	var execEv StepBpfStepExecEvent
 	switch kind := *(*uint32)(unsafe.Pointer(&raw[0])); kind {
-	case stepEvFork:
-		require.GreaterOrEqual(t, len(raw), int(unsafe.Sizeof(fork)))
+	case stepEvFork, stepEvExit:
+		require.Len(t, raw, int(unsafe.Sizeof(fork)))
 		fork = *(*StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
 		return kind, fork, execEv
-	case stepEvExec, stepEvExit:
+	case stepEvExec:
 		require.GreaterOrEqual(t, len(raw), int(unsafe.Sizeof(execEv)))
 		execEv = *(*StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
 		return kind, fork, execEv
@@ -93,7 +94,7 @@ func awaitStepEvent(t *testing.T, rd *ringbuf.Reader, kind, ordinal uint32,
 	for {
 		k, fork, execEv := readStepEvent(t, rd)
 		ord := fork.Ordinal
-		if k != stepEvFork {
+		if k == stepEvExec {
 			ord = execEv.Ordinal
 		}
 		t.Logf("step event: kind=%d ordinal=%d fork.tgid=%d exec.tgid=%d argv_len=%d", k, ord, fork.Tgid,
@@ -374,9 +375,10 @@ func TestStepExec_FirstExecOnly(t *testing.T) {
 			break
 		}
 		raw := record.RawSample
-		if len(raw) >= int(unsafe.Sizeof(StepBpfStepExecEvent{})) && *(*uint32)(unsafe.Pointer(&raw[0])) != stepEvFork {
-			ev := (*StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
-			require.NotEqual(t, first.Ordinal, ev.Ordinal, "a second event (kind %d) for the step", ev.Kind)
+		// Every kind carries its ordinal at the same offset.
+		if kind := *(*uint32)(unsafe.Pointer(&raw[0])); len(raw) >= 12 && kind != stepEvFork {
+			ord := *(*uint32)(unsafe.Pointer(&raw[8]))
+			require.NotEqual(t, first.Ordinal, ord, "a second event (kind %d) for the step", kind)
 		}
 	}
 }
@@ -532,12 +534,12 @@ func TestStepExit_WithoutExec(t *testing.T) {
 	_, err = stdin.Write([]byte("\n"))
 	require.NoError(t, err)
 	fork, _ := awaitStepEvent(t, rd, stepEvFork, 0, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool { return true })
-	_, exitEv := awaitStepEvent(t, rd, stepEvExit, fork.Ordinal, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool {
+	// An exit record has no room for an environment (readStepEvent pins its
+	// size), so it can't carry what an older exec record left in the ring.
+	exitEv, _ := awaitStepEvent(t, rd, stepEvExit, fork.Ordinal, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool {
 		return true
 	})
 	require.Equal(t, fork.Tgid, exitEv.Tgid)
-	require.Zero(t, exitEv.ArgvLen)
-	require.Zero(t, exitEv.EnvLen)
 }
 
 // readProcInt reads an integer /proc/sys value.

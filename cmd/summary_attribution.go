@@ -149,10 +149,11 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 	return idx
 }
 
-// foldRunnerHelpers moves the traffic of runner helpers — processes
-// Runner.Worker starts for itself, such as the hashFiles() helper, which
-// fork like steps but name none — into the runner tier, where the rest of
-// the runner's own traffic is, instead of leaving it posing as a step's.
+// foldRunnerHelpers moves the traffic of runner helpers — roots whose
+// whole environment names no step, as the hashFiles() helper's doesn't,
+// which fork like steps but are none — into the runner tier, where the
+// rest of the runner's own traffic is, instead of leaving it posing as a
+// step's. Reporting only: the class vouches for nothing.
 // It returns regular with those events' ordinals set to StepOrdinalRunner;
 // their boundaries keep the real ordinal, for the Step Attribution table.
 func foldRunnerHelpers(regular, stepBoundaries []events.AuditEvent) []events.AuditEvent {

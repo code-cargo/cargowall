@@ -67,6 +67,7 @@
 
 // Event flags (blocked_event.flags bit field)
 #define EVENT_FLAG_MIDSTREAM 0x1  // non-SYN TCP drop: established connection killed mid-stream
+#define EVENT_FLAG_STEP_TIER 0x2  // the job's rules decided nothing, and the socket's step's own were asked
 
 struct blocked_event {
     __u8 ip_version;   // 4 or 6
@@ -158,10 +159,10 @@ struct {
 // BTF) tags each such child with a monotonically increasing step ordinal;
 // every other fork inherits the forking thread's tag, so a step's entire
 // process subtree — including daemonized survivors — carries its ordinal.
-// The cgroup hooks below copy the tag onto each socket cookie at creation,
-// and TC embeds it in events. Attribution only: no verdict consults these
-// maps. Ordinals stay attached to userspace confidence/state via the
-// reconciler; the kernel only ever increments and copies.
+// The cgroup hooks copy the tag onto each socket cookie at creation and at
+// each connect or addressed send, and TC embeds it in events. The verdict reads a socket's tag only to find
+// its step's own allow rules (map_sock_step and map_step_policy, in
+// verdict.h); the kernel otherwise only ever increments and copies.
 
 // Reserved ordinal values. Documentation of the map value space only — no
 // BPF program compares against them; they are written and interpreted by
@@ -193,13 +194,8 @@ struct {
     __uint(max_entries, 32768);
 } map_task_step SEC(".maps");
 
-// socket cookie → step ordinal, written at socket creation/connect.
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, __u64);
-    __type(value, __u32);
-    __uint(max_entries, 65536);
-} map_sock_step SEC(".maps");
+// map_sock_step (socket cookie → step ordinal) lives in verdict.h, which
+// the verdict reads it through.
 
 // global tid → tgid as numbered in the daemon's pid namespace. Maintained
 // by stepbpf.c (fork/exit tracepoints plus the task iterator that seeds
@@ -226,9 +222,17 @@ static __always_inline __u32 sock_owner_pid(void) {
     return ns ? *ns : (__u32)(pid_tgid >> 32);
 }
 
-// Helper: copy the calling thread's step tag onto a socket cookie.
-// Shared by the connect/sendmsg hooks below (fallback for sockets created
-// before attach) and cw_cg_sock_new in stepbpf.c (primary path).
+// Helper: copy the calling thread's step tag onto a socket cookie, over
+// whatever tag it had. Shared by the connect/sendmsg hooks below and
+// cw_cg_sock_new in stepbpf.c: a socket's tag is the step of the thread
+// that last chose its destination (connect, or a send to an address), and
+// until one has, of the thread that created it. The verdict judges a
+// socket by its tag's step, so the step whose thread aimed it is the step
+// judged, never one whose socket it merely borrowed. Steps of one job that
+// share a socket (an unconnected UDP socket sent on by two steps' threads,
+// whose tags can cross between one's send and the other's packet) are
+// beyond it: they share a uid and the workspace, and the job is the
+// boundary between them.
 static __always_inline void step_tag_socket(__u64 cookie) {
     __u32 sk = 0;
     struct step_state *st = bpf_map_lookup_elem(&map_step_state, &sk);
@@ -306,8 +310,8 @@ static __always_inline void submit_event_v4(struct __sk_buff *skb, __u32 src_ip,
 
 // Helper: emit an IPv4 protocol-block event. dst_port carries the protocol
 // number (userspace keys on src_port==0 && dst_port<256 to decode it).
-static __always_inline void submit_protocol_block_v4(struct __sk_buff *skb, __u32 src_ip, __u32 dst_ip, __u8 ip_proto) {
-    submit_event_v4(skb, src_ip, dst_ip, 0, ip_proto, ip_proto, 0, 0);
+static __always_inline void submit_protocol_block_v4(struct __sk_buff *skb, __u32 src_ip, __u32 dst_ip, __u8 ip_proto, __u8 flags) {
+    submit_event_v4(skb, src_ip, dst_ip, 0, ip_proto, ip_proto, 0, flags);
 }
 
 // Helper: check if nexthdr is an IPv6 extension header
@@ -358,7 +362,7 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
     __u8 ip_proto = ip_hdr.protocol;
 
     if (ip_proto != IPPROTO_TCP && ip_proto != IPPROTO_UDP && ip_proto != IPPROTO_ICMP) {
-        submit_protocol_block_v4(skb, src_ip, dst_ip, ip_proto);
+        submit_protocol_block_v4(skb, src_ip, dst_ip, ip_proto, 0);
         return check_audit_or_block();
     }
 
@@ -421,15 +425,17 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
         }
     }
 
-    // The allow/deny decision (map_cidrs → map_ports → wildcard → default)
-    // is shared with cw_cg_egress via verdict.h.
-    __u8 allowed = verdict_allowed_v4(dst_ip_nbo, dst_port, ip_proto);
+    // The allow/deny decision (the job's rules, the socket's step's own,
+    // then the default) is shared with cw_cg_egress via verdict.h.
+    __u8 step_tier;
+    __u8 allowed = verdict_allowed_v4(skb, dst_ip_nbo, dst_port, ip_proto, &step_tier);
+    __u8 tier = step_tier ? EVENT_FLAG_STEP_TIER : 0;
 
     if (!allowed) {
         if (is_tcp_syn || ip_proto == IPPROTO_UDP) {
-            submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0, 0);
+            submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0, tier);
         } else if (ip_proto == IPPROTO_ICMP) {
-            submit_protocol_block_v4(skb, src_ip, dst_ip, ip_proto);
+            submit_protocol_block_v4(skb, src_ip, dst_ip, ip_proto, tier);
         } else if (is_tcp_midstream) {
             // Mid-stream TCP drop: an established connection killed because
             // its destination isn't allowed. Previously silent — invisible
@@ -437,14 +443,14 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
             // tuple; non-first fragments carry no L4 header, so they stay
             // silent as before (is_tcp_midstream is never set for them).
             if (midstream_should_emit(dst_ip_nbo, dst_port, ip_proto)) {
-                submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0, EVENT_FLAG_MIDSTREAM);
+                submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0, EVENT_FLAG_MIDSTREAM | tier);
             }
         }
         return check_audit_or_block();
     }
 
     if (is_tcp_syn) {
-        submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 1, 0);
+        submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 1, tier);
     }
     return TC_ACT_OK;
 }
@@ -559,24 +565,26 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
         }
     }
 
-    // The allow/deny decision (map_cidrs_v6 → map_ports_v6 → wildcard →
-    // default) is shared with cw_cg_egress via verdict.h.
-    __u8 allowed = verdict_allowed_v6(dst_ip6, dst_port, nexthdr);
+    // The allow/deny decision, shared with cw_cg_egress via verdict.h —
+    // see the IPv4 branch.
+    __u8 step_tier;
+    __u8 allowed = verdict_allowed_v6(skb, dst_ip6, dst_port, nexthdr, &step_tier);
+    __u8 tier = step_tier ? EVENT_FLAG_STEP_TIER : 0;
 
     if (!allowed) {
         if (is_tcp_syn || nexthdr == IPPROTO_UDP) {
-            submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0, 0);
+            submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0, tier);
         } else if (is_tcp_midstream) {
             // Mid-stream TCP drop — see the IPv4 branch for rationale.
             if (midstream_should_emit_v6(dst_ip6, dst_port, nexthdr)) {
-                submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0, EVENT_FLAG_MIDSTREAM);
+                submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0, EVENT_FLAG_MIDSTREAM | tier);
             }
         }
         return check_audit_or_block();
     }
 
     if (is_tcp_syn) {
-        submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 1, 0);
+        submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 1, tier);
     }
     return TC_ACT_OK;
 }

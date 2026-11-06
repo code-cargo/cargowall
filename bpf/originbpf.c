@@ -87,6 +87,8 @@
                                        // tcbpf.c, so kernel RST replies to inbound port
                                        // scans and SYN-ACK replies to inbound handshakes
                                        // are never reported as killed egress connections
+#define ORIGIN_FLAG_STEP_TIER 0x4      // the job's rules decided nothing, and the socket's
+                                       // step's own were asked (EVENT_FLAG_STEP_TIER at TC)
 
 // origin_event.verdict values — what this hook decided about the flow.
 #define ORIGIN_VERDICT_NONE        0  // observe mode: no verdict computed
@@ -523,6 +525,9 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
 
     __u8 allowed = 1;
     __u8 verdict = ORIGIN_VERDICT_NONE;
+    // Kept apart from flags, which the emission and L7 tests below compare
+    // whole; it joins them only in the record.
+    __u8 step_tier = 0;
     if (mode != ORIGIN_MODE_OBSERVE) {
         // Carve-out evaluated only when a verdict would be, so observe mode
         // never pays for it.
@@ -547,7 +552,7 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
                 // uncontested on any path TC does not cover.
                 allowed = 0;
             } else {
-                allowed = verdict_allowed_v4(ip_hdr.daddr, dst_port, ip_proto);
+                allowed = verdict_allowed_v4(skb, ip_hdr.daddr, dst_port, ip_proto, &step_tier);
             }
             verdict = verdict_label(mode, allowed);
             // Surface our own denials (dedup still applies), for exactly the
@@ -565,8 +570,8 @@ static __always_inline int origin_handle_v4(struct __sk_buff *skb, __u8 mode) {
 
     if (emit) {
         __u8 zero16[16] = {};
-        origin_emit(skb, 4, ip_proto, flags, verdict, src_ip, dst_ip, zero16, zero16,
-                    src_port, dst_port);
+        origin_emit(skb, 4, ip_proto, flags | (step_tier ? ORIGIN_FLAG_STEP_TIER : 0), verdict,
+                    src_ip, dst_ip, zero16, zero16, src_port, dst_port);
     }
 
     // L7 narrowing. l7_gate_open holds the rules; the carve-out is checked
@@ -718,6 +723,7 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
 
     __u8 allowed = 1;
     __u8 verdict = ORIGIN_VERDICT_NONE;
+    __u8 step_tier = 0;  // apart from flags, as in the IPv4 handler
     if (mode != ORIGIN_MODE_OBSERVE) {
         // Multicast, ::1, and ICMPv6 returned above, so a hit here is one
         // of the LOCAL classes (lo device / bridge-local) — same carve-out
@@ -732,7 +738,7 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
                 // unconditional allow.
                 allowed = 0;
             } else {
-                allowed = verdict_allowed_v6(dst_ip6, dst_port, nexthdr);
+                allowed = verdict_allowed_v6(skb, dst_ip6, dst_port, nexthdr, &step_tier);
             }
             verdict = verdict_label(mode, allowed);
             // Same denial-surfacing policy as the IPv4 branch: silent for
@@ -744,8 +750,8 @@ static __always_inline int origin_handle_v6(struct __sk_buff *skb, __u8 mode) {
     }
 
     if (emit) {
-        origin_emit(skb, 6, nexthdr, flags, verdict, 0, 0, src_ip6, dst_ip6,
-                    src_port, dst_port);
+        origin_emit(skb, 6, nexthdr, flags | (step_tier ? ORIGIN_FLAG_STEP_TIER : 0), verdict,
+                    0, 0, src_ip6, dst_ip6, src_port, dst_port);
     }
 
     // L7 narrowing — the v6 twin, same gate. l4_offset already points past the

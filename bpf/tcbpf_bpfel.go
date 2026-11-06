@@ -97,6 +97,7 @@ const (
 	TcBpfMapMapPortsV6            = "map_ports_v6"
 	TcBpfMapMapSockPid            = "map_sock_pid"
 	TcBpfMapMapSockStep           = "map_sock_step"
+	TcBpfMapMapStepPolicy         = "map_step_policy"
 	TcBpfMapMapStepState          = "map_step_state"
 	TcBpfMapMapTaskNspid          = "map_task_nspid"
 	TcBpfMapMapTaskStep           = "map_task_step"
@@ -107,6 +108,7 @@ const (
 	TcBpfProgCwTcEgress           = "cw_tc_egress"
 	TcBpfProgCwTcIngress          = "cw_tc_ingress"
 	TcBpfVarBtfAnchorBlockedEvent = "btf_anchor_blocked_event"
+	TcBpfVarStepRulesEnabled      = "step_rules_enabled"
 )
 
 // LoadTcBpf returns the embedded CollectionSpec for TcBpf.
@@ -174,6 +176,7 @@ type TcBpfMapSpecs struct {
 	MapPortsV6         *ebpf.MapSpec `ebpf:"map_ports_v6"`
 	MapSockPid         *ebpf.MapSpec `ebpf:"map_sock_pid"`
 	MapSockStep        *ebpf.MapSpec `ebpf:"map_sock_step"`
+	MapStepPolicy      *ebpf.MapSpec `ebpf:"map_step_policy"`
 	MapStepState       *ebpf.MapSpec `ebpf:"map_step_state"`
 	MapTaskNspid       *ebpf.MapSpec `ebpf:"map_task_nspid"`
 	MapTaskStep        *ebpf.MapSpec `ebpf:"map_task_step"`
@@ -184,6 +187,7 @@ type TcBpfMapSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type TcBpfVariableSpecs struct {
 	BtfAnchorBlockedEvent *ebpf.VariableSpec `ebpf:"btf_anchor_blocked_event"`
+	StepRulesEnabled      *ebpf.VariableSpec `ebpf:"step_rules_enabled"`
 }
 
 // TcBpfObjects contains all objects after they have been loaded into the kernel.
@@ -217,6 +221,7 @@ type TcBpfMaps struct {
 	MapPortsV6         *ebpf.Map `ebpf:"map_ports_v6"`
 	MapSockPid         *ebpf.Map `ebpf:"map_sock_pid"`
 	MapSockStep        *ebpf.Map `ebpf:"map_sock_step"`
+	MapStepPolicy      *ebpf.Map `ebpf:"map_step_policy"`
 	MapStepState       *ebpf.Map `ebpf:"map_step_state"`
 	MapTaskNspid       *ebpf.Map `ebpf:"map_task_nspid"`
 	MapTaskStep        *ebpf.Map `ebpf:"map_task_step"`
@@ -235,6 +240,7 @@ func (m *TcBpfMaps) Close() error {
 		m.MapPortsV6,
 		m.MapSockPid,
 		m.MapSockStep,
+		m.MapStepPolicy,
 		m.MapStepState,
 		m.MapTaskNspid,
 		m.MapTaskStep,
@@ -246,6 +252,7 @@ func (m *TcBpfMaps) Close() error {
 // It can be passed to LoadTcBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TcBpfVariables struct {
 	BtfAnchorBlockedEvent *ebpf.Variable `ebpf:"btf_anchor_blocked_event"`
+	StepRulesEnabled      *ebpf.Variable `ebpf:"step_rules_enabled"`
 }
 
 // TcBpfPrograms contains all programs after they have been loaded into the kernel.

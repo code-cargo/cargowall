@@ -49,4 +49,7 @@ const (
 	// RST replies to inbound port scans and SYN-ACK replies to inbound
 	// handshakes are never reported as killed egress connections.
 	OriginFlagTCPMidstream = 0x2
+	// OriginFlagStepTier marks a verdict for which the job's rules decided
+	// nothing and the own rules of the socket's step were asked.
+	OriginFlagStepTier = 0x4
 )

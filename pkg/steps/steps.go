@@ -20,7 +20,8 @@
 // monotonically increasing ordinal, every other fork inherits the forking
 // thread's tag, and the cgroup hooks copy the tag onto each socket cookie —
 // so every TC event carries the step that (transitively) created its socket.
-// Attribution only: no verdict consults these maps.
+// The verdict reads a socket's tag only to find its step's own allow
+// rules, through the step's policy binding (map_step_policy).
 //
 // Pid numbering: the kernel side keys everything by global (init-namespace)
 // ids; everything this package reads from /proc — the worker pid, the

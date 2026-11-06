@@ -76,7 +76,8 @@ type Options struct {
 	OrdinalBase uint64
 	// OnIdentified, if set, is told each step's identity once, when its
 	// root's first exec event is read, however late. It runs on the
-	// step-event reader, ahead of the step's report, and must not block.
+	// step-event reader, before the step's report unless the exec event
+	// comes too late for it, and must not block.
 	// The step's program is already running by then: nothing orders the
 	// call ahead of the step's first connection. A step whose exec event
 	// never comes, and a root that exits without exec'ing, are never

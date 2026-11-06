@@ -430,6 +430,7 @@ func TestOriginConstantsMatchBpfSource(t *testing.T) {
 		"ORIGIN_VERDICT_BLOCK":       uint64(VerdictBlock),
 		"ORIGIN_FLAG_TCP_SYN":        uint64(bpf.OriginFlagTCPSyn),
 		"ORIGIN_FLAG_TCP_MIDSTREAM":  uint64(bpf.OriginFlagTCPMidstream),
+		"ORIGIN_FLAG_STEP_TIER":      uint64(bpf.OriginFlagStepTier),
 		"ORIGIN_CFG_KEY_MODE":        uint64(cfgKeyMode),
 		"ORIGIN_CFG_KEY_LO_CARVEOUT": uint64(cfgKeyLoCarveout),
 	}

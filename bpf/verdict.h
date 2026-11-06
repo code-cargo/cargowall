@@ -24,7 +24,7 @@
 // packet parsing, event emission, and action constants (TC_ACT_* vs the
 // cgroup_skb 1/0 and the mode ladder), because those genuinely differ.
 //
-// The six maps below are declared identically here in whichever collection
+// The maps below are declared identically here in whichever collection
 // includes this header; userspace wires the non-owning collection's copies
 // to the owning collection's fds via ebpf MapReplacements (see
 // pkg/origin/origin.go), so all hooks read one set of kernel maps.
@@ -174,6 +174,40 @@ struct {
     __uint(max_entries, 1);
 } map_audit_mode SEC(".maps");
 
+// ---- Step policies ----
+//
+// A step's own allow rules live in the rule maps under a policy of their
+// own, never under POLICY_JOB. map_step_policy binds a step's ordinal to
+// that policy, written once, by userspace, when the step is identified, and
+// a socket finds its step's ordinal in map_sock_step, by the tag the process
+// that made it carried. An ordinal with no binding (not identified yet, or
+// never: a sentinel, a runner helper, an unknown step) and a socket with no
+// tag have no step policy, and the job's rules alone judge them.
+
+// Nonzero when some step has rules of its own. A load-time constant, so a
+// job without step rules runs no step lookup at all: at zero the verifier
+// prunes the branch.
+const volatile __u8 step_rules_enabled = 0;
+
+// socket cookie → step ordinal, written at socket creation (cw_cg_sock_new
+// in stepbpf.c, which declares the same map) and by the connect/sendmsg
+// fallbacks in tcbpf.c.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u64);
+    __type(value, __u32);
+    __uint(max_entries, 65536);
+} map_sock_step SEC(".maps");
+
+// step ordinal → the policy that holds the step's own allow rules.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 4096);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} map_step_policy SEC(".maps");
+
 // ---- Decision helpers ----
 
 // audit_mode_active reports whether the run is in audit (log-only) posture.
@@ -308,11 +342,39 @@ __noinline int rules_v6(__u32 policy, __u64 dst_hi, __u64 dst_lo, __u32 dst_port
     return RULE_NONE;
 }
 
+// step_policy_of is the policy holding the own rules of the step whose
+// process made the socket skb was sent from, or POLICY_JOB for none: no
+// socket, no tag, or no binding for the tag.
+static __always_inline __u32 step_policy_of(struct __sk_buff *skb) {
+    __u64 cookie = bpf_get_socket_cookie(skb);
+    if (!cookie)
+        return POLICY_JOB;
+    __u32 *ordinal = bpf_map_lookup_elem(&map_sock_step, &cookie);
+    if (!ordinal)
+        return POLICY_JOB;
+    __u32 *policy = bpf_map_lookup_elem(&map_step_policy, ordinal);
+    return policy ? *policy : POLICY_JOB;
+}
+
 // verdict_allowed_v4 returns 1 if a packet to dst (network byte order) on
-// dst_port (host order) / proto is allowed, 0 if denied: the job's rules,
-// then its default action where they do not decide.
-static __always_inline __u8 verdict_allowed_v4(__u32 dst_ip_nbo, __u16 dst_port, __u8 proto) {
+// dst_port (host order) / proto is allowed, 0 if denied. The job's rules
+// decide first. Where they decide nothing, the own rules of the step whose
+// process made the socket may allow it, and the job's default action
+// decides the rest. A step's rules only ever turn the job's silence into an
+// allow, never into a deny, whatever the maps hold, so a step gets all the
+// job gets and never less. *step_tier is set when a step's rules were asked.
+static __always_inline __u8 verdict_allowed_v4(struct __sk_buff *skb, __u32 dst_ip_nbo,
+                                               __u16 dst_port, __u8 proto, __u8 *step_tier) {
+    *step_tier = 0;
     int r = rules_v4(POLICY_JOB, dst_ip_nbo, dst_port, proto);
+    if (r == RULE_NONE && step_rules_enabled) {
+        __u32 policy = step_policy_of(skb);
+        if (policy != POLICY_JOB) {
+            *step_tier = 1;
+            if (rules_v4(policy, dst_ip_nbo, dst_port, proto) == RULE_ALLOW)
+                return 1;
+        }
+    }
     if (r == RULE_NONE)
         return default_allows();
     return r == RULE_ALLOW;
@@ -320,11 +382,21 @@ static __always_inline __u8 verdict_allowed_v4(__u32 dst_ip_nbo, __u16 dst_port,
 
 // verdict_allowed_v6 is the IPv6 analogue of verdict_allowed_v4, dst_ip6 in
 // network byte order.
-static __always_inline __u8 verdict_allowed_v6(const __u8 dst_ip6[16], __u16 dst_port, __u8 proto) {
+static __always_inline __u8 verdict_allowed_v6(struct __sk_buff *skb, const __u8 dst_ip6[16],
+                                               __u16 dst_port, __u8 proto, __u8 *step_tier) {
     __u64 hi, lo;
     __builtin_memcpy(&hi, dst_ip6, 8);
     __builtin_memcpy(&lo, dst_ip6 + 8, 8);
+    *step_tier = 0;
     int r = rules_v6(POLICY_JOB, hi, lo, dst_port, proto);
+    if (r == RULE_NONE && step_rules_enabled) {
+        __u32 policy = step_policy_of(skb);
+        if (policy != POLICY_JOB) {
+            *step_tier = 1;
+            if (rules_v6(policy, hi, lo, dst_port, proto) == RULE_ALLOW)
+                return 1;
+        }
+    }
     if (r == RULE_NONE)
         return default_allows();
     return r == RULE_ALLOW;

@@ -332,6 +332,16 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		"map_ports_v6":       tcObjs.MapPortsV6,
 		"map_default_action": tcObjs.MapDefaultAction,
 		"map_audit_mode":     tcObjs.MapAuditMode,
+		// A socket's step policy: its step tag and the tag's binding.
+		"map_sock_step":   tcObjs.MapSockStep,
+		"map_step_policy": tcObjs.MapStepPolicy,
+	}
+	// tcbpf's tag map is shrunk where step attribution is off; the stand-in
+	// takes its size, or the replacement is refused.
+	spec.Maps[bpf.OriginBpfMapMapSockStep].MaxEntries = tcObjs.MapSockStep.MaxEntries()
+	// Built as TC was, so the two hooks prune or ask the step tier together.
+	if err := bpf.SetStepRules(spec, tcObjs.StepRules()); err != nil {
+		return nil, fmt.Errorf("failed to set the step-rules gate: %w", err)
 	}
 	if scope.Limited() {
 		// Set before load, with the map it reads: the program never judges,

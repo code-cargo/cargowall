@@ -704,9 +704,22 @@ func TestDNSProxyFWMarkMatchesGoConstant(t *testing.T) {
 // backstop is a security bug, so every tuple must produce the same
 // allow/deny from both — despite different parse paths (TC starts at the
 // Ethernet header, cgroup at L3) and inverted action constants.
+//
+// It runs twice, with the step-rules gate off and on: with no step bound to
+// a policy the step tier finds none, so the gate alone must change no
+// verdict.
 func TestVerdictParityWithTcEgress(t *testing.T) {
 	requireBPF(t)
-	tcObjs := loadBPFObjects(t)
+	off := verdictParity(t, false)
+	on := verdictParity(t, true)
+	require.Equal(t, off, on, "the step-rules gate alone changed a verdict")
+}
+
+// verdictParity runs the parity cases with the step-rules gate as asked and
+// returns each case's verdict.
+func verdictParity(t *testing.T, stepRules bool) map[string]bool {
+	t.Helper()
+	tcObjs := loadBPFObjectsStepRules(t, stepRules)
 	originObjs := loadOriginObjectsSharing(t, tcObjs)
 
 	// One policy, written once, read by both programs through the shared maps.
@@ -783,8 +796,9 @@ func TestVerdictParityWithTcEgress(t *testing.T) {
 		{"ARP (non-IP)", craftARP(t)},
 	}
 
+	verdicts := make(map[string]bool, len(cases))
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(fmt.Sprintf("step rules %v/%s", stepRules, tc.name), func(t *testing.T) {
 			tcRet, _, err := tcObjs.CwTcEgress.Test(tc.packet)
 			require.NoError(t, err)
 			cgRet, _, err := originObjs.CwCgEgress.Test(tc.packet)
@@ -795,18 +809,24 @@ func TestVerdictParityWithTcEgress(t *testing.T) {
 			cgAllowed := cgRet == 1
 			require.Equal(t, tcAllowed, cgAllowed,
 				"cw_tc_egress and cw_cg_egress disagree (tc=%d cgroup=%d)", tcRet, cgRet)
+			verdicts[tc.name] = tcAllowed
 		})
 	}
+	return verdicts
 }
 
 // loadOriginObjectsSharing loads the origin collection against the tcbpf
-// collection's rule maps — the same MapReplacements wiring pkg/origin uses
-// in production, which also pins that the two collections' map specs stay
-// compatible (a shape or size drift fails the load here).
+// collection's rule and step-policy maps, built with tcbpf's step-rules
+// gate — the same wiring pkg/origin uses in production, which also pins
+// that the two collections' map specs stay compatible (a shape or size
+// drift fails the load here).
 func loadOriginObjectsSharing(t *testing.T, tcObjs *TcBpfObjects) *OriginBpfObjects {
 	t.Helper()
+	spec, err := LoadOriginBpf()
+	require.NoError(t, err)
+	require.NoError(t, SetStepRules(spec, tcObjs.StepRules()))
 	var objs OriginBpfObjects
-	require.NoError(t, LoadOriginBpfObjects(&objs, &ebpf.CollectionOptions{
+	require.NoError(t, spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
 		MapReplacements: map[string]*ebpf.Map{
 			"map_cidrs":          tcObjs.MapCidrs,
 			"map_ports":          tcObjs.MapPorts,
@@ -814,6 +834,8 @@ func loadOriginObjectsSharing(t *testing.T, tcObjs *TcBpfObjects) *OriginBpfObje
 			"map_ports_v6":       tcObjs.MapPortsV6,
 			"map_default_action": tcObjs.MapDefaultAction,
 			"map_audit_mode":     tcObjs.MapAuditMode,
+			"map_sock_step":      tcObjs.MapSockStep,
+			"map_step_policy":    tcObjs.MapStepPolicy,
 		},
 	}), "origin collection must load against the tcbpf rule maps")
 	t.Cleanup(func() { objs.Close() })

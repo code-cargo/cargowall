@@ -802,21 +802,32 @@ to select policy with.
   upstream socket is mark-exempt). Accepted because the alternative rests
   on the unfit signal above; revisit only with a genuinely causal
   mechanism, none of which is currently known.
-- *Per-step tightness is planned at the connection verdict* — future work,
-  none of it exists yet. `verdict.h`'s maps and key structs have no step
-  dimension, and the enforcing hook does not read `map_sock_step`.
-  Constraints that phase must resolve, recorded now so they aren't
-  rediscovered in review: (a) step-keyed rules mean re-keying the rule maps
-  and every writer; (b) the "one decision, parity-tested" invariant above
-  must be renegotiated, because a socket-keyed verdict is computable only
-  at the cgroup hook — post-NAT TC has no socket — so parity would scope to
-  the run-wide baseline with TC remaining the run-wide backstop (the
-  existing degradation posture); (c) selection semantics follow the tagging
-  model: sockets and container processes keep their *creating* step's tag,
-  so a service container started in step 2 is governed by step 2's policy
-  for its lifetime unless re-tagged by exec — per-step policy means "the
-  policy of the step that created it", not "the step active now"; (d) the
-  denial UX above applies — UDP fails fast with `EPERM`, TCP times out.
+- *Per-step rules live at the connection verdict.* A step may carry allow
+  rules of its own, added to the job's; mode and default action stay the
+  job's. The rule maps hold rules by policy (policy 0 is the job's), and a
+  step's own rules sit under a policy bound to its ordinal in
+  `map_step_policy`, once, when the step is identified. Both hooks decide
+  the same way (`verdict_allowed_v4`/`_v6` in `verdict.h`): the job's
+  rules first; where they decide nothing (no match, or a port-specific
+  match whose port is not listed), the rules of the step whose process made
+  the socket, read through its tag in `map_sock_step` and the tag's
+  binding, may allow; the job's default action decides the rest. A step's
+  rules can only turn the job's silence into an allow, never into a deny,
+  so a step gets all the job gets and never less, and anything with no
+  step policy — an untagged socket, a sentinel or unbound ordinal, a step
+  not yet identified — gets the job's rules alone: every gap is
+  fail-closed. Explicit job denies hold for every step. A load-time
+  constant (`step_rules_enabled`) prunes the step lookup from both hooks
+  when no step has rules; the data plane is in place, and until the
+  policy's own `steps` arrive nothing turns it on or binds a step. What follows from the tagging model: sockets and
+  container processes keep their *creating* step's tag, so a service
+  container started in step 2 is governed by step 2's policy for its
+  lifetime unless re-tagged by exec — "the policy of the step that created
+  it", not "the step active now". Parity: both hooks read the same tag for
+  the same socket, but TC sees a container's packets post-NAT with no
+  socket, so there it judges them by the job's rules; per-step rules reach
+  container traffic at the cgroup hook. The denial UX above applies — UDP
+  fails fast with `EPERM`, TCP times out.
 
 **Follow-ups deliberately NOT adopted as written** (each has a verified
 flaw; redesign before building):

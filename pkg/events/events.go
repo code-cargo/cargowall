@@ -110,6 +110,11 @@ func (n *NotificationTracker) SendNotification(hostname, ip string, port uint16)
 // EVENT_FLAG_MIDSTREAM in tcbpf.c.
 const BpfEventFlagMidstream = 0x1
 
+// BpfEventFlagStepTier marks a verdict for which the job's rules decided
+// nothing and the own rules of the socket's step were asked. Mirrors
+// EVENT_FLAG_STEP_TIER in tcbpf.c.
+const BpfEventFlagStepTier = 0x2
+
 // BpfBlockedEvent matches the struct in tcbpf.c
 type BpfBlockedEvent struct {
 	IpVersion   uint8

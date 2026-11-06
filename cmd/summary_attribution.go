@@ -65,6 +65,11 @@ const resolveRoundingSlack = 2 * time.Second
 // would hand the window tie-breaker synthetic evidence — Run resolves
 // BEFORE backfillStepCompletion for exactly this reason.
 //
+// Timing is the fallback. A boundary whose step id a step's context name
+// matches resolves to that step (stepIndexByID), with no timing at all;
+// only the boundaries that leaves, from older logs or older actions,
+// are placed by time. Both kinds move the same cursor.
+//
 // A runner helper's boundary (hashFiles()) is no step's, and takes no part.
 func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep) map[uint32]int {
 	var boundaries []events.AuditEvent
@@ -80,6 +85,11 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 	idx := make(map[uint32]int)
 	prev := -1
 	for _, b := range boundaries {
+		if i := stepIndexByID(steps, b, prev); i >= 0 {
+			idx[b.StepOrdinal] = i
+			prev = max(prev, i)
+			continue
+		}
 		best := -1
 		for i := prev + 1; i < len(steps); i++ {
 			if steps[i].StartedAt.IsZero() || steps[i].StartedAt.After(b.Timestamp) {
@@ -116,8 +126,8 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 		//    and systematically shift attribution one step left. Inside
 		//    this shared band timestamps cannot distinguish a composite's
 		//    final block from the next step's early fork; next-wins is
-		//    the deliberate choice until cmdline correlation (#103) can
-		//    tell them apart.
+		//    the deliberate choice. A step id tells them apart, which is
+		//    why a boundary with one never gets here.
 		if best == -1 && nearNext {
 			best = nextIdx
 		}
@@ -147,6 +157,32 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 		}
 	}
 	return idx
+}
+
+// stepIndexByID is the step a boundary's step id names, or -1 when the
+// boundary has none or no step carries it as its context name. Context
+// names are unique within a job, except that an action's post step
+// carries its main step's: the first match at or after the cursor is the
+// one running now, so the main step's processes go to the main step and
+// the post step's, forked after later steps ran, to the post step. With
+// no match from the cursor on, the nearest earlier one still names the
+// right step.
+func stepIndexByID(steps []GitHubStep, b events.AuditEvent, prev int) int {
+	if b.StepClass != events.StepClassStep || b.StepID == "" {
+		return -1
+	}
+	from := max(prev, 0)
+	for i := from; i < len(steps); i++ {
+		if steps[i].ContextName == b.StepID {
+			return i
+		}
+	}
+	for i := from - 1; i >= 0; i-- {
+		if steps[i].ContextName == b.StepID {
+			return i
+		}
+	}
+	return -1
 }
 
 // foldRunnerHelpers moves the traffic of runner helpers — roots whose

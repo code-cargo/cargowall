@@ -46,7 +46,7 @@ type SummaryCmd struct {
 	Version string `kong:"-"` // Version passed from main
 
 	AuditLog string `help:"Path to audit log JSON file" required:""`
-	Steps    string `help:"JSON array of step timing from GitHub API" required:""`
+	Steps    string `help:"JSON array of the job's steps: name, times and, where known, context_name" required:""`
 
 	// API push flags (optional — skip API push if api-url is not set)
 	ApiUrl        string `help:"CodeCargo API URL for pushing results" name:"api-url"`
@@ -61,12 +61,18 @@ type SummaryCmd struct {
 	output io.Writer // overridable for testing; defaults to os.Stdout
 }
 
-// GitHubStep represents a step from the GitHub API
+// GitHubStep is one step of the job as the action reports it.
 type GitHubStep struct {
 	Name        string    `json:"name"`
 	Number      int       `json:"number"`
 	StartedAt   time.Time `json:"started_at"`
 	CompletedAt time.Time `json:"completed_at"`
+	// ContextName is the runner's name for the step, the GITHUB_ACTION its
+	// processes carry: a main step's own, and an action's post step its
+	// main step's. Empty where the action doesn't know it (older actions,
+	// pre steps). It comes from the Worker log, which any step can write
+	// to, so it only names steps in reports.
+	ContextName string `json:"context_name,omitempty"`
 }
 
 // StepEvents groups events by step

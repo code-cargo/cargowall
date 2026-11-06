@@ -231,6 +231,38 @@ step_identity() {
     FAILED=true
   fi
 
+  # Given steps with context names, the summary names each step by its id,
+  # whatever the timings say. Here every step starts in the same second,
+  # and the skipped step is listed among them, which is what shifts the
+  # names timing gives.
+  local at steps table
+  at=$(jq -r -s '[.[] | select(.event_type == "step_boundary" and .step_id == "identity-named")][0].timestamp
+    | sub("\\.[0-9]+"; "")' "$AUDIT_LOG")
+  steps=$(jq -nc --arg at "$at" '[
+    {name: "Step identity, named", context_name: "identity-named", started_at: $at},
+    {name: "Step identity, skipped", started_at: $at},
+    {name: "Step identity, composite", context_name: "identity-composite", started_at: $at},
+    {name: "Step identity, behind hashFiles()", context_name: "identity-hashfiles", started_at: $at}]')
+  table=$(./bin/cargowall summary --audit-log "$AUDIT_LOG" --steps "$steps" | sed -n '/^### Step Attribution/,$p')
+  echo "$table"
+  named() {
+    local got
+    got=$(grep -cF "| \`$1\` | $2 |" <<<"$table" || true)
+    if [ "$got" -ne "$3" ]; then
+      echo "❌ $1 is named \"$2\" in $got rows, want $3"
+      FAILED=true
+    else
+      echo "✅ $1 is named \"$2\""
+    fi
+  }
+  named identity-named "Step identity, named" 1
+  named identity-composite "Step identity, composite" 2
+  named identity-hashfiles "Step identity, behind hashFiles()" 1
+  if grep -qF "Step identity, skipped" <<<"$table"; then
+    echo "❌ the skipped step names a step that ran"
+    FAILED=true
+  fi
+
   if [ "$FAILED" = true ]; then
     exit 1
   fi

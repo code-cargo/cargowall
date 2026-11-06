@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -471,6 +472,111 @@ func TestSummary_ResolveOrdinalSteps_InterStepGapBoundaryStaysUnresolved(t *test
 	_, resolved := idx[2]
 	assert.False(t, resolved, "gap boundary maps to neither neighbor")
 	assert.Equal(t, 1, idx[3], "later mappings must not shift")
+}
+
+// With context names, a boundary's step id names its step whatever the
+// timings say: here every main step starts in the same second, and a
+// skipped step the action still listed sits among them, which is what
+// shifts timing.
+func TestSummary_ResolveOrdinalSteps_ByStepID(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) time.Time { return base.Add(d) }
+	steps := []GitHubStep{
+		{Name: "Run actions/checkout", ContextName: "__actions_checkout", StartedAt: at(0)},
+		{Name: "Start CargoWall", ContextName: "__code-cargo_cargowall-action", StartedAt: at(0)},
+		{Name: "Named", ContextName: "named", StartedAt: at(time.Second)},
+		{Name: "Skipped", StartedAt: at(time.Second)},
+		{Name: "Composite", ContextName: "composite", StartedAt: at(time.Second)},
+		{Name: "Same name", ContextName: "__run", StartedAt: at(time.Second)},
+		{Name: "Same name", ContextName: "__run_2", StartedAt: at(time.Second)},
+		{Name: "Post Run actions/checkout", ContextName: "__actions_checkout", StartedAt: at(2 * time.Second)},
+		{Name: "Post Start CargoWall", ContextName: "__code-cargo_cargowall-action", StartedAt: at(2 * time.Second)},
+	}
+	boundary := func(ord uint32, d time.Duration, id string) events.AuditEvent {
+		return events.AuditEvent{
+			EventType: events.EventStepBoundary, StepOrdinal: ord, Timestamp: at(d),
+			StepID: id, StepClass: events.StepClassStep,
+		}
+	}
+	boundaries := []events.AuditEvent{
+		boundary(1, 1200*time.Millisecond, "named"),
+		boundary(2, 1300*time.Millisecond, "composite"),
+		{EventType: events.EventStepBoundary, StepOrdinal: 3, Timestamp: at(1400 * time.Millisecond), StepClass: events.StepClassRunner},
+		boundary(4, 1500*time.Millisecond, "composite"),
+		boundary(5, 1600*time.Millisecond, "__run"),
+		boundary(6, 1700*time.Millisecond, "__run_2"),
+		boundary(7, 2100*time.Millisecond, "__actions_checkout"),
+		boundary(8, 2200*time.Millisecond, "__code-cargo_cargowall-action"),
+	}
+	want := map[uint32]int{1: 2, 2: 4, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8}
+	assert.Equal(t, want, resolveOrdinalSteps(boundaries, steps),
+		"each id names its step, the composite's two roots one step, and a post step's root the post step")
+
+	timed := slices.Clone(steps)
+	for i := range timed {
+		timed[i].ContextName = ""
+	}
+	assert.NotEqual(t, want, resolveOrdinalSteps(boundaries, timed), "the same timings alone get it wrong")
+}
+
+// Boundaries an id resolves and boundaries timing places share the cursor:
+// one with no id (a lost identity, an older log) is placed by time among
+// the steps after the last one an id named, and an id no step carries
+// falls back to time too.
+func TestSummary_ResolveOrdinalSteps_IDAndTimingShareTheCursor(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	steps := []GitHubStep{
+		{Name: "a", ContextName: "a", StartedAt: base, CompletedAt: base.Add(10 * time.Second)},
+		{Name: "b", ContextName: "b", StartedAt: base.Add(10 * time.Second), CompletedAt: base.Add(20 * time.Second)},
+		{Name: "c", StartedAt: base.Add(20 * time.Second), CompletedAt: base.Add(30 * time.Second)},
+		{Name: "d", ContextName: "d", StartedAt: base.Add(30 * time.Second)},
+	}
+	boundaries := []events.AuditEvent{
+		{EventType: events.EventStepBoundary, StepOrdinal: 1, Timestamp: base.Add(time.Second), StepID: "a", StepClass: events.StepClassStep},
+		{EventType: events.EventStepBoundary, StepOrdinal: 2, Timestamp: base.Add(12 * time.Second), StepClass: events.StepClassUnknown},
+		{EventType: events.EventStepBoundary, StepOrdinal: 3, Timestamp: base.Add(21 * time.Second), StepID: "not-listed", StepClass: events.StepClassStep},
+		{EventType: events.EventStepBoundary, StepOrdinal: 4, Timestamp: base.Add(31 * time.Second), StepID: "d", StepClass: events.StepClassStep},
+	}
+	assert.Equal(t, map[uint32]int{1: 0, 2: 1, 3: 2, 4: 3}, resolveOrdinalSteps(boundaries, steps))
+}
+
+// A post step the action didn't list still carries its main step's id;
+// it names that main step, and the cursor stays where it was.
+func TestSummary_ResolveOrdinalSteps_IDOfAnEarlierStep(t *testing.T) {
+	steps := []GitHubStep{{Name: "a", ContextName: "a"}, {Name: "b", ContextName: "b"}, {Name: "c", ContextName: "c"}}
+	boundary := func(ord uint32, id string) events.AuditEvent {
+		return events.AuditEvent{EventType: events.EventStepBoundary, StepOrdinal: ord, StepID: id, StepClass: events.StepClassStep}
+	}
+	idx := resolveOrdinalSteps([]events.AuditEvent{boundary(1, "a"), boundary(2, "b"), boundary(3, "a"), boundary(4, "c")}, steps)
+	assert.Equal(t, map[uint32]int{1: 0, 2: 1, 3: 0, 4: 2}, idx)
+}
+
+// End to end from --steps: context_name is read, and the attribution table
+// and the step headings carry the names it gives.
+func TestSummary_Run_NamesStepsByContextName(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	enc := json.NewEncoder(f)
+	for _, ev := range []events.AuditEvent{
+		{Timestamp: base.Add(1200 * time.Millisecond), EventType: events.EventStepBoundary, PID: 10, StepOrdinal: 1, Process: "bash -e /tmp/a.sh", StepID: "composite", StepClass: events.StepClassStep},
+		{Timestamp: base.Add(1300 * time.Millisecond), EventType: events.EventStepBoundary, PID: 11, StepOrdinal: 2, Process: "bash -e /tmp/b.sh", StepID: "composite", StepClass: events.StepClassStep},
+		{Timestamp: base.Add(1400 * time.Millisecond), EventType: events.EventConnectionBlocked, DstIP: "9.9.9.9", DstPort: 443, Protocol: "TCP", Process: "curl", StepOrdinal: 2, Blocked: true},
+	} {
+		require.NoError(t, enc.Encode(ev))
+	}
+	require.NoError(t, f.Close())
+
+	stepsJSON := `[{"name":"Skipped","started_at":"2025-01-01T10:00:01Z"},` +
+		`{"name":"Composite","started_at":"2025-01-01T10:00:01Z","context_name":"composite"}]`
+	var buf bytes.Buffer
+	require.NoError(t, (&SummaryCmd{AuditLog: path, Steps: stepsJSON, output: &buf}).Run())
+	out := buf.String()
+	assert.Contains(t, out, "| #1 | `composite` | Composite |")
+	assert.Contains(t, out, "| #2 | `composite` | Composite |")
+	assert.Contains(t, out, `#### Step: "#2 - Composite"`, "the event's heading names its step")
+	assert.NotContains(t, out, "| Skipped |")
 }
 
 // With the mapping deliberately non-injective, a composite's several

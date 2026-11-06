@@ -232,35 +232,47 @@ step_identity() {
   fi
 
   # Given steps with context names, the summary names each step by its id,
-  # whatever the timings say. Here every step starts in the same second,
-  # and the skipped step is listed among them, which is what shifts the
-  # names timing gives.
+  # whatever the timings say. The steps passed are the ones the job ran,
+  # each with its context name, as the action lists them: the identity
+  # steps under their names, the rest named after their ids. They all
+  # start in the same second, and the skipped step is listed after the
+  # named one, which is what shifts the names timing gives.
   local at steps table
   at=$(jq -r -s '[.[] | select(.event_type == "step_boundary" and .step_id == "identity-named")][0].timestamp
-    | sub("\\.[0-9]+"; "")' "$AUDIT_LOG")
-  steps=$(jq -nc --arg at "$at" '[
-    {name: "Step identity, named", context_name: "identity-named", started_at: $at},
-    {name: "Step identity, skipped", started_at: $at},
-    {name: "Step identity, composite", context_name: "identity-composite", started_at: $at},
-    {name: "Step identity, behind hashFiles()", context_name: "identity-hashfiles", started_at: $at}]')
-  table=$(./bin/cargowall summary --audit-log "$AUDIT_LOG" --steps "$steps" | sed -n '/^### Step Attribution/,$p')
-  echo "$table"
-  named() {
-    local got
-    got=$(grep -cF "| \`$1\` | $2 |" <<<"$table" || true)
-    if [ "$got" -ne "$3" ]; then
-      echo "❌ $1 is named \"$2\" in $got rows, want $3"
-      FAILED=true
-    else
-      echo "✅ $1 is named \"$2\""
-    fi
-  }
-  named identity-named "Step identity, named" 1
-  named identity-composite "Step identity, composite" 2
-  named identity-hashfiles "Step identity, behind hashFiles()" 1
-  if grep -qF "Step identity, skipped" <<<"$table"; then
-    echo "❌ the skipped step names a step that ran"
+    // "" | sub("\\.[0-9]+"; "")' "$AUDIT_LOG")
+  if [ -z "$at" ]; then
+    echo "❌ no identity-named boundary to time the steps by"
     FAILED=true
+  else
+    steps=$(jq -s -c --arg at "$at" '
+      {"identity-named": "Step identity, named", "identity-composite": "Step identity, composite",
+       "identity-hashfiles": "Step identity, behind hashFiles()"} as $names
+      | [.[] | select(.event_type == "step_boundary" and .step_class == "step")] | sort_by(.step_ordinal)
+      | reduce .[].step_id as $id ([]; if index([$id]) then . else . + [$id] end)
+      | map({name: ($names[.] // .), context_name: ., started_at: $at})
+      | ((map(.context_name) | index("identity-named")) // -1) as $i
+      | .[:$i + 1] + [{name: "Step identity, skipped", started_at: $at}] + .[$i + 1:]' "$AUDIT_LOG")
+    table=$(./bin/cargowall summary --audit-log "$AUDIT_LOG" --steps "$steps" | sed -n '/^### Step Attribution/,$p')
+    echo "$table"
+    # A name must be on exactly want rows, every one of them the step's own.
+    named() {
+      local got all
+      got=$(grep -cF "| \`$1\` | $2 |" <<<"$table" || true)
+      all=$(grep -cF "| $2 |" <<<"$table" || true)
+      if [ "$got" -ne "$3" ] || [ "$all" -ne "$3" ]; then
+        echo "❌ \"$2\" names $all rows, $got of them $1's; want $3, all $1's"
+        FAILED=true
+      else
+        echo "✅ $1 is named \"$2\""
+      fi
+    }
+    named identity-named "Step identity, named" 1
+    named identity-composite "Step identity, composite" 2
+    named identity-hashfiles "Step identity, behind hashFiles()" 1
+    if grep -qF "Step identity, skipped" <<<"$table"; then
+      echo "❌ the skipped step names a step that ran"
+      FAILED=true
+    fi
   fi
 
   if [ "$FAILED" = true ]; then

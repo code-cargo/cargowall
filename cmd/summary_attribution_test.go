@@ -541,7 +541,7 @@ func TestSummary_ResolveOrdinalSteps_IDAndTimingShareTheCursor(t *testing.T) {
 }
 
 // A post step the action didn't list still carries its main step's id;
-// it names that main step, and the cursor stays where it was.
+// it names that main step.
 func TestSummary_ResolveOrdinalSteps_IDOfAnEarlierStep(t *testing.T) {
 	steps := []GitHubStep{{Name: "a", ContextName: "a"}, {Name: "b", ContextName: "b"}, {Name: "c", ContextName: "c"}}
 	boundary := func(ord uint32, id string) events.AuditEvent {
@@ -549,6 +549,45 @@ func TestSummary_ResolveOrdinalSteps_IDOfAnEarlierStep(t *testing.T) {
 	}
 	idx := resolveOrdinalSteps([]events.AuditEvent{boundary(1, "a"), boundary(2, "b"), boundary(3, "a"), boundary(4, "c")}, steps)
 	assert.Equal(t, map[uint32]int{1: 0, 2: 1, 3: 0, 4: 2}, idx)
+}
+
+// A main step's processes go to the main step though its post step,
+// further on, carries the same id: the match taken is the first from the
+// cursor, which for a step forking twice is the step itself again.
+func TestSummary_ResolveOrdinalSteps_MainStepBeforeItsPostStep(t *testing.T) {
+	steps := []GitHubStep{
+		{Name: "Start CargoWall", ContextName: "cw"},
+		{Name: "Cache", ContextName: "cache"},
+		{Name: "Build", ContextName: "build"},
+		{Name: "Post Cache", ContextName: "cache"},
+		{Name: "Post Start CargoWall", ContextName: "cw"},
+	}
+	boundary := func(ord uint32, id string) events.AuditEvent {
+		return events.AuditEvent{EventType: events.EventStepBoundary, StepOrdinal: ord, StepID: id, StepClass: events.StepClassStep}
+	}
+	idx := resolveOrdinalSteps([]events.AuditEvent{
+		boundary(1, "cache"), boundary(2, "cache"), boundary(3, "build"), boundary(4, "cache"), boundary(5, "cw"),
+	}, steps)
+	assert.Equal(t, map[uint32]int{1: 1, 2: 1, 3: 2, 4: 3, 5: 4}, idx)
+}
+
+// Placed by time, a boundary with a step id takes no step that carries
+// another id: here the step that started just before it is another
+// step's, and it stays unresolved rather than take that step's name.
+func TestSummary_ResolveOrdinalSteps_TimingKeepsOffOtherIDs(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	steps := []GitHubStep{
+		{Name: "a", ContextName: "a", StartedAt: base, CompletedAt: base.Add(10 * time.Second)},
+		{Name: "b", ContextName: "b", StartedAt: base.Add(10 * time.Second)},
+	}
+	boundaries := []events.AuditEvent{
+		{EventType: events.EventStepBoundary, StepOrdinal: 1, Timestamp: base.Add(time.Second), StepID: "a", StepClass: events.StepClassStep},
+		// Inside a's window, within slack of b's start, and past b's.
+		{EventType: events.EventStepBoundary, StepOrdinal: 2, Timestamp: base.Add(5 * time.Second), StepID: "x", StepClass: events.StepClassStep},
+		{EventType: events.EventStepBoundary, StepOrdinal: 3, Timestamp: base.Add(9500 * time.Millisecond), StepID: "y", StepClass: events.StepClassStep},
+		{EventType: events.EventStepBoundary, StepOrdinal: 4, Timestamp: base.Add(11 * time.Second), StepID: "z", StepClass: events.StepClassStep},
+	}
+	assert.Equal(t, map[uint32]int{1: 0}, resolveOrdinalSteps(boundaries, steps))
 }
 
 // End to end from --steps: context_name is read, and the attribution table

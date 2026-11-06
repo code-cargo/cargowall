@@ -68,7 +68,9 @@ const resolveRoundingSlack = 2 * time.Second
 // Timing is the fallback. A boundary whose step id a step's context name
 // matches resolves to that step (stepIndexByID), with no timing at all;
 // only the boundaries that leaves, from older logs or older actions,
-// are placed by time. Both kinds move the same cursor.
+// are placed by time. Both kinds move the same cursor. A boundary with
+// a step id placed by time never takes a step that carries another one:
+// it stays unresolved rather than take that step's name.
 //
 // A runner helper's boundary (hashFiles()) is no step's, and takes no part.
 func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep) map[uint32]int {
@@ -90,9 +92,10 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 			prev = max(prev, i)
 			continue
 		}
+		fits := func(i int) bool { return stepFits(steps[i], b) }
 		best := -1
 		for i := prev + 1; i < len(steps); i++ {
-			if steps[i].StartedAt.IsZero() || steps[i].StartedAt.After(b.Timestamp) {
+			if steps[i].StartedAt.IsZero() || steps[i].StartedAt.After(b.Timestamp) || !fits(i) {
 				continue
 			}
 			// Strictly-later only: within a same-second tie group the
@@ -112,7 +115,7 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 				break
 			}
 		}
-		nearNext := nextIdx >= 0 && steps[nextIdx].StartedAt.After(b.Timestamp) &&
+		nearNext := nextIdx >= 0 && fits(nextIdx) && steps[nextIdx].StartedAt.After(b.Timestamp) &&
 			steps[nextIdx].StartedAt.Sub(b.Timestamp) <= resolveRoundingSlack
 
 		// Unmatched boundary: ordered tie-breakers.
@@ -137,7 +140,7 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 		//    empirically real — see steps.Options.OrdinalBase — into
 		//    whatever step was running rather than letting them shift the
 		//    mapping).
-		if best == -1 && prev >= 0 && !steps[prev].StartedAt.After(b.Timestamp) &&
+		if best == -1 && prev >= 0 && fits(prev) && !steps[prev].StartedAt.After(b.Timestamp) &&
 			!steps[prev].CompletedAt.IsZero() && !b.Timestamp.After(steps[prev].CompletedAt) {
 			best = prev
 		}
@@ -145,7 +148,7 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 		//    end-side rounding of the same step. Farther than slack is a
 		//    fork in the inter-step gap that belongs to no step; it stays
 		//    unresolved and renders as its bare "#N" group.
-		if best == -1 && prev >= 0 && !steps[prev].StartedAt.After(b.Timestamp) {
+		if best == -1 && prev >= 0 && fits(prev) && !steps[prev].StartedAt.After(b.Timestamp) {
 			end := steps[prev].CompletedAt
 			if end.IsZero() || b.Timestamp.Sub(end) <= resolveRoundingSlack {
 				best = prev
@@ -157,6 +160,13 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 		}
 	}
 	return idx
+}
+
+// stepFits reports whether boundary b may be placed by time on step s: not
+// when b has a step id and s carries another, which names some other step.
+func stepFits(s GitHubStep, b events.AuditEvent) bool {
+	return s.ContextName == "" || b.StepClass != events.StepClassStep || b.StepID == "" ||
+		s.ContextName == b.StepID
 }
 
 // stepIndexByID is the step a boundary's step id names, or -1 when the

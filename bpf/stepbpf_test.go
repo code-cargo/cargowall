@@ -77,6 +77,12 @@ func argvOf(ev StepBpfStepExecEvent) string {
 	return string(unsafe.Slice((*byte)(unsafe.Pointer(&ev.Argv[0])), n))
 }
 
+// envOf returns the environment bytes an exec event copied.
+func envOf(ev StepBpfStepExecEvent) string {
+	n := min(int(ev.EnvLen), len(ev.Env))
+	return string(unsafe.Slice((*byte)(unsafe.Pointer(&ev.Env[0])), n))
+}
+
 // awaitStepEvent reads step events until one of kind for ordinal (any
 // ordinal when ordinal is 0) satisfies match, logging every event seen.
 func awaitStepEvent(t *testing.T, rd *ringbuf.Reader, kind, ordinal uint32,
@@ -300,6 +306,44 @@ func TestStepExec_CutsLongArguments(t *testing.T) {
 	require.Equal(t, full[:len(execEv.Argv)], argvOf(execEv))
 }
 
+// TestStepExec_CarriesEnvironment: a step root's exec event carries the
+// environment its parent gave it, as the kernel laid it out — where the
+// runner names the step — and an environment longer than the event holds
+// is copied up to the event's size, with its full length reported.
+func TestStepExec_CarriesEnvironment(t *testing.T) {
+	tcObjs, objs, iter := loadStepObjects(t)
+	rd, err := ringbuf.NewReader(objs.MapStepEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { rd.Close() })
+	selfTgid, ok := globalTgid(t, iter, os.Getpid())
+	require.True(t, ok)
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: selfTgid, Enabled: 1, NextOrdinal: 5}))
+
+	run := func(env ...string) StepBpfStepExecEvent {
+		t.Helper()
+		child := exec.Command("/bin/true")
+		child.Env = env
+		require.NoError(t, child.Start())
+		pid := uint32(child.Process.Pid)
+		require.NoError(t, child.Wait())
+		_, execEv := awaitStepEvent(t, rd, stepEvExec, 0, func(_ StepBpfStepChildEvent, e StepBpfStepExecEvent) bool {
+			return e.Tgid == pid
+		})
+		return execEv
+	}
+
+	small := run("HOME=/home/runner", "GITHUB_ACTION=build")
+	want := "HOME=/home/runner\x00GITHUB_ACTION=build\x00"
+	require.EqualValues(t, len(want), small.EnvLen)
+	require.Equal(t, want, envOf(small))
+
+	big := strings.Repeat("v", len(small.Env)+1000)
+	cut := run("BIG="+big, "GITHUB_ACTION=build")
+	full := "BIG=" + big + "\x00GITHUB_ACTION=build\x00"
+	require.EqualValues(t, len(full), cut.EnvLen)
+	require.Equal(t, full[:len(cut.Env)], envOf(cut))
+}
+
 // TestStepExec_FirstExecOnly: a step root that execs again (a shell's
 // `exec`) is reported once, for what the worker started; its later exec
 // and its exit say nothing.
@@ -493,6 +537,7 @@ func TestStepExit_WithoutExec(t *testing.T) {
 	})
 	require.Equal(t, fork.Tgid, exitEv.Tgid)
 	require.Zero(t, exitEv.ArgvLen)
+	require.Zero(t, exitEv.EnvLen)
 }
 
 // readProcInt reads an integer /proc/sys value.
@@ -733,7 +778,7 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 	require.True(t, ok, "step_exec_event must be a struct, got %T", typ)
 	var execEv StepBpfStepExecEvent
 	require.Equal(t, uint32(unsafe.Sizeof(execEv)), st.Size, "struct size")
-	require.Len(t, st.Members, 6)
+	require.Len(t, st.Members, 8)
 	for i, w := range []struct {
 		name string
 		off  uintptr
@@ -744,6 +789,8 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 		{"argv_len", unsafe.Offsetof(execEv.ArgvLen)},
 		{"argv", unsafe.Offsetof(execEv.Argv)},
 		{"comm", unsafe.Offsetof(execEv.Comm)},
+		{"env_len", unsafe.Offsetof(execEv.EnvLen)},
+		{"env", unsafe.Offsetof(execEv.Env)},
 	} {
 		require.Equal(t, w.name, st.Members[i].Name)
 		require.Equal(t, w.off, uintptr(st.Members[i].Offset.Bytes()))

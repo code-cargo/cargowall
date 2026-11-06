@@ -138,19 +138,23 @@ func (t *Tracker) run() {
 
 // reportLost reports the steps forked before cutoff whose exec or exit
 // event never came, with what /proc shows for the root by now: a lost
-// event's step must not vanish from the audit stream.
+// event's step must not vanish from the audit stream. It is unidentified:
+// /proc shows the root's environment as the step may since have rewritten
+// it.
 func (t *Tracker) reportLost(cutoff time.Time) {
 	for _, b := range t.unreported(cutoff) {
-		t.reportStep(b, sanitizeCmdline(readCmdline(int(b.pid))))
+		id := Identity{Class: events.StepClassUnknown}
+		t.identified(b.ordinal, id)
+		t.reportStep(b, sanitizeCmdline(readCmdline(int(b.pid))), id)
 	}
 }
 
 // handleStepEvent handles one step event. A fork starts the step: the
 // boundary is recorded at once, so OrdinalAt callers racing it resolve
 // against it promptly, and its time is the boundary's. The root's first
-// exec says what the step runs, and only then is the step reported. A root
-// that exits without exec'ing ran a copy of Runner.Worker, whose command
-// line it reports.
+// exec says what the step runs and which step it is, and only then is the
+// step reported. A root that exits without exec'ing ran a copy of
+// Runner.Worker, whose command line it reports, and is no step.
 func (t *Tracker) handleStepEvent(raw []byte, now time.Time) {
 	if len(raw) < 4 {
 		return
@@ -167,12 +171,21 @@ func (t *Tracker) handleStepEvent(raw []byte, now time.Time) {
 			return
 		}
 		ev := (*bpf.StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
+		exec := bpf.StepBpfStepEventKind(ev.Kind) == bpf.StepBpfStepEventKindSTEP_EV_EXEC
+		var id Identity
+		if exec {
+			id = identify(cBytes(ev.Env[:]), int(ev.EnvLen))
+			// The rest of the environment is the step's secrets: don't
+			// leave them in the heap.
+			clear(ev.Env[:])
+		}
 		b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now)
 		if !ok {
-			return // reported as lost already
+			return // reported, and identified, as lost already
 		}
 		cmdline := t.workerCmdline
-		if bpf.StepBpfStepEventKind(ev.Kind) == bpf.StepBpfStepEventKindSTEP_EV_EXEC {
+		if exec {
+			t.identified(ev.Ordinal, id)
 			n := min(int(ev.ArgvLen), len(ev.Argv))
 			cmdline = formatCmdline(cBytes(ev.Argv[:n]), int(ev.ArgvLen) > len(ev.Argv))
 			if cmdline == "" {
@@ -182,7 +195,15 @@ func (t *Tracker) handleStepEvent(raw []byte, now time.Time) {
 				cmdline = strings.TrimRight(string(cBytes(ev.Comm[:])), "\x00")
 			}
 		}
-		t.reportStep(b, sanitizeCmdline(cmdline))
+		t.reportStep(b, sanitizeCmdline(cmdline), id)
+	}
+}
+
+// identified hands a step's identity to Options.OnIdentified, ahead of the
+// step's report: a policy bound on it applies the sooner.
+func (t *Tracker) identified(ordinal uint32, id Identity) {
+	if t.onIdentified != nil {
+		t.onIdentified(ordinal, id)
 	}
 }
 
@@ -197,9 +218,11 @@ func cBytes(a []int8) []byte {
 // reportStep logs a step and writes its step_boundary event, stamped with
 // the step's fork time. The pid is numbered in our pid namespace (see
 // map_task_nspid).
-func (t *Tracker) reportStep(b boundary, cmdline string) {
+func (t *Tracker) reportStep(b boundary, cmdline string, id Identity) {
 	t.logger.Info("Workflow step process started",
 		"step_ordinal", b.ordinal,
+		"step_id", id.StepID,
+		"step_class", id.Class,
 		"pid", b.pid,
 		"cmdline", cmdline)
 	if t.auditLogger == nil {
@@ -211,6 +234,8 @@ func (t *Tracker) reportStep(b boundary, cmdline string) {
 		Process:     cmdline,
 		PID:         b.pid,
 		StepOrdinal: b.ordinal,
+		StepID:      id.StepID,
+		StepClass:   id.Class,
 	}); err != nil {
 		t.logger.Error("Failed to write audit log", "error", err)
 	}

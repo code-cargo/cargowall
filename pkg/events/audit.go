@@ -153,6 +153,24 @@ const (
 	StepAttrUnsupported StepAttrOutcome = "unsupported_addr"
 )
 
+// StepClass says what a step root is, by its environment as the kernel
+// read it at the root's first exec (pkg/steps). It rides step_boundary
+// events with StepID; policy keyed on step ids must treat anything but
+// StepClassStep as an unidentified step.
+type StepClass string
+
+const (
+	// StepClassStep: a workflow step; StepID is the runner's name for it.
+	StepClassStep StepClass = "step"
+	// StepClassRunner: a process Runner.Worker starts for itself, not for a
+	// step (the hashFiles() helper): its whole environment was read and
+	// names no step.
+	StepClassRunner StepClass = "runner"
+	// StepClassUnknown: the environment could not be read, or was cut
+	// before the step's name, or the exec event was lost.
+	StepClassUnknown StepClass = "unknown"
+)
+
 // StepAttribution is one resolved DNS-client attribution — the step
 // lookup's result, copied field-for-field onto dns_blocked events. Owned
 // here next to the outcome vocabulary so the producer (pkg/steps) and the
@@ -183,6 +201,8 @@ type AuditEvent struct {
 	Blocked         bool            `json:"blocked"`                     // true in enforce mode (actually blocked)
 	StepOrdinal     uint32          `json:"step_ordinal,omitempty"`      // workflow step that (transitively) created the socket — causal, not temporal; see StepOrdinal* sentinels
 	StepAttrOutcome StepAttrOutcome `json:"step_attr_outcome,omitempty"` // dns_blocked only: how the sockdiag step lookup resolved — additive/omitempty like the container fields below
+	StepID          string          `json:"step_id,omitempty"`           // step_boundary only: the runner's name for the step (GITHUB_ACTION) — its YAML id:, or a generated one such as __run_2; shared by a composite's inner steps and an action's pre/post steps
+	StepClass       StepClass       `json:"step_class,omitempty"`        // step_boundary only: what the step root is; empty for a root that exited without exec'ing
 
 	// L7 (TLS SNI / HTTP Host / QUIC) enforcement. All additive/omitempty. On
 	// l7_blocked/l7_would_block: L7Name is the SNI/Host the flow presented (may

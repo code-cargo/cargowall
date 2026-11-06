@@ -186,6 +186,56 @@ summary() {
   fi
 }
 
+# Each step names itself through the GITHUB_ACTION the runner gives it,
+# read in the kernel at the step's first exec. The identity steps in ci.yml
+# are the shapes it must hold for: a named step, a skipped one, a
+# composite's two inner steps under the outer step's id, and the
+# hashFiles() helper Runner.Worker starts for itself, which is no step.
+step_identity() {
+  AUDIT_LOG=/tmp/cargowall-audit.json
+  echo "step_boundary events (ordinal / step_id / step_class / process):"
+  jq -r -s '.[] | select(.event_type == "step_boundary")
+    | [.step_ordinal, (.step_id // "-"), (.step_class // "-"), (.process // "-")] | @tsv' "$AUDIT_LOG"
+
+  boundaries() {
+    jq -s "[.[] | select(.event_type == \"step_boundary\") | select($1)] | length" "$AUDIT_LOG"
+  }
+  FAILED=false
+  expect() {
+    local got
+    got=$(boundaries "$2")
+    if [ "$got" -ne "$3" ]; then
+      echo "❌ $1: $got boundaries, want $3"
+      FAILED=true
+    else
+      echo "✅ $1"
+    fi
+  }
+  expect "the named step is one boundary, named by its id" '.step_id == "identity-named" and .step_class == "step"' 1
+  expect "a skipped step never runs" '.step_id == "identity-skipped"' 0
+  expect "both of the composite's steps carry its id" '.step_id == "identity-composite" and .step_class == "step"' 2
+  expect "the step behind hashFiles() is named by its id" '.step_id == "identity-hashfiles" and .step_class == "step"' 1
+  expect "no step's identity was lost" '.step_class == "unknown"' 0
+  if [ "$(boundaries '.step_class == "runner"')" -lt 1 ]; then
+    echo "❌ hashFiles() starts a runner helper, which must be classed as one"
+    FAILED=true
+  fi
+  if [ "$(boundaries '.step_class == "step" and ((.step_id // "") | startswith("__run"))')" -lt 1 ]; then
+    echo "❌ the steps with no id: carry the runner's generated names"
+    FAILED=true
+  fi
+
+  # Of the environment, only the step's name may be kept.
+  if sudo grep -l "cw-identity-canary-7f3a" "$AUDIT_LOG" /tmp/cargowall.log; then
+    echo "❌ a step's environment reached cargowall's logs"
+    FAILED=true
+  fi
+
+  if [ "$FAILED" = true ]; then
+    exit 1
+  fi
+}
+
 case "${1:-}" in
   warm-resolver) warm_resolver ;;
   allowed-pattern) allowed_pattern ;;
@@ -196,5 +246,6 @@ case "${1:-}" in
   docker-filter) docker_filter ;;
   dns-attribution) dns_attribution ;;
   summary) summary ;;
-  *) echo "usage: $0 warm-resolver|allowed-pattern|allowed|blocked|blocked-ip|docker-pull|docker-filter|dns-attribution|summary" >&2; exit 2 ;;
+  step-identity) step_identity ;;
+  *) echo "usage: $0 warm-resolver|allowed-pattern|allowed|blocked|blocked-ip|docker-pull|docker-filter|dns-attribution|summary|step-identity" >&2; exit 2 ;;
 esac

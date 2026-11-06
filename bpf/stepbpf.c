@@ -111,13 +111,23 @@ const struct step_child_event *btf_anchor_step_child_event __attribute__((unused
 // userspace puts on a command line anyway.
 #define STEP_ARGV_MAX 256
 
+// Bytes of a step root's environment its exec event carries. The runner
+// names the step there (GITHUB_ACTION), a few KB in: the step's and job's
+// env: values can come before it. An environment cut before the name
+// leaves the step unidentified.
+#define STEP_ENV_MAX (32 * 1024)
+
 // What a step runs, from its root's first exec (STEP_EV_EXEC): argv is the
 // start of the new program's argument area, NUL-separated, and argv_len
 // the whole area's length (0 if unreadable), so a value over
 // STEP_ARGV_MAX says argv was cut; comm is the new program's name, for
-// when it is. A fork event cannot carry them: the child is still a copy of
-// Runner.Worker, and a /proc read races the exec, reading empty mid-exec.
-// A root that exits without exec'ing reports STEP_EV_EXIT, with neither.
+// when it is. env and env_len are the same for the environment, which
+// Runner.Worker wrote and which names the step; it holds secrets, so
+// userspace takes the name and keeps nothing else. A fork event cannot
+// carry these: the child is still a copy of Runner.Worker. Nor can /proc,
+// whose read races the exec, and reads what the program may since have
+// rewritten. A root that exits without exec'ing reports STEP_EV_EXIT, with
+// none of them.
 struct step_exec_event {
     __u32 kind;
     __u32 tgid;
@@ -125,13 +135,17 @@ struct step_exec_event {
     __u32 argv_len;
     char argv[STEP_ARGV_MAX];
     char comm[16];
+    __u32 env_len;
+    char env[STEP_ENV_MAX];
 };
 
 const struct step_exec_event *btf_anchor_step_exec_event __attribute__((unused));
 
+// Room for several exec events, each over STEP_ENV_MAX: steps start one
+// at a time, and a lost one is still reported (from /proc), unidentified.
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 64 * 1024);
+    __uint(max_entries, 256 * 1024);
 } map_step_events SEC(".maps");
 
 // Step roots between fork and their first exec: global tgid → ordinal.
@@ -274,7 +288,7 @@ static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid,
         ev->kind = kind;
         ev->tgid = ns ? *ns : 0;
         ev->ordinal = *ord;
-        __u64 len = 0;
+        __u64 len = 0, env_len = 0;
         if (kind == STEP_EV_EXEC) {
             __u64 start = BPF_CORE_READ(task, mm, arg_start);
             __u64 end = BPF_CORE_READ(task, mm, arg_end);
@@ -284,8 +298,17 @@ static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid,
             if (bpf_probe_read_user(ev->argv, n, (const void *)start))
                 len = 0;
             bpf_get_current_comm(ev->comm, sizeof(ev->comm));
+
+            start = BPF_CORE_READ(task, mm, env_start);
+            end = BPF_CORE_READ(task, mm, env_end);
+            if (end > start)
+                env_len = end - start;
+            n = env_len > STEP_ENV_MAX ? STEP_ENV_MAX : env_len;
+            if (bpf_probe_read_user(ev->env, n, (const void *)start))
+                env_len = 0;
         }
         ev->argv_len = len > 0xffffffff ? 0xffffffff : len;
+        ev->env_len = env_len > 0xffffffff ? 0xffffffff : env_len;
         bpf_ringbuf_submit(ev, 0);
     }
     bpf_map_delete_elem(&map_step_exec_pending, &tgid);

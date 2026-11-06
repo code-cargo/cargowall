@@ -138,6 +138,7 @@ func (c *SummaryCmd) Run() error {
 	// the resolver's window tie-breaker would then capture rounding-early
 	// boundaries that belong to the next step.
 	ordinalSteps := resolveOrdinalSteps(stepBoundaries, steps)
+	regularEvents = foldRunnerHelpers(regularEvents, stepBoundaries)
 
 	// Every push path ships per-step timestamps, so the null-completed_at
 	// backfill must run before ANY of them — including the zero-network

@@ -56,7 +56,7 @@ func TestSummary_Run_BoundariesRenderAsAttributionNotEntries(t *testing.T) {
 	})
 	assert.Contains(t, out, "1.2.3.4", "the connection event renders")
 	assert.Contains(t, out, "### Step Attribution", "boundaries render as the attribution table")
-	assert.Contains(t, out, "| #1 | - | `bash -e /tmp/a.sh` |", "ordinal→process mapping row (no GitHub name with empty steps)")
+	assert.Contains(t, out, "| #1 | - | - | `bash -e /tmp/a.sh` |", "ordinal→process mapping row (no step id in an older log, no GitHub name with empty steps)")
 	assert.Contains(t, out, "| #1 |\n", "connection row carries its causal step label")
 	assert.Contains(t, out, "#### Step: \"#1\"", "events grouped under the causal ordinal")
 	assert.Contains(t, out, "Grouped causally", "causal grouping is announced")
@@ -102,7 +102,7 @@ func TestSummary_Run_CausalGroupingAndCounts(t *testing.T) {
 	// heading carries the resolved step's time range like temporal
 	// grouping's headings do.
 	assert.Contains(t, out, `#### Step: "#1 - build" (10:00:00 - 10:00:10)`)
-	assert.Contains(t, out, "| #1 | build | `bash -e /tmp/build.sh` |")
+	assert.Contains(t, out, "| #1 | - | build | `bash -e /tmp/build.sh` |")
 	// All three retries live under build — none leak into deploy's window
 	// bucket — and dedup to one row while the counts show both numbers.
 	assert.NotContains(t, out, `"deploy"`)
@@ -125,6 +125,54 @@ func TestSummary_Run_MarkdownCellsEscaped(t *testing.T) {
 	assert.Contains(t, out, `cu\|rl`, "pipe in process escaped in entries table")
 	assert.Contains(t, out, "`bash -e /tmp/a\\|b'c.sh`", "attribution process cell escapes pipes and neutralizes backticks")
 	assert.NotContains(t, out, "| cu|rl |", "raw pipe must not survive into a cell")
+}
+
+// The attribution table names each boundary's step as the runner did, or
+// what the root is when it names none; an id that could break the table
+// can't.
+func TestSummary_Run_StepIDColumn(t *testing.T) {
+	base := time.Now()
+	out := runSummary(t, []events.AuditEvent{
+		{Timestamp: base, EventType: events.EventStepBoundary, PID: 10, StepOrdinal: 1, Process: "bash", StepID: "build", StepClass: events.StepClassStep},
+		{Timestamp: base, EventType: events.EventStepBoundary, PID: 11, StepOrdinal: 2, Process: "node", StepClass: events.StepClassRunner},
+		{Timestamp: base, EventType: events.EventStepBoundary, PID: 12, StepOrdinal: 3, Process: "bash", StepClass: events.StepClassUnknown},
+		{Timestamp: base, EventType: events.EventStepBoundary, PID: 13, StepOrdinal: 4, Process: "sh", StepID: "a|b`c", StepClass: events.StepClassStep},
+		{Timestamp: base, EventType: events.EventConnectionBlocked, DstIP: "9.9.9.9", DstPort: 443, Protocol: "TCP", Process: "curl", Blocked: true, StepOrdinal: 1},
+	})
+	assert.Contains(t, out, "| Step | Step id | GitHub step | Process |")
+	assert.Contains(t, out, "| #1 | `build` | - | `bash` |")
+	assert.Contains(t, out, "| #2 | runner helper | - | `node` |")
+	assert.Contains(t, out, "| #3 | unknown | - | `bash` |")
+	assert.Contains(t, out, "| #4 | `a\\|b'c` | - | `sh` |")
+}
+
+// A runner helper forks like a step but is none: its boundary resolves to
+// no GitHub step, and so can't take a step's place, and its traffic lands
+// in the runner tier.
+func TestSummary_RunnerHelpers(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	steps := []GitHubStep{
+		{Name: "build", StartedAt: base, CompletedAt: base.Add(10 * time.Second)},
+		{Name: "deploy", StartedAt: base.Add(10 * time.Second), CompletedAt: base.Add(20 * time.Second)},
+	}
+	boundaries := []events.AuditEvent{
+		{Timestamp: base, EventType: events.EventStepBoundary, StepOrdinal: 1, StepClass: events.StepClassStep, StepID: "build"},
+		// hashFiles() for deploy's if:, evaluated just before deploy starts.
+		{Timestamp: base.Add(9500 * time.Millisecond), EventType: events.EventStepBoundary, StepOrdinal: 2, StepClass: events.StepClassRunner},
+		{Timestamp: base.Add(10 * time.Second), EventType: events.EventStepBoundary, StepOrdinal: 3, StepClass: events.StepClassStep, StepID: "deploy"},
+	}
+	assert.Equal(t, map[uint32]int{1: 0, 3: 1}, resolveOrdinalSteps(boundaries, steps))
+
+	regular := []events.AuditEvent{
+		{EventType: events.EventConnectionAllowed, DstIP: "1.1.1.1", StepOrdinal: 2},
+		{EventType: events.EventConnectionAllowed, DstIP: "2.2.2.2", StepOrdinal: 3},
+	}
+	folded := foldRunnerHelpers(regular, boundaries)
+	assert.Equal(t, events.StepOrdinalRunner, folded[0].StepOrdinal)
+	assert.Equal(t, uint32(3), folded[1].StepOrdinal)
+	assert.Equal(t, uint32(2), regular[0].StepOrdinal, "the caller's events are left alone")
+	assert.Equal(t, causalAssignment{class: causalBucketed, bucket: bucketRunner},
+		assignCausal(folded[0], resolveOrdinalSteps(boundaries, steps)))
 }
 
 func TestSummary_StepOrdinalLabel(t *testing.T) {
@@ -375,7 +423,7 @@ func TestSummary_Run_ResolvesAgainstReportedTimesNotBackfilled(t *testing.T) {
 	out := buf.String()
 
 	assert.Contains(t, out, `#### Step: "#2 - deploy"`, "the early boundary resolves to deploy, not build")
-	assert.Contains(t, out, "| #2 | deploy |", "attribution table agrees")
+	assert.Contains(t, out, "| #2 | - | deploy |", "attribution table agrees")
 	assert.NotContains(t, out, `"#2 - build"`)
 }
 

@@ -343,6 +343,31 @@ func received(t *testing.T, l *net.UDPConn, wait time.Duration) (string, *net.UD
 	return string(buf[:n]), from
 }
 
+// resentUntil writes pkt to wire, again every resend, until l gets want or
+// wait runs out, and reports what l got as received does. An IPv6 packet
+// written to a TUN or TAP can find no input route while other network
+// namespaces come and go (Ip6InNoRoutes, and an ICMPv6 unreachable back:
+// about 1 in 80 under ip netns add/del churn, never for IPv4 or for a
+// socket's own sends), so one that should land gets more than one try.
+// Anything else l reads is skipped: an earlier probe's extra copy can come
+// late.
+func resentUntil(t *testing.T, wire *os.File, pkt []byte, l *net.UDPConn, want string,
+	wait time.Duration,
+) (string, *net.UDPAddr) {
+	t.Helper()
+	for end := time.Now().Add(wait); time.Now().Before(end); {
+		_, err := wire.Write(pkt)
+		require.NoError(t, err)
+		again := time.Now().Add(min(resend, time.Until(end)))
+		for time.Now().Before(again) {
+			if got, from := received(t, l, time.Until(again)); got == want {
+				return got, from
+			}
+		}
+	}
+	return "", nil
+}
+
 // query sends payload to addr from a fresh socket, marked as the proxy's
 // own when marked.
 func query(t *testing.T, addr, payload string, marked bool) {
@@ -361,6 +386,11 @@ func query(t *testing.T, addr, payload string, marked bool) {
 const (
 	arrives = 2 * time.Second        // how long a packet that should land may take
 	absent  = 300 * time.Millisecond // how long to watch for one that should not
+	// How long resentUntil waits on one copy before it sends another: past
+	// absent, so a packet that should not land is still sent once, and long
+	// enough that a copy that is only slow, not lost, rarely gets a twin
+	// for a later check to read.
+	resend = time.Second
 )
 
 // TestDNSRedirect_Output: DNS this namespace sends leaves for the proxy at
@@ -482,9 +512,7 @@ func TestDNSRedirect_InputGuard(t *testing.T) {
 	require.NoError(t, err)
 	got, _ := received(t, l, arrives)
 	require.Equal(t, "before", got)
-	_, err = wire.Write(udp6(remote6, local6, 53, 40000, "before6"))
-	require.NoError(t, err)
-	got, _ = received(t, l6, arrives)
+	got, _ = resentUntil(t, wire, udp6(remote6, local6, 53, 40000, "before6"), l6, "before6", arrives)
 	require.Equal(t, "before6", got)
 
 	marked := net.ListenConfig{Control: MarkDNSProxySocket}
@@ -532,9 +560,8 @@ func TestDNSRedirect_InputGuard(t *testing.T) {
 			_, err = upstream6.WriteTo([]byte("query6"), &net.UDPAddr{IP: remote6, Port: 53})
 			require.NoError(t, err)
 			port := uint16(upstream6.LocalAddr().(*net.UDPAddr).Port)
-			_, err = wire.Write(udp6(remote6, local6, 53, port, "answer6"))
-			require.NoError(t, err)
-			got, _ = received(t, upstream6.(*net.UDPConn), arrives)
+			got, _ = resentUntil(t, wire, udp6(remote6, local6, 53, port, "answer6"), upstream6.(*net.UDPConn),
+				"answer6", arrives)
 			require.Equal(t, "answer6", got, "a reply to the proxy's own IPv6 query must pass the guard")
 			upstream6.Close()
 		}
@@ -600,14 +627,13 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 			require.True(t, synAcked(t, c.wire, c.src, resolver, sport, 53),
 				"ipv6 %v: TCP DNS on %s must reach the container listener", ipv6, name)
 
-			_, err := c.wire.Write(udp6(c.src6, net.ParseIP("fd56::1"), 5000, 53, name+"6"))
-			require.NoError(t, err)
+			query6 := udp6(c.src6, net.ParseIP("fd56::1"), 5000, 53, name+"6")
 			if ipv6 {
-				got, from := received(t, l6, arrives)
+				got, from := resentUntil(t, c.wire, query6, l6, name+"6", arrives)
 				require.Equal(t, name+"6", got, "IPv6 DNS on %s must reach the IPv6 container listener", name)
 				require.True(t, from.IP.Equal(c.src6), "DNAT must keep the container's source, got %s", from)
 			} else {
-				got, _ = received(t, hostResolver6, arrives)
+				got, _ = resentUntil(t, c.wire, query6, hostResolver6, name+"6", arrives)
 				require.Equal(t, name+"6", got, "an IPv4-only redirect leaves IPv6 container DNS on %s alone", name)
 			}
 		}
@@ -619,12 +645,11 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 			require.Empty(t, got, "ipv6 %v: DNS for %s arriving off a docker bridge must not reach the container listener",
 				ipv6, dst)
 		}
-		_, err := other.Write(udp6(net.ParseIP("fd56::2"), net.ParseIP("fd56::1"), 5000, 53, "other6"))
-		require.NoError(t, err)
-		got, _ := received(t, hostResolver6, arrives)
+		got, _ := resentUntil(t, other, udp6(net.ParseIP("fd56::2"), net.ParseIP("fd56::1"), 5000, 53, "other6"),
+			hostResolver6, "other6", arrives)
 		require.Equal(t, "other6", got, "ipv6 %v: IPv6 DNS arriving off a docker bridge is no bridge's to redirect", ipv6)
 		if ipv6 {
-			_, err = other.Write(udp6(net.ParseIP("fd56::2"), v6, 5000, 53, "other6"))
+			_, err := other.Write(udp6(net.ParseIP("fd56::2"), v6, 5000, 53, "other6"))
 			require.NoError(t, err)
 			got, _ = received(t, l6, absent)
 			require.Empty(t, got, "IPv6 DNS for the IPv6 container listener arriving off a docker bridge must not reach it")

@@ -198,9 +198,7 @@ func TestOwnedAddrs_GuardWithoutRedirect(t *testing.T) {
 		_, err := c.wire.Write(udp4(c.src, v4, 5000, 53, name))
 		require.NoError(t, err)
 		got, _ := received(t, l, wait)
-		_, err = c.wire.Write(udp6(c.src6, v6, 5000, 53, name+"6"))
-		require.NoError(t, err)
-		got6, _ := received(t, l6, wait)
+		got6, _ := resentUntil(t, c.wire, udp6(c.src6, v6, 5000, 53, name+"6"), l6, name+"6", wait)
 		sport++
 		return got == name, got6 == name+"6", synAcked(t, c.wire, c.src, v4, sport, 53)
 	}

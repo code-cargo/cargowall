@@ -115,26 +115,42 @@ type OriginBpfOriginSeenVal struct {
 	Pad      [7]uint8
 }
 
-type OriginBpfPortKey struct {
+type OriginBpfPortVal struct {
+	_      structs.HostLayout
+	Action uint8
+	Pad    [3]uint8
+}
+
+type OriginBpfRuleKey struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Policy    uint32
+	Ip        uint32
+}
+
+type OriginBpfRuleKeyV6 struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Policy    uint32
+	Ip        [16]uint8
+}
+
+type OriginBpfRulePortKey struct {
 	_        structs.HostLayout
+	Policy   uint32
 	Ip       uint32
 	Port     uint16
 	Proto    uint8
 	HostBits uint8
 }
 
-type OriginBpfPortKeyV6 struct {
+type OriginBpfRulePortKeyV6 struct {
 	_        structs.HostLayout
+	Policy   uint32
 	Ip       [16]uint8
 	Port     uint16
 	Proto    uint8
 	HostBits uint8
-}
-
-type OriginBpfPortVal struct {
-	_      structs.HostLayout
-	Action uint8
-	Pad    [3]uint8
 }
 
 // Names of all BPF objects in the ELF.

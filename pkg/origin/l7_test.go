@@ -96,7 +96,7 @@ func TestL7OracleEndToEnd(t *testing.T) {
 	require.NoError(t, objs.MapDefaultAction.Put(uint32(0), uint8(0)))
 	require.NoError(t, objs.MapAuditMode.Put(uint32(0), uint8(0)))
 	require.NoError(t, objs.MapCidrs.Put(
-		bpf.OriginBpfLpmKey{Prefixlen: 24, Ip: binary.NativeEndian.Uint32(net.ParseIP("140.82.114.0").To4())},
+		bpf.RuleKey(bpf.PolicyJob, 24, binary.NativeEndian.Uint32(net.ParseIP("140.82.114.0").To4())),
 		bpf.OriginBpfLpmVal{Action: 1},
 	))
 	require.NoError(t, objs.MapOriginConfig.Put(uint32(0), uint8(ModeEnforce)))
@@ -277,7 +277,7 @@ func TestL7ReaderGoroutine(t *testing.T) {
 	require.NoError(t, objs.MapDefaultAction.Put(uint32(0), uint8(0)))
 	require.NoError(t, objs.MapAuditMode.Put(uint32(0), uint8(0)))
 	require.NoError(t, objs.MapCidrs.Put(
-		bpf.OriginBpfLpmKey{Prefixlen: 24, Ip: binary.NativeEndian.Uint32(net.ParseIP("140.82.114.0").To4())},
+		bpf.RuleKey(bpf.PolicyJob, 24, binary.NativeEndian.Uint32(net.ParseIP("140.82.114.0").To4())),
 		bpf.OriginBpfLpmVal{Action: 1},
 	))
 	require.NoError(t, objs.MapOriginConfig.Put(uint32(0), uint8(ModeEnforce)))

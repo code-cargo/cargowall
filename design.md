@@ -123,7 +123,7 @@ flowchart TD
     BlockShot([Block<br/>TC_ACT_SHOT])
     ParsePorts[Extract src/dst Ports]
 
-    LPMLookup["LPM Trie Lookup<br/>map_cidrs (dst_ip/32)"]
+    LPMLookup["LPM Trie Lookup<br/>map_cidrs (job policy, dst_ip/32)"]
     HasRule{Found<br/>Matching<br/>CIDR?}
 
     IsPortSpecific{port_specific<br/>flag set?}
@@ -189,7 +189,7 @@ flowchart TD
     BlockShot([Block<br/>TC_ACT_SHOT])
     ParsePorts[Extract src/dst Ports]
 
-    LPMLookup["LPM Trie Lookup<br/>map_cidrs_v6 (dst_ip6/128)"]
+    LPMLookup["LPM Trie Lookup<br/>map_cidrs_v6 (job policy, dst_ip6/128)"]
     HasRule{Found<br/>Matching<br/>CIDR?}
 
     IsPortSpecific{port_specific<br/>flag set?}
@@ -233,13 +233,15 @@ flowchart TD
 
 ```mermaid
 classDiagram
-    class LPM_Key {
+    class Rule_Key {
         +uint32 prefixlen
+        +uint32 policy
         +uint32 ip
     }
 
-    class LPM_Key_V6 {
+    class Rule_Key_V6 {
         +uint32 prefixlen
+        +uint32 policy
         +uint8 ip[16]
     }
 
@@ -250,14 +252,16 @@ classDiagram
         +uint8 pad
     }
 
-    class Port_Key {
+    class Rule_Port_Key {
+        +uint32 policy
         +uint32 ip
         +uint16 port
         +uint8 proto
         +uint8 host_bits
     }
 
-    class Port_Key_V6 {
+    class Rule_Port_Key_V6 {
+        +uint32 policy
         +uint8 ip[16]
         +uint16 port
         +uint8 proto
@@ -284,6 +288,7 @@ classDiagram
         +uint32 _pad2
     }
     note for LPM_Val "host_bits: 32 (128 for v6) minus the prefix length, 0 = host route\na port-specific rule's port entries are keyed by its network address + host_bits\nthe verdict masks dst by the matched rule's host_bits to find them\nwildcard-port entries: ip 0, host_bits 0"
+    note for Rule_Key "prefixlen: 32 policy bits + the rule's prefix length\npolicy 0 = the job's rules; every lookup matches the policy whole,\nso one policy's entries (a /0 included) never answer another's lookup"
     note for Blocked_Event "64 bytes total\nip_version: 4 or 6\nallowed: 0=blocked, 1=allowed\ntimestamp: bpf_ktime_get_ns()\npid: from map_sock_pid via socket cookie"
 
     class Default_Action {
@@ -341,6 +346,7 @@ sequenceDiagram
 ## Component Responsibilities
 
 ### Firewall Manager (`pkg/firewall`)
+- Writes the job's rules into the rule maps under policy 0 (`bpf.PolicyJob`). The rule maps are keyed by policy and address (`bpf.RuleKey` and friends build every key), and the verdict reads them through one function per family, `rules_v4`/`rules_v6(policy, …)` in `bpf/verdict.h`, a global BPF function the verifier walks once; the default action applies only when a policy's rules decide nothing
 - Manages 8 eBPF maps: `map_cidrs`, `map_cidrs_v6`, `map_ports`, `map_ports_v6`, `map_default_action`, `map_audit_mode`, `map_events`, `map_sock_pid`
 - Separate IPv4/IPv6 methods (`addCIDRv4`, `addCIDRv6`) with appropriate key types
 - `SetDefaultAction(action)` — sets `map_default_action[0]` to 0 (deny) or 1 (allow)

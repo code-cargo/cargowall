@@ -159,7 +159,7 @@ func bpfDecideV4(cidrs, ports *mockMap, ip net.IP, port uint16, proto uint8, def
 	ip4 := ip.To4()
 	for plen := 32; plen >= 0; plen-- {
 		network := binary.NativeEndian.Uint32(ip4.Mask(net.CIDRMask(plen, 32)))
-		rv, ok := cidrs.store[bpf.TcBpfLpmKey{Prefixlen: uint32(plen), Ip: network}]
+		rv, ok := cidrs.store[bpf.RuleKey(bpf.PolicyJob, uint32(plen), network)]
 		if !ok {
 			continue
 		}
@@ -169,15 +169,15 @@ func bpfDecideV4(cidrs, ports *mockMap, ip net.IP, port uint16, proto uint8, def
 		}
 		// The kernel masks by the value's host_bits, not the key it matched.
 		ruleNet := binary.NativeEndian.Uint32(ip4.Mask(net.CIDRMask(max(32-int(rule.HostBits), 0), 32)))
-		if pv, ok := ports.store[bpf.TcBpfPortKey{Ip: ruleNet, Port: port, Proto: proto, HostBits: rule.HostBits}]; ok {
+		if pv, ok := ports.store[bpf.RulePortKey(bpf.PolicyJob, ruleNet, port, proto, rule.HostBits)]; ok {
 			return pv.(bpf.TcBpfPortVal).Action == 1
 		}
-		if pv, ok := ports.store[bpf.TcBpfPortKey{Ip: 0, Port: port, Proto: proto}]; ok {
+		if pv, ok := ports.store[bpf.RulePortKey(bpf.PolicyJob, 0, port, proto, 0)]; ok {
 			return pv.(bpf.TcBpfPortVal).Action == 1
 		}
 		return defaultAllow
 	}
-	if pv, ok := ports.store[bpf.TcBpfPortKey{Ip: 0, Port: port, Proto: proto}]; ok {
+	if pv, ok := ports.store[bpf.RulePortKey(bpf.PolicyJob, 0, port, proto, 0)]; ok {
 		return pv.(bpf.TcBpfPortVal).Action == 1
 	}
 	return defaultAllow
@@ -192,7 +192,7 @@ func bpfDecideV6(cidrs, ports *mockMap, ip net.IP, port uint16, proto uint8, def
 		return out
 	}
 	for plen := 128; plen >= 0; plen-- {
-		rv, ok := cidrs.store[bpf.TcBpfLpmKeyV6{Prefixlen: uint32(plen), Ip: masked(plen)}]
+		rv, ok := cidrs.store[bpf.RuleKeyV6(bpf.PolicyJob, uint32(plen), masked(plen))]
 		if !ok {
 			continue
 		}
@@ -201,15 +201,15 @@ func bpfDecideV6(cidrs, ports *mockMap, ip net.IP, port uint16, proto uint8, def
 			return rule.Action == 1
 		}
 		ruleNet := masked(max(128-int(rule.HostBits), 0))
-		if pv, ok := ports.store[bpf.TcBpfPortKeyV6{Ip: ruleNet, Port: port, Proto: proto, HostBits: rule.HostBits}]; ok {
+		if pv, ok := ports.store[bpf.RulePortKeyV6(bpf.PolicyJob, ruleNet, port, proto, rule.HostBits)]; ok {
 			return pv.(bpf.TcBpfPortVal).Action == 1
 		}
-		if pv, ok := ports.store[bpf.TcBpfPortKeyV6{Port: port, Proto: proto}]; ok {
+		if pv, ok := ports.store[bpf.RulePortKeyV6(bpf.PolicyJob, [16]byte{}, port, proto, 0)]; ok {
 			return pv.(bpf.TcBpfPortVal).Action == 1
 		}
 		return defaultAllow
 	}
-	if pv, ok := ports.store[bpf.TcBpfPortKeyV6{Port: port, Proto: proto}]; ok {
+	if pv, ok := ports.store[bpf.RulePortKeyV6(bpf.PolicyJob, [16]byte{}, port, proto, 0)]; ok {
 		return pv.(bpf.TcBpfPortVal).Action == 1
 	}
 	return defaultAllow
@@ -235,7 +235,7 @@ func TestAddIP_ExactDuplicate(t *testing.T) {
 
 	// Configure Lookup to return an existing entry that matches what AddIP would write
 	mocks["cidrs"].lookupFn = func(key, valueOut any) error {
-		k := key.(*bpf.TcBpfLpmKey)
+		k := key.(*bpf.TcBpfRuleKey)
 		if k.Ip == ipUint32 {
 			v := valueOut.(*bpf.TcBpfLpmVal)
 			v.Action = 1 // ActionAllow
@@ -270,7 +270,7 @@ func TestAddIP_SharedIP_DifferentPorts_StillWritesPortEntries(t *testing.T) {
 	// Existing LPM entry from a prior AddIP for the same IP with a different
 	// port set — Action and PortSpecific both match what we're about to write.
 	mocks["cidrs"].lookupFn = func(key, valueOut any) error {
-		k := key.(*bpf.TcBpfLpmKey)
+		k := key.(*bpf.TcBpfRuleKey)
 		if k.Ip == ipUint32 {
 			v := valueOut.(*bpf.TcBpfLpmVal)
 			v.Action = 1       // ActionAllow
@@ -290,7 +290,7 @@ func TestAddIP_SharedIP_DifferentPorts_StillWritesPortEntries(t *testing.T) {
 	// retry on the new port succeeds. Pre-fix this was skipped and the BPF
 	// blocked the connection silently.
 	require.Len(t, mocks["ports"].updates, 1, "per-port entry must be written even when LPM is a no-op")
-	portKey := mocks["ports"].updates[0].key.(*bpf.TcBpfPortKey)
+	portKey := mocks["ports"].updates[0].key.(*bpf.TcBpfRulePortKey)
 	assert.Equal(t, ipUint32, portKey.Ip)
 	assert.Equal(t, uint16(8080), portKey.Port)
 	assert.Equal(t, uint8(6), portKey.Proto, "TCP proto number")
@@ -317,7 +317,7 @@ func TestAddIPv6_SharedIP_DifferentPorts_StillWritesPortEntries(t *testing.T) {
 	assert.True(t, changed, "per-port v6 entry was newly written")
 
 	require.Len(t, mocks["portsV6"].updates, 1, "per-port v6 entry must be written even when LPM is a no-op")
-	portKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfPortKeyV6)
+	portKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfRulePortKeyV6)
 	assert.Equal(t, uint16(8080), portKey.Port)
 	assert.Equal(t, uint8(6), portKey.Proto)
 	assert.Equal(t, []portProto{{Port: 8080, Proto: 6}}, fw.ipPorts[ip.String()].ports)
@@ -369,7 +369,7 @@ func TestAddIP_SharedIP_IpPortsAccumulatesAcrossCalls(t *testing.T) {
 	// to return the LPM entry from the first call.
 	ipUint32 := binary.NativeEndian.Uint32(ip.To4())
 	mocks["cidrs"].lookupFn = func(key, valueOut any) error {
-		k := key.(*bpf.TcBpfLpmKey)
+		k := key.(*bpf.TcBpfRuleKey)
 		if k.Ip == ipUint32 {
 			v := valueOut.(*bpf.TcBpfLpmVal)
 			v.Action = 1
@@ -433,7 +433,7 @@ func TestAddIP_TransitionToAllPorts_KeepsPortEntriesAndIsSticky(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, changed, "port-specific re-add over a sticky all-ports grant is a no-op")
 
-	lpm := mocks["cidrs"].store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: binary.NativeEndian.Uint32(ip.To4())}].(bpf.TcBpfLpmVal)
+	lpm := mocks["cidrs"].store[bpf.RuleKey(bpf.PolicyJob, 32, binary.NativeEndian.Uint32(ip.To4()))].(bpf.TcBpfLpmVal)
 	assert.Equal(t, uint8(0), lpm.PortSpecific, "all-ports grant stays PortSpecific=0 after a port-specific add")
 	assert.True(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], ip, 9999, protoTCP, false), "any port still allowed")
 }
@@ -449,7 +449,7 @@ func TestAddIP_SameIPDifferentAction(t *testing.T) {
 
 	// Existing entry has Action=allow (1), all-ports; we'll add an all-ports deny.
 	mocks["cidrs"].lookupFn = func(key, valueOut any) error {
-		k := key.(*bpf.TcBpfLpmKey)
+		k := key.(*bpf.TcBpfRuleKey)
 		if k.Ip == ipUint32 {
 			v := valueOut.(*bpf.TcBpfLpmVal)
 			v.Action = 1 // ActionAllow
@@ -691,7 +691,7 @@ func TestUpdateAllowlistTC_ICMPRule_WritesICMPPortEntry(t *testing.T) {
 	assert.Equal(t, uint8(1), lpmVal.PortSpecific, "ICMP rule is port-specific (even though port=0)")
 
 	require.Len(t, mocks["ports"].updates, 1, "port map entry for ICMP")
-	pKey := mocks["ports"].updates[0].key.(*bpf.TcBpfPortKey)
+	pKey := mocks["ports"].updates[0].key.(*bpf.TcBpfRulePortKey)
 	assert.Equal(t, uint16(0), pKey.Port)
 	assert.Equal(t, protoICMP, pKey.Proto)
 }
@@ -710,7 +710,7 @@ func TestUpdateAllowlistTC_IPv4Wildcard_ICMPOnly(t *testing.T) {
 
 	assert.Empty(t, mocks["cidrs"].updates, "wildcard CIDR skips LPM entry")
 	require.Len(t, mocks["ports"].updates, 1, "wildcard ICMP entry goes into port map with ip=0")
-	pKey := mocks["ports"].updates[0].key.(*bpf.TcBpfPortKey)
+	pKey := mocks["ports"].updates[0].key.(*bpf.TcBpfRulePortKey)
 	assert.Equal(t, uint32(0), pKey.Ip)
 	assert.Equal(t, uint16(0), pKey.Port)
 	assert.Equal(t, protoICMP, pKey.Proto)
@@ -745,7 +745,7 @@ func TestAddIP_IPv6_MixedICMPAndTCP_DropsICMP(t *testing.T) {
 	assert.Equal(t, uint8(1), lpmVal.PortSpecific, "mixed rule stays port-specific after ICMP filter")
 
 	require.Len(t, mocks["portsV6"].updates, 1, "only the TCP entry should be written")
-	pKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfPortKeyV6)
+	pKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfRulePortKeyV6)
 	assert.Equal(t, uint16(443), pKey.Port)
 	assert.Equal(t, protoTCP, pKey.Proto)
 }
@@ -800,7 +800,7 @@ func TestUpdateAllowlistTC_HostnameResolvedToV6_MixedPorts_FiltersICMP(t *testin
 	assert.Equal(t, uint8(1), lpmVal.PortSpecific)
 
 	require.Len(t, mocks["portsV6"].updates, 1, "only the TCP entry should be written for v6")
-	pKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfPortKeyV6)
+	pKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfRulePortKeyV6)
 	assert.Equal(t, uint16(443), pKey.Port)
 	assert.Equal(t, protoTCP, pKey.Proto)
 }
@@ -864,7 +864,7 @@ func TestAddIP_SharedIP_AllPortsWinsAnyOrder_V4(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			lpm := mocks["cidrs"].store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: ipU}].(bpf.TcBpfLpmVal)
+			lpm := mocks["cidrs"].store[bpf.RuleKey(bpf.PolicyJob, 32, ipU)].(bpf.TcBpfLpmVal)
 			assert.Equal(t, uint8(0), lpm.PortSpecific, "all-ports grant must leave PortSpecific=0")
 			assert.Equal(t, uint8(1), lpm.Action)
 
@@ -896,7 +896,7 @@ func TestAddIP_SharedIP_AllPortsWinsAnyOrder_V6(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			lpm := mocks["cidrsV6"].store[bpf.TcBpfLpmKeyV6{Prefixlen: 128, Ip: ipArr}].(bpf.TcBpfLpmVal)
+			lpm := mocks["cidrsV6"].store[bpf.RuleKeyV6(bpf.PolicyJob, 128, ipArr)].(bpf.TcBpfLpmVal)
 			assert.Equal(t, uint8(0), lpm.PortSpecific, "all-ports grant must leave PortSpecific=0")
 			assert.Equal(t, uint8(1), lpm.Action)
 
@@ -927,7 +927,7 @@ func TestAddIP_SharedIP_TwoPortSpecificUnionAnyOrder_V4(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			lpm := mocks["cidrs"].store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: ipU}].(bpf.TcBpfLpmVal)
+			lpm := mocks["cidrs"].store[bpf.RuleKey(bpf.PolicyJob, 32, ipU)].(bpf.TcBpfLpmVal)
 			assert.Equal(t, uint8(1), lpm.PortSpecific, "no all-ports rule → stays port-specific")
 
 			assert.True(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], ip, 80, protoTCP, false), "TCP/80 allowed")
@@ -955,7 +955,7 @@ func TestAddIP_SharedIP_TwoPortSpecificUnionAnyOrder_V6(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			lpm := mocks["cidrsV6"].store[bpf.TcBpfLpmKeyV6{Prefixlen: 128, Ip: ipArr}].(bpf.TcBpfLpmVal)
+			lpm := mocks["cidrsV6"].store[bpf.RuleKeyV6(bpf.PolicyJob, 128, ipArr)].(bpf.TcBpfLpmVal)
 			assert.Equal(t, uint8(1), lpm.PortSpecific, "no all-ports rule → stays port-specific")
 
 			assert.True(t, bpfDecideV6(mocks["cidrsV6"], mocks["portsV6"], ip, 80, protoTCP, false), "TCP/80 allowed")
@@ -975,12 +975,12 @@ func TestAddIP_PortSpecific_DoesNotDowngradeSeededAllPortsLPM_V4(t *testing.T) {
 	ipU := binary.NativeEndian.Uint32(ip.To4())
 
 	// Pre-existing all-ports allow entry with no ipPorts tracking.
-	mocks["cidrs"].store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: ipU}] = bpf.TcBpfLpmVal{Action: 1, PortSpecific: 0}
+	mocks["cidrs"].store[bpf.RuleKey(bpf.PolicyJob, 32, ipU)] = bpf.TcBpfLpmVal{Action: 1, PortSpecific: 0}
 
 	_, err := fw.AddIP(ip, config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolTCP}})
 	require.NoError(t, err)
 
-	lpm := mocks["cidrs"].store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: ipU}].(bpf.TcBpfLpmVal)
+	lpm := mocks["cidrs"].store[bpf.RuleKey(bpf.PolicyJob, 32, ipU)].(bpf.TcBpfLpmVal)
 	assert.Equal(t, uint8(0), lpm.PortSpecific, "existing all-ports grant must not be downgraded")
 	assert.True(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], ip, 9999, protoTCP, false), "any port still allowed")
 }
@@ -996,7 +996,7 @@ func TestAddIP_AllPortsDeny_BlocksAll_V4(t *testing.T) {
 	_, err := fw.AddIP(ip, config.ActionDeny, nil)
 	require.NoError(t, err)
 
-	lpm := mocks["cidrs"].store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: ipU}].(bpf.TcBpfLpmVal)
+	lpm := mocks["cidrs"].store[bpf.RuleKey(bpf.PolicyJob, 32, ipU)].(bpf.TcBpfLpmVal)
 	assert.Equal(t, uint8(0), lpm.PortSpecific)
 	assert.Equal(t, uint8(0), lpm.Action)
 	// Even with a default-allow policy the IP is blocked on every port.
@@ -1022,7 +1022,7 @@ func TestAddIP_AllPortsDeny_WinsOverAllPortsAllow(t *testing.T) {
 				_, err := fw.AddIP(ip, action, nil)
 				require.NoError(t, err)
 			}
-			lpm := mocks["cidrs"].store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: ipU}].(bpf.TcBpfLpmVal)
+			lpm := mocks["cidrs"].store[bpf.RuleKey(bpf.PolicyJob, 32, ipU)].(bpf.TcBpfLpmVal)
 			assert.Equal(t, uint8(0), lpm.Action, "deny must win")
 			assert.Equal(t, uint8(0), lpm.PortSpecific)
 			assert.False(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], ip, 443, protoTCP, true))
@@ -1046,7 +1046,7 @@ func TestAddIP_PortSpecificDeny_InertUnderAllPortsAllow_V4(t *testing.T) {
 	assert.False(t, changed, "inert port-specific deny must report no observable change")
 
 	// The deny is neither written to map_ports nor tracked in the union.
-	_, denyWritten := mocks["ports"].store[bpf.TcBpfPortKey{Ip: binary.NativeEndian.Uint32(ip.To4()), Port: 8080, Proto: protoTCP}]
+	_, denyWritten := mocks["ports"].store[bpf.RulePortKey(bpf.PolicyJob, binary.NativeEndian.Uint32(ip.To4()), 8080, protoTCP, 0)]
 	assert.False(t, denyWritten, "inert per-port entry must not be written")
 	assert.Empty(t, fw.ipPorts[ip.String()].ports, "inert ports must not be tracked")
 
@@ -1074,7 +1074,7 @@ func TestSharedIP_UpdateAllowlistTC_AndAddIP_Unified_V4(t *testing.T) {
 		_, err := fw.AddIP(net.ParseIP(ip), config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolTCP}})
 		require.NoError(t, err)
 
-		lpm := mocks["cidrs"].store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: binary.NativeEndian.Uint32(net.ParseIP(ip).To4())}].(bpf.TcBpfLpmVal)
+		lpm := mocks["cidrs"].store[bpf.RuleKey(bpf.PolicyJob, 32, binary.NativeEndian.Uint32(net.ParseIP(ip).To4()))].(bpf.TcBpfLpmVal)
 		assert.Equal(t, uint8(0), lpm.PortSpecific, "config all-ports grant must not be narrowed by a runtime port-specific add")
 		assert.True(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], net.ParseIP(ip), 9999, protoTCP, false), "any port still allowed")
 	})
@@ -1091,7 +1091,7 @@ func TestSharedIP_UpdateAllowlistTC_AndAddIP_Unified_V4(t *testing.T) {
 		require.NoError(t, cm.LoadConfigFromRules(rules, config.ActionDeny))
 		require.NoError(t, fw.UpdateAllowlistTC(cm)) // config all-ports over a runtime port-specific IP
 
-		lpm := mocks["cidrs"].store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: binary.NativeEndian.Uint32(net.ParseIP(ip).To4())}].(bpf.TcBpfLpmVal)
+		lpm := mocks["cidrs"].store[bpf.RuleKey(bpf.PolicyJob, 32, binary.NativeEndian.Uint32(net.ParseIP(ip).To4()))].(bpf.TcBpfLpmVal)
 		assert.Equal(t, uint8(0), lpm.PortSpecific, "config all-ports grant must broaden the runtime port-specific entry")
 		assert.True(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], net.ParseIP(ip), 9999, protoTCP, false), "any port allowed")
 	})
@@ -1120,10 +1120,10 @@ func TestRemoveIP_CleansFullUnion_LeavesOtherIPsIntact_V4(t *testing.T) {
 	// X is gone from tracking, the LPM trie and the port map (full union).
 	_, exists := fw.ipPorts[x.String()]
 	assert.False(t, exists, "removed IP must be dropped from tracking")
-	_, lpmExists := mocks["cidrs"].store[bpf.TcBpfLpmKey{Prefixlen: 32, Ip: xU}]
+	_, lpmExists := mocks["cidrs"].store[bpf.RuleKey(bpf.PolicyJob, 32, xU)]
 	assert.False(t, lpmExists, "removed IP must be gone from the LPM trie")
 	for k := range mocks["ports"].store {
-		assert.NotEqual(t, xU, k.(bpf.TcBpfPortKey).Ip, "no port entry for the removed IP may remain")
+		assert.NotEqual(t, xU, k.(bpf.TcBpfRulePortKey).Ip, "no port entry for the removed IP may remain")
 	}
 	assert.False(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], x, 80, protoTCP, false))
 

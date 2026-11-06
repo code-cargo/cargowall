@@ -87,7 +87,7 @@ func seedOriginRules(t *testing.T, objs *OriginBpfObjects) {
 	require.NoError(t, objs.MapDefaultAction.Put(uint32(0), uint8(0)))
 	require.NoError(t, objs.MapAuditMode.Put(uint32(0), uint8(0)))
 	require.NoError(t, objs.MapCidrs.Put(
-		OriginBpfLpmKey{Prefixlen: 24, Ip: ipToU32("140.82.114.0")},
+		RuleKey(PolicyJob, 24, ipToU32("140.82.114.0")),
 		OriginBpfLpmVal{Action: 1},
 	))
 	require.NoError(t, objs.MapCidrsV6.Put(
@@ -96,13 +96,11 @@ func seedOriginRules(t *testing.T, objs *OriginBpfObjects) {
 	))
 }
 
-func originV6Key(t *testing.T, prefixlen uint32, addr string) OriginBpfLpmKeyV6 {
+func originV6Key(t *testing.T, prefixlen uint32, addr string) TcBpfRuleKeyV6 {
 	t.Helper()
-	key := OriginBpfLpmKeyV6{Prefixlen: prefixlen}
 	ip := net.ParseIP(addr).To16()
 	require.NotNil(t, ip, "bad v6 addr %q", addr)
-	copy(key.Ip[:], ip)
-	return key
+	return RuleKeyV6(PolicyJob, prefixlen, [16]byte(ip))
 }
 
 // Note on PROG_TEST_RUN inputs: for non-L2 program types like cgroup_skb the
@@ -715,31 +713,31 @@ func TestVerdictParityWithTcEgress(t *testing.T) {
 	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(0)))
 	require.NoError(t, tcObjs.MapAuditMode.Put(uint32(0), uint8(0)))
 	require.NoError(t, tcObjs.MapCidrs.Put(
-		TcBpfLpmKey{Prefixlen: 24, Ip: ipToU32("140.82.114.0")},
+		RuleKey(PolicyJob, 24, ipToU32("140.82.114.0")),
 		TcBpfLpmVal{Action: 1},
 	))
 	require.NoError(t, tcObjs.MapCidrs.Put(
-		TcBpfLpmKey{Prefixlen: 32, Ip: ipToU32("10.1.2.3")},
+		RuleKey(PolicyJob, 32, ipToU32("10.1.2.3")),
 		TcBpfLpmVal{Action: 1, PortSpecific: 1},
 	))
 	require.NoError(t, tcObjs.MapPorts.Put(
-		TcBpfPortKey{Ip: ipToU32("10.1.2.3"), Port: 8443, Proto: ipprotoTCP},
+		RulePortKey(PolicyJob, ipToU32("10.1.2.3"), 8443, ipprotoTCP, 0),
 		TcBpfPortVal{Action: 1},
 	))
 	// Port-specific subnets, keyed as the firewall writes them: the verdict
 	// masks the destination down to the matched rule's network address.
 	require.NoError(t, tcObjs.MapCidrs.Put(
-		TcBpfLpmKey{Prefixlen: 16, Ip: ipToU32("10.2.0.0")},
+		RuleKey(PolicyJob, 16, ipToU32("10.2.0.0")),
 		TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 16},
 	))
 	require.NoError(t, tcObjs.MapPorts.Put(
-		TcBpfPortKey{Ip: ipToU32("10.2.0.0"), Port: 8443, Proto: ipprotoTCP, HostBits: 16},
+		RulePortKey(PolicyJob, ipToU32("10.2.0.0"), 8443, ipprotoTCP, 16),
 		TcBpfPortVal{Action: 1},
 	))
-	subnet6 := TcBpfLpmKeyV6{Prefixlen: 48}
+	subnet6 := RuleKeyV6(PolicyJob, 48, [16]byte{})
 	copy(subnet6.Ip[:], net.ParseIP("2001:db8:5::").To16())
 	require.NoError(t, tcObjs.MapCidrsV6.Put(subnet6, TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 80}))
-	port6 := TcBpfPortKeyV6{Ip: subnet6.Ip, Port: 8443, Proto: ipprotoTCP, HostBits: 80}
+	port6 := RulePortKeyV6(PolicyJob, subnet6.Ip, 8443, ipprotoTCP, 80)
 	require.NoError(t, tcObjs.MapPortsV6.Put(port6, TcBpfPortVal{Action: 1}))
 	require.NoError(t, originObjs.MapOriginConfig.Put(uint32(0), uint8(originModeEnforce)))
 

@@ -60,8 +60,8 @@
 #define TCP_FLAG_ACK 0x10
 #define TCP_FLAG_URG 0x20
 
-// The rule/config structs (lpm_key, lpm_val, port_key, port_val, and the v6
-// variants) now live in verdict.h, shared with cw_cg_egress.
+// The rule/config structs (rule_key, lpm_val, rule_port_key, port_val, and
+// the v6 variants) live in verdict.h, shared with cw_cg_egress.
 
 // ---- Event struct with version discriminator ----
 
@@ -120,6 +120,22 @@ struct {
 // blocked destination tuple, ~110KB worst case. LRU eviction under pressure
 // costs an occasional duplicate event, never a lost verdict.
 #define MIDSTREAM_EMIT_INTERVAL_NS (10ULL * 1000000000ULL)
+
+// One exact destination tuple: the rate-limit key, policy-free since it
+// keys what was blocked, not the rule that blocked it.
+struct port_key {
+    __u32 ip;
+    __u16 port;
+    __u8 proto;
+    __u8 host_bits;  // always 0
+} __attribute__((packed));
+
+struct port_key_v6 {
+    __u8 ip[16];
+    __u16 port;
+    __u8 proto;
+    __u8 host_bits;  // always 0
+} __attribute__((packed));
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -240,7 +256,7 @@ static __always_inline int midstream_should_emit(__u32 dst_ip_nbo, __u16 dst_por
         .ip = dst_ip_nbo,
         .port = dst_port,
         .proto = proto,
-        .host_bits = 0  // one exact destination, keyed like a host route
+        .host_bits = 0
     };
     __u64 now = bpf_ktime_get_ns();
     __u64 *last = bpf_map_lookup_elem(&map_midstream_seen, &key);

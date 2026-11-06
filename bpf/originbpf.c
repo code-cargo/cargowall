@@ -186,6 +186,18 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } map_scope_cgroups SEC(".maps");
 
+// LPM key of map_local_nets: a plain prefix over the address, since the
+// carve-out is no policy's rule.
+struct lpm_key {
+    __u32 prefixlen;  // Must be first member for LPM trie
+    __u32 ip;
+} __attribute__((packed));
+
+struct lpm_key_v6 {
+    __u32 prefixlen;
+    __u8 ip[16];
+} __attribute__((packed));
+
 // Local-only networks (docker bridge subnets), carved out of adjudication
 // the way loopback is. OWNED by this collection and deliberately NOT in
 // verdict.h: an entry here must never widen cw_tc_egress. Subnets are

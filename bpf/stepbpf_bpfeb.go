@@ -36,6 +36,8 @@ type StepBpfStepExecEvent struct {
 	ArgvLen uint32
 	Argv    [256]int8
 	Comm    [16]int8
+	EnvLen  uint32
+	Env     [32768]int8
 }
 
 type StepBpfStepState struct {

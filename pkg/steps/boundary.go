@@ -138,19 +138,22 @@ func (t *Tracker) run() {
 
 // reportLost reports the steps forked before cutoff whose exec or exit
 // event never came, with what /proc shows for the root by now: a lost
-// event's step must not vanish from the audit stream.
+// event's step must not vanish from the audit stream. It is reported
+// unidentified, and not identified at all: /proc shows the root's
+// environment as the step may since have rewritten it. Should the exec
+// event come after all, it identifies the step then.
 func (t *Tracker) reportLost(cutoff time.Time) {
 	for _, b := range t.unreported(cutoff) {
-		t.reportStep(b, sanitizeCmdline(readCmdline(int(b.pid))))
+		t.reportStep(b, sanitizeCmdline(readCmdline(int(b.pid))), Identity{Class: events.StepClassUnknown})
 	}
 }
 
 // handleStepEvent handles one step event. A fork starts the step: the
 // boundary is recorded at once, so OrdinalAt callers racing it resolve
 // against it promptly, and its time is the boundary's. The root's first
-// exec says what the step runs, and only then is the step reported. A root
-// that exits without exec'ing ran a copy of Runner.Worker, whose command
-// line it reports.
+// exec says what the step runs and which step it is, and only then is the
+// step reported. A root that exits without exec'ing ran a copy of
+// Runner.Worker, whose command line it reports, and is no step.
 func (t *Tracker) handleStepEvent(raw []byte, now time.Time) {
 	if len(raw) < 4 {
 		return
@@ -162,27 +165,52 @@ func (t *Tracker) handleStepEvent(raw []byte, now time.Time) {
 		}
 		ev := (*bpf.StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
 		t.recordBoundary(boundary{ordinal: ev.Ordinal, at: now, pid: ev.Tgid})
-	case bpf.StepBpfStepEventKindSTEP_EV_EXEC, bpf.StepBpfStepEventKindSTEP_EV_EXIT:
+	case bpf.StepBpfStepEventKindSTEP_EV_EXIT:
+		if len(raw) < int(unsafe.Sizeof(bpf.StepBpfStepChildEvent{})) {
+			return
+		}
+		ev := (*bpf.StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
+		if b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now); ok {
+			t.reportStep(b, sanitizeCmdline(t.workerCmdline), Identity{})
+		}
+	case bpf.StepBpfStepEventKindSTEP_EV_EXEC:
 		if len(raw) < int(unsafe.Sizeof(bpf.StepBpfStepExecEvent{})) {
 			return
 		}
+		// The record carries the step's environment and arguments, its
+		// secrets among them. Nothing taken from it below shares its
+		// memory, so it is wiped once read rather than left in the heap.
+		defer clear(raw)
 		ev := (*bpf.StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
+		id := identify(cBytes(ev.Env[:]), int(ev.EnvLen))
 		b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now)
+		t.identified(ev.Ordinal, id)
 		if !ok {
-			return // reported as lost already
+			// Reported as lost already, unidentified: the kernel's copy
+			// came late, and still names the step.
+			t.logger.Info("Workflow step identified after it was reported",
+				"step_ordinal", ev.Ordinal,
+				"step_id", id.StepID,
+				"step_class", id.Class)
+			return
 		}
-		cmdline := t.workerCmdline
-		if bpf.StepBpfStepEventKind(ev.Kind) == bpf.StepBpfStepEventKindSTEP_EV_EXEC {
-			n := min(int(ev.ArgvLen), len(ev.Argv))
-			cmdline = formatCmdline(cBytes(ev.Argv[:n]), int(ev.ArgvLen) > len(ev.Argv))
-			if cmdline == "" {
-				// The kernel could not read the arguments: the program's
-				// name, from the same exec. /proc could by now show
-				// another exec, or another process on a reused pid.
-				cmdline = strings.TrimRight(string(cBytes(ev.Comm[:])), "\x00")
-			}
+		n := min(int(ev.ArgvLen), len(ev.Argv))
+		cmdline := formatCmdline(cBytes(ev.Argv[:n]), int(ev.ArgvLen) > len(ev.Argv))
+		if cmdline == "" {
+			// The kernel could not read the arguments: the program's
+			// name, from the same exec. /proc could by now show
+			// another exec, or another process on a reused pid.
+			cmdline = strings.TrimRight(string(cBytes(ev.Comm[:])), "\x00")
 		}
-		t.reportStep(b, sanitizeCmdline(cmdline))
+		t.reportStep(b, sanitizeCmdline(cmdline), id)
+	}
+}
+
+// identified hands a step's identity to Options.OnIdentified, ahead of the
+// step's report: a policy bound on it applies the sooner.
+func (t *Tracker) identified(ordinal uint32, id Identity) {
+	if t.onIdentified != nil {
+		t.onIdentified(ordinal, id)
 	}
 }
 
@@ -197,9 +225,11 @@ func cBytes(a []int8) []byte {
 // reportStep logs a step and writes its step_boundary event, stamped with
 // the step's fork time. The pid is numbered in our pid namespace (see
 // map_task_nspid).
-func (t *Tracker) reportStep(b boundary, cmdline string) {
+func (t *Tracker) reportStep(b boundary, cmdline string, id Identity) {
 	t.logger.Info("Workflow step process started",
 		"step_ordinal", b.ordinal,
+		"step_id", id.StepID,
+		"step_class", id.Class,
 		"pid", b.pid,
 		"cmdline", cmdline)
 	if t.auditLogger == nil {
@@ -211,6 +241,8 @@ func (t *Tracker) reportStep(b boundary, cmdline string) {
 		Process:     cmdline,
 		PID:         b.pid,
 		StepOrdinal: b.ordinal,
+		StepID:      id.StepID,
+		StepClass:   id.Class,
 	}); err != nil {
 		t.logger.Error("Failed to write audit log", "error", err)
 	}

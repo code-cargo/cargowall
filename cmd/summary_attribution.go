@@ -64,9 +64,15 @@ const resolveRoundingSlack = 2 * time.Second
 // (the next step's start) make every window abut its successor, which
 // would hand the window tie-breaker synthetic evidence — Run resolves
 // BEFORE backfillStepCompletion for exactly this reason.
+//
+// A runner helper's boundary (hashFiles()) is no step's, and takes no part.
 func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep) map[uint32]int {
-	boundaries := make([]events.AuditEvent, len(stepBoundaries))
-	copy(boundaries, stepBoundaries)
+	var boundaries []events.AuditEvent
+	for _, b := range stepBoundaries {
+		if b.StepClass != events.StepClassRunner {
+			boundaries = append(boundaries, b)
+		}
+	}
 	sort.Slice(boundaries, func(i, j int) bool {
 		return boundaries[i].StepOrdinal < boundaries[j].StepOrdinal
 	})
@@ -141,6 +147,33 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 		}
 	}
 	return idx
+}
+
+// foldRunnerHelpers moves the traffic of runner helpers — roots whose
+// whole environment names no step, as the hashFiles() helper's doesn't,
+// which fork like steps but are none — into the runner tier, where the
+// rest of the runner's own traffic is, instead of leaving it posing as a
+// step's. Reporting only: the class vouches for nothing.
+// It returns regular with those events' ordinals set to StepOrdinalRunner;
+// their boundaries keep the real ordinal, for the Step Attribution table.
+func foldRunnerHelpers(regular, stepBoundaries []events.AuditEvent) []events.AuditEvent {
+	helpers := make(map[uint32]bool)
+	for _, b := range stepBoundaries {
+		if b.StepClass == events.StepClassRunner {
+			helpers[b.StepOrdinal] = true
+		}
+	}
+	if len(helpers) == 0 {
+		return regular
+	}
+	out := make([]events.AuditEvent, len(regular))
+	for i, ev := range regular {
+		if helpers[ev.StepOrdinal] {
+			ev.StepOrdinal = events.StepOrdinalRunner
+		}
+		out[i] = ev
+	}
+	return out
 }
 
 // ordinalStepName is the display name for an ordinal, or "" when unresolved
@@ -381,9 +414,27 @@ func stepOrdinalLabel(ordinal uint32) string {
 	}
 }
 
+// stepIDLabel renders a boundary's step identity for the Step Attribution
+// table: the runner's name for the step, or what the root is when it names
+// none. A log from a cargowall that predates step ids, or a root that
+// exited without exec'ing, has neither: "-".
+func stepIDLabel(b events.AuditEvent) string {
+	switch b.StepClass {
+	case events.StepClassStep:
+		return "`" + mdCode(b.StepID) + "`"
+	case events.StepClassRunner:
+		return "runner helper"
+	case events.StepClassUnknown:
+		return "unknown"
+	default:
+		return "-"
+	}
+}
+
 // generateStepAttributionSection renders the causal step table: one row per
-// step_boundary event, mapping each ordinal to the GitHub step it resolved
-// to and the process the runner actually launched for it.
+// step_boundary event, mapping each ordinal to the step id the runner gave
+// it, the GitHub step it resolved to, and the process the runner actually
+// launched for it.
 func (c *SummaryCmd) generateStepAttributionSection(stepBoundaries []events.AuditEvent, steps []GitHubStep, ordinalSteps map[uint32]int) {
 	if len(stepBoundaries) == 0 {
 		return
@@ -399,8 +450,8 @@ func (c *SummaryCmd) generateStepAttributionSection(stepBoundaries []events.Audi
 	fmt.Fprintln(c.output)
 	fmt.Fprintln(c.output, "Causal mapping of the `Step` column: the step process whose subtree created each connection's socket.")
 	fmt.Fprintln(c.output)
-	fmt.Fprintln(c.output, "| Step | GitHub step | Process |")
-	fmt.Fprintln(c.output, "|------|-------------|---------|")
+	fmt.Fprintln(c.output, "| Step | Step id | GitHub step | Process |")
+	fmt.Fprintln(c.output, "|------|---------|-------------|---------|")
 	for _, b := range boundaries {
 		process := b.Process
 		if process == "" {
@@ -410,7 +461,7 @@ func (c *SummaryCmd) generateStepAttributionSection(stepBoundaries []events.Audi
 		if name == "" {
 			name = "-"
 		}
-		fmt.Fprintf(c.output, "| #%d | %s | `%s` |\n", b.StepOrdinal, mdCell(name), mdCode(process))
+		fmt.Fprintf(c.output, "| #%d | %s | %s | `%s` |\n", b.StepOrdinal, stepIDLabel(b), mdCell(name), mdCode(process))
 	}
 	fmt.Fprintln(c.output)
 }

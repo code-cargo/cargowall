@@ -47,7 +47,8 @@ const (
 )
 
 // readStepEvent reads the next step event: its kind, and the event decoded
-// as the fork or the exec/exit struct its kind says it is.
+// as the struct its kind says it is: a fork or an exit is a child event,
+// exactly that size, and an exec an exec event.
 func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEvent, StepBpfStepExecEvent) {
 	t.Helper()
 	record, err := rd.Read()
@@ -57,11 +58,11 @@ func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEv
 	var fork StepBpfStepChildEvent
 	var execEv StepBpfStepExecEvent
 	switch kind := *(*uint32)(unsafe.Pointer(&raw[0])); kind {
-	case stepEvFork:
-		require.GreaterOrEqual(t, len(raw), int(unsafe.Sizeof(fork)))
+	case stepEvFork, stepEvExit:
+		require.Len(t, raw, int(unsafe.Sizeof(fork)))
 		fork = *(*StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
 		return kind, fork, execEv
-	case stepEvExec, stepEvExit:
+	case stepEvExec:
 		require.GreaterOrEqual(t, len(raw), int(unsafe.Sizeof(execEv)))
 		execEv = *(*StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
 		return kind, fork, execEv
@@ -77,6 +78,12 @@ func argvOf(ev StepBpfStepExecEvent) string {
 	return string(unsafe.Slice((*byte)(unsafe.Pointer(&ev.Argv[0])), n))
 }
 
+// envOf returns the environment bytes an exec event copied.
+func envOf(ev StepBpfStepExecEvent) string {
+	n := min(int(ev.EnvLen), len(ev.Env))
+	return string(unsafe.Slice((*byte)(unsafe.Pointer(&ev.Env[0])), n))
+}
+
 // awaitStepEvent reads step events until one of kind for ordinal (any
 // ordinal when ordinal is 0) satisfies match, logging every event seen.
 func awaitStepEvent(t *testing.T, rd *ringbuf.Reader, kind, ordinal uint32,
@@ -87,7 +94,7 @@ func awaitStepEvent(t *testing.T, rd *ringbuf.Reader, kind, ordinal uint32,
 	for {
 		k, fork, execEv := readStepEvent(t, rd)
 		ord := fork.Ordinal
-		if k != stepEvFork {
+		if k == stepEvExec {
 			ord = execEv.Ordinal
 		}
 		t.Logf("step event: kind=%d ordinal=%d fork.tgid=%d exec.tgid=%d argv_len=%d", k, ord, fork.Tgid,
@@ -300,6 +307,44 @@ func TestStepExec_CutsLongArguments(t *testing.T) {
 	require.Equal(t, full[:len(execEv.Argv)], argvOf(execEv))
 }
 
+// TestStepExec_CarriesEnvironment: a step root's exec event carries the
+// environment its parent gave it, as the kernel laid it out — where the
+// runner names the step — and an environment longer than the event holds
+// is copied up to the event's size, with its full length reported.
+func TestStepExec_CarriesEnvironment(t *testing.T) {
+	tcObjs, objs, iter := loadStepObjects(t)
+	rd, err := ringbuf.NewReader(objs.MapStepEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { rd.Close() })
+	selfTgid, ok := globalTgid(t, iter, os.Getpid())
+	require.True(t, ok)
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: selfTgid, Enabled: 1, NextOrdinal: 5}))
+
+	run := func(env ...string) StepBpfStepExecEvent {
+		t.Helper()
+		child := exec.Command("/bin/true")
+		child.Env = env
+		require.NoError(t, child.Start())
+		pid := uint32(child.Process.Pid)
+		require.NoError(t, child.Wait())
+		_, execEv := awaitStepEvent(t, rd, stepEvExec, 0, func(_ StepBpfStepChildEvent, e StepBpfStepExecEvent) bool {
+			return e.Tgid == pid
+		})
+		return execEv
+	}
+
+	small := run("HOME=/home/runner", "GITHUB_ACTION=build")
+	want := "HOME=/home/runner\x00GITHUB_ACTION=build\x00"
+	require.EqualValues(t, len(want), small.EnvLen)
+	require.Equal(t, want, envOf(small))
+
+	big := strings.Repeat("v", len(small.Env)+1000)
+	cut := run("BIG="+big, "GITHUB_ACTION=build")
+	full := "BIG=" + big + "\x00GITHUB_ACTION=build\x00"
+	require.EqualValues(t, len(full), cut.EnvLen)
+	require.Equal(t, full[:len(cut.Env)], envOf(cut))
+}
+
 // TestStepExec_FirstExecOnly: a step root that execs again (a shell's
 // `exec`) is reported once, for what the worker started; its later exec
 // and its exit say nothing.
@@ -330,9 +375,10 @@ func TestStepExec_FirstExecOnly(t *testing.T) {
 			break
 		}
 		raw := record.RawSample
-		if len(raw) >= int(unsafe.Sizeof(StepBpfStepExecEvent{})) && *(*uint32)(unsafe.Pointer(&raw[0])) != stepEvFork {
-			ev := (*StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
-			require.NotEqual(t, first.Ordinal, ev.Ordinal, "a second event (kind %d) for the step", ev.Kind)
+		// Every kind carries its ordinal at the same offset.
+		if kind := *(*uint32)(unsafe.Pointer(&raw[0])); len(raw) >= 12 && kind != stepEvFork {
+			ord := *(*uint32)(unsafe.Pointer(&raw[8]))
+			require.NotEqual(t, first.Ordinal, ord, "a second event (kind %d) for the step", kind)
 		}
 	}
 }
@@ -488,11 +534,12 @@ func TestStepExit_WithoutExec(t *testing.T) {
 	_, err = stdin.Write([]byte("\n"))
 	require.NoError(t, err)
 	fork, _ := awaitStepEvent(t, rd, stepEvFork, 0, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool { return true })
-	_, exitEv := awaitStepEvent(t, rd, stepEvExit, fork.Ordinal, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool {
+	// An exit record has no room for an environment (readStepEvent pins its
+	// size), so it can't carry what an older exec record left in the ring.
+	exitEv, _ := awaitStepEvent(t, rd, stepEvExit, fork.Ordinal, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool {
 		return true
 	})
 	require.Equal(t, fork.Tgid, exitEv.Tgid)
-	require.Zero(t, exitEv.ArgvLen)
 }
 
 // readProcInt reads an integer /proc/sys value.
@@ -733,7 +780,7 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 	require.True(t, ok, "step_exec_event must be a struct, got %T", typ)
 	var execEv StepBpfStepExecEvent
 	require.Equal(t, uint32(unsafe.Sizeof(execEv)), st.Size, "struct size")
-	require.Len(t, st.Members, 6)
+	require.Len(t, st.Members, 8)
 	for i, w := range []struct {
 		name string
 		off  uintptr
@@ -744,6 +791,8 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 		{"argv_len", unsafe.Offsetof(execEv.ArgvLen)},
 		{"argv", unsafe.Offsetof(execEv.Argv)},
 		{"comm", unsafe.Offsetof(execEv.Comm)},
+		{"env_len", unsafe.Offsetof(execEv.EnvLen)},
+		{"env", unsafe.Offsetof(execEv.Env)},
 	} {
 		require.Equal(t, w.name, st.Members[i].Name)
 		require.Equal(t, w.off, uintptr(st.Members[i].Offset.Bytes()))

@@ -1,0 +1,11 @@
+name: step-identity
+description: >-
+  Two run steps under one composite step, for the step identity check in
+  ci.yml's test-cargowall-enforce job: both must carry the outer step's id.
+runs:
+  using: composite
+  steps:
+    - run: echo "composite, first"
+      shell: bash
+    - run: echo "composite, second"
+      shell: bash

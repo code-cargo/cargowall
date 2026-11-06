@@ -74,6 +74,16 @@ type Options struct {
 	// correlation happens downstream by matching step_boundary cmdlines,
 	// never by assuming ordinal == plan index.
 	OrdinalBase uint64
+	// OnIdentified, if set, is told each step's identity once, when its
+	// root's first exec event is read, however late. It runs on the
+	// step-event reader, before the step's report unless the exec event
+	// comes too late for it, and must not block.
+	// The step's program is already running by then: nothing orders the
+	// call ahead of the step's first connection. A step whose exec event
+	// never comes, and a root that exits without exec'ing, are never
+	// identified. Only events.StepClassStep identifies a step, and see
+	// Identity for what it does and doesn't vouch for.
+	OnIdentified func(ordinal uint32, id Identity)
 }
 
 // maxOrdinalBase bounds --step-ordinal-base away from the reserved
@@ -99,6 +109,7 @@ type Tracker struct {
 	auditLogger   *events.AuditLogger
 	logger        *slog.Logger
 	done          chan struct{}
+	onIdentified  func(ordinal uint32, id Identity)
 
 	// Boundary history for OrdinalAt and for reporting steps — see the
 	// boundary type.
@@ -175,6 +186,7 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		auditLogger:   auditLogger,
 		logger:        logger,
 		done:          make(chan struct{}),
+		onIdentified:  opts.OnIdentified,
 		resolver:      newClientResolver(tcObjs.MapSockStep, tcObjs.MapSockPid, logger),
 	}
 	t.snapshotFn = t.iterSnapshot

@@ -253,6 +253,35 @@ jobs:
       - name: Test summary command
         run: bash scripts/ci/enforce.sh summary
 
+      # Step identity: each step's id comes from the runner, read in the
+      # kernel at the step's first exec. The steps below are the shapes it
+      # must hold for, and step-identity checks them; the steps above,
+      # which have no id:, carry the runner's generated names.
+      - name: Step identity, named
+        id: identity-named
+        env:
+          # A step's environment holds its secrets: this must reach
+          # neither the audit log nor cargowall's log.
+          CW_IDENTITY_CANARY: cw-identity-canary-7f3a
+        run: echo "named"
+
+      - name: Step identity, skipped
+        id: identity-skipped
+        if: false
+        run: echo "never runs"
+
+      - name: Step identity, composite
+        id: identity-composite
+        uses: ./.github/actions/step-identity
+
+      - name: Step identity, behind hashFiles()
+        id: identity-hashfiles
+        if: hashFiles('go.mod') != ''
+        run: echo "hashFiles"
+
+      - name: Check step identity
+        run: bash scripts/ci/enforce.sh step-identity
+
   test-cargowall-cgroup-enforce:
     name: Integration Test (Cgroup Enforce)
     needs: build-binary

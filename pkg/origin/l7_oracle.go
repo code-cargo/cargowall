@@ -161,7 +161,7 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 		st = &l7flow{proto: protocolForEvent(ev)}
 		l.flows[fk] = st
 	}
-	if st.decided && ev.Flags&(l7PuntNoState|l7PuntRepin) == 0 {
+	if st.decided && ev.Flags&(l7PuntNoState|l7PuntRepin|l7PuntNewConn) == 0 {
 		// A punt queued before our verdict landed: stale. Its kernel-side
 		// write may have clobbered the entry back to PENDING, which would
 		// strand the flow under enforce — re-assert rather than only
@@ -183,12 +183,14 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 	if st.decided {
 		// NO_STATE: the kernel LRU evicted the entry after we adjudicated, so
 		// the verdict is gone and the kernel punts until a new one is written.
-		// REPIN: a new QUIC attempt superseded the adjudicated one. Either
-		// way, start over from this sample.
+		// REPIN: a new QUIC attempt superseded the adjudicated one. NEW_CONN:
+		// the socket opened another TCP connection to the same destination,
+		// and a verdict governs one connection. Any way, start over from this
+		// sample.
 		*st = l7flow{proto: st.proto, lastSeen: now}
-	} else if ev.Flags&l7PuntRepin != 0 || supersededDCID(st, ev) {
-		// A new attempt superseded a still-undecided cycle: its CRYPTO must
-		// not mix with the superseded assembler's.
+	} else if ev.Flags&(l7PuntRepin|l7PuntNewConn) != 0 || supersededDCID(st, ev) {
+		// A new attempt or connection superseded a still-undecided cycle: its
+		// bytes must not mix with the superseded assembler's.
 		*st = l7flow{proto: st.proto, lastSeen: now}
 	}
 	// Record the cycle's identity. REPIN only fires when the KERNEL had a

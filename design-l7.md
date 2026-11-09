@@ -72,8 +72,10 @@ adjudicated identity governs it.
 same destination, so its flow key outlives a connection. Every
 connection-opening SYN therefore parks the flow `NEED_HELLO` whatever its entry
 said, and a SYN carrying data (TCP Fast Open) is judged as the new
-connection's first flight. A verdict governs one connection, never the next one
-on the socket.
+connection's first flight. The punt that opens a connection's first flight
+carries `L7_PUNT_F_NEW_CONN`, so the oracle starts a cycle of its own for it
+instead of treating it as a stale punt of the decided one. A verdict governs
+one connection, never the next one on the socket.
 
 **HTTP** gets the same contract deliberately: the first request's `Host` pins
 the connection. Re-adjudicating every request line was tried and removed — the
@@ -247,8 +249,12 @@ It is a documented residual, identical in class for both protocols: traffic
 on a connection L7 never saw open reaches this arm without an adjudicated
 first flight. At a real shared edge such packets belong to no connection and
 die at the terminator — the identity-bearing first flight is what routes, and
-that is always adjudicated. Riding gives up nothing a first-byte test held,
-since that test never bound a sender in control of its own writes.
+that is always adjudicated. What riding gives up is adjudicating a
+segment-leading ClientHello on such a flow: a no-entry TLS flow whose socket
+has had data acknowledged. Only connections L7 never saw open, or whose entry
+was evicted, are no-entry flows, so nothing changes for a flow L7 saw open and
+still holds; and the first-byte test it replaces never bound a sender in
+control of its own writes.
 
 ## Scope maps are rebuilt, not patched
 

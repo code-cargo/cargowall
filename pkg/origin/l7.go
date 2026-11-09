@@ -64,6 +64,7 @@ const (
 	l7PuntQUIC      uint8 = 0x08
 	l7PuntRepin     uint8 = 0x10 // a new QUIC Initial DCID superseded the flow's identity
 	l7PuntRefused   uint8 = 0x20 // an identity-gate refusal record, not an adjudication punt
+	l7PuntNewConn   uint8 = 0x40 // opens a connection's first flight: a cycle of its own
 )
 
 // Stats slots (sni.h L7_STAT_*), read by logStats and pinned against the C

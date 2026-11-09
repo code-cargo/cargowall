@@ -722,3 +722,56 @@ func TestL7RefusalReason(t *testing.T) {
 		"the posture bit must not change the reason")
 	require.Equal(t, L7QUICVersion, refusalReason(refused(makeL7Event(443, 0, unknownQUIC, true), 0)))
 }
+
+// TestL7NewConnectionPuntReAdjudicates: a NEW_CONN punt on a decided flow is
+// a later TCP connection of the same socket to the same destination, so the
+// same flow key. A verdict governs one connection: the oracle must
+// adjudicate the new one afresh rather than re-assert the old verdict.
+func TestL7NewConnectionPuntReAdjudicates(t *testing.T) {
+	objs := loadL7Objects(t)
+	l := newL7(objs, L7Options{Matcher: allowSet{"auth.docker.io": true}}, nil)
+	outcomes := captureSink(l)
+
+	first := makeL7Event(443, 1000, snitest.BuildClientHello("auth.docker.io"), false)
+	first.Flags |= l7PuntNewConn
+	l.onSample(first)
+	require.Len(t, *outcomes, 1)
+	require.True(t, (*outcomes)[0].Allowed)
+
+	next := makeL7Event(443, 9000, snitest.BuildClientHello("other.example"), false)
+	next.Flags |= l7PuntNewConn
+	l.onSample(next)
+
+	require.Len(t, *outcomes, 2, "a NEW_CONN punt must re-adjudicate")
+	require.False(t, (*outcomes)[1].Allowed)
+	require.Equal(t, L7Mismatch, (*outcomes)[1].Reason)
+	var v bpf.OriginBpfL7FlowVal
+	require.NoError(t, objs.MapL7Flow.Lookup(first.FlowKey(), &v))
+	require.Equal(t, l7StateDenied, v.State, "the new connection's verdict must be written")
+
+	// A punt without the flag on the decided flow is still stale.
+	stale := makeL7Event(443, 9000, snitest.BuildClientHello("other.example"), false)
+	l.onSample(stale)
+	require.Len(t, *outcomes, 2, "a stale punt is not adjudicated")
+}
+
+// TestL7NewConnectionResetsUndecidedCycle: a NEW_CONN punt while the socket's
+// previous connection is still mid-handshake starts the new connection's own
+// cycle; its bytes must not join the old connection's assembler.
+func TestL7NewConnectionResetsUndecidedCycle(t *testing.T) {
+	objs := loadL7Objects(t)
+	l := newL7(objs, L7Options{Matcher: allowSet{"auth.docker.io": true}}, nil)
+	outcomes := captureSink(l)
+
+	partial := makeL7Event(443, 1000, snitest.BuildClientHello("old.example")[:8], false)
+	partial.Flags |= l7PuntNewConn
+	l.onSample(partial)
+	require.Empty(t, *outcomes, "a hello prefix needs more")
+
+	next := makeL7Event(443, 70000, snitest.BuildClientHello("auth.docker.io"), false)
+	next.Flags |= l7PuntNewConn
+	l.onSample(next)
+	require.Len(t, *outcomes, 1)
+	require.True(t, (*outcomes)[0].Allowed, "the new connection's hello adjudicates on its own (why=%q)", (*outcomes)[0].Reason)
+	require.Equal(t, "auth.docker.io", (*outcomes)[0].Name)
+}

@@ -75,6 +75,7 @@ func TestOriginL7RealSocketReconnectReadjudicated(t *testing.T) {
 	require.NoError(t, err)
 	ev := readL7SampleFor(t, h.rd, cookie)
 	require.Zero(t, ev.Flags&l7PuntFlagRefused, "the new hello is punted for adjudication")
+	require.NotZero(t, ev.Flags&l7PuntFlagNewConn, "the punt must tell the oracle it opens a connection")
 	require.Equal(t, other, append([]byte(nil), ev.Payload[:ev.PayloadLen]...))
 	select {
 	case b := <-got:
@@ -126,6 +127,7 @@ func TestOriginL7RealSocketReconnectFastOpenReadjudicated(t *testing.T) {
 	require.NoError(t, unix.Sendto(fd, other, unix.MSG_FASTOPEN, peer))
 	ev := readL7SampleFor(t, h.rd, cookie)
 	require.Zero(t, ev.Flags&l7PuntFlagRefused, "the SYN's hello is punted for adjudication")
+	require.NotZero(t, ev.Flags&l7PuntFlagNewConn, "the punt must tell the oracle it opens a connection")
 	require.Equal(t, other, append([]byte(nil), ev.Payload[:ev.PayloadLen]...))
 	select {
 	case b := <-got:
@@ -158,6 +160,9 @@ func drainL7SamplesFor(t *testing.T, rd *ringbuf.Reader, cookie uint64, d time.D
 // for client and server, restored when the test ends.
 func newL7FastOpenHarness(t *testing.T, l7mode uint8) *l7RealSocketHarness {
 	t.Helper()
+	// The harness first: it skips where the test can't run, which an
+	// unprivileged run must reach before any sysctl write.
+	h := newL7RealSocketHarness(t, l7mode, 443, L7ScopeTLS)
 	const sysctl = "/proc/sys/net/ipv4/tcp_fastopen"
 	old, err := os.ReadFile(sysctl)
 	if err != nil {
@@ -166,7 +171,6 @@ func newL7FastOpenHarness(t *testing.T, l7mode uint8) *l7RealSocketHarness {
 	require.NoError(t, os.WriteFile(sysctl, []byte("3"), 0o644), "enable Fast Open for client and server")
 	t.Cleanup(func() { _ = os.WriteFile(sysctl, old, 0o644) })
 
-	h := newL7RealSocketHarness(t, l7mode, 443, L7ScopeTLS)
 	raw, err := h.ln.(*net.TCPListener).SyscallConn()
 	require.NoError(t, err)
 	require.NoError(t, raw.Control(func(fd uintptr) {

@@ -48,6 +48,7 @@ const (
 	l7PuntFlagQUIC    = 0x08
 	l7PuntFlagRepin   = 0x10
 	l7PuntFlagRefused = 0x20
+	l7PuntFlagNewConn = 0x40
 )
 
 // craftIPv4TLSData builds an eth+IPv4+TCP data segment (PSH|ACK) carrying a

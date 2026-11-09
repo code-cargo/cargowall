@@ -50,6 +50,9 @@
 #define L7_PUNT_F_REFUSED   0x20  // an identity-gate refusal RECORD, not an
                                   // adjudication punt: report-only, opens no
                                   // cycle and writes no flow state
+#define L7_PUNT_F_NEW_CONN  0x40  // the flow was NEED_HELLO: this punt opens
+                                  // a connection's first flight, and the
+                                  // oracle starts a cycle of its own for it
 
 // A flow undecided after this many punts never will be, so the cap bounds a
 // segment flood to O(flows) ringbuf traffic. Each re-pinned QUIC cycle re-arms
@@ -879,6 +882,8 @@ __noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, __u32 slot) {
         flags |= L7_PUNT_F_NO_STATE;
     if (repin)
         flags |= L7_PUNT_F_REPIN;
+    if (st && st->state == L7_STATE_NEED_HELLO)
+        flags |= L7_PUNT_F_NEW_CONN;
     if (c->ip_proto == IPPROTO_UDP) {
         flags |= L7_PUNT_F_QUIC;
         l7_stat(L7_STAT_QUIC);

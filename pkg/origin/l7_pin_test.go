@@ -58,6 +58,7 @@ func TestL7KernelConstantsMatchSniSource(t *testing.T) {
 		"L7_PUNT_F_QUIC":         uint64(l7PuntQUIC),
 		"L7_PUNT_F_REPIN":        uint64(l7PuntRepin),
 		"L7_PUNT_F_REFUSED":      uint64(l7PuntRefused),
+		"L7_PUNT_F_NEW_CONN":     uint64(l7PuntNewConn),
 		// The stat slots the Go mirror (l7Stat*) reads in logStats.
 		"L7_STAT_PUNT":          uint64(l7StatPunt),
 		"L7_STAT_PUNT_DROPPED":  uint64(l7StatPuntDropped),

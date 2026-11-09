@@ -140,20 +140,32 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// TestRunAs runs probes as another user, with another user's groups — which
-// setting credentials needs root for. It is what proves runAs applies
-// Credential.Groups.
+// TestRunAs runs probes as another user, with a supplementary group distinct
+// from the primary gid — which setting credentials needs root for. It is what
+// proves runAs applies Credential.Groups: a probe without it would not see
+// gid 4242.
 func TestRunAs(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root to run as another user")
 	}
-	v := &jobView{uid: 65534, gid: 65534, groups: []uint32{65534}}
-	if code, _, err := v.runAs("/bin/sh", "-c", `[ "$(id -u)" = 65534 ] && [ "$(id -G)" = 65534 ] && [ "$PATH" != "" ]`); err != nil || code != 0 {
-		t.Errorf("runAs did not run as uid 65534 with only its groups: %d, %v", code, err)
+	v := &jobView{uid: 65534, gid: 65534, groups: []uint32{65534, 4242}}
+	if code, out, err := v.runAs("/bin/sh", "-c", `id -u; id -G`); err != nil || code != 0 {
+		t.Fatalf("runAs: %d, %q, %v", code, out, err)
+	} else if !strings.Contains(out, "65534") || !strings.Contains(out, "4242") {
+		t.Errorf("runAs did not apply uid 65534 and the supplementary gid 4242: %q", out)
 	}
 	dir := t.TempDir() // root's, mode 0700
 	if code, _, err := v.runAs("/usr/bin/test", "-w", dir); err != nil || code == 0 {
 		t.Errorf("runAs wrote where uid 65534 cannot: %d, %v", code, err)
+	}
+}
+
+// TestRunAs_execFailure: a command that cannot be started is an error
+// (nothing ran), not a zero exit.
+func TestRunAs_execFailure(t *testing.T) {
+	v := selfView(t)
+	if code, _, err := v.runAs("/does/not/exist"); err == nil || code != -1 {
+		t.Errorf("a missing binary: code=%d err=%v, want -1 and an error", code, err)
 	}
 }
 

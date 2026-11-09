@@ -551,6 +551,9 @@ jobs:
       - name: Escalation rolls the whole lockdown back (actions-runner image)
         run: bash scripts/ci/sudo-lockdown-group-grant.sh run-escalation ghcr.io/actions/actions-runner:2.338.2
 
+      - name: Later-sorting competing grant is disabled whatever its spelling
+        run: bash scripts/ci/sudo-lockdown-group-grant.sh run-latefile ghcr.io/actions/actions-runner:2.338.2
+
   test-cargowall-gitlab-ci:
     name: Integration Test (GitLab CI mode)
     needs: build-binary

@@ -243,8 +243,7 @@ func TestSudoersFileGrantsUser_groupByID(t *testing.T) {
 
 // TestSudoersFileGrantsUser_userList: the user list that opens a rule is
 // comma-separated, so a grant naming the target anywhere in it must be
-// detected — the shape a plain prefix check misses (the #194 BLOCKER and
-// NIT-1).
+// detected — the shape a plain "line starts with the username" check misses.
 func TestSudoersFileGrantsUser_userList(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sudoers")
 	cases := []struct {
@@ -257,15 +256,74 @@ func TestSudoersFileGrantsUser_userList(t *testing.T) {
 		{"alice , runner ALL=(ALL) NOPASSWD: /bin/cat\n", "runner", true},
 		{"alice,runner ALL=(ALL) NOPASSWD: /bin/cat\n", "runner", true},
 		{"alice, bob ALL=(ALL) NOPASSWD: /bin/cat\n", "runner", false},
-		{"ALL, !runner ALL=(ALL) NOPASSWD:ALL\n", "runner", false},  // excluded from ALL
-		{"!runner, ALL ALL=(ALL) NOPASSWD:ALL\n", "runner", true},   // re-added after
-		{"#999, #0 ALL=(ALL:ALL) NOPASSWD:ALL\n", "root", true},     // uid in a comma list
-		{"#999, #1001 ALL=(ALL:ALL) NOPASSWD:ALL\n", "root", false}, // neither is 0
+		{"ALL, !runner ALL=(ALL) NOPASSWD:ALL\n", "runner", false},        // excluded from ALL
+		{"!runner, ALL ALL=(ALL) NOPASSWD:ALL\n", "runner", true},         // re-added after
+		{"#999, #0 ALL=(ALL:ALL) NOPASSWD:ALL\n", "root", true},           // uid in a comma list
+		{"#999, #1001 ALL=(ALL:ALL) NOPASSWD:ALL\n", "root", false},       // neither is 0
+		{`"runner" ALL=(ALL) NOPASSWD: /bin/cat` + "\n", "runner", true},  // quoted name
+		{"alice, ! bob, runner ALL=(ALL) NOPASSWD:ALL\n", "runner", true}, // space after '!'
+		{`ru\nner ALL=(ALL) NOPASSWD: /bin/cat` + "\n", "runner", true},   // backslash escape
+		{"alice, !runner ALL=(ALL) NOPASSWD:ALL\n", "runner", false},      // negated only
+		{"+net, runner ALL=(ALL) NOPASSWD:ALL\n", "runner", true},         // runner beside a netgroup
+		{"+net ALL=(ALL) NOPASSWD:ALL\n", "runner", true},                 // netgroup: unknowable, fail-closed
 	}
 	for _, tt := range cases {
 		writeFile(t, path, tt.content)
 		if got, err := sudoersFileGrantsUser(path, tt.username, nil, nil); err != nil || got != tt.want {
 			t.Errorf("%q (%s): got %v, %v; want %v", tt.content, tt.username, got, err, tt.want)
+		}
+	}
+}
+
+// TestSudoersFileCompetes: a file read after the lockdown rules is judged
+// structurally — any rule line in any spelling, or an include, disables it,
+// even one granting another user — while a file read before them is judged
+// by parsing, where a miss is harmless because deny-first overrides it.
+func TestSudoersFileCompetes(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		// Read after zz-cargowall-lockdown (structural).
+		{"zzz-list", `"runner" ALL=(ALL) NOPASSWD: /bin/cat` + "\n", true},
+		{"zzz-other", "someoneelse ALL=(ALL) NOPASSWD:ALL\n", true}, // another user, still disabled
+		{"zzz-uid", "#1234 ALL=(ALL) NOPASSWD:ALL\n", true},
+		{"zzz-include", "@includedir /etc/sudoers.extra\n", true},
+		{"zzz-notes", "# just a comment\n\n# END\n", false},
+		{"zzz-defaults", "Defaults:runner !requiretty\nUser_Alias FOO = a, b\n", false},
+		{"zzz-dotted.bak", "someoneelse ALL=(ALL) NOPASSWD:ALL\n", false}, // sudo ignores dotted names
+		// Read before zz-cargowall-lockdown (parser; deny-first overrides).
+		{"00-other", "someoneelse ALL=(ALL) NOPASSWD:ALL\n", false},
+		{"00-runner", "runner ALL=(ALL) NOPASSWD:ALL\n", true},
+	}
+	for _, tt := range cases {
+		path := filepath.Join(dir, tt.name)
+		writeFile(t, path, tt.content)
+		got, reason, err := sudoersFileCompetes(path, tt.name, "runner", nil, nil)
+		if err != nil || got != tt.want {
+			t.Errorf("%s %q: got %v (%s), %v; want %v", tt.name, tt.content, got, reason, err, tt.want)
+		}
+		if got && reason == "" {
+			t.Errorf("%s: a competing file has no reason", tt.name)
+		}
+		os.Remove(path)
+	}
+}
+
+func TestReadAfterLockdown(t *testing.T) {
+	for name, want := range map[string]bool{
+		"zz-cargowall-lockdown": false, // the lockdown file itself
+		"zzz-team":              true,
+		"zz0-local":             true,
+		"00-base":               false,
+		"README":                false,
+		"zzz-team.bak":          false, // dotted: sudo ignores it
+		"zzz-team~":             false, // backup: sudo ignores it
+	} {
+		if got := readAfterLockdown(name); got != want {
+			t.Errorf("readAfterLockdown(%q) = %v, want %v", name, got, want)
 		}
 	}
 }

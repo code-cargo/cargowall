@@ -45,6 +45,13 @@ runescalation() {
     -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh escalation
 }
 
+# runlatefile is run for the later-sorting competing-grant scenario.
+runlatefile() {
+  local image="$1"
+  docker run --rm --privileged --user root --entrypoint bash \
+    -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh latefile
+}
+
 fail() {
   echo "❌ $*"
   [ -f /tmp/cw.log ] && { echo "--- cargowall log"; tail -40 /tmp/cw.log; }
@@ -154,6 +161,55 @@ inside() {
   echo "✅ runner back in the sudo group"
 }
 
+# latefile checks a competing grant in a file sudo reads after the lockdown
+# rules is disabled whatever its spelling: a quoted user name granting a
+# command the verification probe never tests. The Debian includedir shape,
+# so the lockdown relies on its own zz- file being read, with the grant in a
+# later-sorting zzz- file.
+latefile() {
+  export DEBIAN_FRONTEND=noninteractive
+  command -v sudo >/dev/null || { apt-get update -qq >/dev/null && apt-get install -y -qq sudo >/dev/null; }
+  id runner >/dev/null 2>&1 || { getent group docker >/dev/null || groupadd docker; useradd -m -G sudo,users,docker runner; }
+  printf 'root ALL=(ALL:ALL) ALL\n%%sudo ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\n' > /etc/sudoers
+  mkdir -p /etc/sudoers.d
+  find /etc/sudoers.d -type f ! -name README -delete
+  printf '"runner" ALL=(ALL) NOPASSWD: /bin/cat\n' > /etc/sudoers.d/zzz-quoted
+  chmod 0440 /etc/sudoers.d/zzz-quoted
+  sudo --version | head -1
+  find /etc/sudoers.d | sort > /tmp/sudoersd.before
+
+  ln -sf /bin/bash /tmp/Runner.Worker
+  su runner -c '/tmp/Runner.Worker -c "
+    while [ ! -f /tmp/go ]; do sleep 0.2; done
+    sudo -n /bin/cat /etc/hostname >/dev/null 2>&1; echo \$? > /tmp/cat.rc
+    touch /tmp/done; sleep 600"' &
+  local upstream
+  upstream="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
+  echo '{"defaultAction":"allow","rules":[]}' > /tmp/policy.json
+  /w/bin/cargowall start --config=/tmp/policy.json --dns-upstream="${upstream}:53" --audit-mode \
+    --sudo-lockdown --sudo-allow-commands /usr/bin/id \
+    --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 &
+  local cw=$!
+  for _ in $(seq 1 60); do [ -f /tmp/cargowall-ready ] && break; sleep 0.5; done
+  [ -f /tmp/cargowall-ready ] || fail "cargowall did not become ready"
+
+  [ -f /etc/sudoers.d/zzz-quoted ] && fail "the later-sorting grant file was not disabled"
+  [ -f /etc/sudoers.d/zzz-quoted.cargowall-disabled ] || fail "the grant file was not renamed to disabled"
+  grep -q 'read after the lockdown rules' /tmp/cw.log || fail "the disable reason was not logged"
+  echo "✅ the quoted-name grant file read after the lockdown was disabled"
+
+  touch /tmp/go
+  for _ in $(seq 1 50); do [ -f /tmp/done ] && break; sleep 0.2; done
+  [ "$(cat /tmp/cat.rc)" != 0 ] || fail "sudo cat ran: the quoted grant still applied"
+  echo "✅ the held step cannot use the quoted grant"
+
+  kill -TERM "$cw" 2>/dev/null || true
+  wait "$cw" 2>/dev/null || true
+  [ -f /etc/sudoers.d/zzz-quoted ] || fail "the grant file was not restored"
+  find /etc/sudoers.d | sort | diff /tmp/sudoersd.before - || fail "sudoers.d differs after stop"
+  echo "✅ the grant file was restored after stop"
+}
+
 # escalation drives the rollback path: a stand-in `sudo` that always exits 0
 # makes the step verification see an escalation, so EnableSudoLockdown must
 # undo everything and report that it does not hold.
@@ -203,7 +259,9 @@ shift || true
 case "$cmd" in
   run) run "$@" ;;
   run-escalation) runescalation "$@" ;;
+  run-latefile) runlatefile "$@" ;;
   inside) inside ;;
   escalation) escalation ;;
-  *) echo "usage: $0 run <image> | run-escalation <image> | inside | escalation" >&2; exit 2 ;;
+  latefile) latefile ;;
+  *) echo "usage: $0 run <image> | run-escalation <image> | run-latefile <image> | inside | escalation | latefile" >&2; exit 2 ;;
 esac

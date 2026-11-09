@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -83,6 +84,11 @@ func TestWithoutBlock(t *testing.T) {
 		{name: "no block", content: arcSudoers, want: arcSudoers},
 		{name: "block at the end", content: arcSudoers + block, want: arcSudoers, found: true},
 		{name: "block between lines", content: "a\n" + block + "b\n", want: "a\nb\n", found: true},
+		// An added-newline block at the end has that newline taken back...
+		{name: "added-newline block at end", content: "a\n" + lockdownBlock(testRules, true), want: "a", found: true},
+		// ...but one with content after it must keep the separator, or "head"
+		// and "tail" would join.
+		{name: "added-newline block mid-file", content: "head\n" + lockdownBlock(testRules, true) + "tail\n", want: "head\ntail\n", found: true},
 		{name: "begin without end", content: arcSudoers + blockBegin + "\n" + testRules, wantErr: true},
 		{name: "end without begin", content: arcSudoers + blockEnd + "\n", wantErr: true},
 		{name: "second begin", content: blockBegin + "\n" + block, wantErr: true},
@@ -178,7 +184,7 @@ func readString(t *testing.T, path string) string {
 
 // TestAppendSudoersBlock_noFinalNewline: a sudoers file that does not end
 // with a newline is restored byte for byte, including the absence of that
-// newline (the #194 FIX-2).
+// newline.
 func TestAppendSudoersBlock_noFinalNewline(t *testing.T) {
 	stubVisudo(t, nil)
 	const noNL = "%sudo   ALL=(ALL:ALL) NOPASSWD:ALL" // no trailing newline
@@ -323,5 +329,29 @@ func TestReplaceSudoers_refusesSymlink(t *testing.T) {
 	}
 	if got := readString(t, target); got != arcSudoers {
 		t.Errorf("symlink target changed: %q", got)
+	}
+}
+
+// TestReplaceSudoers_keepsOwner: an edit preserves a non-root owner, which
+// needs root to set up (and to chown the result back).
+func TestReplaceSudoers_keepsOwner(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to own a file as another user")
+	}
+	stubVisudo(t, nil)
+	main := writeSudoers(t, arcSudoers)
+	if err := os.Chown(main, 65534, 65534); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceSudoers(main, "runner ALL=(ALL:ALL) !ALL\n"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := fi.Sys().(*syscall.Stat_t)
+	if st.Uid != 65534 || st.Gid != 65534 {
+		t.Errorf("owner not preserved: uid=%d gid=%d, want 65534/65534", st.Uid, st.Gid)
 	}
 }

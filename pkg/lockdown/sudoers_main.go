@@ -28,6 +28,7 @@ package lockdown
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,6 +44,11 @@ const (
 	// that newline back, so a file with no final newline is restored exactly.
 	blockBeginAddedNL = "# BEGIN cargowall sudo lockdown (added a preceding newline; removed when the lockdown ends)"
 	blockEnd          = "# END cargowall sudo lockdown"
+	// sudoersTempPrefix names the scratch files replaceSudoers creates beside
+	// a sudoers file. The leading dot keeps sudo from reading one (sudo skips
+	// a name containing '.'); a crash's leftover is cleaned on the next
+	// enable and on disable.
+	sudoersTempPrefix = ".sudoers.cargowall-"
 )
 
 // isBeginMarker reports whether a block-stripped line is a begin marker, and
@@ -67,16 +73,21 @@ var visudoCheckFile = func(path string) error {
 }
 
 // readsLockdownLast reports whether sudo, reading main's content, reads the
-// sudoers.d lockdown file after every rule in main: the last line that is
-// neither blank nor a comment includes dir. A directive is not a comment,
-// though both start with '#'. Any other line after the include, a Defaults
-// line included, counts against it, which costs at most a block that was
-// not strictly needed.
+// sudoers.d lockdown file after every rule in main: the last meaningful line
+// includes that dir. A line is meaningful unless it is blank or a comment; a
+// '#' and a digit is a user named by uid, not a comment, and a directive is
+// not a comment either, though both start with '#'. Any other meaningful
+// line after the include — a user specification or a Defaults line — counts
+// against it, which costs at most a block that was not strictly needed.
 func readsLockdownLast(content, dir string) bool {
 	last := ""
 	for _, line := range strings.Split(content, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || (strings.HasPrefix(trimmed, "#") && !isIncludeDirective(trimmed)) {
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") && !isIncludeDirective(trimmed) &&
+			!(len(trimmed) >= 2 && trimmed[1] >= '0' && trimmed[1] <= '9') {
 			continue
 		}
 		last = trimmed
@@ -130,10 +141,14 @@ func withoutBlock(content string) (string, bool, error) {
 		return "", false, errors.New("sudoers holds a lockdown block without its end")
 	}
 	before := strings.Join(lines[:begin], "")
-	if addedNL {
+	after := strings.Join(lines[end+1:], "")
+	// The added newline is the one that separated the file's own last line
+	// from the block. Only take it back when the block ended the file;
+	// otherwise what follows it needs the separator.
+	if addedNL && after == "" {
 		before = strings.TrimSuffix(before, "\n")
 	}
-	return before + strings.Join(lines[end+1:], ""), true, nil
+	return before + after, true, nil
 }
 
 // withBlock is content with the lockdown block at its end, replacing one a
@@ -220,7 +235,7 @@ func replaceSudoers(main, content string) error {
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", main)
 	}
-	f, err := os.CreateTemp(filepath.Dir(main), ".sudoers.cargowall-*")
+	f, err := os.CreateTemp(filepath.Dir(main), sudoersTempPrefix+"*")
 	if err != nil {
 		return fmt.Errorf("create a temp file beside %s: %w", main, err)
 	}
@@ -249,4 +264,19 @@ func replaceSudoers(main, content string) error {
 		return fmt.Errorf("replace %s: %w", main, err)
 	}
 	return nil
+}
+
+// cleanStaleSudoersTemps removes scratch files a crashed run left beside the
+// sudoers files in dir. They are inert — sudo does not read a dotted name —
+// but tidied so they do not accumulate. Best-effort.
+func cleanStaleSudoersTemps(dir string, logger *slog.Logger) {
+	matches, err := filepath.Glob(filepath.Join(dir, sudoersTempPrefix+"*"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		if err := os.Remove(m); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logger.Debug("Could not remove a stale sudoers temp file", "path", m, "error", err)
+		}
+	}
 }

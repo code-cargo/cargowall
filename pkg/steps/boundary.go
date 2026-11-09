@@ -319,7 +319,7 @@ func (t *Tracker) handleStepEvent(raw []byte, now clock) {
 		defer clear(raw)
 		ev := (*bpf.StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
 		id := identify(cBytes(ev.Env[:]), int(ev.EnvLen))
-		b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now.wall, id.Class == events.StepClassRunner)
+		b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now.at(ev.ForkKtime), id.Class == events.StepClassRunner)
 		t.identified(ev.Ordinal, id)
 		if !ok {
 			// Reported as lost already, unidentified: the kernel's copy

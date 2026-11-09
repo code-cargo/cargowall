@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strings"
 
 	"github.com/code-cargo/cargowall/pkg/origin"
 )
@@ -199,8 +200,14 @@ func (t *Tracker) scanNetworks(ctx context.Context) []netip.Prefix {
 	nets, err := t.client.listNetworks(lctx)
 	cancel()
 	if err != nil {
-		t.logger.Warn("Cannot list networks; subnet carve-outs wait for each network's containers, "+
-			"and bridges for the next session", "error", err)
+		var waits []string
+		if t.opts.AllowLocalSubnet != nil {
+			waits = append(waits, "subnet carve-outs wait for each network's containers")
+		}
+		if t.opts.OnBridge != nil {
+			waits = append(waits, "custom-named bridges wait for the next session")
+		}
+		t.logger.Warn("Cannot list networks; "+strings.Join(waits, ", and "), "error", err)
 		return nil
 	}
 	t.bridgesListed(nets)

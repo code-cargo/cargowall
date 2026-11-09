@@ -281,6 +281,7 @@ func TestStepFork(t *testing.T) {
 		return true
 	})
 	require.Equal(t, childPID, execEv.Tgid)
+	require.Equal(t, fork.Ktime, execEv.ForkKtime, "the exec event carries the fork's time")
 	require.Equal(t, "sleep\x001\x00", argvOf(execEv))
 	comm := unsafe.Slice((*byte)(unsafe.Pointer(&execEv.Comm[0])), len(execEv.Comm))
 	require.Equal(t, "sleep", strings.TrimRight(string(comm), "\x00"), "the exec event carries the program's name")
@@ -861,7 +862,7 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 	require.True(t, ok, "step_exec_event must be a struct, got %T", typ)
 	var execEv StepBpfStepExecEvent
 	require.Equal(t, uint32(unsafe.Sizeof(execEv)), st.Size, "struct size")
-	require.Len(t, st.Members, 8)
+	require.Len(t, st.Members, 9)
 	for i, w := range []struct {
 		name string
 		off  uintptr
@@ -870,6 +871,7 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 		{"tgid", unsafe.Offsetof(execEv.Tgid)},
 		{"ordinal", unsafe.Offsetof(execEv.Ordinal)},
 		{"argv_len", unsafe.Offsetof(execEv.ArgvLen)},
+		{"fork_ktime", unsafe.Offsetof(execEv.ForkKtime)},
 		{"argv", unsafe.Offsetof(execEv.Argv)},
 		{"comm", unsafe.Offsetof(execEv.Comm)},
 		{"env_len", unsafe.Offsetof(execEv.EnvLen)},

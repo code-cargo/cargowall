@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -40,6 +41,7 @@ import (
 // fakeLink is an attachment the fake attacher made: attached until its
 // interface goes, or it is closed.
 type fakeLink struct {
+	f        *fakePorts
 	index    int
 	attached bool
 	closed   int
@@ -49,6 +51,7 @@ func (l *fakeLink) Attached() bool { return l.attached && l.closed == 0 }
 
 func (l *fakeLink) Close() error {
 	l.closed++
+	l.f.order = append(l.f.order, fmt.Sprintf("close %d", l.index))
 	return nil
 }
 
@@ -58,6 +61,7 @@ type fakePorts struct {
 	initial []network.Link // what the watch lists when it starts
 	fail    map[int]error  // attach failures, by index
 	links   []*fakeLink
+	order   []string // attaches and closes, as they came
 	onLink  func(network.Link)
 	onGone  func(int)
 	watches int
@@ -68,8 +72,9 @@ func (f *fakePorts) attach(index int, _ string, _ *ebpf.Program, _ *slog.Logger)
 	if err := f.fail[index]; err != nil {
 		return nil, err
 	}
-	l := &fakeLink{index: index, attached: true}
+	l := &fakeLink{f: f, index: index, attached: true}
 	f.links = append(f.links, l)
+	f.order = append(f.order, fmt.Sprintf("attach %d", index))
 	return l, nil
 }
 
@@ -184,9 +189,12 @@ func TestBridgeStamp_DetachesAndReattaches(t *testing.T) {
 	assert.Equal(t, []int{12}, f.live())
 
 	f.links[2].attached = false // the interface at 12 was recreated in a gap
+	f.order = nil
 	f.onLink(port(12, "veth3", "veth", 3))
 	assert.Equal(t, []int{12}, f.live())
-	assert.Len(t, f.links, 4, "attached afresh")
+	// The dead one first: under clsact, its filter is known by the index
+	// alone, and closing it after would remove the new one.
+	assert.Equal(t, []string{"close 12", "attach 12"}, f.order, "attached afresh, the dead attachment closed first")
 
 	f.onLink(port(10, "veth1", "veth", 3))
 	f.onGone(3) // the bridge

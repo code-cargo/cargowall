@@ -32,15 +32,24 @@ const (
 )
 
 type StepBpfStepExecEvent struct {
-	_       structs.HostLayout
-	Kind    uint32
-	Tgid    uint32
-	Ordinal uint32
-	ArgvLen uint32
-	Argv    [256]int8
-	Comm    [16]int8
-	EnvLen  uint32
-	Env     [32768]int8
+	_         structs.HostLayout
+	Kind      uint32
+	Tgid      uint32
+	Ordinal   uint32
+	ArgvLen   uint32
+	ForkKtime uint64
+	Argv      [256]int8
+	Comm      [16]int8
+	EnvLen    uint32
+	Env       [32768]int8
+	_         [4]byte
+}
+
+type StepBpfStepPending struct {
+	_         structs.HostLayout
+	Ordinal   uint32
+	Pad       uint32
+	ForkKtime uint64
 }
 
 type StepBpfStepState struct {

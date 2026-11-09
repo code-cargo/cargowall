@@ -135,12 +135,14 @@ const struct step_child_event *btf_anchor_step_child_event __attribute__((unused
 // whose read races the exec, and reads what the program may since have
 // rewritten. A root that exits without exec'ing reports STEP_EV_EXIT in a
 // step_child_event, which has room for none of them, so an exit record
-// can't carry what an older record left in the ring.
+// can't carry what an older record left in the ring. fork_ktime is the
+// fork's, as its own event has it, for a reader that missed that event.
 struct step_exec_event {
     __u32 kind;
     __u32 tgid;
     __u32 ordinal;
     __u32 argv_len;
+    __u64 fork_ktime;
     char argv[STEP_ARGV_MAX];
     char comm[16];
     __u32 env_len;
@@ -157,13 +159,22 @@ struct {
     __uint(max_entries, 2 * 1024 * 1024);
 } map_step_events SEC(".maps");
 
-// Step roots between fork and their first exec: global tgid → ordinal.
-// cw_step_fork adds one, and cw_step_exec or cw_step_exit takes it out, so a
-// recycled tgid never finds an entry. Steps run a few at a time.
+// A step root between its fork and its first exec: its ordinal, and when
+// it forked.
+struct step_pending {
+    __u32 ordinal;
+    __u32 pad;
+    __u64 fork_ktime;
+};
+
+// Step roots between fork and their first exec: global tgid →
+// step_pending. cw_step_fork adds one, and cw_step_exec or cw_step_exit
+// takes it out, so a recycled tgid never finds an entry. Steps run a few
+// at a time.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u32);
-    __type(value, __u32);
+    __type(value, struct step_pending);
     __uint(max_entries, 1024);
 } map_step_exec_pending SEC(".maps");
 
@@ -282,7 +293,8 @@ int BPF_PROG(cw_step_fork, struct task_struct *child, __u64 clone_flags)
     if (parent_tgid == st->worker_tgid && child_tgid == child_tid) {
         __u32 ord = (__u32)__sync_fetch_and_add(&st->next_ordinal, 1);
         bpf_map_update_elem(&map_task_step, &child_tid, &ord, BPF_ANY);
-        bpf_map_update_elem(&map_step_exec_pending, &child_tgid, &ord, BPF_ANY);
+        struct step_pending pend = {.ordinal = ord, .fork_ktime = bpf_ktime_get_ns()};
+        bpf_map_update_elem(&map_step_exec_pending, &child_tgid, &pend, BPF_ANY);
         struct step_child_event *ev =
             bpf_ringbuf_reserve(&map_step_events, sizeof(*ev), 0);
         if (ev) {
@@ -290,7 +302,7 @@ int BPF_PROG(cw_step_fork, struct task_struct *child, __u64 clone_flags)
             ev->tgid = ns_tgid;
             ev->ordinal = ord;
             ev->pad = 0;
-            ev->ktime = bpf_ktime_get_ns();
+            ev->ktime = pend.fork_ktime;
             bpf_ringbuf_submit(ev, 0);
         }
         return 0;
@@ -310,10 +322,11 @@ int BPF_PROG(cw_step_fork, struct task_struct *child, __u64 clone_flags)
 // the leader's own exit has deleted it (userspace has it from the fork).
 static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid, __u32 kind)
 {
-    __u32 *pending = bpf_map_lookup_elem(&map_step_exec_pending, &tgid);
+    struct step_pending *pending = bpf_map_lookup_elem(&map_step_exec_pending, &tgid);
     if (!pending)
         return;
-    __u32 ord = *pending;
+    __u32 ord = pending->ordinal;
+    __u64 fork_ktime = pending->fork_ktime;
     __u32 *ns = bpf_map_lookup_elem(&map_task_nspid, &tgid);
     __u32 ns_tgid = ns ? *ns : 0;
     if (kind == STEP_EV_EXIT) {
@@ -334,6 +347,7 @@ static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid,
         ev->kind = kind;
         ev->tgid = ns_tgid;
         ev->ordinal = ord;
+        ev->fork_ktime = fork_ktime;
         __u64 len = 0, env_len = 0;
         __u64 start = BPF_CORE_READ(task, mm, arg_start);
         __u64 end = BPF_CORE_READ(task, mm, arg_end);

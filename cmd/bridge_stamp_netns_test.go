@@ -67,12 +67,18 @@ func TestBridgeStampPortsNetns(t *testing.T) {
 		skipUnlessStrict(t, "needs iproute2's ip")
 	}
 	require.NoError(t, rlimit.RemoveMemlock())
-	spec, err := bpf.LoadTcBpf()
-	require.NoError(t, err)
-	require.NoError(t, bpf.SetStepRules(spec, true))
-	var objs bpf.TcBpfObjects
-	require.NoError(t, spec.LoadAndAssign(&objs, nil))
-	t.Cleanup(func() { objs.Close() })
+	load := func(stepRules bool) *bpf.TcBpfObjects {
+		spec, err := bpf.LoadTcBpf()
+		require.NoError(t, err)
+		require.NoError(t, bpf.SetStepRules(spec, stepRules))
+		var objs bpf.TcBpfObjects
+		require.NoError(t, spec.LoadAndAssign(&objs, nil))
+		t.Cleanup(func() { objs.Close() })
+		return &objs
+	}
+	require.Nil(t, newBridgeStamp(load(false), slog.New(slog.DiscardHandler)),
+		"step rules off: no stamp, so no watch and no bridge callbacks")
+	objs := *load(true)
 
 	ip := func(args ...string) {
 		t.Helper()

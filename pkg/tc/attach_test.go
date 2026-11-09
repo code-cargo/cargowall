@@ -253,3 +253,27 @@ func TestAttachClsact_RecreatedInterface(t *testing.T) {
 		t.Fatal("a qdisc we did not create must stay")
 	}
 }
+
+// A qdisc we create counts our filters on it afresh: a count left from an
+// interface that went, its filter never closed, doesn't keep the qdisc
+// once our last filter on it closes.
+func TestAttachClsact_FreshQdiscCountsAfresh(t *testing.T) {
+	netns := scratchNetns(t)
+	prog := passProg(t)
+
+	if _, err := attachClsact(scratchIndex, prog, ingress, discard()); err != nil {
+		t.Fatalf("attach ingress: %v", err)
+	}
+	run(t, "ip", "-n", netns, "link", "del", "d0")
+	addScratchDevice(t, netns)
+	fresh, err := attachClsact(scratchIndex, prog, ingress, discard())
+	if err != nil {
+		t.Fatalf("attach ingress again: %v", err)
+	}
+	if err := fresh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if hasClsact(t, netns) {
+		t.Fatal("the qdisc we created must go with our last filter on it")
+	}
+}

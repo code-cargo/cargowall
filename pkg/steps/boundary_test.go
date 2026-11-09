@@ -249,14 +249,22 @@ func TestHandleStepEvent_CutAndUnreadableArguments(t *testing.T) {
 }
 
 // An exec whose fork event never came still starts the step for OrdinalAt,
-// from the exec's time.
+// from the fork's time as the exec event has it, though read late.
 func TestHandleStepEvent_ExecWithoutForkRecordsBoundary(t *testing.T) {
 	tr, sink := newBoundaryTracker(t)
-	at := time.Unix(1000, 0)
-	tr.handleStepEvent(execEvent(evExec, 45, 11, "true\x00", 5, "true"), wallClock(at))
+	sec := uint64(time.Second)
+	ev := bpf.StepBpfStepExecEvent{Kind: evExec, Tgid: 45, Ordinal: 11, ArgvLen: 5, ForkKtime: 6 * sec}
+	for i, c := range "true\x00" {
+		ev.Argv[i] = int8(c)
+	}
+	var buf bytes.Buffer
+	require.NoError(t, binary.Write(&buf, binary.NativeEndian, ev))
+	tr.handleStepEvent(buf.Bytes(), clock{wall: time.Unix(1000, 0), mono: 10 * sec})
+	forked := time.Unix(996, 0)
 	require.Len(t, sink.events, 1)
-	assert.True(t, sink.events[0].Timestamp.Equal(at))
-	assert.Equal(t, uint32(11), tr.OrdinalAt(at))
+	assert.True(t, sink.events[0].Timestamp.Equal(forked), "dated at the fork, got %v", sink.events[0].Timestamp)
+	assert.Equal(t, uint32(11), tr.OrdinalAt(forked))
+	assert.Zero(t, tr.OrdinalAt(forked.Add(-time.Second)))
 }
 
 // A step whose exec or exit event was lost is reported, once, from what

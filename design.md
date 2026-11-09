@@ -835,8 +835,9 @@ to select policy with.
     lifetime unless an exec re-tags it. The tag is by time, not by cause:
     whatever drives dockerd while step 2 runs starts containers with step
     2's tag. Two things keep the time honest. A step starts at its root's
-    fork as the kernel timed it (`bpf_ktime_get_ns` on the fork event),
-    not when the reader got to the event. And a root identified as no step
+    fork as the kernel timed it (`bpf_ktime_get_ns` on the fork event,
+    and on the exec event too, for a reader that lost the fork's), not
+    when the reader got to the event. And a root identified as no step
     (a runner helper, or a copy of Runner.Worker that exits without
     exec'ing) does not end a step whose root is still running; one forked
     between steps (a step root's exit is recorded too) does, and is bound

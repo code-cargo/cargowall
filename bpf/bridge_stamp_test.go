@@ -175,6 +175,10 @@ func runBridgeStamp(t *testing.T, brNetfilter bool) {
 	require.NoError(t, err)
 	t.Cleanup(func() { uplink.Close() })
 	brMAC := interfaceMAC(t, "br0")
+	probe, pastPort := stampedPastPort(t)
+	probeLink, err := tc.AttachIngress(interfaceIndex(t, "br0"), "br0", probe, logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { probeLink.Close() })
 
 	for _, dst := range []netip.Addr{netip.MustParseAddr("10.99.0.20"), netip.MustParseAddr("fd99::20")} {
 		// From the container.
@@ -205,6 +209,11 @@ func runBridgeStamp(t *testing.T, brNetfilter bool) {
 		checkUplink(t, events, fmt.Sprintf("host socket with a stamp's mark to %s", dst), dst, sport, false)
 	}
 	requireSocketless(t, objs, 0)
+	if brNetfilter {
+		require.NotZero(t, pastPort(), "stamps land at the port, and reach the bridge after br_netfilter took the socket")
+	} else {
+		require.Zero(t, pastPort(), "without br_netfilter, packets reach the bridge with their socket")
+	}
 
 	// A tagged thread's TCP socket is tagged by the connect hook, and
 	// stamped; its AF_PACKET frame is not.
@@ -289,13 +298,23 @@ func TestBridgeStampCountsSocketless(t *testing.T) {
 	t.Cleanup(func() { stamp.Close() })
 	requireSocketless(t, objs, 0)
 
-	topo.enter(t, nested)
-	udp, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
-	require.NoError(t, err)
-	t.Cleanup(func() { unix.Close(udp) })
-	require.NoError(t, unix.Sendto(udp, []byte("x"), 0, &unix.SockaddrInet4{Port: 9, Addr: [4]byte{10, 99, 0, 20}}))
-	topo.enter(t, topo.rtr)
-	n := awaitSocketless(t, objs, 0, "a datagram the container forwards")
+	n := uint64(0)
+	for _, dst := range []unix.Sockaddr{
+		&unix.SockaddrInet4{Port: 9, Addr: netip.MustParseAddr("10.99.0.20").As4()},
+		&unix.SockaddrInet6{Port: 9, Addr: netip.MustParseAddr("fd99::20").As16()},
+	} {
+		family := unix.AF_INET
+		if _, v6 := dst.(*unix.SockaddrInet6); v6 {
+			family = unix.AF_INET6
+		}
+		topo.enter(t, nested)
+		udp, err := unix.Socket(family, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+		require.NoError(t, err)
+		t.Cleanup(func() { unix.Close(udp) })
+		require.NoError(t, unix.Sendto(udp, []byte("x"), 0, dst))
+		topo.enter(t, topo.rtr)
+		n = awaitSocketless(t, objs, n, fmt.Sprintf("a datagram (family %d) the container forwards", family))
+	}
 
 	topo.enter(t, topo.ctr)
 	c0, err := net.InterfaceByName("c0")
@@ -464,7 +483,8 @@ func loadBrNetfilter(t *testing.T) bool {
 }
 
 // addNested adds a namespace behind the container's, with n0 at
-// 10.97.0.2/24, whose default route is the container, which forwards.
+// 10.97.0.2/24 and fd97::2/64, whose default routes are the container,
+// which forwards.
 func (b *bridgeTopology) addNested(t *testing.T) *os.File {
 	t.Helper()
 	ctr, nst := fmt.Sprintf("cwbr-%d-c", os.Getpid()), fmt.Sprintf("cwbr-%d-n", os.Getpid())
@@ -472,11 +492,14 @@ func (b *bridgeTopology) addNested(t *testing.T) *os.File {
 	t.Cleanup(func() { _ = exec.Command("ip", "netns", "del", nst).Run() })
 	b.ip("-n", ctr, "link", "add", "n0c", "type", "veth", "peer", "name", "n0", "netns", nst)
 	b.ip("-n", ctr, "addr", "add", "10.97.0.1/24", "dev", "n0c")
+	b.ip("-n", ctr, "addr", "add", "fd97::1/64", "dev", "n0c", "nodad")
 	b.ip("-n", ctr, "link", "set", "n0c", "up")
 	b.ip("-n", nst, "addr", "add", "10.97.0.2/24", "dev", "n0")
+	b.ip("-n", nst, "addr", "add", "fd97::2/64", "dev", "n0", "nodad")
 	b.ip("-n", nst, "link", "set", "n0", "up")
 	b.ip("-n", nst, "route", "add", "default", "via", "10.97.0.1")
-	b.ip("netns", "exec", ctr, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+	b.ip("-n", nst, "-6", "route", "add", "default", "via", "fd97::1")
+	b.ip("netns", "exec", ctr, "sysctl", "-qw", "net.ipv4.ip_forward=1", "net.ipv6.conf.all.forwarding=1")
 	f, err := os.Open("/run/netns/" + nst)
 	require.NoError(t, err)
 	t.Cleanup(func() { f.Close() })
@@ -535,6 +558,46 @@ func dialSYN(t *testing.T, objs *TcBpfObjects, dst netip.Addr, ordinal, mark uin
 	}
 	t.Fatalf("unexpected local address %T", local)
 	return 0, 0
+}
+
+// stampedPastPort is a program for the bridge's own ingress, and the count
+// it keeps of the packets that reach it with no socket and a stamp on
+// them: stamped at the port, before br_netfilter took the socket.
+func stampedPastPort(t *testing.T) (*ebpf.Program, func() uint64) {
+	t.Helper()
+	m, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Array, KeySize: 4, ValueSize: 8, MaxEntries: 1})
+	require.NoError(t, err)
+	t.Cleanup(func() { m.Close() })
+	mask, magic := StepStampMask, StepStampMagic
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SchedCLS,
+		Instructions: asm.Instructions{
+			asm.Mov.Reg(asm.R6, asm.R1),
+			asm.FnGetSocketCookie.Call(),
+			asm.JNE.Imm(asm.R0, 0, "out"),
+			asm.LoadMem(asm.R2, asm.R6, int16(unsafe.Offsetof(skBuffCtx{}.Mark)), asm.Word),
+			asm.And.Imm32(asm.R2, int32(mask)),
+			asm.JNE.Imm32(asm.R2, int32(magic), "out"),
+			asm.StoreImm(asm.RFP, -4, 0, asm.Word),
+			asm.LoadMapPtr(asm.R1, m.FD()),
+			asm.Mov.Reg(asm.R2, asm.RFP),
+			asm.Add.Imm(asm.R2, -4),
+			asm.FnMapLookupElem.Call(),
+			asm.JEq.Imm(asm.R0, 0, "out"),
+			asm.Mov.Imm(asm.R1, 1),
+			asm.StoreXAdd(asm.R0, asm.R1, asm.DWord),
+			asm.Mov.Imm(asm.R0, -1).WithSymbol("out"), // TC_ACT_UNSPEC
+			asm.Return(),
+		},
+		License: "GPL",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { prog.Close() })
+	return prog, func() uint64 {
+		var n uint64
+		require.NoError(t, m.Lookup(uint32(0), &n))
+		return n
+	}
 }
 
 // markerProg sets mark on every packet and lets it on, as a host's own TC

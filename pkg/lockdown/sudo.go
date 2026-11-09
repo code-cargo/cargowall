@@ -186,17 +186,15 @@ func restoreToGroups(username string, groups []string, logger *slog.Logger) bool
 // *.cargowall-disabled. Returns the list of original file paths that were
 // disabled and an error if any matching file could not be disabled (lockdown
 // may be incomplete).
-func disableCompetingSudoersFiles(dir, username string, logger *slog.Logger) ([]string, error) {
+//
+// userGIDs is the user's group memberships as a running job holds them, from
+// before the lockdown removed any: a %group grant must be matched against the
+// groups a step kept, not the ones left after removal. A nil map (the lookup
+// failed) makes any %group a potential grant, fail-closed.
+func disableCompetingSudoersFiles(dir, username string, userGIDs map[string]bool, logger *slog.Logger) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read sudoers.d directory: %w", err)
-	}
-
-	// Resolve user's group memberships once for all file checks.
-	userGIDs, gidErr := lookupUserGIDs(username)
-	if gidErr != nil {
-		logger.Warn("Failed to look up user groups for sudoers scan, group detection disabled",
-			"username", username, "error", gidErr)
 	}
 
 	// Collect User_Alias names containing the target user across all files
@@ -286,14 +284,13 @@ func disableCompetingSudoersFiles(dir, username string, logger *slog.Logger) ([]
 	return disabled, nil
 }
 
-// sudoersFileGrantsUser returns true if the file contains a non-comment line
-// that either:
-//   - starts with the username followed by whitespace (direct grant),
-//   - contains the username in a User_Alias definition (indirect grant via alias),
-//   - starts with a name present in aliases (cross-file alias grant), or
-//   - contains a %group grant where the user is a member of that group,
-//
-// each of user and group by name or by id ("#uid", "%#gid").
+// sudoersFileGrantsUser returns true if the file contains a sudoers rule
+// whose user list grants the target user. A rule's user list is the
+// comma-separated list of users that opens the line (`alice, runner ALL=…`);
+// the user matches when a non-negated element names them — by name, by
+// `#uid`, by a `%group` or `%#gid` they are in, by `ALL`, or by a User_Alias
+// — and no later element negates them, as sudoers resolves the list
+// last-match-wins. A User_Alias definition that includes them counts too.
 //
 // aliases is the set of User_Alias names (collected across all sudoers.d files)
 // that include the target username; it may be nil when cross-file detection is
@@ -306,8 +303,6 @@ func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, alia
 	if err != nil {
 		return false, fmt.Errorf("failed to read sudoers file %s: %w", path, err)
 	}
-	directPrefix := username + " "
-	directPrefixTab := username + "\t"
 	uid := ""
 	if u, err := user.Lookup(username); err == nil {
 		uid = u.Uid
@@ -322,76 +317,122 @@ func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, alia
 		if isIncludeDirective(trimmed) {
 			return false, fmt.Errorf("sudoers file %s contains include directive that cannot be inspected", path)
 		}
-		// Nor is '#' and a digit, which names a user by uid. An unknown uid
-		// counts as a match (fail-closed), as an unknown group does below.
-		if ids, ok := uidSpec(trimmed); ok {
-			if uid == "" || slices.Contains(ids, uid) {
-				return true, nil
-			}
-			continue
-		}
-		if strings.HasPrefix(trimmed, "#") {
-			continue
-		}
 		// Defaults !authenticate disables password prompts for all users,
 		// effectively granting passwordless sudo to anyone with a grant.
 		if strings.HasPrefix(trimmed, "Defaults") && strings.Contains(trimmed, "!authenticate") {
 			return false, fmt.Errorf("sudoers file %s contains 'Defaults !authenticate' which bypasses password requirements", path)
 		}
-		if strings.HasPrefix(trimmed, directPrefix) || strings.HasPrefix(trimmed, directPrefixTab) {
-			return true, nil
-		}
-		// Detect ALL as user specifier — grants every user on the system.
-		if fields := strings.Fields(trimmed); len(fields) > 0 && fields[0] == "ALL" {
-			return true, nil
-		}
 		if strings.HasPrefix(trimmed, "User_Alias ") {
 			if userAliasContains(trimmed, username) {
 				return true, nil
 			}
+			continue
 		}
-		// Check if line uses a known User_Alias name as a grant (cross-file).
-		if len(aliases) > 0 {
-			if fields := strings.Fields(trimmed); len(fields) > 0 && aliases[fields[0]] {
-				return true, nil
-			}
+		// Other definition and default lines are never a user grant; skipping
+		// them keeps their leading word out of the user-list parse below.
+		if isNonGrantLine(trimmed) {
+			continue
 		}
-		// Detect %group grants where the user is a member.
-		// When userGIDs is nil (lookup failed), treat any %group line as a
-		// potential grant (fail-closed) rather than skipping.
-		if strings.HasPrefix(trimmed, "%") {
-			if userGIDs == nil {
-				return true, nil
-			}
-			groupName := strings.Fields(trimmed)[0][1:]
-			if gid, byID := strings.CutPrefix(groupName, "#"); byID {
-				if userGIDs[gid] {
-					return true, nil
-				}
-				continue
-			}
-			if grp, err := user.LookupGroup(groupName); err == nil && userGIDs[grp.Gid] {
-				return true, nil
-			}
+		// A comment, unless it is a user named by uid ("#1001 …"): '#' and a
+		// digit is a user specifier, not a comment.
+		if strings.HasPrefix(trimmed, "#") && !(len(trimmed) >= 2 && trimmed[1] >= '0' && trimmed[1] <= '9') {
+			continue
+		}
+		if userListGrants(grantUserList(trimmed), username, uid, userGIDs, aliases) {
+			return true, nil
 		}
 	}
 	return false, nil
 }
 
-// uidSpec returns the uids a rule's user list names by "#uid", and whether
-// the line starts with one: a '#' followed by a digit is a user, not a
-// comment. Members are comma-separated in the first field.
-func uidSpec(line string) ([]string, bool) {
-	if len(line) < 2 || line[0] != '#' || line[1] < '0' || line[1] > '9' {
-		return nil, false
-	}
-	var ids []string
-	for _, m := range strings.Split(strings.Fields(line)[0], ",") {
-		if id, ok := strings.CutPrefix(m, "#"); ok && id != "" {
-			ids = append(ids, id)
+// isNonGrantLine reports whether a line is a sudoers definition or default
+// whose leading word is not a user list: a Defaults line, or an alias
+// definition other than User_Alias (which the caller handles).
+func isNonGrantLine(trimmed string) bool {
+	for _, kw := range []string{"Defaults", "Host_Alias ", "Cmnd_Alias ", "Runas_Alias "} {
+		if strings.HasPrefix(trimmed, kw) {
+			return true
 		}
 	}
-	return ids, true
+	return false
+}
+
+// grantUserList is the user list that opens a sudoers rule line: the maximal
+// run of items separated by commas, with whitespace allowed around the
+// commas, before the whitespace that begins the host spec. So
+// "alice , runner ALL=(ALL) NOPASSWD: /bin/cat" yields ["alice", "runner"].
+func grantUserList(line string) []string {
+	var items []string
+	rest := line
+	for {
+		rest = strings.TrimLeft(rest, " \t")
+		if i := strings.IndexAny(rest, " \t,"); i < 0 {
+			if rest != "" {
+				items = append(items, rest)
+			}
+			return items
+		} else {
+			if rest[:i] != "" {
+				items = append(items, rest[:i])
+			}
+			rest = rest[i:]
+		}
+		// A comma, with optional surrounding space, continues the list; any
+		// other whitespace begins the host spec and ends it.
+		rest = strings.TrimLeft(rest, " \t")
+		if !strings.HasPrefix(rest, ",") {
+			return items
+		}
+		rest = rest[1:]
+	}
+}
+
+// userListGrants resolves whether a rule's user list grants the user, as
+// sudoers does: an element may be negated with '!', and the last element to
+// name the user wins. An unknown uid or a %group with no group information
+// counts as naming the user (fail-closed).
+func userListGrants(items []string, username, uid string, userGIDs, aliases map[string]bool) bool {
+	granted := false
+	for _, item := range items {
+		neg := false
+		for strings.HasPrefix(item, "!") {
+			neg = !neg
+			item = item[1:]
+		}
+		if item == "" {
+			continue
+		}
+		if userListItemNames(item, username, uid, userGIDs, aliases) {
+			granted = !neg
+		}
+	}
+	return granted
+}
+
+// userListItemNames reports whether one user-list element names the target
+// user: ALL, the username, a known User_Alias, a "#uid", or a "%group" /
+// "%#gid" the user belongs to.
+func userListItemNames(item, username, uid string, userGIDs, aliases map[string]bool) bool {
+	switch {
+	case item == "ALL", item == username, aliases[item]:
+		return true
+	}
+	if id, ok := strings.CutPrefix(item, "#"); ok {
+		// A user by uid; an unknown target uid counts as a match.
+		return uid == "" || id == uid
+	}
+	grp, byGroup := strings.CutPrefix(item, "%")
+	if !byGroup {
+		return false
+	}
+	if userGIDs == nil {
+		return true // group membership unknown: fail closed
+	}
+	if gid, byID := strings.CutPrefix(grp, "#"); byID {
+		return userGIDs[gid]
+	}
+	g, err := user.LookupGroup(grp)
+	return err == nil && userGIDs[g.Gid]
 }
 
 // isIncludeDirective returns true if the line is a sudoers #include,
@@ -689,14 +730,19 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	defer func() {
 		if !success {
 			rb.rollback()
+			// The state is saved before verification, so a failed
+			// verification's rollback removes it too.
+			removeLockdownState()
 		}
 	}()
 
 	// The groups as a process started before the lockdown holds them, which
-	// removing the user from a group below does not change.
+	// removing the user from a group below does not change. Both the competing
+	// %group scan and the verification need them as a running step has them.
 	preGIDs, preErr := lookupUserGIDs(username)
 	if preErr != nil {
-		logger.Debug("Failed to look up user groups before lockdown", "username", username, "error", preErr)
+		logger.Warn("Failed to look up user groups before lockdown; %group grant detection is fail-closed",
+			"username", username, "error", preErr)
 	}
 
 	// Remove user from sudo-granting groups, for logins after the lockdown;
@@ -706,8 +752,9 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return fmt.Errorf("sudo lockdown incomplete, group removal failed: %w", err)
 	}
 
-	// Disable competing sudoers.d files that grant this user access
-	rb.DisabledFiles, err = disableCompetingSudoersFiles(sudoersDir, username, logger)
+	// Disable competing sudoers.d files that grant this user access, matched
+	// against the groups from before the removal above.
+	rb.DisabledFiles, err = disableCompetingSudoersFiles(sudoersDir, username, preGIDs, logger)
 	if err != nil {
 		return fmt.Errorf("sudo lockdown incomplete, competing grants remain active: %w", err)
 	}
@@ -768,6 +815,14 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return fmt.Errorf("sudoers validation failed after lockdown modifications: %w", err)
 	}
 
+	// Save state first, so a forced teardown during the verification below
+	// restores the groups too, not only the sudoers files. A failed
+	// verification's rollback removes the state (the deferred cleanup).
+	if err := saveLockdownState(&rb.lockdownState); err != nil {
+		logger.Warn("Failed to save lockdown state, rolling back", "error", err)
+		return fmt.Errorf("sudo lockdown aborted, state could not be persisted: %w", err)
+	}
+
 	// Ask sudo, as a job step, whether the lockdown holds, and report the
 	// docker access it leaves, which fails nothing.
 	if view, err := lookupJobView(username, preGIDs); err != nil {
@@ -776,12 +831,6 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return err
 	} else {
 		warnDockerAccess(view, logger)
-	}
-
-	// Save state so DisableSudoLockdown can reverse all changes
-	if err := saveLockdownState(&rb.lockdownState); err != nil {
-		logger.Warn("Failed to save lockdown state, rolling back", "error", err)
-		return fmt.Errorf("sudo lockdown aborted, state could not be persisted: %w", err)
 	}
 
 	success = true

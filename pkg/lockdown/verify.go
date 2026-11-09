@@ -25,6 +25,7 @@ package lockdown
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -43,10 +44,12 @@ import (
 )
 
 const (
-	probeTimeout = 10 * time.Second
 	probePath    = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	dockerSocket = "/var/run/docker.sock"
 )
+
+// probeTimeout bounds a probe. A var so tests can shorten it.
+var probeTimeout = 10 * time.Second
 
 // sudoProbes are the commands the escalation check asks sudo to run as
 // root, the first that exists and the allowlist does not name. Each does
@@ -187,9 +190,11 @@ func lookupJobView(username string, preGIDs map[string]bool) (*jobView, error) {
 }
 
 // runAs runs argv as the job's user with the job's groups, with nothing of
-// cargowall's environment but a PATH, no terminal and a timeout, and
-// returns its exit status.
-func (v *jobView) runAs(argv ...string) (int, error) {
+// cargowall's environment but a PATH, no terminal and a timeout. It returns
+// the exit status and a short snippet of what the command printed. A command
+// that did not exit normally — it timed out, was killed by a signal, or
+// could not be started — is an error, not an exit status: it showed nothing.
+func (v *jobView) runAs(argv ...string) (code int, output string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -199,18 +204,33 @@ func (v *jobView) runAs(argv ...string) (int, error) {
 		Setsid:     true,
 		Credential: &syscall.Credential{Uid: v.uid, Gid: v.gid, Groups: v.groups},
 	}
-	err := cmd.Run()
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	runErr := cmd.Run()
+	output = snippet(buf.String())
 	if ctx.Err() != nil {
-		return -1, fmt.Errorf("%s timed out after %s", argv[0], probeTimeout)
+		return -1, output, fmt.Errorf("%s timed out after %s", argv[0], probeTimeout)
 	}
 	var exit *exec.ExitError
-	if errors.As(err, &exit) {
-		return exit.ExitCode(), nil
+	if errors.As(runErr, &exit) {
+		if !exit.Exited() {
+			return -1, output, fmt.Errorf("%s did not exit normally: %s", argv[0], exit)
+		}
+		return exit.ExitCode(), output, nil
 	}
-	if err != nil {
-		return -1, err
+	if runErr != nil {
+		return -1, output, runErr
 	}
-	return 0, nil
+	return 0, output, nil
+}
+
+// snippet is s as one short line, for a log field.
+func snippet(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+	if len(s) > 200 {
+		s = strings.ToValidUTF8(s[:200], "") + "…"
+	}
+	return s
 }
 
 // sudoProbe is the first of sudoProbes that exists and that allow does not
@@ -245,9 +265,13 @@ var errLockdownIneffective = errors.New("sudo lockdown does not hold")
 
 // verifyLockdown asks sudo, as a job step would, to run a command the
 // allowlist does not name, and returns errLockdownIneffective when it does.
-// Whatever stops the question being asked (no sudo, no probe command, a
-// timeout) is logged and leaves the lockdown in place: that is what was
-// asked for, and nothing shows it does not hold.
+// It is a backstop, not the guarantee: it tests a small fixed set of
+// commands, so it shows those don't escalate, not that nothing does. The
+// guarantee is complete detection of competing grants (sudoersFileGrantsUser)
+// and the deny-first rules read last. Whatever stops the question being asked
+// — no sudo, every probe command allowlisted, a timeout, a sudo that did not
+// run to completion — is logged and leaves the lockdown in place: that is
+// what was asked for, and nothing shows it does not hold.
 func verifyLockdown(v *jobView, allow []string, logger *slog.Logger) error {
 	sudo, err := exec.LookPath("sudo")
 	if err != nil {
@@ -256,19 +280,21 @@ func verifyLockdown(v *jobView, allow []string, logger *slog.Logger) error {
 	}
 	probe := sudoProbe(allow)
 	if probe == nil {
-		logger.Warn("Cannot verify sudo lockdown: every probe command is on the allowlist")
+		logger.Warn("Cannot verify sudo lockdown: the allowlist names every probe command. Allowlisting a shell or interpreter is itself a grant of full root")
 		return nil
 	}
-	code, err := v.runAs(append([]string{sudo, "-n", "--"}, probe...)...)
+	code, out, err := v.runAs(append([]string{sudo, "-n", "--"}, probe...)...)
 	if err != nil {
-		logger.Warn("Cannot verify sudo lockdown", "error", err)
+		// A sudo that could not be run to completion showed nothing.
+		logger.Warn("Cannot verify sudo lockdown; leaving it in place", "error", err)
 		return nil
 	}
 	if code == 0 {
 		return fmt.Errorf("%w: as uid %d with %s (%v), sudo ran %s as root",
 			errLockdownIneffective, v.uid, v.from, v.groups, strings.Join(probe, " "))
 	}
-	logger.Info("Verified sudo lockdown", "uid", v.uid, "groups", v.groups, "groups_from", v.from)
+	logger.Info("Verified sudo lockdown", "uid", v.uid, "groups", v.groups,
+		"groups_from", v.from, "probe", strings.Join(probe, " "), "sudo_exit", code, "sudo_output", out)
 	return nil
 }
 
@@ -295,7 +321,7 @@ func warnDockerAccess(v *jobView, logger *slog.Logger) {
 			continue
 		}
 		// The shell's own test: not every distribution ships a test binary.
-		if code, err := v.runAs("/bin/sh", "-c", `test -w "$1"`, "sh", s); err == nil && code == 0 {
+		if code, _, err := v.runAs("/bin/sh", "-c", `test -w "$1"`, "sh", s); err == nil && code == 0 {
 			logger.Warn("Sudo lockdown leaves docker reachable: job steps can still use the docker socket, which is root-equivalent",
 				"socket", s, "uid", v.uid, "groups_from", v.from)
 		}

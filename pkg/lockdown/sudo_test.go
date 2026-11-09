@@ -227,11 +227,61 @@ func TestSudoersFileGrantsUser_groupByID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sudoers")
 	gids := map[string]bool{"27": true}
 	for content, want := range map[string]bool{
-		"%#27 ALL=(ALL:ALL) NOPASSWD:ALL\n": true,
-		"%#28 ALL=(ALL:ALL) NOPASSWD:ALL\n": false,
+		"%#27 ALL=(ALL:ALL) NOPASSWD:ALL\n":        true,
+		"%#28 ALL=(ALL:ALL) NOPASSWD:ALL\n":        false,
+		"%#28, %#27 ALL=(ALL:ALL) NOPASSWD:ALL\n":  true,  // gid in a comma list
+		"alice, %#27 ALL=(ALL:ALL) NOPASSWD:ALL\n": true,  // mixed name + gid
+		"%#28, alice ALL=(ALL:ALL) NOPASSWD:ALL\n": false, // neither names runner
+		"ALL, !%#27 ALL=(ALL:ALL) NOPASSWD:ALL\n":  false, // the group negated out of ALL
 	} {
 		writeFile(t, path, content)
 		if got, err := sudoersFileGrantsUser(path, "runner", gids, nil); err != nil || got != want {
+			t.Errorf("%q: got %v, %v; want %v", content, got, err, want)
+		}
+	}
+}
+
+// TestSudoersFileGrantsUser_userList: the user list that opens a rule is
+// comma-separated, so a grant naming the target anywhere in it must be
+// detected — the shape a plain prefix check misses (the #194 BLOCKER and
+// NIT-1).
+func TestSudoersFileGrantsUser_userList(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sudoers")
+	cases := []struct {
+		content  string
+		username string
+		want     bool
+	}{
+		{"alice, runner ALL=(ALL) NOPASSWD: /bin/cat\n", "runner", true},
+		{"runner, alice ALL=(ALL) NOPASSWD: /bin/cat\n", "runner", true},
+		{"alice , runner ALL=(ALL) NOPASSWD: /bin/cat\n", "runner", true},
+		{"alice,runner ALL=(ALL) NOPASSWD: /bin/cat\n", "runner", true},
+		{"alice, bob ALL=(ALL) NOPASSWD: /bin/cat\n", "runner", false},
+		{"ALL, !runner ALL=(ALL) NOPASSWD:ALL\n", "runner", false},  // excluded from ALL
+		{"!runner, ALL ALL=(ALL) NOPASSWD:ALL\n", "runner", true},   // re-added after
+		{"#999, #0 ALL=(ALL:ALL) NOPASSWD:ALL\n", "root", true},     // uid in a comma list
+		{"#999, #1001 ALL=(ALL:ALL) NOPASSWD:ALL\n", "root", false}, // neither is 0
+	}
+	for _, tt := range cases {
+		writeFile(t, path, tt.content)
+		if got, err := sudoersFileGrantsUser(path, tt.username, nil, nil); err != nil || got != tt.want {
+			t.Errorf("%q (%s): got %v, %v; want %v", tt.content, tt.username, got, err, tt.want)
+		}
+	}
+}
+
+// TestSudoersFileGrantsUser_aliasInList: a User_Alias used anywhere in the
+// user list, not only as the whole list, grants its members.
+func TestSudoersFileGrantsUser_aliasInList(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sudoers")
+	aliases := map[string]bool{"ADMINS": true}
+	for content, want := range map[string]bool{
+		"ADMINS, alice ALL=(ALL) NOPASSWD:ALL\n": true,
+		"alice, ADMINS ALL=(ALL) NOPASSWD:ALL\n": true,
+		"alice, bob ALL=(ALL) NOPASSWD:ALL\n":    false,
+	} {
+		writeFile(t, path, content)
+		if got, err := sudoersFileGrantsUser(path, "runner", nil, aliases); err != nil || got != want {
 			t.Errorf("%q: got %v, %v; want %v", content, got, err, want)
 		}
 	}
@@ -477,7 +527,7 @@ func TestDisableCompetingSudoersFiles(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "50-cloud-init"), "# cloud-init defaults\nDefaults env_reset\n")
 	writeFile(t, filepath.Join(dir, "91-other"), "otheruser ALL=(ALL) ALL\n")
 
-	disabled, err := disableCompetingSudoersFiles(dir, "runner", logger)
+	disabled, err := disableCompetingSudoersFiles(dir, "runner", map[string]bool{"27": true}, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +564,7 @@ func TestDisableCompetingSudoersFiles_skipsOwnFiles(t *testing.T) {
 	writeFile(t, filepath.Join(dir, filepath.Base(sudoersFile)), "runner ALL=(ALL) NOPASSWD: /usr/sbin/iptables\n")
 	writeFile(t, filepath.Join(dir, filepath.Base(stateFile)), `{"username":"runner"}`)
 
-	disabled, err := disableCompetingSudoersFiles(dir, "runner", logger)
+	disabled, err := disableCompetingSudoersFiles(dir, "runner", map[string]bool{"27": true}, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -751,7 +801,7 @@ func TestDisableCompetingSudoersFiles_crossFileAlias(t *testing.T) {
 	// Unrelated file
 	writeFile(t, filepath.Join(dir, "30-other"), "otheruser ALL=(ALL) ALL\n")
 
-	disabled, err := disableCompetingSudoersFiles(dir, "runner", logger)
+	disabled, err := disableCompetingSudoersFiles(dir, "runner", map[string]bool{"27": true}, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -868,7 +918,7 @@ func TestRecoverLockdownState_emptyDir(t *testing.T) {
 func TestRecoverLockdownState_findsSudoersBlock(t *testing.T) {
 	dir := t.TempDir()
 	main := filepath.Join(t.TempDir(), "sudoers")
-	writeFile(t, main, arcSudoers+lockdownBlock(testRules))
+	writeFile(t, main, arcSudoers+lockdownBlock(testRules, false))
 	if state := recoverLockdownState(dir, main, "runner", discardLogger()); !state.SudoersBlock {
 		t.Error("the block in sudoers was not recovered")
 	}

@@ -38,6 +38,13 @@ run() {
     -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh inside
 }
 
+# runescalation is run for the rollback-on-escalation scenario.
+runescalation() {
+  local image="$1"
+  docker run --rm --privileged --user root --entrypoint bash \
+    -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh escalation
+}
+
 fail() {
   echo "❌ $*"
   [ -f /tmp/cw.log ] && { echo "--- cargowall log"; tail -40 /tmp/cw.log; }
@@ -147,10 +154,56 @@ inside() {
   echo "✅ runner back in the sudo group"
 }
 
+# escalation drives the rollback path: a stand-in `sudo` that always exits 0
+# makes the step verification see an escalation, so EnableSudoLockdown must
+# undo everything and report that it does not hold.
+escalation() {
+  prepare
+  sha256sum /etc/sudoers > /tmp/sudoers.sha
+  find /etc/sudoers.d | sort > /tmp/sudoersd.before
+  id -nG runner | tr ' ' '\n' | sort > /tmp/groups.before
+
+  # A fake sudo first on PATH for cargowall only; visudo and gpasswd still
+  # resolve to the real ones further down PATH.
+  mkdir -p /tmp/fakebin
+  printf '#!/bin/sh\nexit 0\n' > /tmp/fakebin/sudo
+  chmod 0755 /tmp/fakebin/sudo
+
+  local upstream
+  upstream="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
+  echo '{"defaultAction":"allow","rules":[]}' > /tmp/policy.json
+  PATH="/tmp/fakebin:$PATH" /w/bin/cargowall start --config=/tmp/policy.json \
+    --dns-upstream="${upstream}:53" --audit-mode \
+    --sudo-lockdown --sudo-allow-commands "$ALLOWED" \
+    --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 &
+  local cw=$!
+  for _ in $(seq 1 60); do [ -f /tmp/cargowall-ready ] && break; sleep 0.5; done
+  [ -f /tmp/cargowall-ready ] || fail "cargowall did not become ready"
+
+  grep -q 'sudo lockdown does not hold' /tmp/cw.log || fail "escalation was not detected"
+  grep -q 'Failed to enable sudo lockdown' /tmp/cw.log || fail "the lockdown was not reported as failed"
+  echo "✅ escalation detected and the lockdown reported as failed"
+
+  # Everything the aborted enable touched must be undone, with cargowall
+  # still running.
+  [ -f /etc/sudoers.d/zz-cargowall-lockdown ] && fail "the lockdown sudoers file was left behind"
+  [ -f /etc/sudoers.d/.cargowall-lockdown-state ] && fail "the state file was left behind"
+  grep -q 'BEGIN cargowall sudo lockdown' /etc/sudoers && fail "the lockdown block was left in /etc/sudoers"
+  sha256sum -c --quiet /tmp/sudoers.sha || { cat /etc/sudoers; fail "/etc/sudoers differs after rollback"; }
+  find /etc/sudoers.d | sort | diff /tmp/sudoersd.before - || fail "sudoers.d differs after rollback"
+  id -nG runner | tr ' ' '\n' | sort | diff /tmp/groups.before - || fail "runner's groups were not restored"
+  echo "✅ rollback left the system pristine"
+
+  kill -TERM "$cw" 2>/dev/null || true
+  wait "$cw" 2>/dev/null || true
+}
+
 cmd="${1:-}"
 shift || true
 case "$cmd" in
   run) run "$@" ;;
+  run-escalation) runescalation "$@" ;;
   inside) inside ;;
-  *) echo "usage: $0 run <image> | inside" >&2; exit 2 ;;
+  escalation) escalation ;;
+  *) echo "usage: $0 run <image> | run-escalation <image> | inside | escalation" >&2; exit 2 ;;
 esac

@@ -17,10 +17,17 @@
 package lockdown
 
 import (
+	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"slices"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/code-cargo/cargowall/pkg/procfs"
 )
 
 // fakeProc writes a /proc/<pid> with the given comm, status and environ.
@@ -133,18 +140,125 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// TestRunAs runs probes as another user, which setting credentials needs
-// root for.
+// TestRunAs runs probes as another user, with another user's groups — which
+// setting credentials needs root for. It is what proves runAs applies
+// Credential.Groups.
 func TestRunAs(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root to run as another user")
 	}
 	v := &jobView{uid: 65534, gid: 65534, groups: []uint32{65534}}
-	if code, err := v.runAs("/bin/sh", "-c", `[ "$(id -u)" = 65534 ] && [ "$(id -G)" = 65534 ] && [ "$PATH" != "" ]`); err != nil || code != 0 {
+	if code, _, err := v.runAs("/bin/sh", "-c", `[ "$(id -u)" = 65534 ] && [ "$(id -G)" = 65534 ] && [ "$PATH" != "" ]`); err != nil || code != 0 {
 		t.Errorf("runAs did not run as uid 65534 with only its groups: %d, %v", code, err)
 	}
 	dir := t.TempDir() // root's, mode 0700
-	if code, err := v.runAs("/usr/bin/test", "-w", dir); err != nil || code == 0 {
+	if code, _, err := v.runAs("/usr/bin/test", "-w", dir); err != nil || code == 0 {
 		t.Errorf("runAs wrote where uid 65534 cannot: %d, %v", code, err)
+	}
+}
+
+// selfView is a jobView for the test process's own user, so runAs needs no
+// privilege: it runs as who it already is.
+func selfView(t *testing.T) *jobView {
+	t.Helper()
+	gids, err := syscall.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := make([]uint32, len(gids))
+	for i, g := range gids {
+		groups[i] = uint32(g)
+	}
+	return &jobView{uid: uint32(os.Getuid()), gid: uint32(os.Getgid()), groups: groups}
+}
+
+// writeExec writes an executable shell script and returns its path.
+func writeExec(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestRunAs_classifies checks the three outcomes runAs must tell apart: a
+// clean exit (status, no error), a command killed by a signal, and a
+// timeout.
+func TestRunAs_classifies(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("runAs sets process credentials, which needs root")
+	}
+	v := selfView(t)
+	dir := t.TempDir()
+
+	if code, out, err := v.runAs(writeExec(t, dir, "ok", "echo hello; exit 3")); err != nil || code != 3 || !strings.Contains(out, "hello") {
+		t.Errorf("clean exit: code=%d out=%q err=%v, want 3, hello, nil", code, out, err)
+	}
+	if code, _, err := v.runAs(writeExec(t, dir, "sig", "kill -TERM $$")); err == nil || code != -1 {
+		t.Errorf("a signal: code=%d err=%v, want -1 and an error", code, err)
+	}
+
+	old := probeTimeout
+	probeTimeout = 200 * time.Millisecond
+	defer func() { probeTimeout = old }()
+	if code, _, err := v.runAs(writeExec(t, dir, "slow", "sleep 5")); err == nil || code != -1 {
+		t.Errorf("a timeout: code=%d err=%v, want -1 and an error", code, err)
+	}
+}
+
+// fakeSudo puts a stand-in `sudo` first on PATH; verifyLockdown finds it
+// with exec.LookPath.
+func fakeSudo(t *testing.T, body string) {
+	t.Helper()
+	dir := t.TempDir()
+	writeExec(t, dir, "sudo", body)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestVerifyLockdown_outcomes exercises the decisive branches: a sudo that
+// runs the probe (escalation), one that refuses it (held), and one that
+// never completes (unverifiable, left in place).
+func TestVerifyLockdown_outcomes(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("verifyLockdown runs the probe with process credentials, which needs root")
+	}
+	v := selfView(t)
+
+	fakeSudo(t, "exit 0")
+	if err := verifyLockdown(v, nil, discardLogger()); !errors.Is(err, errLockdownIneffective) {
+		t.Errorf("sudo running the probe: err=%v, want errLockdownIneffective", err)
+	}
+
+	fakeSudo(t, "echo nope >&2; exit 1")
+	if err := verifyLockdown(v, nil, discardLogger()); err != nil {
+		t.Errorf("sudo refusing the probe: err=%v, want nil", err)
+	}
+
+	old := probeTimeout
+	probeTimeout = 200 * time.Millisecond
+	defer func() { probeTimeout = old }()
+	fakeSudo(t, "sleep 5")
+	if err := verifyLockdown(v, nil, discardLogger()); err != nil {
+		t.Errorf("a sudo that hangs: err=%v, want nil (left in place)", err)
+	}
+}
+
+// TestLookupJobView_fallbackUsesPreGIDs: with no Runner.Worker of the user's
+// own, the view falls back to the groups captured before the lockdown.
+func TestLookupJobView_fallbackUsesPreGIDs(t *testing.T) {
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := lookupJobView(u.Username, map[string]bool{"4242": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.from == procfs.RunnerWorkerComm {
+		t.Skip("a Runner.Worker of this user is running; the fallback isn't taken")
+	}
+	if !slices.Contains(view.groups, 4242) {
+		t.Errorf("fallback groups %v do not include the pre-lockdown gid 4242", view.groups)
 	}
 }

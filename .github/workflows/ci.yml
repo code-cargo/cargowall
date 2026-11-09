@@ -548,6 +548,9 @@ jobs:
       - name: Group grant kept by a running job (Ubuntu 26.04, sudo-rs)
         run: bash scripts/ci/sudo-lockdown-group-grant.sh run ubuntu:26.04
 
+      - name: Escalation rolls the whole lockdown back (actions-runner image)
+        run: bash scripts/ci/sudo-lockdown-group-grant.sh run-escalation ghcr.io/actions/actions-runner:2.338.2
+
   test-cargowall-gitlab-ci:
     name: Integration Test (GitLab CI mode)
     needs: build-binary

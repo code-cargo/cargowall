@@ -72,7 +72,7 @@ func TestReadsLockdownLast(t *testing.T) {
 }
 
 func TestWithoutBlock(t *testing.T) {
-	block := lockdownBlock(testRules)
+	block := lockdownBlock(testRules, false)
 	tests := []struct {
 		name    string
 		content string
@@ -107,11 +107,13 @@ func TestWithoutBlock(t *testing.T) {
 }
 
 func TestWithBlock(t *testing.T) {
+	// A base without a trailing newline: a newline is added and recorded in
+	// the begin marker.
 	got, err := withBlock("%sudo ALL=(ALL) ALL", testRules)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "%sudo ALL=(ALL) ALL\n" + lockdownBlock(testRules); got != want {
+	if want := "%sudo ALL=(ALL) ALL\n" + lockdownBlock(testRules, true); got != want {
 		t.Errorf("a file without a trailing newline: got %q, want %q", got, want)
 	}
 
@@ -128,8 +130,17 @@ func TestWithBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "%sudo ALL=(ALL) ALL\n" + lockdownBlock(other); replaced != want {
+	if want := "%sudo ALL=(ALL) ALL\n" + lockdownBlock(other, true); replaced != want {
 		t.Errorf("a previous block is not replaced: got %q, want %q", replaced, want)
+	}
+
+	// A base that already ends with a newline: none is added.
+	withNL, err := withBlock("%sudo ALL=(ALL) ALL\n", testRules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "%sudo ALL=(ALL) ALL\n" + lockdownBlock(testRules, false); withNL != want {
+		t.Errorf("a file with a trailing newline: got %q, want %q", withNL, want)
 	}
 }
 
@@ -165,6 +176,29 @@ func readString(t *testing.T, path string) string {
 	return string(data)
 }
 
+// TestAppendSudoersBlock_noFinalNewline: a sudoers file that does not end
+// with a newline is restored byte for byte, including the absence of that
+// newline (the #194 FIX-2).
+func TestAppendSudoersBlock_noFinalNewline(t *testing.T) {
+	stubVisudo(t, nil)
+	const noNL = "%sudo   ALL=(ALL:ALL) NOPASSWD:ALL" // no trailing newline
+	main := writeSudoers(t, noNL)
+
+	appended, err := appendSudoersBlock(main, "/etc/sudoers.d", testRules)
+	if err != nil || !appended {
+		t.Fatalf("appendSudoersBlock = %v, %v", appended, err)
+	}
+	if got, want := readString(t, main), noNL+"\n"+lockdownBlock(testRules, true); got != want {
+		t.Errorf("content: got %q, want %q", got, want)
+	}
+	if removed, err := removeSudoersBlock(main); err != nil || !removed {
+		t.Fatalf("removeSudoersBlock = %v, %v", removed, err)
+	}
+	if got := readString(t, main); got != noNL {
+		t.Errorf("not restored byte for byte: got %q, want %q", got, noNL)
+	}
+}
+
 func TestAppendSudoersBlock_arcShape(t *testing.T) {
 	calls := stubVisudo(t, nil)
 	main := writeSudoers(t, arcSudoers)
@@ -176,7 +210,7 @@ func TestAppendSudoersBlock_arcShape(t *testing.T) {
 	if !appended {
 		t.Fatal("a sudoers without the include gets no block")
 	}
-	if got, want := readString(t, main), arcSudoers+lockdownBlock(testRules); got != want {
+	if got, want := readString(t, main), arcSudoers+lockdownBlock(testRules, false); got != want {
 		t.Errorf("content: got %q, want %q", got, want)
 	}
 	if fi, err := os.Stat(main); err != nil || fi.Mode().Perm() != 0o440 {
@@ -221,7 +255,7 @@ func TestAppendSudoersBlock_readsLastAlready(t *testing.T) {
 func TestAppendSudoersBlock_removesStaleBlockWhereNoneIsNeeded(t *testing.T) {
 	stubVisudo(t, nil)
 	// A block a crashed run left above the include, which sudo reads last.
-	main := writeSudoers(t, lockdownBlock("runner ALL=(ALL) NOPASSWD: /bin/old\n")+ubuntuSudoers)
+	main := writeSudoers(t, lockdownBlock("runner ALL=(ALL) NOPASSWD: /bin/old\n", false)+ubuntuSudoers)
 
 	appended, err := appendSudoersBlock(main, "/etc/sudoers.d", testRules)
 	if err != nil || appended {

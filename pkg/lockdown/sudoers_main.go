@@ -38,8 +38,24 @@ import (
 const (
 	mainSudoers = "/etc/sudoers"
 	blockBegin  = "# BEGIN cargowall sudo lockdown (removed when the lockdown ends)"
-	blockEnd    = "# END cargowall sudo lockdown"
+	// blockBeginAddedNL marks a block we had to separate from the file with a
+	// newline the file did not end with. Removing such a block also takes
+	// that newline back, so a file with no final newline is restored exactly.
+	blockBeginAddedNL = "# BEGIN cargowall sudo lockdown (added a preceding newline; removed when the lockdown ends)"
+	blockEnd          = "# END cargowall sudo lockdown"
 )
+
+// isBeginMarker reports whether a block-stripped line is a begin marker, and
+// whether it is the variant that added a preceding newline.
+func isBeginMarker(line string) (addedNL, ok bool) {
+	switch line {
+	case blockBegin:
+		return false, true
+	case blockBeginAddedNL:
+		return true, true
+	}
+	return false, false
+}
 
 // visudoCheckFile validates a candidate sudoers file, includes and all. A
 // var so tests can stand in for visudo, which needs root.
@@ -72,25 +88,32 @@ func readsLockdownLast(content, dir string) bool {
 	return filepath.Clean(strings.Trim(fields[1], `"`)) == filepath.Clean(dir)
 }
 
-// lockdownBlock is rules wrapped in the markers removeBlock finds.
-func lockdownBlock(rules string) string {
-	return blockBegin + "\n" + strings.TrimRight(rules, "\n") + "\n" + blockEnd + "\n"
+// lockdownBlock is rules wrapped in the markers withoutBlock finds, with the
+// begin marker saying whether a preceding newline was added.
+func lockdownBlock(rules string, addedNL bool) string {
+	begin := blockBegin
+	if addedNL {
+		begin = blockBeginAddedNL
+	}
+	return begin + "\n" + strings.TrimRight(rules, "\n") + "\n" + blockEnd + "\n"
 }
 
 // withoutBlock is content with the lockdown block cut out, marker lines
-// included, and whether there was one. A begin marker without its end is an
-// error: what follows it is not known to be ours.
+// included, and whether there was one. When the block's begin marker says it
+// added a preceding newline, that newline is taken back too, so a file with
+// no final newline is restored byte for byte. A begin marker without its end
+// is an error: what follows it is not known to be ours.
 func withoutBlock(content string) (string, bool, error) {
 	lines := strings.SplitAfter(content, "\n")
 	begin, end := -1, -1
+	addedNL := false
 	for i, line := range lines {
-		switch strings.TrimRight(line, "\n") {
-		case blockBegin:
+		if a, ok := isBeginMarker(strings.TrimRight(line, "\n")); ok {
 			if begin >= 0 {
 				return "", false, errors.New("sudoers holds a second lockdown block before the first ends")
 			}
-			begin = i
-		case blockEnd:
+			begin, addedNL = i, a
+		} else if strings.TrimRight(line, "\n") == blockEnd {
 			if begin < 0 {
 				return "", false, errors.New("sudoers holds a lockdown block end without its beginning")
 			}
@@ -106,20 +129,26 @@ func withoutBlock(content string) (string, bool, error) {
 	case end < 0:
 		return "", false, errors.New("sudoers holds a lockdown block without its end")
 	}
-	return strings.Join(lines[:begin], "") + strings.Join(lines[end+1:], ""), true, nil
+	before := strings.Join(lines[:begin], "")
+	if addedNL {
+		before = strings.TrimSuffix(before, "\n")
+	}
+	return before + strings.Join(lines[end+1:], ""), true, nil
 }
 
 // withBlock is content with the lockdown block at its end, replacing one a
-// previous run left.
+// previous run left. A base that does not end with a newline gets one before
+// the block, recorded in the begin marker so withoutBlock restores it.
 func withBlock(content, rules string) (string, error) {
 	base, _, err := withoutBlock(content)
 	if err != nil {
 		return "", err
 	}
-	if base != "" && !strings.HasSuffix(base, "\n") {
+	addedNL := base != "" && !strings.HasSuffix(base, "\n")
+	if addedNL {
 		base += "\n"
 	}
-	return base + lockdownBlock(rules), nil
+	return base + lockdownBlock(rules, addedNL), nil
 }
 
 // appendSudoersBlock appends the lockdown rules to main when sudo would not
@@ -180,7 +209,9 @@ func removeSudoersBlock(main string) (bool, error) {
 // file beside it, with main's mode and owner, validated, then renamed over
 // it. A file sudo refuses to parse would take sudo away from everyone, so
 // nothing invalid is ever put in its place. A symlink is refused rather
-// than replaced by a file.
+// than replaced by a file. The temporary file has a unique name, so a
+// concurrent edit of the same file (a forced teardown's Disable racing an
+// Enable) can never rename one edit's unvalidated file over the real one.
 func replaceSudoers(main, content string) error {
 	fi, err := os.Lstat(main)
 	if err != nil {
@@ -189,12 +220,11 @@ func replaceSudoers(main, content string) error {
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", main)
 	}
-	tmp := main + ".cargowall-tmp"
-	os.Remove(tmp)
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fi.Mode().Perm())
+	f, err := os.CreateTemp(filepath.Dir(main), ".sudoers.cargowall-*")
 	if err != nil {
-		return fmt.Errorf("create %s: %w", tmp, err)
+		return fmt.Errorf("create a temp file beside %s: %w", main, err)
 	}
+	tmp := f.Name()
 	_, err = f.WriteString(content)
 	if err == nil {
 		err = f.Sync()
@@ -203,7 +233,6 @@ func replaceSudoers(main, content string) error {
 		err = cerr
 	}
 	if err == nil {
-		// OpenFile's mode is masked by the umask; chmod sets it whole.
 		err = os.Chmod(tmp, fi.Mode().Perm())
 	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok && err == nil {

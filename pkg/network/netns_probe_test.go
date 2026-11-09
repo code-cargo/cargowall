@@ -210,7 +210,8 @@ func received(t *testing.T, l *net.UDPConn, wait time.Duration) (string, *net.UD
 // about 1 in 80 under ip netns add/del churn, never for IPv4 or for a
 // socket's own sends), so one that should land gets more than one try.
 // Anything else l reads is skipped: an earlier probe's extra copy can come
-// late.
+// late. So a probe sent to the same listener again takes a payload of its
+// own, or the earlier one's extra copy would answer for it.
 func resentUntil(t *testing.T, wire *os.File, pkt []byte, l *net.UDPConn, want string,
 	wait time.Duration,
 ) (string, *net.UDPAddr) {

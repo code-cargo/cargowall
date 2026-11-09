@@ -421,11 +421,12 @@ func TestDNSRedirect_Bridge(t *testing.T) {
 			require.Empty(t, got, "ipv6 %v: DNS for %s arriving off a docker bridge must not reach the container listener",
 				ipv6, dst)
 		}
-		got, _ := resentUntil(t, other, udp6(net.ParseIP("fd56::2"), net.ParseIP("fd56::1"), 5000, 53, "other6"),
-			hostResolver6, "other6", arrives)
-		require.Equal(t, "other6", got, "ipv6 %v: IPv6 DNS arriving off a docker bridge is no bridge's to redirect", ipv6)
+		other6 := fmt.Sprintf("other6, ipv6 %v", ipv6) // each round's own, to the same hostResolver6
+		got, _ := resentUntil(t, other, udp6(net.ParseIP("fd56::2"), net.ParseIP("fd56::1"), 5000, 53, other6),
+			hostResolver6, other6, arrives)
+		require.Equal(t, other6, got, "ipv6 %v: IPv6 DNS arriving off a docker bridge is no bridge's to redirect", ipv6)
 		if ipv6 {
-			got, _ = resentUntil(t, other, udp6(net.ParseIP("fd56::2"), v6, 5000, 53, "other6"), l6, "other6", absent)
+			got, _ = resentUntil(t, other, udp6(net.ParseIP("fd56::2"), v6, 5000, 53, other6), l6, other6, absent)
 			require.Empty(t, got, "IPv6 DNS for the IPv6 container listener arriving off a docker bridge must not reach it")
 		}
 

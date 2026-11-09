@@ -521,7 +521,17 @@ func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byt
 // connection-attempt identity the kernel compares in every state; empty for
 // TCP. last_punt_seq is deliberately left zero: it is the kernel's PENDING
 // dedup field, never read on a terminal state.
+//
+// It leaves a NEED_HELLO entry alone. Only a connection's first SYN parks
+// one, after which the entry belongs to that connection, not to the cycle
+// this verdict closes, and its own first flight punts with NEW_CONN. The
+// lookup narrows the window a SYN landing between it and the update leaves
+// open; it doesn't close it.
 func (l *L7) writeFlowState(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte) error {
+	var cur bpf.OriginBpfL7FlowVal
+	if err := l.flow.Lookup(&key, &cur); err == nil && cur.State == l7StateNeedHello {
+		return nil
+	}
 	val := bpf.OriginBpfL7FlowVal{State: state}
 	if n := copy(val.Dcid[:], dcid); n > 0 {
 		val.DcidLen = uint8(n)

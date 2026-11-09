@@ -52,8 +52,9 @@ const l7CfgKeyMode = uint32(2)
 
 // Flow-state values written back to map_l7_flow (sni.h L7_STATE_*).
 const (
-	l7StateAllowed uint8 = 2
-	l7StateDenied  uint8 = 3
+	l7StateNeedHello uint8 = 0
+	l7StateAllowed   uint8 = 2
+	l7StateDenied    uint8 = 3
 )
 
 // Punt flags (sni.h L7_PUNT_F_*).

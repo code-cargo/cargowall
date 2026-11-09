@@ -50,6 +50,7 @@ func TestL7KernelConstantsMatchSniSource(t *testing.T) {
 		"L7_SCOPE_TLS":           uint64(bpf.L7ScopeTLS),
 		"L7_SCOPE_HTTP":          uint64(bpf.L7ScopeHTTP),
 		"L7_SCOPE_QUIC":          uint64(bpf.L7ScopeQUIC),
+		"L7_STATE_NEED_HELLO":    uint64(l7StateNeedHello),
 		"L7_STATE_ALLOWED":       uint64(l7StateAllowed),
 		"L7_STATE_DENIED":        uint64(l7StateDenied),
 		"L7_PUNT_F_NO_STATE":     uint64(l7PuntNoState),

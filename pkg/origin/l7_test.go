@@ -775,3 +775,38 @@ func TestL7NewConnectionResetsUndecidedCycle(t *testing.T) {
 	require.True(t, (*outcomes)[0].Allowed, "the new connection's hello adjudicates on its own (why=%q)", (*outcomes)[0].Reason)
 	require.Equal(t, "auth.docker.io", (*outcomes)[0].Name)
 }
+
+// TestL7VerdictLeavesANewConnectionAlone: a verdict, or a re-assert of one,
+// that lands after the socket's next connection parked its entry NEED_HELLO
+// belongs to the earlier connection and must not be written over the new
+// one's entry. Over the cycle's own PENDING entry it is written as usual.
+func TestL7VerdictLeavesANewConnectionAlone(t *testing.T) {
+	objs := loadL7Objects(t)
+	l := newL7(objs, L7Options{Matcher: allowSet{"auth.docker.io": true}}, nil)
+	outcomes := captureSink(l)
+	state := func(ev *bpf.L7Event) uint8 {
+		var v bpf.OriginBpfL7FlowVal
+		require.NoError(t, objs.MapL7Flow.Lookup(ev.FlowKey(), &v))
+		return v.State
+	}
+
+	ev := makeL7Event(443, 1000, snitest.BuildClientHello("auth.docker.io"), false)
+	ev.Flags |= l7PuntNewConn
+	require.NoError(t, objs.MapL7Flow.Put(ev.FlowKey(), bpf.OriginBpfL7FlowVal{State: l7StateNeedHello}))
+	l.onSample(ev)
+	require.Len(t, *outcomes, 1, "the cycle is still adjudicated and reported")
+	require.Equal(t, l7StateNeedHello, state(ev), "the verdict must not land on the next connection's entry")
+
+	// A stale punt's re-assert must leave it alone too.
+	l.onSample(makeL7Event(443, 1000, snitest.BuildClientHello("auth.docker.io"), false))
+	require.Len(t, *outcomes, 1)
+	require.Equal(t, l7StateNeedHello, state(ev), "a re-assert must not land on the next connection's entry")
+
+	// Over its own cycle's PENDING entry the verdict is written.
+	other := makeL7Event(443, 1000, snitest.BuildClientHello("auth.docker.io"), false)
+	other.Cookie = 77
+	other.Flags |= l7PuntNewConn
+	require.NoError(t, objs.MapL7Flow.Put(other.FlowKey(), bpf.OriginBpfL7FlowVal{State: 1}))
+	l.onSample(other)
+	require.Equal(t, l7StateAllowed, state(other))
+}

@@ -114,9 +114,8 @@ func TestOwnedAddrs_GuardAdmitsBridgesButUplinks(t *testing.T) {
 		require.NoError(t, err)
 		got, _ := received(t, l, wait)
 		assert.Equal(t, c.admit, got == c.name, "%s: IPv4 admitted", c.name)
-		_, err = c.link.port.Write(ether(c.link.mac, peer, 0x86dd, udp6(c.link.src6, v6, 5000, 53, c.name+"6")))
-		require.NoError(t, err)
-		got, _ = received(t, l6, wait)
+		got, _ = resentUntil(t, c.link.port, ether(c.link.mac, peer, 0x86dd, udp6(c.link.src6, v6, 5000, 53, c.name+"6")),
+			l6, c.name+"6", wait)
 		assert.Equal(t, c.admit, got == c.name+"6", "%s: IPv6 admitted", c.name)
 	}
 	_, err := plain.Write(udp4(net.IPv4(10, 56, 0, 2), v4, 5000, 53, "tun"))
@@ -224,13 +223,20 @@ func TestOwnedAddrs_NotAdvertised(t *testing.T) {
 				binary.BigEndian.Uint16(f[20:]) == 2 && net.IP(f[28:32]).Equal(target)
 		})
 	}
+	// Sent again every resend, as resentUntil sends: IPv6 written to a TAP
+	// can find no input route under load.
 	ndFor := func(target net.IP, wait time.Duration) bool {
-		_, err := tap.Write(neighborSolicit(mac, peer, net.ParseIP("fd56::2"), net.ParseIP("fd56::1"), target))
-		require.NoError(t, err)
-		return answered(t, tap, wait, func(f []byte) bool {
-			return binary.BigEndian.Uint16(f[12:]) == 0x86dd && len(f) >= 78 && f[20] == unix.IPPROTO_ICMPV6 &&
-				f[54] == 136 && net.IP(f[62:78]).Equal(target)
-		})
+		for end := time.Now().Add(wait); time.Now().Before(end); {
+			_, err := tap.Write(neighborSolicit(mac, peer, net.ParseIP("fd56::2"), net.ParseIP("fd56::1"), target))
+			require.NoError(t, err)
+			if answered(t, tap, min(resend, time.Until(end)), func(f []byte) bool {
+				return binary.BigEndian.Uint16(f[12:]) == 0x86dd && len(f) >= 78 && f[20] == unix.IPPROTO_ICMPV6 &&
+					f[54] == 136 && net.IP(f[62:78]).Equal(target)
+			}) {
+				return true
+			}
+		}
+		return false
 	}
 
 	// The controls: the link's own addresses are answered, and so is the

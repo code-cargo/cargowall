@@ -112,7 +112,8 @@ type OriginBpfOriginSeenVal struct {
 	_        structs.HostLayout
 	LastEmit uint64
 	Verdict  uint8
-	Pad      [7]uint8
+	StepTier uint8
+	Pad      [6]uint8
 }
 
 type OriginBpfPortVal struct {

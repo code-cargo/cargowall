@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -241,6 +242,149 @@ func checkStepVerdict(t *testing.T, tcObjs *TcBpfObjects, tcEvents, cgRecords *r
 	}
 	require.Equal(t, wantVerdict, rec.Verdict, "%s: cw_cg_egress verdict", name)
 	require.Equal(t, stepAsked, rec.Flags&OriginFlagStepTier != 0, "%s: cw_cg_egress ORIGIN_FLAG_STEP_TIER", name)
+}
+
+// TestStepTierChangeReEmits: identifying a step mid-flow can change whether
+// its rules are asked about a destination without changing the verdict, as
+// a SYN denied by the job's rules before the step is bound is still denied
+// after, by rules of its own that do not cover it. The flow's records must
+// say so at once, not keep the first one's answer for the rest of the
+// re-emit interval: at the cgroup hook, whose records dedup per socket and
+// destination, the retransmitted SYN, a second after the binding, must
+// bring a record with ORIGIN_FLAG_STEP_TIER set.
+func TestStepTierChangeReEmits(t *testing.T) {
+	requireBPF(t)
+	tcObjs := loadBPFObjectsStepRules(t, true)
+	originObjs := loadOriginObjectsSharing(t, tcObjs)
+	setOriginMode(t, originObjs, originModeShadow)
+	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(0)))
+	require.NoError(t, tcObjs.MapAuditMode.Put(uint32(0), uint8(0)))
+	// A rule of the step's own, but not for the destination probed.
+	require.NoError(t, tcObjs.MapCidrs.Put(RuleKey(stepPolicyA, 32, ipToU32("10.99.0.20")), TcBpfLpmVal{Action: 1}))
+
+	ns := newStepNetns(t)
+	cgLink, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    "/sys/fs/cgroup",
+		Attach:  ebpf.AttachCGroupInetEgress,
+		Program: originObjs.CwCgEgress,
+	})
+	if err != nil {
+		t.Skipf("cannot attach cgroup_skb/egress at root cgroup: %v", err)
+	}
+	t.Cleanup(func() { cgLink.Close() })
+	tcEvents, err := ringbuf.NewReader(tcObjs.MapEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { tcEvents.Close() })
+	cgRecords, err := ringbuf.NewReader(originObjs.MapOriginEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { cgRecords.Close() })
+
+	enterStepNetns(t, ns)
+	tcLink, err := tc.AttachEgress("d0", tcObjs.CwTcEgress, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	t.Cleanup(func() { tcLink.Close() })
+
+	dst := netip.MustParseAddr("10.99.0.50")
+	cookie, sport := connectTagged(t, tcObjs, dst.String(), 80, true, ordinalUnbound)
+	first := readOriginRecordFor(t, cgRecords, cookie)
+	require.Equal(t, uint8(originVerdictWouldBlock), first.Verdict)
+	require.Zero(t, first.Flags&OriginFlagStepTier, "before the binding no step policy is asked")
+	ev := readTcEventFor(t, tcEvents, dst, 80, sport)
+	require.Zero(t, ev.Flags&0x2, "nor at TC")
+
+	require.NoError(t, tcObjs.MapStepPolicy.Put(ordinalUnbound, stepPolicyA))
+	t.Cleanup(func() { _ = tcObjs.MapStepPolicy.Delete(ordinalUnbound) })
+	second := readOriginRecordFor(t, cgRecords, cookie)
+	require.Equal(t, uint8(originVerdictWouldBlock), second.Verdict, "the step's rules do not cover it either")
+	require.NotZero(t, second.Flags&OriginFlagStepTier, "the retransmit's record says the step was asked")
+	ev = readTcEventFor(t, tcEvents, dst, 80, sport)
+	require.NotZero(t, ev.Flags&0x2, "and so does TC's event for it")
+}
+
+// TestStepTierChangeReEmitsMidstream is the same at TC's mid-stream drop
+// events, which are rate-limited per destination: an established flow,
+// denied once the default turns to deny, keeps retransmitting, and the
+// first retransmit after its step is bound must be reported with
+// EVENT_FLAG_STEP_TIER set, not swallowed by the earlier event's interval.
+// The flow runs over the namespace's loopback, with cw_tc_egress on it.
+func TestStepTierChangeReEmitsMidstream(t *testing.T) {
+	requireBPF(t)
+	tcObjs := loadBPFObjectsStepRules(t, true)
+	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(1)))
+	require.NoError(t, tcObjs.MapAuditMode.Put(uint32(0), uint8(0)))
+	require.NoError(t, tcObjs.MapCidrs.Put(RuleKey(stepPolicyA, 32, ipToU32("10.99.0.20")), TcBpfLpmVal{Action: 1}))
+	tcEvents, err := ringbuf.NewReader(tcObjs.MapEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { tcEvents.Close() })
+
+	ns := newStepNetns(t)
+	enterStepNetns(t, ns)
+	tcLink, err := tc.AttachEgress("lo", tcObjs.CwTcEgress, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	t.Cleanup(func() { tcLink.Close() })
+
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			accepted <- c
+		}
+	}()
+	t.Cleanup(func() {
+		select {
+		case c := <-accepted:
+			c.Close()
+		default:
+		}
+	})
+	port := uint16(ln.Addr().(*net.TCPAddr).Port)
+	conn, err := net.Dial("tcp4", ln.Addr().String()) // allowed by default
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	raw, err := conn.(*net.TCPConn).SyscallConn()
+	require.NoError(t, err)
+	var cookie uint64
+	var cerr error
+	require.NoError(t, raw.Control(func(fd uintptr) {
+		cookie, cerr = unix.GetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_COOKIE)
+	}))
+	require.NoError(t, cerr)
+	require.NoError(t, tcObjs.MapSockStep.Put(cookie, ordinalUnbound))
+
+	// Denied from here on, and dropped, so the data retransmits.
+	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(0)))
+	_, err = conn.Write([]byte("x"))
+	require.NoError(t, err)
+	first := readMidstreamEventTo(t, tcEvents, port)
+	require.Zero(t, first.Flags&0x2, "before the binding no step policy is asked")
+
+	require.NoError(t, tcObjs.MapStepPolicy.Put(ordinalUnbound, stepPolicyA))
+	second := readMidstreamEventTo(t, tcEvents, port)
+	require.NotZero(t, second.Flags&0x2, "the first retransmit after the binding says the step was asked")
+}
+
+// readMidstreamEventTo reads cw_tc_egress events until a mid-stream drop
+// event for 127.0.0.1:port.
+func readMidstreamEventTo(t *testing.T, rd *ringbuf.Reader, port uint16) bpfBlockedEvent {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		rd.SetDeadline(time.Now().Add(200 * time.Millisecond))
+		rec, err := rd.Read()
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			continue
+		}
+		require.NoError(t, err)
+		var ev bpfBlockedEvent
+		require.NoError(t, binary.Read(bytes.NewReader(rec.RawSample), binary.NativeEndian, &ev))
+		if ev.IpVersion == 4 && ev.DstPort == port && ev.Flags&0x1 != 0 {
+			return ev
+		}
+	}
+	t.Fatalf("no mid-stream drop event for 127.0.0.1:%d", port)
+	return bpfBlockedEvent{}
 }
 
 // newStepNetns makes a scratch network namespace with loopback up and a

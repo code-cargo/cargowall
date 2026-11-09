@@ -114,8 +114,8 @@ struct {
 
 // Rate-limit maps for mid-stream drop events: a killed TCP connection
 // retransmits for minutes (and in audit mode non-SYN data segments flow
-// continuously), so emit at most one event per (dst_ip, dst_port, proto)
-// per interval. 10s caps a tuple at 6 events/min while refreshing well
+// continuously), so emit at most one event per (dst_ip, dst_port, proto,
+// step tier asked) per interval. 10s caps a tuple at 6 events/min while refreshing well
 // inside the 5-minute RecentBlocks TTL, so the late-allow reconciler always
 // has a live entry. 4096 entries matches the rule maps — one per distinct
 // blocked destination tuple, ~110KB worst case. LRU eviction under pressure
@@ -123,19 +123,23 @@ struct {
 #define MIDSTREAM_EMIT_INTERVAL_NS (10ULL * 1000000000ULL)
 
 // One exact destination tuple: the rate-limit key, policy-free since it
-// keys what was blocked, not the rule that blocked it.
+// keys what was blocked, not the rule that blocked it. Whether the step
+// tier was asked keys it too, so a denial's tier changing (a step
+// identified mid-flow) is reported at once, not swallowed by the earlier
+// event's interval; each tier is limited on its own, so sockets of both
+// kinds to one destination cannot make the events alternate per packet.
 struct port_key {
     __u32 ip;
     __u16 port;
     __u8 proto;
-    __u8 host_bits;  // always 0
+    __u8 step_tier;  // EVENT_FLAG_STEP_TIER of the event, or 0
 } __attribute__((packed));
 
 struct port_key_v6 {
     __u8 ip[16];
     __u16 port;
     __u8 proto;
-    __u8 host_bits;  // always 0
+    __u8 step_tier;  // as in port_key
 } __attribute__((packed));
 
 struct {
@@ -261,12 +265,12 @@ static __always_inline int check_audit_or_block(void) {
 // Helper: rate-limit mid-stream drop events per IPv4 destination tuple.
 // A concurrent lookup/update race across CPUs costs at most one duplicate
 // event — not worth an atomic.
-static __always_inline int midstream_should_emit(__u32 dst_ip_nbo, __u16 dst_port, __u8 proto) {
+static __always_inline int midstream_should_emit(__u32 dst_ip_nbo, __u16 dst_port, __u8 proto, __u8 tier) {
     struct port_key key = {
         .ip = dst_ip_nbo,
         .port = dst_port,
         .proto = proto,
-        .host_bits = 0
+        .step_tier = tier
     };
     __u64 now = bpf_ktime_get_ns();
     __u64 *last = bpf_map_lookup_elem(&map_midstream_seen, &key);
@@ -277,12 +281,13 @@ static __always_inline int midstream_should_emit(__u32 dst_ip_nbo, __u16 dst_por
 }
 
 // Helper: rate-limit mid-stream drop events per IPv6 destination tuple.
-static __always_inline int midstream_should_emit_v6(const __u8 dst_ip6[16], __u16 dst_port, __u8 proto) {
+static __always_inline int midstream_should_emit_v6(const __u8 dst_ip6[16], __u16 dst_port, __u8 proto, __u8 tier) {
     struct port_key_v6 key;
     __builtin_memset(&key, 0, sizeof(key));
     __builtin_memcpy(key.ip, dst_ip6, 16);
     key.port = dst_port;
     key.proto = proto;
+    key.step_tier = tier;
     __u64 now = bpf_ktime_get_ns();
     __u64 *last = bpf_map_lookup_elem(&map_midstream_seen_v6, &key);
     if (last && now - *last < MIDSTREAM_EMIT_INTERVAL_NS)
@@ -448,7 +453,7 @@ static __always_inline int handle_ipv4(struct __sk_buff *skb, __u32 l3_offset) {
             // to audit and the late-allow reconciler. Rate-limited per dst
             // tuple; non-first fragments carry no L4 header, so they stay
             // silent as before (is_tcp_midstream is never set for them).
-            if (midstream_should_emit(dst_ip_nbo, dst_port, ip_proto)) {
+            if (midstream_should_emit(dst_ip_nbo, dst_port, ip_proto, tier)) {
                 submit_event_v4(skb, src_ip, dst_ip, src_port, dst_port, ip_proto, 0, EVENT_FLAG_MIDSTREAM | tier);
             }
         }
@@ -582,7 +587,7 @@ static __always_inline int handle_ipv6(struct __sk_buff *skb, __u32 l3_offset) {
             submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0, tier);
         } else if (is_tcp_midstream) {
             // Mid-stream TCP drop — see the IPv4 branch for rationale.
-            if (midstream_should_emit_v6(dst_ip6, dst_port, nexthdr)) {
+            if (midstream_should_emit_v6(dst_ip6, dst_port, nexthdr, tier)) {
                 submit_event_v6(skb, src_ip6, dst_ip6, src_port, dst_port, nexthdr, 0, EVENT_FLAG_MIDSTREAM | tier);
             }
         }

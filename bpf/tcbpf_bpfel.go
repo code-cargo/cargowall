@@ -26,7 +26,7 @@ type TcBpfPortKey struct {
 	Ip       uint32
 	Port     uint16
 	Proto    uint8
-	HostBits uint8
+	StepTier uint8
 }
 
 type TcBpfPortKeyV6 struct {
@@ -34,7 +34,7 @@ type TcBpfPortKeyV6 struct {
 	Ip       [16]uint8
 	Port     uint16
 	Proto    uint8
-	HostBits uint8
+	StepTier uint8
 }
 
 type TcBpfPortVal struct {

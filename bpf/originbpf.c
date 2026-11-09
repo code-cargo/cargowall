@@ -303,11 +303,15 @@ struct origin_seen_key {
 // before the mode was raised (or a policy reload flipped allow→deny) would
 // have its first denial suppressed for the rest of the interval — in enforce
 // mode that is a drop with no record, no audit event, and no late-allow
-// reconciliation.
+// reconciliation. Whether the step tier was asked is part of it too: a
+// step identified mid-flow turns a denial the job's rules alone judged into
+// one its step's rules were asked about, with the same verdict, and the
+// tuple's only record must not keep saying they were not.
 struct origin_seen_val {
     __u64 last_emit;  // bpf_ktime_get_ns()
     __u8 verdict;     // ORIGIN_VERDICT_* carried by the last emitted record
-    __u8 pad[7];      // explicit padding for a deterministic value layout
+    __u8 step_tier;   // its ORIGIN_FLAG_STEP_TIER bit
+    __u8 pad[6];      // explicit padding for a deterministic value layout
 };
 
 struct {
@@ -345,9 +349,11 @@ static __always_inline void origin_emit(struct __sk_buff *skb, __u8 ip_version,
     key.ip_proto = ip_proto;
     key.ip_version = ip_version;
 
+    __u8 step_tier = flags & ORIGIN_FLAG_STEP_TIER;
     __u64 now = bpf_ktime_get_ns();
     struct origin_seen_val *last = bpf_map_lookup_elem(&map_origin_seen, &key);
-    if (last && last->verdict == verdict && now - last->last_emit < ORIGIN_EMIT_INTERVAL_NS)
+    if (last && last->verdict == verdict && last->step_tier == step_tier &&
+        now - last->last_emit < ORIGIN_EMIT_INTERVAL_NS)
         return;
 
     struct origin_event *evt = bpf_ringbuf_reserve(&map_origin_events, sizeof(*evt), 0);
@@ -356,7 +362,7 @@ static __always_inline void origin_emit(struct __sk_buff *skb, __u8 ip_version,
                  // going silent for the interval — in enforce mode this
                  // record is a drop's only audit trail, and a stamped-but-
                  // lost entry would mute every retransmit for 10s.
-    struct origin_seen_val val = { .last_emit = now, .verdict = verdict };
+    struct origin_seen_val val = { .last_emit = now, .verdict = verdict, .step_tier = step_tier };
     bpf_map_update_elem(&map_origin_seen, &key, &val, BPF_ANY);
     __builtin_memset(evt, 0, sizeof(*evt));
     evt->cookie = cookie;

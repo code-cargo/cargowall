@@ -115,11 +115,13 @@ struct {
 // Rate-limit maps for mid-stream drop events: a killed TCP connection
 // retransmits for minutes (and in audit mode non-SYN data segments flow
 // continuously), so emit at most one event per (dst_ip, dst_port, proto,
-// step tier asked) per interval. 10s caps a tuple at 6 events/min while refreshing well
-// inside the 5-minute RecentBlocks TTL, so the late-allow reconciler always
-// has a live entry. 4096 entries matches the rule maps — one per distinct
-// blocked destination tuple, ~110KB worst case. LRU eviction under pressure
-// costs an occasional duplicate event, never a lost verdict.
+// step tier asked) per interval. 10s caps each at 6 events/min, so up to
+// 12 per destination tuple, one series for each tier, while refreshing
+// well inside the 5-minute RecentBlocks TTL, so the late-allow reconciler
+// always has a live entry. 4096 entries matches the rule maps — up to two
+// per distinct blocked destination tuple, one per tier, ~110KB worst
+// case. LRU eviction under pressure costs an occasional duplicate event,
+// never a lost verdict.
 #define MIDSTREAM_EMIT_INTERVAL_NS (10ULL * 1000000000ULL)
 
 // One exact destination tuple: the rate-limit key, policy-free since it
@@ -130,8 +132,9 @@ struct {
 // tier is limited on its own: sockets of both kinds to one destination,
 // whose data flows on under audit, cannot make the events alternate per
 // packet, and a return to a tier already reported for the destination
-// within the interval stays limited, that state having been reported,
-// each event with its own socket's step tag.
+// within the interval stays limited: some socket's event has reported
+// that tier for the destination in the interval, though not necessarily
+// this socket's step.
 struct port_key {
     __u32 ip;
     __u16 port;

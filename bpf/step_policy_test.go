@@ -319,11 +319,11 @@ func TestStepTierChangeReEmits(t *testing.T) {
 // bound from the start, its first retransmit after a job deny takes over
 // the destination must be reported with the flag clear: neither swallowed
 // by the earlier event's interval. The flows run over the namespace's
-// loopback, with cw_tc_egress on it.
+// loopback, with cw_tc_egress on it, in both families: each keys its own
+// rate limit.
 func TestStepTierChangeReEmitsMidstream(t *testing.T) {
 	requireBPF(t)
 	tcObjs := loadBPFObjectsStepRules(t, true)
-	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(1)))
 	require.NoError(t, tcObjs.MapAuditMode.Put(uint32(0), uint8(0)))
 	require.NoError(t, tcObjs.MapCidrs.Put(RuleKey(stepPolicyA, 32, ipToU32("10.99.0.20")), TcBpfLpmVal{Action: 1}))
 	tcEvents, err := ringbuf.NewReader(tcObjs.MapEvents)
@@ -336,37 +336,55 @@ func TestStepTierChangeReEmitsMidstream(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { tcLink.Close() })
 
+	// Each family's ordinals are its own: one bound mid-flow, one bound
+	// from the start.
+	checkMidstreamTierChanges(t, tcObjs, tcEvents, netip.MustParseAddr("127.0.0.1"), 31, 32)
+	checkMidstreamTierChanges(t, tcObjs, tcEvents, netip.MustParseAddr("::1"), 33, 34)
+}
+
+// checkMidstreamTierChanges runs both halves of
+// TestStepTierChangeReEmitsMidstream over loopback address lo: a flow
+// tagged with the unbound ordinal later, whose step is bound to policy A
+// mid-flow, and one tagged with bound, whose step is A's from the start
+// until a job deny for lo decides.
+func checkMidstreamTierChanges(t *testing.T, tcObjs *TcBpfObjects, tcEvents *ringbuf.Reader, lo netip.Addr, later, bound uint32) {
+	t.Helper()
 	// Not asked, then asked: a step bound mid-flow.
-	conn, port := dialTagged(t, tcObjs, ordinalUnbound)
+	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(1)))
+	conn, port := dialTagged(t, tcObjs, lo, later)
 	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(0))) // denied, and dropped
-	_, err = conn.Write([]byte("x"))
+	_, err := conn.Write([]byte("x"))
 	require.NoError(t, err)
-	first := readMidstreamEventTo(t, tcEvents, port)
-	require.Zero(t, first.Flags&0x2, "before the binding no step policy is asked")
-	require.NoError(t, tcObjs.MapStepPolicy.Put(ordinalUnbound, stepPolicyA))
-	second := readMidstreamEventTo(t, tcEvents, port)
-	require.NotZero(t, second.Flags&0x2, "the first retransmit after the binding says the step was asked")
+	first := readMidstreamEventTo(t, tcEvents, lo, port)
+	require.Zero(t, first.Flags&0x2, "%s: before the binding no step policy is asked", lo)
+	require.NoError(t, tcObjs.MapStepPolicy.Put(later, stepPolicyA))
+	second := readMidstreamEventTo(t, tcEvents, lo, port)
+	require.NotZero(t, second.Flags&0x2, "%s: the first retransmit after the binding says the step was asked", lo)
 
 	// Asked, then not: a job deny installed for the destination.
 	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(1)))
-	require.NoError(t, tcObjs.MapStepPolicy.Put(ordinalA, stepPolicyA))
-	conn, port = dialTagged(t, tcObjs, ordinalA)
+	require.NoError(t, tcObjs.MapStepPolicy.Put(bound, stepPolicyA))
+	conn, port = dialTagged(t, tcObjs, lo, bound)
 	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(0)))
 	_, err = conn.Write([]byte("x"))
 	require.NoError(t, err)
-	first = readMidstreamEventTo(t, tcEvents, port)
-	require.NotZero(t, first.Flags&0x2, "a bound step's rules are asked")
-	require.NoError(t, tcObjs.MapCidrs.Put(RuleKey(PolicyJob, 32, ipToU32("127.0.0.1")), TcBpfLpmVal{Action: 0}))
-	second = readMidstreamEventTo(t, tcEvents, port)
-	require.Zero(t, second.Flags&0x2, "once the job's deny decides, the next retransmit says the step was not asked")
+	first = readMidstreamEventTo(t, tcEvents, lo, port)
+	require.NotZero(t, first.Flags&0x2, "%s: a bound step's rules are asked", lo)
+	if lo.Is4() {
+		require.NoError(t, tcObjs.MapCidrs.Put(RuleKey(PolicyJob, 32, ipToU32(lo.String())), TcBpfLpmVal{Action: 0}))
+	} else {
+		require.NoError(t, tcObjs.MapCidrsV6.Put(RuleKeyV6(PolicyJob, 128, lo.As16()), TcBpfLpmVal{Action: 0}))
+	}
+	second = readMidstreamEventTo(t, tcEvents, lo, port)
+	require.Zero(t, second.Flags&0x2, "%s: once the job's deny decides, the next retransmit says the step was not asked", lo)
 }
 
-// dialTagged connects to a fresh loopback listener while the default allows
-// it, and tags the client socket's cookie with ordinal. It returns the
-// connection and the listener's port.
-func dialTagged(t *testing.T, objs *TcBpfObjects, ordinal uint32) (net.Conn, uint16) {
+// dialTagged connects to a fresh listener on loopback address lo while the
+// default allows it, and tags the client socket's cookie with ordinal. It
+// returns the connection and the listener's port.
+func dialTagged(t *testing.T, objs *TcBpfObjects, lo netip.Addr, ordinal uint32) (net.Conn, uint16) {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", netip.AddrPortFrom(lo, 0).String())
 	require.NoError(t, err)
 	t.Cleanup(func() { ln.Close() })
 	accepted := make(chan net.Conn, 1)
@@ -382,7 +400,7 @@ func dialTagged(t *testing.T, objs *TcBpfObjects, ordinal uint32) (net.Conn, uin
 		default:
 		}
 	})
-	conn, err := net.Dial("tcp4", ln.Addr().String())
+	conn, err := net.Dial("tcp", ln.Addr().String())
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
 	raw, err := conn.(*net.TCPConn).SyscallConn()
@@ -398,8 +416,8 @@ func dialTagged(t *testing.T, objs *TcBpfObjects, ordinal uint32) (net.Conn, uin
 }
 
 // readMidstreamEventTo reads cw_tc_egress events until a mid-stream drop
-// event for 127.0.0.1:port.
-func readMidstreamEventTo(t *testing.T, rd *ringbuf.Reader, port uint16) bpfBlockedEvent {
+// event for lo:port.
+func readMidstreamEventTo(t *testing.T, rd *ringbuf.Reader, lo netip.Addr, port uint16) bpfBlockedEvent {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -411,11 +429,17 @@ func readMidstreamEventTo(t *testing.T, rd *ringbuf.Reader, port uint16) bpfBloc
 		require.NoError(t, err)
 		var ev bpfBlockedEvent
 		require.NoError(t, binary.Read(bytes.NewReader(rec.RawSample), binary.NativeEndian, &ev))
-		if ev.IpVersion == 4 && ev.DstPort == port && ev.Flags&0x1 != 0 {
+		if ev.DstPort != port || ev.Flags&0x1 == 0 {
+			continue
+		}
+		if lo.Is4() && ev.IpVersion == 4 && ev.DstIp == binary.BigEndian.Uint32(lo.AsSlice()) {
+			return ev
+		}
+		if lo.Is6() && ev.IpVersion == 6 && ev.DstIp6 == lo.As16() {
 			return ev
 		}
 	}
-	t.Fatalf("no mid-stream drop event for 127.0.0.1:%d", port)
+	t.Fatalf("no mid-stream drop event for %s", netip.AddrPortFrom(lo, port))
 	return bpfBlockedEvent{}
 }
 

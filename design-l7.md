@@ -67,6 +67,14 @@ ones, which is the shared-edge swap this layer exists to close.
 **TLS.** The SNI is fixed at the handshake, so the connection's first
 adjudicated identity governs it.
 
+**A TCP socket can carry more than one connection.** It can disconnect
+(`connect` with `AF_UNSPEC`) and connect again under the same cookie, to the
+same destination, so its flow key outlives a connection. Every
+connection-opening SYN therefore parks the flow `NEED_HELLO` whatever its entry
+said, and a SYN carrying data (TCP Fast Open) is judged as the new
+connection's first flight. A verdict governs one connection, never the next one
+on the socket.
+
 **HTTP** gets the same contract deliberately: the first request's `Host` pins
 the connection. Re-adjudicating every request line was tried and removed — the
 kernel can only classify one segment's leading bytes, so a pipelined request

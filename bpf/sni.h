@@ -629,6 +629,31 @@ static __always_inline int l7_tcp_continuation(struct __sk_buff *skb) {
     return tp && tp->bytes_acked > 1;
 }
 
+// l7_tcp_first_segment reports whether this packet is its connection's first
+// segment rather than a retransmit of it. segs_out already counts the packet
+// in hand, and a disconnect clears it. A socket that doesn't resolve to a
+// full TCP socket reads as a first segment, which costs a re-adjudication at
+// worst.
+static __always_inline int l7_tcp_first_segment(struct __sk_buff *skb) {
+    struct bpf_sock *sk = skb->sk;
+    if (!sk)
+        return 1;
+    sk = bpf_sk_fullsock(sk);
+    if (!sk)
+        return 1;
+    struct bpf_tcp_sock *tp = bpf_tcp_sock(sk);
+    return !tp || tp->segs_out <= 1;
+}
+
+// l7_park_need_hello writes a flow's entry as a connection awaiting its first
+// data segment, built in v.
+static __always_inline void l7_park_need_hello(struct l7_flow_key *key, struct l7_flow_val *v) {
+    __builtin_memset(v, 0, sizeof(*v));
+    v->state = L7_STATE_NEED_HELLO;
+    v->ts = bpf_ktime_get_ns();
+    bpf_map_update_elem(&map_l7_flow, key, v, BPF_ANY);
+}
+
 // l7_identity_gate decides what a packet's leading bytes mean for a flow in
 // state st. It returns 1 to punt for adjudication, or writes *ret with the
 // pass/drop answer and returns 0 — L7 only adjudicates bytes that carry a
@@ -806,6 +831,23 @@ __noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, __u32 slot) {
         st->dcid_len = c->quic.dcid_len;
         __builtin_memcpy(st->dcid, c->quic.dcid, 20);
     }
+
+    // A connection-opening SYN starts a connection of its own, and the
+    // verdict on the socket's earlier one is not its verdict: a TCP socket
+    // can disconnect and connect again under the same cookie, to the same
+    // destination. So a connection's first SYN parks the flow NEED_HELLO
+    // whatever its entry said, and one that carries data (TCP Fast Open) is
+    // judged as the new connection's first flight. A retransmit of the SYN
+    // keeps the entry, so a verdict given on a Fast Open SYN's data holds for
+    // the connection it was given to.
+    if (c->is_syn && l7_tcp_first_segment(skb)) {
+        l7_park_need_hello(key, &s->fresh);
+        if (c->payload_len == 0)
+            return 1;
+        *stv = s->fresh;
+        st = stv;
+    }
+
     if (st && !repin) {
         if (st->state == L7_STATE_ALLOWED) {
             l7_stat(L7_STAT_ALLOWED);
@@ -818,11 +860,8 @@ __noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, __u32 slot) {
     }
 
     if (c->is_syn && c->payload_len == 0) {
-        struct l7_flow_val *v = &s->fresh;
-        __builtin_memset(v, 0, sizeof(*v));
-        v->state = L7_STATE_NEED_HELLO;
-        v->ts = bpf_ktime_get_ns();
-        bpf_map_update_elem(&map_l7_flow, key, v, BPF_ANY);
+        // A retransmitted SYN of a connection with no verdict yet.
+        l7_park_need_hello(key, &s->fresh);
         return 1;
     }
     if (c->payload_len == 0)

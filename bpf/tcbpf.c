@@ -124,10 +124,14 @@ struct {
 
 // One exact destination tuple: the rate-limit key, policy-free since it
 // keys what was blocked, not the rule that blocked it. Whether the step
-// tier was asked keys it too, so a denial's tier changing (a step
-// identified mid-flow) is reported at once, not swallowed by the earlier
-// event's interval; each tier is limited on its own, so sockets of both
-// kinds to one destination cannot make the events alternate per packet.
+// tier was asked keys it too, so a denial whose tier changes (a step
+// identified mid-flow, or a job rule installed for the destination) is
+// reported at once, not swallowed by the earlier event's interval. Each
+// tier is limited on its own: sockets of both kinds to one destination,
+// whose data flows on under audit, cannot make the events alternate per
+// packet, and a return to a tier already reported for the destination
+// within the interval stays limited, that state having been reported,
+// each event with its own socket's step tag.
 struct port_key {
     __u32 ip;
     __u16 port;

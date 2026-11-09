@@ -251,7 +251,10 @@ func checkStepVerdict(t *testing.T, tcObjs *TcBpfObjects, tcEvents, cgRecords *r
 // say so at once, not keep the first one's answer for the rest of the
 // re-emit interval: at the cgroup hook, whose records dedup per socket and
 // destination, the retransmitted SYN, a second after the binding, must
-// bring a record with ORIGIN_FLAG_STEP_TIER set.
+// bring a record with ORIGIN_FLAG_STEP_TIER set. And back: a job deny
+// installed for the destination then decides it, the step is no longer
+// asked, the verdict is the same, and the next retransmit's record must
+// have the flag clear.
 func TestStepTierChangeReEmits(t *testing.T) {
 	requireBPF(t)
 	tcObjs := loadBPFObjectsStepRules(t, true)
@@ -299,14 +302,24 @@ func TestStepTierChangeReEmits(t *testing.T) {
 	require.NotZero(t, second.Flags&OriginFlagStepTier, "the retransmit's record says the step was asked")
 	ev = readTcEventFor(t, tcEvents, dst, 80, sport)
 	require.NotZero(t, ev.Flags&0x2, "and so does TC's event for it")
+
+	require.NoError(t, tcObjs.MapCidrs.Put(RuleKey(PolicyJob, 32, ipToU32(dst.String())), TcBpfLpmVal{Action: 0}))
+	third := readOriginRecordFor(t, cgRecords, cookie)
+	require.Equal(t, uint8(originVerdictWouldBlock), third.Verdict, "the job's deny now decides")
+	require.Zero(t, third.Flags&OriginFlagStepTier, "the next retransmit's record says the step was not asked")
+	ev = readTcEventFor(t, tcEvents, dst, 80, sport)
+	require.Zero(t, ev.Flags&0x2, "nor TC's")
 }
 
 // TestStepTierChangeReEmitsMidstream is the same at TC's mid-stream drop
-// events, which are rate-limited per destination: an established flow,
-// denied once the default turns to deny, keeps retransmitting, and the
-// first retransmit after its step is bound must be reported with
-// EVENT_FLAG_STEP_TIER set, not swallowed by the earlier event's interval.
-// The flow runs over the namespace's loopback, with cw_tc_egress on it.
+// events, which are rate-limited per destination and step tier: an
+// established flow, denied once the default turns to deny, keeps
+// retransmitting. Its first retransmit after its step is bound must be
+// reported with EVENT_FLAG_STEP_TIER set, and, for a flow whose step was
+// bound from the start, its first retransmit after a job deny takes over
+// the destination must be reported with the flag clear: neither swallowed
+// by the earlier event's interval. The flows run over the namespace's
+// loopback, with cw_tc_egress on it.
 func TestStepTierChangeReEmitsMidstream(t *testing.T) {
 	requireBPF(t)
 	tcObjs := loadBPFObjectsStepRules(t, true)
@@ -323,6 +336,36 @@ func TestStepTierChangeReEmitsMidstream(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { tcLink.Close() })
 
+	// Not asked, then asked: a step bound mid-flow.
+	conn, port := dialTagged(t, tcObjs, ordinalUnbound)
+	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(0))) // denied, and dropped
+	_, err = conn.Write([]byte("x"))
+	require.NoError(t, err)
+	first := readMidstreamEventTo(t, tcEvents, port)
+	require.Zero(t, first.Flags&0x2, "before the binding no step policy is asked")
+	require.NoError(t, tcObjs.MapStepPolicy.Put(ordinalUnbound, stepPolicyA))
+	second := readMidstreamEventTo(t, tcEvents, port)
+	require.NotZero(t, second.Flags&0x2, "the first retransmit after the binding says the step was asked")
+
+	// Asked, then not: a job deny installed for the destination.
+	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(1)))
+	require.NoError(t, tcObjs.MapStepPolicy.Put(ordinalA, stepPolicyA))
+	conn, port = dialTagged(t, tcObjs, ordinalA)
+	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(0)))
+	_, err = conn.Write([]byte("x"))
+	require.NoError(t, err)
+	first = readMidstreamEventTo(t, tcEvents, port)
+	require.NotZero(t, first.Flags&0x2, "a bound step's rules are asked")
+	require.NoError(t, tcObjs.MapCidrs.Put(RuleKey(PolicyJob, 32, ipToU32("127.0.0.1")), TcBpfLpmVal{Action: 0}))
+	second = readMidstreamEventTo(t, tcEvents, port)
+	require.Zero(t, second.Flags&0x2, "once the job's deny decides, the next retransmit says the step was not asked")
+}
+
+// dialTagged connects to a fresh loopback listener while the default allows
+// it, and tags the client socket's cookie with ordinal. It returns the
+// connection and the listener's port.
+func dialTagged(t *testing.T, objs *TcBpfObjects, ordinal uint32) (net.Conn, uint16) {
+	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { ln.Close() })
@@ -339,8 +382,7 @@ func TestStepTierChangeReEmitsMidstream(t *testing.T) {
 		default:
 		}
 	})
-	port := uint16(ln.Addr().(*net.TCPAddr).Port)
-	conn, err := net.Dial("tcp4", ln.Addr().String()) // allowed by default
+	conn, err := net.Dial("tcp4", ln.Addr().String())
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
 	raw, err := conn.(*net.TCPConn).SyscallConn()
@@ -351,18 +393,8 @@ func TestStepTierChangeReEmitsMidstream(t *testing.T) {
 		cookie, cerr = unix.GetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_COOKIE)
 	}))
 	require.NoError(t, cerr)
-	require.NoError(t, tcObjs.MapSockStep.Put(cookie, ordinalUnbound))
-
-	// Denied from here on, and dropped, so the data retransmits.
-	require.NoError(t, tcObjs.MapDefaultAction.Put(uint32(0), uint8(0)))
-	_, err = conn.Write([]byte("x"))
-	require.NoError(t, err)
-	first := readMidstreamEventTo(t, tcEvents, port)
-	require.Zero(t, first.Flags&0x2, "before the binding no step policy is asked")
-
-	require.NoError(t, tcObjs.MapStepPolicy.Put(ordinalUnbound, stepPolicyA))
-	second := readMidstreamEventTo(t, tcEvents, port)
-	require.NotZero(t, second.Flags&0x2, "the first retransmit after the binding says the step was asked")
+	require.NoError(t, objs.MapSockStep.Put(cookie, ordinal))
+	return conn, uint16(ln.Addr().(*net.TCPAddr).Port)
 }
 
 // readMidstreamEventTo reads cw_tc_egress events until a mid-stream drop

@@ -221,12 +221,26 @@ ringbuf and an exhausted punt budget therefore all deny.
 The one deliberate exception is the identity gate's **no-state arm**:
 continuation bytes on a flow with no map entry (a pre-existing connection at
 attach, an LRU-evicted verdict) pass rather than kill a live allowed session.
-For TLS that is post-handshake records; for QUIC, datagrams carrying no Initial
-identity. It is a documented residual, identical in class for both protocols: traffic
-shaped like a continuation reaches this arm without an adjudicated first
-flight. At a real shared edge such packets belong to no connection and die at
-the terminator — the identity-bearing first flight is what routes, and that is
-always adjudicated.
+For QUIC, that is datagrams carrying no Initial identity. For TLS, it is a
+connection whose socket has already had data acknowledged (`bytes_acked` past
+the SYN's byte, read with `bpf_tcp_sock`): its bytes continue a connection
+rather than open it. Its segments can start anywhere in a record, and a
+retransmit starts where the original did, so a per-segment first-byte test
+would kill it at its first segment that starts mid-record. Its segments ride
+the L4 verdict instead, never adjudicated. No entry is written for it: the
+socket's counter answers for each segment, and a socket that disconnects and
+connects again starts that counter from zero. A TLS socket that has had no
+data acknowledged is judged by its first byte as before: a ClientHello is
+adjudicated, a record header rides, and anything else is refused. HTTP keeps
+the first-byte gate whatever the socket has sent, because a new request line
+on a kept-alive connection still carries a Host to adjudicate.
+
+It is a documented residual, identical in class for both protocols: traffic
+on a connection L7 never saw open reaches this arm without an adjudicated
+first flight. At a real shared edge such packets belong to no connection and
+die at the terminator — the identity-bearing first flight is what routes, and
+that is always adjudicated. Riding gives up nothing a first-byte test held,
+since that test never bound a sender in control of its own writes.
 
 ## Scope maps are rebuilt, not patched
 
@@ -275,12 +289,15 @@ stays legible:
   carrying a snippet of the refused bytes and the cookie→pid/step attribution,
   so an operator debugging a hung `ssh.github.com:443` or a QUIC-version drop
   sees more than an L4 ALLOW.
-- A **no-state** refusal (no SYN: a segment starting mid-record after LRU
-  eviction, or a pre-existing connection at attach) is overwhelmingly
-  evicted-flow ciphertext whose arbitrary first byte misses the four TLS record
-  types. It counts a separate `L7_STAT_GATE_NO_STATE` and is deliberately not
-  recorded — high-volume noise that would make `GATE_REFUSED` unreadable as the
-  number the enforce decision rests on.
+- A **no-state** refusal (no SYN, and a socket that has had no data
+  acknowledged: a connection opened just before attach, or a first flight
+  whose entry was evicted) counts a separate `L7_STAT_GATE_NO_STATE`, so it
+  cannot make `GATE_REFUSED` unreadable as the number the enforce decision
+  rests on. It emits a refusal record with the `NO_STATE` flag, reported with
+  reason `no_state`, at most once per flow every 10s: its retransmits are
+  refused every RTO, and one record is what makes the stall visible.
+- A segment of a TLS connection met mid-stream that rides counts
+  `L7_STAT_CONTINUATION` (`no_state_continuation` at teardown).
 
 A per-rule `l4-only` opt-out is future work, to add only if the measured
 incidence warrants it. It does not exist yet; do not document it as available.

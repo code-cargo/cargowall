@@ -69,12 +69,15 @@
 #define L7_STAT_PENDING_NO_ID 7  // no-identity packet on a flow mid-adjudication
                                  // (0-RTT racing its Initial): expected, counted
                                  // apart so it cannot inflate GATE_REFUSED
-#define L7_STAT_GATE_NO_STATE 8  // no-state bytes that are not the protocol —
-                                 // mostly evicted flows' mid-record ciphertext,
+#define L7_STAT_GATE_NO_STATE 8  // no-state bytes that are not the protocol, on
+                                 // a socket that has had no data acknowledged:
                                  // counted apart for the same reason
 #define L7_STAT_ALT_UNGATED   9  // a packet on an ALTERNATE HTTPS/HTTP port
                                  // carrying no TLS/HTTP identity: passed, not
                                  // refused (see l7_alt_https_port)
+#define L7_STAT_CONTINUATION  10 // a no-state TLS segment from a socket that
+                                 // has had data acknowledged: rode the L4
+                                 // verdict (see l7_tcp_continuation)
 #define L7_STATS_MAX          16
 
 // Bytes of payload a punt carries. A GSO/TSO super-skb delivers a whole first
@@ -89,6 +92,10 @@
 // the refusal (a TLS record byte, a QUIC version), and no more: refusals have
 // no per-flow budget, so the copy must stay cheap under a garbage flood.
 #define L7_REFUSAL_SNIPPET 64
+
+// A no-state refusal records once per flow per interval: its retransmits
+// repeat it every RTO, and one record is what makes the stall visible.
+#define L7_NO_STATE_RECORD_INTERVAL_NS (10ULL * 1000000000ULL)
 
 // Per-flow key, shaped like origin_seen_key. Binding the verdict to the socket
 // cookie AND the destination stops a raw socket laundering an allow from one
@@ -175,6 +182,15 @@ struct {
     __type(value, struct l7_flow_val);
     __uint(max_entries, 16384);
 } map_l7_flow SEC(".maps");
+
+// When each no-state flow last emitted a refusal record. An LRU: eviction
+// only costs an extra record.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, struct l7_flow_key);
+    __type(value, __u64);
+    __uint(max_entries, 4096);
+} map_l7_no_state_seen SEC(".maps");
 
 struct {
     // ~120 in-flight 16KB samples. Fewer would make a handshake burst hit
@@ -426,22 +442,16 @@ static __always_inline void l7_fill_event(struct l7_event *e, struct l7_ctx *c,
     __builtin_memset(e->pad2, 0, sizeof(e->pad2));
 }
 
-// l7_refuse is the identity gate's fail-closed answer plus its audit record: a
-// counter and a report-only sample carrying a snippet, so userspace can
-// classify the refusal and attribute it to a pid/step. It opens no
-// adjudication and writes no flow state. A lost record (full ring) is
+// l7_refusal_record emits a refusal's report-only sample, carrying a snippet
+// so userspace can classify the refusal and attribute it to a pid/step.
+// Returns 1 when the sample reached the ring. A lost record (full ring) is
 // tolerated — the counter still carries the aggregate.
-static __always_inline int l7_refuse(struct __sk_buff *skb, struct l7_ctx *c,
-                                     __u8 scope, __u8 l7mode, __u32 slot) {
-    l7_stat(slot);
-    int pass = l7_pass(l7mode);
+static __always_inline int l7_refusal_record(struct __sk_buff *skb, struct l7_ctx *c,
+                                             __u8 scope, __u8 flags) {
     struct l7_event *e = bpf_ringbuf_reserve(&map_l7_events, sizeof(*e), 0);
     if (!e)
-        return pass;
-    __u8 flags = L7_PUNT_F_REFUSED;
-    if (pass)
-        flags |= L7_PUNT_F_OBSERVE;
-    l7_fill_event(e, c, scope, flags);
+        return 0;
+    l7_fill_event(e, c, scope, L7_PUNT_F_REFUSED | flags);
     __u32 n = c->payload_len;
     if (n > L7_REFUSAL_SNIPPET)
         n = L7_REFUSAL_SNIPPET;
@@ -455,9 +465,39 @@ static __always_inline int l7_refuse(struct __sk_buff *skb, struct l7_ctx *c,
         bpf_skb_load_bytes(skb, c->payload_off, e->payload,
                            ((n - 1) & (L7_REFUSAL_SNIPPET - 1)) + 1) < 0) {
         bpf_ringbuf_discard(e, 0);
-        return pass;
+        return 0;
     }
     bpf_ringbuf_submit(e, 0);
+    return 1;
+}
+
+// l7_refuse is the identity gate's fail-closed answer plus its audit record.
+// It opens no adjudication and writes no flow state.
+static __always_inline int l7_refuse(struct __sk_buff *skb, struct l7_ctx *c,
+                                     __u8 scope, __u8 l7mode, __u32 slot) {
+    l7_stat(slot);
+    int pass = l7_pass(l7mode);
+    l7_refusal_record(skb, c, scope, pass ? L7_PUNT_F_OBSERVE : 0);
+    return pass;
+}
+
+// l7_refuse_no_state is l7_refuse for a flow with no entry, whose retransmits
+// arrive refused every RTO: it records at most once per flow per interval,
+// stamping only a record that reached the ring.
+static __always_inline int l7_refuse_no_state(struct __sk_buff *skb, struct l7_ctx *c,
+                                              struct l7_flow_key *key, __u8 scope,
+                                              __u8 l7mode) {
+    l7_stat(L7_STAT_GATE_NO_STATE);
+    int pass = l7_pass(l7mode);
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *last = bpf_map_lookup_elem(&map_l7_no_state_seen, key);
+    if (last && now - *last < L7_NO_STATE_RECORD_INTERVAL_NS)
+        return pass;
+    __u8 flags = L7_PUNT_F_NO_STATE;
+    if (pass)
+        flags |= L7_PUNT_F_OBSERVE;
+    if (l7_refusal_record(skb, c, scope, flags))
+        bpf_map_update_elem(&map_l7_no_state_seen, key, &now, BPF_ANY);
     return pass;
 }
 
@@ -558,9 +598,10 @@ static __always_inline __u8 l7_narrow_scope(struct l7_ctx *c, __u8 scope) {
 //     refuse, with a per-flow record.
 //   ride — bytes that are established-session traffic by shape (a non-hello TLS
 //     record, an HTTP body) ride the L4 verdict. Without it the bytes are not
-//     the protocol at all and take the counter-only no-state arm.
+//     the protocol at all and take the no-state arm, rate-limited per flow.
 static __always_inline int l7_no_identity(struct __sk_buff *skb, struct l7_ctx *c,
-                                          __u8 scope, __u8 l7mode, __u8 fresh, int ride) {
+                                          struct l7_flow_key *key, __u8 scope,
+                                          __u8 l7mode, __u8 fresh, int ride) {
     if (c->alt_port) {
         l7_stat(L7_STAT_ALT_UNGATED);
         return 1;
@@ -569,7 +610,23 @@ static __always_inline int l7_no_identity(struct __sk_buff *skb, struct l7_ctx *
         return l7_refuse(skb, c, scope, l7mode, L7_STAT_GATE_REFUSED);
     if (ride)
         return 1;
-    return l7_gate_refused(l7mode, L7_STAT_GATE_NO_STATE);
+    return l7_refuse_no_state(skb, c, key, scope, l7mode);
+}
+
+// l7_tcp_continuation reports whether this packet's socket has already had
+// data acknowledged, so these bytes continue a connection rather than open
+// it. bytes_acked counts the SYN's one byte: a connection that has had no
+// data acknowledged reads 1. A socket that doesn't resolve to a full TCP
+// socket reads as no continuation.
+static __always_inline int l7_tcp_continuation(struct __sk_buff *skb) {
+    struct bpf_sock *sk = skb->sk;
+    if (!sk)
+        return 0;
+    sk = bpf_sk_fullsock(sk);
+    if (!sk)
+        return 0;
+    struct bpf_tcp_sock *tp = bpf_tcp_sock(sk);
+    return tp && tp->bytes_acked > 1;
 }
 
 // l7_identity_gate decides what a packet's leading bytes mean for a flow in
@@ -578,8 +635,8 @@ static __always_inline int l7_no_identity(struct __sk_buff *skb, struct l7_ctx *
 // destination identity, and what a non-identity byte means depends on the
 // protocol and the flow's state.
 static __always_inline int l7_identity_gate(struct __sk_buff *skb, struct l7_ctx *c,
-                                            struct l7_flow_val *st, __u8 scope,
-                                            __u8 l7mode, int *ret) {
+                                            struct l7_flow_val *st, struct l7_flow_key *key,
+                                            __u8 scope, __u8 l7mode, int *ret) {
     if (c->ip_proto == IPPROTO_UDP) {
         // Uncertain datagrams were refused before the state machine, so only a
         // walk that found a known-version Initial reaches a punt: every QUIC
@@ -603,48 +660,59 @@ static __always_inline int l7_identity_gate(struct __sk_buff *skb, struct l7_ctx
     if (st && st->state == L7_STATE_PENDING)
         return 1;
 
+    // No entry, and the socket has had data acknowledged: a TLS connection L7
+    // never saw open (one that predates attach, or whose entry was evicted),
+    // met mid-stream. Its segments can start anywhere in a record, and a
+    // retransmit starts where the original did, so judging each by its first
+    // byte would kill the connection at its first segment that starts
+    // mid-record. It rides. No entry is written: the socket's own counter
+    // answers for every later segment, and a reconnect of the socket starts
+    // from zero. HTTP keeps the gate below: a request line on it is still
+    // adjudicated.
+    if (!st && (scope & L7_SCOPE_TLS) && l7_tcp_continuation(skb)) {
+        l7_stat(L7_STAT_CONTINUATION);
+        *ret = 1;
+        return 0;
+    }
+
     // `fresh` (this flow's SYN was seen) splits two things. The COUNTER:
-    // no-state non-protocol bytes are mostly evicted flows' mid-record
-    // ciphertext, so folding them into GATE_REFUSED would make the number the
-    // enforce rollout is decided on unreadable. The RECORD: a fresh refusal is
-    // a low-volume, actionable first flight and gets one; a no-state refusal
-    // is high-volume noise and stays counter-only.
+    // no-state non-protocol bytes come from a socket that has had no data
+    // acknowledged (a connection opened just before attach, or a first
+    // flight whose entry was evicted), so folding them into GATE_REFUSED
+    // would make the number the enforce rollout is decided on unreadable. The
+    // RECORD: a fresh refusal gets one each; a no-state refusal repeats every
+    // RTO, so it gets one per flow per interval.
     __u8 fresh = st && st->state == L7_STATE_NEED_HELLO;
+    int ride = 0;
     __u8 b0;
-    if (!l7_load_u8(skb, c->payload_off, c->payload_off + c->payload_len, &b0)) {
-        *ret = l7_no_identity(skb, c, scope, l7mode, fresh, /*ride=*/0);
-        return 0;
-    }
-
-    if (scope & L7_SCOPE_TLS) {
-        if (b0 == TLS_REC_HANDSHAKE) {
-            // Only a ClientHello (msg type 1, at byte 5) opens adjudication;
-            // any other handshake record is established-session traffic.
-            __u8 msg = TLS_HS_CLIENT_HELLO;  // <6 bytes: a hello prefix, punt it
-            if (c->payload_len >= 6)
-                l7_load_u8(skb, c->payload_off + 5,
-                           c->payload_off + c->payload_len, &msg);
-            if (msg == TLS_HS_CLIENT_HELLO)
+    if (l7_load_u8(skb, c->payload_off, c->payload_off + c->payload_len, &b0)) {
+        if (scope & L7_SCOPE_TLS) {
+            if (b0 == TLS_REC_HANDSHAKE) {
+                // Only a ClientHello (msg type 1, at byte 5) opens
+                // adjudication; any other handshake record is
+                // established-session traffic.
+                __u8 msg = TLS_HS_CLIENT_HELLO;  // <6 bytes: a hello prefix, punt it
+                if (c->payload_len >= 6)
+                    l7_load_u8(skb, c->payload_off + 5,
+                               c->payload_off + c->payload_len, &msg);
+                if (msg == TLS_HS_CLIENT_HELLO)
+                    return 1;
+                ride = 1;
+            } else if (b0 == 0x14 || b0 == 0x15 || b0 == 0x17) {
+                // change_cipher_spec / alert / application_data.
+                ride = 1;
+            }
+            // Anything else is not TLS at all (e.g. SSH-on-443): fail closed
+            // in every state.
+        } else {
+            // HTTP: body bytes on an established flow ride; a first flight
+            // that is not a request line fails closed.
+            if (l7_http_request_line(skb, c->payload_off, c->payload_off + c->payload_len))
                 return 1;
-            // A non-hello handshake record: established-session traffic.
-            *ret = l7_no_identity(skb, c, scope, l7mode, fresh, /*ride=*/1);
-            return 0;
+            ride = 1;
         }
-        if (b0 == 0x14 || b0 == 0x15 || b0 == 0x17) {
-            // change_cipher_spec / alert / application_data.
-            *ret = l7_no_identity(skb, c, scope, l7mode, fresh, /*ride=*/1);
-            return 0;
-        }
-        // Not TLS at all (e.g. SSH-on-443): fail closed in every state.
-        *ret = l7_no_identity(skb, c, scope, l7mode, fresh, /*ride=*/0);
-        return 0;
     }
-
-    // HTTP: body bytes on an established flow ride; a first flight that is not
-    // a request line fails closed.
-    if (l7_http_request_line(skb, c->payload_off, c->payload_off + c->payload_len))
-        return 1;
-    *ret = l7_no_identity(skb, c, scope, l7mode, fresh, /*ride=*/1);
+    *ret = l7_no_identity(skb, c, key, scope, l7mode, fresh, ride);
     return 0;
 }
 
@@ -761,7 +829,7 @@ __noinline int l7_adjudicate(struct __sk_buff *skb, __u8 l7mode, __u32 slot) {
         return 1;  // pure ACK / empty datagram
 
     int gated;
-    if (!l7_identity_gate(skb, c, st, scope, l7mode, &gated))
+    if (!l7_identity_gate(skb, c, st, key, scope, l7mode, &gated))
         return gated;
 
     // Punt. There is no in-kernel admit — userspace is the only name matcher —

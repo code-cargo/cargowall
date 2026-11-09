@@ -1581,8 +1581,8 @@ func prePopulateDNSCache(ctx context.Context, configMgr *config.Manager, dnsServ
 // when it carries the late-allow registrar, hostname-allowed IPs opened here
 // are also L7-scoped, so a new TLS flow to a pre-existing connection's edge
 // IP still has its SNI pinned instead of bypassing L7 entirely. (The
-// pre-existing flows themselves are untouched: their mid-stream segments
-// carry no handshake and pass the identity gate.)
+// pre-existing flows themselves are never adjudicated: L7 meets them
+// mid-stream with no flow entry and lets them ride, see design-l7.md.)
 func gateExistingConnections(conns existingConns, configMgr *config.Manager, fw events.FirewallUpdater, l7 events.L7LateRegistrar, auditLogger *events.AuditLogger, logger *slog.Logger) {
 	for ipStr, observedPorts := range conns {
 		ip := net.ParseIP(ipStr)

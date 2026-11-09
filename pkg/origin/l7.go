@@ -79,6 +79,7 @@ const (
 	l7StatPendingNoID uint32 = 7
 	l7StatGateNoState uint32 = 8
 	l7StatAltUngated  uint32 = 9
+	l7StatContinued   uint32 = 10
 )
 
 // L7Options configures the oracle. Everything the reader goroutines read is
@@ -400,6 +401,9 @@ func (l *L7) logStats() {
 		"allowed", sum(l7StatAllowed), "denied", sum(l7StatDenied),
 		"identity_gate_refused", gateRefused, "pending_no_identity", pendingNoID,
 		"no_state_refused", gateNoState,
+		// Segments of TLS connections met mid-stream with no flow entry
+		// (opened before attach, or evicted) that rode the L4 verdict.
+		"no_state_continuation", sum(l7StatContinued),
 		// Packets on an alternate HTTPS/HTTP port that carried no TLS/HTTP
 		// identity and were PASSED rather than refused. Reported so the
 		// widened scope's residual is visible next to the refusals.

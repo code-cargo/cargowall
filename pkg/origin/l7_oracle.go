@@ -66,6 +66,10 @@ const (
 	L7QUICVersion L7Reason = "quic_version"  // unknown QUIC version
 	L7ParseError  L7Reason = "parse_error"   // malformed handshake
 	L7Reassembly  L7Reason = "reassembly"    // overlap conflict / overflow
+	// L7NoState: bytes that are not TLS/HTTP on a connection L7 has no entry
+	// for and whose socket has had no data acknowledged, such as one opened
+	// just before attach.
+	L7NoState L7Reason = "no_state"
 	// L7NameNotAtIP: the name IS allowed by policy on this port, but this
 	// daemon never saw it resolve to THIS destination. Distinct from
 	// L7Mismatch because observe-mode telemetry has to separate "name not
@@ -470,10 +474,15 @@ func (l *L7) reportRefusal(ev *bpf.L7Event) {
 	})
 }
 
-// refusalReason classifies a refusal from its snippet. A QUIC long header in a
-// version outside the decryptor's table gets its own reason because its remedy
-// is extending that table, not fixing a workload.
+// refusalReason classifies a refusal from its flags and snippet. A QUIC long
+// header in a version outside the decryptor's table gets its own reason
+// because its remedy is extending that table, not fixing a workload; so does a
+// refusal on a flow with no entry, which points at a connection opened before
+// attach rather than at its bytes.
 func refusalReason(ev *bpf.L7Event) L7Reason {
+	if ev.Flags&l7PuntNoState != 0 {
+		return L7NoState
+	}
 	if ev.Scope == bpf.L7ScopeQUIC {
 		s := ev.Payload[:ev.PayloadLen]
 		if len(s) >= 5 && s[0]&0x80 != 0 {

@@ -703,3 +703,22 @@ func TestL7OutcomeReportsTheParsedProtocol(t *testing.T) {
 	require.Equal(t, sni.ProtoTLS, (*outcomes)[0].Protocol,
 		"the outcome must name the protocol the handshake was parsed with")
 }
+
+// TestL7RefusalReason: a refusal record on a flow with no entry is reported
+// as no_state whatever its bytes, so a stalled connection opened before
+// attach reads as that and not as a protocol violation; the others keep the
+// snippet's classification.
+func TestL7RefusalReason(t *testing.T) {
+	refused := func(ev *bpf.L7Event, flags uint8) *bpf.L7Event {
+		ev.Flags |= l7PuntRefused | flags
+		return ev
+	}
+	ssh := []byte("SSH-2.0-x\r\n")
+	unknownQUIC := []byte{0xc0, 0x0a, 0x0a, 0x0a, 0x0a, 0x00}
+
+	require.Equal(t, L7NotProtocol, refusalReason(refused(makeL7Event(443, 1, ssh, false), 0)))
+	require.Equal(t, L7NoState, refusalReason(refused(makeL7Event(443, 1, ssh, false), l7PuntNoState)))
+	require.Equal(t, L7NoState, refusalReason(refused(makeL7Event(443, 1, ssh, false), l7PuntNoState|l7PuntObserve)),
+		"the posture bit must not change the reason")
+	require.Equal(t, L7QUICVersion, refusalReason(refused(makeL7Event(443, 0, unknownQUIC, true), 0)))
+}

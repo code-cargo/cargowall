@@ -69,6 +69,7 @@ func TestL7KernelConstantsMatchSniSource(t *testing.T) {
 		"L7_STAT_PENDING_NO_ID": uint64(l7StatPendingNoID),
 		"L7_STAT_GATE_NO_STATE": uint64(l7StatGateNoState),
 		"L7_STAT_ALT_UNGATED":   uint64(l7StatAltUngated),
+		"L7_STAT_CONTINUATION":  uint64(l7StatContinued),
 	}
 	for name, want := range defines {
 		re := regexp.MustCompile(`(?m)^#define ` + name + `\s+(0x[0-9A-Fa-f]+|\d+)\b`)

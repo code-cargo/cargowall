@@ -377,10 +377,12 @@ int BPF_PROG(cw_step_exit, struct task_struct *task)
     return 0;
 }
 
-// Primary socket-tagging path: fires at socket() for every family/protocol
-// in process context, so the cookie carries the creator's step for the
-// socket's whole life. The connect/sendmsg hooks in tcbpf.c re-tag as a
-// fallback for sockets created before attach.
+// Socket tagging at birth: cgroup/sock_create runs from inet_create and
+// inet6_create, for each user socket of the inet families, in the creating
+// thread's context, so the cookie carries that thread's step. The connect
+// and sendmsg hooks in tcbpf.c re-tag it later, which also tags a socket
+// made before attach once it is connected or sent on to an address: see
+// step_tag_socket there for the rule.
 SEC("cgroup/sock_create")
 int cw_cg_sock_new(struct bpf_sock *ctx)
 {

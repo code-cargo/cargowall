@@ -112,7 +112,8 @@ type OriginBpfOriginSeenVal struct {
 	_        structs.HostLayout
 	LastEmit uint64
 	Verdict  uint8
-	Pad      [7]uint8
+	StepTier uint8
+	Pad      [6]uint8
 }
 
 type OriginBpfPortVal struct {
@@ -176,11 +177,14 @@ const (
 	OriginBpfMapMapPorts             = "map_ports"
 	OriginBpfMapMapPortsV6           = "map_ports_v6"
 	OriginBpfMapMapScopeCgroups      = "map_scope_cgroups"
+	OriginBpfMapMapSockStep          = "map_sock_step"
+	OriginBpfMapMapStepPolicy        = "map_step_policy"
 	OriginBpfProgCwCgEgress          = "cw_cg_egress"
 	OriginBpfVarBtfAnchorL7Event     = "btf_anchor_l7_event"
 	OriginBpfVarBtfAnchorOriginEvent = "btf_anchor_origin_event"
 	OriginBpfVarScopeSubtreeCgroup   = "scope_subtree_cgroup"
 	OriginBpfVarScopeSubtreeLevel    = "scope_subtree_level"
+	OriginBpfVarStepRulesEnabled     = "step_rules_enabled"
 )
 
 // LoadOriginBpf returns the embedded CollectionSpec for OriginBpf.
@@ -251,6 +255,8 @@ type OriginBpfMapSpecs struct {
 	MapPorts         *ebpf.MapSpec `ebpf:"map_ports"`
 	MapPortsV6       *ebpf.MapSpec `ebpf:"map_ports_v6"`
 	MapScopeCgroups  *ebpf.MapSpec `ebpf:"map_scope_cgroups"`
+	MapSockStep      *ebpf.MapSpec `ebpf:"map_sock_step"`
+	MapStepPolicy    *ebpf.MapSpec `ebpf:"map_step_policy"`
 }
 
 // OriginBpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -261,6 +267,7 @@ type OriginBpfVariableSpecs struct {
 	BtfAnchorOriginEvent *ebpf.VariableSpec `ebpf:"btf_anchor_origin_event"`
 	ScopeSubtreeCgroup   *ebpf.VariableSpec `ebpf:"scope_subtree_cgroup"`
 	ScopeSubtreeLevel    *ebpf.VariableSpec `ebpf:"scope_subtree_level"`
+	StepRulesEnabled     *ebpf.VariableSpec `ebpf:"step_rules_enabled"`
 }
 
 // OriginBpfObjects contains all objects after they have been loaded into the kernel.
@@ -302,6 +309,8 @@ type OriginBpfMaps struct {
 	MapPorts         *ebpf.Map `ebpf:"map_ports"`
 	MapPortsV6       *ebpf.Map `ebpf:"map_ports_v6"`
 	MapScopeCgroups  *ebpf.Map `ebpf:"map_scope_cgroups"`
+	MapSockStep      *ebpf.Map `ebpf:"map_sock_step"`
+	MapStepPolicy    *ebpf.Map `ebpf:"map_step_policy"`
 }
 
 func (m *OriginBpfMaps) Close() error {
@@ -325,6 +334,8 @@ func (m *OriginBpfMaps) Close() error {
 		m.MapPorts,
 		m.MapPortsV6,
 		m.MapScopeCgroups,
+		m.MapSockStep,
+		m.MapStepPolicy,
 	)
 }
 
@@ -336,6 +347,7 @@ type OriginBpfVariables struct {
 	BtfAnchorOriginEvent *ebpf.Variable `ebpf:"btf_anchor_origin_event"`
 	ScopeSubtreeCgroup   *ebpf.Variable `ebpf:"scope_subtree_cgroup"`
 	ScopeSubtreeLevel    *ebpf.Variable `ebpf:"scope_subtree_level"`
+	StepRulesEnabled     *ebpf.Variable `ebpf:"step_rules_enabled"`
 }
 
 // OriginBpfPrograms contains all programs after they have been loaded into the kernel.

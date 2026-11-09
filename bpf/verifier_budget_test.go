@@ -104,14 +104,18 @@ func TestVerifierBudget(t *testing.T) {
 		}},
 		{"originbpf", LoadOriginBpf, nil},
 		// The scope is a load-time constant, so a privileged pod runs a
-		// different program from a runner VM's. Measure both, the scoped one
-		// with the job's subtree set: at zero the verifier prunes the scope
-		// check as dead.
-		{"originbpf_scoped", LoadOriginBpf, func(spec *ebpf.CollectionSpec) error {
-			if err := spec.Variables[OriginBpfVarScopeSubtreeCgroup].Set(uint64(1)); err != nil {
+		// different program from a runner VM's. Measure both.
+		{"originbpf_scoped", LoadOriginBpf, scopeOrigin},
+		// The step-rules gate is a load-time constant too: a job whose
+		// steps have rules of their own runs the verdict with the step
+		// tier in it, which at zero the verifier prunes.
+		{"tcbpf_steprules", LoadTcBpf, stepRulesOn},
+		{"originbpf_steprules", LoadOriginBpf, stepRulesOn},
+		{"originbpf_scoped_steprules", LoadOriginBpf, func(spec *ebpf.CollectionSpec) error {
+			if err := scopeOrigin(spec); err != nil {
 				return err
 			}
-			return spec.Variables[OriginBpfVarScopeSubtreeLevel].Set(uint32(3))
+			return stepRulesOn(spec)
 		}},
 	}
 
@@ -170,6 +174,19 @@ func TestVerifierBudget(t *testing.T) {
 		}
 	}
 }
+
+// scopeOrigin sets the origin collection's scope as a privileged pod's is,
+// with the job's subtree set: at zero the verifier prunes the scope check.
+func scopeOrigin(spec *ebpf.CollectionSpec) error {
+	if err := spec.Variables[OriginBpfVarScopeSubtreeCgroup].Set(uint64(1)); err != nil {
+		return err
+	}
+	return spec.Variables[OriginBpfVarScopeSubtreeLevel].Set(uint32(3))
+}
+
+// stepRulesOn turns on the step-rules gate of a collection including
+// verdict.h.
+func stepRulesOn(spec *ebpf.CollectionSpec) error { return SetStepRules(spec, true) }
 
 func itoa(n int) string { return strconv.Itoa(n) }
 

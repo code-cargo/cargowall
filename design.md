@@ -832,7 +832,21 @@ to select policy with.
     dockerd reports the container started, or an exec run in it, with the
     step running at that moment (see Container Attribution), so a service
     container started in step 2 is governed by step 2's policy for its
-    lifetime unless an exec re-tags it.
+    lifetime unless an exec re-tags it. The tag is by time, not by cause:
+    whatever drives dockerd while step 2 runs starts containers with step
+    2's tag. Two things keep the time honest. A step starts at its root's
+    fork as the kernel timed it (`bpf_ktime_get_ns` on the fork event),
+    not when the reader got to the event. And a root identified as no step
+    (a runner helper, or a copy of Runner.Worker that exits without
+    exec'ing) does not end the step it forks in; one not identified yet,
+    or never, does, and is bound no rules. The runner's own docker CLI
+    calls carry no step environment: "Initialize containers" starts job
+    and service containers before any step, so they are untagged and get
+    the job's rules, and a container action's image pull or build is
+    passed over. The `docker run` of a container action, and the
+    `docker exec` a container job runs each step as, carry the step's
+    environment, so the action's container, and each step's exec, get
+    that step's tag.
   - *What per-step rules do not separate.* They bound what each step's own
     processes reach. Steps of one job share a uid, the workspace and
     dockerd, so a step can shape what a later one runs, or share a socket
@@ -843,13 +857,41 @@ to select policy with.
     each other, the boundary is the job.
   - *Where the two hooks differ.* Both read the same tag for the same
     socket, with two exceptions. TC sees a bridge-networked container's
-    packets post-NAT with no socket, and judges them by the job's rules:
-    a destination only the container's step allows passes the cgroup hook
-    and is still dropped at TC, until the bridge stamp carries the step's
-    policy past NAT. And a SYN-ACK is sent from a request socket, which TC
-    reads as untagged (the job's rules) while the cgroup hook reads the
-    listener's tag; the stricter wins, fail-closed. Accepted sockets carry
-    no tag, so both hooks judge them by the job's rules.
+    packets post-NAT with no socket, and reads the step's policy from the
+    bridge stamp instead (below). And a SYN-ACK is sent from a request
+    socket, which TC reads as untagged (the job's rules) while the cgroup
+    hook reads the listener's tag; the stricter wins, fail-closed.
+    Accepted sockets carry no tag, so both hooks judge them by the job's
+    rules.
+  - *The bridge stamp.* `cw_tc_br_stamp`, on each Docker bridge's TC
+    ingress, still sees the container's socket: the kernel orphans a
+    packet only in `ip_rcv_core`, after TC ingress (since 4.19; the veth,
+    bridge and TC ingress paths at v5.15 and v6.6 orphan nothing). For a
+    socket whose step has a policy it writes `0xCA1B0000 | policy` into
+    the packet's mark, which rides forwarding and NAT to the uplink, where
+    `cw_tc_egress` reads it for a packet with no socket, and only then. A
+    container on a bridge network cannot forge one: the mark is cleared as
+    a packet leaves the container's namespace, and the bridge program
+    clears a stamp it did not write. It stamps no packet that already
+    carries another mark, nor a policy past `0xFFFF`. Two premises: the
+    `0xCA1B` range is cargowall's (a host whose own rules mark forwarded
+    packets in it would read as stamped), and every container path to the
+    uplink either clears the mark at a namespace boundary or carries the
+    container's socket. A macvlan or ipvlan network does neither for
+    packets a container forwards, so a container with `NET_ADMIN` there is
+    trusted with the stamp; dockerd grants that to any caller, and a step
+    that can drive dockerd is beyond step rules anyway (see Sudo
+    lockdown). `cmd/bridge_stamp.go` attaches the program to each bridge
+    the container tracker reports, attaches afresh one recreated behind
+    the same name, and detaches one whose network is destroyed; it runs
+    only with step rules on.
+  - *Host-only step rules.* Where the stamp cannot apply, a container's
+    traffic gets the job's rules at TC, never wider: a bridge the program
+    could not be attached to (warned), a bridge's packets before the
+    attach lands (a bridge created and used at once, or one in use before
+    the tracker's first session lists it), a daemon whose bridges are in
+    another network namespace, and a run with no container tracking. Step
+    rules then reach the host's processes alone.
   - The denial UX above applies: UDP fails fast with `EPERM`, TCP times
     out.
 
@@ -906,5 +948,6 @@ documented residuals.
   - Best-effort with a Warn at both call sites: idle entries age out in 30–120s, but an actively-used flow (an open DNS-over-TCP stream) refreshes its entry indefinitely — exactly the flow the flush exists to kill, which is why a failed flush is warned loudly rather than ignored
   - Synthetic names (#126): systemd-resolved answers `_gateway`, `_outbound`, `_localdnsstub`, `_localdnsproxy`, the machine's own hostname (its configured name and, when it carries a domain, its first label — read per lookup, so a rename mid-run is honoured; `/etc/hosts` does not always pin it, and `sudo` warns on every invocation when it fails) and the RFC 6761 localhost family (`localhost`, `localhost.localdomain`, anything beneath either) from local state and never sends them upstream. With the stub DNAT'd and the proxy's upstream deliberately the resolver *behind* resolved, they would NXDOMAIN for the whole run — REFUSED under enforce, silently under audit, where no connection is ever attempted and nothing is logged (`/etc/hosts` covers only the exact name `localhost`). The proxy relays them to the stub on its marked client socket (`pkg/dns/synthetic.go`; the mark return rules pass it through the stub DNAT, as they do the startup cache peek) and writes resolved's own answer back — uncached. `_gateway`, `_outbound` and the machine names get L4 enforcement and attribution like any upstream answer (#129): a hostname rule naming `_gateway` opens the gateway's address on its ports, a deny rule closes it, and with no rule the connection is attributed to `_gateway` rather than a bare IP. They mint no L7 forward-resolution evidence — `enforceDNSResponse(…, localAnswer)` at the synthetic call site, and startup pre-population records its answers through `dns.Server.RecordSystemCacheAnswer`, the same policy: a tracked alias mapped without evidence, a loopback listener recorded nowhere at all — because an alias is never a name the peer presents, and binding it would L7-scope the address against a name no flow can show: an all-ports allow would then drop HTTP to the host agent for carrying `Host: <ip>`. SCOPE IFF BOUND makes the omission sufficient; nothing in the L7 matcher knows about synthetic names. `_localdnsstub`, `_localdnsproxy` and the localhost family are relayed only: loopback, which the proxy's own relay and cache peek depend on, and any label under `.localhost` is accepted, so tracking them would grow the per-host maps without bound. The mDNS `<hostname>.local` form is not relayed: resolved renames it on conflict, and a `.local` query it does not synthesize is multicast to the LAN, whose answer is not local state. Ahead of the filter gate; host listeners and IN class only (a container's native path never resolved them). A stub that does not answer — resolved stopped, or never installed — sends the query down the ordinary path; `/run/systemd/resolve` outlives a stopped resolved (`RuntimeDirectoryPreserve=yes`), so directory presence is no probe, and the connection-refused round trip on loopback is the cheapest true one. The search-expanded form a stub resolver tries first (`<name>.<search>`, for a suffix on the host's own `resolv.conf` search list) is answered NXDOMAIN locally for every one of these names — what the upstream says natively — rather than REFUSED, which c-ares treats as terminal on a multi-label attempt and which therefore left `_gateway` unresolvable for c-ares clients under enforce; it is never relayed to the stub, which would send it upstream unmarked and DNAT it back into the proxy. This is specific to names resolved synthesizes, whose expanded form never exists; for a real host the expanded form is the name that resolves (#127). Residual: a machine hostname that is also a real DNS name resolves to resolved's synthesized local address rather than the upstream record — inherent to making the machine hostname resolve at all, and what the host does natively, since resolved synthesizes its own name before any upstream lookup
 - **Sudo lockdown:** writes `/etc/sudoers.d/zz-cargowall-lockdown` with a NOPASSWD allowlist; removes the runner user from sudo-granting groups (`sudo`, `admin`, `wheel`) and the `docker` group; disables competing sudoers.d files by renaming them to `*.cargowall-disabled`
+  - Per-step rules rest on it: a step with root could re-tag its sockets or mark its packets, and could reach anything the run allows any step. They bound what each step's own processes reach, and do not isolate steps from each other: between steps that do not trust each other, the boundary is the job
 - **Auto-infrastructure:** `EnsureInfraAllowed()` and `EnsureHostnameAllowed()` add rules for platform services (Azure IMDS, GitHub API, etc.)
 - **Logging:** `slog.Handler` that formats messages as GitHub workflow commands (`::error::`, `::warning::`, `::debug::`)

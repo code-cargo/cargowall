@@ -51,3 +51,13 @@ func (o *TcBpfObjects) StepRules() bool {
 	}
 	return b != 0
 }
+
+// The bridge stamp, STEP_STAMP_* in verdict.h: a packet's mark carries a
+// step policy as StepStampMagic | policy, from a Docker bridge's ingress
+// to the uplink's TC egress. A policy past StepStampPolicyMax fits no
+// stamp, and its containers' traffic gets the job's rules.
+const (
+	StepStampMagic     uint32 = 0xCA1B0000
+	StepStampMask      uint32 = 0xFFFF0000
+	StepStampPolicyMax uint32 = 0xFFFF
+)

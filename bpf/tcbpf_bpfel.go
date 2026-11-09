@@ -105,6 +105,7 @@ const (
 	TcBpfProgCwCgConnect6         = "cw_cg_connect6"
 	TcBpfProgCwCgSendmsg4         = "cw_cg_sendmsg4"
 	TcBpfProgCwCgSendmsg6         = "cw_cg_sendmsg6"
+	TcBpfProgCwTcBrStamp          = "cw_tc_br_stamp"
 	TcBpfProgCwTcEgress           = "cw_tc_egress"
 	TcBpfProgCwTcIngress          = "cw_tc_ingress"
 	TcBpfVarBtfAnchorBlockedEvent = "btf_anchor_blocked_event"
@@ -157,6 +158,7 @@ type TcBpfProgramSpecs struct {
 	CwCgConnect6 *ebpf.ProgramSpec `ebpf:"cw_cg_connect6"`
 	CwCgSendmsg4 *ebpf.ProgramSpec `ebpf:"cw_cg_sendmsg4"`
 	CwCgSendmsg6 *ebpf.ProgramSpec `ebpf:"cw_cg_sendmsg6"`
+	CwTcBrStamp  *ebpf.ProgramSpec `ebpf:"cw_tc_br_stamp"`
 	CwTcEgress   *ebpf.ProgramSpec `ebpf:"cw_tc_egress"`
 	CwTcIngress  *ebpf.ProgramSpec `ebpf:"cw_tc_ingress"`
 }
@@ -263,6 +265,7 @@ type TcBpfPrograms struct {
 	CwCgConnect6 *ebpf.Program `ebpf:"cw_cg_connect6"`
 	CwCgSendmsg4 *ebpf.Program `ebpf:"cw_cg_sendmsg4"`
 	CwCgSendmsg6 *ebpf.Program `ebpf:"cw_cg_sendmsg6"`
+	CwTcBrStamp  *ebpf.Program `ebpf:"cw_tc_br_stamp"`
 	CwTcEgress   *ebpf.Program `ebpf:"cw_tc_egress"`
 	CwTcIngress  *ebpf.Program `ebpf:"cw_tc_ingress"`
 }
@@ -273,6 +276,7 @@ func (p *TcBpfPrograms) Close() error {
 		p.CwCgConnect6,
 		p.CwCgSendmsg4,
 		p.CwCgSendmsg6,
+		p.CwTcBrStamp,
 		p.CwTcEgress,
 		p.CwTcIngress,
 	)

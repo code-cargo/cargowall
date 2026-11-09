@@ -18,6 +18,8 @@ type StepBpfStepChildEvent struct {
 	Kind    uint32
 	Tgid    uint32
 	Ordinal uint32
+	Pad     uint32
+	Ktime   uint64
 }
 
 type StepBpfStepEventKind uint32

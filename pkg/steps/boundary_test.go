@@ -49,10 +49,26 @@ func exitEvent(tgid, ordinal uint32) []byte {
 	return childEvent(evExit, tgid, ordinal)
 }
 
+// forkEventAt is forkEvent with the kernel time of the fork.
+func forkEventAt(tgid, ordinal uint32, ktime uint64) []byte {
+	return childEventAt(evFork, tgid, ordinal, ktime)
+}
+
 func childEvent(kind, tgid, ordinal uint32) []byte {
+	return childEventAt(kind, tgid, ordinal, 0)
+}
+
+func childEventAt(kind, tgid, ordinal uint32, ktime uint64) []byte {
 	var buf bytes.Buffer
-	_ = binary.Write(&buf, binary.NativeEndian, bpf.StepBpfStepChildEvent{Kind: kind, Tgid: tgid, Ordinal: ordinal})
+	ev := bpf.StepBpfStepChildEvent{Kind: kind, Tgid: tgid, Ordinal: ordinal, Ktime: ktime}
+	_ = binary.Write(&buf, binary.NativeEndian, ev)
 	return buf.Bytes()
+}
+
+// wallClock is a reading with no monotonic part: every event read at it,
+// none carrying a kernel time, is dated at tm.
+func wallClock(tm time.Time) clock {
+	return clock{wall: tm}
 }
 
 // execEvent encodes a step event as cw_step_exec streams it: argv is the
@@ -103,12 +119,12 @@ func newBoundaryTracker(t *testing.T) (*Tracker, *boundarySink) {
 func TestHandleStepEvent_ReportsAtExecWithForkTime(t *testing.T) {
 	tr, sink := newBoundaryTracker(t)
 	forked := time.Unix(1000, 0)
-	tr.handleStepEvent(forkEvent(42, 7), forked)
+	tr.handleStepEvent(forkEvent(42, 7), wallClock(forked))
 	assert.Equal(t, uint32(7), tr.OrdinalAt(forked.Add(time.Millisecond)))
 	assert.Empty(t, sink.events, "a fork alone has not said what the step runs")
 
 	argv := "/usr/bin/bash\x00-e\x00/home/runner/work/_temp/abc.sh\x00"
-	tr.handleStepEvent(execEvent(evExec, 42, 7, argv, uint32(len(argv)), "bash"), forked.Add(30*time.Millisecond))
+	tr.handleStepEvent(execEvent(evExec, 42, 7, argv, uint32(len(argv)), "bash"), wallClock(forked.Add(30*time.Millisecond)))
 	require.Len(t, sink.events, 1)
 	ev := sink.events[0]
 	assert.Equal(t, events.EventStepBoundary, ev.EventType)
@@ -147,7 +163,7 @@ func TestHandleStepEvent_IdentifiesTheStep(t *testing.T) {
 	env := "HOME=/home/runner\x00GITHUB_ACTION=build\x00SECRET=hunter2\x00"
 	argv := "curl\x00--oauth2-bearer\x00s3cret\x00"
 	raw := execEventEnv(evExec, 42, 7, argv, uint32(len(argv)), "curl", env, uint32(len(env)))
-	tr.handleStepEvent(raw, time.Unix(1000, 0))
+	tr.handleStepEvent(raw, wallClock(time.Unix(1000, 0)))
 
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, "build", sink.events[0].StepID)
@@ -165,7 +181,7 @@ func TestHandleStepEvent_StaleBytesPastTheEnvironment(t *testing.T) {
 	tr, sink := newBoundaryTracker(t)
 	env := "HOME=/home/runner\x00"
 	stale := env + "GITHUB_ACTION=older-step\x00"
-	tr.handleStepEvent(execEventEnv(evExec, 42, 7, "node\x00", 5, "node", stale, uint32(len(env))), time.Unix(1000, 0))
+	tr.handleStepEvent(execEventEnv(evExec, 42, 7, "node\x00", 5, "node", stale, uint32(len(env))), wallClock(time.Unix(1000, 0)))
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, events.StepClassRunner, sink.events[0].StepClass)
 	assert.Empty(t, sink.events[0].StepID)
@@ -178,10 +194,10 @@ func TestHandleStepEvent_UnidentifiedSteps(t *testing.T) {
 	tr.onIdentified = ids.record
 
 	helper := "HOME=/home/runner\x00PATH=/usr/bin\x00"
-	tr.handleStepEvent(execEventEnv(evExec, 42, 7, "node\x00", 5, "node", helper, uint32(len(helper))), time.Unix(1000, 0))
+	tr.handleStepEvent(execEventEnv(evExec, 42, 7, "node\x00", 5, "node", helper, uint32(len(helper))), wallClock(time.Unix(1000, 0)))
 	cut := "HOME=/home/runner\x00"
-	tr.handleStepEvent(execEventEnv(evExec, 43, 8, "bash\x00", 5, "bash", cut, 64*1024), time.Unix(1000, 0))
-	tr.handleStepEvent(execEvent(evExec, 44, 9, "bash\x00", 5, "bash"), time.Unix(1000, 0))
+	tr.handleStepEvent(execEventEnv(evExec, 43, 8, "bash\x00", 5, "bash", cut, 64*1024), wallClock(time.Unix(1000, 0)))
+	tr.handleStepEvent(execEvent(evExec, 44, 9, "bash\x00", 5, "bash"), wallClock(time.Unix(1000, 0)))
 
 	require.Len(t, sink.events, 3)
 	assert.Equal(t, events.StepClassRunner, sink.events[0].StepClass, "a runner helper")
@@ -203,8 +219,8 @@ func TestHandleStepEvent_ExitWithoutExecReportsWorker(t *testing.T) {
 	tr, sink := newBoundaryTracker(t)
 	ids := &identities{sink: sink}
 	tr.onIdentified = ids.record
-	tr.handleStepEvent(forkEvent(43, 8), time.Unix(1000, 0))
-	tr.handleStepEvent(exitEvent(43, 8), time.Unix(1001, 0))
+	tr.handleStepEvent(forkEvent(43, 8), wallClock(time.Unix(1000, 0)))
+	tr.handleStepEvent(exitEvent(43, 8), wallClock(time.Unix(1001, 0)))
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, sanitizeCmdline(tr.workerCmdline), sink.events[0].Process)
 	assert.True(t, sink.events[0].Timestamp.Equal(time.Unix(1000, 0)))
@@ -218,8 +234,8 @@ func TestHandleStepEvent_ExitWithoutExecReportsWorker(t *testing.T) {
 func TestHandleStepEvent_CutAndUnreadableArguments(t *testing.T) {
 	tr, sink := newBoundaryTracker(t)
 	long := strings.Repeat("a", cmdlineMax)
-	tr.handleStepEvent(execEvent(evExec, 44, 9, long, cmdlineMax+50, "a"), time.Unix(1000, 0))
-	tr.handleStepEvent(execEvent(evExec, uint32(os.Getpid()), 10, "", 0, "node"), time.Unix(1000, 0))
+	tr.handleStepEvent(execEvent(evExec, 44, 9, long, cmdlineMax+50, "a"), wallClock(time.Unix(1000, 0)))
+	tr.handleStepEvent(execEvent(evExec, uint32(os.Getpid()), 10, "", 0, "node"), wallClock(time.Unix(1000, 0)))
 	require.Len(t, sink.events, 2)
 	assert.Equal(t, long+"...", sink.events[0].Process)
 	assert.Equal(t, "node", sink.events[1].Process)
@@ -230,7 +246,7 @@ func TestHandleStepEvent_CutAndUnreadableArguments(t *testing.T) {
 func TestHandleStepEvent_ExecWithoutForkRecordsBoundary(t *testing.T) {
 	tr, sink := newBoundaryTracker(t)
 	at := time.Unix(1000, 0)
-	tr.handleStepEvent(execEvent(evExec, 45, 11, "true\x00", 5, "true"), at)
+	tr.handleStepEvent(execEvent(evExec, 45, 11, "true\x00", 5, "true"), wallClock(at))
 	require.Len(t, sink.events, 1)
 	assert.True(t, sink.events[0].Timestamp.Equal(at))
 	assert.Equal(t, uint32(11), tr.OrdinalAt(at))
@@ -241,7 +257,7 @@ func TestHandleStepEvent_ExecWithoutForkRecordsBoundary(t *testing.T) {
 func TestReportLost_ReportsAStepWhoseEventNeverCame(t *testing.T) {
 	tr, sink := newBoundaryTracker(t)
 	forked := time.Unix(1000, 0)
-	tr.handleStepEvent(forkEvent(uint32(os.Getpid()), 12), forked)
+	tr.handleStepEvent(forkEvent(uint32(os.Getpid()), 12), wallClock(forked))
 	tr.reportLost(forked) // not yet overdue
 	assert.Empty(t, sink.events)
 
@@ -251,7 +267,7 @@ func TestReportLost_ReportsAStepWhoseEventNeverCame(t *testing.T) {
 	assert.True(t, sink.events[0].Timestamp.Equal(forked))
 	assert.Equal(t, events.StepClassUnknown, sink.events[0].StepClass, "/proc can't identify a step")
 
-	tr.handleStepEvent(execEvent(evExec, uint32(os.Getpid()), 12, "late\x00", 5, "late"), forked.Add(time.Minute))
+	tr.handleStepEvent(execEvent(evExec, uint32(os.Getpid()), 12, "late\x00", 5, "late"), wallClock(forked.Add(time.Minute)))
 	tr.reportLost(forked.Add(time.Hour))
 	assert.Len(t, sink.events, 1)
 }
@@ -264,26 +280,135 @@ func TestReportLost_LateExecStillIdentifies(t *testing.T) {
 	ids := &identities{sink: sink}
 	tr.onIdentified = ids.record
 	forked := time.Unix(1000, 0)
-	tr.handleStepEvent(forkEvent(uint32(os.Getpid()), 12), forked)
+	tr.handleStepEvent(forkEvent(uint32(os.Getpid()), 12), wallClock(forked))
 	tr.reportLost(forked.Add(reportAfter + time.Millisecond))
 	require.Len(t, sink.events, 1)
 	assert.Empty(t, ids.got)
 
 	env := "GITHUB_ACTION=build\x00"
-	tr.handleStepEvent(execEventEnv(evExec, uint32(os.Getpid()), 12, "late\x00", 5, "late", env, uint32(len(env))), forked.Add(time.Minute))
+	tr.handleStepEvent(execEventEnv(evExec, uint32(os.Getpid()), 12, "late\x00", 5, "late", env, uint32(len(env))), wallClock(forked.Add(time.Minute)))
 	assert.Equal(t, []identified{{12, Identity{StepID: "build", Class: events.StepClassStep}, 1}}, ids.got)
 	assert.Len(t, sink.events, 1, "reported once")
 }
 
 func TestHandleStepEvent_IgnoresShortAndUnknownRecords(t *testing.T) {
 	tr, sink := newBoundaryTracker(t)
-	tr.handleStepEvent(nil, time.Now())
-	tr.handleStepEvent([]byte{1, 0}, time.Now())
-	tr.handleStepEvent(forkEvent(1, 1)[:8], time.Now())
-	tr.handleStepEvent(execEvent(evExec, 1, 1, "x", 1, "x")[:20], time.Now())
-	tr.handleStepEvent(execEvent(9, 1, 1, "x", 1, "x"), time.Now())
+	tr.handleStepEvent(nil, wallClock(time.Now()))
+	tr.handleStepEvent([]byte{1, 0}, wallClock(time.Now()))
+	tr.handleStepEvent(forkEvent(1, 1)[:8], wallClock(time.Now()))
+	tr.handleStepEvent(execEvent(evExec, 1, 1, "x", 1, "x")[:20], wallClock(time.Now()))
+	tr.handleStepEvent(execEvent(9, 1, 1, "x", 1, "x"), wallClock(time.Now()))
 	assert.Empty(t, sink.events)
 	assert.Empty(t, tr.boundaries)
+}
+
+// A kernel time dates an event before the reading by as much as the
+// monotonic clock has run since, and never after the reading.
+func TestClockAt(t *testing.T) {
+	c := clock{wall: time.Unix(1000, 0), mono: 5 * uint64(time.Second)}
+	assert.True(t, c.at(3*uint64(time.Second)).Equal(time.Unix(998, 0)))
+	assert.True(t, c.at(5*uint64(time.Second)).Equal(c.wall), "read as it happened")
+	assert.True(t, c.at(6*uint64(time.Second)).Equal(c.wall), "not after the reading")
+	assert.True(t, c.at(0).Equal(c.wall), "no kernel time")
+}
+
+// A reader that falls behind dates each fork when it happened, not when it
+// was read: a container started between two steps resolves to the step
+// that was running then.
+func TestHandleStepEvent_ForkDatedByKernelTime(t *testing.T) {
+	tr, sink := newBoundaryTracker(t)
+	sec := uint64(time.Second)
+	late := clock{wall: time.Unix(1000, 0), mono: 10 * sec}
+	tr.handleStepEvent(forkEventAt(41, 6, 4*sec), late)
+	tr.handleStepEvent(forkEventAt(42, 7, 7*sec), late)
+	assert.Zero(t, tr.OrdinalAt(time.Unix(993, 0)))
+	assert.Equal(t, uint32(6), tr.OrdinalAt(time.Unix(995, 0)))
+	assert.Equal(t, uint32(7), tr.OrdinalAt(time.Unix(998, 0)))
+
+	env := "GITHUB_ACTION=build\x00"
+	tr.handleStepEvent(execEventEnv(evExec, 42, 7, "bash\x00", 5, "bash", env, uint32(len(env))), late)
+	require.Len(t, sink.events, 1)
+	assert.True(t, sink.events[0].Timestamp.Equal(time.Unix(997, 0)), "reported at its fork, got %v", sink.events[0].Timestamp)
+
+	// A root that exits without exec'ing, its fork event lost, is dated at
+	// its exit.
+	tr.handleStepEvent(childEventAt(evExit, 43, 8, 8*sec), late)
+	require.Len(t, sink.events, 2)
+	assert.True(t, sink.events[1].Timestamp.Equal(time.Unix(998, 0)))
+}
+
+// Stepping through a job's roots in order: a runner helper or a copy of
+// Runner.Worker doesn't end the step it forks in, once it is known to be
+// one. A root not identified yet, or whose identity the kernel couldn't
+// read, still does.
+func TestOrdinalAt_PassesOverRootsThatAreNoStep(t *testing.T) {
+	tr, _ := newBoundaryTracker(t)
+	step := "GITHUB_ACTION=build\x00"
+	helper := "HOME=/home/runner\x00PATH=/usr/bin\x00"
+	at := func(s int64) clock { return wallClock(time.Unix(s, 0)) }
+
+	tr.handleStepEvent(forkEvent(41, 6), at(1000))
+	tr.handleStepEvent(execEventEnv(evExec, 41, 6, "bash\x00", 5, "bash", step, uint32(len(step))), at(1000))
+
+	tr.handleStepEvent(forkEvent(42, 7), at(1010))
+	assert.Equal(t, uint32(7), tr.OrdinalAt(time.Unix(1015, 0)), "not identified yet")
+	tr.handleStepEvent(execEventEnv(evExec, 42, 7, "node\x00", 5, "node", helper, uint32(len(helper))), at(1011))
+	assert.Equal(t, uint32(6), tr.OrdinalAt(time.Unix(1015, 0)), "a runner helper")
+
+	tr.handleStepEvent(forkEvent(43, 8), at(1020))
+	tr.handleStepEvent(exitEvent(43, 8), at(1021))
+	assert.Equal(t, uint32(6), tr.OrdinalAt(time.Unix(1025, 0)), "a copy of Runner.Worker")
+
+	tr.handleStepEvent(forkEvent(44, 9), at(1030))
+	tr.handleStepEvent(execEventEnv(evExec, 44, 9, "bash\x00", 5, "bash", "", 0), at(1030))
+	assert.Equal(t, uint32(9), tr.OrdinalAt(time.Unix(1035, 0)), "unknown")
+
+	// A root reported lost is unknown until its exec comes after all.
+	tr.handleStepEvent(forkEvent(45, 10), at(1040))
+	tr.reportLost(time.Unix(1050, 0))
+	assert.Equal(t, uint32(10), tr.OrdinalAt(time.Unix(1045, 0)))
+	tr.handleStepEvent(execEventEnv(evExec, 45, 10, "node\x00", 5, "node", helper, uint32(len(helper))), at(1051))
+	assert.Equal(t, uint32(9), tr.OrdinalAt(time.Unix(1045, 0)))
+}
+
+// How the runner's docker CLI processes resolve, all of them direct
+// children of Runner.Worker. "Initialize containers" creates and starts
+// the job and service containers with no step environment, before any
+// step: they resolve to no step, and get the job's rules. An action's
+// image is pulled or built with no step environment either, and only the
+// action's docker run carries its step's (GITHUB_ACTION among it), so the
+// action's container resolves to that step.
+func TestOrdinalAt_ContainerActionsAndJobContainers(t *testing.T) {
+	tr, _ := newBoundaryTracker(t)
+	noStep := "PATH=/usr/bin\x00"
+	docker := func(ordinal uint32, s int64, env string) {
+		at := wallClock(time.Unix(s, 0))
+		tr.handleStepEvent(forkEvent(100+ordinal, ordinal), at)
+		tr.handleStepEvent(execEventEnv(evExec, 100+ordinal, ordinal, "docker\x00", 7, "docker", env, uint32(len(env))), at)
+	}
+
+	docker(1, 1000, noStep) // docker create, a service container
+	docker(2, 1001, noStep) // docker start
+	assert.Zero(t, tr.OrdinalAt(time.Unix(1001, 500)))
+
+	run := "GITHUB_ACTION=__run\x00"
+	tr.handleStepEvent(forkEvent(103, 3), wallClock(time.Unix(1010, 0)))
+	tr.handleStepEvent(execEventEnv(evExec, 103, 3, "bash\x00", 5, "bash", run, uint32(len(run))), wallClock(time.Unix(1010, 0)))
+
+	docker(4, 1020, noStep) // docker build, a local action's image
+	assert.Equal(t, uint32(3), tr.OrdinalAt(time.Unix(1021, 0)))
+	docker(5, 1030, "GITHUB_ACTION=lint\x00") // docker run
+	assert.Equal(t, uint32(5), tr.OrdinalAt(time.Unix(1031, 0)))
+}
+
+// The latest boundary is the latest by time, whatever order the events
+// were read in.
+func TestOrdinalAt_LatestByTimeNotReadOrder(t *testing.T) {
+	tr := &Tracker{}
+	tr.recordBoundary(boundary{ordinal: 8, at: time.Unix(1010, 0)})
+	tr.recordBoundary(boundary{ordinal: 7, at: time.Unix(1005, 0)})
+	assert.Equal(t, uint32(7), tr.OrdinalAt(time.Unix(1007, 0)))
+	assert.Equal(t, uint32(8), tr.OrdinalAt(time.Unix(1012, 0)))
 }
 
 func TestFormatCmdline(t *testing.T) {

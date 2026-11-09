@@ -24,6 +24,7 @@
 #include "verdict.h"
 
 // TC action return codes
+#define TC_ACT_UNSPEC (-1)
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
 
@@ -686,6 +687,29 @@ int cw_tc_egress(struct __sk_buff *skb) {
 
     // Allow non-IP protocols (ARP, etc.) - required for basic networking
     return TC_ACT_OK;
+}
+
+// Bridge stamp, on a Docker bridge's ingress: see the bridge stamp section
+// of verdict.h. It stamps a packet whose socket's step has a policy, and
+// clears a stamp it finds on any other; it never touches a mark that is not
+// a stamp, and leaves a packet that carries one unstamped (the job's rules
+// at TC, fail-closed). TC_ACT_UNSPEC, not TC_ACT_OK: a marker must not end
+// the bridge's chain. Under TCX it is TCX_NEXT, the next program's turn;
+// for a direct-action cls_bpf filter, classification goes on to the next
+// filter; at the end of either the packet passes.
+SEC("classifier/br_stamp")
+int cw_tc_br_stamp(struct __sk_buff *skb) {
+    if (!step_rules_enabled)
+        return TC_ACT_UNSPEC;
+    __u64 cookie = bpf_get_socket_cookie(skb);
+    __u32 policy = cookie ? cookie_step_policy(cookie) : POLICY_JOB;
+    __u32 mark = skb->mark;
+    __u8 ours = (mark & STEP_STAMP_MASK) == STEP_STAMP_MAGIC;
+    if (policy != POLICY_JOB && policy <= STEP_STAMP_POLICY_MAX && (mark == 0 || ours))
+        skb->mark = STEP_STAMP_MAGIC | policy;
+    else if (ours)
+        skb->mark = 0;
+    return TC_ACT_UNSPEC;
 }
 
 // Handle ingress traffic - currently just allows everything

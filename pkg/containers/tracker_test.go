@@ -288,9 +288,9 @@ func newFakeDaemonAfter(t *testing.T, ready <-chan struct{}) *fakeDaemon {
 }
 
 // setNetwork creates or replaces a network with the given driver and IPAM
-// subnets.
+// subnets, and the id its events carry.
 func (d *fakeDaemon) setNetwork(name, driver string, subnets ...string) {
-	nw := networkInspect{Name: name, Driver: driver}
+	nw := networkInspect{ID: "netid-" + name, Name: name, Driver: driver}
 	for _, s := range subnets {
 		nw.IPAM.Config = append(nw.IPAM.Config, struct {
 			Subnet string `json:"Subnet"`

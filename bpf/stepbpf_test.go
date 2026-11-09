@@ -72,6 +72,14 @@ func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEv
 	}
 }
 
+// monoNow reads CLOCK_MONOTONIC, the clock bpf_ktime_get_ns reads.
+func monoNow(t *testing.T) uint64 {
+	t.Helper()
+	var ts unix.Timespec
+	require.NoError(t, unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts))
+	return uint64(ts.Nano())
+}
+
 // argvOf returns the argument bytes an exec event copied.
 func argvOf(ev StepBpfStepExecEvent) string {
 	n := min(int(ev.ArgvLen), len(ev.Argv))
@@ -236,8 +244,10 @@ func TestStepFork(t *testing.T) {
 		NextOrdinal: wantOrdinal,
 	}))
 
+	before := monoNow(t)
 	child := exec.Command("sleep", "1")
 	require.NoError(t, child.Start())
+	after := monoNow(t)
 	childPID := uint32(child.Process.Pid)
 	defer func() { _ = child.Wait() }()
 
@@ -261,6 +271,9 @@ func TestStepFork(t *testing.T) {
 	})
 	require.Equal(t, got, fork.Ordinal, "map tag and boundary event must agree")
 	require.GreaterOrEqual(t, fork.Ordinal, uint32(wantOrdinal))
+	require.Zero(t, fork.Pad)
+	require.True(t, fork.Ktime >= before && fork.Ktime <= after,
+		"the fork is dated when it happened: %d not in [%d, %d]", fork.Ktime, before, after)
 
 	// Its first exec says what it runs, under the same ordinal and pid.
 	_, execEv := awaitStepEvent(t, rd, stepEvExec, fork.Ordinal, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool {
@@ -540,6 +553,9 @@ func TestStepExit_WithoutExec(t *testing.T) {
 		return true
 	})
 	require.Equal(t, fork.Tgid, exitEv.Tgid)
+	require.Zero(t, exitEv.Pad)
+	require.True(t, exitEv.Ktime >= fork.Ktime && exitEv.Ktime <= monoNow(t),
+		"the exit is dated when it happened: %d not in [%d, now]", exitEv.Ktime, fork.Ktime)
 }
 
 // readProcInt reads an integer /proc/sys value.
@@ -761,7 +777,7 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 
 	var ev StepBpfStepChildEvent
 	require.Equal(t, uint32(unsafe.Sizeof(ev)), st.Size, "struct size")
-	require.Len(t, st.Members, 3)
+	require.Len(t, st.Members, 5)
 	for i, w := range []struct {
 		name string
 		off  uintptr
@@ -769,6 +785,8 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 		{"kind", unsafe.Offsetof(ev.Kind)},
 		{"tgid", unsafe.Offsetof(ev.Tgid)},
 		{"ordinal", unsafe.Offsetof(ev.Ordinal)},
+		{"pad", unsafe.Offsetof(ev.Pad)},
+		{"ktime", unsafe.Offsetof(ev.Ktime)},
 	} {
 		require.Equal(t, w.name, st.Members[i].Name)
 		require.Equal(t, w.off, uintptr(st.Members[i].Offset.Bytes()))

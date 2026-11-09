@@ -65,9 +65,9 @@ func TestMakeFilterInfo(t *testing.T) {
 // firewall would silently fail open.
 func TestEncodeEgressFilterAttrs(t *testing.T) {
 	const fd = 42
-	data, err := encodeEgressFilterAttrs(fd)
+	data, err := encodeFilterAttrs(fd, cwFilterName)
 	if err != nil {
-		t.Fatalf("encodeEgressFilterAttrs: %v", err)
+		t.Fatalf("encodeFilterAttrs: %v", err)
 	}
 
 	ad, err := netlink.NewAttributeDecoder(data)
@@ -159,9 +159,9 @@ func TestAttachClsactEgressIntegration(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	closer, err := attachClsactEgress(lo.Index, prog, logger)
+	closer, err := attachClsact(lo.Index, prog, egress, logger)
 	if err != nil {
-		t.Fatalf("attachClsactEgress: %v", err)
+		t.Fatalf("attachClsact: %v", err)
 	}
 	// Safety net in case an assertion below fails before the explicit Close.
 	defer func() { _ = closer.Close() }()

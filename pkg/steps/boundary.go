@@ -25,23 +25,50 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf/ringbuf"
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
-// boundary is one step's start: its fork as run() observed it, stamped
-// with wall-clock receive time so external event streams that carry their
-// own timestamps (Docker's timeNano) can be resolved against the step that
-// was active when the event happened, not whichever step is active when a
-// possibly backlogged stream gets processed. pid is the step root,
-// numbered in our pid namespace; reported is whether its step_boundary
-// event is written.
+// boundary is one step's start: its fork, stamped with the wall-clock
+// time the kernel saw it happen, so external event streams that carry
+// their own timestamps (Docker's timeNano) can be resolved against the
+// step that was active when the event happened, not whichever step is
+// active when a possibly backlogged stream gets processed. pid is the step
+// root, numbered in our pid namespace; reported is whether its
+// step_boundary event is written. notStep is set once the root is known to
+// be no step: a runner helper (events.StepClassRunner), or a copy of
+// Runner.Worker that exited without exec'ing.
 type boundary struct {
 	ordinal  uint32
 	at       time.Time
 	pid      uint32
 	reported bool
+	notStep  bool
+}
+
+// clock is a reading of the wall clock and of CLOCK_MONOTONIC, the clock
+// bpf_ktime_get_ns reads, taken together, to date kernel events by.
+type clock struct {
+	wall time.Time
+	mono uint64 // ns
+}
+
+func readClock() clock {
+	var ts unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return clock{wall: time.Now(), mono: uint64(ts.Nano())}
+}
+
+// at dates a kernel event at ktime by the wall clock, never after the
+// reading: an event can't happen after it is read, so a ktime of 0 or past
+// the reading dates it at the reading.
+func (c clock) at(ktime uint64) time.Time {
+	if ktime == 0 || ktime >= c.mono {
+		return c.wall
+	}
+	return c.wall.Add(-time.Duration(c.mono - ktime))
 }
 
 // boundaryHistory bounds the ring; ordinals are monotonic so old entries
@@ -64,35 +91,53 @@ func (t *Tracker) recordBoundary(b boundary) {
 	}
 }
 
-// OrdinalAt returns the ordinal of the latest step boundary observed at or
-// before tm, or 0 when tm predates every observed boundary (callers treat 0
-// as untagged, which degrades to the stricter attribution tier by design).
+// OrdinalAt returns the ordinal of the latest step boundary at or before
+// tm, or 0 when tm predates every observed boundary (callers treat 0 as
+// untagged, which degrades to the stricter attribution tier by design).
+//
+// Roots known to be no step are passed over: a runner helper Runner.Worker
+// forks while a step runs doesn't end that step. A root not identified
+// yet, or never (events.StepClassUnknown), still counts. Its ordinal is
+// bound no step's rules until it is identified as that step, so resolving
+// to it is never wider than resolving to the step before it.
+//
+// Boundaries are in the order their events were read, which their kernel
+// times need not follow (a fork recorded from its exec, its fork event
+// lost), so the latest is looked for among all of them.
 func (t *Tracker) OrdinalAt(tm time.Time) uint32 {
 	t.boundaryMu.Lock()
 	defer t.boundaryMu.Unlock()
-	for i := len(t.boundaries) - 1; i >= 0; i-- {
-		if !t.boundaries[i].at.After(tm) {
-			return t.boundaries[i].ordinal
+	var latest *boundary
+	for i := range t.boundaries {
+		b := &t.boundaries[i]
+		if b.notStep || b.at.After(tm) || (latest != nil && b.at.Before(latest.at)) {
+			continue
 		}
+		latest = b
 	}
-	return 0
+	if latest == nil {
+		return 0
+	}
+	return latest.ordinal
 }
 
 // claimBoundary marks ordinal's boundary reported and returns it, recording
-// one at now when its fork event never came (OrdinalAt then knows the step
-// from its exec on). ok is false when it was already reported.
-func (t *Tracker) claimBoundary(ordinal, pid uint32, now time.Time) (b boundary, ok bool) {
+// one at the given time when its fork event never came (OrdinalAt then
+// knows the step from then on). notStep is what the event says of the root.
+// ok is false when it was already reported.
+func (t *Tracker) claimBoundary(ordinal, pid uint32, at time.Time, notStep bool) (b boundary, ok bool) {
 	t.boundaryMu.Lock()
 	for i := len(t.boundaries) - 1; i >= 0; i-- {
 		if t.boundaries[i].ordinal == ordinal {
 			b, ok = t.boundaries[i], !t.boundaries[i].reported
 			t.boundaries[i].reported = true
+			t.boundaries[i].notStep = notStep
 			t.boundaryMu.Unlock()
 			return b, ok
 		}
 	}
 	t.boundaryMu.Unlock()
-	b = boundary{ordinal: ordinal, at: now, pid: pid, reported: true}
+	b = boundary{ordinal: ordinal, at: at, pid: pid, reported: true, notStep: notStep}
 	t.recordBoundary(b)
 	return b, true
 }
@@ -131,7 +176,7 @@ func (t *Tracker) run() {
 		case err != nil:
 			t.logger.Error("Failed to read step event", "error", err)
 		default:
-			t.handleStepEvent(record.RawSample, time.Now())
+			t.handleStepEvent(record.RawSample, readClock())
 		}
 	}
 }
@@ -148,13 +193,13 @@ func (t *Tracker) reportLost(cutoff time.Time) {
 	}
 }
 
-// handleStepEvent handles one step event. A fork starts the step: the
-// boundary is recorded at once, so OrdinalAt callers racing it resolve
-// against it promptly, and its time is the boundary's. The root's first
-// exec says what the step runs and which step it is, and only then is the
-// step reported. A root that exits without exec'ing ran a copy of
-// Runner.Worker, whose command line it reports, and is no step.
-func (t *Tracker) handleStepEvent(raw []byte, now time.Time) {
+// handleStepEvent handles one step event, read at now. A fork starts the
+// step: the boundary is recorded at once, so OrdinalAt callers racing it
+// resolve against it promptly, and the fork's time is the boundary's. The
+// root's first exec says what the step runs and which step it is, and only
+// then is the step reported. A root that exits without exec'ing ran a copy
+// of Runner.Worker, whose command line it reports, and is no step.
+func (t *Tracker) handleStepEvent(raw []byte, now clock) {
 	if len(raw) < 4 {
 		return
 	}
@@ -164,13 +209,13 @@ func (t *Tracker) handleStepEvent(raw []byte, now time.Time) {
 			return
 		}
 		ev := (*bpf.StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
-		t.recordBoundary(boundary{ordinal: ev.Ordinal, at: now, pid: ev.Tgid})
+		t.recordBoundary(boundary{ordinal: ev.Ordinal, at: now.at(ev.Ktime), pid: ev.Tgid})
 	case bpf.StepBpfStepEventKindSTEP_EV_EXIT:
 		if len(raw) < int(unsafe.Sizeof(bpf.StepBpfStepChildEvent{})) {
 			return
 		}
 		ev := (*bpf.StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
-		if b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now); ok {
+		if b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now.at(ev.Ktime), true); ok {
 			t.reportStep(b, sanitizeCmdline(t.workerCmdline), Identity{})
 		}
 	case bpf.StepBpfStepEventKindSTEP_EV_EXEC:
@@ -183,7 +228,7 @@ func (t *Tracker) handleStepEvent(raw []byte, now time.Time) {
 		defer clear(raw)
 		ev := (*bpf.StepBpfStepExecEvent)(unsafe.Pointer(&raw[0]))
 		id := identify(cBytes(ev.Env[:]), int(ev.EnvLen))
-		b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now)
+		b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now.wall, id.Class == events.StepClassRunner)
 		t.identified(ev.Ordinal, id)
 		if !ok {
 			// Reported as lost already, unidentified: the kernel's copy

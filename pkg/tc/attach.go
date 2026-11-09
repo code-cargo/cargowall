@@ -14,9 +14,9 @@
 
 //go:build linux
 
-// Package tc attaches cargowall's egress eBPF classifier to a network
-// interface, preferring the modern TCX hook and transparently falling back to
-// the legacy clsact qdisc on older kernels.
+// Package tc attaches cargowall's eBPF classifiers to a network interface's
+// egress or ingress hook, preferring the modern TCX hook and transparently
+// falling back to the legacy clsact qdisc on older kernels.
 package tc
 
 import (
@@ -30,6 +30,15 @@ import (
 	"github.com/cilium/ebpf/link"
 )
 
+// Attachment is a program attached to an interface's TC hook.
+type Attachment interface {
+	io.Closer
+	// Attached reports whether the program is still attached to the
+	// interface it was attached to: false once that interface is gone, as a
+	// bridge Docker removes is, whatever index a later interface takes.
+	Attached() bool
+}
+
 // AttachEgress attaches prog to the named interface's egress TC hook.
 //
 // It prefers TCX (the modern bpf_link TC hook, kernel 6.6+). On older kernels
@@ -37,6 +46,18 @@ import (
 // clsact qdisc + direct-action cls_bpf filter (kernel 4.5+). The returned
 // io.Closer detaches the program on Close, regardless of which path was taken.
 func AttachEgress(ifname string, prog *ebpf.Program, logger *slog.Logger) (io.Closer, error) {
+	return attach(ifname, prog, egress, logger)
+}
+
+// AttachIngress attaches prog to the named interface's ingress TC hook, the
+// same two ways as AttachEgress. Under TCX the program joins any others
+// there, after them.
+func AttachIngress(ifname string, prog *ebpf.Program, logger *slog.Logger) (Attachment, error) {
+	return attach(ifname, prog, ingress, logger)
+}
+
+// attach attaches prog to the named interface's hook in direction d.
+func attach(ifname string, prog *ebpf.Program, d direction, logger *slog.Logger) (Attachment, error) {
 	iface, err := net.InterfaceByName(ifname)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get interface %s: %w", ifname, err)
@@ -45,11 +66,11 @@ func AttachEgress(ifname string, prog *ebpf.Program, logger *slog.Logger) (io.Cl
 	l, err := link.AttachTCX(link.TCXOptions{
 		Interface: iface.Index,
 		Program:   prog,
-		Attach:    ebpf.AttachTCXEgress,
+		Attach:    d.tcx,
 	})
 	if err == nil {
-		logger.Info("Attached TC egress program", "interface", ifname, "method", "tcx")
-		return l, nil
+		logger.Info("Attached TC "+d.name+" program", "interface", ifname, "method", "tcx")
+		return tcxAttachment{l}, nil
 	}
 	if !errors.Is(err, ebpf.ErrNotSupported) {
 		// AttachTCX runs cilium's haveTCX() feature probe on failure and returns
@@ -57,14 +78,27 @@ func AttachEgress(ifname string, prog *ebpf.Program, logger *slog.Logger) (io.Cl
 		// EOPNOTSUPP/EINVAL reaching here therefore means TCX *is* supported but
 		// the attach genuinely failed (permissions, bad program, busy interface) —
 		// surface it rather than silently falling back to clsact.
-		return nil, fmt.Errorf("attach TCX egress: %w", err)
+		return nil, fmt.Errorf("attach TCX %s: %w", d.name, err)
 	}
 
 	logger.Info("TCX unsupported on this kernel, falling back to legacy clsact", "interface", ifname)
-	closer, err := attachClsactEgress(iface.Index, prog, logger)
+	a, err := attachClsact(iface.Index, prog, d, logger)
 	if err != nil {
-		return nil, fmt.Errorf("attach legacy clsact egress: %w", err)
+		return nil, fmt.Errorf("attach legacy clsact %s: %w", d.name, err)
 	}
-	logger.Info("Attached TC egress program", "interface", ifname, "method", "clsact")
-	return closer, nil
+	logger.Info("Attached TC "+d.name+" program", "interface", ifname, "method", "clsact")
+	return a, nil
+}
+
+// tcxAttachment is a TCX link. The kernel detaches it when its interface
+// goes, and then reports no interface for it.
+type tcxAttachment struct{ link.Link }
+
+func (a tcxAttachment) Attached() bool {
+	info, err := a.Info()
+	if err != nil {
+		return false
+	}
+	tcx := info.TCX()
+	return tcx != nil && tcx.Ifindex != 0
 }

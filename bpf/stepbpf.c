@@ -98,11 +98,15 @@ const enum step_event_kind *btf_anchor_step_event_kind __attribute__((unused));
 // direct child process of Runner.Worker, before the child runs user code
 // (STEP_EV_FORK), and again should the child exit before it execs
 // (STEP_EV_EXIT). tgid is the child's pid as numbered in the daemon's
-// namespace (0 if untranslatable).
+// namespace (0 if untranslatable). ktime is when the fork or exit
+// happened, by bpf_ktime_get_ns (CLOCK_MONOTONIC): the reader can fall
+// behind, and the step starts at its fork, not when the reader gets to it.
 struct step_child_event {
     __u32 kind;
     __u32 tgid;
     __u32 ordinal;
+    __u32 pad;
+    __u64 ktime;
 };
 
 // BTF anchor — see the blocked_event anchor in tcbpf.c for rationale.
@@ -263,6 +267,8 @@ int BPF_PROG(cw_step_fork, struct task_struct *child, __u64 clone_flags)
             ev->kind = STEP_EV_FORK;
             ev->tgid = ns_tgid;
             ev->ordinal = ord;
+            ev->pad = 0;
+            ev->ktime = bpf_ktime_get_ns();
             bpf_ringbuf_submit(ev, 0);
         }
         return 0;
@@ -294,6 +300,8 @@ static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid,
             ev->kind = kind;
             ev->tgid = ns_tgid;
             ev->ordinal = ord;
+            ev->pad = 0;
+            ev->ktime = bpf_ktime_get_ns();
             bpf_ringbuf_submit(ev, 0);
         }
         bpf_map_delete_elem(&map_step_exec_pending, &tgid);

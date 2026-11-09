@@ -40,7 +40,7 @@ import (
 // its stale byIP entry keeps answering DNS attribution lookups, crediting
 // whatever later occupies that bridge address to a dead container.
 //
-// Before either, it carves every bridge network's subnets (carveNetworks),
+// Before either, it carves every bridge network's subnets (scanNetworks),
 // and returns the prefixes carved.
 func (t *Tracker) reconcile(ctx context.Context) []netip.Prefix {
 	// The network-driver cache can be stale across a stream gap (a destroy
@@ -50,7 +50,7 @@ func (t *Tracker) reconcile(ctx context.Context) []netip.Prefix {
 	t.mu.Lock()
 	clear(t.netDrivers)
 	t.mu.Unlock()
-	carved := t.carveNetworks(ctx)
+	carved := t.scanNetworks(ctx)
 
 	list, err := t.client.listContainers(ctx)
 	if err != nil {

@@ -20,9 +20,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"runtime"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/mdlayher/netlink"
@@ -39,6 +39,8 @@ const (
 	clsactHandle = 0xFFFF0000
 	// egressParent is TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS) — the egress hook.
 	egressParent = 0xFFFFFFF3
+	// ingressParent is TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_INGRESS) — the ingress hook.
+	ingressParent = 0xFFFFFFF2
 
 	// cwFilterPrio is a distinctive filter priority so teardown can target
 	// exactly cargowall's filter without disturbing anything else on the qdisc.
@@ -60,6 +62,19 @@ const (
 	// TC_ACT_SHOT would NOT drop — i.e. the firewall would silently fail open.
 	// TCX is always direct-action, which is why the TCX path sets no flag.
 	bpfFlagActDirect = 1
+)
+
+// direction is one of an interface's two TC hooks.
+type direction struct {
+	name   string          // for errors and logs
+	tcx    ebpf.AttachType // its TCX attach type
+	parent uint32          // its clsact parent
+	filter string          // our cls_bpf filter's TCA_BPF_NAME there
+}
+
+var (
+	egress  = direction{name: "egress", tcx: ebpf.AttachTCXEgress, parent: egressParent, filter: cwFilterName}
+	ingress = direction{name: "ingress", tcx: ebpf.AttachTCXIngress, parent: ingressParent, filter: "cargowall_ingress"}
 )
 
 // tcMsg is the netlink tcmsg header (struct tcmsg, linux/rtnetlink.h): 20 bytes.
@@ -95,15 +110,16 @@ func makeFilterInfo(prio, proto uint16) uint32 {
 	return uint32(prio)<<16 | uint32(htons(proto))
 }
 
-// encodeEgressFilterAttrs builds the rtnetlink attributes for a direct-action
-// cls_bpf egress filter referencing the program file descriptor fd. Extracted
-// so the (security-critical) direct-action encoding is unit-testable.
-func encodeEgressFilterAttrs(fd uint32) ([]byte, error) {
+// encodeFilterAttrs builds the rtnetlink attributes for a direct-action
+// cls_bpf filter named name referencing the program file descriptor fd.
+// Extracted so the (security-critical) direct-action encoding is
+// unit-testable.
+func encodeFilterAttrs(fd uint32, name string) ([]byte, error) {
 	ae := netlink.NewAttributeEncoder()
 	ae.String(unix.TCA_KIND, "bpf")
 	ae.Nested(unix.TCA_OPTIONS, func(nae *netlink.AttributeEncoder) error {
 		nae.Uint32(tcaBPFFD, fd)
-		nae.String(tcaBPFName, cwFilterName)
+		nae.String(tcaBPFName, name)
 		nae.Uint32(tcaBPFFlags, bpfFlagActDirect)
 		return nil
 	})
@@ -124,14 +140,26 @@ func execTC(conn *netlink.Conn, typ uint16, flags netlink.HeaderFlags, m tcMsg, 
 	return err
 }
 
-// attachClsactEgress attaches prog to the interface's egress hook via the legacy
-// clsact qdisc + direct-action cls_bpf filter (the pre-TCX mechanism, kernel
-// 4.5+). It is the fallback used by AttachEgress on kernels without TCX (< 6.6).
+// ownedQdiscs counts this process's filters on each clsact qdisc it
+// created, keyed by interface index, so the qdisc goes only with the last
+// of them: an egress and an ingress filter of ours can share one
+// interface's qdisc (an uplink that is a Docker bridge), and the first to
+// close must not take the other with it.
+var (
+	ownedMu     sync.Mutex
+	ownedQdiscs = map[int]int{}
+)
+
+// attachClsact attaches prog to the interface's hook in direction d via the
+// legacy clsact qdisc + direct-action cls_bpf filter (the pre-TCX mechanism,
+// kernel 4.5+). It is the fallback attach uses on kernels without TCX
+// (< 6.6).
 //
-// The clsact qdisc is created only if absent, and we record whether we created
-// it so teardown removes only a qdisc we own (libbpf-style) — a qdisc installed
-// by another tool (e.g. Cilium) is left in place.
-func attachClsactEgress(ifindex int, prog *ebpf.Program, logger *slog.Logger) (io.Closer, error) {
+// The clsact qdisc is created only if absent, and we record whether we
+// created it so teardown removes only a qdisc we own (libbpf-style) — a
+// qdisc installed by another tool (e.g. Cilium) is left in place, with
+// every filter on it but ours.
+func attachClsact(ifindex int, prog *ebpf.Program, d direction, logger *slog.Logger) (Attachment, error) {
 	conn, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
 	if err != nil {
 		return nil, fmt.Errorf("dial netlink: %w", err)
@@ -147,54 +175,86 @@ func attachClsactEgress(ifindex int, prog *ebpf.Program, logger *slog.Logger) (i
 	}
 	qmsg := tcMsg{family: unix.AF_UNSPEC, ifindex: int32(ifindex), handle: clsactHandle, parent: clsactParent}
 
+	ownedMu.Lock()
+	defer ownedMu.Unlock()
 	createdQdisc := false
 	switch err := execTC(conn, unix.RTM_NEWQDISC, netlink.Create|netlink.Excl, qmsg, clsactData); {
 	case err == nil:
 		createdQdisc = true
 	case errors.Is(err, unix.EEXIST):
-		// A clsact qdisc is already present (prior run or another tool); reuse it.
+		// A clsact qdisc is already present: ours, under another filter of
+		// ours, or a prior run's or another tool's, to reuse and leave.
 	default:
 		return nil, fmt.Errorf("create clsact qdisc: %w", err)
 	}
 
-	// 2. Attach the program as a direct-action cls_bpf egress filter. REPLACE
+	// 2. Attach the program as a direct-action cls_bpf filter. REPLACE
 	//    makes a restart idempotent over a stale filter from a crashed run.
-	filterData, err := encodeEgressFilterAttrs(uint32(prog.FD()))
+	filterData, err := encodeFilterAttrs(uint32(prog.FD()), d.filter)
 	if err != nil {
-		return nil, fmt.Errorf("encode egress filter attrs: %w", err)
+		return nil, fmt.Errorf("encode %s filter attrs: %w", d.name, err)
 	}
-	fmsg := tcMsg{
-		family:  unix.AF_UNSPEC,
-		ifindex: int32(ifindex),
-		handle:  cwFilterHandle,
-		parent:  egressParent,
-		info:    makeFilterInfo(cwFilterPrio, unix.ETH_P_ALL),
-	}
+	fmsg := filterMsg(ifindex, d)
 	err = execTC(conn, unix.RTM_NEWTFILTER, netlink.Create|netlink.Replace, fmsg, filterData)
 	runtime.KeepAlive(prog) // keep the program fd valid across the syscall
 	if err != nil {
 		if createdQdisc {
 			_ = execTC(conn, unix.RTM_DELQDISC, 0, qmsg, nil) // best-effort rollback of our qdisc
 		}
-		return nil, fmt.Errorf("attach egress bpf filter: %w", err)
+		return nil, fmt.Errorf("attach %s bpf filter: %w", d.name, err)
 	}
 
-	return &tcLegacyLink{ifindex: ifindex, createdQdisc: createdQdisc, logger: logger}, nil
+	owner := false
+	switch {
+	case createdQdisc:
+		ownedQdiscs[ifindex] = 1 // a fresh qdisc: any count left is a dead interface's
+		owner = true
+	case ownedQdiscs[ifindex] > 0:
+		ownedQdiscs[ifindex]++
+		owner = true
+	}
+	return &tcLegacyLink{ifindex: ifindex, dir: d, ownsQdisc: owner, logger: logger}, nil
 }
 
-// tcLegacyLink is the io.Closer returned by attachClsactEgress. Close removes
-// cargowall's egress filter and, if attachClsactEgress created the clsact qdisc,
-// the qdisc as well.
+// filterMsg addresses our filter on the interface's hook in direction d.
+func filterMsg(ifindex int, d direction) tcMsg {
+	return tcMsg{
+		family:  unix.AF_UNSPEC,
+		ifindex: int32(ifindex),
+		handle:  cwFilterHandle,
+		parent:  d.parent,
+		info:    makeFilterInfo(cwFilterPrio, unix.ETH_P_ALL),
+	}
+}
+
+// tcLegacyLink is the Attachment attachClsact returns. Close removes our
+// filter and, with the last filter of ours on a clsact qdisc we created,
+// the qdisc as well. The filter is known by its interface's index alone:
+// one whose interface went is to be closed before ours is attached to a
+// later interface at that index, or its Close removes the later filter.
 type tcLegacyLink struct {
-	ifindex      int
-	createdQdisc bool
-	logger       *slog.Logger
+	ifindex   int
+	dir       direction
+	ownsQdisc bool // the qdisc is one we created, counted in ownedQdiscs
+	logger    *slog.Logger
 }
 
-// Close detaches the egress filter (and our clsact qdisc, if we created it).
-// It is best-effort: benign races (ENOENT — already gone; ENODEV — interface
-// removed, e.g. netns teardown) are ignored, and other failures are logged
-// rather than returned, matching cargowall's shutdown-defer conventions.
+// Attached asks the kernel for our filter: gone with its interface, and
+// not on a later interface that takes the same index.
+func (t *tcLegacyLink) Attached() bool {
+	conn, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	return execTC(conn, unix.RTM_GETTFILTER, 0, filterMsg(t.ifindex, t.dir), nil) == nil
+}
+
+// Close detaches our filter (and our clsact qdisc, with our last filter on
+// it). It is best-effort: benign races (ENOENT — already gone; ENODEV —
+// interface removed, e.g. netns teardown) are ignored, and other failures
+// are logged rather than returned, matching cargowall's shutdown-defer
+// conventions.
 func (t *tcLegacyLink) Close() error {
 	conn, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
 	if err != nil {
@@ -203,25 +263,35 @@ func (t *tcLegacyLink) Close() error {
 	}
 	defer conn.Close()
 
-	// Remove exactly our egress filter (matched by parent + priority + handle).
-	fmsg := tcMsg{
-		family:  unix.AF_UNSPEC,
-		ifindex: int32(t.ifindex),
-		handle:  cwFilterHandle,
-		parent:  egressParent,
-		info:    makeFilterInfo(cwFilterPrio, unix.ETH_P_ALL),
+	// Remove exactly our filter (matched by parent + priority + handle).
+	err = execTC(conn, unix.RTM_DELTFILTER, 0, filterMsg(t.ifindex, t.dir), nil)
+	if err != nil && !isBenignDetachErr(err) {
+		t.logger.Warn("Failed to remove legacy TC "+t.dir.name+" filter", "ifindex", t.ifindex, "error", err)
 	}
-	if err := execTC(conn, unix.RTM_DELTFILTER, 0, fmsg, nil); err != nil && !isBenignDetachErr(err) {
-		t.logger.Warn("Failed to remove legacy TC egress filter", "ifindex", t.ifindex, "error", err)
-	}
+	// Our filter not there means its interface went, and a qdisc we
+	// created with it, or someone removed the filter: a qdisc there now
+	// may not be ours, and is left.
+	gone := err != nil && isBenignDetachErr(err)
 
-	// Only remove the clsact qdisc if we created it, so we never tear down a
-	// qdisc another tool installed.
-	if t.createdQdisc {
-		qmsg := tcMsg{family: unix.AF_UNSPEC, ifindex: int32(t.ifindex), handle: clsactHandle, parent: clsactParent}
-		if err := execTC(conn, unix.RTM_DELQDISC, 0, qmsg, nil); err != nil && !isBenignDetachErr(err) {
-			t.logger.Warn("Failed to remove clsact qdisc", "ifindex", t.ifindex, "error", err)
-		}
+	// Only remove the clsact qdisc if we created it, and only with the last
+	// filter of ours on it, so we never tear down a qdisc another tool
+	// installed, nor another filter of ours.
+	if !t.ownsQdisc {
+		return nil
+	}
+	ownedMu.Lock()
+	defer ownedMu.Unlock()
+	t.ownsQdisc = false
+	if ownedQdiscs[t.ifindex]--; ownedQdiscs[t.ifindex] > 0 {
+		return nil
+	}
+	delete(ownedQdiscs, t.ifindex)
+	if gone {
+		return nil
+	}
+	qmsg := tcMsg{family: unix.AF_UNSPEC, ifindex: int32(t.ifindex), handle: clsactHandle, parent: clsactParent}
+	if err := execTC(conn, unix.RTM_DELQDISC, 0, qmsg, nil); err != nil && !isBenignDetachErr(err) {
+		t.logger.Warn("Failed to remove clsact qdisc", "ifindex", t.ifindex, "error", err)
 	}
 	return nil
 }

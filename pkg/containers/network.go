@@ -182,33 +182,35 @@ func (t *Tracker) carvePrefix(ctx context.Context, networkName string, prefix ne
 	return true
 }
 
-// carveNetworks carves every bridge network's subnets, the default bridge
+// scanNetworks carves every bridge network's subnets, the default bridge
 // network's included, from one list of the daemon's networks, and caches
 // each network's driver on the way, so carvePrefix inspects none of them.
-// It runs at the top of every session (reconcile): the first, before any
-// container of a daemon that came up after cargowall can have produced
-// traffic but for the window between its coming up and that first list,
-// and every later one, which picks up networks created during a stream
+// The same list says which bridges there are (bridgesListed). It runs at
+// the top of every session (reconcile): the first, before any container
+// of a daemon that came up after cargowall can have produced traffic but
+// for the window between its coming up and that first list, and every
+// later one, which picks up networks created or destroyed during a stream
 // gap. It returns the prefixes it carved now.
-func (t *Tracker) carveNetworks(ctx context.Context) []netip.Prefix {
-	if t.opts.AllowLocalSubnet == nil {
+func (t *Tracker) scanNetworks(ctx context.Context) []netip.Prefix {
+	if t.opts.AllowLocalSubnet == nil && t.opts.OnBridge == nil {
 		return nil
 	}
 	lctx, cancel := context.WithTimeout(ctx, unaryTimeout)
 	nets, err := t.client.listNetworks(lctx)
 	cancel()
 	if err != nil {
-		t.logger.Warn("Cannot list networks for subnet carve-outs; they wait for each network's containers",
-			"error", err)
+		t.logger.Warn("Cannot list networks; subnet carve-outs wait for each network's containers, "+
+			"and bridges for the next session", "error", err)
 		return nil
 	}
+	t.bridgesListed(nets)
 	var carved []netip.Prefix
 	for _, nw := range nets {
 		isBridge := nw.Driver == "bridge"
 		t.mu.Lock()
 		t.netDrivers[nw.Name] = isBridge
 		t.mu.Unlock()
-		if !isBridge {
+		if !isBridge || t.opts.AllowLocalSubnet == nil {
 			continue
 		}
 		for _, cfg := range nw.IPAM.Config {
@@ -224,9 +226,9 @@ func (t *Tracker) carveNetworks(ctx context.Context) []netip.Prefix {
 // BEFORE its first container can produce traffic — container-driven
 // discovery alone misses networks whose containers exit faster than an
 // inspect (docker run --rm ... true), and under enforce an uncarved bridge
-// is a broken network.
+// is a broken network. Its device goes to Options.OnBridge first.
 func (t *Tracker) handleNetworkCreate(ctx context.Context, ev dockerEvent) {
-	if t.opts.AllowLocalSubnet == nil {
+	if t.opts.AllowLocalSubnet == nil && t.opts.OnBridge == nil {
 		return
 	}
 	name := ev.Actor.Attributes["name"]
@@ -252,6 +254,10 @@ func (t *Tracker) handleNetworkCreate(ctx context.Context, ev dockerEvent) {
 		// already primed); say it once here instead.
 		t.logger.Info("Non-bridge network created; its subnets stay adjudicated (not local-only)",
 			"network", name, "driver", nw.Driver)
+		return
+	}
+	t.bridgeUp(nw)
+	if t.opts.AllowLocalSubnet == nil {
 		return
 	}
 	for _, cfg := range nw.IPAM.Config {

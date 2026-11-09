@@ -64,6 +64,7 @@ type containerAttribution struct {
 	observer    *origin.Observer // nil when the hook failed to load/attach under observe
 	enricher    *containers.Enricher
 	tracker     *containers.Tracker // nil until startUserspace succeeds
+	stamp       *bridgeStamp        // nil with step rules off
 	postures    *postureLedger      // decides what losing the posture means
 	scope       scopeDecision       // the daemon's rules, left for it to decide once it answers
 	logger      *slog.Logger
@@ -125,6 +126,7 @@ func newContainerAttribution(enabled bool, mode origin.Mode, stepTracker *steps.
 		stepTracker: stepTracker,
 		mode:        mode,
 		enricher:    &containers.Enricher{},
+		stamp:       newBridgeStamp(tcObjs, logger),
 		postures:    p,
 		logger:      logger,
 	}
@@ -391,7 +393,8 @@ func (a *containerAttribution) subnetCarver(allow func(prefix netip.Prefix) erro
 
 // startUserspace is the late phase: docker-events tracking, tagging, DNS
 // client attribution (only meaningful when the proxy holds a container
-// listener, containerDNS), and bridge-subnet discovery for the hook. It
+// listener, containerDNS), bridge-subnet discovery for the hook, and the
+// bridges the step stamp attaches to. It
 // reports whether a tracker started: none on a host with no Docker, and
 // none for bridges with no socket to ask about them, which is warned. A
 // tracker for a Docker still to come up connects once it answers, and
@@ -411,6 +414,8 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 	ctr, err := startTracker(ctx, containers.Options{
 		AllowLocalSubnet: a.subnetCarver(a.allowLocalNetwork),
 		OnConnect:        a.onConnect(docker),
+		OnBridge:         a.stamp.onBridge(),
+		OnBridgeGone:     a.stamp.onBridgeGone(),
 	}, a.stepTracker, a.observer, auditLogger, a.logger)
 	if err != nil {
 		a.logger.Warn("Container attribution disabled", "error", err)
@@ -442,7 +447,8 @@ func (a *containerAttribution) onConnect(docker *dockerUp) func(first bool, carv
 
 // Close settles the scope's decision, then stops the tracker before the
 // observer: the tracker's shutdown telemetry summary reads the observer's
-// record counter.
+// record counter. The stamp's bridges are detached once the tracker, which
+// reports them, has stopped.
 func (a *containerAttribution) Close() {
 	if a == nil {
 		return
@@ -451,6 +457,7 @@ func (a *containerAttribution) Close() {
 	if a.tracker != nil {
 		a.tracker.Close()
 	}
+	a.stamp.Close()
 	if a.observer != nil {
 		a.observer.Close()
 	}

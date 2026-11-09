@@ -98,6 +98,16 @@ type Options struct {
 	// the bridge subnets that session's reconcile carved. Nil for none.
 	// Called on the stream goroutine: it must not block.
 	OnConnect func(first bool, carved []netip.Prefix)
+	// OnBridge is called with the host device of every bridge-driver
+	// network: each one in the network list at the top of every session,
+	// and each one created since, before its subnets are carved. A device
+	// it was called with before may come again, the same bridge or a new
+	// one behind the same name. OnBridgeGone is called with the device of
+	// a bridge network destroyed since, or missing from a later session's
+	// list. Nil OnBridge for neither. Called on the stream goroutine,
+	// without the tracker lock: they must not block.
+	OnBridge     func(dev string)
+	OnBridgeGone func(dev string)
 }
 
 type containerInfo struct {
@@ -164,6 +174,9 @@ type Tracker struct {
 	// — the inspect runs on the event-stream goroutine, which must never be
 	// serially parked (same rule execConcurrency exists for).
 	netDrivers map[string]bool
+	// bridges maps each bridge network handed to Options.OnBridge, by id,
+	// to its device, for OnBridgeGone.
+	bridges map[string]string
 	// missingCounts tracks consecutive reconcile passes a tracked container
 	// was absent from listContainers; the stale sweep fires only on the
 	// second consecutive absence, so one partial list from a settling
@@ -253,6 +266,7 @@ func Start(ctx context.Context, opts Options, tagger StepTagger, observer *origi
 		seenExecs:   make(map[string]map[string]bool),
 		seenSubnets: make(map[string]bool),
 		netDrivers:  make(map[string]bool),
+		bridges:     make(map[string]string),
 
 		missingCounts: make(map[string]int),
 	}
@@ -358,7 +372,7 @@ func (t *Tracker) streamOnce(ctx context.Context) (healthy bool, err error) {
 			// whose containers are too short-lived to inspect. A destroy
 			// evicts the driver cache — a same-name recreate with a
 			// different driver must never read the dead network's "bridge"
-			// verdict.
+			// verdict — and reports the bridge gone.
 			switch ev.Action {
 			case "create":
 				t.handleNetworkCreate(ctx, ev)
@@ -370,6 +384,7 @@ func (t *Tracker) streamOnce(ctx context.Context) (healthy bool, err error) {
 				t.mu.Lock()
 				delete(t.netDrivers, name)
 				t.mu.Unlock()
+				t.bridgeGone(ev.Actor.ID)
 			case "connect", "disconnect":
 				// A running container gaining or releasing an address — the
 				// only address changes that arrive without a container start.

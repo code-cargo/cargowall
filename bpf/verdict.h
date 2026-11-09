@@ -345,23 +345,57 @@ __noinline int rules_v6(__u32 policy, __u64 dst_hi, __u64 dst_lo, __u32 dst_port
     return RULE_NONE;
 }
 
-// step_policy_of is the policy holding the own rules of the step tagged on
-// the socket skb was sent from, or POLICY_JOB for none: no socket, no tag,
-// or no binding for the tag. The two lookups are not one atomic read: the
-// tag map is an LRU, whose element a concurrent re-tag or eviction can
-// recycle between them, judging the packet by another socket's step. TC
-// reads its own way, so both hooks would have to lose that race on the
-// same packet, and steps that race each other's sockets so are beyond the
-// step rules: the job is the boundary between them.
-static __always_inline __u32 step_policy_of(struct __sk_buff *skb) {
-    __u64 cookie = bpf_get_socket_cookie(skb);
-    if (!cookie)
+// ---- Bridge stamp ----
+//
+// A bridge-networked container's packets reach TC past NAT with no socket,
+// so TC cannot read their socket's step tag. cw_tc_br_stamp, on each Docker
+// bridge's ingress, still sees the container's socket (the kernel orphans
+// the packet only as it enters the IP layer), and writes the socket's step
+// policy into skb->mark under STEP_STAMP_MAGIC; the mark rides forwarding
+// and NAT to the uplink, where step_policy_of reads it for a packet with no
+// socket. A container on a bridge network cannot forge a stamp: a packet's
+// mark is cleared as it leaves the container's network namespace, and the
+// bridge program clears any stamp it did not write itself. Premises: the
+// 0xCA1B0000 range is cargowall's (a host whose own rules mark forwarded
+// packets in it would read as stamped), and every other container path to
+// the uplink clears the mark too or carries the container's socket (see
+// "The bridge stamp" in design.md). The cgroup hook always has the socket,
+// and never reads a stamp.
+#define STEP_STAMP_MAGIC      0xCA1B0000u
+#define STEP_STAMP_MASK       0xFFFF0000u
+#define STEP_STAMP_POLICY_MAX 0xFFFFu
+
+// stamp_step_policy is the step policy a bridge stamp in mark carries, or
+// POLICY_JOB for a mark that is none.
+static __always_inline __u32 stamp_step_policy(__u32 mark) {
+    if ((mark & STEP_STAMP_MASK) != STEP_STAMP_MAGIC)
         return POLICY_JOB;
+    return mark & STEP_STAMP_POLICY_MAX;
+}
+
+// cookie_step_policy is the policy holding the own rules of the step tagged
+// on the socket with cookie, or POLICY_JOB for none: no tag, or no binding
+// for the tag. The two lookups are not one atomic read: the tag map is an
+// LRU, whose element a concurrent re-tag or eviction can recycle between
+// them, judging the packet by another socket's step. TC reads its own way,
+// so both hooks would have to lose that race on the same packet, and steps
+// that race each other's sockets so are beyond the step rules: the job is
+// the boundary between them.
+static __always_inline __u32 cookie_step_policy(__u64 cookie) {
     __u32 *ordinal = bpf_map_lookup_elem(&map_sock_step, &cookie);
     if (!ordinal)
         return POLICY_JOB;
     __u32 *policy = bpf_map_lookup_elem(&map_step_policy, ordinal);
     return policy ? *policy : POLICY_JOB;
+}
+
+// step_policy_of is the step policy skb is judged by: that of the socket it
+// was sent from, or, with no socket (TC, past NAT), its bridge stamp's.
+static __always_inline __u32 step_policy_of(struct __sk_buff *skb) {
+    __u64 cookie = bpf_get_socket_cookie(skb);
+    if (!cookie)
+        return stamp_step_policy(skb->mark);
+    return cookie_step_policy(cookie);
 }
 
 // verdict_allowed_v4 returns 1 if a packet to dst (network byte order) on

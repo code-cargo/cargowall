@@ -74,8 +74,10 @@ connection-opening SYN therefore parks the flow `NEED_HELLO` whatever its entry
 said, and a SYN carrying data (TCP Fast Open) is judged as the new
 connection's first flight. The punt that opens a connection's first flight
 carries `L7_PUNT_F_NEW_CONN`, so the oracle starts a cycle of its own for it
-instead of treating it as a stale punt of the decided one. A verdict governs
-one connection, never the next one on the socket.
+instead of treating it as a stale punt of the decided one, and a verdict is
+never written over a `NEED_HELLO` entry, which belongs to the connection that
+parked it. A verdict governs one connection, never the next one on the
+socket.
 
 **HTTP** gets the same contract deliberately: the first request's `Host` pins
 the connection. Re-adjudicating every request line was tried and removed — the

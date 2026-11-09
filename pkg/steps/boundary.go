@@ -24,6 +24,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
 	"golang.org/x/sys/unix"
 
@@ -210,7 +211,58 @@ func (t *Tracker) run() {
 		default:
 			t.handleStepEvent(record.RawSample, readClock())
 		}
+		t.checkEndsLost(time.Now())
 	}
+}
+
+// checkEndsLost warns of step ends the kernel had no room to report, at
+// most every reportAfter. Each leaves a step running as far as OrdinalAt
+// knows, until the next step starts: a runner operation in that window,
+// after the step really ended, resolves to it, and what it starts gets
+// that step's rules rather than the job's.
+func (t *Tracker) checkEndsLost(now time.Time) {
+	if t.endsLost == nil || now.Sub(t.endsLostChecked) < reportAfter {
+		return
+	}
+	t.endsLostChecked = now
+	n, err := t.endsLost()
+	if err != nil || n <= t.endsLostSeen {
+		return
+	}
+	t.logger.Warn("Step end events lost; until the next step starts, containers a runner operation starts get "+
+		"the rules of the step last seen running, not the job's", "lost", n-t.endsLostSeen, "step_ordinal", t.runningStep())
+	t.endsLostSeen = n
+}
+
+// runningStep is the ordinal of the latest root that may be a step and has
+// not been seen to exit, 0 for none.
+func (t *Tracker) runningStep() uint32 {
+	t.boundaryMu.Lock()
+	defer t.boundaryMu.Unlock()
+	var latest *boundary
+	for i := range t.boundaries {
+		b := &t.boundaries[i]
+		if !b.notStep && b.end.IsZero() && (latest == nil || !b.at.Before(latest.at)) {
+			latest = b
+		}
+	}
+	if latest == nil {
+		return 0
+	}
+	return latest.ordinal
+}
+
+// sumPerCPU sums the one value of a per-CPU array.
+func sumPerCPU(m *ebpf.Map) (uint64, error) {
+	var perCPU []uint64
+	if err := m.Lookup(uint32(0), &perCPU); err != nil {
+		return 0, err
+	}
+	var n uint64
+	for _, v := range perCPU {
+		n += v
+	}
+	return n, nil
 }
 
 // reportLost reports the steps forked before cutoff whose exec or exit

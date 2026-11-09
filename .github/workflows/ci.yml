@@ -114,6 +114,10 @@ jobs:
 
       - name: Run tests
         run: make test-ci
+        env:
+          # The privileged lanes' tests fail, not skip, where the runner
+          # lacks what they need (a bridge, veth, br_netfilter).
+          CARGOWALL_TEST_STRICT: "1"
 
       - name: Fix test result permissions
         if: always()

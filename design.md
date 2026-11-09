@@ -849,8 +849,9 @@ to select policy with.
     `docker run` of a container action, and the `docker exec` a container
     job runs each step as, carry the step's environment, so the action's
     container, and each step's exec, get that step's tag. A step root's
-    lost exit event leaves it running as far as this goes, so a no-step
-    root after it is passed over.
+    exit event lost (the ring full) leaves it running as far as this
+    goes, so a no-step root after it is passed over: the kernel counts
+    each, and the tracker warns of them, naming the step.
   - *What per-step rules do not separate.* They bound what each step's own
     processes reach. Steps of one job share a uid, the workspace and
     dockerd, so a step can shape what a later one runs, or share a socket
@@ -867,34 +868,43 @@ to select policy with.
     hook reads the listener's tag; the stricter wins, fail-closed.
     Accepted sockets carry no tag, so both hooks judge them by the job's
     rules.
-  - *The bridge stamp.* `cw_tc_br_stamp`, on each Docker bridge's TC
-    ingress, still sees the container's socket: the kernel first orphans
-    a packet in `ip_rcv_core`, after TC ingress (since 4.19, 9c4c325252c5,
-    below the 5.8 floor; the veth, bridge and TC ingress paths at v5.15
-    and v6.6 orphan nothing). For a socket whose step has a policy it
-    writes `0xCA1B0000 | policy` into the packet's mark, which rides
-    forwarding and NAT to the uplink, where `cw_tc_egress` reads it for a
-    packet with no socket, and only then. A stamp can only add a step's
-    allowances: a packet that reaches the uplink without one is judged by
-    the job's rules, never wider, so a kernel that broke the premise would
-    leave container traffic fail-closed. A container on a bridge network
-    cannot forge a stamp: the mark is cleared as a packet leaves the
-    container's namespace, and the bridge program clears a stamp it did
-    not write. It stamps no packet that already carries another mark, nor
-    a policy past `0xFFFF`. Two premises: the `0xCA1B` range is
-    cargowall's (a host whose own rules mark forwarded packets in it would
-    read as stamped), and every container path to the uplink either clears
-    the mark at a namespace boundary or carries the container's socket. A
-    macvlan or ipvlan network does neither for packets a container
-    forwards, so a container with `NET_ADMIN` there is trusted with the
-    stamp; dockerd grants that to any caller, and a step that can drive
-    dockerd is beyond step rules anyway (see Sudo lockdown).
-    `cmd/bridge_stamp.go` attaches the program to each bridge the
-    container tracker reports, attaches afresh one recreated behind the
-    same name, and detaches one whose network is destroyed; it runs only
+  - *The bridge stamp.* `cw_tc_br_stamp`, at the TC ingress of each
+    Docker bridge port (a container veth's host end), still sees the
+    container's socket. That hook runs in `__netif_receive_skb_core`
+    before the port's rx_handler, `br_handle_frame`, and the first orphan
+    on the path comes after it: br_netfilter's `setup_pre_routing`, under
+    `br_nf_pre_routing` in the bridge's input, where
+    `bridge-nf-call-iptables`/`-ip6tables` are on (as Docker sets them),
+    else `ip_rcv_core` (since 4.19, 9c4c325252c5, below the 5.8 floor).
+    The veth crossing and the bridge's own input orphan nothing (read at
+    v5.15 and v6.6). For a socket whose step has a policy the program
+    writes `0xCA1B0000 | policy` into the packet's mark, which rides the
+    bridge, br_netfilter, forwarding and NAT to the uplink, where
+    `cw_tc_egress` reads it for a packet with no socket, and only then. A
+    stamp can only add a step's allowances: a packet that reaches the
+    uplink without one is judged by the job's rules, never wider, so a
+    kernel that broke the premise would leave container traffic
+    fail-closed. A container cannot forge a stamp: the mark is cleared as
+    a packet leaves the container's namespace, and the port program clears
+    a stamp it did not write. It stamps no packet that already carries
+    another mark, nor a policy past `0xFFFF`. Premises: no rule of the
+    host's sets or changes a forwarded packet's mark in the `0xCA1B` range
+    between the port and the uplink, and every container path to the
+    uplink either clears the mark at a namespace boundary or carries the
+    container's socket. Where neither holds the root premise does: a
+    root-installed program ahead of the stamp at a port's head, or on a
+    path that crosses no stamped port (a plain routed veth, macvlan or
+    ipvlan, whose packets a container with `NET_ADMIN` forwards), can set
+    a mark that is read as a stamp; dockerd grants `NET_ADMIN` to any
+    caller, and a step that can drive dockerd is beyond step rules anyway
+    (see Sudo lockdown). `cmd/bridge_stamp.go` keeps the program on every
+    port there is: rtnetlink's interface events (`network.WatchLinks`)
+    say which veths have a Docker bridge (`network.DockerBridge`'s names,
+    or one the container tracker reports) for their master, by index,
+    and a listing makes up for events the kernel dropped. It runs only
     with step rules on.
-  - *Checking the premise.* The bridge program counts the IP packets that
-    reach a bridge's ingress with no socket (`map_br_sockless`, per CPU;
+  - *Checking the premise.* The port program counts the IP packets that
+    reach it with no socket (`map_br_sockless`, per CPU;
     `TcBpfObjects.BridgeSocketless` sums them), on whatever kernel the job
     runs: a container's own flows keep the count at 0. Packets with no
     socket by nature count too: IGMP reports, which the kernel builds
@@ -903,12 +913,11 @@ to select policy with.
     netns, docker-in-docker). IPv6's neighbor discovery and MLD carry the
     kernel's socket, and don't count.
   - *Host-only step rules.* Where the stamp cannot apply, a container's
-    traffic gets the job's rules at TC, never wider: a bridge the program
-    could not be attached to (warned), a bridge's packets before the
-    attach lands (a bridge created and used at once, or one in use before
-    the tracker's first session lists it), a daemon whose bridges are in
-    another network namespace, and a run with no container tracking. Step
-    rules then reach the host's processes alone.
+    traffic gets the job's rules at TC, never wider: a port the program
+    could not be attached to (warned), a port's packets before the attach
+    lands, a daemon whose bridges are in another network namespace, and a
+    run with no container tracking. Step rules then reach the host's
+    processes alone.
   - The denial UX above applies: UDP fails fast with `EPERM`, TCP times
     out.
 

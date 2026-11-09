@@ -497,6 +497,10 @@ func TestStart_TagsWorkerChild(t *testing.T) {
 	require.NoError(t, objs.MapTaskNspid.Lookup(childTgid, &got))
 	assert.Equal(t, uint32(childPID), got)
 
+	lost, err := tr.endsLost()
+	require.NoError(t, err)
+	assert.Zero(t, lost, "no step end lost")
+
 	// The reconciler saw the boundary event (its tgid is our numbering, so
 	// the cmdline read behind it works too — visible in -v output).
 	assert.Eventually(t, func() bool { return tr.OrdinalAt(time.Now()) >= ordinal },

@@ -53,7 +53,7 @@ func (o *TcBpfObjects) StepRules() bool {
 }
 
 // The bridge stamp, STEP_STAMP_* in verdict.h: a packet's mark carries a
-// step policy as StepStampMagic | policy, from a Docker bridge's ingress
+// step policy as StepStampMagic | policy, from a Docker bridge port's ingress
 // to the uplink's TC egress. A policy past StepStampPolicyMax fits no
 // stamp, and its containers' traffic gets the job's rules.
 const (
@@ -62,10 +62,10 @@ const (
 	StepStampPolicyMax uint32 = 0xFFFF
 )
 
-// BridgeSocketless is how many IP packets have reached a Docker bridge's
-// ingress with no socket, map_br_sockless summed over the CPUs: 0 while the
-// kernel keeps a container's socket on its packets there, as the bridge
-// stamp needs. Packets with no socket by nature (IGMP reports, a nested
+// BridgeSocketless is how many IP packets have reached a Docker bridge
+// port's ingress with no socket, map_br_sockless summed over the CPUs: 0
+// while the kernel keeps a container's socket on its packets there, as the
+// bridge stamp needs. Packets with no socket by nature (IGMP reports, a nested
 // namespace's forwarded traffic) count too.
 func (o *TcBpfObjects) BridgeSocketless() (uint64, error) {
 	var perCPU []uint64

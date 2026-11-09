@@ -17,45 +17,47 @@
 package cmd
 
 import (
+	"io"
 	"log/slog"
-	"net"
 	"sync"
 
 	"github.com/cilium/ebpf"
 
 	"github.com/code-cargo/cargowall/bpf"
+	"github.com/code-cargo/cargowall/pkg/network"
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
 
 // bridgeStamp keeps cw_tc_br_stamp attached at the TC ingress of every
-// Docker bridge the container tracker reports, so a container's traffic
-// forwarded through one reaches the uplink's TC egress with its socket's
-// step policy in the packet's mark (stamp_step_policy in verdict.h). The
-// container's socket is gone from the packet by then.
+// port of a Docker bridge: the host end of each container's veth. There a
+// container's packet still has its socket, which br_netfilter drops as the
+// bridge takes the packet, so the program can write the socket's step
+// policy into the packet's mark for the uplink's TC egress
+// (stamp_step_policy in verdict.h).
 //
-// A bridge it can't attach to is warned and left unstamped: its
-// containers' traffic gets the job's rules alone, the stricter outcome. So
-// does a bridge's traffic before the attach lands, a bridge created and
-// used at once among it.
+// The ports come from the kernel (network.WatchLinks): a veth whose master
+// is a Docker bridge, by Docker's names (network.DockerBridge) or a name
+// the container tracker reports. Everything is keyed by interface index,
+// which a removal names exactly.
+//
+// A port it can't attach to is warned and left unstamped: its container's
+// traffic gets the job's rules alone, the stricter outcome. So do a port's
+// packets before the attach lands.
 //
 // Nil (step rules off) is the disabled feature, and every method no-ops:
-// the program would stamp nothing.
+// the program would stamp nothing, and no watch starts.
 type bridgeStamp struct {
-	prog    *ebpf.Program
-	attach  func(dev string, prog *ebpf.Program, logger *slog.Logger) (tc.Attachment, error)
-	ifindex func(dev string) (int, error)
-	logger  *slog.Logger
+	prog   *ebpf.Program
+	attach func(ifindex int, name string, prog *ebpf.Program, logger *slog.Logger) (tc.Attachment, error)
+	watch  func(onLink func(network.Link), onGone func(int), logger *slog.Logger) (io.Closer, error)
+	logger *slog.Logger
 
 	mu      sync.Mutex
-	bridges map[string]stampedBridge // by device
+	links   map[int]network.Link  // the namespace's interfaces, by index
+	named   map[string]bool       // Docker bridges the tracker reported
+	ports   map[int]tc.Attachment // where the program is attached, by index
+	watcher io.Closer
 	closed  bool
-}
-
-// stampedBridge is the attachment on one bridge, and the index the device
-// had then.
-type stampedBridge struct {
-	ifindex int
-	link    tc.Attachment
 }
 
 // newBridgeStamp is the stamp for objs' program, nil with no objects or
@@ -65,66 +67,148 @@ func newBridgeStamp(objs *bpf.TcBpfObjects, logger *slog.Logger) *bridgeStamp {
 		return nil
 	}
 	return &bridgeStamp{
-		prog:    objs.CwTcBrStamp,
-		attach:  tc.AttachIngress,
-		ifindex: ifindexOf,
-		logger:  logger,
-		bridges: make(map[string]stampedBridge),
+		prog:   objs.CwTcBrStamp,
+		attach: tc.AttachIngress,
+		watch:  watchLinks,
+		logger: logger,
+		links:  make(map[int]network.Link),
+		named:  make(map[string]bool),
+		ports:  make(map[int]tc.Attachment),
 	}
 }
 
-func ifindexOf(dev string) (int, error) {
-	iface, err := net.InterfaceByName(dev)
+func watchLinks(onLink func(network.Link), onGone func(int), logger *slog.Logger) (io.Closer, error) {
+	return network.WatchLinks(onLink, onGone, logger)
+}
+
+// start watches the namespace's interfaces, attaching to each Docker
+// bridge port there is and each one that comes.
+func (b *bridgeStamp) start() {
+	if b == nil {
+		return
+	}
+	// Not under b.mu: the watch reports the interfaces there are before it
+	// returns.
+	w, err := b.watch(b.link, b.linkGone, b.logger)
 	if err != nil {
-		return 0, err
+		b.logger.Warn("Cannot watch interfaces for Docker bridge ports; container traffic gets the job's rules, "+
+			"not its steps'", "error", err)
+		return
 	}
-	return iface.Index, nil
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		_ = w.Close()
+		return
+	}
+	b.watcher = w
 }
 
-// up attaches to dev, unless the program is attached there already: to the
-// same device, still. A device recreated behind the name, at any index, is
-// attached afresh, and the dead one's attachment dropped.
-func (b *bridgeStamp) up(dev string) {
+// link takes an interface's report: a port to attach to or detach from,
+// or a bridge whose ports are looked at again when it is new or renamed.
+func (b *bridgeStamp) link(l network.Link) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
 		return
 	}
-	idx, err := b.ifindex(dev)
-	if err != nil {
-		b.drop(dev)
-		b.logger.Warn("Docker bridge not found; its containers' traffic gets the job's rules, not their steps'",
-			"bridge", dev, "error", err)
-		return
+	old, had := b.links[l.Index]
+	b.links[l.Index] = l
+	b.sync(l.Index)
+	if !had || old.Name != l.Name {
+		b.syncPortsOf(l.Index)
 	}
-	if s, ok := b.bridges[dev]; ok {
-		if s.ifindex == idx && s.link.Attached() {
-			return
-		}
-		b.drop(dev)
-	}
-	l, err := b.attach(dev, b.prog, b.logger)
-	if err != nil {
-		b.logger.Warn("Docker bridge left unstamped; its containers' traffic gets the job's rules, not their steps'",
-			"bridge", dev, "error", err)
-		return
-	}
-	b.bridges[dev] = stampedBridge{ifindex: idx, link: l}
 }
 
-// gone drops dev's attachment: its network was destroyed.
+// linkGone drops a removed interface's attachment, and those of its ports
+// if it was a bridge.
+func (b *bridgeStamp) linkGone(index int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return
+	}
+	delete(b.links, index)
+	b.sync(index)
+	b.syncPortsOf(index)
+}
+
+// up is the tracker's report of a Docker bridge, which may carry a name of
+// its network's choosing (com.docker.network.bridge.name): its ports are
+// stamped.
+func (b *bridgeStamp) up(dev string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed || b.named[dev] {
+		return
+	}
+	b.named[dev] = true
+	for index, l := range b.links {
+		if l.Name == dev {
+			b.syncPortsOf(index)
+		}
+	}
+}
+
+// gone is the tracker's report that a Docker bridge's network was
+// destroyed. While a device by its name is still there, which is a bridge
+// recreated behind the name, reported before this, the name stays
+// Docker's. A removed bridge's ports have gone with it.
 func (b *bridgeStamp) gone(dev string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.drop(dev)
+	for _, l := range b.links {
+		if l.Name == dev {
+			return
+		}
+	}
+	delete(b.named, dev)
 }
 
-// drop detaches from dev, if attached there, with b.mu held.
-func (b *bridgeStamp) drop(dev string) {
-	if s, ok := b.bridges[dev]; ok {
-		_ = s.link.Close()
-		delete(b.bridges, dev)
+// syncPortsOf syncs the ports of the interface at index, with b.mu held.
+func (b *bridgeStamp) syncPortsOf(index int) {
+	for i, l := range b.links {
+		if l.Master == index {
+			b.sync(i)
+		}
 	}
+}
+
+// sync attaches to or detaches from the interface at index as it now is,
+// with b.mu held: attached if it is a Docker bridge's veth port, and
+// attached afresh if an attachment there has gone dead.
+func (b *bridgeStamp) sync(index int) {
+	l, ok := b.links[index]
+	want := ok && b.dockerPort(l)
+	a, have := b.ports[index]
+	switch {
+	case want && have && a.Attached():
+	case want:
+		if have {
+			_ = a.Close()
+			delete(b.ports, index)
+		}
+		na, err := b.attach(index, l.Name, b.prog, b.logger)
+		if err != nil {
+			b.logger.Warn("Docker bridge port left unstamped; its container's traffic gets the job's rules, "+
+				"not its step's", "port", l.Name, "bridge", b.links[l.Master].Name, "error", err)
+			return
+		}
+		b.ports[index] = na
+	case have:
+		_ = a.Close()
+		delete(b.ports, index)
+	}
+}
+
+// dockerPort reports whether l is a veth port of a Docker bridge, with
+// b.mu held.
+func (b *bridgeStamp) dockerPort(l network.Link) bool {
+	if l.Kind != "veth" || l.Master == 0 {
+		return false
+	}
+	m, ok := b.links[l.Master]
+	return ok && m.Kind == "bridge" && (network.DockerBridge(m.Name) || b.named[m.Name])
 }
 
 // onBridge and onBridgeGone are the tracker's Options.OnBridge and
@@ -144,15 +228,25 @@ func (b *bridgeStamp) onBridgeGone() func(string) {
 	return b.gone
 }
 
-// Close detaches from every bridge, and attaches to none after.
+// Close stops the watch and detaches from every port, and attaches to
+// none after.
 func (b *bridgeStamp) Close() {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.closed = true
-	for dev := range b.bridges {
-		b.drop(dev)
+	w := b.watcher
+	b.watcher = nil
+	b.mu.Unlock()
+	// Unlocked: the watch's last report may be waiting on b.mu.
+	if w != nil {
+		_ = w.Close()
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for index, a := range b.ports {
+		_ = a.Close()
+		delete(b.ports, index)
 	}
 }

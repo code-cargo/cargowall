@@ -394,7 +394,7 @@ func (a *containerAttribution) subnetCarver(allow func(prefix netip.Prefix) erro
 // startUserspace is the late phase: docker-events tracking, tagging, DNS
 // client attribution (only meaningful when the proxy holds a container
 // listener, containerDNS), bridge-subnet discovery for the hook, and the
-// bridges the step stamp attaches to. It
+// step stamp's watch for Docker bridge ports. It
 // reports whether a tracker started: none on a host with no Docker, and
 // none for bridges with no socket to ask about them, which is warned. A
 // tracker for a Docker still to come up connects once it answers, and
@@ -411,6 +411,7 @@ func (a *containerAttribution) startUserspace(ctx context.Context, dnsServer *dn
 			"bridges_error", docker.dockerd.BridgesErr)
 		return false
 	}
+	a.stamp.start()
 	ctr, err := startTracker(ctx, containers.Options{
 		AllowLocalSubnet: a.subnetCarver(a.allowLocalNetwork),
 		OnConnect:        a.onConnect(docker),
@@ -447,8 +448,8 @@ func (a *containerAttribution) onConnect(docker *dockerUp) func(first bool, carv
 
 // Close settles the scope's decision, then stops the tracker before the
 // observer: the tracker's shutdown telemetry summary reads the observer's
-// record counter. The stamp's bridges are detached once the tracker, which
-// reports them, has stopped.
+// record counter. The stamp's ports are detached once the tracker, which
+// names bridges for it, has stopped.
 func (a *containerAttribution) Close() {
 	if a == nil {
 		return

@@ -34,6 +34,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// skipUnlessStrict skips t for what the environment lacks, or fails it
+// where CARGOWALL_TEST_STRICT=1 (CI's privileged lanes) says it must not.
+func skipUnlessStrict(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("CARGOWALL_TEST_STRICT") == "1" {
+		t.Fatalf(format+" (CARGOWALL_TEST_STRICT=1)", args...)
+	}
+	t.Skipf(format, args...)
+}
+
 // scratchIndex is the interface index the scratch device takes, so a
 // device recreated behind it takes the same one.
 const scratchIndex = 77
@@ -50,7 +60,7 @@ func scratchNetns(t *testing.T) string {
 	}
 	for _, bin := range []string{"ip", "tc"} {
 		if _, err := exec.LookPath(bin); err != nil {
-			t.Skipf("needs iproute2's %s", bin)
+			skipUnlessStrict(t, "needs iproute2's %s", bin)
 		}
 	}
 	// One a run that died left behind, its process gone, is no one's.
@@ -128,7 +138,7 @@ func TestAttachIngress_AttachedUntilTheInterfaceGoes(t *testing.T) {
 	netns := scratchNetns(t)
 	prog := passProg(t)
 
-	a, err := AttachIngress("d0", prog, discard())
+	a, err := AttachIngress(scratchIndex, "d0", prog, discard())
 	if err != nil {
 		t.Fatalf("AttachIngress: %v", err)
 	}

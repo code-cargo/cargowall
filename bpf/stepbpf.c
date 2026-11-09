@@ -177,6 +177,16 @@ struct {
     __uint(max_entries, 1024);
 } map_step_live SEC(".maps");
 
+// Step ends the ring had no room for, per CPU. A lost exec or exit event
+// is made up for from /proc; a lost end leaves its step running as far as
+// userspace knows, and userspace warns of it.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, 1);
+} map_step_ends_lost SEC(".maps");
+
 // One record per task in the daemon's pid-namespace subtree, streamed by
 // cw_step_iter. tid/tgid/ppid are global; ns_tgid is the process id
 // userspace sees. pkg/steps builds its process-tree views from these
@@ -366,6 +376,11 @@ static __always_inline void emit_step_end(__u32 tgid)
         ev->pad = 0;
         ev->ktime = bpf_ktime_get_ns();
         bpf_ringbuf_submit(ev, 0);
+    } else {
+        __u32 k = 0;
+        __u64 *lost = bpf_map_lookup_elem(&map_step_ends_lost, &k);
+        if (lost)
+            *lost += 1;
     }
     bpf_map_delete_elem(&map_step_live, &tgid);
 }

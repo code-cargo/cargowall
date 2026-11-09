@@ -567,6 +567,32 @@ func TestStepExit_WithoutExec(t *testing.T) {
 	require.False(t, objs.MapStepLive.Iterate().Next(&k, &v), "a root that never exec'd has no step to end")
 }
 
+// TestStepEnd_LostIsCounted: a step end the ring has no room for, its
+// reader gone quiet and full with exec events, is counted.
+func TestStepEnd_LostIsCounted(t *testing.T) {
+	tcObjs, objs, iter := loadStepObjects(t)
+	selfTgid, ok := globalTgid(t, iter, os.Getpid())
+	require.True(t, ok)
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: selfTgid, Enabled: 1, NextOrdinal: 5}))
+
+	// With no reader, about sixty exec events (each over STEP_ENV_MAX) fill
+	// the ring's 2MB but for less than one more, and the fork and end
+	// events after take what is left, a few hundred roots on.
+	lost := func() uint64 {
+		var perCPU []uint64
+		require.NoError(t, objs.MapStepEndsLost.Lookup(uint32(0), &perCPU))
+		var n uint64
+		for _, v := range perCPU {
+			n += v
+		}
+		return n
+	}
+	for i := 0; i < 5000 && lost() == 0; i++ {
+		require.NoError(t, exec.Command("true").Run())
+	}
+	require.NotZero(t, lost(), "the ends that found the ring full are counted")
+}
+
 // TestStepEnd_AfterExec: a step root that exits after its exec reports
 // its step's end, once, dated when it exited, and leaves nothing behind.
 func TestStepEnd_AfterExec(t *testing.T) {

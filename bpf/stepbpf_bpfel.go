@@ -64,6 +64,7 @@ type StepBpfTaskIterRec struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	StepBpfMapMapSockStep             = "map_sock_step"
+	StepBpfMapMapStepEndsLost         = "map_step_ends_lost"
 	StepBpfMapMapStepEvents           = "map_step_events"
 	StepBpfMapMapStepExecPending      = "map_step_exec_pending"
 	StepBpfMapMapStepLive             = "map_step_live"
@@ -136,6 +137,7 @@ type StepBpfProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type StepBpfMapSpecs struct {
 	MapSockStep        *ebpf.MapSpec `ebpf:"map_sock_step"`
+	MapStepEndsLost    *ebpf.MapSpec `ebpf:"map_step_ends_lost"`
 	MapStepEvents      *ebpf.MapSpec `ebpf:"map_step_events"`
 	MapStepExecPending *ebpf.MapSpec `ebpf:"map_step_exec_pending"`
 	MapStepLive        *ebpf.MapSpec `ebpf:"map_step_live"`
@@ -176,6 +178,7 @@ func (o *StepBpfObjects) Close() error {
 // It can be passed to LoadStepBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type StepBpfMaps struct {
 	MapSockStep        *ebpf.Map `ebpf:"map_sock_step"`
+	MapStepEndsLost    *ebpf.Map `ebpf:"map_step_ends_lost"`
 	MapStepEvents      *ebpf.Map `ebpf:"map_step_events"`
 	MapStepExecPending *ebpf.Map `ebpf:"map_step_exec_pending"`
 	MapStepLive        *ebpf.Map `ebpf:"map_step_live"`
@@ -187,6 +190,7 @@ type StepBpfMaps struct {
 func (m *StepBpfMaps) Close() error {
 	return _StepBpfClose(
 		m.MapSockStep,
+		m.MapStepEndsLost,
 		m.MapStepEvents,
 		m.MapStepExecPending,
 		m.MapStepLive,

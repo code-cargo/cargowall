@@ -689,11 +689,11 @@ int cw_tc_egress(struct __sk_buff *skb) {
     return TC_ACT_OK;
 }
 
-// IP packets that reached a bridge's ingress with no socket, per CPU (see
-// cw_tc_br_stamp). The stamp rests on the kernel keeping a container's
-// socket on its packets until the IP layer: a container's own flows keep
-// this at 0, on whatever kernel the job runs. Packets with no socket by
-// nature count too: see "The bridge stamp" in design.md.
+// IP packets that reached a Docker bridge port's ingress with no socket,
+// per CPU (see cw_tc_br_stamp). The stamp rests on the kernel keeping a
+// container's socket on its packets until then: a container's own flows
+// keep this at 0, on whatever kernel the job runs. Packets with no socket
+// by nature count too: see "Checking the premise" in design.md.
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, __u32);
@@ -701,13 +701,13 @@ struct {
     __uint(max_entries, 1);
 } map_br_sockless SEC(".maps");
 
-// Bridge stamp, on a Docker bridge's ingress: see the bridge stamp section
-// of verdict.h. It stamps a packet whose socket's step has a policy, and
+// Bridge stamp, at a Docker bridge port's ingress: see the bridge stamp
+// section of verdict.h. It stamps a packet whose socket's step has a policy, and
 // clears a stamp it finds on any other; it never touches a mark that is not
 // a stamp, and leaves a packet that carries one unstamped (the job's rules
 // at TC, fail-closed). It counts an IP packet with no socket in
 // map_br_sockless. TC_ACT_UNSPEC, not TC_ACT_OK: a marker must not end
-// the bridge's chain. Under TCX it is TCX_NEXT, the next program's turn;
+// the port's chain. Under TCX it is TCX_NEXT, the next program's turn;
 // for a direct-action cls_bpf filter, classification goes on to the next
 // filter; at the end of either the packet passes.
 SEC("classifier/br_stamp")

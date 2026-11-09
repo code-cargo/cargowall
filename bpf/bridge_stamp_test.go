@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -111,25 +112,45 @@ const (
 	brForeignMark   uint32 = 0x00010000 | brPolicy // a mark no stamp: its low bits read as brPolicy
 )
 
+// skipUnlessStrict skips t for what the environment lacks, or fails it
+// where CARGOWALL_TEST_STRICT=1 (CI's privileged lanes) says it must not.
+func skipUnlessStrict(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("CARGOWALL_TEST_STRICT") == "1" {
+		t.Fatalf(format+" (CARGOWALL_TEST_STRICT=1)", args...)
+	}
+	t.Skipf(format, args...)
+}
+
 // TestBridgeStamp drives a container's sockets through the shape Docker
 // gives it: the container's namespace, a veth into the host's, a bridge
-// there, forwarding (masquerading, where iptables is there) and an uplink
-// with cw_tc_egress on it, cw_tc_br_stamp on the bridge's ingress. The
-// job's rules allow nothing, the default denies, and step policy brPolicy
-// allows 10.99.0.20 and fd99::20: a SYN to it gets through only with a
-// stamp of brPolicy, which only a socket tagged with a step bound to it
-// may get. Nothing else gets one: not an untagged or unbound socket, nor a
-// mark the container set (cleared as the packet leaves its namespace), or
-// a stamp set on the host's side before the bridge (cleared there), or a
-// packet another mark is on (left as it is, unstamped). A host socket's
-// mark in the stamp's range is never read as one, nor is an AF_PACKET
-// frame a tagged thread sends: packet sockets get no tag. And every one of
-// the container's packets reaches the bridge with its socket:
-// BridgeSocketless stays 0.
+// there with br_netfilter on it, forwarding (masquerading, where iptables
+// is there) and an uplink with cw_tc_egress on it, cw_tc_br_stamp on the
+// veth's host end, the bridge's port. The job's rules allow nothing, the
+// default denies, and step policy brPolicy allows 10.99.0.20 and fd99::20:
+// a SYN to it gets through only with a stamp of brPolicy, which only a
+// socket tagged with a step bound to it may get. Nothing else gets one:
+// not an untagged or unbound socket, nor a mark the container set (cleared
+// as the packet leaves its namespace), or a stamp set on the host's side
+// ahead of the program (cleared), or a packet another mark is on (left as
+// it is, unstamped). A host socket's mark in the stamp's range is never
+// read as one, nor is an AF_PACKET frame a tagged thread sends: packet
+// sockets get no tag. And every one of the container's packets reaches
+// the port with its socket: BridgeSocketless stays 0.
 //
 // ci-kernels have no bridge or veth: there it skips, and CI's runner
 // kernels run it.
 func TestBridgeStamp(t *testing.T) {
+	runBridgeStamp(t, true)
+}
+
+// TestBridgeStampWithoutBrNetfilter is TestBridgeStamp on a bridge
+// br_netfilter leaves alone, as one where the module is not loaded is.
+func TestBridgeStampWithoutBrNetfilter(t *testing.T) {
+	runBridgeStamp(t, false)
+}
+
+func runBridgeStamp(t *testing.T, brNetfilter bool) {
 	requireBPF(t)
 	objs := loadBPFObjectsStepRules(t, true)
 	put := func(m *ebpf.Map, k, v any) { require.NoError(t, m.Put(k, v)) }
@@ -143,10 +164,11 @@ func TestBridgeStamp(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { events.Close() })
 
-	topo := newBridgeTopology(t)
+	topo := newBridgeTopology(t, brNetfilter)
 	topo.enter(t, topo.rtr)
 	logger := slog.New(slog.DiscardHandler)
-	stamp, err := tc.AttachIngress("br0", objs.CwTcBrStamp, logger)
+	c0h := interfaceIndex(t, "c0h")
+	stamp, err := tc.AttachIngress(c0h, "c0h", objs.CwTcBrStamp, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { stamp.Close() })
 	uplink, err := tc.AttachEgress("d0", objs.CwTcEgress, logger)
@@ -169,16 +191,14 @@ func TestBridgeStamp(t *testing.T) {
 		check("step bound past the stamp's range", brOrdinalWide, 0, false)
 		check("forged stamp, set in the container", 0, StepStampMagic|brPolicy, false)
 
-		marker := markerProg(t, StepStampMagic|brPolicy)
-		m, err := tc.AttachIngress("c0h", marker, logger)
-		require.NoError(t, err)
-		check("forged stamp, set on the host's side", 0, 0, false)
-		require.NoError(t, m.Close())
-		m, err = tc.AttachIngress("c0h", markerProg(t, brForeignMark), logger)
-		require.NoError(t, err)
-		check("bound step, another mark on its packets", brOrdinal, 0, false)
-		require.NoError(t, m.Close())
-		check("bound step, the marks gone", brOrdinal, 0, true)
+		if m := markAhead(t, c0h, StepStampMagic|brPolicy); m != nil {
+			check("forged stamp, set on the host's side", 0, 0, false)
+			require.NoError(t, m.Close())
+			m = markAhead(t, c0h, brForeignMark)
+			check("bound step, another mark on its packets", brOrdinal, 0, false)
+			require.NoError(t, m.Close())
+			check("bound step, the marks gone", brOrdinal, 0, true)
+		}
 
 		// From a host socket: its own mark is no stamp.
 		_, sport := dialSYN(t, objs, dst, 0, StepStampMagic|brPolicy)
@@ -232,27 +252,50 @@ func TestBridgeStamp(t *testing.T) {
 	requireSocketless(t, objs, 0)
 }
 
-// requireSocketless checks how many IP packets have reached the bridge's
+// requireSocketless checks how many IP packets have reached a bridge port's
 // ingress with no socket.
 func requireSocketless(t *testing.T, objs *TcBpfObjects, want uint64) {
 	t.Helper()
 	n, err := objs.BridgeSocketless()
 	require.NoError(t, err)
-	require.Equal(t, want, n, "IP packets at the bridge's ingress with no socket")
+	require.Equal(t, want, n, "IP packets at a bridge port's ingress with no socket")
 }
 
-// A packet that reaches the bridge's ingress with no socket is counted:
-// an IGMP report, which the kernel builds without one, sent as the
-// container joins a group.
+// awaitSocketless waits for the count to pass after.
+func awaitSocketless(t *testing.T, objs *TcBpfObjects, after uint64, what string) uint64 {
+	t.Helper()
+	var n uint64
+	require.Eventually(t, func() bool {
+		var err error
+		n, err = objs.BridgeSocketless()
+		return err == nil && n > after
+	}, 5*time.Second, 20*time.Millisecond, "%s reaches the port with no socket, and is counted", what)
+	return n
+}
+
+// A packet that reaches a bridge port's ingress with no socket is counted,
+// as two do by nature: one the container forwards from a namespace behind
+// it, which its own IP layer took the socket from, and an IGMP report,
+// which the kernel builds without one, sent as the container joins a
+// group.
 func TestBridgeStampCountsSocketless(t *testing.T) {
 	requireBPF(t)
 	objs := loadBPFObjectsStepRules(t, true)
-	topo := newBridgeTopology(t)
+	topo := newBridgeTopology(t, true)
+	nested := topo.addNested(t)
 	topo.enter(t, topo.rtr)
-	stamp, err := tc.AttachIngress("br0", objs.CwTcBrStamp, slog.New(slog.DiscardHandler))
+	stamp, err := tc.AttachIngress(interfaceIndex(t, "c0h"), "c0h", objs.CwTcBrStamp, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 	t.Cleanup(func() { stamp.Close() })
 	requireSocketless(t, objs, 0)
+
+	topo.enter(t, nested)
+	udp, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { unix.Close(udp) })
+	require.NoError(t, unix.Sendto(udp, []byte("x"), 0, &unix.SockaddrInet4{Port: 9, Addr: [4]byte{10, 99, 0, 20}}))
+	topo.enter(t, topo.rtr)
+	n := awaitSocketless(t, objs, 0, "a datagram the container forwards")
 
 	topo.enter(t, topo.ctr)
 	c0, err := net.InterfaceByName("c0")
@@ -265,10 +308,34 @@ func TestBridgeStampCountsSocketless(t *testing.T) {
 		Ifindex:   int32(c0.Index),
 	}))
 	topo.enter(t, topo.rtr)
-	require.Eventually(t, func() bool {
-		n, err := objs.BridgeSocketless()
-		return err == nil && n > 0
-	}, 5*time.Second, 20*time.Millisecond, "the IGMP report reaches the bridge with no socket, and is counted")
+	awaitSocketless(t, objs, n, "the IGMP report")
+}
+
+// markAhead attaches a program that sets mark on every packet at the head
+// of the ingress of the interface at ifindex, ahead of any other, as a
+// host's own program might be. Nil where the kernel has no TCX to put it
+// there with.
+func markAhead(t *testing.T, ifindex int, mark uint32) io.Closer {
+	t.Helper()
+	l, err := link.AttachTCX(link.TCXOptions{
+		Interface: ifindex,
+		Program:   markerProg(t, mark),
+		Attach:    ebpf.AttachTCXIngress,
+		Anchor:    link.Head(),
+	})
+	if errors.Is(err, ebpf.ErrNotSupported) {
+		t.Log("no TCX: the cases with a mark set ahead of the program are not run")
+		return nil
+	}
+	require.NoError(t, err)
+	return l
+}
+
+func interfaceIndex(t *testing.T, name string) int {
+	t.Helper()
+	iface, err := net.InterfaceByName(name)
+	require.NoError(t, err)
+	return iface.Index
 }
 
 // checkUplink reads cw_tc_egress's event for the SYN to dst:80 from sport
@@ -285,15 +352,23 @@ func checkUplink(t *testing.T, events *ringbuf.Reader, name string, dst netip.Ad
 // has 10.98.0.2/24 and fd98::2/64 and its default routes by the bridge,
 // and rtr, the host's, with c0's peer c0h on the bridge br0 (10.98.0.1/24,
 // fd98::1/64), forwarding to the dummy uplink d0 (10.99.0.1/24, fd99::1/64),
-// past which packets go nowhere.
+// past which packets go nowhere. br_netfilter filters the bridge's
+// traffic, as on a Docker host, or leaves it alone.
 type bridgeTopology struct {
 	ctr, rtr *os.File
+	ip       func(args ...string)
 }
 
-func newBridgeTopology(t *testing.T) *bridgeTopology {
+func newBridgeTopology(t *testing.T, brNetfilter bool) *bridgeTopology {
 	t.Helper()
 	if _, err := exec.LookPath("ip"); err != nil {
-		t.Skip("needs iproute2's ip")
+		skipUnlessStrict(t, "needs iproute2's ip")
+	}
+	// Ahead of the namespaces, so its cleanup runs after theirs.
+	brNetfilterLoaded := brNetfilter && loadBrNetfilter(t)
+	if !brNetfilter {
+		_, err := os.Stat("/sys/module/br_netfilter")
+		brNetfilterLoaded = err == nil
 	}
 	ip := func(args ...string) {
 		t.Helper()
@@ -315,10 +390,20 @@ func newBridgeTopology(t *testing.T) *bridgeTopology {
 		ip("-n", ns, "link", "set", "lo", "up")
 	}
 	if out, err := exec.Command("ip", "-n", rtr, "link", "add", "br0", "type", "bridge").CombinedOutput(); err != nil {
-		t.Skipf("no bridge support: %v: %s", err, out)
+		skipUnlessStrict(t, "no bridge support: %v: %s", err, out)
 	}
 	if out, err := exec.Command("ip", "-n", rtr, "link", "add", "c0h", "type", "veth", "peer", "name", "c0", "netns", ctr).CombinedOutput(); err != nil {
-		t.Skipf("no veth support: %v: %s", err, out)
+		skipUnlessStrict(t, "no veth support: %v: %s", err, out)
+	}
+	// A namespace's own br_netfilter switches, which in a new one start
+	// on once the module is loaded; the host's are never touched.
+	if brNetfilterLoaded {
+		on := "0"
+		if brNetfilter {
+			on = "1"
+		}
+		ip("netns", "exec", rtr, "sysctl", "-qw", "net.bridge.bridge-nf-call-iptables="+on,
+			"net.bridge.bridge-nf-call-ip6tables="+on)
 	}
 	ip("-n", rtr, "link", "set", "c0h", "master", "br0")
 	ip("-n", rtr, "addr", "add", "10.98.0.1/24", "dev", "br0")
@@ -341,7 +426,7 @@ func newBridgeTopology(t *testing.T) *bridgeTopology {
 		}
 	}
 
-	topo := &bridgeTopology{}
+	topo := &bridgeTopology{ip: ip}
 	for _, ns := range []struct {
 		f    **os.File
 		name string
@@ -356,6 +441,46 @@ func newBridgeTopology(t *testing.T) *bridgeTopology {
 	// run on other goroutines, so the caller checks its cases inline.
 	runtime.LockOSThread()
 	return topo
+}
+
+// loadBrNetfilter loads br_netfilter where it is not loaded, and reports
+// whether it is. One this loaded is unloaded at the end, unless something
+// has come to use it since, and nothing else is: rmmod, not modprobe -r,
+// which would take the bridge module with it from under another test.
+func loadBrNetfilter(t *testing.T) bool {
+	t.Helper()
+	if _, err := os.Stat("/sys/module/br_netfilter"); err == nil {
+		return true
+	}
+	if out, err := exec.Command("modprobe", "br_netfilter").CombinedOutput(); err != nil {
+		skipUnlessStrict(t, "cannot load br_netfilter: %v: %s", err, out)
+	}
+	t.Cleanup(func() {
+		if refs, err := os.ReadFile("/sys/module/br_netfilter/refcnt"); err == nil && strings.TrimSpace(string(refs)) == "0" {
+			_ = exec.Command("rmmod", "br_netfilter").Run()
+		}
+	})
+	return true
+}
+
+// addNested adds a namespace behind the container's, with n0 at
+// 10.97.0.2/24, whose default route is the container, which forwards.
+func (b *bridgeTopology) addNested(t *testing.T) *os.File {
+	t.Helper()
+	ctr, nst := fmt.Sprintf("cwbr-%d-c", os.Getpid()), fmt.Sprintf("cwbr-%d-n", os.Getpid())
+	b.ip("netns", "add", nst)
+	t.Cleanup(func() { _ = exec.Command("ip", "netns", "del", nst).Run() })
+	b.ip("-n", ctr, "link", "add", "n0c", "type", "veth", "peer", "name", "n0", "netns", nst)
+	b.ip("-n", ctr, "addr", "add", "10.97.0.1/24", "dev", "n0c")
+	b.ip("-n", ctr, "link", "set", "n0c", "up")
+	b.ip("-n", nst, "addr", "add", "10.97.0.2/24", "dev", "n0")
+	b.ip("-n", nst, "link", "set", "n0", "up")
+	b.ip("-n", nst, "route", "add", "default", "via", "10.97.0.1")
+	b.ip("netns", "exec", ctr, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+	f, err := os.Open("/run/netns/" + nst)
+	require.NoError(t, err)
+	t.Cleanup(func() { f.Close() })
+	return f
 }
 
 // enter moves the test's thread into ns.

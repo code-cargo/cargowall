@@ -428,6 +428,32 @@ func TestOrdinalAt_ContainerActionsAndJobContainers(t *testing.T) {
 	assert.Equal(t, uint32(5), tr.OrdinalAt(time.Unix(1036, 0)))
 }
 
+// A step end the kernel had no room to report is warned of, once, naming
+// the step it leaves running; a check within reportAfter of the last
+// reads nothing.
+func TestCheckEndsLost(t *testing.T) {
+	var log bytes.Buffer
+	tr := &Tracker{logger: slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+	lost := uint64(0)
+	tr.endsLost = func() (uint64, error) { return lost, nil }
+	step := "GITHUB_ACTION=build\x00"
+	tr.handleStepEvent(forkEvent(41, 6), wallClock(time.Unix(1000, 0)))
+	tr.handleStepEvent(execEventEnv(evExec, 41, 6, "bash\x00", 5, "bash", step, uint32(len(step))), wallClock(time.Unix(1000, 0)))
+
+	now := time.Unix(2000, 0)
+	tr.checkEndsLost(now)
+	assert.Empty(t, log.String())
+	lost = 1
+	tr.checkEndsLost(now.Add(time.Second))
+	assert.Empty(t, log.String(), "not due yet")
+	tr.checkEndsLost(now.Add(reportAfter))
+	assert.Contains(t, log.String(), `level=WARN msg="Step end events lost`)
+	assert.Contains(t, log.String(), "lost=1 step_ordinal=6")
+	log.Reset()
+	tr.checkEndsLost(now.Add(3 * reportAfter))
+	assert.Empty(t, log.String(), "warned of once")
+}
+
 // The latest boundary is the latest by time, whatever order the events
 // were read in.
 func TestOrdinalAt_LatestByTimeNotReadOrder(t *testing.T) {

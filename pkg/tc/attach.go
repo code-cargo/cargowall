@@ -20,6 +20,7 @@
 package tc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -46,30 +47,30 @@ type Attachment interface {
 // clsact qdisc + direct-action cls_bpf filter (kernel 4.5+). The returned
 // io.Closer detaches the program on Close, regardless of which path was taken.
 func AttachEgress(ifname string, prog *ebpf.Program, logger *slog.Logger) (io.Closer, error) {
-	return attach(ifname, prog, egress, logger)
-}
-
-// AttachIngress attaches prog to the named interface's ingress TC hook, the
-// same two ways as AttachEgress. Under TCX the program joins any others
-// there, after them.
-func AttachIngress(ifname string, prog *ebpf.Program, logger *slog.Logger) (Attachment, error) {
-	return attach(ifname, prog, ingress, logger)
-}
-
-// attach attaches prog to the named interface's hook in direction d.
-func attach(ifname string, prog *ebpf.Program, d direction, logger *slog.Logger) (Attachment, error) {
 	iface, err := net.InterfaceByName(ifname)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get interface %s: %w", ifname, err)
 	}
+	return attach(iface.Index, ifname, prog, egress, logger)
+}
 
+// AttachIngress attaches prog to the ingress TC hook of the interface at
+// ifindex, the same two ways as AttachEgress, and logs it under name.
+// Under TCX the program joins any others there, after them.
+func AttachIngress(ifindex int, name string, prog *ebpf.Program, logger *slog.Logger) (Attachment, error) {
+	return attach(ifindex, name, prog, ingress, logger)
+}
+
+// attach attaches prog to the hook in direction d of the interface at
+// ifindex, called ifname.
+func attach(ifindex int, ifname string, prog *ebpf.Program, d direction, logger *slog.Logger) (Attachment, error) {
 	l, err := link.AttachTCX(link.TCXOptions{
-		Interface: iface.Index,
+		Interface: ifindex,
 		Program:   prog,
 		Attach:    d.tcx,
 	})
 	if err == nil {
-		logger.Info("Attached TC "+d.name+" program", "interface", ifname, "method", "tcx")
+		logger.Log(context.Background(), d.level, "Attached TC "+d.name+" program", "interface", ifname, "method", "tcx")
 		return tcxAttachment{l}, nil
 	}
 	if !errors.Is(err, ebpf.ErrNotSupported) {
@@ -81,12 +82,12 @@ func attach(ifname string, prog *ebpf.Program, d direction, logger *slog.Logger)
 		return nil, fmt.Errorf("attach TCX %s: %w", d.name, err)
 	}
 
-	logger.Info("TCX unsupported on this kernel, falling back to legacy clsact", "interface", ifname)
-	a, err := attachClsact(iface.Index, prog, d, logger)
+	logger.Log(context.Background(), d.level, "TCX unsupported on this kernel, falling back to legacy clsact", "interface", ifname)
+	a, err := attachClsact(ifindex, prog, d, logger)
 	if err != nil {
 		return nil, fmt.Errorf("attach legacy clsact %s: %w", d.name, err)
 	}
-	logger.Info("Attached TC "+d.name+" program", "interface", ifname, "method", "clsact")
+	logger.Log(context.Background(), d.level, "Attached TC "+d.name+" program", "interface", ifname, "method", "clsact")
 	return a, nil
 }
 

@@ -348,19 +348,20 @@ __noinline int rules_v6(__u32 policy, __u64 dst_hi, __u64 dst_lo, __u32 dst_port
 // ---- Bridge stamp ----
 //
 // A bridge-networked container's packets reach TC past NAT with no socket,
-// so TC cannot read their socket's step tag. cw_tc_br_stamp, on each Docker
-// bridge's ingress, still sees the container's socket (the kernel orphans
-// the packet only as it enters the IP layer), and writes the socket's step
-// policy into skb->mark under STEP_STAMP_MAGIC; the mark rides forwarding
-// and NAT to the uplink, where step_policy_of reads it for a packet with no
-// socket. A container on a bridge network cannot forge a stamp: a packet's
-// mark is cleared as it leaves the container's network namespace, and the
-// bridge program clears any stamp it did not write itself. Premises: the
-// 0xCA1B0000 range is cargowall's (a host whose own rules mark forwarded
-// packets in it would read as stamped), and every other container path to
-// the uplink clears the mark too or carries the container's socket (see
-// "The bridge stamp" in design.md). The cgroup hook always has the socket,
-// and never reads a stamp.
+// so TC cannot read their socket's step tag. cw_tc_br_stamp, at the ingress
+// of each Docker bridge port (a container veth's host end), still sees the
+// container's socket: the kernel takes it off the packet only later, as
+// the bridge hands the packet to br_netfilter, or as it enters the IP
+// layer. It writes the socket's step policy into skb->mark under
+// STEP_STAMP_MAGIC; the mark rides the bridge, forwarding and NAT to the
+// uplink, where step_policy_of reads it for a packet with no socket. A
+// container cannot forge a stamp: a packet's mark is cleared as it leaves
+// the container's network namespace, and the port program clears any
+// stamp it did not write itself. Premises: no rule of the host's sets or
+// changes a forwarded packet's mark in the 0xCA1B0000 range, and every
+// other container path to the uplink clears the mark too or carries the
+// container's socket (see "The bridge stamp" in design.md). The cgroup
+// hook always has the socket, and never reads a stamp.
 #define STEP_STAMP_MAGIC      0xCA1B0000u
 #define STEP_STAMP_MASK       0xFFFF0000u
 #define STEP_STAMP_POLICY_MAX 0xFFFFu

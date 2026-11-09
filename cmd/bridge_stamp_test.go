@@ -20,8 +20,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"log/slog"
+	"slices"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -30,15 +31,16 @@ import (
 
 	"github.com/code-cargo/cargowall/pkg/containers"
 	"github.com/code-cargo/cargowall/pkg/events"
+	"github.com/code-cargo/cargowall/pkg/network"
 	"github.com/code-cargo/cargowall/pkg/origin"
 	"github.com/code-cargo/cargowall/pkg/podenv"
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
 
 // fakeLink is an attachment the fake attacher made: attached until its
-// device goes, or it is closed.
+// interface goes, or it is closed.
 type fakeLink struct {
-	dev      string
+	index    int
 	attached bool
 	closed   int
 }
@@ -50,150 +52,208 @@ func (l *fakeLink) Close() error {
 	return nil
 }
 
-// fakeBridges stands in for the host's devices and tc.AttachIngress.
-type fakeBridges struct {
-	index map[string]int // the devices there are, by name
-	fail  map[string]error
-	links []*fakeLink
+// fakePorts stands in for the kernel's interfaces, network.WatchLinks and
+// tc.AttachIngress.
+type fakePorts struct {
+	initial []network.Link // what the watch lists when it starts
+	fail    map[int]error  // attach failures, by index
+	links   []*fakeLink
+	onLink  func(network.Link)
+	onGone  func(int)
+	watches int
+	stopped int
 }
 
-func (f *fakeBridges) attach(dev string, _ *ebpf.Program, _ *slog.Logger) (tc.Attachment, error) {
-	if err := f.fail[dev]; err != nil {
+func (f *fakePorts) attach(index int, _ string, _ *ebpf.Program, _ *slog.Logger) (tc.Attachment, error) {
+	if err := f.fail[index]; err != nil {
 		return nil, err
 	}
-	l := &fakeLink{dev: dev, attached: true}
+	l := &fakeLink{index: index, attached: true}
 	f.links = append(f.links, l)
 	return l, nil
 }
 
-func (f *fakeBridges) ifindex(dev string) (int, error) {
-	if idx, ok := f.index[dev]; ok {
-		return idx, nil
+func (f *fakePorts) watch(onLink func(network.Link), onGone func(int), _ *slog.Logger) (io.Closer, error) {
+	f.watches++
+	f.onLink, f.onGone = onLink, onGone
+	for _, l := range f.initial {
+		onLink(l)
 	}
-	return 0, fmt.Errorf("route ip+net: no such network interface %s", dev)
+	return closerFunc(func() error { f.stopped++; return nil }), nil
 }
 
-// remove takes dev away, and with it every attachment on it.
-func (f *fakeBridges) remove(dev string) {
-	delete(f.index, dev)
-	for _, l := range f.links {
-		if l.dev == dev {
-			l.attached = false
-		}
-	}
-}
+type closerFunc func() error
 
-// live is the attachments not closed.
-func (f *fakeBridges) live() []string {
-	var out []string
+func (c closerFunc) Close() error { return c() }
+
+// live is the indexes of the attachments not closed, sorted.
+func (f *fakePorts) live() []int {
+	var out []int
 	for _, l := range f.links {
 		if l.closed == 0 {
-			out = append(out, l.dev)
+			out = append(out, l.index)
 		}
 	}
+	slices.Sort(out)
 	return out
 }
 
-func newFakeStamp(f *fakeBridges, log *bytes.Buffer) *bridgeStamp {
+func newFakeStamp(f *fakePorts, log *bytes.Buffer) *bridgeStamp {
 	return &bridgeStamp{
-		attach:  f.attach,
-		ifindex: f.ifindex,
-		logger:  slog.New(slog.NewTextHandler(log, nil)),
-		bridges: make(map[string]stampedBridge),
+		attach: f.attach,
+		watch:  f.watch,
+		logger: slog.New(slog.NewTextHandler(log, nil)),
+		links:  make(map[int]network.Link),
+		named:  make(map[string]bool),
+		ports:  make(map[int]tc.Attachment),
 	}
 }
 
-// With step rules off there is no stamp, and the tracker is handed no
-// bridge callbacks, so it does no bridge work.
+func bridge(index int, name string) network.Link {
+	return network.Link{Index: index, Name: name, Kind: "bridge"}
+}
+
+func port(index int, name, kind string, master int) network.Link {
+	return network.Link{Index: index, Name: name, Kind: kind, Master: master}
+}
+
+// With step rules off there is no stamp: the tracker is handed no bridge
+// callbacks and no watch starts.
 func TestBridgeStamp_OffIsNil(t *testing.T) {
 	b := newBridgeStamp(nil, slog.New(slog.DiscardHandler))
 	require.Nil(t, b)
 	assert.Nil(t, b.onBridge())
 	assert.Nil(t, b.onBridgeGone())
+	assert.NotPanics(t, b.start)
 	assert.NotPanics(t, b.Close)
 }
 
-// A bridge reported again, still attached, is left as it is.
-func TestBridgeStamp_UpIsIdempotent(t *testing.T) {
-	f := &fakeBridges{index: map[string]int{"docker0": 3}}
+// The program goes on a Docker bridge's veth ports, those there are when
+// the watch starts and those that come, and on nothing else: not a port of
+// another bridge, nor one that is no veth, nor a veth on no bridge. A port
+// listed before its bridge is attached once the bridge is.
+func TestBridgeStamp_AttachesDockerBridgeVethPorts(t *testing.T) {
+	f := &fakePorts{initial: []network.Link{
+		port(10, "veth1", "veth", 3), // before its bridge
+		bridge(3, "docker0"),
+		bridge(4, "br-0123456789ab"),
+		bridge(5, "virbr0"),
+		bridge(6, "br-lan"),
+		port(11, "veth2", "veth", 4),
+		port(12, "veth3", "veth", 5),
+		port(13, "veth4", "veth", 6),
+		port(14, "tap0", "tun", 3),
+		port(15, "veth5", "veth", 0),
+	}}
 	b := newFakeStamp(f, &bytes.Buffer{})
-	b.up("docker0")
-	b.up("docker0")
-	require.Len(t, f.links, 1)
-	assert.Equal(t, []string{"docker0"}, f.live())
+	b.start()
+	assert.Equal(t, []int{10, 11}, f.live())
+
+	f.onLink(port(16, "veth6", "veth", 0))
+	f.onLink(port(16, "veth6", "veth", 4)) // enslaved
+	assert.Equal(t, []int{10, 11, 16}, f.live())
+	f.onLink(port(16, "veth6", "veth", 4)) // up, still attached
+	assert.Len(t, f.links, 3, "a report of an attached port attaches nothing more")
 }
 
-// A network removed and another created behind the same device is
-// attached afresh, at a new index or at the same one, whether or not its
-// destroy was seen; the dead device's attachment is closed. So is one that
-// still answers attached, its index another device's now.
-func TestBridgeStamp_RecreatedBridgeIsAttachedAfresh(t *testing.T) {
-	for _, c := range []struct {
-		name        string
-		index       int
-		destroySeen bool
-		answering   bool
-	}{
-		{"new index", 9, false, false},
-		{"reused index", 4, false, false},
-		{"destroy seen", 4, true, false},
-		{"new index, the old attachment answering", 9, false, true},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			f := &fakeBridges{index: map[string]int{"br-0123456789ab": 4}}
-			b := newFakeStamp(f, &bytes.Buffer{})
-			b.up("br-0123456789ab")
-			f.remove("br-0123456789ab")
-			f.links[0].attached = c.answering
-			if c.destroySeen {
-				b.gone("br-0123456789ab")
-				assert.Empty(t, f.live())
-			}
-			f.index["br-0123456789ab"] = c.index
-			b.up("br-0123456789ab")
-			require.Len(t, f.links, 2)
-			assert.Equal(t, 1, f.links[0].closed, "the dead device's attachment is closed once")
-			assert.True(t, f.links[1].Attached())
-		})
-	}
+// A bridge the tracker names (com.docker.network.bridge.name) is Docker's
+// from then on: its ports are attached then, and the ones that come.
+func TestBridgeStamp_TrackerNamedBridge(t *testing.T) {
+	f := &fakePorts{initial: []network.Link{bridge(7, "ci-br"), port(20, "veth1", "veth", 7)}}
+	b := newFakeStamp(f, &bytes.Buffer{})
+	b.start()
+	assert.Empty(t, f.live())
+	b.up("ci-br")
+	assert.Equal(t, []int{20}, f.live())
+	f.onLink(port(21, "veth2", "veth", 7))
+	assert.Equal(t, []int{20, 21}, f.live())
 }
 
-// A bridge gone by the time it is reported is dropped, with a warning; so
-// is one the program can't be attached to, and startup goes on.
+// A port is detached when it leaves the bridge, when it goes, and when its
+// bridge goes; an attachment found dead is replaced.
+func TestBridgeStamp_DetachesAndReattaches(t *testing.T) {
+	f := &fakePorts{initial: []network.Link{
+		bridge(3, "docker0"), port(10, "veth1", "veth", 3), port(11, "veth2", "veth", 3), port(12, "veth3", "veth", 3),
+	}}
+	b := newFakeStamp(f, &bytes.Buffer{})
+	b.start()
+	require.Equal(t, []int{10, 11, 12}, f.live())
+
+	f.onLink(port(10, "veth1", "veth", 0)) // nomaster
+	f.onGone(11)
+	assert.Equal(t, []int{12}, f.live())
+
+	f.links[2].attached = false // the interface at 12 was recreated in a gap
+	f.onLink(port(12, "veth3", "veth", 3))
+	assert.Equal(t, []int{12}, f.live())
+	assert.Len(t, f.links, 4, "attached afresh")
+
+	f.onLink(port(10, "veth1", "veth", 3))
+	f.onGone(3) // the bridge
+	assert.Empty(t, f.live())
+}
+
+// The tracker's report that a bridge's network is gone keeps the name
+// Docker's while a device by that name is there (a recreated bridge,
+// reported before the destroy), and drops it once there is none.
+func TestBridgeStamp_TrackerGoneAfterRecreate(t *testing.T) {
+	f := &fakePorts{initial: []network.Link{bridge(7, "ci-br"), port(20, "veth1", "veth", 7)}}
+	b := newFakeStamp(f, &bytes.Buffer{})
+	b.start()
+	b.up("ci-br")
+	b.gone("ci-br")
+	f.onLink(port(21, "veth2", "veth", 7))
+	assert.Equal(t, []int{20, 21}, f.live(), "a destroy that comes after its recreate leaves the new bridge Docker's")
+
+	f.onGone(20)
+	f.onGone(21)
+	f.onGone(7)
+	b.gone("ci-br")
+	f.onLink(bridge(8, "ci-br")) // another bridge by the name, none of Docker's
+	f.onLink(port(22, "veth2", "veth", 8))
+	assert.Empty(t, f.live())
+}
+
+// A port the program can't be attached to is warned, and the rest go on;
+// so is a watch that can't start.
 func TestBridgeStamp_FailuresWarn(t *testing.T) {
-	f := &fakeBridges{
-		index: map[string]int{"br-a": 5, "br-b": 6},
-		fail:  map[string]error{"br-b": errors.New("attach TCX ingress: permission denied")},
+	f := &fakePorts{
+		initial: []network.Link{bridge(3, "docker0"), port(10, "veth1", "veth", 3), port(11, "veth2", "veth", 3)},
+		fail:    map[int]error{10: errors.New("attach TCX ingress: permission denied")},
 	}
 	var log bytes.Buffer
 	b := newFakeStamp(f, &log)
-	b.up("br-a")
-	f.remove("br-a")
-	b.up("br-a")
-	b.up("br-b")
-	assert.Empty(t, f.live())
-	assert.Contains(t, log.String(), "level=WARN msg=\"Docker bridge not found")
-	assert.Contains(t, log.String(), "bridge=br-a")
-	assert.Contains(t, log.String(), "level=WARN msg=\"Docker bridge left unstamped")
-	assert.Contains(t, log.String(), "bridge=br-b")
+	b.start()
+	assert.Equal(t, []int{11}, f.live())
+	assert.Contains(t, log.String(), `level=WARN msg="Docker bridge port left unstamped`)
+	assert.Contains(t, log.String(), "port=veth1 bridge=docker0")
+
+	log.Reset()
+	b = newFakeStamp(f, &log)
+	b.watch = func(func(network.Link), func(int), *slog.Logger) (io.Closer, error) {
+		return nil, errors.New("subscribe to interface events: permission denied")
+	}
+	b.start()
+	assert.Contains(t, log.String(), `level=WARN msg="Cannot watch interfaces for Docker bridge ports`)
 }
 
-// Close detaches every bridge, and none is attached after.
+// Close stops the watch and detaches every port, and nothing is attached
+// after.
 func TestBridgeStamp_CloseDetachesEverything(t *testing.T) {
-	f := &fakeBridges{index: map[string]int{"docker0": 3, "br-a": 5}}
+	f := &fakePorts{initial: []network.Link{bridge(3, "docker0"), port(10, "veth1", "veth", 3)}}
 	b := newFakeStamp(f, &bytes.Buffer{})
-	b.up("docker0")
-	b.up("br-a")
-	b.gone("br-unknown")
+	b.start()
 	b.Close()
+	assert.Equal(t, 1, f.stopped)
 	assert.Empty(t, f.live())
-	b.up("docker0")
-	assert.Len(t, f.links, 2)
+	f.onLink(port(11, "veth2", "veth", 3))
+	b.up("ci-br")
+	assert.Len(t, f.links, 1)
 }
 
-// The tracker startUserspace starts is handed the stamp's callbacks, none
-// with the stamp off, and the attribution's Close detaches the stamp's
-// bridges.
+// startUserspace starts the stamp's watch and hands the tracker the
+// stamp's callbacks, none with the stamp off, and the attribution's Close
+// detaches the ports.
 func TestBridgeStamp_TrackerWiring(t *testing.T) {
 	saved := startTracker
 	t.Cleanup(func() { startTracker = saved })
@@ -211,15 +271,15 @@ func TestBridgeStamp_TrackerWiring(t *testing.T) {
 	assert.Nil(t, handed.OnBridge)
 	assert.Nil(t, handed.OnBridgeGone)
 
-	f := &fakeBridges{index: map[string]int{"docker0": 3, "br-a": 5}}
+	f := &fakePorts{initial: []network.Link{bridge(7, "ci-br"), port(20, "veth1", "veth", 7)}}
 	a.stamp = newFakeStamp(f, &bytes.Buffer{})
 	a.startUserspace(t.Context(), nil, false, nil, u)
+	assert.Equal(t, 1, f.watches)
 	require.NotNil(t, handed.OnBridge)
 	require.NotNil(t, handed.OnBridgeGone)
-	handed.OnBridge("docker0")
-	handed.OnBridge("br-a")
-	handed.OnBridgeGone("br-a")
-	assert.Equal(t, []string{"docker0"}, f.live())
+	handed.OnBridge("ci-br")
+	assert.Equal(t, []int{20}, f.live())
 	a.Close()
 	assert.Empty(t, f.live())
+	assert.Equal(t, 1, f.stopped)
 }

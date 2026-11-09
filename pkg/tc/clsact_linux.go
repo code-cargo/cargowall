@@ -70,11 +70,16 @@ type direction struct {
 	tcx    ebpf.AttachType // its TCX attach type
 	parent uint32          // its clsact parent
 	filter string          // our cls_bpf filter's TCA_BPF_NAME there
+	level  slog.Level      // an attach's log: egress is the uplink's, once; ingress, each bridge port's
 }
 
 var (
-	egress  = direction{name: "egress", tcx: ebpf.AttachTCXEgress, parent: egressParent, filter: cwFilterName}
-	ingress = direction{name: "ingress", tcx: ebpf.AttachTCXIngress, parent: ingressParent, filter: "cargowall_ingress"}
+	egress = direction{
+		name: "egress", tcx: ebpf.AttachTCXEgress, parent: egressParent, filter: cwFilterName, level: slog.LevelInfo,
+	}
+	ingress = direction{
+		name: "ingress", tcx: ebpf.AttachTCXIngress, parent: ingressParent, filter: "cargowall_ingress", level: slog.LevelDebug,
+	}
 )
 
 // tcMsg is the netlink tcmsg header (struct tcmsg, linux/rtnetlink.h): 20 bytes.

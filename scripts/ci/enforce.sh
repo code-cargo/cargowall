@@ -193,6 +193,16 @@ summary() {
 # hashFiles() helper Runner.Worker starts for itself, which is no step.
 step_identity() {
   AUDIT_LOG=/tmp/cargowall-audit.json
+  # A step's boundary is logged once cargowall has read its step event and
+  # identified it, which can trail the step itself, and this check runs
+  # right after the identity steps. Wait for the last of them first.
+  for _ in $(seq 1 60); do
+    if [ "$(jq -s '[.[] | select(.event_type == "step_boundary" and .step_id == "identity-hashfiles")] | length' \
+      "$AUDIT_LOG" 2>/dev/null || echo 0)" -ge 1 ]; then
+      break
+    fi
+    sleep 0.5
+  done
   echo "step_boundary events (ordinal / step_id / step_class / process):"
   jq -r -s '.[] | select(.event_type == "step_boundary")
     | [.step_ordinal, (.step_id // "-"), (.step_class // "-"), (.process // "-")] | @tsv' "$AUDIT_LOG"

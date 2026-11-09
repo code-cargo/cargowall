@@ -571,6 +571,43 @@ func TestSummary_ResolveOrdinalSteps_MainStepBeforeItsPostStep(t *testing.T) {
 	assert.Equal(t, map[uint32]int{1: 1, 2: 1, 3: 2, 4: 3, 5: 4}, idx)
 }
 
+// When nothing forks between a main step and its post step, as when the
+// action is the job's last step, the cursor is still on the main step as
+// the post step starts: a boundary from then on is the post step's, and
+// one before, the main step forking again, the main step's. The main
+// step's first boundary is its own even in the second its post step
+// starts in.
+func TestSummary_ResolveOrdinalSteps_PostStepRightAfterItsMainStep(t *testing.T) {
+	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) time.Time { return base.Add(d) }
+	boundary := func(ord uint32, d time.Duration, id string) events.AuditEvent {
+		return events.AuditEvent{
+			EventType: events.EventStepBoundary, StepOrdinal: ord, Timestamp: at(d),
+			StepID: id, StepClass: events.StepClassStep,
+		}
+	}
+	steps := []GitHubStep{
+		{Name: "Build", ContextName: "build", StartedAt: at(0)},
+		{Name: "Push", ContextName: "push", StartedAt: at(10 * time.Second)},
+		{Name: "Post Push", ContextName: "push", StartedAt: at(20 * time.Second)},
+	}
+	idx := resolveOrdinalSteps([]events.AuditEvent{
+		boundary(1, 100*time.Millisecond, "build"),
+		boundary(2, 10100*time.Millisecond, "push"),
+		boundary(3, 15*time.Second, "push"),
+		boundary(4, 20100*time.Millisecond, "push"),
+	}, steps)
+	assert.Equal(t, map[uint32]int{1: 0, 2: 1, 3: 1, 4: 2}, idx)
+
+	steps[2].StartedAt = at(10 * time.Second)
+	idx = resolveOrdinalSteps([]events.AuditEvent{
+		boundary(1, 100*time.Millisecond, "build"),
+		boundary(2, 10200*time.Millisecond, "push"),
+		boundary(3, 10700*time.Millisecond, "push"),
+	}, steps)
+	assert.Equal(t, map[uint32]int{1: 0, 2: 1, 3: 2}, idx, "the same second")
+}
+
 // Placed by time, a boundary with a step id takes no step that carries
 // another id: here the step that started just before it is another
 // step's, and it stays unresolved rather than take that step's name.

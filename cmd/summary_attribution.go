@@ -66,9 +66,10 @@ const resolveRoundingSlack = 2 * time.Second
 // BEFORE backfillStepCompletion for exactly this reason.
 //
 // Timing is the fallback. A boundary whose step id a step's context name
-// matches resolves to that step (stepIndexByID), with no timing at all;
-// only the boundaries that leaves, from older logs or older actions,
-// are placed by time. Both kinds move the same cursor. A boundary with
+// matches resolves to that step (stepIndexByID), by the id alone but for
+// telling a main step from its post step when nothing forked between
+// them; only the boundaries that leaves, from older logs or older
+// actions, are placed by time. Both kinds move the same cursor. A boundary with
 // a step id placed by time never takes a step that carries another one:
 // it stays unresolved rather than take that step's name.
 //
@@ -174,18 +175,32 @@ func stepFits(s GitHubStep, b events.AuditEvent) bool {
 // names are unique within a job, except that an action's post step
 // carries its main step's: the first match at or after the cursor is the
 // one running now, so the main step's processes go to the main step and
-// the post step's, forked after later steps ran, to the post step. With
-// no match from the cursor on, the nearest earlier one still names the
-// right step.
+// the post step's, forked after later steps ran, to the post step. When
+// none did, as when the action is the job's last step, the cursor is
+// still on the main step as its post step starts: from the post step's
+// start on, a boundary is the post step's. With no match from the cursor
+// on, the nearest earlier one still names the right step.
 func stepIndexByID(steps []GitHubStep, b events.AuditEvent, prev int) int {
 	if b.StepClass != events.StepClassStep || b.StepID == "" {
 		return -1
 	}
 	from := max(prev, 0)
 	for i := from; i < len(steps); i++ {
-		if steps[i].ContextName == b.StepID {
-			return i
+		if steps[i].ContextName != b.StepID {
+			continue
 		}
+		if i == prev {
+			for j := i + 1; j < len(steps); j++ {
+				if steps[j].ContextName != b.StepID {
+					continue
+				}
+				if steps[j].StartedAt.IsZero() || steps[j].StartedAt.After(b.Timestamp) {
+					break
+				}
+				i = j
+			}
+		}
+		return i
 	}
 	for i := from - 1; i >= 0; i-- {
 		if steps[i].ContextName == b.StepID {

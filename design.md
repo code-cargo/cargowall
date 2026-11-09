@@ -864,27 +864,40 @@ to select policy with.
     Accepted sockets carry no tag, so both hooks judge them by the job's
     rules.
   - *The bridge stamp.* `cw_tc_br_stamp`, on each Docker bridge's TC
-    ingress, still sees the container's socket: the kernel orphans a
-    packet only in `ip_rcv_core`, after TC ingress (since 4.19; the veth,
-    bridge and TC ingress paths at v5.15 and v6.6 orphan nothing). For a
-    socket whose step has a policy it writes `0xCA1B0000 | policy` into
-    the packet's mark, which rides forwarding and NAT to the uplink, where
-    `cw_tc_egress` reads it for a packet with no socket, and only then. A
-    container on a bridge network cannot forge one: the mark is cleared as
-    a packet leaves the container's namespace, and the bridge program
-    clears a stamp it did not write. It stamps no packet that already
-    carries another mark, nor a policy past `0xFFFF`. Two premises: the
-    `0xCA1B` range is cargowall's (a host whose own rules mark forwarded
-    packets in it would read as stamped), and every container path to the
-    uplink either clears the mark at a namespace boundary or carries the
-    container's socket. A macvlan or ipvlan network does neither for
-    packets a container forwards, so a container with `NET_ADMIN` there is
-    trusted with the stamp; dockerd grants that to any caller, and a step
-    that can drive dockerd is beyond step rules anyway (see Sudo
-    lockdown). `cmd/bridge_stamp.go` attaches the program to each bridge
-    the container tracker reports, attaches afresh one recreated behind
-    the same name, and detaches one whose network is destroyed; it runs
-    only with step rules on.
+    ingress, still sees the container's socket: the kernel first orphans
+    a packet in `ip_rcv_core`, after TC ingress (since 4.19, 9c4c325252c5,
+    below the 5.8 floor; the veth, bridge and TC ingress paths at v5.15
+    and v6.6 orphan nothing). For a socket whose step has a policy it
+    writes `0xCA1B0000 | policy` into the packet's mark, which rides
+    forwarding and NAT to the uplink, where `cw_tc_egress` reads it for a
+    packet with no socket, and only then. A stamp can only add a step's
+    allowances: a packet that reaches the uplink without one is judged by
+    the job's rules, never wider, so a kernel that broke the premise would
+    leave container traffic fail-closed. A container on a bridge network
+    cannot forge a stamp: the mark is cleared as a packet leaves the
+    container's namespace, and the bridge program clears a stamp it did
+    not write. It stamps no packet that already carries another mark, nor
+    a policy past `0xFFFF`. Two premises: the `0xCA1B` range is
+    cargowall's (a host whose own rules mark forwarded packets in it would
+    read as stamped), and every container path to the uplink either clears
+    the mark at a namespace boundary or carries the container's socket. A
+    macvlan or ipvlan network does neither for packets a container
+    forwards, so a container with `NET_ADMIN` there is trusted with the
+    stamp; dockerd grants that to any caller, and a step that can drive
+    dockerd is beyond step rules anyway (see Sudo lockdown).
+    `cmd/bridge_stamp.go` attaches the program to each bridge the
+    container tracker reports, attaches afresh one recreated behind the
+    same name, and detaches one whose network is destroyed; it runs only
+    with step rules on.
+  - *Checking the premise.* The bridge program counts the IP packets that
+    reach a bridge's ingress with no socket (`map_br_sockless`, per CPU;
+    `TcBpfObjects.BridgeSocketless` sums them), on whatever kernel the job
+    runs: a container's own flows keep the count at 0. Packets with no
+    socket by nature count too: IGMP reports, which the kernel builds
+    without one (a container joining an IPv4 group sends them), and
+    packets a container forwards from a namespace of its own (a nested
+    netns, docker-in-docker). IPv6's neighbor discovery and MLD carry the
+    kernel's socket, and don't count.
   - *Host-only step rules.* Where the stamp cannot apply, a container's
     traffic gets the job's rules at TC, never wider: a bridge the program
     could not be attached to (warned), a bridge's packets before the

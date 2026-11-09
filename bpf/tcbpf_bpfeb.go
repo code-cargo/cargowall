@@ -87,6 +87,7 @@ type TcBpfStepState struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	TcBpfMapMapAuditMode          = "map_audit_mode"
+	TcBpfMapMapBrSockless         = "map_br_sockless"
 	TcBpfMapMapCidrs              = "map_cidrs"
 	TcBpfMapMapCidrsV6            = "map_cidrs_v6"
 	TcBpfMapMapDefaultAction      = "map_default_action"
@@ -168,6 +169,7 @@ type TcBpfProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type TcBpfMapSpecs struct {
 	MapAuditMode       *ebpf.MapSpec `ebpf:"map_audit_mode"`
+	MapBrSockless      *ebpf.MapSpec `ebpf:"map_br_sockless"`
 	MapCidrs           *ebpf.MapSpec `ebpf:"map_cidrs"`
 	MapCidrsV6         *ebpf.MapSpec `ebpf:"map_cidrs_v6"`
 	MapDefaultAction   *ebpf.MapSpec `ebpf:"map_default_action"`
@@ -213,6 +215,7 @@ func (o *TcBpfObjects) Close() error {
 // It can be passed to LoadTcBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TcBpfMaps struct {
 	MapAuditMode       *ebpf.Map `ebpf:"map_audit_mode"`
+	MapBrSockless      *ebpf.Map `ebpf:"map_br_sockless"`
 	MapCidrs           *ebpf.Map `ebpf:"map_cidrs"`
 	MapCidrsV6         *ebpf.Map `ebpf:"map_cidrs_v6"`
 	MapDefaultAction   *ebpf.Map `ebpf:"map_default_action"`
@@ -232,6 +235,7 @@ type TcBpfMaps struct {
 func (m *TcBpfMaps) Close() error {
 	return _TcBpfClose(
 		m.MapAuditMode,
+		m.MapBrSockless,
 		m.MapCidrs,
 		m.MapCidrsV6,
 		m.MapDefaultAction,

@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -122,7 +123,9 @@ const (
 // a stamp set on the host's side before the bridge (cleared there), or a
 // packet another mark is on (left as it is, unstamped). A host socket's
 // mark in the stamp's range is never read as one, nor is an AF_PACKET
-// frame a tagged thread sends: packet sockets get no tag.
+// frame a tagged thread sends: packet sockets get no tag. And every one of
+// the container's packets reaches the bridge with its socket:
+// BridgeSocketless stays 0.
 //
 // ci-kernels have no bridge or veth: there it skips, and CI's runner
 // kernels run it.
@@ -181,6 +184,7 @@ func TestBridgeStamp(t *testing.T) {
 		_, sport := dialSYN(t, objs, dst, 0, StepStampMagic|brPolicy)
 		checkUplink(t, events, fmt.Sprintf("host socket with a stamp's mark to %s", dst), dst, sport, false)
 	}
+	requireSocketless(t, objs, 0)
 
 	// A tagged thread's TCP socket is tagged by the connect hook, and
 	// stamped; its AF_PACKET frame is not.
@@ -225,6 +229,46 @@ func TestBridgeStamp(t *testing.T) {
 		checkUplink(t, events, fmt.Sprintf("tagged thread's AF_PACKET frame to %s", c.dst), c.dst, sport, false)
 	}
 	topo.enter(t, topo.rtr)
+	requireSocketless(t, objs, 0)
+}
+
+// requireSocketless checks how many IP packets have reached the bridge's
+// ingress with no socket.
+func requireSocketless(t *testing.T, objs *TcBpfObjects, want uint64) {
+	t.Helper()
+	n, err := objs.BridgeSocketless()
+	require.NoError(t, err)
+	require.Equal(t, want, n, "IP packets at the bridge's ingress with no socket")
+}
+
+// A packet that reaches the bridge's ingress with no socket is counted:
+// an IGMP report, which the kernel builds without one, sent as the
+// container joins a group.
+func TestBridgeStampCountsSocketless(t *testing.T) {
+	requireBPF(t)
+	objs := loadBPFObjectsStepRules(t, true)
+	topo := newBridgeTopology(t)
+	topo.enter(t, topo.rtr)
+	stamp, err := tc.AttachIngress("br0", objs.CwTcBrStamp, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	t.Cleanup(func() { stamp.Close() })
+	requireSocketless(t, objs, 0)
+
+	topo.enter(t, topo.ctr)
+	c0, err := net.InterfaceByName("c0")
+	require.NoError(t, err)
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { unix.Close(fd) })
+	require.NoError(t, unix.SetsockoptIPMreqn(fd, unix.IPPROTO_IP, unix.IP_ADD_MEMBERSHIP, &unix.IPMreqn{
+		Multiaddr: [4]byte{239, 1, 2, 3},
+		Ifindex:   int32(c0.Index),
+	}))
+	topo.enter(t, topo.rtr)
+	require.Eventually(t, func() bool {
+		n, err := objs.BridgeSocketless()
+		return err == nil && n > 0
+	}, 5*time.Second, 20*time.Millisecond, "the IGMP report reaches the bridge with no socket, and is counted")
 }
 
 // checkUplink reads cw_tc_egress's event for the SYN to dst:80 from sport

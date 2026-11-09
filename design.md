@@ -822,7 +822,7 @@ to select policy with.
   is in place, and until the policy's own `steps` arrive nothing turns it
   on or binds a step.
   - *Which step a socket is judged as.* Its tag: the step of the last
-    tagged thread to connect it (TCP and UDP; ping from 6.x) or to send
+    tagged thread to connect it (TCP and UDP; ping from 6.1) or to send
     on it as UDP through an address or IP-level control messages (which
     run the sendmsg hook even on a connected socket), and until then of
     the thread that created it (`cgroup/sock_create` runs for user sockets
@@ -838,9 +838,9 @@ to select policy with.
     dockerd, so a step can shape what a later one runs, or share a socket
     with another (two steps' threads sending on one unconnected UDP socket
     can each re-tag it between the other's send and its packet's verdict,
-    and a step aiming a ping or raw socket another made is judged as its
-    maker): between steps that do not trust each other, the boundary is
-    the job.
+    and a step sending on a ping or raw socket another made, or connecting
+    a raw one, is judged as its maker): between steps that do not trust
+    each other, the boundary is the job.
   - *Where the two hooks differ.* Both read the same tag for the same
     socket, with two exceptions. TC sees a bridge-networked container's
     packets post-NAT with no socket, and judges them by the job's rules:

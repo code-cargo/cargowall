@@ -224,15 +224,16 @@ static __always_inline __u32 sock_owner_pid(void) {
 }
 
 // Helper: copy the calling thread's step tag, if it has one, onto a socket
-// cookie, over whatever tag it had. Shared by the connect/sendmsg hooks
-// below and cw_cg_sock_new in stepbpf.c, so a socket's tag is the step of
-// the last tagged thread to connect it (TCP and UDP, and ping from 6.x:
-// before that a ping connect runs no hook) or to send on it as UDP through
-// an address or IP-level control messages (IP_TTL, IP_PKTINFO and the like
-// run the sendmsg hook even on a connected socket), and until then of the
-// thread that created it. Raw and ping sends, raw connects, and untagged
-// threads never re-tag. The verdict judges a socket by its tag's step, so
-// for TCP and UDP the step whose thread aimed a socket is the step judged.
+// cookie, over whatever tag it had. Used by the connect/sendmsg hooks
+// below; cw_cg_sock_new in stepbpf.c tags the same way at birth. So a
+// socket's tag is the step of the last tagged thread to connect it (TCP
+// and UDP, and ping from 6.1: before that a ping connect runs no hook) or
+// to send on it as UDP through an address or IP-level control messages
+// (IP_TTL, IP_PKTINFO and the like run the sendmsg hook even on a
+// connected socket), and until then of the thread that created it. Raw
+// and ping sends, raw connects, and untagged threads never re-tag. The
+// verdict judges a socket by its tag's step, so for TCP and UDP the step
+// whose thread aimed a socket is the step judged.
 // Steps of one job that share a socket are beyond it: an unconnected UDP
 // socket two steps' threads send on, whose tags can cross between one's
 // send and the other's packet, or a ping or raw socket one step aims and

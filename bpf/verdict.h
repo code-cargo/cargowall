@@ -181,7 +181,8 @@ struct {
 // that policy, written once, by userspace, when the step is identified, and
 // a socket finds its step's ordinal in map_sock_step, by the rule
 // step_tag_socket in tcbpf.c gives: in short, the last tagged thread to
-// connect it or send on it as UDP, and until then its creator. An ordinal
+// connect it or send on it as UDP to an address (or with IP-level control
+// messages), and until then its creator. An ordinal
 // with no binding (not identified yet, or never: a sentinel, a runner
 // helper, an unknown step) and a socket with no tag have no step policy,
 // and the job's rules alone judge them.

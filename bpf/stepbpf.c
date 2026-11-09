@@ -381,8 +381,8 @@ int BPF_PROG(cw_step_exit, struct task_struct *task)
 // inet6_create, for each user socket of the inet families, in the creating
 // thread's context, so the cookie carries that thread's step. The connect
 // and sendmsg hooks in tcbpf.c re-tag it later, which also tags a socket
-// made before attach once it is connected or sent on: see step_tag_socket
-// there for the rule.
+// made before attach once it is connected or sent on to an address: see
+// step_tag_socket there for the rule.
 SEC("cgroup/sock_create")
 int cw_cg_sock_new(struct bpf_sock *ctx)
 {

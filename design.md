@@ -838,15 +838,19 @@ to select policy with.
     fork as the kernel timed it (`bpf_ktime_get_ns` on the fork event),
     not when the reader got to the event. And a root identified as no step
     (a runner helper, or a copy of Runner.Worker that exits without
-    exec'ing) does not end the step it forks in; one not identified yet,
-    or never, does, and is bound no rules. The runner's own docker CLI
-    calls carry no step environment: "Initialize containers" starts job
-    and service containers before any step, so they are untagged and get
-    the job's rules, and a container action's image pull or build is
-    passed over. The `docker run` of a container action, and the
-    `docker exec` a container job runs each step as, carry the step's
-    environment, so the action's container, and each step's exec, get
-    that step's tag.
+    exec'ing) does not end a step whose root is still running; one forked
+    between steps (a step root's exit is recorded too) does, and is bound
+    no rules, so what it starts gets the job's rules, not the ended step's.
+    A root not identified yet, or never, counts as a step, and is bound no
+    rules. The runner's own docker CLI calls carry no step environment:
+    "Initialize containers" starts job and service containers before any
+    step, so they resolve to those calls and get the job's rules, as does
+    whatever a local action's image build starts, between steps. The
+    `docker run` of a container action, and the `docker exec` a container
+    job runs each step as, carry the step's environment, so the action's
+    container, and each step's exec, get that step's tag. A step root's
+    lost exit event leaves it running as far as this goes, so a no-step
+    root after it is passed over.
   - *What per-step rules do not separate.* They bound what each step's own
     processes reach. Steps of one job share a uid, the workspace and
     dockerd, so a step can shape what a later one runs, or share a socket

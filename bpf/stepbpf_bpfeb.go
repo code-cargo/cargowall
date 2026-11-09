@@ -28,6 +28,7 @@ const (
 	StepBpfStepEventKindSTEP_EV_FORK StepBpfStepEventKind = 1
 	StepBpfStepEventKindSTEP_EV_EXEC StepBpfStepEventKind = 2
 	StepBpfStepEventKindSTEP_EV_EXIT StepBpfStepEventKind = 3
+	StepBpfStepEventKindSTEP_EV_END  StepBpfStepEventKind = 4
 )
 
 type StepBpfStepExecEvent struct {
@@ -65,6 +66,7 @@ const (
 	StepBpfMapMapSockStep             = "map_sock_step"
 	StepBpfMapMapStepEvents           = "map_step_events"
 	StepBpfMapMapStepExecPending      = "map_step_exec_pending"
+	StepBpfMapMapStepLive             = "map_step_live"
 	StepBpfMapMapStepState            = "map_step_state"
 	StepBpfMapMapTaskNspid            = "map_task_nspid"
 	StepBpfMapMapTaskStep             = "map_task_step"
@@ -136,6 +138,7 @@ type StepBpfMapSpecs struct {
 	MapSockStep        *ebpf.MapSpec `ebpf:"map_sock_step"`
 	MapStepEvents      *ebpf.MapSpec `ebpf:"map_step_events"`
 	MapStepExecPending *ebpf.MapSpec `ebpf:"map_step_exec_pending"`
+	MapStepLive        *ebpf.MapSpec `ebpf:"map_step_live"`
 	MapStepState       *ebpf.MapSpec `ebpf:"map_step_state"`
 	MapTaskNspid       *ebpf.MapSpec `ebpf:"map_task_nspid"`
 	MapTaskStep        *ebpf.MapSpec `ebpf:"map_task_step"`
@@ -175,6 +178,7 @@ type StepBpfMaps struct {
 	MapSockStep        *ebpf.Map `ebpf:"map_sock_step"`
 	MapStepEvents      *ebpf.Map `ebpf:"map_step_events"`
 	MapStepExecPending *ebpf.Map `ebpf:"map_step_exec_pending"`
+	MapStepLive        *ebpf.Map `ebpf:"map_step_live"`
 	MapStepState       *ebpf.Map `ebpf:"map_step_state"`
 	MapTaskNspid       *ebpf.Map `ebpf:"map_task_nspid"`
 	MapTaskStep        *ebpf.Map `ebpf:"map_task_step"`
@@ -185,6 +189,7 @@ func (m *StepBpfMaps) Close() error {
 		m.MapSockStep,
 		m.MapStepEvents,
 		m.MapStepExecPending,
+		m.MapStepLive,
 		m.MapStepState,
 		m.MapTaskNspid,
 		m.MapTaskStep,

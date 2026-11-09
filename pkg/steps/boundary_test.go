@@ -36,6 +36,7 @@ const (
 	evFork = uint32(bpf.StepBpfStepEventKindSTEP_EV_FORK)
 	evExec = uint32(bpf.StepBpfStepEventKindSTEP_EV_EXEC)
 	evExit = uint32(bpf.StepBpfStepEventKindSTEP_EV_EXIT)
+	evEnd  = uint32(bpf.StepBpfStepEventKindSTEP_EV_END)
 )
 
 // forkEvent encodes a step event as cw_step_fork streams it.
@@ -47,6 +48,12 @@ func forkEvent(tgid, ordinal uint32) []byte {
 // streams it.
 func exitEvent(tgid, ordinal uint32) []byte {
 	return childEvent(evExit, tgid, ordinal)
+}
+
+// endEvent encodes a step root's exit after its exec, as cw_step_exit
+// streams it.
+func endEvent(tgid, ordinal uint32) []byte {
+	return childEvent(evEnd, tgid, ordinal)
 }
 
 // forkEventAt is forkEvent with the kernel time of the fork.
@@ -296,6 +303,8 @@ func TestHandleStepEvent_IgnoresShortAndUnknownRecords(t *testing.T) {
 	tr.handleStepEvent(nil, wallClock(time.Now()))
 	tr.handleStepEvent([]byte{1, 0}, wallClock(time.Now()))
 	tr.handleStepEvent(forkEvent(1, 1)[:8], wallClock(time.Now()))
+	tr.handleStepEvent(endEvent(1, 1)[:8], wallClock(time.Now()))
+	tr.handleStepEvent(endEvent(1, 1), wallClock(time.Now())) // a step not seen
 	tr.handleStepEvent(execEvent(evExec, 1, 1, "x", 1, "x")[:20], wallClock(time.Now()))
 	tr.handleStepEvent(execEvent(9, 1, 1, "x", 1, "x"), wallClock(time.Now()))
 	assert.Empty(t, sink.events)
@@ -340,7 +349,8 @@ func TestHandleStepEvent_ForkDatedByKernelTime(t *testing.T) {
 // Stepping through a job's roots in order: a runner helper or a copy of
 // Runner.Worker doesn't end the step it forks in, once it is known to be
 // one. A root not identified yet, or whose identity the kernel couldn't
-// read, still does.
+// read, still does. Forked once every step's root has exited, a runner
+// helper is passed over no more.
 func TestOrdinalAt_PassesOverRootsThatAreNoStep(t *testing.T) {
 	tr, _ := newBoundaryTracker(t)
 	step := "GITHUB_ACTION=build\x00"
@@ -369,15 +379,28 @@ func TestOrdinalAt_PassesOverRootsThatAreNoStep(t *testing.T) {
 	assert.Equal(t, uint32(10), tr.OrdinalAt(time.Unix(1045, 0)))
 	tr.handleStepEvent(execEventEnv(evExec, 45, 10, "node\x00", 5, "node", helper, uint32(len(helper))), at(1051))
 	assert.Equal(t, uint32(9), tr.OrdinalAt(time.Unix(1045, 0)))
+
+	tr.handleStepEvent(endEvent(41, 6), at(1060))
+	tr.handleStepEvent(forkEvent(46, 11), at(1065))
+	tr.handleStepEvent(execEventEnv(evExec, 46, 11, "node\x00", 5, "node", helper, uint32(len(helper))), at(1065))
+	assert.Equal(t, uint32(9), tr.OrdinalAt(time.Unix(1066, 0)), "the unknown root still runs")
+	tr.handleStepEvent(endEvent(44, 9), at(1070))
+	tr.handleStepEvent(forkEvent(47, 12), at(1075))
+	tr.handleStepEvent(execEventEnv(evExec, 47, 12, "node\x00", 5, "node", helper, uint32(len(helper))), at(1075))
+	assert.Equal(t, uint32(12), tr.OrdinalAt(time.Unix(1076, 0)), "no step runs")
+	assert.Equal(t, uint32(9), tr.OrdinalAt(time.Unix(1067, 0)), "and the window before is as it was")
 }
 
 // How the runner's docker CLI processes resolve, all of them direct
 // children of Runner.Worker. "Initialize containers" creates and starts
 // the job and service containers with no step environment, before any
-// step: they resolve to no step, and get the job's rules. An action's
-// image is pulled or built with no step environment either, and only the
-// action's docker run carries its step's (GITHUB_ACTION among it), so the
-// action's container resolves to that step.
+// step: they resolve to the runner's own docker call, bound no rules, and
+// get the job's rules. A local action's image is built just before its
+// step, with no step environment either, once the step before has ended:
+// what the build starts gets the job's rules too, not the ended step's.
+// The action's docker run carries its step's environment (GITHUB_ACTION
+// among it), so the action's container resolves to that step, and a
+// runner check made while it runs doesn't end it.
 func TestOrdinalAt_ContainerActionsAndJobContainers(t *testing.T) {
 	tr, _ := newBoundaryTracker(t)
 	noStep := "PATH=/usr/bin\x00"
@@ -389,16 +412,20 @@ func TestOrdinalAt_ContainerActionsAndJobContainers(t *testing.T) {
 
 	docker(1, 1000, noStep) // docker create, a service container
 	docker(2, 1001, noStep) // docker start
-	assert.Zero(t, tr.OrdinalAt(time.Unix(1001, 500)))
+	assert.Equal(t, uint32(2), tr.OrdinalAt(time.Unix(1001, 500)))
 
 	run := "GITHUB_ACTION=__run\x00"
 	tr.handleStepEvent(forkEvent(103, 3), wallClock(time.Unix(1010, 0)))
 	tr.handleStepEvent(execEventEnv(evExec, 103, 3, "bash\x00", 5, "bash", run, uint32(len(run))), wallClock(time.Unix(1010, 0)))
+	assert.Equal(t, uint32(3), tr.OrdinalAt(time.Unix(1012, 0)))
+	tr.handleStepEvent(endEvent(103, 3), wallClock(time.Unix(1015, 0)))
 
 	docker(4, 1020, noStep) // docker build, a local action's image
-	assert.Equal(t, uint32(3), tr.OrdinalAt(time.Unix(1021, 0)))
+	assert.Equal(t, uint32(4), tr.OrdinalAt(time.Unix(1021, 0)))
 	docker(5, 1030, "GITHUB_ACTION=lint\x00") // docker run
 	assert.Equal(t, uint32(5), tr.OrdinalAt(time.Unix(1031, 0)))
+	docker(6, 1035, noStep) // a runner check, docker exec
+	assert.Equal(t, uint32(5), tr.OrdinalAt(time.Unix(1036, 0)))
 }
 
 // The latest boundary is the latest by time, whatever order the events

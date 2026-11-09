@@ -90,17 +90,19 @@ enum step_event_kind {
     STEP_EV_FORK = 1,
     STEP_EV_EXEC = 2,
     STEP_EV_EXIT = 3,
+    STEP_EV_END = 4,
 };
 
 const enum step_event_kind *btf_anchor_step_event_kind __attribute__((unused));
 
 // New-step notifications for the userspace reconciler, emitted once per new
 // direct child process of Runner.Worker, before the child runs user code
-// (STEP_EV_FORK), and again should the child exit before it execs
-// (STEP_EV_EXIT). tgid is the child's pid as numbered in the daemon's
-// namespace (0 if untranslatable). ktime is when the fork or exit
-// happened, by bpf_ktime_get_ns (CLOCK_MONOTONIC): the reader can fall
-// behind, and the step starts at its fork, not when the reader gets to it.
+// (STEP_EV_FORK), and again when the child exits: before it execs
+// (STEP_EV_EXIT), or after (STEP_EV_END), which ends its step. tgid is the
+// child's pid as numbered in the daemon's namespace (0 if
+// untranslatable). ktime is when the fork or exit happened, by
+// bpf_ktime_get_ns (CLOCK_MONOTONIC): the reader can fall behind, and the
+// step starts at its fork, not when the reader gets to it.
 struct step_child_event {
     __u32 kind;
     __u32 tgid;
@@ -164,6 +166,16 @@ struct {
     __type(value, __u32);
     __uint(max_entries, 1024);
 } map_step_exec_pending SEC(".maps");
+
+// Step roots from their first exec to their exit: global tgid → ordinal.
+// emit_step_exec adds one, and cw_step_exit takes it out as it reports the
+// step's end.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1024);
+} map_step_live SEC(".maps");
 
 // One record per task in the daemon's pid-namespace subtree, streamed by
 // cw_step_iter. tid/tgid/ppid are global; ns_tgid is the process id
@@ -333,7 +345,29 @@ static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid,
         ev->env_len = env_len > 0xffffffff ? 0xffffffff : env_len;
         bpf_ringbuf_submit(ev, 0);
     }
+    bpf_map_update_elem(&map_step_live, &tgid, &ord, BPF_ANY);
     bpf_map_delete_elem(&map_step_exec_pending, &tgid);
+}
+
+// emit_step_end reports the exit of a step root that has exec'd, the end
+// of its step, and takes it out of map_step_live.
+static __always_inline void emit_step_end(__u32 tgid)
+{
+    __u32 *live = bpf_map_lookup_elem(&map_step_live, &tgid);
+    if (!live)
+        return;
+    __u32 ord = *live;
+    __u32 *ns = bpf_map_lookup_elem(&map_task_nspid, &tgid);
+    struct step_child_event *ev = bpf_ringbuf_reserve(&map_step_events, sizeof(*ev), 0);
+    if (ev) {
+        ev->kind = STEP_EV_END;
+        ev->tgid = ns ? *ns : 0;
+        ev->ordinal = ord;
+        ev->pad = 0;
+        ev->ktime = bpf_ktime_get_ns();
+        bpf_ringbuf_submit(ev, 0);
+    }
+    bpf_map_delete_elem(&map_step_live, &tgid);
 }
 
 // move_entry moves a task's entry in map from tid from to tid to, if it
@@ -370,16 +404,18 @@ int BPF_PROG(cw_step_exec, struct task_struct *p, pid_t old_pid, struct linux_bi
 
 // PID-reuse hygiene: drop the tag and the namespace entry when the task
 // exits. Unconditional — a delete on an absent key is cheap, and gating on
-// step_state would cost the same lookup. A step root that exits without
-// exec'ing reports it first, when its last thread exits: the leader alone
-// exiting is a pthread_exit, or a de_thread whose exec is still to come.
-// do_exit counts the thread out of signal->live before this fires.
+// step_state would cost the same lookup. A step root reports its exit
+// first, when its last thread exits: the leader alone exiting is a
+// pthread_exit, or a de_thread whose exec is still to come. do_exit
+// counts the thread out of signal->live before this fires.
 SEC("tp_btf/sched_process_exit")
 int BPF_PROG(cw_step_exit, struct task_struct *task)
 {
     __u32 tid = task->pid;
-    if (BPF_CORE_READ(task, signal, live.counter) == 0)
+    if (BPF_CORE_READ(task, signal, live.counter) == 0) {
         emit_step_exec(task, task->tgid, STEP_EV_EXIT);
+        emit_step_end(task->tgid);
+    }
     bpf_map_delete_elem(&map_task_step, &tid);
     bpf_map_delete_elem(&map_task_nspid, &tid);
     return 0;

@@ -39,10 +39,12 @@ import (
 // root, numbered in our pid namespace; reported is whether its
 // step_boundary event is written. notStep is set once the root is known to
 // be no step: a runner helper (events.StepClassRunner), or a copy of
-// Runner.Worker that exited without exec'ing.
+// Runner.Worker that exited without exec'ing. end is when the root exited
+// after exec'ing, zero while it runs (or its exit event was lost).
 type boundary struct {
 	ordinal  uint32
 	at       time.Time
+	end      time.Time
 	pid      uint32
 	reported bool
 	notStep  bool
@@ -95,11 +97,15 @@ func (t *Tracker) recordBoundary(b boundary) {
 // tm, or 0 when tm predates every observed boundary (callers treat 0 as
 // untagged, which degrades to the stricter attribution tier by design).
 //
-// Roots known to be no step are passed over: a runner helper Runner.Worker
-// forks while a step runs doesn't end that step. A root not identified
-// yet, or never (events.StepClassUnknown), still counts. Its ordinal is
-// bound no step's rules until it is identified as that step, so resolving
-// to it is never wider than resolving to the step before it.
+// A root known to be no step, forked while a step's root runs, is passed
+// over: a runner helper Runner.Worker forks during a step doesn't end that
+// step. One forked between steps, after the last step's root exited, is
+// not: what it starts gets no step's rules, not the ended step's. A root
+// not identified yet, or never (events.StepClassUnknown), counts as a
+// step. Its ordinal is bound no step's rules until it is identified as
+// that step, so resolving to it is never wider than resolving to the step
+// before it. A lost exit event leaves a root running as far as this
+// knows, so a no-step root after it is passed over.
 //
 // Boundaries are in the order their events were read, which their kernel
 // times need not follow (a fork recorded from its exec, its fork event
@@ -110,7 +116,10 @@ func (t *Tracker) OrdinalAt(tm time.Time) uint32 {
 	var latest *boundary
 	for i := range t.boundaries {
 		b := &t.boundaries[i]
-		if b.notStep || b.at.After(tm) || (latest != nil && b.at.Before(latest.at)) {
+		if b.at.After(tm) || (latest != nil && b.at.Before(latest.at)) {
+			continue
+		}
+		if b.notStep && t.stepRunning(b.at) {
 			continue
 		}
 		latest = b
@@ -119,6 +128,29 @@ func (t *Tracker) OrdinalAt(tm time.Time) uint32 {
 		return 0
 	}
 	return latest.ordinal
+}
+
+// stepRunning reports whether the root of a boundary that may be a step
+// had started at tm and not yet exited, with boundaryMu held.
+func (t *Tracker) stepRunning(tm time.Time) bool {
+	for _, b := range t.boundaries {
+		if !b.notStep && !b.at.After(tm) && (b.end.IsZero() || b.end.After(tm)) {
+			return true
+		}
+	}
+	return false
+}
+
+// ended records when ordinal's root exited, for OrdinalAt.
+func (t *Tracker) ended(ordinal uint32, at time.Time) {
+	t.boundaryMu.Lock()
+	defer t.boundaryMu.Unlock()
+	for i := len(t.boundaries) - 1; i >= 0; i-- {
+		if t.boundaries[i].ordinal == ordinal {
+			t.boundaries[i].end = at
+			return
+		}
+	}
 }
 
 // claimBoundary marks ordinal's boundary reported and returns it, recording
@@ -197,8 +229,9 @@ func (t *Tracker) reportLost(cutoff time.Time) {
 // step: the boundary is recorded at once, so OrdinalAt callers racing it
 // resolve against it promptly, and the fork's time is the boundary's. The
 // root's first exec says what the step runs and which step it is, and only
-// then is the step reported. A root that exits without exec'ing ran a copy
-// of Runner.Worker, whose command line it reports, and is no step.
+// then is the step reported, and its exit after is the step's end. A root
+// that exits without exec'ing ran a copy of Runner.Worker, whose command
+// line it reports, and is no step.
 func (t *Tracker) handleStepEvent(raw []byte, now clock) {
 	if len(raw) < 4 {
 		return
@@ -218,6 +251,12 @@ func (t *Tracker) handleStepEvent(raw []byte, now clock) {
 		if b, ok := t.claimBoundary(ev.Ordinal, ev.Tgid, now.at(ev.Ktime), true); ok {
 			t.reportStep(b, sanitizeCmdline(t.workerCmdline), Identity{})
 		}
+	case bpf.StepBpfStepEventKindSTEP_EV_END:
+		if len(raw) < int(unsafe.Sizeof(bpf.StepBpfStepChildEvent{})) {
+			return
+		}
+		ev := (*bpf.StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
+		t.ended(ev.Ordinal, now.at(ev.Ktime))
 	case bpf.StepBpfStepEventKindSTEP_EV_EXEC:
 		if len(raw) < int(unsafe.Sizeof(bpf.StepBpfStepExecEvent{})) {
 			return

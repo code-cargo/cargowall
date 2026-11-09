@@ -44,11 +44,12 @@ const (
 	stepEvFork = uint32(StepBpfStepEventKindSTEP_EV_FORK)
 	stepEvExec = uint32(StepBpfStepEventKindSTEP_EV_EXEC)
 	stepEvExit = uint32(StepBpfStepEventKindSTEP_EV_EXIT)
+	stepEvEnd  = uint32(StepBpfStepEventKindSTEP_EV_END)
 )
 
 // readStepEvent reads the next step event: its kind, and the event decoded
-// as the struct its kind says it is: a fork or an exit is a child event,
-// exactly that size, and an exec an exec event.
+// as the struct its kind says it is: a fork, an exit or an end is a child
+// event, exactly that size, and an exec an exec event.
 func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEvent, StepBpfStepExecEvent) {
 	t.Helper()
 	record, err := rd.Read()
@@ -58,7 +59,7 @@ func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEv
 	var fork StepBpfStepChildEvent
 	var execEv StepBpfStepExecEvent
 	switch kind := *(*uint32)(unsafe.Pointer(&raw[0])); kind {
-	case stepEvFork, stepEvExit:
+	case stepEvFork, stepEvExit, stepEvEnd:
 		require.Len(t, raw, int(unsafe.Sizeof(fork)))
 		fork = *(*StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
 		return kind, fork, execEv
@@ -360,7 +361,7 @@ func TestStepExec_CarriesEnvironment(t *testing.T) {
 
 // TestStepExec_FirstExecOnly: a step root that execs again (a shell's
 // `exec`) is reported once, for what the worker started; its later exec
-// and its exit say nothing.
+// says nothing, and its exit only ends the step, once.
 func TestStepExec_FirstExecOnly(t *testing.T) {
 	tcObjs, objs, iter := loadStepObjects(t)
 	rd, err := ringbuf.NewReader(objs.MapStepEvents)
@@ -379,8 +380,9 @@ func TestStepExec_FirstExecOnly(t *testing.T) {
 		return e.Tgid == pid
 	})
 	require.Equal(t, "sh\x00-c\x00exec true\x00", argvOf(first))
-	// Drain what is left: nothing more for this ordinal.
+	// Drain what is left: nothing more for this ordinal but its end.
 	rd.SetDeadline(time.Now().Add(200 * time.Millisecond))
+	ends := 0
 	for {
 		record, err := rd.Read()
 		if err != nil {
@@ -391,9 +393,14 @@ func TestStepExec_FirstExecOnly(t *testing.T) {
 		// Every kind carries its ordinal at the same offset.
 		if kind := *(*uint32)(unsafe.Pointer(&raw[0])); len(raw) >= 12 && kind != stepEvFork {
 			ord := *(*uint32)(unsafe.Pointer(&raw[8]))
+			if kind == stepEvEnd && ord == first.Ordinal {
+				ends++
+				continue
+			}
 			require.NotEqual(t, first.Ordinal, ord, "a second event (kind %d) for the step", kind)
 		}
 	}
+	require.Equal(t, 1, ends, "the root's exit ends the step, once")
 }
 
 // TestHelperExecFromThread is not a test: TestStepExec_FromThreadKeepsTag
@@ -556,6 +563,36 @@ func TestStepExit_WithoutExec(t *testing.T) {
 	require.Zero(t, exitEv.Pad)
 	require.True(t, exitEv.Ktime >= fork.Ktime && exitEv.Ktime <= monoNow(t),
 		"the exit is dated when it happened: %d not in [%d, now]", exitEv.Ktime, fork.Ktime)
+	var k, v uint32
+	require.False(t, objs.MapStepLive.Iterate().Next(&k, &v), "a root that never exec'd has no step to end")
+}
+
+// TestStepEnd_AfterExec: a step root that exits after its exec reports
+// its step's end, once, dated when it exited, and leaves nothing behind.
+func TestStepEnd_AfterExec(t *testing.T) {
+	tcObjs, objs, iter := loadStepObjects(t)
+	rd, err := ringbuf.NewReader(objs.MapStepEvents)
+	require.NoError(t, err)
+	t.Cleanup(func() { rd.Close() })
+	selfTgid, ok := globalTgid(t, iter, os.Getpid())
+	require.True(t, ok)
+	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: selfTgid, Enabled: 1, NextOrdinal: 5}))
+
+	child := exec.Command("true")
+	require.NoError(t, child.Start())
+	childPID := uint32(child.Process.Pid)
+	fork, _ := awaitStepEvent(t, rd, stepEvFork, 0, func(f StepBpfStepChildEvent, _ StepBpfStepExecEvent) bool {
+		return f.Tgid == childPID
+	})
+	require.NoError(t, child.Wait())
+	end, _ := awaitStepEvent(t, rd, stepEvEnd, fork.Ordinal, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool {
+		return true
+	})
+	require.Zero(t, end.Pad)
+	require.True(t, end.Ktime > fork.Ktime && end.Ktime <= monoNow(t),
+		"the end is dated when the root exited: %d not in (%d, now]", end.Ktime, fork.Ktime)
+	var k, v uint32
+	require.False(t, objs.MapStepLive.Iterate().Next(&k, &v), "the ended root is out of map_step_live")
 }
 
 // readProcInt reads an integer /proc/sys value.

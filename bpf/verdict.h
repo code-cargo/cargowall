@@ -179,11 +179,12 @@ struct {
 // A step's own allow rules live in the rule maps under a policy of their
 // own, never under POLICY_JOB. map_step_policy binds a step's ordinal to
 // that policy, written once, by userspace, when the step is identified, and
-// a socket finds its step's ordinal in map_sock_step: the step of the
-// thread that last chose its destination, or that created it (see
-// step_tag_socket in tcbpf.c). An ordinal with no binding (not identified yet, or
-// never: a sentinel, a runner helper, an unknown step) and a socket with no
-// tag have no step policy, and the job's rules alone judge them.
+// a socket finds its step's ordinal in map_sock_step, by the rule
+// step_tag_socket in tcbpf.c gives: in short, the last tagged thread to
+// connect it or send on it as UDP, and until then its creator. An ordinal
+// with no binding (not identified yet, or never: a sentinel, a runner
+// helper, an unknown step) and a socket with no tag have no step policy,
+// and the job's rules alone judge them.
 
 // Nonzero when some step has rules of its own. A load-time constant, so a
 // job without step rules runs no step lookup at all: at zero the verifier
@@ -191,8 +192,8 @@ struct {
 const volatile __u8 step_rules_enabled = 0;
 
 // socket cookie → step ordinal, written at socket creation (cw_cg_sock_new
-// in stepbpf.c, which declares the same map) and again at each connect or
-// addressed send (the connect/sendmsg hooks in tcbpf.c).
+// in stepbpf.c, which declares the same map) and again by the connect and
+// sendmsg hooks in tcbpf.c (see step_tag_socket there).
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, __u64);

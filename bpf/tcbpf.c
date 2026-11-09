@@ -159,10 +159,11 @@ struct {
 // BTF) tags each such child with a monotonically increasing step ordinal;
 // every other fork inherits the forking thread's tag, so a step's entire
 // process subtree — including daemonized survivors — carries its ordinal.
-// The cgroup hooks copy the tag onto each socket cookie at creation and at
-// each connect or addressed send, and TC embeds it in events. The verdict reads a socket's tag only to find
-// its step's own allow rules (map_sock_step and map_step_policy, in
-// verdict.h); the kernel otherwise only ever increments and copies.
+// The cgroup hooks copy the tag onto each socket cookie at creation, and
+// again at connect and some sends (see step_tag_socket), and TC embeds it
+// in events. The verdict reads a socket's tag only to find its step's own
+// allow rules (map_sock_step and map_step_policy, in verdict.h); the
+// kernel otherwise only ever increments and copies.
 
 // Reserved ordinal values. Documentation of the map value space only — no
 // BPF program compares against them; they are written and interpreted by
@@ -222,16 +223,20 @@ static __always_inline __u32 sock_owner_pid(void) {
     return ns ? *ns : (__u32)(pid_tgid >> 32);
 }
 
-// Helper: copy the calling thread's step tag onto a socket cookie, over
-// whatever tag it had. Shared by the connect/sendmsg hooks below and
-// cw_cg_sock_new in stepbpf.c: a socket's tag is the step of the thread
-// that last chose its destination (connect, or a send to an address), and
-// until one has, of the thread that created it. The verdict judges a
-// socket by its tag's step, so the step whose thread aimed it is the step
-// judged, never one whose socket it merely borrowed. Steps of one job that
-// share a socket (an unconnected UDP socket sent on by two steps' threads,
-// whose tags can cross between one's send and the other's packet) are
-// beyond it: they share a uid and the workspace, and the job is the
+// Helper: copy the calling thread's step tag, if it has one, onto a socket
+// cookie, over whatever tag it had. Shared by the connect/sendmsg hooks
+// below and cw_cg_sock_new in stepbpf.c, so a socket's tag is the step of
+// the last tagged thread to connect it (TCP and UDP, and ping from 6.x:
+// before that a ping connect runs no hook) or to send on it as UDP through
+// an address or IP-level control messages (IP_TTL, IP_PKTINFO and the like
+// run the sendmsg hook even on a connected socket), and until then of the
+// thread that created it. Raw and ping sends, raw connects, and untagged
+// threads never re-tag. The verdict judges a socket by its tag's step, so
+// for TCP and UDP the step whose thread aimed a socket is the step judged.
+// Steps of one job that share a socket are beyond it: an unconnected UDP
+// socket two steps' threads send on, whose tags can cross between one's
+// send and the other's packet, or a ping or raw socket one step aims and
+// another made. They share a uid and the workspace, and the job is the
 // boundary between them.
 static __always_inline void step_tag_socket(__u64 cookie) {
     __u32 sk = 0;

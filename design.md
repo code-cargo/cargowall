@@ -808,33 +808,39 @@ to select policy with.
   step's own rules sit under a policy bound to its ordinal in
   `map_step_policy`, once, when the step is identified. Both hooks decide
   the same way (`verdict_allowed_v4`/`_v6` in `verdict.h`): the job's
-  rules first; where they decide nothing (no match, or a port-specific
-  match whose port is not listed and no wildcard port entry), the rules of
-  the step tagged on the socket, read through `map_sock_step` and the
-  tag's binding, may allow; the job's default action decides the rest. A
-  step's rules can only turn the job's silence into an allow, never into a
-  deny, so a step gets all the job gets and never less, and anything with
-  no step policy (an untagged socket, a sentinel or unbound ordinal, a
-  step not yet identified) gets the job's rules alone: every gap is
-  fail-closed. Explicit job denies hold for every step. A load-time
-  constant (`step_rules_enabled`) prunes the step lookup from both hooks
-  when no step has rules; the data plane is in place, and until the
-  policy's own `steps` arrive nothing turns it on or binds a step.
-  - *Which step a socket is judged as.* Its tag: the step of the thread
-    that last chose its destination (a `connect`, or a send to an address
-    of its own choosing), and until one has, of the thread that created
-    it. The step whose thread aimed a socket is the step judged, never one
-    whose socket it merely borrowed. A container's processes are tagged
-    when dockerd reports the container started, or an exec run in it,
-    with the step running at that moment (see Container Attribution), so
-    a service container started in step 2 is governed by step 2's policy
-    for its lifetime unless an exec re-tags it.
+  rules first; where they decide nothing (no LPM match and no wildcard
+  port entry, or a port-specific match whose port is not listed and no
+  wildcard port entry), the rules of the step tagged on the socket, read
+  through `map_sock_step` and the tag's binding, may allow; the job's
+  default action decides the rest. A step's rules can only turn the job's
+  silence into an allow, never into a deny, so a step gets all the job
+  gets and never less, and anything with no step policy (an untagged
+  socket, a sentinel or unbound ordinal, a step not yet identified) gets
+  the job's rules alone: every gap is fail-closed. Explicit job denies
+  hold for every step. A load-time constant (`step_rules_enabled`) prunes
+  the step lookup from both hooks when no step has rules; the data plane
+  is in place, and until the policy's own `steps` arrive nothing turns it
+  on or binds a step.
+  - *Which step a socket is judged as.* Its tag: the step of the last
+    tagged thread to connect it (TCP and UDP; ping from 6.x) or to send
+    on it as UDP through an address or IP-level control messages (which
+    run the sendmsg hook even on a connected socket), and until then of
+    the thread that created it (`cgroup/sock_create` runs for user sockets
+    of the inet families). Raw and ping sends, raw connects, and untagged
+    threads never re-tag. So for TCP and UDP the step whose thread aimed a
+    socket is the step judged. A container's processes are tagged when
+    dockerd reports the container started, or an exec run in it, with the
+    step running at that moment (see Container Attribution), so a service
+    container started in step 2 is governed by step 2's policy for its
+    lifetime unless an exec re-tags it.
   - *What per-step rules do not separate.* They bound what each step's own
     processes reach. Steps of one job share a uid, the workspace and
     dockerd, so a step can shape what a later one runs, or share a socket
     with another (two steps' threads sending on one unconnected UDP socket
-    can each re-tag it between the other's send and its packet's verdict):
-    between steps that do not trust each other, the boundary is the job.
+    can each re-tag it between the other's send and its packet's verdict,
+    and a step aiming a ping or raw socket another made is judged as its
+    maker): between steps that do not trust each other, the boundary is
+    the job.
   - *Where the two hooks differ.* Both read the same tag for the same
     socket, with two exceptions. TC sees a bridge-networked container's
     packets post-NAT with no socket, and judges them by the job's rules:

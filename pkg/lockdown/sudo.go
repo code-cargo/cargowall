@@ -55,6 +55,9 @@ type lockdownState struct {
 	RemovedGroups []string `json:"removedGroups"`
 	DisabledFiles []string `json:"disabledFiles"`
 	DockerRemoved bool     `json:"dockerRemoved"`
+	// SudoersBlock is whether the lockdown rules were also appended to
+	// /etc/sudoers, for a file that does not read sudoers.d last.
+	SudoersBlock bool `json:"sudoersBlock,omitempty"`
 }
 
 const sudoersUnsafeChars = " ,#\n\r\t`;&!()\\|*?[]"
@@ -288,7 +291,9 @@ func disableCompetingSudoersFiles(dir, username string, logger *slog.Logger) ([]
 //   - starts with the username followed by whitespace (direct grant),
 //   - contains the username in a User_Alias definition (indirect grant via alias),
 //   - starts with a name present in aliases (cross-file alias grant), or
-//   - contains a %group grant where the user is a member of that group.
+//   - contains a %group grant where the user is a member of that group,
+//
+// each of user and group by name or by id ("#uid", "%#gid").
 //
 // aliases is the set of User_Alias names (collected across all sudoers.d files)
 // that include the target username; it may be nil when cross-file detection is
@@ -303,6 +308,10 @@ func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, alia
 	}
 	directPrefix := username + " "
 	directPrefixTab := username + "\t"
+	uid := ""
+	if u, err := user.Lookup(username); err == nil {
+		uid = u.Uid
+	}
 	for _, line := range strings.Split(string(data), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
@@ -312,6 +321,14 @@ func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, alia
 		// NOT comments. Modern sudo (1.9.1+) uses the @ form.
 		if isIncludeDirective(trimmed) {
 			return false, fmt.Errorf("sudoers file %s contains include directive that cannot be inspected", path)
+		}
+		// Nor is '#' and a digit, which names a user by uid. An unknown uid
+		// counts as a match (fail-closed), as an unknown group does below.
+		if ids, ok := uidSpec(trimmed); ok {
+			if uid == "" || slices.Contains(ids, uid) {
+				return true, nil
+			}
+			continue
 		}
 		if strings.HasPrefix(trimmed, "#") {
 			continue
@@ -347,12 +364,34 @@ func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, alia
 				return true, nil
 			}
 			groupName := strings.Fields(trimmed)[0][1:]
+			if gid, byID := strings.CutPrefix(groupName, "#"); byID {
+				if userGIDs[gid] {
+					return true, nil
+				}
+				continue
+			}
 			if grp, err := user.LookupGroup(groupName); err == nil && userGIDs[grp.Gid] {
 				return true, nil
 			}
 		}
 	}
 	return false, nil
+}
+
+// uidSpec returns the uids a rule's user list names by "#uid", and whether
+// the line starts with one: a '#' followed by a digit is a user, not a
+// comment. Members are comma-separated in the first field.
+func uidSpec(line string) ([]string, bool) {
+	if len(line) < 2 || line[0] != '#' || line[1] < '0' || line[1] > '9' {
+		return nil, false
+	}
+	var ids []string
+	for _, m := range strings.Split(strings.Fields(line)[0], ",") {
+		if id, ok := strings.CutPrefix(m, "#"); ok && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, true
 }
 
 // isIncludeDirective returns true if the line is a sudoers #include,
@@ -499,6 +538,12 @@ type rollbackState struct {
 
 func (r *rollbackState) rollback() {
 	os.Remove(sudoersFile)
+	// Unconditional: the block is found by its markers, and a run that
+	// crashed after appending it never recorded that it did.
+	if _, err := removeSudoersBlock(mainSudoers); err != nil {
+		r.logger.Warn("Failed to remove the lockdown block from sudoers during rollback",
+			"path", mainSudoers, "error", err)
+	}
 	restoreDisabledSudoersFiles(r.DisabledFiles, r.logger)
 	if r.Username != "" {
 		restoreToGroups(r.Username, r.RemovedGroups, r.logger)
@@ -551,9 +596,17 @@ func removeLockdownState() {
 
 // recoverLockdownState attempts to reconstruct a lockdownState by scanning
 // the filesystem for evidence of a previous lockdown run. Used as a fallback
-// when the state file exists but is corrupted.
-func recoverLockdownState(dir, username string, logger *slog.Logger) *lockdownState {
+// when the state file exists but is corrupted. main is the sudoers file a
+// lockdown block may have been appended to.
+func recoverLockdownState(dir, main, username string, logger *slog.Logger) *lockdownState {
 	recovered := &lockdownState{Username: username}
+
+	if data, err := os.ReadFile(main); err == nil {
+		if _, found, _ := withoutBlock(string(data)); found {
+			recovered.SudoersBlock = true
+			logger.Info("Recovered the lockdown block in sudoers", "path", main)
+		}
+	}
 
 	// Recover disabled files by scanning for *.cargowall-disabled files.
 	recovered.DisabledFiles = findDisabledSudoersFiles(dir, logger)
@@ -600,7 +653,9 @@ func recoverLockdownState(dir, username string, logger *slog.Logger) *lockdownSt
 
 // EnableSudoLockdown configures sudoers to restrict what commands can be run
 // with sudo, removes the target user from sudo-granting and docker groups,
-// and disables competing sudoers.d files.
+// and disables competing sudoers.d files. It then checks, as a job step,
+// that sudo refuses a command the allowlist does not name, and undoes it
+// all with an error when sudo does not.
 func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	logger.Info("Enabling sudo lockdown")
 
@@ -615,7 +670,7 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	if prevErr != nil {
 		logger.Warn("Lockdown state file is corrupted, attempting best-effort recovery",
 			"error", prevErr, "state_file", stateFile)
-		prev = recoverLockdownState(sudoersDir, username, logger)
+		prev = recoverLockdownState(sudoersDir, mainSudoers, username, logger)
 	}
 	if prev != nil {
 		logger.Warn("Found stale lockdown state from previous run, cleaning up first")
@@ -637,7 +692,15 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		}
 	}()
 
-	// Remove user from sudo-granting groups to neutralize group-based grants
+	// The groups as a process started before the lockdown holds them, which
+	// removing the user from a group below does not change.
+	preGIDs, preErr := lookupUserGIDs(username)
+	if preErr != nil {
+		logger.Debug("Failed to look up user groups before lockdown", "username", username, "error", preErr)
+	}
+
+	// Remove user from sudo-granting groups, for logins after the lockdown;
+	// the rules below are what hold against processes already running.
 	rb.RemovedGroups, err = removeFromSudoGroups(username, logger)
 	if err != nil {
 		return fmt.Errorf("sudo lockdown incomplete, group removal failed: %w", err)
@@ -649,11 +712,13 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return fmt.Errorf("sudo lockdown incomplete, competing grants remain active: %w", err)
 	}
 
-	// Remove user from docker group to prevent docker-based firewall bypass
+	// Remove user from the docker group. Like the sudo groups, this reaches
+	// only logins after the lockdown: running job steps keep the docker
+	// socket, which warnDockerAccess reports.
 	if out, err := exec.Command("gpasswd", "-d", username, "docker").CombinedOutput(); err != nil {
 		logger.Warn("Failed to remove user from docker group (user may not be in group)", "error", err, "output", strings.TrimSpace(string(out)))
 	} else {
-		logger.Info("Removed user from docker group", "username", username)
+		logger.Info("Removed user from docker group for later logins; running job steps keep it", "username", username)
 		rb.DockerRemoved = true
 	}
 
@@ -662,6 +727,7 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("failed to build sudoers config: %w", err)
 	}
+	rules := lockdownRules(username, cfg.AllowCommands)
 
 	// Ensure sudoers.d directory exists
 	if err := os.MkdirAll(sudoersDir, 0o755); err != nil {
@@ -684,12 +750,32 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return fmt.Errorf("failed to install sudoers file: %w", err)
 	}
 
+	// Where sudo would not read that file last, the same rules go at the end
+	// of /etc/sudoers.
+	rb.SudoersBlock, err = appendSudoersBlock(mainSudoers, sudoersDir, rules)
+	if err != nil {
+		return fmt.Errorf("sudo lockdown incomplete, %s does not read the lockdown last and could not be amended: %w", mainSudoers, err)
+	}
+	if rb.SudoersBlock {
+		logger.Info("Appended the lockdown rules to sudoers, which does not read sudoers.d last", "path", mainSudoers)
+	}
+
 	// Validate the overall sudoers configuration after all modifications.
 	// If disabling files broke alias/Defaults dependencies, roll back.
 	if out, err := exec.Command("visudo", "-c").CombinedOutput(); err != nil {
 		logger.Warn("Overall sudoers validation failed after modifications, rolling back",
 			"error", err, "output", strings.TrimSpace(string(out)))
 		return fmt.Errorf("sudoers validation failed after lockdown modifications: %w", err)
+	}
+
+	// Ask sudo, as a job step, whether the lockdown holds, and report the
+	// docker access it leaves, which fails nothing.
+	if view, err := lookupJobView(username, preGIDs); err != nil {
+		logger.Warn("Cannot verify sudo lockdown: the target user's credentials are unknown", "username", username, "error", err)
+	} else if err := verifyLockdown(view, cfg.AllowCommands, logger); err != nil {
+		return err
+	} else {
+		warnDockerAccess(view, logger)
 	}
 
 	// Save state so DisableSudoLockdown can reverse all changes
@@ -704,7 +790,8 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		"allow_commands", cfg.AllowCommands,
 		"username", username,
 		"removed_groups", rb.RemovedGroups,
-		"disabled_files", rb.DisabledFiles)
+		"disabled_files", rb.DisabledFiles,
+		"sudoers_block", rb.SudoersBlock)
 
 	return nil
 }
@@ -727,8 +814,17 @@ func DisableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		logger.Warn("Failed to remove sudoers file", "error", err)
 	}
 
-	// Restore disabled sudoers.d files
+	// The block goes next, for the same reason. Removed by its markers
+	// whatever the state says, which a crash may have left without it.
 	restoreFailed := false
+	if removed, err := removeSudoersBlock(mainSudoers); err != nil {
+		logger.Warn("Failed to remove the lockdown block from sudoers", "path", mainSudoers, "error", err)
+		restoreFailed = true
+	} else if removed {
+		logger.Info("Removed the lockdown block from sudoers", "path", mainSudoers)
+	}
+
+	// Restore disabled sudoers.d files
 	if state != nil {
 		if !restoreDisabledSudoersFiles(state.DisabledFiles, logger) {
 			restoreFailed = true
@@ -794,11 +890,8 @@ func DisableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	return nil
 }
 
-// buildSudoersConfig generates the sudoers configuration content.
-// The lockdown relies on restricting NOPASSWD to a specific set of commands,
-// removing the user from sudo-granting groups, and disabling competing
-// sudoers.d files. Sudoers negation (!ALL) is intentionally not used because
-// it does not reliably override grants from other sudoers files.
+// buildSudoersConfig generates the sudoers configuration content: a header
+// and lockdownRules.
 func buildSudoersConfig(cfg *SudoLockdownConfig, username string) (string, error) {
 	cmds := slices.Clone(cfg.AllowCommands)
 
@@ -810,16 +903,24 @@ func buildSudoersConfig(cfg *SudoLockdownConfig, username string) (string, error
 # This file restricts sudo access to prevent firewall bypass
 # Generated by cargowall - DO NOT EDIT
 #
-# Effective only when combined with disabling competing sudoers.d files
-# (renamed to *%s) and removing the user from sudo-granting groups.
+# The first rule denies the user every command, and the allowlist follows.
+# Sudoers is last-match-wins, so they hold against any grant read before
+# them, a group's included, whatever groups a running process kept.
+# Competing sudoers.d files are disabled as well (renamed to *%s), and the
+# user is removed from sudo-granting groups for later logins.
 `, disabledSuffix)
 
-	if len(cmds) == 0 {
-		return header, nil
+	return header + "\n" + lockdownRules(username, cmds), nil
+}
+
+// lockdownRules are the lockdown's sudoers rules: everything denied to the
+// user, then the allowlist allowed without a password. The deny holds for
+// any command the allowlist does not name, as the last rule to match it,
+// against every grant read before it. The caller has validated both.
+func lockdownRules(username string, cmds []string) string {
+	rules := username + " ALL=(ALL:ALL) !ALL\n"
+	if len(cmds) > 0 {
+		rules += fmt.Sprintf("%s ALL=(ALL) NOPASSWD: %s\n", username, strings.Join(cmds, ", "))
 	}
-
-	content := header + fmt.Sprintf("\n%s ALL=(ALL) NOPASSWD: %s\n",
-		username, strings.Join(cmds, ", "))
-
-	return content, nil
+	return rules
 }

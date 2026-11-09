@@ -65,6 +65,14 @@ const resolveRoundingSlack = 2 * time.Second
 // would hand the window tie-breaker synthetic evidence — Run resolves
 // BEFORE backfillStepCompletion for exactly this reason.
 //
+// Timing is the fallback. A boundary whose step id a step's context name
+// matches resolves to that step (stepIndexByID), by the id alone but for
+// telling a main step from its post step when nothing forked between
+// them; only the boundaries that leaves, from older logs or older
+// actions, are placed by time. Both kinds move the same cursor. A
+// boundary with a step id placed by time never takes a step that carries
+// another one: it stays unresolved rather than take that step's name.
+//
 // A runner helper's boundary (hashFiles()) is no step's, and takes no part.
 func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep) map[uint32]int {
 	var boundaries []events.AuditEvent
@@ -80,9 +88,15 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 	idx := make(map[uint32]int)
 	prev := -1
 	for _, b := range boundaries {
+		if i := stepIndexByID(steps, b, prev); i >= 0 {
+			idx[b.StepOrdinal] = i
+			prev = max(prev, i)
+			continue
+		}
+		fits := func(i int) bool { return stepFits(steps[i], b) }
 		best := -1
 		for i := prev + 1; i < len(steps); i++ {
-			if steps[i].StartedAt.IsZero() || steps[i].StartedAt.After(b.Timestamp) {
+			if steps[i].StartedAt.IsZero() || steps[i].StartedAt.After(b.Timestamp) || !fits(i) {
 				continue
 			}
 			// Strictly-later only: within a same-second tie group the
@@ -102,7 +116,7 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 				break
 			}
 		}
-		nearNext := nextIdx >= 0 && steps[nextIdx].StartedAt.After(b.Timestamp) &&
+		nearNext := nextIdx >= 0 && fits(nextIdx) && steps[nextIdx].StartedAt.After(b.Timestamp) &&
 			steps[nextIdx].StartedAt.Sub(b.Timestamp) <= resolveRoundingSlack
 
 		// Unmatched boundary: ordered tie-breakers.
@@ -116,8 +130,8 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 		//    and systematically shift attribution one step left. Inside
 		//    this shared band timestamps cannot distinguish a composite's
 		//    final block from the next step's early fork; next-wins is
-		//    the deliberate choice until cmdline correlation (#103) can
-		//    tell them apart.
+		//    the deliberate choice. A step id tells them apart, which is
+		//    why a boundary with one never gets here.
 		if best == -1 && nearNext {
 			best = nextIdx
 		}
@@ -127,7 +141,7 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 		//    empirically real — see steps.Options.OrdinalBase — into
 		//    whatever step was running rather than letting them shift the
 		//    mapping).
-		if best == -1 && prev >= 0 && !steps[prev].StartedAt.After(b.Timestamp) &&
+		if best == -1 && prev >= 0 && fits(prev) && !steps[prev].StartedAt.After(b.Timestamp) &&
 			!steps[prev].CompletedAt.IsZero() && !b.Timestamp.After(steps[prev].CompletedAt) {
 			best = prev
 		}
@@ -135,7 +149,7 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 		//    end-side rounding of the same step. Farther than slack is a
 		//    fork in the inter-step gap that belongs to no step; it stays
 		//    unresolved and renders as its bare "#N" group.
-		if best == -1 && prev >= 0 && !steps[prev].StartedAt.After(b.Timestamp) {
+		if best == -1 && prev >= 0 && fits(prev) && !steps[prev].StartedAt.After(b.Timestamp) {
 			end := steps[prev].CompletedAt
 			if end.IsZero() || b.Timestamp.Sub(end) <= resolveRoundingSlack {
 				best = prev
@@ -147,6 +161,57 @@ func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep)
 		}
 	}
 	return idx
+}
+
+// stepFits reports whether boundary b may be placed by time on step s: not
+// when b has a step id and s carries another, which names some other step.
+func stepFits(s GitHubStep, b events.AuditEvent) bool {
+	return s.ContextName == "" || b.StepClass != events.StepClassStep || b.StepID == "" ||
+		s.ContextName == b.StepID
+}
+
+// stepIndexByID is the step a boundary's step id names, or -1 when the
+// boundary has none or no step carries it as its context name. Context
+// names are unique within a job, except that an action's post step
+// carries its main step's: the first match at or after the cursor is the
+// one running now, so the main step's processes go to the main step and
+// the post step's, forked after later steps ran, to the post step. When
+// none did, as when the action is the job's last step, the cursor is
+// still on the main step as its post step starts: from the post step's
+// start on, a boundary is the post step's. Start times are whole
+// seconds, so in the second the post step starts in, the main step's
+// first boundary is still its own, but a later one, as a composite whose
+// inner action has a post step forks more than once, goes to the post
+// step. With no match from the cursor on, the nearest earlier one still
+// names the right step.
+func stepIndexByID(steps []GitHubStep, b events.AuditEvent, prev int) int {
+	if b.StepClass != events.StepClassStep || b.StepID == "" {
+		return -1
+	}
+	from := max(prev, 0)
+	for i := from; i < len(steps); i++ {
+		if steps[i].ContextName != b.StepID {
+			continue
+		}
+		if i == prev {
+			for j := i + 1; j < len(steps); j++ {
+				if steps[j].ContextName != b.StepID {
+					continue
+				}
+				if steps[j].StartedAt.IsZero() || steps[j].StartedAt.After(b.Timestamp) {
+					break
+				}
+				i = j
+			}
+		}
+		return i
+	}
+	for i := from - 1; i >= 0; i-- {
+		if steps[i].ContextName == b.StepID {
+			return i
+		}
+	}
+	return -1
 }
 
 // foldRunnerHelpers moves the traffic of runner helpers — roots whose

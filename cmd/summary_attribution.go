@@ -69,9 +69,9 @@ const resolveRoundingSlack = 2 * time.Second
 // matches resolves to that step (stepIndexByID), by the id alone but for
 // telling a main step from its post step when nothing forked between
 // them; only the boundaries that leaves, from older logs or older
-// actions, are placed by time. Both kinds move the same cursor. A boundary with
-// a step id placed by time never takes a step that carries another one:
-// it stays unresolved rather than take that step's name.
+// actions, are placed by time. Both kinds move the same cursor. A
+// boundary with a step id placed by time never takes a step that carries
+// another one: it stays unresolved rather than take that step's name.
 //
 // A runner helper's boundary (hashFiles()) is no step's, and takes no part.
 func resolveOrdinalSteps(stepBoundaries []events.AuditEvent, steps []GitHubStep) map[uint32]int {
@@ -178,8 +178,12 @@ func stepFits(s GitHubStep, b events.AuditEvent) bool {
 // the post step's, forked after later steps ran, to the post step. When
 // none did, as when the action is the job's last step, the cursor is
 // still on the main step as its post step starts: from the post step's
-// start on, a boundary is the post step's. With no match from the cursor
-// on, the nearest earlier one still names the right step.
+// start on, a boundary is the post step's. Start times are whole
+// seconds, so in the second the post step starts in, the main step's
+// first boundary is still its own, but a later one, as a composite whose
+// inner action has a post step forks more than once, goes to the post
+// step. With no match from the cursor on, the nearest earlier one still
+// names the right step.
 func stepIndexByID(steps []GitHubStep, b events.AuditEvent, prev int) int {
 	if b.StepClass != events.StepClassStep || b.StepID == "" {
 		return -1

@@ -574,9 +574,10 @@ func TestSummary_ResolveOrdinalSteps_MainStepBeforeItsPostStep(t *testing.T) {
 // When nothing forks between a main step and its post step, as when the
 // action is the job's last step, the cursor is still on the main step as
 // the post step starts: a boundary from then on is the post step's, and
-// one before, the main step forking again, the main step's. The main
-// step's first boundary is its own even in the second its post step
-// starts in.
+// one before, the main step forking again, the main step's. Start times
+// are whole seconds: in the second the post step starts in, the main
+// step's first boundary is still its own, and a later one goes to the
+// post step.
 func TestSummary_ResolveOrdinalSteps_PostStepRightAfterItsMainStep(t *testing.T) {
 	base := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
 	at := func(d time.Duration) time.Time { return base.Add(d) }

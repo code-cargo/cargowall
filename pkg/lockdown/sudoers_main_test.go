@@ -60,6 +60,11 @@ func TestReadsLockdownLast(t *testing.T) {
 		{"commented-out include", "%sudo ALL=(ALL) ALL\n# includedir /etc/sudoers.d\n", false},
 		{"another directory", "@includedir /etc/sudoers.local\n", false},
 		{"one file of the directory", "@include /etc/sudoers.d/runner\n", false},
+		// Each of these is read after the lockdown file, so its grants would
+		// beat a deny that lives only there: the block must be appended.
+		{"ours, then another includedir", "@includedir /etc/sudoers.d\n@includedir /etc/sudoers.local\n", false},
+		{"ours, then a single-file include", "@includedir /etc/sudoers.d\n@include /etc/sudoers.extra\n", false},
+		{"ours, then a uid grant", "@includedir /etc/sudoers.d\n#1001 ALL=(ALL) NOPASSWD:ALL\n", false},
 		{"keyword alone", "%sudo ALL=(ALL) ALL\n#includedir\n", false},
 		{"empty", "", false},
 	}

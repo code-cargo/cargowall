@@ -293,10 +293,15 @@ func TestSudoersFileCompetes(t *testing.T) {
 		{"zzz-include", "@includedir /etc/sudoers.extra\n", true},
 		{"zzz-notes", "# just a comment\n\n# END\n", false},
 		{"zzz-defaults", "Defaults:runner !requiretty\nUser_Alias FOO = a, b\n", false},
-		{"zzz-dotted.bak", "someoneelse ALL=(ALL) NOPASSWD:ALL\n", false}, // sudo ignores dotted names
+		{"zzz-defaults-forms", "Defaults\tenv_reset\nDefaults@host x\nDefaults!/bin/ls noexec\nDefaults>root x\nDefaults\n" +
+			"Host_Alias H = h\nCmnd_Alias C = /bin/ls\nRunas_Alias R = root\n", false},
+		{"zzz-defaultsx", "Defaultsx, runner ALL=(ALL) NOPASSWD:ALL\n", true},     // a rule, not a Defaults line
+		{"zzz-user-aliasx", "User_Aliasx, runner ALL=(ALL) NOPASSWD:ALL\n", true}, // a rule, not an alias
+		{"zzz-dotted.bak", "someoneelse ALL=(ALL) NOPASSWD:ALL\n", false},         // sudo ignores dotted names
 		// Read before zz-cargowall-lockdown (parser; deny-first overrides).
 		{"00-other", "someoneelse ALL=(ALL) NOPASSWD:ALL\n", false},
 		{"00-runner", "runner ALL=(ALL) NOPASSWD:ALL\n", true},
+		{"00-defaultsx", "Defaultsx, runner ALL=(ALL) NOPASSWD:ALL\n", true}, // parsed as a user list
 	}
 	for _, tt := range cases {
 		path := filepath.Join(dir, tt.name)
@@ -312,11 +317,18 @@ func TestSudoersFileCompetes(t *testing.T) {
 	}
 }
 
+// TestReadAfterLockdown pins sudo's own read order: bytewise strcmp,
+// case-sensitive, C locale, skipping a name with '.' or ending in '~'.
 func TestReadAfterLockdown(t *testing.T) {
 	for name, want := range map[string]bool{
 		"zz-cargowall-lockdown": false, // the lockdown file itself
+		"zz-team":               true,
+		"zzz":                   true,
 		"zzz-team":              true,
 		"zz0-local":             true,
+		"zz_cargowall":          true,  // '_' (0x5F) sorts after '-' (0x2D)
+		"ZZ-after":              false, // uppercase sorts before lowercase
+		"ZZZ-team":              false, // would sort after if case were folded
 		"00-base":               false,
 		"README":                false,
 		"zzz-team.bak":          false, // dotted: sudo ignores it

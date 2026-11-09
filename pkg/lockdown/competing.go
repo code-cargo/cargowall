@@ -184,10 +184,10 @@ func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, alia
 		}
 		// Defaults !authenticate disables password prompts for all users,
 		// effectively granting passwordless sudo to anyone with a grant.
-		if strings.HasPrefix(trimmed, "Defaults") && strings.Contains(trimmed, "!authenticate") {
+		if isDefaultsLine(trimmed) && strings.Contains(trimmed, "!authenticate") {
 			return false, fmt.Errorf("sudoers file %s contains 'Defaults !authenticate' which bypasses password requirements", path)
 		}
-		if strings.HasPrefix(trimmed, "User_Alias ") {
+		if isAliasDefinition(trimmed, "User_Alias") {
 			if userAliasContains(trimmed, username) {
 				return true, nil
 			}
@@ -210,12 +210,41 @@ func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, alia
 	return false, nil
 }
 
+// hasSudoersKeyword reports whether a line opens with keyword as a whole
+// word: followed by the end of the line or one of seps. A bare prefix test
+// would read "Defaultsx, runner ALL=…" — a rule for users named Defaultsx and
+// runner — as a Defaults line.
+func hasSudoersKeyword(line, keyword, seps string) bool {
+	rest, ok := strings.CutPrefix(line, keyword)
+	return ok && (rest == "" || strings.ContainsRune(seps, rune(rest[0])))
+}
+
+// isDefaultsLine reports whether a line is a Defaults entry: the keyword
+// alone or bound to a user (':'), host ('@'), command ('!') or runas ('>')
+// list.
+func isDefaultsLine(trimmed string) bool {
+	return hasSudoersKeyword(trimmed, "Defaults", " \t:@!>")
+}
+
+// isAliasDefinition reports whether a line defines an alias of the given
+// kind ("User_Alias", "Host_Alias", …). Only whitespace may follow the
+// keyword; anything else is not a definition and is treated as a rule.
+func isAliasDefinition(trimmed, kind string) bool {
+	return hasSudoersKeyword(trimmed, kind, " \t")
+}
+
 // isNonGrantLine reports whether a line is a sudoers definition or default
 // whose leading word is not a user list: a Defaults line, or an alias
 // definition other than User_Alias (which the caller handles).
+//
+// Ignoring every Defaults line is safe under deny-first: a Defaults entry
+// sets options, and none can re-open a command the lockdown's !ALL denies.
 func isNonGrantLine(trimmed string) bool {
-	for _, kw := range []string{"Defaults", "Host_Alias ", "Cmnd_Alias ", "Runas_Alias "} {
-		if strings.HasPrefix(trimmed, kw) {
+	if isDefaultsLine(trimmed) {
+		return true
+	}
+	for _, kind := range []string{"Host_Alias", "Cmnd_Alias", "Runas_Alias"} {
+		if isAliasDefinition(trimmed, kind) {
 			return true
 		}
 	}
@@ -386,7 +415,7 @@ func fileHasEffectiveRule(path string) (bool, error) {
 		if strings.HasPrefix(trimmed, "#") && !(len(trimmed) >= 2 && trimmed[1] >= '0' && trimmed[1] <= '9') {
 			continue
 		}
-		if isNonGrantLine(trimmed) || strings.HasPrefix(trimmed, "User_Alias ") {
+		if isNonGrantLine(trimmed) || isAliasDefinition(trimmed, "User_Alias") {
 			continue
 		}
 		return true, nil // a user specification
@@ -469,7 +498,7 @@ func collectUserAliases(dir, username string) map[string]bool {
 		}
 		for _, line := range strings.Split(string(data), "\n") {
 			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "User_Alias ") && userAliasContains(trimmed, username) {
+			if isAliasDefinition(trimmed, "User_Alias") && userAliasContains(trimmed, username) {
 				if alias := userAliasName(trimmed); alias != "" {
 					aliases[alias] = true
 				}

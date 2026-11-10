@@ -106,7 +106,8 @@ func (t *Tracker) recordBoundary(b boundary) {
 // step. Its ordinal is bound no step's rules until it is identified as
 // that step, so resolving to it is never wider than resolving to the step
 // before it. A lost exit event leaves a root running as far as this
-// knows, so a no-step root after it is passed over.
+// knows until the next step starts, so a no-step root between is passed
+// over.
 //
 // Boundaries are in the order their events were read, which their kernel
 // times need not follow (a fork recorded from its exec, its fork event
@@ -131,15 +132,22 @@ func (t *Tracker) OrdinalAt(tm time.Time) uint32 {
 	return latest.ordinal
 }
 
-// stepRunning reports whether the root of a boundary that may be a step
-// had started at tm and not yet exited, with boundaryMu held.
+// stepRunning reports whether a step's root was running at tm, with
+// boundaryMu held: the latest root that may be a step and had started by
+// tm, if it had not exited by then. Steps run one at a time, so a later
+// step's start ends one whose exit event was lost; were two roots ever to
+// overlap, the earlier is taken to have ended, and a no-step root then
+// counts, bound no rules: the job's.
 func (t *Tracker) stepRunning(tm time.Time) bool {
-	for _, b := range t.boundaries {
-		if !b.notStep && !b.at.After(tm) && (b.end.IsZero() || b.end.After(tm)) {
-			return true
+	var latest *boundary
+	for i := range t.boundaries {
+		b := &t.boundaries[i]
+		if b.notStep || b.at.After(tm) || (latest != nil && b.at.Before(latest.at)) {
+			continue
 		}
+		latest = b
 	}
-	return false
+	return latest != nil && (latest.end.IsZero() || latest.end.After(tm))
 }
 
 // ended records when ordinal's root exited, for OrdinalAt.

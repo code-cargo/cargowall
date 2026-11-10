@@ -399,6 +399,26 @@ func TestOrdinalAt_PassesOverRootsThatAreNoStep(t *testing.T) {
 	assert.Equal(t, uint32(9), tr.OrdinalAt(time.Unix(1067, 0)), "and the window before is as it was")
 }
 
+// A step whose end was lost runs, as far as OrdinalAt knows, only until
+// the next step starts: a runner operation after a later step that ended
+// resolves to itself, bound no rules, not to the step before.
+func TestOrdinalAt_LostEndLastsUntilTheNextStep(t *testing.T) {
+	tr, _ := newBoundaryTracker(t)
+	at := func(s int64) clock { return wallClock(time.Unix(s, 0)) }
+	root := func(tgid, ordinal uint32, s int64, env string) {
+		tr.handleStepEvent(forkEvent(tgid, ordinal), at(s))
+		tr.handleStepEvent(execEventEnv(evExec, tgid, ordinal, "bash\x00", 5, "bash", env, uint32(len(env))), at(s))
+	}
+	step, helper := "GITHUB_ACTION=build\x00", "PATH=/usr/bin\x00"
+
+	root(103, 3, 1010, step) // its end is lost
+	root(105, 5, 1030, step)
+	tr.handleStepEvent(endEvent(105, 5), at(1040))
+	root(106, 6, 1050, helper)
+	assert.Equal(t, uint32(6), tr.OrdinalAt(time.Unix(1051, 0)))
+	assert.Equal(t, uint32(5), tr.OrdinalAt(time.Unix(1035, 0)), "while step 5 ran, it is the step")
+}
+
 // How the runner's docker CLI processes resolve, all of them direct
 // children of Runner.Worker. "Initialize containers" creates and starts
 // the job and service containers with no step environment, before any

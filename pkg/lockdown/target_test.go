@@ -66,6 +66,9 @@ func TestResolveTarget_rootWorker(t *testing.T) {
 	root := t.TempDir()
 	fakeProc(t, root, "40", "Runner.Worker", status("0", "0"), "")
 	fakeProc(t, root, "41", "Runner.Worker", status(nobody.Uid, "65534"), "")
+	if _, err := resolveTarget("alice", root, "", asRoot, nil); err == nil || !strings.Contains(err.Error(), "runs as root") {
+		t.Errorf("a configured user with a root worker: err = %v; want refused", err)
+	}
 	for _, sudoUser := range []string{"", "nobody", "root"} {
 		_, err := resolveTarget("", root, sudoUser, asRoot, nil)
 		if err == nil || !strings.Contains(err.Error(), "runs as root") {
@@ -142,37 +145,57 @@ func TestResolveTarget_noWorker(t *testing.T) {
 	}
 }
 
-// A host has sudo when cargowall's PATH finds one, or when any of the
-// places sudo is installed holds one, a dangling link included: either way a
-// job step may run it.
+// A host has sudo when any name sudo is installed under is in a standard
+// directory, on cargowall's PATH or on a Runner.Worker's PATH, a dangling
+// link included: a job step may run it. With none, a sudo policy file left
+// behind is reported.
 func TestHasSudo(t *testing.T) {
 	dir := t.TempDir()
-	old := sudoPaths
-	t.Cleanup(func() { sudoPaths = old })
-	t.Setenv("PATH", dir)
-	sudoPaths = []string{dir + "/elsewhere/sudo", dir + "/link/sudo"}
-	if hasSudo() {
-		t.Fatal("hasSudo with no sudo on PATH or at any install path")
+	oldDirs, oldPolicies := sudoDirs, sudoPolicies
+	t.Cleanup(func() { sudoDirs, sudoPolicies = oldDirs, oldPolicies })
+	sudoDirs = []string{dir + "/std"}
+	sudoPolicies = []string{dir + "/etc/sudoers"}
+	t.Setenv("PATH", dir+"/path:relative/bin")
+	proc := dir + "/proc"
+	fakeProc(t, proc, "40", "Runner.Worker", status("1001", "1001"), "HOME=/home/runner\x00PATH="+dir+"/job")
+	fakeProc(t, proc, "41", "bash", status("1001", "1001"), "PATH="+dir+"/notworker")
+	for _, d := range []string{"std", "path", "job", "notworker", "etc"} {
+		if err := os.MkdirAll(dir+"/"+d, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	writeFile(t, dir+"/sudo", "#!/bin/sh\n")
-	if err := os.Chmod(dir+"/sudo", 0o755); err != nil {
-		t.Fatal(err)
+	check := func(want bool, wantPolicy, why string) {
+		t.Helper()
+		found, policy := hasSudo(proc)
+		if found != want || policy != wantPolicy {
+			t.Errorf("%s: hasSudo = %v, %q; want %v, %q", why, found, policy, want, wantPolicy)
+		}
 	}
-	if !hasSudo() {
-		t.Error("a sudo on PATH was missed")
-	}
-	if err := os.Remove(dir + "/sudo"); err != nil {
-		t.Fatal(err)
+	place := func(path string) func() {
+		t.Helper()
+		if err := os.Symlink(dir+"/gone", path); err != nil {
+			t.Fatal(err)
+		}
+		return func() { os.Remove(path) }
 	}
 
-	if err := os.MkdirAll(dir+"/link", 0o755); err != nil {
-		t.Fatal(err)
+	check(false, "", "nothing anywhere")
+	undo := place(dir + "/notworker/sudo")
+	check(false, "", "a sudo only on a process that is not the worker")
+	undo()
+
+	for _, tc := range []struct{ path, why string }{
+		{dir + "/std/sudo.ws", "classic sudo under its own name in a standard dir"},
+		{dir + "/std/sudoedit", "sudoedit in a standard dir"},
+		{dir + "/path/sudo-rs", "sudo-rs on cargowall's PATH"},
+		{dir + "/job/sudo", "a sudo only on the worker's PATH"},
+	} {
+		undo := place(tc.path)
+		check(true, "", tc.why)
+		undo()
 	}
-	if err := os.Symlink(dir+"/gone", dir+"/link/sudo"); err != nil {
-		t.Fatal(err)
-	}
-	if !hasSudo() {
-		t.Error("a sudo at an install path, off PATH, was missed")
-	}
+
+	writeFile(t, dir+"/etc/sudoers", "root ALL=(ALL) ALL\n")
+	check(false, dir+"/etc/sudoers", "a policy left behind by a removed sudo")
 }

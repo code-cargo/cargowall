@@ -26,7 +26,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 )
 
@@ -78,99 +77,6 @@ func validateSudoersInput(username string, cmds []string) error {
 		}
 	}
 	return nil
-}
-
-// ciUsernames are the runner accounts guessed at when nothing names one.
-var ciUsernames = []string{"runner", "github", "ci"}
-
-// resolveUsername determines whose sudo the lockdown takes, reading the
-// runner's workers from /proc and the user who ran cargowall through sudo
-// from SUDO_USER (resolveTarget).
-func resolveUsername(cfgUsername string) (string, error) {
-	current, err := user.Current()
-	if err != nil {
-		return "", fmt.Errorf("failed to get current user: %w", err)
-	}
-	return resolveTarget(cfgUsername, "/proc", os.Getenv("SUDO_USER"), current, ciUsernames)
-}
-
-// resolveTarget determines whose sudo the lockdown takes. A configured user
-// is taken as given. Otherwise it is the owner of the runner's Runner.Worker,
-// whose job steps the lockdown must hold against. With no worker visible it
-// is the current user when not root, then the first of guesses that exists,
-// then the user who ran cargowall through sudo, unless root: SUDO_USER comes
-// last, since an account that started cargowall before any job ran is not
-// the job's, where an existing runner account is.
-//
-// A worker running as root is an error: its steps have root without sudo,
-// which no lockdown takes away, and locking another account would report a
-// lockdown that holds against nothing the job runs. So are workers of
-// several users that sudoUser does not choose between, and a worker whose
-// uid /etc/passwd does not name.
-func resolveTarget(cfgUsername, procRoot, sudoUser string, current *user.User, guesses []string) (string, error) {
-	if cfgUsername != "" {
-		return cfgUsername, nil
-	}
-	if owners := workerOwners(procRoot); len(owners) > 0 {
-		if slices.Contains(owners, 0) {
-			return "", errors.New("a Runner.Worker runs as root: its job steps have root without sudo, which the lockdown cannot take away")
-		}
-		if len(owners) > 1 {
-			if u, err := user.Lookup(sudoUser); err == nil && sudoUser != "" && slices.Contains(owners, uidOf(u)) {
-				return sudoUser, nil
-			}
-			return "", fmt.Errorf("the runner's Runner.Workers run as several users (uids %v), and SUDO_USER does not name one of them", owners)
-		}
-		u, err := user.LookupId(strconv.FormatUint(uint64(owners[0]), 10))
-		if err != nil {
-			return "", fmt.Errorf("the Runner.Worker runs as uid %d, which /etc/passwd does not name: %w", owners[0], err)
-		}
-		return u.Username, nil
-	}
-	if current.Uid != "0" {
-		return current.Username, nil
-	}
-	for _, u := range guesses {
-		if _, err := user.Lookup(u); err == nil {
-			return u, nil
-		}
-	}
-	if sudoUser != "" && sudoUser != "root" {
-		return sudoUser, nil
-	}
-	return "", fmt.Errorf("could not determine target username for sudo lockdown")
-}
-
-// uidOf is u's uid, or a value no worker has when it does not parse.
-func uidOf(u *user.User) uint32 {
-	n, err := strconv.ParseUint(u.Uid, 10, 32)
-	if err != nil {
-		return ^uint32(0)
-	}
-	return uint32(n)
-}
-
-// sudoPaths are where sudo, classic or sudo-rs, is installed. They are looked
-// at as well as cargowall's own PATH, which can be narrower than a job's: a
-// sudo missed here would be a lockdown skipped with sudo in place.
-var sudoPaths = []string{
-	"/usr/bin/sudo", "/bin/sudo", "/usr/sbin/sudo", "/sbin/sudo",
-	"/usr/local/bin/sudo", "/usr/local/sbin/sudo",
-	"/usr/lib/cargo/bin/sudo", // sudo-rs, before the alternatives link
-	"/run/wrappers/bin/sudo",  // NixOS's setuid wrapper
-}
-
-// hasSudo reports whether this host has a sudo for a job step to run.
-func hasSudo() bool {
-	if _, err := exec.LookPath("sudo"); err == nil {
-		return true
-	}
-	for _, p := range sudoPaths {
-		if _, err := os.Lstat(p); err == nil {
-			return true
-		}
-	}
-	return false
 }
 
 // lookupUserGIDs returns the set of group IDs the user belongs to.
@@ -381,10 +287,19 @@ func recoverLockdownState(dir, main, username string, logger *slog.Logger) *lock
 func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	logger.Info("Enabling sudo lockdown")
 
+	// A root worker's steps have root without sudo, so no lockdown holds
+	// against them, on a host with sudo or without.
+	if slices.Contains(workerOwners(procDir), 0) {
+		return errRootWorker
+	}
 	// No sudo, nothing to take: a job step on this host has no sudo to run,
 	// and the lockdown's guarantee holds as it stands.
-	if !hasSudo() {
-		logger.Info("No sudo on this host, nothing to lock down")
+	if found, policy := hasSudo(procDir); !found {
+		if policy != "" {
+			logger.Warn("No sudo binary found, though its policy file is here; nothing to lock down", "policy", policy)
+		} else {
+			logger.Info("No sudo on this host, nothing to lock down")
+		}
 		return nil
 	}
 

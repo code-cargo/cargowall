@@ -332,7 +332,7 @@ rootworker() {
 
 # nosudo: a host with no sudo has nothing to lock down, so a requested
 # lockdown is no loss, even under an enforcing policy and with no runner
-# account to name.
+# account to name. A root Runner.Worker there is still refused.
 nosudo() {
   if command -v sudo >/dev/null 2>&1 || [ -e /usr/lib/cargo/bin/sudo ]; then
     fail "the image has sudo; this test needs one without"
@@ -348,9 +348,26 @@ nosudo() {
   [ -f /tmp/cargowall-ready ] || fail "cargowall did not become ready on a host without sudo"
   grep -q 'No sudo on this host, nothing to lock down' /tmp/cw.log || fail "the missing sudo was not the reason"
   grep -q 'requested but could not be applied' /tmp/cw.log && fail "a host without sudo lost the lockdown"
+  grep -q '"posture":"sudo-lockdown","requested":"true","applied":"true"' /tmp/cargowall-postures \
+    || fail "the posture record does not show the lockdown applied: $(cat /tmp/cargowall-postures 2>/dev/null)"
   echo "✅ no sudo: nothing to lock down, an enforcing start comes up"
   kill -TERM "$cw" 2>/dev/null || true
   wait "$cw" 2>/dev/null || true
+  rm -f /tmp/cargowall-ready /tmp/cargowall-failed /tmp/cargowall-postures /tmp/cw.log
+
+  # A root worker's steps have root without sudo too: no sudo is no excuse.
+  ln -sf /bin/bash /tmp/Runner.Worker
+  /tmp/Runner.Worker -c 'sleep 600; :' &
+  local worker=$!
+  local rc=0
+  timeout 60 /w/bin/cargowall start --config=/tmp/policy.json --dns-upstream="${upstream}:53" \
+    --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 || rc=$?
+  kill "$worker" 2>/dev/null || true
+  [ "$rc" = 3 ] || fail "cargowall exited $rc with a root Runner.Worker and no sudo, not 3 (a refused posture)"
+  grep -qx 'refused=sudo-lockdown' /tmp/cargowall-failed \
+    || fail "the failure sentinel does not name the posture: $(cat /tmp/cargowall-failed 2>/dev/null)"
+  grep -q 'a Runner.Worker runs as root' /tmp/cw.log || fail "the root worker was not the reason"
+  echo "✅ no sudo but a root Runner.Worker: an enforcing start is refused"
 }
 
 # pristine checks that everything the aborted enable touched is undone.

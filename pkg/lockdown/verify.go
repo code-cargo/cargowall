@@ -76,16 +76,8 @@ type jobView struct {
 // Runner.Worker under procRoot owned by uid. Several workers' groups are
 // joined: a step of any of them is a step this lockdown must hold against.
 func workerView(procRoot string, uid uint32) (groups []uint32, dockerHosts []string, found bool) {
-	entries, err := os.ReadDir(procRoot)
-	if err != nil {
-		return nil, nil, false
-	}
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || procfs.CommIn(procRoot, pid) != procfs.RunnerWorkerComm {
-			continue
-		}
-		owner, gs, ok := parseStatusCreds(filepath.Join(procRoot, e.Name(), "status"))
+	for _, dir := range workerDirs(procRoot) {
+		owner, gs, ok := parseStatusCreds(filepath.Join(dir, "status"))
 		if !ok || owner != uid {
 			continue
 		}
@@ -95,31 +87,11 @@ func workerView(procRoot string, uid uint32) (groups []uint32, dockerHosts []str
 				groups = append(groups, g)
 			}
 		}
-		if h := environValue(filepath.Join(procRoot, e.Name(), "environ"), "DOCKER_HOST"); h != "" && !slices.Contains(dockerHosts, h) {
+		if h := environValue(filepath.Join(dir, "environ"), "DOCKER_HOST"); h != "" && !slices.Contains(dockerHosts, h) {
 			dockerHosts = append(dockerHosts, h)
 		}
 	}
 	return groups, dockerHosts, found
-}
-
-// workerOwners is the distinct real uids of the Runner.Workers under
-// procRoot, in the order found.
-func workerOwners(procRoot string) []uint32 {
-	entries, err := os.ReadDir(procRoot)
-	if err != nil {
-		return nil
-	}
-	var owners []uint32
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || procfs.CommIn(procRoot, pid) != procfs.RunnerWorkerComm {
-			continue
-		}
-		if owner, _, ok := parseStatusCreds(filepath.Join(procRoot, e.Name(), "status")); ok && !slices.Contains(owners, owner) {
-			owners = append(owners, owner)
-		}
-	}
-	return owners
 }
 
 // parseStatusCreds reads the real uid and the supplementary groups from a
@@ -198,7 +170,7 @@ func lookupJobView(username string, preGIDs map[string]bool) (*jobView, error) {
 		return nil, err
 	}
 	v := &jobView{uid: uint32(uid), gid: uint32(gid)}
-	if gs, hosts, ok := workerView("/proc", v.uid); ok {
+	if gs, hosts, ok := workerView(procDir, v.uid); ok {
 		v.groups, v.dockerHosts, v.from = gs, hosts, procfs.RunnerWorkerComm
 		return v, nil
 	}

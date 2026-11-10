@@ -43,40 +43,6 @@ const arcSudoers = "%sudo   ALL=(ALL:ALL) NOPASSWD:ALL\n"
 
 const testRules = "runner ALL=(ALL:ALL) !ALL\nrunner ALL=(ALL) NOPASSWD: /usr/sbin/iptables\n"
 
-func TestReadsLockdownLast(t *testing.T) {
-	tests := []struct {
-		name    string
-		content string
-		want    bool
-	}{
-		{"ubuntu default", ubuntuSudoers, true},
-		{"hash spelling", "%sudo ALL=(ALL) ALL\n#includedir /etc/sudoers.d\n", true},
-		{"comments and blanks after", "%sudo ALL=(ALL) ALL\n@includedir /etc/sudoers.d\n\n# trailing note\n   \n", true},
-		{"quoted with a trailing slash", "@includedir \"/etc/sudoers.d/\"\n", true},
-		{"no trailing newline", "@includedir /etc/sudoers.d", true},
-		{"arc image: group grant, no include", arcSudoers, false},
-		{"grant after the include", "@includedir /etc/sudoers.d\n%sudo ALL=(ALL:ALL) NOPASSWD:ALL\n", false},
-		{"defaults after the include", "@includedir /etc/sudoers.d\nDefaults !lecture\n", false},
-		{"commented-out include", "%sudo ALL=(ALL) ALL\n# includedir /etc/sudoers.d\n", false},
-		{"another directory", "@includedir /etc/sudoers.local\n", false},
-		{"one file of the directory", "@include /etc/sudoers.d/runner\n", false},
-		// Each of these is read after the lockdown file, so its grants would
-		// beat a deny that lives only there: the block must be appended.
-		{"ours, then another includedir", "@includedir /etc/sudoers.d\n@includedir /etc/sudoers.local\n", false},
-		{"ours, then a single-file include", "@includedir /etc/sudoers.d\n@include /etc/sudoers.extra\n", false},
-		{"ours, then a uid grant", "@includedir /etc/sudoers.d\n#1001 ALL=(ALL) NOPASSWD:ALL\n", false},
-		{"keyword alone", "%sudo ALL=(ALL) ALL\n#includedir\n", false},
-		{"empty", "", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := readsLockdownLast(tt.content, "/etc/sudoers.d"); got != tt.want {
-				t.Errorf("readsLockdownLast = %v, want %v\n%s", got, tt.want, tt.content)
-			}
-		})
-	}
-}
-
 func TestWithoutBlock(t *testing.T) {
 	block := lockdownBlock(testRules, false)
 	tests := []struct {
@@ -195,7 +161,7 @@ func TestAppendSudoersBlock_noFinalNewline(t *testing.T) {
 	const noNL = "%sudo   ALL=(ALL:ALL) NOPASSWD:ALL" // no trailing newline
 	main := writeSudoers(t, noNL)
 
-	appended, err := appendSudoersBlock(main, "/etc/sudoers.d", testRules)
+	appended, err := appendSudoersBlock(main, testRules)
 	if err != nil || !appended {
 		t.Fatalf("appendSudoersBlock = %v, %v", appended, err)
 	}
@@ -214,7 +180,7 @@ func TestAppendSudoersBlock_arcShape(t *testing.T) {
 	calls := stubVisudo(t, nil)
 	main := writeSudoers(t, arcSudoers)
 
-	appended, err := appendSudoersBlock(main, "/etc/sudoers.d", testRules)
+	appended, err := appendSudoersBlock(main, testRules)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,33 +213,41 @@ func TestAppendSudoersBlock_arcShape(t *testing.T) {
 	}
 }
 
-func TestAppendSudoersBlock_readsLastAlready(t *testing.T) {
-	calls := stubVisudo(t, nil)
+// TestAppendSudoersBlock_includedirShape: a distro /etc/sudoers that ends
+// with the includedir is still appended to — the block is always the last
+// lines read, whatever sudoers.d holds — and is restored byte for byte.
+func TestAppendSudoersBlock_includedirShape(t *testing.T) {
+	stubVisudo(t, nil)
 	main := writeSudoers(t, ubuntuSudoers)
 
-	appended, err := appendSudoersBlock(main, "/etc/sudoers.d", testRules)
-	if err != nil || appended {
-		t.Fatalf("appendSudoersBlock = %v, %v; want false, nil", appended, err)
+	appended, err := appendSudoersBlock(main, testRules)
+	if err != nil || !appended {
+		t.Fatalf("appendSudoersBlock = %v, %v; want true, nil", appended, err)
+	}
+	if got, want := readString(t, main), ubuntuSudoers+lockdownBlock(testRules, false); got != want {
+		t.Errorf("content: got %q, want %q", got, want)
+	}
+	if removed, err := removeSudoersBlock(main); err != nil || !removed {
+		t.Fatalf("removeSudoersBlock = %v, %v", removed, err)
 	}
 	if got := readString(t, main); got != ubuntuSudoers {
-		t.Errorf("a sudoers that reads the lockdown last was changed: %q", got)
-	}
-	if *calls != 0 {
-		t.Errorf("visudo calls = %d, want 0", *calls)
+		t.Errorf("not restored byte for byte: got %q", got)
 	}
 }
 
-func TestAppendSudoersBlock_removesStaleBlockWhereNoneIsNeeded(t *testing.T) {
+// TestAppendSudoersBlock_replacesStaleBlock: a block a crashed run left is
+// replaced in place, so its allowlist never outlives that run.
+func TestAppendSudoersBlock_replacesStaleBlock(t *testing.T) {
 	stubVisudo(t, nil)
-	// A block a crashed run left above the include, which sudo reads last.
-	main := writeSudoers(t, lockdownBlock("runner ALL=(ALL) NOPASSWD: /bin/old\n", false)+ubuntuSudoers)
+	stale := lockdownRules("runner", []string{"/bin/old"})
+	main := writeSudoers(t, ubuntuSudoers+lockdownBlock(stale, false))
 
-	appended, err := appendSudoersBlock(main, "/etc/sudoers.d", testRules)
-	if err != nil || appended {
-		t.Fatalf("appendSudoersBlock = %v, %v; want false, nil", appended, err)
+	appended, err := appendSudoersBlock(main, testRules)
+	if err != nil || !appended {
+		t.Fatalf("appendSudoersBlock = %v, %v; want true, nil", appended, err)
 	}
-	if got := readString(t, main); got != ubuntuSudoers {
-		t.Errorf("stale block not removed: %q", got)
+	if got, want := readString(t, main), ubuntuSudoers+lockdownBlock(testRules, false); got != want {
+		t.Errorf("stale block not replaced: got %q, want %q", got, want)
 	}
 }
 
@@ -281,7 +255,7 @@ func TestAppendSudoersBlock_visudoRejects(t *testing.T) {
 	stubVisudo(t, errors.New("syntax error"))
 	main := writeSudoers(t, arcSudoers)
 
-	if _, err := appendSudoersBlock(main, "/etc/sudoers.d", testRules); err == nil {
+	if _, err := appendSudoersBlock(main, testRules); err == nil {
 		t.Fatal("expected an error")
 	}
 	if got := readString(t, main); got != arcSudoers {
@@ -295,7 +269,7 @@ func TestAppendSudoersBlock_visudoRejects(t *testing.T) {
 func TestAppendSudoersBlock_missingFile(t *testing.T) {
 	calls := stubVisudo(t, nil)
 	main := filepath.Join(t.TempDir(), "sudoers")
-	appended, err := appendSudoersBlock(main, "/etc/sudoers.d", testRules)
+	appended, err := appendSudoersBlock(main, testRules)
 	if err != nil || appended {
 		t.Fatalf("appendSudoersBlock = %v, %v; want false, nil", appended, err)
 	}
@@ -311,7 +285,7 @@ func TestAppendSudoersBlock_brokenMarkers(t *testing.T) {
 	stubVisudo(t, nil)
 	broken := arcSudoers + blockBegin + "\n" + testRules
 	main := writeSudoers(t, broken)
-	if _, err := appendSudoersBlock(main, "/etc/sudoers.d", testRules); err == nil {
+	if _, err := appendSudoersBlock(main, testRules); err == nil {
 		t.Error("appendSudoersBlock: expected an error for a block without its end")
 	}
 	if _, err := removeSudoersBlock(main); err == nil {

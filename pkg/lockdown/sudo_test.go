@@ -291,7 +291,11 @@ func TestSudoersFileCompetes(t *testing.T) {
 		{"zzz-other", "someoneelse ALL=(ALL) NOPASSWD:ALL\n", true}, // another user, still disabled
 		{"zzz-uid", "#1234 ALL=(ALL) NOPASSWD:ALL\n", true},
 		{"zzz-include", "@includedir /etc/sudoers.extra\n", true},
+		{"zzz-tab-include", "#include\t/etc/grant\n", true},   // a tab separator
+		{"zzz-nosep-include", "#include/etc/grant\n", true},   // no separator (sudo-rs)
+		{"zzz-tab-includedir", "#includedir\t/etc/x\n", true}, // includedir with a tab
 		{"zzz-notes", "# just a comment\n\n# END\n", false},
+		{"zzz-hash-tab", "#\ta tab comment\n", false}, // '#' + whitespace is a comment
 		{"zzz-defaults", "Defaults:runner !requiretty\nUser_Alias FOO = a, b\n", false},
 		{"zzz-defaults-forms", "Defaults\tenv_reset\nDefaults@host x\nDefaults!/bin/ls noexec\nDefaults>root x\nDefaults\n" +
 			"Host_Alias H = h\nCmnd_Alias C = /bin/ls\nRunas_Alias R = root\n", false},
@@ -940,6 +944,11 @@ func TestIsIncludeDirective(t *testing.T) {
 		{"#includedir", true},
 		{"@include", true},
 		{"@includedir", true},
+		{"#include\t/etc/grant", true},        // a tab separator (both sudos)
+		{"#includedir\t/etc/sudoers.d", true}, // includedir with a tab
+		{"#include/etc/grant", true},          // no separator (sudo-rs)
+		{"@include/etc/grant", true},
+		{"#includedir/etc/sudoers.d", true},
 		{"#includes_discussion", false},
 		{"#including_notes", false},
 		{"@including_stuff", false},

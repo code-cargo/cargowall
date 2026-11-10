@@ -424,17 +424,20 @@ func fileHasEffectiveRule(path string) (bool, error) {
 }
 
 // isIncludeDirective returns true if the line is a sudoers #include,
-// #includedir, @include, or @includedir directive. Requires the keyword
-// to be followed by a space (and a path), or to be the entire line.
+// #includedir, @include, or @includedir directive. The keyword may be
+// followed by whitespace, by the end of the line, or — as sudo-rs accepts —
+// by the path with no separator ("#include/etc/x"). This is used only for
+// reporting now that the appended block, not the read order of sudoers.d,
+// holds the lockdown; erring toward "directive" only disables an inert file,
+// the safe direction. A non-directive "#..." (a comment, a #uid) is handled
+// by the caller.
 func isIncludeDirective(line string) bool {
-	for _, prefix := range []string{"#include ", "#includedir ", "@include ", "@includedir "} {
-		if strings.HasPrefix(line, prefix) {
-			return true
+	for _, kw := range []string{"#includedir", "@includedir", "#include", "@include"} {
+		if rest, ok := strings.CutPrefix(line, kw); ok {
+			if rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '/' {
+				return true
+			}
 		}
-	}
-	switch line {
-	case "#include", "#includedir", "@include", "@includedir":
-		return true
 	}
 	return false
 }

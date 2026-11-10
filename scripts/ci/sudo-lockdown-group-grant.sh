@@ -161,11 +161,13 @@ inside() {
   echo "✅ runner back in the sudo group"
 }
 
-# latefile checks a competing grant in a file sudo reads after the lockdown
-# rules is disabled whatever its spelling: a quoted user name granting a
-# command the verification probe never tests. The Debian includedir shape,
-# so the lockdown relies on its own zz- file being read, with the grant in a
-# later-sorting zzz- file.
+# latefile checks that a competing grant in a file sudo reads after the
+# lockdown's own sudoers.d file is denied anyway — because the lockdown rules
+# are appended to the end of /etc/sudoers, read after every sudoers.d file and
+# every include. The Debian includedir shape, with two later-sorting grants a
+# reader could miss: a quoted user name, and a tab-separated #include that
+# pulls in a grant from another file. Both grant commands the verification
+# probe never tests, so only the appended block stops them.
 latefile() {
   export DEBIAN_FRONTEND=noninteractive
   command -v sudo >/dev/null || { apt-get update -qq >/dev/null && apt-get install -y -qq sudo >/dev/null; }
@@ -175,13 +177,19 @@ latefile() {
   find /etc/sudoers.d -type f ! -name README -delete
   printf '"runner" ALL=(ALL) NOPASSWD: /bin/cat\n' > /etc/sudoers.d/zzz-quoted
   chmod 0440 /etc/sudoers.d/zzz-quoted
+  printf '#include\t/etc/cargowall-extra-grant\n' > /etc/sudoers.d/zzz-tabinc
+  chmod 0440 /etc/sudoers.d/zzz-tabinc
+  printf 'runner ALL=(ALL) NOPASSWD: /usr/bin/head\n' > /etc/cargowall-extra-grant
+  chmod 0440 /etc/cargowall-extra-grant
   sudo --version | head -1
+  sha256sum /etc/sudoers > /tmp/sudoers.sha
   find /etc/sudoers.d | sort > /tmp/sudoersd.before
 
   ln -sf /bin/bash /tmp/Runner.Worker
   su runner -c '/tmp/Runner.Worker -c "
     while [ ! -f /tmp/go ]; do sleep 0.2; done
     sudo -n /bin/cat /etc/hostname >/dev/null 2>&1; echo \$? > /tmp/cat.rc
+    sudo -n /usr/bin/head /etc/hostname >/dev/null 2>&1; echo \$? > /tmp/head.rc
     touch /tmp/done; sleep 600"' &
   local upstream
   upstream="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
@@ -192,22 +200,21 @@ latefile() {
   local cw=$!
   for _ in $(seq 1 60); do [ -f /tmp/cargowall-ready ] && break; sleep 0.5; done
   [ -f /tmp/cargowall-ready ] || fail "cargowall did not become ready"
-
-  [ -f /etc/sudoers.d/zzz-quoted ] && fail "the later-sorting grant file was not disabled"
-  [ -f /etc/sudoers.d/zzz-quoted.cargowall-disabled ] || fail "the grant file was not renamed to disabled"
-  grep -q 'read after the lockdown rules' /tmp/cw.log || fail "the disable reason was not logged"
-  echo "✅ the quoted-name grant file read after the lockdown was disabled"
+  grep -q '"Verified sudo lockdown"' /tmp/cw.log || fail "the lockdown was not verified"
+  echo "✅ lockdown up on the includedir shape"
 
   touch /tmp/go
   for _ in $(seq 1 50); do [ -f /tmp/done ] && break; sleep 0.2; done
-  [ "$(cat /tmp/cat.rc)" != 0 ] || fail "sudo cat ran: the quoted grant still applied"
-  echo "✅ the held step cannot use the quoted grant"
+  [ -f /tmp/done ] || fail "the held step never answered"
+  [ "$(cat /tmp/cat.rc)" != 0 ] || fail "sudo cat ran: the quoted later-sorting grant applied"
+  [ "$(cat /tmp/head.rc)" != 0 ] || fail "sudo head ran: the tab-include later-sorting grant applied"
+  echo "✅ both later-sorting grants are denied by the appended block"
 
   kill -TERM "$cw" 2>/dev/null || true
   wait "$cw" 2>/dev/null || true
-  [ -f /etc/sudoers.d/zzz-quoted ] || fail "the grant file was not restored"
+  sha256sum -c --quiet /tmp/sudoers.sha || { cat /etc/sudoers; fail "/etc/sudoers differs after stop"; }
   find /etc/sudoers.d | sort | diff /tmp/sudoersd.before - || fail "sudoers.d differs after stop"
-  echo "✅ the grant file was restored after stop"
+  echo "✅ /etc/sudoers and sudoers.d restored after stop"
 }
 
 # escalation drives the rollback path: a stand-in `sudo` that always exits 0

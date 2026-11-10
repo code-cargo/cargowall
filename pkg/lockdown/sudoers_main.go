@@ -72,33 +72,6 @@ var visudoCheckFile = func(path string) error {
 	return nil
 }
 
-// readsLockdownLast reports whether sudo, reading main's content, reads the
-// sudoers.d lockdown file after every rule in main: the last meaningful line
-// includes that dir. A line is meaningful unless it is blank or a comment; a
-// '#' and a digit is a user named by uid, not a comment, and a directive is
-// not a comment either, though both start with '#'. Any other meaningful
-// line after the include — a user specification or a Defaults line — counts
-// against it, which costs at most a block that was not strictly needed.
-func readsLockdownLast(content, dir string) bool {
-	last := ""
-	for _, line := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "#") && !isIncludeDirective(trimmed) &&
-			!(len(trimmed) >= 2 && trimmed[1] >= '0' && trimmed[1] <= '9') {
-			continue
-		}
-		last = trimmed
-	}
-	fields := strings.Fields(last)
-	if len(fields) != 2 || (fields[0] != "#includedir" && fields[0] != "@includedir") {
-		return false
-	}
-	return filepath.Clean(strings.Trim(fields[1], `"`)) == filepath.Clean(dir)
-}
-
 // lockdownBlock is rules wrapped in the markers withoutBlock finds, with the
 // begin marker saying whether a preceding newline was added.
 func lockdownBlock(rules string, addedNL bool) string {
@@ -166,12 +139,16 @@ func withBlock(content, rules string) (string, error) {
 	return base + lockdownBlock(rules, addedNL), nil
 }
 
-// appendSudoersBlock appends the lockdown rules to main when sudo would not
-// read the sudoers.d file last, and reports whether it did. A block a
-// previous run left is replaced, or removed where none is needed, so its
-// allowlist never outlives that run. A missing main file is no sudo to lock
-// down here: nothing is appended.
-func appendSudoersBlock(main, dir, rules string) (bool, error) {
+// appendSudoersBlock appends the lockdown rules as the last lines of main,
+// and reports whether it did. Those lines are read after every rule in main
+// and after every file it includes, wherever they appear and however they
+// are spelled, since sudoers is last-match-wins and expands an include where
+// it stands. So the lockdown holds whatever a sudoers.d file contains,
+// without the reader having to tell a grant from an inert line there. A block
+// a previous run left is replaced, so its allowlist never outlives that run.
+// A missing main file is no sudo to lock down here: nothing is appended, and
+// the step verification is the backstop.
+func appendSudoersBlock(main, rules string) (bool, error) {
 	data, err := os.ReadFile(main)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -179,17 +156,7 @@ func appendSudoersBlock(main, dir, rules string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("read %s: %w", main, err)
 	}
-	base, stale, err := withoutBlock(string(data))
-	if err != nil {
-		return false, err
-	}
-	if readsLockdownLast(base, dir) {
-		if stale {
-			return false, replaceSudoers(main, base)
-		}
-		return false, nil
-	}
-	next, err := withBlock(base, rules)
+	next, err := withBlock(string(data), rules)
 	if err != nil {
 		return false, err
 	}

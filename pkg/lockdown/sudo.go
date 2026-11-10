@@ -410,14 +410,20 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return fmt.Errorf("failed to install sudoers file: %w", err)
 	}
 
-	// Where sudo would not read that file last, the same rules go at the end
-	// of /etc/sudoers.
-	rb.SudoersBlock, err = appendSudoersBlock(mainSudoers, sudoersDir, rules)
+	// The same rules go at the end of /etc/sudoers, where sudo reads them
+	// after every sudoers.d file and every include: that is what holds the
+	// lockdown, whatever a competing file contains or how it is spelled. The
+	// sudoers.d file above is a harmless duplicate, read earlier on a distro
+	// whose /etc/sudoers includes the directory, and never read on an image
+	// whose does not.
+	rb.SudoersBlock, err = appendSudoersBlock(mainSudoers, rules)
 	if err != nil {
-		return fmt.Errorf("sudo lockdown incomplete, %s does not read the lockdown last and could not be amended: %w", mainSudoers, err)
+		return fmt.Errorf("sudo lockdown incomplete, %s could not be amended with the lockdown rules: %w", mainSudoers, err)
 	}
 	if rb.SudoersBlock {
-		logger.Info("Appended the lockdown rules to sudoers, which does not read sudoers.d last", "path", mainSudoers)
+		logger.Info("Appended the lockdown rules as the last lines of sudoers", "path", mainSudoers)
+	} else {
+		logger.Warn("No sudoers file to append the lockdown rules to; relying on the sudoers.d file and the step verification", "path", mainSudoers)
 	}
 
 	// Validate the overall sudoers configuration after all modifications.

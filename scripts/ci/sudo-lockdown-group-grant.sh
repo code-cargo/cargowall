@@ -223,7 +223,12 @@ latefile() {
 
 # escalation drives the rollback path: a stand-in `sudo` that always exits 0
 # makes the step verification see an escalation, so EnableSudoLockdown must
-# undo everything and report that it does not hold.
+# undo everything and report that it does not hold. That is a lost posture:
+# under an auditing policy cargowall warns, records it for the summary and
+# runs on; under an enforcing policy startup fails, naming the posture in
+# the failure sentinel and exiting 3. The enforcing run asks for the
+# lockdown in the policy rather than by flag, so the policy's settings must
+# be applied before the postures are registered.
 escalation() {
   prepare
   sha256sum /etc/sudoers > /tmp/sudoers.sha
@@ -238,6 +243,7 @@ escalation() {
 
   local upstream
   upstream="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
+
   echo '{"defaultAction":"allow","rules":[]}' > /tmp/policy.json
   PATH="/tmp/fakebin:$PATH" /w/bin/cargowall start --config=/tmp/policy.json \
     --dns-upstream="${upstream}:53" --audit-mode \
@@ -245,14 +251,39 @@ escalation() {
     --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 &
   local cw=$!
   for _ in $(seq 1 60); do [ -f /tmp/cargowall-ready ] && break; sleep 0.5; done
-  [ -f /tmp/cargowall-ready ] || fail "cargowall did not become ready"
+  [ -f /tmp/cargowall-ready ] || fail "cargowall did not become ready under an auditing policy"
 
   grep -q 'sudo lockdown does not hold' /tmp/cw.log || fail "escalation was not detected"
-  grep -q 'Failed to enable sudo lockdown' /tmp/cw.log || fail "the lockdown was not reported as failed"
-  echo "✅ escalation detected and the lockdown reported as failed"
+  grep -q '"level":"WARN","msg":"--sudo-lockdown=true requested but could not be applied"' /tmp/cw.log \
+    || fail "the lost lockdown was not warned about"
+  grep -q '"posture":"sudo-lockdown","requested":"true","applied":"false"' /tmp/cargowall-postures \
+    || fail "the lost lockdown is not in the posture record: $(cat /tmp/cargowall-postures 2>/dev/null)"
+  echo "✅ auditing policy: escalation detected, warned, recorded for the summary"
+  pristine
 
-  # Everything the aborted enable touched must be undone, with cargowall
-  # still running.
+  kill -TERM "$cw" 2>/dev/null || true
+  wait "$cw" 2>/dev/null || true
+  rm -f /tmp/cargowall-ready /tmp/cargowall-failed /tmp/cargowall-postures /tmp/cw.log
+
+  printf '{"defaultAction":"allow","rules":[],"sudoLockdown":{"enabled":true,"allowCommands":["%s"]}}\n' \
+    "$ALLOWED" > /tmp/policy.json
+  local rc=0
+  PATH="/tmp/fakebin:$PATH" timeout 60 /w/bin/cargowall start --config=/tmp/policy.json \
+    --dns-upstream="${upstream}:53" \
+    --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 || rc=$?
+
+  [ "$rc" = 3 ] || fail "cargowall exited $rc under an enforcing policy, not 3 (a refused posture)"
+  [ -f /tmp/cargowall-ready ] && fail "cargowall wrote its ready sentinel with the lockdown lost"
+  grep -qx 'refused=sudo-lockdown' /tmp/cargowall-failed \
+    || fail "the failure sentinel does not name the posture: $(cat /tmp/cargowall-failed 2>/dev/null)"
+  grep -q '"level":"ERROR","msg":"--sudo-lockdown=true requested but could not be applied"' /tmp/cw.log \
+    || fail "the refusal was not logged as an error"
+  echo "✅ enforcing policy: the lost lockdown fails startup, exit 3, refused=sudo-lockdown"
+  pristine
+}
+
+# pristine checks that everything the aborted enable touched is undone.
+pristine() {
   [ -f /etc/sudoers.d/zz-cargowall-lockdown ] && fail "the lockdown sudoers file was left behind"
   [ -f /etc/sudoers.d/.cargowall-lockdown-state ] && fail "the state file was left behind"
   grep -q 'BEGIN cargowall sudo lockdown' /etc/sudoers && fail "the lockdown block was left in /etc/sudoers"
@@ -260,9 +291,6 @@ escalation() {
   find /etc/sudoers.d | sort | diff /tmp/sudoersd.before - || fail "sudoers.d differs after rollback"
   id -nG runner | tr ' ' '\n' | sort | diff /tmp/groups.before - || fail "runner's groups were not restored"
   echo "✅ rollback left the system pristine"
-
-  kill -TERM "$cw" 2>/dev/null || true
-  wait "$cw" 2>/dev/null || true
 }
 
 cmd="${1:-}"

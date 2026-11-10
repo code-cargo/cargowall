@@ -16,15 +16,16 @@
 
 // Requested-vs-applied postures for the layers a flag requests but the
 // runtime can fail to deliver: the cgroup egress hook, the L7 layer riding
-// it, and the DNS redirect. A lost enforce rung under an enforcing policy
+// it, the DNS redirect, and the sudo lockdown. A lost enforce rung under an enforcing policy
 // fails startup — the operator asked for a guarantee the job would not have.
 // Under an auditing policy an enforce rung drops nothing (the hook checks the
 // audit gate), so losing it costs only measurement, like a lost observe
 // rung: that warns, and is recorded so the job summary can say the
 // measurement never ran, since an observe run that reports no would-blocks
-// reads exactly like a clean one. The redirect's flag has no rungs of its
-// own; what it guards is the policy's enforcement, so the policy's mode
-// decides there too. Under policy lockdown no loss is fatal: lockdown has
+// reads exactly like a clean one. The redirect's and the lockdown's flags
+// have no rungs of their own; what each guards is the policy's enforcement
+// (the lockdown keeps job steps from the root that could change the
+// firewall's own state), so the policy's mode decides there too. Under policy lockdown no loss is fatal: lockdown has
 // already failed the job and stays up deny-all on purpose, and exiting
 // would take the whole firewall down.
 package cmd
@@ -50,6 +51,7 @@ const (
 	postureContainerEgress = "container-egress"
 	postureTLSSNI          = "tls-sni"
 	postureDNSRedirect     = "dns-redirect"
+	postureSudoLockdown    = "sudo-lockdown"
 )
 
 // The redirect's flag is a bool; these are its values in the record,
@@ -121,7 +123,7 @@ type postureLedger struct {
 	layers []postureLayer
 	// published is whether write has run: a loss decided after startup
 	// rewrites the record only once there is one, since startup publishes
-	// it only once both raises succeed.
+	// it only once both raises and the sudo lockdown succeed.
 	published bool
 }
 
@@ -129,8 +131,8 @@ type postureLedger struct {
 // two flags happen to share the spellings "off" and "enforce", and neither
 // the skip nor the fail-closed decision may lean on that. enforcing is the
 // loaded policy's mode: only under it does an enforce rung drop anything,
-// and the redirect matter to what is allowed. The redirect only does
-// anything while DNS tracking runs.
+// and the redirect and the lockdown matter to what is allowed. The redirect
+// only does anything while DNS tracking runs.
 func newPostures(cmd *StartCmd, kernel string, enforcing bool, logger *slog.Logger) *postureLedger {
 	p := &postureLedger{
 		kernel: kernel, lockdown: cmd.policyLockdown, refused: &cmd.refusedPosture,
@@ -145,6 +147,11 @@ func newPostures(cmd *StartCmd, kernel string, enforcing bool, logger *slog.Logg
 		redirect = dnsRedirectOn
 	}
 	p.register(postureDNSRedirect, redirect, dnsRedirectOff, enforcing)
+	lockdown := sudoLockdownOff
+	if cmd.SudoLockdown {
+		lockdown = sudoLockdownOn
+	}
+	p.register(postureSudoLockdown, lockdown, sudoLockdownOff, enforcing)
 	return p
 }
 
@@ -188,8 +195,9 @@ func (p *postureLedger) linesLocked() []postureLine {
 // it computing no verdict, so the layer goes to off, keeping the first reason;
 // the DNS redirect alone can stay in place in part (loseTo). The ledger owns
 // the log line. On the fatal path the failure sentinel is what leaves the
-// process — write runs only once both raises succeed — so the in-memory mark
-// there serves the log and the ledger's own consistency, nothing downstream.
+// process — write runs only once both raises and the sudo lockdown succeed —
+// so the in-memory mark there serves the log and the ledger's own
+// consistency, nothing downstream.
 //
 // A fail-closed rung returns an error the caller must fail startup with: TC
 // egress would still police post-NAT traffic, but the job would run without

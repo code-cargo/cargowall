@@ -318,9 +318,10 @@ func TestPostures_LoseLate(t *testing.T) {
 	}
 }
 
-// Startup publishes the record only once both raises succeed, so a loss
-// decided before then changes only the ledger, and startup's write carries
-// it. A layer never requested has nothing to lose, and says nothing.
+// Startup publishes the record only once both raises and the sudo lockdown
+// succeed, so a loss decided before then changes only the ledger, and
+// startup's write carries it. A layer never requested has nothing to lose,
+// and says nothing.
 func TestPostures_LoseLateBeforePublished(t *testing.T) {
 	redirectStateFiles(t)
 	p, buf := ledgerWithLog(t, ContainerEgressObserve, TLSSNIOff)

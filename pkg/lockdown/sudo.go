@@ -410,7 +410,7 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	// /etc/sudoers includes the directory, and never read on an image whose
 	// does not — except where /etc/sudoers cannot be replaced, when it is the
 	// fallback (applySudoersBlock says so).
-	rb.SudoersBlock, err = applySudoersBlock(mainSudoers, rules, logger)
+	rb.SudoersBlock, err = applySudoersBlock(mainSudoers, sudoersDir, rules, logger)
 	if err != nil {
 		return fmt.Errorf("sudo lockdown incomplete, %s could not be amended with the lockdown rules: %w", mainSudoers, err)
 	}

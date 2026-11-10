@@ -96,9 +96,13 @@ func disableCompetingSudoersFiles(dir, username string, userGIDs map[string]bool
 	aliases := collectUserAliases(dir, username)
 
 	var disabled, failed []string
+	// reported holds the names the first pass disabled or reported, which the
+	// re-scan below need not look at again.
+	reported := make(map[string]bool)
 	// unsettled records a file the scan could not settle: a failure of the
 	// lockdown when the scan is load-bearing, a Warn when it is not.
 	unsettled := func(path, msg string, args ...any) {
+		reported[filepath.Base(path)] = true
 		args = append([]any{"path", path}, args...)
 		if !loadBearing {
 			logger.Warn(msg+"; reporting only, the appended rules hold", args...)
@@ -107,14 +111,12 @@ func disableCompetingSudoersFiles(dir, username string, userGIDs map[string]bool
 		logger.Warn(msg, args...)
 		failed = append(failed, path)
 	}
-	seen := make(map[string]bool)
 	for _, entry := range entries {
 		if entry.IsDir() || ownSudoersEntry(entry.Name()) {
 			continue
 		}
 		name := entry.Name()
 		path := filepath.Join(dir, name)
-		seen[name] = true
 		competes, reason, readErr := sudoersFileCompetes(path, name, username, userGIDs, aliases)
 		if readErr != nil {
 			if !loadBearing {
@@ -133,22 +135,25 @@ func disableCompetingSudoersFiles(dir, username string, userGIDs map[string]bool
 			continue
 		}
 		logger.Info("Disabled competing sudoers file", "path", path, "reason", reason)
+		reported[name] = true
 		disabled = append(disabled, path)
 	}
+	scanPassDone()
 
-	// Verification re-scan: catch any files that appeared during the disable
-	// pass (narrows the TOCTOU window to microseconds). Only names the first
-	// pass did not see: one it already settled, or reported, is not new.
+	// Verification re-scan: catch a file that appeared, or a file the first
+	// pass judged not to compete whose content changed, during the disable
+	// pass (narrows the TOCTOU window to microseconds). A name the first pass
+	// already disabled or reported is skipped, so it is not reported twice.
 	if len(failed) == 0 {
 		recheck, _ := os.ReadDir(dir)
 		for _, entry := range recheck {
-			if entry.IsDir() || ownSudoersEntry(entry.Name()) || seen[entry.Name()] {
+			if entry.IsDir() || ownSudoersEntry(entry.Name()) || reported[entry.Name()] {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
 			competes, _, err := sudoersFileCompetes(path, entry.Name(), username, userGIDs, aliases)
 			if competes || (err != nil && loadBearing) {
-				unsettled(path, "New sudoers file appeared during lockdown scan")
+				unsettled(path, "A competing sudoers file appeared or changed during the lockdown scan")
 			}
 		}
 	}
@@ -158,6 +163,10 @@ func disableCompetingSudoersFiles(dir, username string, userGIDs map[string]bool
 	}
 	return disabled, nil
 }
+
+// scanPassDone runs between disableCompetingSudoersFiles' first pass and its
+// re-scan. A var so a test can change a file in that window.
+var scanPassDone = func() {}
 
 // disableSudoersFile renames path to path+disabledSuffix. It links then
 // removes rather than renaming, so it fails (EEXIST) instead of overwriting a

@@ -273,18 +273,28 @@ func replaceSudoers(main, content string) error {
 
 // applySudoersBlock appends the lockdown rules to main and says in the log
 // what holds the lockdown. The appended lines are the guarantee. Where main
-// cannot be replaced (a bind mount, a read-only file), it falls back, with a
-// Warn naming the weaker guarantee, to the sudoers.d file alone: that holds
-// only if main includes the directory and nothing read after the file grants
-// the user, so competing-file disabling and the step verification carry it.
-// Any other error is returned and fails the lockdown.
-func applySudoersBlock(main, rules string, logger *slog.Logger) (bool, error) {
+// cannot be replaced (a bind mount, a read-only file), it falls back to the
+// sudoers.d file in dir alone — but only where that holds: main, still
+// readable, must end by including dir, so nothing in main is read after the
+// file. Then competing-file disabling (which keeps later sudoers.d files from
+// overriding it) and the step verification carry the lockdown, and a Warn
+// names the weaker guarantee. Where main does not end that way, the
+// lockdown's rules would not be read last, so it fails with that reason. Any
+// other error is returned and fails the lockdown.
+func applySudoersBlock(main, dir, rules string, logger *slog.Logger) (bool, error) {
 	appended, err := appendSudoersBlock(main, rules)
 	switch {
 	case errors.Is(err, errSudoersNotReplaceable):
+		data, rerr := os.ReadFile(main)
+		if rerr != nil {
+			return false, fmt.Errorf("%w, and it cannot be read to check the fallback: %w", err, rerr)
+		}
+		if last, ok := readsSudoersDLast(string(data), dir); !ok {
+			return false, fmt.Errorf("%w, and the fallback to %s does not hold: %s", err, dir, notLastReason(main, dir, last))
+		}
 		logger.Warn("Cannot append the lockdown rules to sudoers, which cannot be replaced; "+
-			"falling back to the sudoers.d file alone, which holds only if sudoers includes that directory "+
-			"and nothing read after it grants the user; the step verification is the backstop",
+			"falling back to the sudoers.d file alone, which sudoers includes last; "+
+			"competing-file disabling and the step verification carry the lockdown",
 			"path", main, "error", err)
 		return false, nil
 	case err != nil:
@@ -299,6 +309,68 @@ func applySudoersBlock(main, rules string, logger *slog.Logger) (bool, error) {
 		logger.Info("Appended the lockdown rules as the last lines of sudoers", "path", main)
 	}
 	return appended, nil
+}
+
+// readsSudoersDLast reports whether sudo, reading main's content, reads
+// nothing in it after including dir: the last meaningful line is an
+// includedir of dir. It returns that last line too. A line is meaningful
+// unless it is blank or a comment, and a '#' line is a comment only when it
+// is neither a user named by uid ('#' and a digit) nor anything spelled like
+// an include ('#include…', with any separator or none): erring toward
+// "meaningful" only refuses a fallback that might not hold.
+func readsSudoersDLast(content, dir string) (string, bool) {
+	last := ""
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || isSudoersComment(trimmed) {
+			continue
+		}
+		last = trimmed
+	}
+	return last, isIncludedirOf(last, dir)
+}
+
+// isSudoersComment reports whether a trimmed line is a comment that cannot
+// be a directive or a rule.
+func isSudoersComment(trimmed string) bool {
+	rest, ok := strings.CutPrefix(trimmed, "#")
+	if !ok {
+		return false
+	}
+	if rest != "" && rest[0] >= '0' && rest[0] <= '9' {
+		return false // a user named by uid
+	}
+	return !strings.HasPrefix(rest, "include")
+}
+
+// isIncludedirOf reports whether line is an #includedir or @includedir of
+// dir, with any separator isIncludeDirective accepts, the path optionally
+// quoted or with a trailing slash. Anything else after the path makes it not
+// one, which only refuses the fallback.
+func isIncludedirOf(line, dir string) bool {
+	for _, kw := range []string{"#includedir", "@includedir"} {
+		rest, ok := strings.CutPrefix(line, kw)
+		if !ok || rest == "" || !strings.ContainsRune(" \t/", rune(rest[0])) {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) != 1 {
+			return false
+		}
+		return filepath.Clean(strings.Trim(fields[0], `"`)) == filepath.Clean(dir)
+	}
+	return false
+}
+
+// notLastReason says why the sudoers.d fallback would not hold.
+func notLastReason(main, dir, last string) string {
+	if last == "" {
+		return fmt.Sprintf("%s holds no rule or include, so %s is never read", main, dir)
+	}
+	if len(last) > 120 {
+		last = strings.ToValidUTF8(last[:120], "") + "…"
+	}
+	return fmt.Sprintf("the last line sudo reads in %s is %q, not an include of %s, so the lockdown's file there is not read last", main, last, dir)
 }
 
 // fileExists reports whether path names an existing file.

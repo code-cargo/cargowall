@@ -274,11 +274,16 @@ var errLockdownIneffective = errors.New("sudo lockdown does not hold")
 // allowlist does not name, and returns errLockdownIneffective when it does.
 // It is a backstop, not the guarantee: it tests a small fixed set of
 // commands, so it shows those don't escalate, not that nothing does. The
-// guarantee is complete detection of competing grants (sudoersFileGrantsUser)
-// and the deny-first rules read last. Whatever stops the question being asked
-// — no sudo, every probe command allowlisted, a timeout, a sudo that did not
-// run to completion — is logged and leaves the lockdown in place: that is
-// what was asked for, and nothing shows it does not hold.
+// guarantee is the deny-first rules read last. Whatever stops the question
+// being asked — no sudo, every probe command allowlisted, a timeout, a sudo
+// that did not run to completion — is logged and leaves the lockdown in
+// place: that is what was asked for, and nothing shows it does not hold.
+//
+// With an allowlist, it also checks the positive half without running
+// anything: that sudo would permit an allowlisted command (sudo -n -l), so
+// the lockdown's own rules are the ones in force. A deny that holds while the
+// allowlist does not apply means those rules are not what sudo reads — say,
+// a sudoers.d file never included — and is a Warn, not "Verified".
 func verifyLockdown(v *jobView, allow []string, logger *slog.Logger) error {
 	sudo, err := exec.LookPath("sudo")
 	if err != nil {
@@ -300,9 +305,37 @@ func verifyLockdown(v *jobView, allow []string, logger *slog.Logger) error {
 		return fmt.Errorf("%w: as uid %d with %s (%v), sudo ran %s as root",
 			errLockdownIneffective, v.uid, v.from, v.groups, strings.Join(probe, " "))
 	}
+	allowed := ""
+	if cmd := allowlistProbe(allow); cmd != "" {
+		lcode, lout, lerr := v.runAs(sudo, "-n", "-l", "--", cmd)
+		switch {
+		case lerr != nil:
+			logger.Warn("Sudo lockdown holds, but whether its allowlist applies could not be checked",
+				"command", cmd, "error", lerr)
+			return nil
+		case lcode != 0:
+			logger.Warn("Sudo lockdown holds, but its allowlist does not apply: sudo would not run an allowlisted command, "+
+				"so the lockdown's rules are not the ones sudo reads",
+				"command", cmd, "sudo_exit", lcode, "sudo_output", lout, "uid", v.uid, "groups_from", v.from)
+			return nil
+		}
+		allowed = cmd
+	}
 	logger.Info("Verified sudo lockdown", "uid", v.uid, "groups", v.groups,
-		"groups_from", v.from, "probe", strings.Join(probe, " "), "sudo_exit", code, "sudo_output", out)
+		"groups_from", v.from, "probe", strings.Join(probe, " "), "sudo_exit", code, "sudo_output", out,
+		"allowlist_checked", allowed)
 	return nil
+}
+
+// allowlistProbe is the first allowlisted command that exists, which the
+// positive check asks sudo about, or "" when there is none to ask about.
+func allowlistProbe(allow []string) string {
+	for _, a := range allow {
+		if fi, err := os.Stat(a); err == nil && fi.Mode().IsRegular() {
+			return a
+		}
+	}
+	return ""
 }
 
 // warnDockerAccess warns when a job step can still reach a docker daemon,

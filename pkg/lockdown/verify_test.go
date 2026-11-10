@@ -287,3 +287,34 @@ func TestLookupJobView_unknownGroups(t *testing.T) {
 		t.Errorf("lookupJobView with no worker and nil preGIDs = %+v, want an error", view)
 	}
 }
+
+// TestVerifyLockdown_allowlistControl: with an allowlist, "Verified" also
+// needs sudo to permit an allowlisted command (sudo -n -l, nothing run). A
+// deny that holds while the allowlist does not apply is a Warn instead.
+func TestVerifyLockdown_allowlistControl(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("verifyLockdown runs the probe with process credentials, which needs root")
+	}
+	v := selfView(t)
+	allow := []string{"/usr/bin/id"}
+
+	// Refuses the probe (args "-n -- ..."), permits the -l check ("-n -l ...").
+	fakeSudo(t, `[ "$2" = "-l" ] && exit 0; exit 1`)
+	logger, buf := captureLog()
+	if err := verifyLockdown(v, allow, logger); err != nil {
+		t.Fatal(err)
+	}
+	if out := buf.String(); !strings.Contains(out, "Verified sudo lockdown") || !strings.Contains(out, "allowlist_checked=/usr/bin/id") {
+		t.Errorf("allowlist applies: want Verified with the command checked: %s", out)
+	}
+
+	// Refuses everything: the deny holds but the allowlist does not apply.
+	fakeSudo(t, "exit 1")
+	logger, buf = captureLog()
+	if err := verifyLockdown(v, allow, logger); err != nil {
+		t.Fatal(err)
+	}
+	if out := buf.String(); strings.Contains(out, "Verified sudo lockdown") || !strings.Contains(out, "allowlist does not apply") {
+		t.Errorf("allowlist refused: want a Warn and no Verified: %s", out)
+	}
+}

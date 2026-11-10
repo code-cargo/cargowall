@@ -393,23 +393,50 @@ func captureLog() (*slog.Logger, *bytes.Buffer) {
 }
 
 // TestApplySudoersBlock_fallsBackWhenNotReplaceable: an /etc/sudoers that
-// cannot be replaced does not fail the lockdown; it falls back to the
-// sudoers.d file with a Warn naming the weaker guarantee.
+// cannot be replaced, and that ends by including sudoers.d, does not fail
+// the lockdown; it falls back to the sudoers.d file with a Warn naming the
+// weaker guarantee.
 func TestApplySudoersBlock_fallsBackWhenNotReplaceable(t *testing.T) {
 	stubVisudo(t, nil)
 	stubRename(t, syscall.EBUSY)
-	main := writeSudoers(t, arcSudoers)
+	main := writeSudoers(t, ubuntuSudoers)
 	logger, buf := captureLog()
 
-	appended, err := applySudoersBlock(main, testRules, logger)
+	appended, err := applySudoersBlock(main, "/etc/sudoers.d", testRules, logger)
 	if err != nil || appended {
 		t.Fatalf("applySudoersBlock = %v, %v; want false, nil (the fallback)", appended, err)
 	}
-	if got := readString(t, main); got != arcSudoers {
+	if got := readString(t, main); got != ubuntuSudoers {
 		t.Errorf("file changed: %q", got)
 	}
 	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "falling back to the sudoers.d file") {
 		t.Errorf("no Warn naming the fallback: %s", out)
+	}
+}
+
+// TestApplySudoersBlock_refusesFallbackThatDoesNotHold: where /etc/sudoers
+// cannot be replaced and the sudoers.d file would not be read last — a grant
+// after the includedir, or no includedir at all (the ARC image) — the
+// lockdown fails with that reason rather than reporting a fallback that does
+// not hold.
+func TestApplySudoersBlock_refusesFallbackThatDoesNotHold(t *testing.T) {
+	for name, content := range map[string]string{
+		"grant after the includedir": ubuntuSudoers + "runner ALL=(ALL) NOPASSWD: /bin/cat\n",
+		"arc image, no includedir":   arcSudoers,
+		"empty":                      "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			stubVisudo(t, nil)
+			stubRename(t, syscall.EBUSY)
+			main := writeSudoers(t, content)
+			_, err := applySudoersBlock(main, "/etc/sudoers.d", testRules, discardLogger())
+			if err == nil || !errors.Is(err, errSudoersNotReplaceable) || !strings.Contains(err.Error(), "does not hold") {
+				t.Errorf("applySudoersBlock = %v, want a not-replaceable error saying the fallback does not hold", err)
+			}
+			if got := readString(t, main); got != content {
+				t.Errorf("file changed: %q", got)
+			}
+		})
 	}
 }
 
@@ -419,8 +446,39 @@ func TestApplySudoersBlock_otherErrorFails(t *testing.T) {
 	stubVisudo(t, errors.New("syntax error"))
 	main := writeSudoers(t, arcSudoers)
 	logger, _ := captureLog()
-	if _, err := applySudoersBlock(main, testRules, logger); err == nil {
+	if _, err := applySudoersBlock(main, "/etc/sudoers.d", testRules, logger); err == nil {
 		t.Error("applySudoersBlock: expected an error")
+	}
+}
+
+// TestReadsSudoersDLast: the fallback holds only if the last line sudo reads
+// in /etc/sudoers includes sudoers.d. #uid lines and anything spelled like an
+// include count as meaningful, so they can't hide behind a comment.
+func TestReadsSudoersDLast(t *testing.T) {
+	const d = "/etc/sudoers.d"
+	for content, want := range map[string]bool{
+		ubuntuSudoers:                            true,
+		"#includedir /etc/sudoers.d\n":           true,
+		"@includedir\t/etc/sudoers.d\n":          true, // a tab
+		"@includedir/etc/sudoers.d\n":            true, // no separator (sudo-rs)
+		"@includedir \"/etc/sudoers.d/\"\n":      true, // quoted, trailing slash
+		"@includedir /etc/sudoers.d\n# note\n\n": true, // a comment after
+		"@includedir /etc/sudoers.d\n#\tnote\n":  true,
+		arcSudoers:                               false,
+		"":                                       false,
+		"@includedir /etc/sudoers.d\nrunner ALL=(ALL) ALL\n":       false,
+		"@includedir /etc/sudoers.d\n#1001 ALL=(ALL) ALL\n":        false, // #uid is a rule
+		"@includedir /etc/sudoers.d\n#include\t/etc/extra\n":       false, // an include after
+		"@includedir /etc/sudoers.d\n#include/etc/extra\n":         false,
+		"@includedir /etc/sudoers.d\n@includedir /etc/sudoers.x\n": false,
+		"@includedir /etc/sudoers.d\nDefaults !lecture\n":          false,
+		"@includedir /etc/sudoers.local\n":                         false, // another directory
+		"@include /etc/sudoers.d/zz-cargowall-lockdown\n":          false, // a single file
+		"@includedir /etc/sudoers.d extra\n":                       false,
+	} {
+		if _, got := readsSudoersDLast(content, d); got != want {
+			t.Errorf("readsSudoersDLast(%q) = %v, want %v", content, got, want)
+		}
 	}
 }
 
@@ -434,7 +492,7 @@ func TestApplySudoersBlock_logs(t *testing.T) {
 	stubVisudo(t, nil)
 	sudoRsSudoers = filepath.Join(t.TempDir(), "absent")
 	logger, buf := captureLog()
-	if appended, err := applySudoersBlock(writeSudoers(t, arcSudoers), testRules, logger); err != nil || !appended {
+	if appended, err := applySudoersBlock(writeSudoers(t, arcSudoers), "/etc/sudoers.d", testRules, logger); err != nil || !appended {
 		t.Fatalf("applySudoersBlock = %v, %v", appended, err)
 	}
 	if out := buf.String(); !strings.Contains(out, "level=INFO") || !strings.Contains(out, "as the last lines of sudoers") {
@@ -443,7 +501,7 @@ func TestApplySudoersBlock_logs(t *testing.T) {
 
 	sudoRsSudoers = writeSudoers(t, "root ALL=(ALL) ALL\n")
 	logger, buf = captureLog()
-	if appended, err := applySudoersBlock(writeSudoers(t, arcSudoers), testRules, logger); err != nil || !appended {
+	if appended, err := applySudoersBlock(writeSudoers(t, arcSudoers), "/etc/sudoers.d", testRules, logger); err != nil || !appended {
 		t.Fatalf("applySudoersBlock = %v, %v", appended, err)
 	}
 	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "sudo-rs") || strings.Contains(out, "level=INFO") {

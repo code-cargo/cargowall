@@ -751,3 +751,40 @@ func TestDisableCompetingSudoersFiles_cannotDisable(t *testing.T) {
 		t.Error("fallback: want an error, the lockdown rests on this scan")
 	}
 }
+
+// TestDisableCompetingSudoersFiles_recheck: a file the first pass judged not
+// to compete, which gains a grant before the re-scan, is caught there — a
+// failure when the scan is load-bearing, a Warn when the rules are appended.
+// A file the first pass already reported is not reported again.
+func TestDisableCompetingSudoersFiles_recheck(t *testing.T) {
+	run := func(t *testing.T, loadBearing bool) (string, error) {
+		dir := t.TempDir()
+		notes := filepath.Join(dir, "50-notes")
+		writeFile(t, notes, "# nothing here\n")
+		prev := scanPassDone
+		scanPassDone = func() { writeFile(t, notes, "runner ALL=(ALL) NOPASSWD:ALL\n") }
+		t.Cleanup(func() { scanPassDone = prev })
+		logger, buf := captureLog()
+		_, err := disableCompetingSudoersFiles(dir, "runner", nil, loadBearing, logger)
+		return buf.String(), err
+	}
+	if _, err := run(t, true); err == nil {
+		t.Error("load-bearing: a file that changed to a grant during the pass did not fail the scan")
+	}
+	if out, err := run(t, false); err != nil || !strings.Contains(out, "appeared or changed") {
+		t.Errorf("appended: err=%v, want nil and a Warn; log: %s", err, out)
+	}
+
+	// Reported once, not twice: a file that cannot be disabled is reported by
+	// the first pass and skipped by the re-scan.
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "90-runner"), "runner ALL=(ALL) NOPASSWD:ALL\n")
+	writeFile(t, filepath.Join(dir, "90-runner"+disabledSuffix), "stale\n")
+	logger, buf := captureLog()
+	if _, err := disableCompetingSudoersFiles(dir, "runner", nil, false, logger); err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
+		t.Errorf("the undisableable file was reported %d times, want once: %s", n, buf.String())
+	}
+}

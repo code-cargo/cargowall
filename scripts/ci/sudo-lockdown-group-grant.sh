@@ -45,6 +45,13 @@ runescalation() {
     -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh escalation
 }
 
+# runrootworker is run for the root-worker scenario.
+runrootworker() {
+  local image="$1"
+  docker run --rm --privileged --user root --entrypoint bash \
+    -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh rootworker
+}
+
 # runlatefile is run for the later-sorting competing-grant scenario.
 runlatefile() {
   local image="$1"
@@ -282,6 +289,40 @@ escalation() {
   pristine
 }
 
+# rootworker: a Runner.Worker running as root has job steps with root and no
+# use for sudo, so no lockdown holds against them, whatever it does to the
+# runner account. Under an enforcing policy that is a refused start, and
+# nothing is changed.
+rootworker() {
+  prepare
+  sha256sum /etc/sudoers > /tmp/sudoers.sha
+  find /etc/sudoers.d | sort > /tmp/sudoersd.before
+  id -nG runner | tr ' ' '\n' | sort > /tmp/groups.before
+
+  # Two commands, so bash stays the process rather than exec'ing sleep.
+  ln -sf /bin/bash /tmp/Runner.Worker
+  /tmp/Runner.Worker -c 'sleep 600; :' &
+  local worker=$!
+
+  local upstream
+  upstream="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
+  echo '{"defaultAction":"allow","rules":[]}' > /tmp/policy.json
+  local rc=0
+  timeout 60 /w/bin/cargowall start --config=/tmp/policy.json \
+    --dns-upstream="${upstream}:53" \
+    --sudo-lockdown --sudo-allow-commands "$ALLOWED" \
+    --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 || rc=$?
+  kill "$worker" 2>/dev/null || true
+
+  [ "$rc" = 3 ] || fail "cargowall exited $rc with a root Runner.Worker, not 3 (a refused posture)"
+  [ -f /tmp/cargowall-ready ] && fail "cargowall wrote its ready sentinel with the lockdown lost"
+  grep -qx 'refused=sudo-lockdown' /tmp/cargowall-failed \
+    || fail "the failure sentinel does not name the posture: $(cat /tmp/cargowall-failed 2>/dev/null)"
+  grep -q 'a Runner.Worker runs as root' /tmp/cw.log || fail "the root worker was not the reason"
+  echo "✅ a root Runner.Worker fails startup under an enforcing policy"
+  pristine
+}
+
 # pristine checks that everything the aborted enable touched is undone.
 pristine() {
   [ -f /etc/sudoers.d/zz-cargowall-lockdown ] && fail "the lockdown sudoers file was left behind"
@@ -299,8 +340,10 @@ case "$cmd" in
   run) run "$@" ;;
   run-escalation) runescalation "$@" ;;
   run-latefile) runlatefile "$@" ;;
+  run-rootworker) runrootworker "$@" ;;
   inside) inside ;;
   escalation) escalation ;;
   latefile) latefile ;;
-  *) echo "usage: $0 run <image> | run-escalation <image> | run-latefile <image> | inside | escalation | latefile" >&2; exit 2 ;;
+  rootworker) rootworker ;;
+  *) echo "usage: $0 run <image> | run-escalation <image> | run-latefile <image> | run-rootworker <image> | inside | escalation | latefile | rootworker" >&2; exit 2 ;;
 esac

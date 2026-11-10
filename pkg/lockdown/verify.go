@@ -102,6 +102,26 @@ func workerView(procRoot string, uid uint32) (groups []uint32, dockerHosts []str
 	return groups, dockerHosts, found
 }
 
+// workerOwners is the distinct real uids of the Runner.Workers under
+// procRoot, in the order found.
+func workerOwners(procRoot string) []uint32 {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil
+	}
+	var owners []uint32
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || procfs.CommIn(procRoot, pid) != procfs.RunnerWorkerComm {
+			continue
+		}
+		if owner, _, ok := parseStatusCreds(filepath.Join(procRoot, e.Name(), "status")); ok && !slices.Contains(owners, owner) {
+			owners = append(owners, owner)
+		}
+	}
+	return owners
+}
+
 // parseStatusCreds reads the real uid and the supplementary groups from a
 // /proc/<pid>/status.
 func parseStatusCreds(path string) (uid uint32, groups []uint32, ok bool) {

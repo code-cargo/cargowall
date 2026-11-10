@@ -87,14 +87,17 @@ var enableLockdown = lockdown.EnableSudoLockdown
 // against the same config BEFORE calling this, so a signal landing mid-write
 // can never strand the runner with a restricted sudoers file.
 //
-// A lockdown that returns an error has undone itself, a verification that
-// sudo still runs an unlisted command as root included, so the job would run
-// with the runner's sudo unchanged. That is the posture lost, and the error
-// returned fails startup under an enforcing policy: the firewall's
-// enforcement assumes job steps do not have root. What the lockdown only
-// warns about (a verification that could not complete, sudo reading another
-// policy source, the sudoers.d-only fallback) leaves it in place and loses
-// nothing.
+// A lockdown that returns an error has undone itself, so the job would run
+// with the runner's sudo unchanged: it could not be applied, a verification
+// saw sudo still run an unlisted command as root, or the runner's worker runs
+// as root, beyond any lockdown. That is the posture lost, and the error
+// returned fails startup under an enforcing policy. What the posture promises
+// is the lockdown's own guarantee: sudo, for the job's user, runs only the
+// allowlist, checked against a command it does not name. The docker socket
+// and whatever an allowlisted command itself grants are outside it. What the
+// lockdown only warns about (a verification that could not complete, sudo
+// reading another policy source, the sudoers.d-only fallback) leaves it in
+// place and loses nothing.
 func enableSudoLockdown(cfg *lockdown.SudoLockdownConfig, postures *postureLedger, logger *slog.Logger) error {
 	if err := enableLockdown(cfg, logger); err != nil {
 		return postures.lose(postureSudoLockdown, postures.errReason(err))

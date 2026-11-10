@@ -24,10 +24,10 @@
 // measurement never ran, since an observe run that reports no would-blocks
 // reads exactly like a clean one. The redirect's and the lockdown's flags
 // have no rungs of their own; what each guards is the policy's enforcement
-// (the lockdown keeps job steps from the root that could change the
-// firewall's own state), so the policy's mode decides there too. Under policy lockdown no loss is fatal: lockdown has
-// already failed the job and stays up deny-all on purpose, and exiting
-// would take the whole firewall down.
+// (the lockdown limits what a job step can run as root through sudo to the
+// allowlist), so the policy's mode decides there too. Under policy lockdown
+// no loss is fatal: lockdown has already failed the job and stays up
+// deny-all on purpose, and exiting would take the whole firewall down.
 package cmd
 
 import (

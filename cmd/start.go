@@ -815,6 +815,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// posture. The disable is registered first, so /etc/sudoers is restored
 	// on every return path, not just signal-driven shutdown.
 	if cmd.SudoLockdown {
+		// A signal that has already come must not start the lockdown: it
+		// would run in full during shutdown, and the force path's disable
+		// could finish before it does.
+		if startupInterrupted(ctx, logger, "pre-lockdown") {
+			return nil
+		}
 		// Registered BEFORE the mutation, and against the config the
 		// enable path will use: enableSudoLockdown rewrites sudoers
 		// before it returns, so registering afterwards leaves a window

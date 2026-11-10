@@ -392,11 +392,21 @@ func captureLog() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewTextHandler(&buf, nil)), &buf
 }
 
+// noSudoRsFile points sudoRsSudoers at an absent path for the test, so the
+// host's own /etc/sudoers-rs, if any, cannot decide the result.
+func noSudoRsFile(t *testing.T) {
+	t.Helper()
+	prev := sudoRsSudoers
+	sudoRsSudoers = filepath.Join(t.TempDir(), "absent")
+	t.Cleanup(func() { sudoRsSudoers = prev })
+}
+
 // TestApplySudoersBlock_fallsBackWhenNotReplaceable: an /etc/sudoers that
 // cannot be replaced, and that ends by including sudoers.d, does not fail
 // the lockdown; it falls back to the sudoers.d file with a Warn naming the
 // weaker guarantee.
 func TestApplySudoersBlock_fallsBackWhenNotReplaceable(t *testing.T) {
+	noSudoRsFile(t)
 	stubVisudo(t, nil)
 	stubRename(t, syscall.EBUSY)
 	main := writeSudoers(t, ubuntuSudoers)
@@ -441,6 +451,7 @@ func TestApplySudoersBlock_refusesFallbackThatDoesNotHold(t *testing.T) {
 		"empty":                      "",
 	} {
 		t.Run(name, func(t *testing.T) {
+			noSudoRsFile(t)
 			stubVisudo(t, nil)
 			stubRename(t, syscall.EBUSY)
 			main := writeSudoers(t, content)
@@ -505,6 +516,10 @@ func TestSudoersEndsWithIncludedir(t *testing.T) {
 		{"a trailing NBSP", "@includedir /etc/sudoers.d\u00a0\n", false},
 		{"a continuation into it", "Defaults env_reset \\\n@includedir /etc/sudoers.d\n", false},
 		{"a rule continued into it", "runner ALL=(ALL) NOPASSWD: /usr/bin/cat \\\n@includedir /etc/sudoers.d\n", false},
+		{"a continuation with trailing blanks", "Defaults env_reset \\  \n@includedir /etc/sudoers.d\n", false},
+		{"a continuation with a trailing tab", "Defaults env_reset \\\t\n@includedir /etc/sudoers.d\n", false},
+		{"a continuation with a trailing CR", "Defaults env_reset \\\r\n@includedir /etc/sudoers.d\n", false},
+		{"a last comment continued with a trailing blank", "@includedir /etc/sudoers.d\n# note \\ \n", false},
 		{"CRLF", "@includedir /etc/sudoers.d\r\n", false}, // sudo-rs drops it
 		{"no final newline", "@includedir /etc/sudoers.d", false},
 		{"a vertical tab", "@includedir /etc/sudoers.d\v\n", false},
@@ -552,5 +567,26 @@ func TestApplySudoersBlock_logs(t *testing.T) {
 	}
 	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "sudo-rs") || strings.Contains(out, "level=INFO") {
 		t.Errorf("with /etc/sudoers-rs present, want a Warn and no Info: %s", out)
+	}
+}
+
+// TestSudoersEndsWithIncludedir_reasons: a refused fallback says why in terms
+// of what went wrong, not just that the last line isn't the include — a
+// continued or unterminated include line looks like one.
+func TestSudoersEndsWithIncludedir_reasons(t *testing.T) {
+	const d = "/etc/sudoers.d"
+	for content, want := range map[string]string{
+		"":                           "nothing includes",
+		arcSudoers:                   "not an include of",
+		"@includedir /etc/sudoers.d": "no final newline",
+		"Defaults x \\  \n@includedir /etc/sudoers.d\n": "ends in a backslash",
+	} {
+		why, ok := sudoersEndsWithIncludedir(content, d)
+		if ok || !strings.Contains(why, want) {
+			t.Errorf("sudoersEndsWithIncludedir(%q) = %q, %v; want a refusal saying %q", content, why, ok, want)
+		}
+	}
+	if why, ok := sudoersEndsWithIncludedir(ubuntuSudoers, d); !ok || why != "" {
+		t.Errorf("the ubuntu default = %q, %v; want \"\", true", why, ok)
 	}
 }

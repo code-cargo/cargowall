@@ -294,8 +294,8 @@ func applySudoersBlock(main, dir, rules string, logger *slog.Logger) (bool, erro
 		if rerr != nil {
 			return false, fmt.Errorf("%w, and it cannot be read to check the fallback: %w", err, rerr)
 		}
-		if last, ok := sudoersEndsWithIncludedir(string(data), dir); !ok {
-			return false, fmt.Errorf("%w, and the fallback to %s does not hold: %s", err, dir, notLastReason(main, dir, last))
+		if why, ok := sudoersEndsWithIncludedir(string(data), dir); !ok {
+			return false, fmt.Errorf("%w, and the fallback to %s does not hold: in %s, %s", err, dir, main, why)
 		}
 		logger.Warn("Cannot append the lockdown rules to sudoers, which cannot be replaced; "+
 			"falling back to the sudoers.d file alone, which sudoers includes last; "+
@@ -318,8 +318,8 @@ func applySudoersBlock(main, dir, rules string, logger *slog.Logger) (bool, erro
 
 // sudoersEndsWithIncludedir reports whether both classic sudo and sudo-rs,
 // reading content as a whole sudoers file, read nothing in it after an
-// include of dir: its last line either of them acts on is that include. It
-// returns that last line too, for the reason when it does not hold.
+// include of dir: its last line either of them acts on is that include.
+// When it does not hold, it says why, for the lockdown's failure.
 //
 // This is the check the sudoers.d fallback rests on, so it accepts only the
 // intersection of the two parsers, on bytes: a spelling one of them reads
@@ -330,8 +330,8 @@ func applySudoersBlock(main, dir, rules string, logger *slog.Logger) (bool, erro
 // 1.9.15p5, 1.9.17p2 and sudo-rs 0.2.13:
 //   - the include is strictIncludedirOf: no leading blanks, the keyword and a
 //     separator, the path, and a real newline;
-//   - the line before it must not end in a backslash, which would continue
-//     a rule into it;
+//   - the line before it must not continue into it (a backslash, ignoring
+//     trailing blanks and a CR), which would fold it into that line's rule;
 //   - after it, only lines both parsers skip (skippedByBoth).
 func sudoersEndsWithIncludedir(content, dir string) (string, bool) {
 	lines := strings.Split(content, "\n") // lines[i] for i < len-1 ended in '\n'
@@ -340,27 +340,45 @@ func sudoersEndsWithIncludedir(content, dir string) (string, bool) {
 		inc--
 	}
 	if inc < 0 {
-		return "", false
+		return fmt.Sprintf("nothing includes %s, so it is never read", dir), false
 	}
 	line := lines[inc]
-	newline := inc < len(lines)-1 // sudo-rs needs a real '\n' after the path
-	if !newline || !strictIncludedirOf(line, dir) {
-		return line, false
+	if !strictIncludedirOf(line, dir) {
+		return fmt.Sprintf("the last line sudo acts on is %q, not an include of %s that classic sudo and sudo-rs both read as one, so the lockdown's file there is not read last",
+			clip(line), dir), false
 	}
-	if inc > 0 && strings.HasSuffix(lines[inc-1], `\`) {
-		return line, false
+	if inc == len(lines)-1 {
+		return fmt.Sprintf("the include of %s has no final newline, which sudo-rs needs after the path, so sudo-rs drops it", dir), false
 	}
-	return line, true
+	if inc > 0 && continuesLine(lines[inc-1]) {
+		return fmt.Sprintf("the line before the include of %s ends in a backslash, so classic sudo continues that line into it and drops the include", dir), false
+	}
+	return "", true
+}
+
+// clip bounds a sudoers line for an error message.
+func clip(line string) string {
+	if len(line) > 120 {
+		return strings.ToValidUTF8(line[:120], "") + "…"
+	}
+	return line
+}
+
+// continuesLine reports whether classic sudo continues line into the next:
+// it ends in a backslash, ignoring trailing blanks and a CR (toke.l's
+// continuation is `\\[[:blank:]]*\r?\n`).
+func continuesLine(line string) bool {
+	return strings.HasSuffix(strings.TrimRight(line, " \t\r"), `\`)
 }
 
 // skippedByBoth reports whether both parsers skip a line, so that a line
 // after the include does not matter: empty, only spaces and tabs, or a '#'
 // comment both read as one — '#' alone or followed by a byte that is not a
 // digit, not '-' (classic sudo reads "#-1" as a user id) and that does not
-// begin "include". A line ending in a backslash is never skipped: it
-// continues into the next.
+// begin "include". A line that continues into the next (continuesLine) is
+// never skipped.
 func skippedByBoth(line string) bool {
-	if strings.HasSuffix(line, `\`) {
+	if continuesLine(line) {
 		return false
 	}
 	t := strings.TrimLeft(line, " \t")
@@ -424,17 +442,6 @@ func strictIncludedirOf(line, dir string) bool {
 		return false
 	}
 	return path == dir || path == dir+"/"
-}
-
-// notLastReason says why the sudoers.d fallback would not hold.
-func notLastReason(main, dir, last string) string {
-	if last == "" {
-		return fmt.Sprintf("%s holds no rule or include, so %s is never read", main, dir)
-	}
-	if len(last) > 120 {
-		last = strings.ToValidUTF8(last[:120], "") + "…"
-	}
-	return fmt.Sprintf("the last line sudo reads in %s is %q, not an include of %s, so the lockdown's file there is not read last", main, last, dir)
 }
 
 // fileExists reports whether path names an existing file.

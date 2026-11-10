@@ -52,8 +52,9 @@ const l7CfgKeyMode = uint32(2)
 
 // Flow-state values written back to map_l7_flow (sni.h L7_STATE_*).
 const (
-	l7StateAllowed uint8 = 2
-	l7StateDenied  uint8 = 3
+	l7StateNeedHello uint8 = 0
+	l7StateAllowed   uint8 = 2
+	l7StateDenied    uint8 = 3
 )
 
 // Punt flags (sni.h L7_PUNT_F_*).
@@ -64,6 +65,7 @@ const (
 	l7PuntQUIC      uint8 = 0x08
 	l7PuntRepin     uint8 = 0x10 // a new QUIC Initial DCID superseded the flow's identity
 	l7PuntRefused   uint8 = 0x20 // an identity-gate refusal record, not an adjudication punt
+	l7PuntNewConn   uint8 = 0x40 // opens a connection's first flight: a cycle of its own
 )
 
 // Stats slots (sni.h L7_STAT_*), read by logStats and pinned against the C
@@ -79,6 +81,7 @@ const (
 	l7StatPendingNoID uint32 = 7
 	l7StatGateNoState uint32 = 8
 	l7StatAltUngated  uint32 = 9
+	l7StatContinued   uint32 = 10
 )
 
 // L7Options configures the oracle. Everything the reader goroutines read is
@@ -400,6 +403,9 @@ func (l *L7) logStats() {
 		"allowed", sum(l7StatAllowed), "denied", sum(l7StatDenied),
 		"identity_gate_refused", gateRefused, "pending_no_identity", pendingNoID,
 		"no_state_refused", gateNoState,
+		// Segments of TLS connections met mid-stream with no flow entry
+		// (opened before attach, or evicted) that rode the L4 verdict.
+		"no_state_continuation", sum(l7StatContinued),
 		// Packets on an alternate HTTPS/HTTP port that carried no TLS/HTTP
 		// identity and were PASSED rather than refused. Reported so the
 		// widened scope's residual is visible next to the refusals.

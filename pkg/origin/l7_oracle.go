@@ -66,6 +66,10 @@ const (
 	L7QUICVersion L7Reason = "quic_version"  // unknown QUIC version
 	L7ParseError  L7Reason = "parse_error"   // malformed handshake
 	L7Reassembly  L7Reason = "reassembly"    // overlap conflict / overflow
+	// L7NoState: bytes that are not TLS/HTTP on a connection L7 has no entry
+	// for and whose socket has had no data acknowledged, such as one opened
+	// just before attach.
+	L7NoState L7Reason = "no_state"
 	// L7NameNotAtIP: the name IS allowed by policy on this port, but this
 	// daemon never saw it resolve to THIS destination. Distinct from
 	// L7Mismatch because observe-mode telemetry has to separate "name not
@@ -157,7 +161,7 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 		st = &l7flow{proto: protocolForEvent(ev)}
 		l.flows[fk] = st
 	}
-	if st.decided && ev.Flags&(l7PuntNoState|l7PuntRepin) == 0 {
+	if st.decided && ev.Flags&(l7PuntNoState|l7PuntRepin|l7PuntNewConn) == 0 {
 		// A punt queued before our verdict landed: stale. Its kernel-side
 		// write may have clobbered the entry back to PENDING, which would
 		// strand the flow under enforce — re-assert rather than only
@@ -170,7 +174,7 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 		// start dropping live parked flows instead.
 		verdict, dcid := st.verdict, st.dcid
 		l.mu.Unlock()
-		if err := l.reassertVerdict(fk, verdict, dcid); err != nil && l.logger != nil {
+		if err := l.reassertVerdict(fk, verdict, dcid, ev.Timestamp); err != nil && l.logger != nil {
 			l.logger.Warn("L7 verdict re-assert failed", "err", err)
 		}
 		return
@@ -179,12 +183,14 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 	if st.decided {
 		// NO_STATE: the kernel LRU evicted the entry after we adjudicated, so
 		// the verdict is gone and the kernel punts until a new one is written.
-		// REPIN: a new QUIC attempt superseded the adjudicated one. Either
-		// way, start over from this sample.
+		// REPIN: a new QUIC attempt superseded the adjudicated one. NEW_CONN:
+		// the socket opened another TCP connection to the same destination,
+		// and a verdict governs one connection. Any way, start over from this
+		// sample.
 		*st = l7flow{proto: st.proto, lastSeen: now}
-	} else if ev.Flags&l7PuntRepin != 0 || supersededDCID(st, ev) {
-		// A new attempt superseded a still-undecided cycle: its CRYPTO must
-		// not mix with the superseded assembler's.
+	} else if ev.Flags&(l7PuntRepin|l7PuntNewConn) != 0 || supersededDCID(st, ev) {
+		// A new attempt or connection superseded a still-undecided cycle: its
+		// bytes must not mix with the superseded assembler's.
 		*st = l7flow{proto: st.proto, lastSeen: now}
 	}
 	// Record the cycle's identity. REPIN only fires when the KERNEL had a
@@ -417,7 +423,7 @@ func (l *L7) finish(ev *bpf.L7Event, proto sni.Protocol, out L7Outcome, dcid []b
 	out.Protocol = proto
 	out.Enforce = ev.Flags&l7PuntObserve == 0
 
-	if err := l.writeFlowState(ev.FlowKey(), l7FlowState(out.Allowed), dcid); err != nil && l.logger != nil {
+	if err := l.writeFlowState(ev.FlowKey(), l7FlowState(out.Allowed), dcid, ev.Timestamp); err != nil && l.logger != nil {
 		// Warn, not Debug: under enforce a lost verdict write leaves the flow
 		// PENDING, so the kernel drops every retransmit until the punt budget
 		// black-holes it — this line is the only operator-visible signal.
@@ -470,10 +476,15 @@ func (l *L7) reportRefusal(ev *bpf.L7Event) {
 	})
 }
 
-// refusalReason classifies a refusal from its snippet. A QUIC long header in a
-// version outside the decryptor's table gets its own reason because its remedy
-// is extending that table, not fixing a workload.
+// refusalReason classifies a refusal from its flags and snippet. A QUIC long
+// header in a version outside the decryptor's table gets its own reason
+// because its remedy is extending that table, not fixing a workload; so does a
+// refusal on a flow with no entry, which points at a connection opened before
+// attach rather than at its bytes.
 func refusalReason(ev *bpf.L7Event) L7Reason {
+	if ev.Flags&l7PuntNoState != 0 {
+		return L7NoState
+	}
 	if ev.Scope == bpf.L7ScopeQUIC {
 		s := ev.Payload[:ev.PayloadLen]
 		if len(s) >= 5 && s[0]&0x80 != 0 {
@@ -493,7 +504,7 @@ func refusalReason(ev *bpf.L7Event) L7Reason {
 // lookup narrows the race the same way the kernel's commit re-lookup does;
 // neither closes it, and the converging repin/re-assert cycle repairs the
 // remainder. TCP verdicts carry no DCID and always re-assert.
-func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte) error {
+func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte, punted uint64) error {
 	if len(dcid) > 0 {
 		var cur bpf.OriginBpfL7FlowVal
 		if err := l.flow.Lookup(&key, &cur); err == nil {
@@ -502,7 +513,7 @@ func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byt
 			}
 		}
 	}
-	return l.writeFlowState(key, state, dcid)
+	return l.writeFlowState(key, state, dcid, punted)
 }
 
 // writeFlowState stamps the kernel flow-state map so the client's retransmit
@@ -510,7 +521,20 @@ func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byt
 // connection-attempt identity the kernel compares in every state; empty for
 // TCP. last_punt_seq is deliberately left zero: it is the kernel's PENDING
 // dedup field, never read on a terminal state.
-func (l *L7) writeFlowState(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte) error {
+//
+// It leaves alone a NEED_HELLO entry parked after punted, the kernel time
+// of the punt this verdict answers: only a connection's first SYN parks one,
+// so that entry belongs to a later connection of the socket, whose own first
+// flight punts with NEW_CONN. A NEED_HELLO from before the punt is this
+// connection's own, which the kernel moves to PENDING only after it has
+// submitted the punt, and is written over as usual. The lookup narrows the
+// window a SYN landing between it and the update leaves open; it doesn't
+// close it.
+func (l *L7) writeFlowState(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte, punted uint64) error {
+	var cur bpf.OriginBpfL7FlowVal
+	if err := l.flow.Lookup(&key, &cur); err == nil && cur.State == l7StateNeedHello && cur.Ts > punted {
+		return nil
+	}
 	val := bpf.OriginBpfL7FlowVal{State: state}
 	if n := copy(val.Dcid[:], dcid); n > 0 {
 		val.DcidLen = uint8(n)

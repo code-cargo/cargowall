@@ -192,6 +192,7 @@ func TestOriginL7RealSocketWriteback(t *testing.T) {
 	require.NoError(t, err)
 	ev := readL7SampleFor(t, h.rd, cookie)
 	require.Zero(t, ev.Flags&l7PuntFlagNoState, "the SYN's NEED_HELLO entry existed")
+	require.NotZero(t, ev.Flags&l7PuntFlagNewConn, "a first flight from NEED_HELLO opens a connection")
 	require.Zero(t, ev.Flags&l7PuntFlagObserve, "L7 enforce posture")
 	require.Equal(t, key, ev.FlowKey(), "the sample must map back to this socket's flow key")
 	require.NoError(t, h.objs.MapL7Flow.Lookup(key, &fv))
@@ -276,7 +277,10 @@ func TestOriginL7RealSocketSplitHello(t *testing.T) {
 	_, err = conn.Write(hello[mid:])
 	require.NoError(t, err)
 	ev2 := readL7SampleFor(t, h.rd, cookie)
+	require.NotZero(t, ev1.Flags&l7PuntFlagNewConn, "the first half opens the connection")
 	require.Equal(t, ev1.Seq+uint32(mid), ev2.Seq, "the punt must be the continuation segment")
+	require.Zero(t, ev2.Flags&l7PuntFlagNewConn,
+		"the second half continues the cycle; a NEW_CONN here would reset the oracle's assembler")
 	require.Equal(t, uint16(len(hello)-mid), ev2.PayloadLen)
 	require.Equal(t, hello[mid:], append([]byte(nil), ev2.Payload[:ev2.PayloadLen]...),
 		"the mid-record bytes must be punted verbatim, not dropped unpunted")

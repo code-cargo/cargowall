@@ -703,3 +703,125 @@ func TestL7OutcomeReportsTheParsedProtocol(t *testing.T) {
 	require.Equal(t, sni.ProtoTLS, (*outcomes)[0].Protocol,
 		"the outcome must name the protocol the handshake was parsed with")
 }
+
+// TestL7RefusalReason: a refusal record on a flow with no entry is reported
+// as no_state whatever its bytes, so a stalled connection opened before
+// attach reads as that and not as a protocol violation; the others keep the
+// snippet's classification.
+func TestL7RefusalReason(t *testing.T) {
+	refused := func(ev *bpf.L7Event, flags uint8) *bpf.L7Event {
+		ev.Flags |= l7PuntRefused | flags
+		return ev
+	}
+	ssh := []byte("SSH-2.0-x\r\n")
+	unknownQUIC := []byte{0xc0, 0x0a, 0x0a, 0x0a, 0x0a, 0x00}
+
+	require.Equal(t, L7NotProtocol, refusalReason(refused(makeL7Event(443, 1, ssh, false), 0)))
+	require.Equal(t, L7NoState, refusalReason(refused(makeL7Event(443, 1, ssh, false), l7PuntNoState)))
+	require.Equal(t, L7NoState, refusalReason(refused(makeL7Event(443, 1, ssh, false), l7PuntNoState|l7PuntObserve)),
+		"the posture bit must not change the reason")
+	require.Equal(t, L7QUICVersion, refusalReason(refused(makeL7Event(443, 0, unknownQUIC, true), 0)))
+}
+
+// TestL7NewConnectionPuntReAdjudicates: a NEW_CONN punt on a decided flow is
+// a later TCP connection of the same socket to the same destination, so the
+// same flow key. A verdict governs one connection: the oracle must
+// adjudicate the new one afresh rather than re-assert the old verdict.
+func TestL7NewConnectionPuntReAdjudicates(t *testing.T) {
+	objs := loadL7Objects(t)
+	l := newL7(objs, L7Options{Matcher: allowSet{"auth.docker.io": true}}, nil)
+	outcomes := captureSink(l)
+
+	first := makeL7Event(443, 1000, snitest.BuildClientHello("auth.docker.io"), false)
+	first.Flags |= l7PuntNewConn
+	l.onSample(first)
+	require.Len(t, *outcomes, 1)
+	require.True(t, (*outcomes)[0].Allowed)
+
+	next := makeL7Event(443, 9000, snitest.BuildClientHello("other.example"), false)
+	next.Flags |= l7PuntNewConn
+	l.onSample(next)
+
+	require.Len(t, *outcomes, 2, "a NEW_CONN punt must re-adjudicate")
+	require.False(t, (*outcomes)[1].Allowed)
+	require.Equal(t, L7Mismatch, (*outcomes)[1].Reason)
+	var v bpf.OriginBpfL7FlowVal
+	require.NoError(t, objs.MapL7Flow.Lookup(first.FlowKey(), &v))
+	require.Equal(t, l7StateDenied, v.State, "the new connection's verdict must be written")
+
+	// A punt without the flag on the decided flow is still stale.
+	stale := makeL7Event(443, 9000, snitest.BuildClientHello("other.example"), false)
+	l.onSample(stale)
+	require.Len(t, *outcomes, 2, "a stale punt is not adjudicated")
+}
+
+// TestL7NewConnectionResetsUndecidedCycle: a NEW_CONN punt while the socket's
+// previous connection is still mid-handshake starts the new connection's own
+// cycle; its bytes must not join the old connection's assembler.
+func TestL7NewConnectionResetsUndecidedCycle(t *testing.T) {
+	objs := loadL7Objects(t)
+	l := newL7(objs, L7Options{Matcher: allowSet{"auth.docker.io": true}}, nil)
+	outcomes := captureSink(l)
+
+	partial := makeL7Event(443, 1000, snitest.BuildClientHello("old.example")[:8], false)
+	partial.Flags |= l7PuntNewConn
+	l.onSample(partial)
+	require.Empty(t, *outcomes, "a hello prefix needs more")
+
+	next := makeL7Event(443, 70000, snitest.BuildClientHello("auth.docker.io"), false)
+	next.Flags |= l7PuntNewConn
+	l.onSample(next)
+	require.Len(t, *outcomes, 1)
+	require.True(t, (*outcomes)[0].Allowed, "the new connection's hello adjudicates on its own (why=%q)", (*outcomes)[0].Reason)
+	require.Equal(t, "auth.docker.io", (*outcomes)[0].Name)
+}
+
+// TestL7VerdictLeavesANewConnectionAlone: a verdict, or a re-assert of one,
+// that lands after the socket's next connection parked its entry NEED_HELLO
+// belongs to the earlier connection and must not be written over the new
+// one's entry. A NEED_HELLO parked before the punt is the connection's own
+// (the kernel submits the punt before it moves the entry to PENDING), and
+// the verdict is written over it, as over the cycle's PENDING.
+func TestL7VerdictLeavesANewConnectionAlone(t *testing.T) {
+	objs := loadL7Objects(t)
+	l := newL7(objs, L7Options{Matcher: allowSet{"auth.docker.io": true}}, nil)
+	outcomes := captureSink(l)
+	state := func(ev *bpf.L7Event) uint8 {
+		var v bpf.OriginBpfL7FlowVal
+		require.NoError(t, objs.MapL7Flow.Lookup(ev.FlowKey(), &v))
+		return v.State
+	}
+	hello := func(cookie uint64, punted uint64) *bpf.L7Event {
+		ev := makeL7Event(443, 1000, snitest.BuildClientHello("auth.docker.io"), false)
+		ev.Cookie = cookie
+		ev.Timestamp = punted
+		return ev
+	}
+
+	// A later connection's SYN parked the entry after this cycle's punt.
+	ev := hello(1, 5000)
+	ev.Flags |= l7PuntNewConn
+	require.NoError(t, objs.MapL7Flow.Put(ev.FlowKey(), bpf.OriginBpfL7FlowVal{State: l7StateNeedHello, Ts: 6000}))
+	l.onSample(ev)
+	require.Len(t, *outcomes, 1, "the cycle is still adjudicated and reported")
+	require.Equal(t, l7StateNeedHello, state(ev), "the verdict must not land on the next connection's entry")
+
+	// A stale punt's re-assert must leave it alone too.
+	l.onSample(hello(1, 5500))
+	require.Len(t, *outcomes, 1)
+	require.Equal(t, l7StateNeedHello, state(ev), "a re-assert must not land on the next connection's entry")
+
+	// The connection's own NEED_HELLO, parked before its punt: written over.
+	own := hello(2, 5000)
+	own.Flags |= l7PuntNewConn
+	require.NoError(t, objs.MapL7Flow.Put(own.FlowKey(), bpf.OriginBpfL7FlowVal{State: l7StateNeedHello, Ts: 4000}))
+	l.onSample(own)
+	require.Equal(t, l7StateAllowed, state(own), "a fresh connection's own first flight must get its verdict")
+
+	// Over its own cycle's PENDING entry the verdict is written.
+	pending := hello(3, 5000)
+	pending.Flags |= l7PuntNewConn
+	require.NoError(t, objs.MapL7Flow.Put(pending.FlowKey(), bpf.OriginBpfL7FlowVal{State: 1, Ts: 4000}))
+	l.onSample(pending)
+	require.Equal(t, l7StateAllowed, state(pending))
+}

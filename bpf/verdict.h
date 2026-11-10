@@ -121,6 +121,11 @@ struct rule_port_key_v6 {
 } __attribute__((packed));
 
 // ---- Shared rule/config maps ----
+//
+// The four rule maps hold the job's rules (POLICY_JOB) and every step's, so
+// each is sized for both: userspace keeps 4096 entries of each for the job,
+// what the whole map held before step policies, and lets the steps share
+// the rest (pkg/firewall/policy.go).
 
 // Default action map (0 = deny, 1 = allow)
 struct {
@@ -135,7 +140,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __type(key, struct rule_key);
     __type(value, struct lpm_val);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 16384);
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } map_cidrs SEC(".maps");
 
@@ -144,7 +149,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct rule_port_key);
     __type(value, struct port_val);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 16384);
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } map_ports SEC(".maps");
 
@@ -153,7 +158,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __type(key, struct rule_key_v6);
     __type(value, struct lpm_val);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 16384);
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } map_cidrs_v6 SEC(".maps");
 
@@ -162,7 +167,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct rule_port_key_v6);
     __type(value, struct port_val);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 16384);
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } map_ports_v6 SEC(".maps");
 

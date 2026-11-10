@@ -57,6 +57,13 @@ type Firewall interface {
 	// see ipPortState.
 	AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error)
 
+	// AddPolicyIP adds an allow for ip on ports under a step policy, never the
+	// job's (only AddIP writes that), with AddIP's accumulation semantics per
+	// (policy, IP). Step policies share what the job's reservation leaves of
+	// each rule map: a write that would take more is refused with
+	// ErrStepBudget and installs nothing. See policy.go.
+	AddPolicyIP(policy uint32, ip net.IP, ports []config.Port) (bool, error)
+
 	// RemoveIP removes a single IP from the BPF maps
 	RemoveIP(ip net.IP) error
 }
@@ -82,7 +89,11 @@ type FirewallImpl struct {
 	// Per-IP accumulated firewall state, keyed by IP string. Tracks the union of
 	// port-specific entries (for cleanup) plus the sticky all-ports grant, so a
 	// shared IP's effective LPM entry reflects every rule that resolved to it.
+	// The job's; a step policy's accumulators are in stepIPs (policy.go).
 	ipPorts map[string]*ipPortState
+
+	stepIPs map[policyIP]*ipPortState
+	steps   stepLedger
 }
 
 // portProto carries a port number and its IANA protocol number for BPF map keys.
@@ -257,61 +268,8 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 		// Process based on rule type
 		switch rule.Type {
 		case config.RuleTypeCIDR:
-			if rule.IPNet == nil {
-				continue // Skip invalid CIDR rules
-			}
-
-			ones, _ := rule.IPNet.Mask.Size()
-
-			// Expand ports with protocol info for BPF maps
-			portValues := expandPorts(rule.Ports)
-
-			// Check if this is an IPv6 CIDR
-			if ip4 := rule.IPNet.IP.To4(); ip4 != nil {
-				// IPv4 CIDR
-
-				// Special handling for 0.0.0.0/0 with specific ports
-				// Don't add to LPM trie, only to port map
-				if rule.Value == "0.0.0.0/0" && len(portValues) > 0 {
-					for _, pp := range portValues {
-						portKey := bpf.RulePortKey(bpf.PolicyJob, 0, pp.Port, pp.Proto, 0)
-						portVal := bpf.TcBpfPortVal{
-							Action: actionVal,
-						}
-						if err := f.portsMap.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-							return fmt.Errorf("update port map for wildcard port %d proto %d: %w", pp.Port, pp.Proto, err)
-						}
-					}
-					continue
-				}
-
-				if err := f.addCIDRv4(ip4, uint32(ones), actionVal, portValues, rule.Value); err != nil {
-					return err
-				}
-			} else {
-				// IPv6 CIDR
-				ip6 := rule.IPNet.IP.To16()
-				if ip6 == nil {
-					continue
-				}
-
-				// Special handling for ::/0 with specific ports
-				if rule.Value == "::/0" && len(portValues) > 0 {
-					for _, pp := range portValues {
-						portKey := bpf.RulePortKeyV6(bpf.PolicyJob, [16]byte{}, pp.Port, pp.Proto, 0)
-						portVal := bpf.TcBpfPortVal{
-							Action: actionVal,
-						}
-						if err := f.portsV6Map.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-							return fmt.Errorf("update v6 port map for wildcard port %d proto %d: %w", pp.Port, pp.Proto, err)
-						}
-					}
-					continue
-				}
-
-				if err := f.addCIDRv6(ip6, uint32(ones), actionVal, portValues, rule.Value); err != nil {
-					return err
-				}
+			if err := f.addCIDRRuleLocked(bpf.PolicyJob, rule, actionVal); err != nil {
+				return err
 			}
 
 		case config.RuleTypeHostname:
@@ -319,11 +277,11 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 			hostPortValues := expandPorts(rule.Ports)
 			for _, ip := range rule.IPs {
 				if ip4 := ip.To4(); ip4 != nil {
-					if err := f.addCIDRv4(ip4, 32, actionVal, hostPortValues, rule.Value); err != nil {
+					if err := f.addCIDRv4(bpf.PolicyJob, ip4, 32, actionVal, hostPortValues, rule.Value); err != nil {
 						return err
 					}
 				} else if ip6 := ip.To16(); ip6 != nil {
-					if err := f.addCIDRv6(ip6, 128, actionVal, hostPortValues, rule.Value); err != nil {
+					if err := f.addCIDRv6(bpf.PolicyJob, ip6, 128, actionVal, hostPortValues, rule.Value); err != nil {
 						return err
 					}
 				}
@@ -331,18 +289,92 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 		}
 	}
 
+	f.installStepRulesLocked(configMgr.GetStepRules())
 	return nil
 }
 
-// addCIDRv4 adds an IPv4 CIDR to the BPF LPM trie and optional port maps.
-// Must be called with f.mu held.
-func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
+// addCIDRRuleLocked writes one CIDR rule under policy. A whole-address-space
+// rule with ports (0.0.0.0/0, ::/0) goes into the port map alone, as wildcard
+// entries; any other into the LPM trie. Must be called with f.mu held.
+func (f *FirewallImpl) addCIDRRuleLocked(policy uint32, rule config.ResolvedRule, actionVal uint8) error {
+	if rule.IPNet == nil {
+		return nil // Skip invalid CIDR rules
+	}
+
+	ones, _ := rule.IPNet.Mask.Size()
+
+	// Expand ports with protocol info for BPF maps
+	portValues := expandPorts(rule.Ports)
+
+	// Check if this is an IPv6 CIDR
+	if ip4 := rule.IPNet.IP.To4(); ip4 != nil {
+		// Special handling for 0.0.0.0/0 with specific ports
+		// Don't add to LPM trie, only to port map
+		if rule.Value == "0.0.0.0/0" && len(portValues) > 0 {
+			return f.addWildcardPortsV4(policy, actionVal, portValues)
+		}
+		return f.addCIDRv4(policy, ip4, uint32(ones), actionVal, portValues, rule.Value)
+	}
+
+	ip6 := rule.IPNet.IP.To16()
+	if ip6 == nil {
+		return nil
+	}
+	// Special handling for ::/0 with specific ports
+	if rule.Value == "::/0" && len(portValues) > 0 {
+		return f.addWildcardPortsV6(policy, actionVal, portValues)
+	}
+	return f.addCIDRv6(policy, ip6, uint32(ones), actionVal, portValues, rule.Value)
+}
+
+// addWildcardPortsV4 writes port entries that match any IPv4 destination
+// under policy. Must be called with f.mu held.
+func (f *FirewallImpl) addWildcardPortsV4(policy uint32, actionVal uint8, ports []portProto) error {
+	if policy != bpf.PolicyJob {
+		if err := f.admitWildcardLocked(policy, ruleMapPorts, ports, "0.0.0.0/0"); err != nil {
+			return err
+		}
+	}
+	for _, pp := range ports {
+		portKey := bpf.RulePortKey(policy, 0, pp.Port, pp.Proto, 0)
+		portVal := bpf.TcBpfPortVal{
+			Action: actionVal,
+		}
+		if err := f.portsMap.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update port map for wildcard port %d proto %d: %w", pp.Port, pp.Proto, err)
+		}
+	}
+	return nil
+}
+
+// addWildcardPortsV6 is the IPv6 twin of addWildcardPortsV4.
+func (f *FirewallImpl) addWildcardPortsV6(policy uint32, actionVal uint8, ports []portProto) error {
+	if policy != bpf.PolicyJob {
+		if err := f.admitWildcardLocked(policy, ruleMapPortsV6, ports, "::/0"); err != nil {
+			return err
+		}
+	}
+	for _, pp := range ports {
+		portKey := bpf.RulePortKeyV6(policy, [16]byte{}, pp.Port, pp.Proto, 0)
+		portVal := bpf.TcBpfPortVal{
+			Action: actionVal,
+		}
+		if err := f.portsV6Map.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update v6 port map for wildcard port %d proto %d: %w", pp.Port, pp.Proto, err)
+		}
+	}
+	return nil
+}
+
+// addCIDRv4 adds an IPv4 CIDR to the BPF LPM trie and optional port maps,
+// under policy. Must be called with f.mu held.
+func (f *FirewallImpl) addCIDRv4(policy uint32, ip4 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
 	// Host routes (/32) share the per-IP accumulator with AddIP so a shared IP
 	// contributed by both a static rule and a DNS resolution keeps the union of
 	// all its rules instead of last-write-wins narrowing. Genuine subnets fall
 	// through to a direct LPM write.
 	if prefixLen == 32 {
-		_, err := f.addIPv4Locked(ip4, ip4.String(), actionVal, ports)
+		_, err := f.addIPv4Locked(policy, ip4, ip4.String(), actionVal, ports)
 		return err
 	}
 
@@ -355,7 +387,12 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 	// the entries are keyed by (network address, host_bits) — ip4 is already
 	// the network address, net.ParseCIDR masks it.
 	hostBits := uint8(32 - prefixLen)
-	key := bpf.RuleKey(bpf.PolicyJob, prefixLen, ipUint32)
+	key := bpf.RuleKey(policy, prefixLen, ipUint32)
+	if policy != bpf.PolicyJob {
+		if err := f.admitSubnetV4Locked(policy, key, ipUint32, hostBits, ports, label); err != nil {
+			return err
+		}
+	}
 	val := bpf.TcBpfLpmVal{
 		Action:       actionVal,
 		PortSpecific: 0,
@@ -365,7 +402,7 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 	if len(ports) > 0 {
 		val.PortSpecific = 1
 		for _, pp := range ports {
-			portKey := bpf.RulePortKey(bpf.PolicyJob, ipUint32, pp.Port, pp.Proto, hostBits)
+			portKey := bpf.RulePortKey(policy, ipUint32, pp.Port, pp.Proto, hostBits)
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
 			}
@@ -381,13 +418,13 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 	return nil
 }
 
-// addCIDRv6 adds an IPv6 CIDR to the BPF v6 LPM trie and optional port maps.
-// Must be called with f.mu held.
-func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
+// addCIDRv6 adds an IPv6 CIDR to the BPF v6 LPM trie and optional port maps,
+// under policy. Must be called with f.mu held.
+func (f *FirewallImpl) addCIDRv6(policy uint32, ip6 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
 	// Host routes (/128) share the per-IP accumulator with AddIP — see addCIDRv4.
 	// addIPv6Locked applies prepV6Ports itself, so pass the unfiltered ports.
 	if prefixLen == 128 {
-		_, err := f.addIPv6Locked(ip6, ip6.String(), actionVal, ports)
+		_, err := f.addIPv6Locked(policy, ip6, ip6.String(), actionVal, ports)
 		return err
 	}
 
@@ -400,7 +437,12 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 	hostBits := uint8(128 - prefixLen)
 	var ip16 [16]byte
 	copy(ip16[:], ip6)
-	key := bpf.RuleKeyV6(bpf.PolicyJob, prefixLen, ip16)
+	key := bpf.RuleKeyV6(policy, prefixLen, ip16)
+	if policy != bpf.PolicyJob {
+		if err := f.admitSubnetV6Locked(policy, key, ip16, hostBits, ports, label); err != nil {
+			return err
+		}
+	}
 
 	val := bpf.TcBpfLpmVal{
 		Action:       actionVal,
@@ -411,7 +453,7 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 	if len(ports) > 0 {
 		val.PortSpecific = 1
 		for _, pp := range ports {
-			portKey := bpf.RulePortKeyV6(bpf.PolicyJob, ip16, pp.Port, pp.Proto, hostBits)
+			portKey := bpf.RulePortKeyV6(policy, ip16, pp.Port, pp.Proto, hostBits)
 			portVal := bpf.TcBpfPortVal{
 				Action: actionVal,
 			}
@@ -520,23 +562,28 @@ func (f *FirewallImpl) AddIP(ip net.IP, action config.Action, ports []config.Por
 	if ip4 := ip.To4(); ip4 != nil {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		return f.addIPv4Locked(ip4, ip.String(), actionVal, pp)
+		return f.addIPv4Locked(bpf.PolicyJob, ip4, ip.String(), actionVal, pp)
 	}
 	if ip6 := ip.To16(); ip6 != nil {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		return f.addIPv6Locked(ip6, ip.String(), actionVal, pp)
+		return f.addIPv6Locked(bpf.PolicyJob, ip6, ip.String(), actionVal, pp)
 	}
 	return false, fmt.Errorf("invalid IP: %s", ip.String())
 }
 
 // addIPv4Locked is the shared accumulator core for IPv4 /32 host entries, used
-// by both AddIP and UpdateAllowlistTC (via addCIDRv4). Must be called with
-// f.mu held.
-func (f *FirewallImpl) addIPv4Locked(ip4 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
+// by AddIP, AddPolicyIP and UpdateAllowlistTC (via addCIDRv4), under policy.
+// Must be called with f.mu held.
+func (f *FirewallImpl) addIPv4Locked(policy uint32, ip4 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
 
-	key := bpf.RuleKey(bpf.PolicyJob, 32, ipUint32)
+	key := bpf.RuleKey(policy, 32, ipUint32)
+	if policy != bpf.PolicyJob {
+		if err := f.admitHostV4Locked(policy, key, ipUint32, ipStr, ports); err != nil {
+			return false, err
+		}
+	}
 
 	var existingVal bpf.TcBpfLpmVal
 	ipExists := f.cidrsMap.Lookup(&key, &existingVal) == nil
@@ -544,16 +591,9 @@ func (f *FirewallImpl) addIPv4Locked(ip4 net.IP, ipStr string, actionVal uint8, 
 	// Fetch or create this IP's accumulator. On first touch, seed the sticky
 	// all-ports flags from any pre-existing LPM entry so a PortSpecific=0 grant
 	// isn't flipped back to PortSpecific=1 by this add.
-	st := f.ipPorts[ipStr]
-	if st == nil {
-		st = &ipPortState{}
-		if ipExists {
-			st.seedFromLPM(existingVal)
-		}
-		f.ipPorts[ipStr] = st
-	}
+	st := f.ipStateLocked(policy, ipStr, ipExists, existingVal)
 
-	portsChanged, err := f.writePortsV4(ipUint32, ipStr, actionVal, ports, st)
+	portsChanged, err := f.writePortsV4(policy, ipUint32, ipStr, actionVal, ports, st)
 	if err != nil {
 		return false, err
 	}
@@ -584,7 +624,7 @@ func (f *FirewallImpl) addIPv4Locked(ip4 net.IP, ipStr string, actionVal uint8, 
 // no-op check: a shared IP added under two rules with disjoint port sets must
 // still get the second rule's entries even when the LPM value is unchanged, or
 // the retry on the new port is blackholed. Map writes are idempotent.
-func (f *FirewallImpl) writePortsV4(ipUint32 uint32, ipStr string, actionVal uint8, ports []portProto, st *ipPortState) (bool, error) {
+func (f *FirewallImpl) writePortsV4(policy, ipUint32 uint32, ipStr string, actionVal uint8, ports []portProto, st *ipPortState) (bool, error) {
 	if len(ports) == 0 {
 		st.recordAllPorts(actionVal)
 		return false, nil
@@ -596,7 +636,7 @@ func (f *FirewallImpl) writePortsV4(ipUint32 uint32, ipStr string, actionVal uin
 
 	var portsChanged bool
 	for _, pp := range ports {
-		portKey := bpf.RulePortKey(bpf.PolicyJob, ipUint32, pp.Port, pp.Proto, 0)
+		portKey := bpf.RulePortKey(policy, ipUint32, pp.Port, pp.Proto, 0)
 		var existingPortVal bpf.TcBpfPortVal
 		if errLookup := f.portsMap.Lookup(&portKey, &existingPortVal); errLookup != nil || existingPortVal.Action != actionVal {
 			portsChanged = true
@@ -660,9 +700,9 @@ func mergePorts(existing, additions []portProto) []portProto {
 }
 
 // addIPv6Locked is the shared accumulator core for IPv6 /128 host entries, used
-// by both AddIP and UpdateAllowlistTC (via addCIDRv6). Must be called with
-// f.mu held.
-func (f *FirewallImpl) addIPv6Locked(ip6 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
+// by AddIP, AddPolicyIP and UpdateAllowlistTC (via addCIDRv6), under policy.
+// Must be called with f.mu held.
+func (f *FirewallImpl) addIPv6Locked(policy uint32, ip6 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
 	ports, skip := f.prepV6Ports(ports, "ip", ipStr)
 	if skip {
 		return false, nil
@@ -670,22 +710,20 @@ func (f *FirewallImpl) addIPv6Locked(ip6 net.IP, ipStr string, actionVal uint8, 
 
 	var ip16 [16]byte
 	copy(ip16[:], ip6)
-	key := bpf.RuleKeyV6(bpf.PolicyJob, 128, ip16)
+	key := bpf.RuleKeyV6(policy, 128, ip16)
+	if policy != bpf.PolicyJob {
+		if err := f.admitHostV6Locked(policy, key, ip16, ipStr, ports); err != nil {
+			return false, err
+		}
+	}
 
 	var existingVal bpf.TcBpfLpmVal
 	ipExists := f.cidrsV6Map.Lookup(&key, &existingVal) == nil
 
 	// See addIPv4Locked for the accumulator/seeding rationale.
-	st := f.ipPorts[ipStr]
-	if st == nil {
-		st = &ipPortState{}
-		if ipExists {
-			st.seedFromLPM(existingVal)
-		}
-		f.ipPorts[ipStr] = st
-	}
+	st := f.ipStateLocked(policy, ipStr, ipExists, existingVal)
 
-	portsChanged, err := f.writePortsV6(ip16, ipStr, actionVal, ports, st)
+	portsChanged, err := f.writePortsV6(policy, ip16, ipStr, actionVal, ports, st)
 	if err != nil {
 		return false, err
 	}
@@ -704,7 +742,7 @@ func (f *FirewallImpl) addIPv6Locked(ip6 net.IP, ipStr string, actionVal uint8, 
 
 // writePortsV6 is the IPv6 twin of writePortsV4 — see it for the inert-port
 // skip, conflict warning, and disjoint-port rationale.
-func (f *FirewallImpl) writePortsV6(ip16 [16]byte, ipStr string, actionVal uint8, ports []portProto, st *ipPortState) (bool, error) {
+func (f *FirewallImpl) writePortsV6(policy uint32, ip16 [16]byte, ipStr string, actionVal uint8, ports []portProto, st *ipPortState) (bool, error) {
 	if len(ports) == 0 {
 		st.recordAllPorts(actionVal)
 		return false, nil
@@ -716,7 +754,7 @@ func (f *FirewallImpl) writePortsV6(ip16 [16]byte, ipStr string, actionVal uint8
 
 	var portsChanged bool
 	for _, pp := range ports {
-		portKey := bpf.RulePortKeyV6(bpf.PolicyJob, ip16, pp.Port, pp.Proto, 0)
+		portKey := bpf.RulePortKeyV6(policy, ip16, pp.Port, pp.Proto, 0)
 		var existingPortVal bpf.TcBpfPortVal
 		if errLookup := f.portsV6Map.Lookup(&portKey, &existingPortVal); errLookup != nil || existingPortVal.Action != actionVal {
 			portsChanged = true

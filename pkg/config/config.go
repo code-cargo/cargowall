@@ -96,6 +96,8 @@ type FirewallConfig struct {
 	// network traffic is governed by a CIDR rule and per-hostname tracking
 	// would be wasteful.
 	SearchDomains []string `json:"searchDomains,omitempty"`
+	// Steps are per-step allow rules, added to the job's (steprules.go).
+	Steps []StepConfig `json:"steps,omitempty"`
 }
 
 // Rule represents a firewall Rule
@@ -164,6 +166,7 @@ type Manager struct {
 	mu               sync.RWMutex
 	config           *FirewallConfig
 	resolvedRules    []ResolvedRule
+	steps            []stepPolicy // step allow tiers, by policy (steprules.go)
 	hostnameCache    map[string][]net.IP
 	ipToHostname     map[string]string              // Reverse lookup: IP -> hostname
 	ipToCNAMEOrigins map[string][]cnameOriginRecord // Reverse lookup: IP -> CNAME chains (one per origin) for derived-allow attribution
@@ -266,9 +269,14 @@ func (cm *Manager) applyLoadedConfig(cfg *FirewallConfig) error {
 		return err
 	}
 	cfg.Rules = mergeDuplicateRules(cfg.Rules)
+	steps, err := compileSteps(cfg.Steps, cfg.DefaultAction)
+	if err != nil {
+		return err
+	}
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.config = cfg
+	cm.steps = steps
 	if err := cm.resolveRulesLocked(); err != nil {
 		return err
 	}
@@ -1275,7 +1283,7 @@ func (cm *Manager) MatchHostnameRule(hostname string) HostnameVerdict {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	deny, denyPorts, allow := foldForms(cm.matchFormsLocked(strings.ToLower(hostname)))
+	deny, denyPorts, allow := foldForms(cm.matchFormsLocked(cm.resolvedRules, strings.ToLower(hostname)))
 	var v HostnameVerdict
 	if deny != nil {
 		v.DenyPorts, v.DenyRule = denyPorts, deny.value
@@ -1295,13 +1303,14 @@ type formMatch struct {
 	value  string
 }
 
-// matchFormsLocked evaluates the full name and each stripped candidate, in
-// precedence order. Caller must hold cm.mu.RLock and pass lowercase.
-func (cm *Manager) matchFormsLocked(hostname string) []formMatch {
+// matchFormsLocked evaluates the full name and each stripped candidate
+// against rules (the job's, or one step's), in precedence order. Caller
+// must hold cm.mu.RLock and pass lowercase.
+func (cm *Manager) matchFormsLocked(rules []ResolvedRule, hostname string) []formMatch {
 	names := append([]string{hostname}, cm.stripCandidatesLocked(hostname)...)
 	forms := make([]formMatch, 0, len(names))
 	for _, n := range names {
-		action, ports, value := cm.matchHostnameRuleLocked(n)
+		action, ports, value := matchHostnameRuleLocked(rules, n)
 		forms = append(forms, formMatch{name: n, action: action, ports: ports, value: value})
 	}
 	return forms
@@ -1380,19 +1389,19 @@ func pickAllowForm(current, next *formMatch) (nextWins bool) {
 }
 
 // matchHostnameRuleLocked is the lock-free / single-form core of
-// MatchHostnameRule. Caller must hold cm.mu.RLock and pass an
-// already-lowercased hostname.
-func (cm *Manager) matchHostnameRuleLocked(hostname string) (Action, []Port, string) {
+// MatchHostnameRule, over one rule set. Caller must hold cm.mu.RLock and pass
+// an already-lowercased hostname.
+func matchHostnameRuleLocked(rules []ResolvedRule, hostname string) (Action, []Port, string) {
 	// Single pass: classify each hostname rule into one of four candidates,
 	// then apply precedence at the end. Equivalent to the prior two-pass
-	// implementation but halves iterations of resolvedRules. Note we can't
+	// implementation but halves iterations of the rules. Note we can't
 	// short-circuit on a deny-pattern match mid-iteration because an exact
 	// match later in the slice would supersede it (rule 1 in the precedence
 	// docstring); collecting all candidates first preserves correctness.
 	var exactRule, parentRule, denyPatternRule, allowPatternRule *ResolvedRule
 
-	for i := range cm.resolvedRules {
-		r := &cm.resolvedRules[i]
+	for i := range rules {
+		r := &rules[i]
 		if r.Type != RuleTypeHostname {
 			continue
 		}
@@ -1602,7 +1611,7 @@ func (cm *Manager) FindTrackedHostname(name string) string {
 
 	// The same fold as MatchHostnameRule, so audit attribution names the
 	// rule the verdict fired on; a deny outranks an allow, as it does there.
-	deny, _, allow := foldForms(cm.matchFormsLocked(strings.ToLower(name)))
+	deny, _, allow := foldForms(cm.matchFormsLocked(cm.resolvedRules, strings.ToLower(name)))
 	switch {
 	case deny != nil:
 		return chosenAttributionName(deny.name, deny.value)
@@ -1626,7 +1635,8 @@ func chosenAttributionName(name, ruleValue string) string {
 	return ruleValue
 }
 
-// GetTrackedHostnames returns a copy of the tracked hostnames map (hostname -> action).
+// GetTrackedHostnames returns a copy of the tracked hostnames map (hostname -> action),
+// with the steps' literal hostnames added as allows (the map itself stays the job's).
 // This is used to proactively resolve hostnames so the reverse lookup cache is populated.
 func (cm *Manager) GetTrackedHostnames() map[string]Action {
 	cm.mu.RLock()
@@ -1636,6 +1646,7 @@ func (cm *Manager) GetTrackedHostnames() map[string]Action {
 	for hostname, action := range cm.trackedHostnames {
 		result[hostname] = action
 	}
+	cm.addStepHostnamesLocked(result)
 	return result
 }
 

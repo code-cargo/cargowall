@@ -355,6 +355,7 @@ sequenceDiagram
 - `RemoveIP(ip)` — removes LPM entry and all associated port map entries
 - Wildcard CIDR handling: `0.0.0.0/0` and `::/0` with specific ports add only port map entries (no LPM entry)
 - Tracks IP-to-port associations (`ipPorts` map) for accurate cleanup on removal
+- Writes each step's own rules under its policy, never policy 0: `AddPolicyIP(policy, ip, ports)` for the DNS path, and the steps' CIDR rules in `UpdateAllowlistTC`. Each (policy, IP) accumulates on its own, and step writes are charged to a step budget that leaves the job its 4096 entries in each rule map (`policy.go`)
 - Thread-safe with `sync.RWMutex`
 
 ### DNS Proxy Server (`pkg/dns`)
@@ -368,6 +369,7 @@ sequenceDiagram
 - Kubernetes search domain stripping (`.default.svc.cluster.local`, `.svc.cluster.local`, `.cluster.local`)
 - Host search-domain stripping (#127): the host's own `resolv.conf` search list (`search`/`domain`, last directive wins; read once at proxy start — it is boot-time DHCP state and a job is short-lived) is a strip-only suffix source, so `myservice.corp.lan` is judged as `myservice`. It is a separate matching candidate, not a competitor in the policy strip's longest-suffix pick: `MatchHostnameRule` folds over the name as asked, the policy strip (Kubernetes + operator suffixes, longest wins) and the host strip, so a host suffix longer than a policy suffix adds a form and never displaces the one existing rules match (a runner pod's `search runners.svc.cluster.local …` must not break rule `db.runners`). It applies on every listener — a Docker container inherits the host search list by default, and a bare rule names that host whoever asks. Never a bypass — `resolv.conf` is not operator-controlled. Why: a stub resolver tries the expanded form before the bare name, and c-ares ends its search on a REFUSED multi-label attempt, so on any host with a search list an allowed single-label name was unresolvable for c-ares clients (Node `dns.resolve*`, grpcio, curl/gRPC builds on c-ares) and every lookup logged a `dns_blocked` for a name nobody asked about. Public suffixes on the list (`com`, `co.uk`) are ignored: stripping them would let rule `foo` match `foo.com`
 - Accumulates IPs per hostname across responses for round-robin DNS support
+- Step tier (`steppolicy.go`): a step-allowed name's IPs go under its steps' policies, step CNAME chains are learned apart from the job's, and the query filter takes the union, after the job's deny
 - Audit logging of blocked DNS queries
 
 ### Config Manager (`pkg/config`)
@@ -381,6 +383,7 @@ sequenceDiagram
 - `EnsureDNSAllowed(ips)` — adds /32 allow rules on port 53 for upstream DNS IPs
 - `EnsureInfraAllowed(ips, ports)` — adds allow rules for infrastructure (Azure IMDS, K8s API, etc.)
 - `EnsureHostnameAllowed(hostname)` — adds hostname allow rule for auto-discovered infrastructure
+- Per-step allow rules (`steps`, `steprules.go`), validated strictly at load; `MatchStepHostname` matches each step's rules on their own, and the job's matchers never see them
 
 ### Event Handler (`pkg/events`)
 - Processes both blocked and allowed events from ring buffer (`ip_version`, `allowed`, ports, IPs)
@@ -793,15 +796,22 @@ achievable by any hook placement; per-container granularity is too coarse
 to select policy with.
 
 **The split** (what the per-step phase builds instead):
-- *Query filtering stays run-wide and step-agnostic.* All of today's allow
-  paths — rules, CNAME-derived allowances, search-domain suffixes, the
-  default action — remain without a step dimension. Residual risk, stated
-  honestly: this concedes cross-step DNS exfiltration. A compromised step
-  may query any domain the run allows for anyone, and the connection
-  verdict cannot see that channel (the query rides the proxy, whose
-  upstream socket is mark-exempt). Accepted because the alternative rests
-  on the unfit signal above; revisit only with a genuinely causal
-  mechanism, none of which is currently known.
+- *Query filtering stays run-wide and step-agnostic.* All of today's
+  allow paths — rules, CNAME-derived allowances, search-domain suffixes,
+  the default action — remain without a step dimension, and step rules
+  join them as a union: a name any step's own rules allow, or one a
+  CNAME chain rooted at a step's rule leads to, resolves for every step
+  in the run. So a step's hostname rules widen query filtering for all
+  of them; a step rule `**.com` opens every `.com` name run-wide, and
+  patterns with no literal label (`*`, `**`, `*.*`) are rejected at
+  load. The job's denies still win: a name the job's rules deny resolves
+  for no step. Residual risk, stated honestly: this concedes cross-step
+  DNS exfiltration. A compromised step may query any domain the run
+  allows for anyone, and the connection verdict cannot see that channel
+  (the query rides the proxy, whose upstream socket is mark-exempt).
+  Accepted because the alternative rests on the unfit signal above;
+  revisit only with a genuinely causal mechanism, none of which is
+  currently known.
 - *Per-step rules live at the connection verdict.* A step may carry allow
   rules of its own, added to the job's; mode and default action stay the
   job's. The rule maps hold rules by policy (policy 0 is the job's), and a
@@ -819,8 +829,38 @@ to select policy with.
   the job's rules alone: every gap is fail-closed. Explicit job denies
   hold for every step. A load-time constant (`step_rules_enabled`) prunes
   the step lookup from both hooks when no step has rules; the data plane
-  is in place, and until the policy's own `steps` arrive nothing turns it
-  on or binds a step.
+  is in place, and the policy's `steps` load and fill it (below), but
+  nothing turns it on or binds a step yet.
+  - *Where a step's rules come from.* The policy's `steps`, one
+    `{id, rules}` per step, in the local `--config` (env-var config carries
+    none, and a load replaces them wholesale, as it does the rules). The id
+    is the step's workflow `id:`, in GitHub's syntax; ids starting with `__`
+    are the runner's own, and two that differ only in case name one step.
+    Rules are allow rules only, through the job's normalize, validate and
+    merge, and a key the schema doesn't know fails the load. Each step with
+    rules gets a policy, numbered 1..N in config order, at most `0xFFFF` so
+    every one fits a stamp. Under a default-allow job, steps would add
+    nothing, so they are dropped with a Warn.
+  - *How they reach the maps.* A step's CIDR rules are written under its
+    policy at sync, after the job's (`UpdateAllowlistTC`). Its hostname
+    rules' IPs come from the DNS path. An answer for a name some steps'
+    rules allow, or one a CNAME chain rooted at such a rule leads to
+    (learned per step, apart from the job's derived allows), is installed
+    under every one of those steps' policies, whichever step asked, at
+    resolution and in the tracked-hostname backfill. No path writes such
+    an IP under policy 0: that would hand one step's allowance to every
+    step and to untagged traffic. A name the job's rules deny, on any port,
+    gets no step install: under a deny default the job writes nothing for a
+    name it denies, it only withholds the allow, and a step entry would
+    fill that silence. L7 scoping and the late-allow still judge by the
+    job's rules alone.
+  - *Capacity.* Each rule map holds 16384 entries. The steps together may
+    hold 12288 in each, and the 4096 the job had before step policies
+    existed stay the job's, so what the job can install never depends on
+    the steps. A step write that would take more is refused whole, with a
+    rate-limited Warn, and that step gets the job's rules there. Entries are
+    allocated as they are written (`BPF_F_NO_PREALLOC`), so the larger maps
+    cost memory only as they fill, beyond each hash's bucket array.
   - *Which step a socket is judged as.* Its tag: the step of the last
     tagged thread to connect it (TCP and UDP; ping from 6.1) or to send
     on it as UDP through an address or IP-level control messages (which

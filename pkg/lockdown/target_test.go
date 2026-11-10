@@ -23,6 +23,9 @@ import (
 	"testing"
 )
 
+// asRoot is the current user when cargowall runs as root, as it does.
+var asRoot = &user.User{Uid: "0", Username: "root"}
+
 // lookupOrSkip is a user every Debian or Ubuntu host has, or a skip.
 func lookupOrSkip(t *testing.T, name string) *user.User {
 	t.Helper()
@@ -43,10 +46,14 @@ func TestResolveTarget_workerOwner(t *testing.T) {
 	fakeProc(t, root, "41", "Runner.Worker", status(nobody.Uid, "65534"), "")
 	fakeProc(t, root, "42", "bash", status("0", "0"), "") // not a worker
 
-	if got, err := resolveTarget("", root, "someoneelse"); err != nil || got != "nobody" {
+	if got, err := resolveTarget("", root, "someoneelse", asRoot, nil); err != nil || got != "nobody" {
 		t.Errorf("resolveTarget = %q, %v; want the worker's owner, nobody", got, err)
 	}
-	if got, err := resolveTarget("alice", root, ""); err != nil || got != "alice" {
+	alice := &user.User{Uid: "4242", Username: "alice"}
+	if got, err := resolveTarget("", root, "daemon", alice, []string{"daemon"}); err != nil || got != "nobody" {
+		t.Errorf("resolveTarget = %q, %v; want the worker's owner ahead of every fallback", got, err)
+	}
+	if got, err := resolveTarget("alice", root, "", asRoot, nil); err != nil || got != "alice" {
 		t.Errorf("a configured user = %q, %v; want alice", got, err)
 	}
 }
@@ -60,7 +67,7 @@ func TestResolveTarget_rootWorker(t *testing.T) {
 	fakeProc(t, root, "40", "Runner.Worker", status("0", "0"), "")
 	fakeProc(t, root, "41", "Runner.Worker", status(nobody.Uid, "65534"), "")
 	for _, sudoUser := range []string{"", "nobody", "root"} {
-		_, err := resolveTarget("", root, sudoUser)
+		_, err := resolveTarget("", root, sudoUser, asRoot, nil)
 		if err == nil || !strings.Contains(err.Error(), "runs as root") {
 			t.Errorf("SUDO_USER=%q: err = %v; want a root worker refused", sudoUser, err)
 		}
@@ -77,11 +84,11 @@ func TestResolveTarget_severalWorkers(t *testing.T) {
 	fakeProc(t, root, "40", "Runner.Worker", status(nobody.Uid, "65534"), "")
 	fakeProc(t, root, "41", "Runner.Worker", status(daemon.Uid, "1"), "")
 
-	if got, err := resolveTarget("", root, "daemon"); err != nil || got != "daemon" {
+	if got, err := resolveTarget("", root, "daemon", asRoot, nil); err != nil || got != "daemon" {
 		t.Errorf("SUDO_USER=daemon: %q, %v; want daemon", got, err)
 	}
 	for _, sudoUser := range []string{"", "bin", "no-such-user-here"} {
-		if got, err := resolveTarget("", root, sudoUser); err == nil || !strings.Contains(err.Error(), "several users") {
+		if got, err := resolveTarget("", root, sudoUser, asRoot, nil); err == nil || !strings.Contains(err.Error(), "several users") {
 			t.Errorf("SUDO_USER=%q: %q, %v; want several workers refused", sudoUser, got, err)
 		}
 	}
@@ -94,30 +101,44 @@ func TestResolveTarget_workerWithoutUser(t *testing.T) {
 	if _, err := user.LookupId("3999999"); err == nil {
 		t.Skip("uid 3999999 names a user here")
 	}
-	if got, err := resolveTarget("", root, "nobody"); err == nil || !strings.Contains(err.Error(), "names no user") {
+	if got, err := resolveTarget("", root, "nobody", asRoot, nil); err == nil || !strings.Contains(err.Error(), "/etc/passwd does not name") {
 		t.Errorf("resolveTarget = %q, %v; want an unnamed uid refused", got, err)
 	}
 }
 
-// With no worker visible, the user who ran cargowall through sudo is next;
-// root there says nothing about the job, so the guesses follow.
+// With no worker visible, a non-root current user is the target, then an
+// existing runner account, and only then the user who ran cargowall through
+// sudo: an account that started cargowall before any job ran is not the
+// job's, where an existing runner account is. Root there says nothing.
 func TestResolveTarget_noWorker(t *testing.T) {
 	lookupOrSkip(t, "nobody")
+	lookupOrSkip(t, "daemon")
 	root := t.TempDir()
-	if got, err := resolveTarget("", root, "nobody"); err != nil || got != "nobody" {
-		t.Errorf("SUDO_USER=nobody: %q, %v; want nobody", got, err)
-	}
-	if os.Getuid() == 0 {
-		return // the guesses as root depend on the host's accounts
-	}
-	cur, err := user.Current()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, sudoUser := range []string{"", "root"} {
-		if got, err := resolveTarget("", root, sudoUser); err != nil || got != cur.Username {
-			t.Errorf("SUDO_USER=%q: %q, %v; want the current user %s", sudoUser, got, err, cur.Username)
-		}
+	for _, tc := range []struct {
+		name     string
+		sudoUser string
+		current  *user.User
+		guesses  []string
+		want     string
+	}{
+		{"a non-root current user", "daemon", &user.User{Uid: "4242", Username: "alice"}, []string{"nobody"}, "alice"},
+		{"a runner account ahead of SUDO_USER", "daemon", asRoot, []string{"no-such-user-here", "nobody"}, "nobody"},
+		{"SUDO_USER when no guess exists", "daemon", asRoot, []string{"no-such-user-here"}, "daemon"},
+		{"SUDO_USER root names nothing", "root", asRoot, []string{"no-such-user-here"}, ""},
+		{"nothing at all", "", asRoot, nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveTarget("", root, tc.sudoUser, tc.current, tc.guesses)
+			if tc.want == "" {
+				if err == nil {
+					t.Errorf("resolveTarget = %q; want no target", got)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Errorf("resolveTarget = %q, %v; want %s", got, err, tc.want)
+			}
+		})
 	}
 }
 

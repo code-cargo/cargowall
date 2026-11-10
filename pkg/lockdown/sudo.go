@@ -80,25 +80,34 @@ func validateSudoersInput(username string, cmds []string) error {
 	return nil
 }
 
+// ciUsernames are the runner accounts guessed at when nothing names one.
+var ciUsernames = []string{"runner", "github", "ci"}
+
 // resolveUsername determines whose sudo the lockdown takes, reading the
 // runner's workers from /proc and the user who ran cargowall through sudo
 // from SUDO_USER (resolveTarget).
 func resolveUsername(cfgUsername string) (string, error) {
-	return resolveTarget(cfgUsername, "/proc", os.Getenv("SUDO_USER"))
+	current, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current user: %w", err)
+	}
+	return resolveTarget(cfgUsername, "/proc", os.Getenv("SUDO_USER"), current, ciUsernames)
 }
 
 // resolveTarget determines whose sudo the lockdown takes. A configured user
 // is taken as given. Otherwise it is the owner of the runner's Runner.Worker,
-// whose job steps the lockdown must hold against; with no worker visible, the
-// user who ran cargowall through sudo, then the current user when not root,
-// then the first common CI account that exists.
+// whose job steps the lockdown must hold against. With no worker visible it
+// is the current user when not root, then the first of guesses that exists,
+// then the user who ran cargowall through sudo, unless root: SUDO_USER comes
+// last, since an account that started cargowall before any job ran is not
+// the job's, where an existing runner account is.
 //
 // A worker running as root is an error: its steps have root without sudo,
 // which no lockdown takes away, and locking another account would report a
 // lockdown that holds against nothing the job runs. So are workers of
 // several users that sudoUser does not choose between, and a worker whose
-// uid names no user.
-func resolveTarget(cfgUsername, procRoot, sudoUser string) (string, error) {
+// uid /etc/passwd does not name.
+func resolveTarget(cfgUsername, procRoot, sudoUser string, current *user.User, guesses []string) (string, error) {
 	if cfgUsername != "" {
 		return cfgUsername, nil
 	}
@@ -114,27 +123,31 @@ func resolveTarget(cfgUsername, procRoot, sudoUser string) (string, error) {
 		}
 		u, err := user.LookupId(strconv.FormatUint(uint64(owners[0]), 10))
 		if err != nil {
-			return "", fmt.Errorf("the Runner.Worker runs as uid %d, which names no user: %w", owners[0], err)
+			return "", fmt.Errorf("the Runner.Worker runs as uid %d, which /etc/passwd does not name: %w", owners[0], err)
 		}
 		return u.Username, nil
 	}
-	if sudoUser != "" && sudoUser != "root" {
-		return sudoUser, nil
+	if current.Uid != "0" {
+		return current.Username, nil
 	}
-	currentUser, err := user.Current()
-	if err != nil {
-		return "", fmt.Errorf("failed to get current user: %w", err)
-	}
-	if currentUser.Uid != "0" {
-		return currentUser.Username, nil
-	}
-	// Running as root — try common CI usernames
-	for _, u := range []string{"runner", "github", "ci"} {
+	for _, u := range guesses {
 		if _, err := user.Lookup(u); err == nil {
 			return u, nil
 		}
 	}
+	if sudoUser != "" && sudoUser != "root" {
+		return sudoUser, nil
+	}
 	return "", fmt.Errorf("could not determine target username for sudo lockdown")
+}
+
+// uidOf is u's uid, or a value no worker has when it does not parse.
+func uidOf(u *user.User) uint32 {
+	n, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return ^uint32(0)
+	}
+	return uint32(n)
 }
 
 // sudoPaths are where sudo, classic or sudo-rs, is installed. They are looked
@@ -158,15 +171,6 @@ func hasSudo() bool {
 		}
 	}
 	return false
-}
-
-// uidOf is u's uid, or a value no worker has when it does not parse.
-func uidOf(u *user.User) uint32 {
-	n, err := strconv.ParseUint(u.Uid, 10, 32)
-	if err != nil {
-		return ^uint32(0)
-	}
-	return uint32(n)
 }
 
 // lookupUserGIDs returns the set of group IDs the user belongs to.

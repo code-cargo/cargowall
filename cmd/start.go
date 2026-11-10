@@ -848,7 +848,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// restored on every return path, not just signal-driven shutdown.
 	if cmd.SudoLockdown {
 		// Registered BEFORE the mutation, and against the config the
-		// enable path will use: enableSudoLockdown rewrites /etc/sudoers.d
+		// enable path will use: enableSudoLockdown rewrites sudoers
 		// before it returns, so registering afterwards leaves a window
 		// where a force-exit strands the runner with restricted sudoers —
 		// the teardown whose loss is hardest to recover from by hand.

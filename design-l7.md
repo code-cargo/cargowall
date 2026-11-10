@@ -75,9 +75,11 @@ said, and a SYN carrying data (TCP Fast Open) is judged as the new
 connection's first flight. The punt that opens a connection's first flight
 carries `L7_PUNT_F_NEW_CONN`, so the oracle starts a cycle of its own for it
 instead of treating it as a stale punt of the decided one, and a verdict is
-never written over a `NEED_HELLO` entry, which belongs to the connection that
-parked it. A verdict governs one connection, never the next one on the
-socket.
+never written over a `NEED_HELLO` entry parked after the punt it answers,
+which belongs to a later connection of the socket. (A `NEED_HELLO` from before
+the punt is the connection's own: the kernel submits the punt before it moves
+the entry to `PENDING`.) A verdict governs one connection, never the next one
+on the socket.
 
 **HTTP** gets the same contract deliberately: the first request's `Host` pins
 the connection. Re-adjudicating every request line was tried and removed — the

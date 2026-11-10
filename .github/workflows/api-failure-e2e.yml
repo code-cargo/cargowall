@@ -572,9 +572,9 @@ jobs:
             { sudo nft list chain inet cargowall output || sudo nft list chain ip cargowall output; } > /dev/null 2>&1 && break
             sleep 0.2
           done
-          sudo nft list tables 2> /dev/null | grep -qE '^table (ip|inet) cargowall( |$)' \
+          { sudo nft list chain inet cargowall output || sudo nft list chain ip cargowall output; } > /dev/null 2>&1 \
             || { echo "::error::DNS redirect never appeared"; cat /tmp/cargowall.log; exit 1; }
-          sudo nft list table inet cargowall > /dev/null 2>&1 \
+          sudo nft list chain inet cargowall output > /dev/null 2>&1 \
             || { echo "::error::DNS redirect is IPv4 only (ip cargowall) on a runner whose loopback has IPv6"; cat /tmp/cargowall.log; exit 1; }
 
           # $CARGO is sudo's pid; the REAL cargowall pid is in the pidfile

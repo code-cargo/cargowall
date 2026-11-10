@@ -457,6 +457,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		return nil
 	}
 
+	// The policy's sudo lockdown settings override the flags; the postures
+	// below read the request off cmd.
+	policySudoLockdown(cmd, configMgr.GetSudoLockdown())
+
 	// postures decides what losing a requested layer means: a lost enforce
 	// rung fails startup, a lost observe rung is recorded for the summary.
 	// Built as soon as the policy's mode is settled, so a lost redirect
@@ -809,6 +813,32 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			return err
 		}
 	}
+	// Enable sudo lockdown if requested (typically in GitHub Actions mode),
+	// before the record is published: one that does not come up is a lost
+	// posture. The disable is registered first, so /etc/sudoers is restored
+	// on every return path, not just signal-driven shutdown.
+	if cmd.SudoLockdown {
+		// A signal that has already come must not start the lockdown: it
+		// would run in full during shutdown, and the force path's disable
+		// could finish before it does.
+		if startupInterrupted(ctx, logger, "pre-lockdown") {
+			return nil
+		}
+		// Registered BEFORE the mutation, and against the config the
+		// enable path will use: enableSudoLockdown rewrites sudoers
+		// before it returns, so registering afterwards leaves a window
+		// where a force-exit strands the runner with restricted sudoers —
+		// the teardown whose loss is hardest to recover from by hand.
+		cfg := sudoLockdownConfig(cmd, logger)
+		defer teardowns.add(func() {
+			if err := lockdown.DisableSudoLockdown(cfg, logger); err != nil {
+				logger.Debug("Sudo lockdown teardown reported an error (may not have been enabled)", "error", err)
+			}
+		})()
+		if err := enableSudoLockdown(cfg, postures, logger); err != nil {
+			return err
+		}
+	}
 	// Every posture is final here: publish the record before ready.
 	postures.write()
 
@@ -838,30 +868,6 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 
 	if startupInterrupted(ctx, logger, "post-attach") {
 		return nil
-	}
-
-	// Apply policy-sourced sudo lockdown settings (overrides CLI flags)
-	if sl := configMgr.GetSudoLockdown(); sl != nil {
-		cmd.SudoLockdown = sl.Enabled
-		cmd.SudoAllowCommands = strings.Join(sl.AllowCommands, ",")
-	}
-
-	// Enable sudo lockdown if requested (typically in GitHub Actions mode).
-	// Disable is deferred immediately on success so /etc/sudoers gets
-	// restored on every return path, not just signal-driven shutdown.
-	if cmd.SudoLockdown {
-		// Registered BEFORE the mutation, and against the config the
-		// enable path will use: enableSudoLockdown rewrites sudoers
-		// before it returns, so registering afterwards leaves a window
-		// where a force-exit strands the runner with restricted sudoers —
-		// the teardown whose loss is hardest to recover from by hand.
-		cfg := sudoLockdownConfig(cmd, logger)
-		defer teardowns.add(func() {
-			if err := lockdown.DisableSudoLockdown(cfg, logger); err != nil {
-				logger.Debug("Sudo lockdown teardown reported an error (may not have been enabled)", "error", err)
-			}
-		})()
-		enableSudoLockdown(cfg, logger)
 	}
 
 	// Restart Docker daemon so containers pick up the rewritten daemon.json.
@@ -1647,57 +1653,6 @@ func gateExistingConnections(conns existingConns, configMgr *config.Manager, fw 
 		}
 	}
 	logger.Info("Processed pre-existing connections against allowlist", "count", len(conns))
-}
-
-// parseSudoAllowCommands splits a comma-separated list of command paths,
-// stripping arguments (anything after the first whitespace) and skipping
-// non-absolute paths. Returns the cleaned list of command paths.
-func parseSudoAllowCommands(input string, logger *slog.Logger) []string {
-	if input == "" {
-		return nil
-	}
-	var cmds []string
-	for _, c := range strings.Split(input, ",") {
-		c = strings.TrimSpace(c)
-		if c == "" {
-			continue
-		}
-		// Sudoers commands must be absolute paths with no arguments.
-		// Strip arguments (anything after the first whitespace) and warn.
-		if fields := strings.Fields(c); len(fields) > 1 {
-			logger.Warn("Stripping arguments from sudo allow command (sudoers requires bare paths)",
-				"original", c, "path", fields[0])
-			c = fields[0]
-		}
-		if !strings.HasPrefix(c, "/") {
-			logger.Warn("Skipping non-absolute sudo allow command", "command", c)
-			continue
-		}
-		cmds = append(cmds, c)
-	}
-	return cmds
-}
-
-// enableSudoLockdown parses allowed commands from cmd.SudoAllowCommands,
-// builds a lockdown config, and enables sudo lockdown. Returns whether
-// lockdown was successfully enabled and the config (for cleanup).
-func sudoLockdownConfig(cmd *StartCmd, logger *slog.Logger) *lockdown.SudoLockdownConfig {
-	return &lockdown.SudoLockdownConfig{
-		AllowCommands: parseSudoAllowCommands(cmd.SudoAllowCommands, logger),
-		Username:      "", // Auto-detect
-	}
-}
-
-// enableSudoLockdown applies the lockdown. The caller registers the undo
-// against the same config BEFORE calling this, so a signal landing mid-write
-// can never strand the runner with a restricted sudoers file.
-func enableSudoLockdown(cfg *lockdown.SudoLockdownConfig, logger *slog.Logger) bool {
-	if err := lockdown.EnableSudoLockdown(cfg, logger); err != nil {
-		logger.Warn("Failed to enable sudo lockdown", "error", err)
-		// Continue without lockdown - it's a hardening feature, not critical
-		return false
-	}
-	return true
 }
 
 // detectSystemdResolvedUpstreams reads /run/systemd/resolve/resolv.conf

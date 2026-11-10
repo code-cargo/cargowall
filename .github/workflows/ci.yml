@@ -555,6 +555,15 @@ jobs:
       - name: Escalation rolls the whole lockdown back (actions-runner image)
         run: bash scripts/ci/sudo-lockdown-group-grant.sh run-escalation ghcr.io/actions/actions-runner:2.338.2
 
+      - name: Escalation rolls the whole lockdown back (Ubuntu 26.04, sudo-rs)
+        run: bash scripts/ci/sudo-lockdown-group-grant.sh run-escalation ubuntu:26.04
+
+      - name: A root Runner.Worker refuses an enforcing start (actions-runner image)
+        run: bash scripts/ci/sudo-lockdown-group-grant.sh run-rootworker ghcr.io/actions/actions-runner:2.338.2
+
+      - name: A host without sudo has nothing to lock down (Ubuntu 26.04 image)
+        run: bash scripts/ci/sudo-lockdown-group-grant.sh run-nosudo ubuntu:26.04
+
       - name: Later-sorting competing grant is denied, appended block (actions-runner, sudo)
         run: bash scripts/ci/sudo-lockdown-group-grant.sh run-latefile ghcr.io/actions/actions-runner:2.338.2
 

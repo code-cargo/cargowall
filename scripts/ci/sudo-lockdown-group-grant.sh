@@ -45,6 +45,20 @@ runescalation() {
     -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh escalation
 }
 
+# runrootworker is run for the root-worker scenario.
+runrootworker() {
+  local image="$1"
+  docker run --rm --privileged --user root --entrypoint bash \
+    -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh rootworker
+}
+
+# runnosudo is run for the no-sudo scenario, on an image without sudo.
+runnosudo() {
+  local image="$1"
+  docker run --rm --privileged --user root --entrypoint bash \
+    -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh nosudo
+}
+
 # runlatefile is run for the later-sorting competing-grant scenario.
 runlatefile() {
   local image="$1"
@@ -223,7 +237,12 @@ latefile() {
 
 # escalation drives the rollback path: a stand-in `sudo` that always exits 0
 # makes the step verification see an escalation, so EnableSudoLockdown must
-# undo everything and report that it does not hold.
+# undo everything and report that it does not hold. That is a lost posture:
+# under an auditing policy cargowall warns, records it for the summary and
+# runs on; under an enforcing policy startup fails, naming the posture in
+# the failure sentinel and exiting 3. The enforcing run asks for the
+# lockdown in the policy rather than by flag, so the policy's settings must
+# be applied before the postures are registered.
 escalation() {
   prepare
   sha256sum /etc/sudoers > /tmp/sudoers.sha
@@ -238,6 +257,7 @@ escalation() {
 
   local upstream
   upstream="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
+
   echo '{"defaultAction":"allow","rules":[]}' > /tmp/policy.json
   PATH="/tmp/fakebin:$PATH" /w/bin/cargowall start --config=/tmp/policy.json \
     --dns-upstream="${upstream}:53" --audit-mode \
@@ -245,14 +265,116 @@ escalation() {
     --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 &
   local cw=$!
   for _ in $(seq 1 60); do [ -f /tmp/cargowall-ready ] && break; sleep 0.5; done
-  [ -f /tmp/cargowall-ready ] || fail "cargowall did not become ready"
+  [ -f /tmp/cargowall-ready ] || fail "cargowall did not become ready under an auditing policy"
 
   grep -q 'sudo lockdown does not hold' /tmp/cw.log || fail "escalation was not detected"
-  grep -q 'Failed to enable sudo lockdown' /tmp/cw.log || fail "the lockdown was not reported as failed"
-  echo "✅ escalation detected and the lockdown reported as failed"
+  grep -q '"level":"WARN","msg":"--sudo-lockdown=true requested but could not be applied"' /tmp/cw.log \
+    || fail "the lost lockdown was not warned about"
+  grep -q '"posture":"sudo-lockdown","requested":"true","applied":"false"' /tmp/cargowall-postures \
+    || fail "the lost lockdown is not in the posture record: $(cat /tmp/cargowall-postures 2>/dev/null)"
+  echo "✅ auditing policy: escalation detected, warned, recorded for the summary"
+  pristine
 
-  # Everything the aborted enable touched must be undone, with cargowall
-  # still running.
+  kill -TERM "$cw" 2>/dev/null || true
+  wait "$cw" 2>/dev/null || true
+  rm -f /tmp/cargowall-ready /tmp/cargowall-failed /tmp/cargowall-postures /tmp/cw.log
+
+  printf '{"defaultAction":"allow","rules":[],"sudoLockdown":{"enabled":true,"allowCommands":["%s"]}}\n' \
+    "$ALLOWED" > /tmp/policy.json
+  local rc=0
+  PATH="/tmp/fakebin:$PATH" timeout 60 /w/bin/cargowall start --config=/tmp/policy.json \
+    --dns-upstream="${upstream}:53" \
+    --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 || rc=$?
+
+  [ "$rc" = 3 ] || fail "cargowall exited $rc under an enforcing policy, not 3 (a refused posture)"
+  [ -f /tmp/cargowall-ready ] && fail "cargowall wrote its ready sentinel with the lockdown lost"
+  grep -qx 'refused=sudo-lockdown' /tmp/cargowall-failed \
+    || fail "the failure sentinel does not name the posture: $(cat /tmp/cargowall-failed 2>/dev/null)"
+  grep -q '"level":"ERROR","msg":"--sudo-lockdown=true requested but could not be applied"' /tmp/cw.log \
+    || fail "the refusal was not logged as an error"
+  echo "✅ enforcing policy: the lost lockdown fails startup, exit 3, refused=sudo-lockdown"
+  pristine
+}
+
+# rootworker: a Runner.Worker running as root has job steps with root and no
+# use for sudo, so no lockdown holds against them, whatever it does to the
+# runner account. Under an enforcing policy that is a refused start, and
+# nothing is changed.
+rootworker() {
+  prepare
+  sha256sum /etc/sudoers > /tmp/sudoers.sha
+  find /etc/sudoers.d | sort > /tmp/sudoersd.before
+  id -nG runner | tr ' ' '\n' | sort > /tmp/groups.before
+
+  # Two commands, so bash stays the process rather than exec'ing sleep.
+  ln -sf /bin/bash /tmp/Runner.Worker
+  /tmp/Runner.Worker -c 'sleep 600; :' &
+  local worker=$!
+
+  local upstream
+  upstream="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
+  echo '{"defaultAction":"allow","rules":[]}' > /tmp/policy.json
+  local rc=0
+  timeout 60 /w/bin/cargowall start --config=/tmp/policy.json \
+    --dns-upstream="${upstream}:53" \
+    --sudo-lockdown --sudo-allow-commands "$ALLOWED" \
+    --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 || rc=$?
+  kill "$worker" 2>/dev/null || true
+
+  [ "$rc" = 3 ] || fail "cargowall exited $rc with a root Runner.Worker, not 3 (a refused posture)"
+  [ -f /tmp/cargowall-ready ] && fail "cargowall wrote its ready sentinel with the lockdown lost"
+  grep -qx 'refused=sudo-lockdown' /tmp/cargowall-failed \
+    || fail "the failure sentinel does not name the posture: $(cat /tmp/cargowall-failed 2>/dev/null)"
+  grep -q 'a Runner.Worker runs as root' /tmp/cw.log || fail "the root worker was not the reason"
+  # The teardown's disable finds no state, so it has no user to restore and
+  # nothing to keep.
+  grep -q 'keeping state' /tmp/cw.log && fail "the teardown warned about a state file the refused lockdown never wrote"
+  echo "✅ a root Runner.Worker fails startup under an enforcing policy"
+  pristine
+}
+
+# nosudo: a host with no sudo has nothing to lock down, so a requested
+# lockdown is no loss, even under an enforcing policy and with no runner
+# account to name. A root Runner.Worker there is still refused.
+nosudo() {
+  if command -v sudo >/dev/null 2>&1 || [ -e /usr/lib/cargo/bin/sudo ]; then
+    fail "the image has sudo; this test needs one without"
+  fi
+  local upstream
+  upstream="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
+  printf '{"defaultAction":"allow","rules":[],"sudoLockdown":{"enabled":true,"allowCommands":["%s"]}}\n' \
+    "$ALLOWED" > /tmp/policy.json
+  /w/bin/cargowall start --config=/tmp/policy.json --dns-upstream="${upstream}:53" \
+    --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 &
+  local cw=$!
+  for _ in $(seq 1 60); do [ -f /tmp/cargowall-ready ] && break; sleep 0.5; done
+  [ -f /tmp/cargowall-ready ] || fail "cargowall did not become ready on a host without sudo"
+  grep -q 'No sudo on this host, nothing to lock down' /tmp/cw.log || fail "the missing sudo was not the reason"
+  grep -q 'requested but could not be applied' /tmp/cw.log && fail "a host without sudo lost the lockdown"
+  grep -q '"posture":"sudo-lockdown","requested":"true","applied":"true"' /tmp/cargowall-postures \
+    || fail "the posture record does not show the lockdown applied: $(cat /tmp/cargowall-postures 2>/dev/null)"
+  echo "✅ no sudo: nothing to lock down, an enforcing start comes up"
+  kill -TERM "$cw" 2>/dev/null || true
+  wait "$cw" 2>/dev/null || true
+  rm -f /tmp/cargowall-ready /tmp/cargowall-failed /tmp/cargowall-postures /tmp/cw.log
+
+  # A root worker's steps have root without sudo too: no sudo is no excuse.
+  ln -sf /bin/bash /tmp/Runner.Worker
+  /tmp/Runner.Worker -c 'sleep 600; :' &
+  local worker=$!
+  local rc=0
+  timeout 60 /w/bin/cargowall start --config=/tmp/policy.json --dns-upstream="${upstream}:53" \
+    --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 || rc=$?
+  kill "$worker" 2>/dev/null || true
+  [ "$rc" = 3 ] || fail "cargowall exited $rc with a root Runner.Worker and no sudo, not 3 (a refused posture)"
+  grep -qx 'refused=sudo-lockdown' /tmp/cargowall-failed \
+    || fail "the failure sentinel does not name the posture: $(cat /tmp/cargowall-failed 2>/dev/null)"
+  grep -q 'a Runner.Worker runs as root' /tmp/cw.log || fail "the root worker was not the reason"
+  echo "✅ no sudo but a root Runner.Worker: an enforcing start is refused"
+}
+
+# pristine checks that everything the aborted enable touched is undone.
+pristine() {
   [ -f /etc/sudoers.d/zz-cargowall-lockdown ] && fail "the lockdown sudoers file was left behind"
   [ -f /etc/sudoers.d/.cargowall-lockdown-state ] && fail "the state file was left behind"
   grep -q 'BEGIN cargowall sudo lockdown' /etc/sudoers && fail "the lockdown block was left in /etc/sudoers"
@@ -260,9 +382,6 @@ escalation() {
   find /etc/sudoers.d | sort | diff /tmp/sudoersd.before - || fail "sudoers.d differs after rollback"
   id -nG runner | tr ' ' '\n' | sort | diff /tmp/groups.before - || fail "runner's groups were not restored"
   echo "✅ rollback left the system pristine"
-
-  kill -TERM "$cw" 2>/dev/null || true
-  wait "$cw" 2>/dev/null || true
 }
 
 cmd="${1:-}"
@@ -271,8 +390,12 @@ case "$cmd" in
   run) run "$@" ;;
   run-escalation) runescalation "$@" ;;
   run-latefile) runlatefile "$@" ;;
+  run-rootworker) runrootworker "$@" ;;
+  run-nosudo) runnosudo "$@" ;;
   inside) inside ;;
   escalation) escalation ;;
   latefile) latefile ;;
-  *) echo "usage: $0 run <image> | run-escalation <image> | run-latefile <image> | inside | escalation | latefile" >&2; exit 2 ;;
+  rootworker) rootworker ;;
+  nosudo) nosudo ;;
+  *) echo "usage: $0 run|run-escalation|run-latefile|run-rootworker|run-nosudo <image> | inside | escalation | latefile | rootworker | nosudo" >&2; exit 2 ;;
 esac

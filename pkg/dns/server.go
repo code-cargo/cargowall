@@ -225,6 +225,7 @@ func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 		return true
 	}
 	if verdict.HasDeny() {
+		s.noteWithheld(domain, verdict)
 		return false
 	}
 	if s.stepAllowsQuery(domain) {
@@ -761,7 +762,7 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 				"ttl", ttl)
 		}
 	}
-	stepAllows := s.learnStepTier(canonicalHostname, verdict, links)
+	stepAllows := s.learnStepTier(canonicalHostname, verdict, links, ips)
 
 	if len(ips) > 0 {
 		s.logger.Debug("DNS resolution intercepted",

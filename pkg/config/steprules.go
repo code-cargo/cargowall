@@ -268,6 +268,13 @@ func (cm *Manager) StepAllowsHostname(hostname string) bool {
 	return false
 }
 
+// HasStepRules reports whether the loaded policy has a step with rules.
+func (cm *Manager) HasStepRules() bool {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return len(cm.steps) > 0
+}
+
 // StepPolicy returns the policy the loaded steps give step id, if a step
 // with that id has rules.
 func (cm *Manager) StepPolicy(id string) (uint32, bool) {

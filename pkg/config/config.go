@@ -1635,9 +1635,10 @@ func chosenAttributionName(name, ruleValue string) string {
 	return ruleValue
 }
 
-// GetTrackedHostnames returns a copy of the tracked hostnames map (hostname -> action),
-// with the steps' literal hostnames added as allows (the map itself stays the job's).
-// This is used to proactively resolve hostnames so the reverse lookup cache is populated.
+// GetTrackedHostnames returns the names startup pre-resolution should cover, job and
+// step: the job's tracked hostnames with their actions, and each step's literal hostnames
+// as allows where the job has none of its own (the job's entry and action always win).
+// A copy; the job's own map stays the job's.
 func (cm *Manager) GetTrackedHostnames() map[string]Action {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()

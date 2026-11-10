@@ -355,7 +355,7 @@ sequenceDiagram
 - `RemoveIP(ip)` — removes LPM entry and all associated port map entries
 - Wildcard CIDR handling: `0.0.0.0/0` and `::/0` with specific ports add only port map entries (no LPM entry)
 - Tracks IP-to-port associations (`ipPorts` map) for accurate cleanup on removal
-- Writes each step's own rules under its policy, never policy 0: `AddPolicyIP(policy, ip, ports)` for the DNS path, and the steps' CIDR rules in `UpdateAllowlistTC`. Each (policy, IP) accumulates on its own, and step writes are charged to a step budget that leaves the job its 4096 entries in each rule map (`policy.go`)
+- Writes each step's own rules under its policy, never policy 0: `AddPolicyIP(policy, ip, ports)` for the DNS path, and the steps' CIDR rules in `UpdateAllowlistTC`. Each (policy, IP) accumulates on its own, and step writes are charged to a step budget, each rule map's size less the job's 4096 entries (`policy.go`); the maps are sized at load for the policy's steps (`bpf.SizeRuleMaps`). Every step write is gated on the job's CIDR denies the last sync wrote, and each sync rebuilds the step tier (`stepgate.go`)
 - Thread-safe with `sync.RWMutex`
 
 ### DNS Proxy Server (`pkg/dns`)
@@ -812,25 +812,55 @@ to select policy with.
   Accepted because the alternative rests on the unfit signal above;
   revisit only with a genuinely causal mechanism, none of which is
   currently known.
-- *Per-step rules live at the connection verdict.* A step may carry allow
-  rules of its own, added to the job's; mode and default action stay the
-  job's. The rule maps hold rules by policy (policy 0 is the job's), and a
-  step's own rules sit under a policy bound to its ordinal in
-  `map_step_policy`, once, when the step is identified. Both hooks decide
-  the same way (`verdict_allowed_v4`/`_v6` in `verdict.h`): the job's
-  rules first; where they decide nothing (no LPM match and no wildcard
-  port entry, or a port-specific match whose port is not listed and no
-  wildcard port entry), the rules of the step tagged on the socket, read
-  through `map_sock_step` and the tag's binding, may allow; the job's
-  default action decides the rest. A step's rules can only turn the job's
-  silence into an allow, never into a deny, so a step gets all the job
-  gets and never less, and anything with no step policy (an untagged
-  socket, a sentinel or unbound ordinal, a step not yet identified) gets
-  the job's rules alone: every gap is fail-closed. Explicit job denies
-  hold for every step. A load-time constant (`step_rules_enabled`) prunes
-  the step lookup from both hooks when no step has rules; the data plane
-  is in place, and the policy's `steps` load and fill it (below), but
-  nothing turns it on or binds a step yet.
+- *Per-step rules live at the connection verdict.* A step may carry
+  allow rules of its own, added to the job's; mode and default action
+  stay the job's. The rule maps hold rules by policy (policy 0 is the
+  job's), and a step's own rules sit under a policy bound to its ordinal
+  in `map_step_policy`, once, when the step is identified. Both hooks
+  decide the same way (`verdict_allowed_v4`/`_v6` in `verdict.h`): the
+  job's rules first; where they decide nothing (no LPM match and no
+  wildcard port entry, or a port-specific match whose port is not listed
+  and no wildcard port entry), the rules of the step tagged on the
+  socket, read through `map_sock_step` and the tag's binding, may allow;
+  the job's default action decides the rest. A step's rules can only
+  turn the job's silence into an allow, never into a deny, so a step
+  gets all the job gets and never less, and anything with no step policy
+  (an untagged socket, a sentinel or unbound ordinal, a step not yet
+  identified) gets the job's rules alone: every gap is fail-closed.
+  Explicit job denies hold for every step. One requirement keeps that
+  true for hostname denies, which the kernel can't see: under a deny
+  default the DNS path writes nothing for a name the job denies, it only
+  withholds the allow, so in the maps a job hostname deny looks like no
+  rule at all. A name the job's rules deny therefore gets no step
+  install, and teaches no step a CNAME chain, on any port, even where
+  the job's deny names only some ports: the step loses its allow for the
+  whole name, which is fail-closed. A CNAME hop counts the same: a
+  step's chain stops at the first name the job's rules deny, and nothing
+  at or past it is the step's, however the chain is split across answers;
+  the backfill installs for a step only addresses the proxy itself
+  answered for the name, whose hops it saw, never one a system-resolver
+  or reverse lookup put to a name. Each step allow withheld so is logged
+  once, by step and denied name. A job CIDR deny is different, and the
+  asymmetry is deliberate: it is written as a deny entry whatever the
+  default, and the kernel enforces it port by port, so a step may allow
+  a port a job CIDR deny doesn't name, where a job hostname deny
+  withholds the whole name because under a deny default userspace writes
+  nothing per port for it. One thing can hide a job CIDR deny from the
+  job's lookup: an entry nested inside it (a port-specific job entry, or
+  a narrower deny on some ports), whose port misses end the lookup in
+  silence instead of at the deny around it. So no step entry may let a
+  step allow what a job CIDR deny covers either: a step write inside one
+  is withheld on the ports it covers (whole, where the write is on all
+  ports and no entry can say "all but those"), and a job deny inside a
+  step's prefix is carved out of the step's policy, as deny entries that
+  a miss can't fall through to a step wildcard past. Host routes and
+  whole-space wildcard port denies can't be hidden, and aren't gated.
+  Every sync rebuilds the step tier against the denies it wrote,
+  clearing the step entries before it, and the tracked-hostname backfill
+  that follows re-installs the DNS path's. A load-time constant
+  (`step_rules_enabled`) prunes the step lookup from both hooks when no
+  step has rules; the data plane is in place, and the policy's `steps`
+  load and fill it (below), but nothing turns it on or binds a step yet.
   - *Where a step's rules come from.* The policy's `steps`, one
     `{id, rules}` per step, in the local `--config` (env-var config carries
     none, and a load replaces them wholesale, as it does the rules). The id
@@ -852,15 +882,29 @@ to select policy with.
     step and to untagged traffic. A name the job's rules deny, on any port,
     gets no step install: under a deny default the job writes nothing for a
     name it denies, it only withholds the allow, and a step entry would
-    fill that silence. L7 scoping and the late-allow still judge by the
-    job's rules alone.
-  - *Capacity.* Each rule map holds 16384 entries. The steps together may
-    hold 12288 in each, and the 4096 the job had before step policies
-    existed stay the job's, so what the job can install never depends on
-    the steps. A step write that would take more is refused whole, with a
-    rate-limited Warn, and that step gets the job's rules there. Entries are
-    allocated as they are written (`BPF_F_NO_PREALLOC`), so the larger maps
-    cost memory only as they fill, beyond each hash's bucket array.
+    fill that silence (above). L7 scoping and the late-allow still judge
+    by the job's rules alone. Requirement: no step may be bound to its
+    policy until step installs are L7-scoped; until then a step's own
+    entries would open a shared edge IP to it on any SNI. And anything
+    that reloads step rules at runtime must clear the step policies'
+    entries, the DNS path's included, before installing: policies are
+    numbered per load, so a kept entry would be another step's. The sync
+    does that (above); today it runs once, at startup.
+  - *Capacity.* The rule maps are sized at load from the policy in hand
+    (`bpf.SizeRuleMaps`), read once: no path loads a policy after the tcbpf
+    load, and one that did would have to reload the maps itself. Without
+    steps they hold 4096 entries each, as before step policies, so a job
+    with no step rules pays nothing for them. With steps they hold 16384:
+    the steps together may hold 12288 in each, and the 4096 the job had
+    stay the job's, so what the job can install never depends on the
+    steps. A step write that would take more is refused whole, with a
+    rate-limited Warn, and that step gets the job's rules there. The job
+    takes priority over steps for room: its own policy may hold more than
+    its 4096, and room it takes past them is room the steps lose; a step
+    write the map then has no room for is refused the same way, the Warn
+    naming the job's entries as the cause. Entries are allocated as they
+    are written (`BPF_F_NO_PREALLOC`), so a map's size costs memory only as
+    it fills, beyond each hash's bucket array.
   - *Which step a socket is judged as.* Its tag: the step of the last
     tagged thread to connect it (TCP and UDP; ping from 6.1) or to send
     on it as UDP through an address or IP-level control messages (which

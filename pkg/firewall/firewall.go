@@ -94,6 +94,10 @@ type FirewallImpl struct {
 
 	stepIPs map[policyIP]*ipPortState
 	steps   stepLedger
+	// jobDenies are the job's CIDR denies the last sync wrote, which gate
+	// every step write; gated holds the gated writes logged (stepgate.go).
+	jobDenies []jobDeny
+	gated     map[string]struct{}
 }
 
 // portProto carries a port number and its IANA protocol number for BPF map keys.
@@ -207,7 +211,7 @@ func actionName(actionVal uint8) string {
 
 // NewFirewall creates a new firewall instance that owns the eBPF maps
 func NewFirewall(cidrsMap, portsMap, cidrsV6Map, portsV6Map, defaultActionMap, auditModeMap *ebpf.Map, logger *slog.Logger) Firewall {
-	return &FirewallImpl{
+	fw := &FirewallImpl{
 		cidrsMap:         cidrsMap,
 		portsMap:         portsMap,
 		cidrsV6Map:       cidrsV6Map,
@@ -217,6 +221,8 @@ func NewFirewall(cidrsMap, portsMap, cidrsV6Map, portsV6Map, defaultActionMap, a
 		logger:           logger,
 		ipPorts:          make(map[string]*ipPortState),
 	}
+	fw.steps.sizeBudget(cidrsMap, portsMap, cidrsV6Map, portsV6Map)
+	return fw
 }
 
 // SetDefaultAction sets the default allow/deny action for unmatched packets
@@ -252,13 +258,15 @@ func (f *FirewallImpl) SetAuditMode(enabled bool) error {
 }
 
 // UpdateAllowlistTC updates the eBPF LPM trie and port maps for firewall rules.
-// NOTE: This is add-only — it does not remove stale entries from previous calls.
-// Callers should be aware that entries accumulate across invocations.
+// NOTE: This is add-only for the job's rules — it does not remove stale entries
+// from previous calls; entries accumulate across invocations. The steps' are
+// rebuilt each time (syncStepsLocked).
 func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// Process all resolved rules - both CIDR and resolved hostnames
-	for _, rule := range configMgr.GetResolvedRules() {
+	rules := configMgr.GetResolvedRules()
+	for _, rule := range rules {
 		// Determine action value
 		var actionVal uint8 = 0
 		if rule.Action == config.ActionAllow {
@@ -289,7 +297,7 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 		}
 	}
 
-	f.installStepRulesLocked(configMgr.GetStepRules())
+	f.syncStepsLocked(rules, configMgr.GetStepRules())
 	return nil
 }
 
@@ -300,31 +308,35 @@ func (f *FirewallImpl) addCIDRRuleLocked(policy uint32, rule config.ResolvedRule
 	if rule.IPNet == nil {
 		return nil // Skip invalid CIDR rules
 	}
-
-	ones, _ := rule.IPNet.Mask.Size()
-
 	// Expand ports with protocol info for BPF maps
-	portValues := expandPorts(rule.Ports)
+	return f.addCIDRPortsLocked(policy, rule.IPNet, actionVal, expandPorts(rule.Ports))
+}
+
+// addCIDRPortsLocked writes a prefix on expanded ports under policy, as
+// addCIDRRuleLocked does a rule. Must be called with f.mu held.
+func (f *FirewallImpl) addCIDRPortsLocked(policy uint32, ipnet *net.IPNet, actionVal uint8, portValues []portProto) error {
+	ones, _ := ipnet.Mask.Size()
+	label := ipnet.String()
 
 	// Check if this is an IPv6 CIDR
-	if ip4 := rule.IPNet.IP.To4(); ip4 != nil {
+	if ip4 := ipnet.IP.To4(); ip4 != nil {
 		// Special handling for 0.0.0.0/0 with specific ports
 		// Don't add to LPM trie, only to port map
-		if rule.Value == "0.0.0.0/0" && len(portValues) > 0 {
+		if ones == 0 && len(portValues) > 0 {
 			return f.addWildcardPortsV4(policy, actionVal, portValues)
 		}
-		return f.addCIDRv4(policy, ip4, uint32(ones), actionVal, portValues, rule.Value)
+		return f.addCIDRv4(policy, ip4, uint32(ones), actionVal, portValues, label)
 	}
 
-	ip6 := rule.IPNet.IP.To16()
+	ip6 := ipnet.IP.To16()
 	if ip6 == nil {
 		return nil
 	}
 	// Special handling for ::/0 with specific ports
-	if rule.Value == "::/0" && len(portValues) > 0 {
+	if ones == 0 && len(portValues) > 0 {
 		return f.addWildcardPortsV6(policy, actionVal, portValues)
 	}
-	return f.addCIDRv6(policy, ip6, uint32(ones), actionVal, portValues, rule.Value)
+	return f.addCIDRv6(policy, ip6, uint32(ones), actionVal, portValues, label)
 }
 
 // addWildcardPortsV4 writes port entries that match any IPv4 destination

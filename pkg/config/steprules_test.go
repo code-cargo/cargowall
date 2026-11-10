@@ -62,6 +62,7 @@ func TestLoadConfig_Steps(t *testing.T) {
 	require.NotNil(t, build[1].IPNet)
 	require.NotNil(t, steps[1].Rules[0].Pattern)
 
+	assert.True(t, cm.HasStepRules())
 	p, ok := cm.StepPolicy("deploy_2")
 	assert.True(t, ok)
 	assert.Equal(t, uint32(2), p)
@@ -176,6 +177,7 @@ func TestLoadConfig_StepsUnderDefaultAllow(t *testing.T) {
 		"steps": [{"id": "build", "rules": [{"type": "hostname", "value": "step.example.com"}]}]
 	}`)))
 	assert.Empty(t, cm.GetStepRules())
+	assert.False(t, cm.HasStepRules(), "dropped steps size the maps for none")
 	assert.False(t, cm.StepAllowsHostname("step.example.com"))
 	assert.Equal(t, 1, countLines(captured, "Ignoring step rules"))
 
@@ -277,7 +279,7 @@ func TestStepRulesStayOutOfJobState(t *testing.T) {
 
 	tracked := cm.GetTrackedHostnames()
 	assert.Equal(t, ActionAllow, tracked["step.example.com"])
-	assert.Equal(t, ActionDeny, tracked["shared.example.com"], "the job's action stays")
+	assert.Equal(t, ActionDeny, tracked["shared.example.com"], "where a step literal is a job name too, the job's entry and action win")
 	assert.Equal(t, ActionAllow, tracked["github.com"])
 	assert.NotContains(t, tracked, "*.pattern.example.com")
 
@@ -298,6 +300,7 @@ func TestStepsReplacedOnLoad(t *testing.T) {
 	require.True(t, cm.StepAllowsHostname("step.example.com"))
 
 	require.NoError(t, cm.LoadConfigFromCargoWall(&cargowallv1pb.CargoWallPolicy{}))
+	assert.False(t, cm.HasStepRules())
 	assert.False(t, cm.StepAllowsHostname("step.example.com"))
 	assert.Empty(t, cm.GetStepRules())
 

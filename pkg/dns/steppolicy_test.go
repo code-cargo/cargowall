@@ -19,6 +19,7 @@ package dns
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	rand "math/rand/v2"
 	"net"
 	"os"
@@ -34,6 +35,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/firewall"
 )
 
@@ -174,13 +176,15 @@ const stepWritersPolicy = `{
 		{"type": "hostname", "value": "job.example.com", "action": "allow"},
 		{"type": "hostname", "value": "denied.example.com", "action": "deny"},
 		{"type": "hostname", "value": "*.lab.internal", "ports": [{"port": 80, "protocol": "tcp"}], "action": "deny"},
-		{"type": "hostname", "value": "bastion", "ports": [{"port": 22, "protocol": "tcp"}], "action": "allow"}
+		{"type": "hostname", "value": "bastion", "ports": [{"port": 22, "protocol": "tcp"}], "action": "allow"},
+		{"type": "hostname", "value": "ports.example.com", "ports": [{"port": 443, "protocol": "tcp"}], "action": "deny"}
 	],
 	"steps": [
 		{"id": "fetch", "rules": [
 			{"type": "hostname", "value": "step.example.com", "ports": [{"port": 443, "protocol": "tcp"}]},
 			{"type": "hostname", "value": "x.denied.example.com"},
 			{"type": "hostname", "value": "bastion.lab.internal"},
+			{"type": "hostname", "value": "ports.example.com", "ports": [{"port": 80, "protocol": "tcp"}]},
 			{"type": "hostname", "value": "*.cdn-step.example.net"},
 			{"type": "hostname", "value": "svc.corp.internal"}
 		]},
@@ -284,6 +288,14 @@ func TestStepWriters(t *testing.T) {
 			job: []string{"10.2.0.2"},
 		},
 		{
+			// The job denies X:443, the step allows X:80: the step gets
+			// nothing for X, on any port.
+			name: "answer: the job's deny on one port withholds the step's other port",
+			drive: func(t *testing.T, s *Server, _ *recordingFirewall) {
+				answer(s, "ports.example.com", aResponse("ports.example.com", "10.1.0.15"))
+			},
+		},
+		{
 			name:     "backfill: a name seen before the policy loaded",
 			noPolicy: true,
 			drive: func(t *testing.T, s *Server, _ *recordingFirewall) {
@@ -303,6 +315,46 @@ func TestStepWriters(t *testing.T) {
 				s.ApplyRulesToTrackedHostnames()
 			},
 			step: map[uint32]map[string][]config.Port{policyFetch: {"10.1.0.10": tcp443, "10.1.0.11": tcp443}},
+		},
+		{
+			name: "answer: a step's chain through a job-denied hop, in one response",
+			drive: func(t *testing.T, s *Server, _ *recordingFirewall) {
+				answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge.denied.example.com"}, "10.1.0.19"))
+			},
+		},
+		{
+			name: "answer: a step's chain through a job-denied hop, split across queries",
+			drive: func(t *testing.T, s *Server, _ *recordingFirewall) {
+				answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge.denied.example.com"}, ""))
+				answer(s, "edge.denied.example.com", aResponse("edge.denied.example.com", "10.1.0.20"))
+			},
+		},
+		{
+			name: "answer: the tail past a job-denied hop",
+			drive: func(t *testing.T, s *Server, _ *recordingFirewall) {
+				answer(s, "step.example.com", makeCNAMEResponse("step.example.com.",
+					[]string{"edge.denied.example.com", "final.cdn.example.net"}, ""))
+				answer(s, "final.cdn.example.net", aResponse("final.cdn.example.net", "10.1.0.21"))
+			},
+		},
+		{
+			name: "backfill: a chain through a job-denied hop, seen before the firewall",
+			drive: func(t *testing.T, s *Server, fw *recordingFirewall) {
+				s.firewall = nil
+				answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge.denied.example.com"}, "10.1.0.22"))
+				s.SetFirewall(fw)
+				s.ApplyRulesToTrackedHostnames()
+			},
+		},
+		{
+			name: "answer: a chain learned before the job came to deny a hop",
+			drive: func(t *testing.T, s *Server, _ *recordingFirewall) {
+				answer(s, "step.example.com", makeCNAMEResponse("step.example.com.",
+					[]string{"hop.other.example", "last.other.example"}, ""))
+				loadStepPolicy(t, s.config, strings.Replace(stepWritersPolicy, `"rules": [`,
+					`"rules": [{"type": "hostname", "value": "hop.other.example", "action": "deny"},`, 1))
+				answer(s, "last.other.example", aResponse("last.other.example", "10.1.0.23"))
+			},
 		},
 		{
 			name: "answer: the chain of a step the policy dropped",
@@ -325,13 +377,26 @@ func TestStepWriters(t *testing.T) {
 			step: map[uint32]map[string][]config.Port{2: {"10.1.0.14": tcp443}},
 		},
 		{
-			name: "startup pre-population: the system cache's answer",
-			drive: func(t *testing.T, s *Server, _ *recordingFirewall) {
+			// Startup pre-population resolves the steps' names too: the
+			// system cache's answer installs nothing for a step (it carries no
+			// chain to check), the proxy's resolution that follows does.
+			name: "startup pre-population: the system cache, then the proxy",
+			drive: func(t *testing.T, s *Server, fw *recordingFirewall) {
 				require.Contains(t, s.config.GetTrackedHostnames(), "step.example.com")
 				s.RecordSystemCacheAnswer("step.example.com", []string{"10.1.0.12"})
 				s.ApplyRulesToTrackedHostnames()
+				require.Empty(t, fw.stepIPs(policyFetch), "the system cache's answer")
+				answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.12"))
 			},
 			step: map[uint32]map[string][]config.Port{policyFetch: {"10.1.0.12": tcp443}},
+		},
+		{
+			// A reverse lookup's name is the address owner's to choose.
+			name: "backfill: a reverse lookup's name installs nothing",
+			drive: func(t *testing.T, s *Server, _ *recordingFirewall) {
+				s.config.UpdateDNSMapping("step.example.com", "10.1.0.25")
+				s.ApplyRulesToTrackedHostnames()
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -469,6 +534,7 @@ func TestStepQueryFilter(t *testing.T) {
 		"x.denied.example.com":   false, // the job's deny wins over the step's allow
 		"denied.example.com":     false,
 		"bastion.lab.internal":   true,
+		"ports.example.com":      false, // the job's deny on 443 withholds the step's 80
 		"edge9.akamai.example":   false,
 		"elsewhere.example.org":  false,
 	} {
@@ -517,6 +583,85 @@ func TestStepChainTTL(t *testing.T) {
 	assert.LessOrEqual(t, expiresIn("hop3.example"), maxDerivedCNAMETTL*time.Second)
 }
 
+// A step allow the job's deny withholds is logged once per (step, name),
+// whichever path meets it first: the query filter, an answer, or a backfill.
+func TestStepWithheldLogged(t *testing.T) {
+	cfg := config.NewConfigManager()
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	var logs strings.Builder
+	s := newStepTestServer(t, cfg, newRecordingFirewall())
+	s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	withheld := func(step, name string) int {
+		n := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, "Step allow withheld") && strings.Contains(line, "step="+step+" ") &&
+				strings.Contains(line, "hostname="+name+" ") {
+				n++
+			}
+		}
+		return n
+	}
+
+	s.filterQueries = true
+	assert.False(t, s.isQueryAllowed("x.denied.example.com", dns.TypeA))
+	assert.False(t, s.isQueryAllowed("x.denied.example.com", dns.TypeA))
+	assert.Equal(t, 1, withheld("fetch", "x.denied.example.com"))
+	assert.Contains(t, logs.String(), "job_deny_rule=denied.example.com")
+
+	s.filterQueries = false
+	answer(s, "ports.example.com", aResponse("ports.example.com", "10.1.0.16"))
+	answer(s, "ports.example.com", aResponse("ports.example.com", "10.1.0.17"))
+	s.ApplyRulesToTrackedHostnames()
+	assert.Equal(t, 1, withheld("fetch", "ports.example.com"))
+
+	// No step allows the job-denied name itself, so nothing is withheld.
+	answer(s, "denied.example.com", aResponse("denied.example.com", "10.1.0.18"))
+	assert.NotContains(t, logs.String(), "hostname=denied.example.com ")
+}
+
+// A step's chain stops at the first hop the job's rules deny: the targets
+// before it are learned, the hop and everything past it aren't, and the
+// withheld allow is logged naming the hop.
+func TestStepChain_StopsAtJobDeniedHop(t *testing.T) {
+	cfg := config.NewConfigManager()
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	var logs strings.Builder
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	answer(s, "step.example.com", makeCNAMEResponse("step.example.com.",
+		[]string{"pre.akamai.example", "edge.denied.example.com", "final.cdn.example.net"}, "10.1.0.24"))
+	_, ok := s.steps.cname.Get("pre.akamai.example")
+	assert.True(t, ok, "the hop before the job's deny is learned")
+	for _, past := range []string{"edge.denied.example.com", "final.cdn.example.net"} {
+		_, ok := s.steps.cname.Get(past)
+		assert.False(t, ok, "%s is at or past the job's deny", past)
+	}
+	assert.Empty(t, fw.stepIPs(policyFetch), "the answer's addresses are past the job's deny")
+	assert.Contains(t, logs.String(), "via=edge.denied.example.com")
+	assert.Contains(t, logs.String(), "job_deny_rule=denied.example.com")
+}
+
+// A refused query a step's rules come to allow is late-allowed naming the
+// step's rule, and the log names the step, so the report doesn't read as the
+// job's.
+func TestReconcileRefusedQueries_NamesTheStepRule(t *testing.T) {
+	server, sink, cfg := refusedQueryServer(t)
+	var logs strings.Builder
+	server.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	refuse(t, server, sink, "api.step.example.com")
+
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	server.ApplyRulesToTrackedHostnames()
+
+	require.Len(t, sink.evs, 2)
+	late := sink.evs[1]
+	assert.Equal(t, events.EventDNSQueryLateAllowed, late.EventType)
+	assert.Equal(t, "step.example.com", late.MatchedRule, "the step's rule")
+	assert.Contains(t, logs.String(), "allowed_by_step=fetch")
+}
+
 func TestChainReach(t *testing.T) {
 	assert.Equal(t, uint32(maxDerivedCNAMETTL), chainReach(time.Time{}))
 	assert.Equal(t, uint32(maxDerivedCNAMETTL), chainReach(time.Now().Add(48*time.Hour)))
@@ -537,10 +682,11 @@ func TestMergeStepDerived(t *testing.T) {
 
 // TestStepWriters_Property: for random policies whose step rules name only
 // step-only names, and random answers to them (plain, chained in one
-// response, chained across queries), in random order with backfills in
-// between, nothing lands in the job's policy; and each step-only name's IPs
-// land under exactly the steps whose rules (or chains) allow it, unless the
-// job denies the name.
+// response, chained across queries, some chains through a hop the job
+// denies), in random order with backfills in between, nothing lands in the
+// job's policy; and each step-only name's IPs land under exactly the steps
+// whose rules (or chains) allow it, unless the job denies the name or a hop
+// on the way to them.
 func TestStepWriters_Property(t *testing.T) {
 	for seed := range uint64(40) {
 		t.Run(fmt.Sprint(seed), func(t *testing.T) {
@@ -637,10 +783,15 @@ func TestStepWriters_Property(t *testing.T) {
 					owner[a] = decider
 					answer(s, name, aResponse(name, a))
 				case 2:
-					target := fmt.Sprintf("t%d.edge.test", nextIP)
+					targets := []string{fmt.Sprintf("t%d.edge.test", nextIP)}
+					if rng.IntN(3) == 0 {
+						// Through a hop the job denies: past it, nothing is a step's.
+						targets = append([]string{fmt.Sprintf("h%d.deny.test", nextIP)}, targets...)
+						decider = ""
+					}
 					a := ip(job)
 					owner[a] = decider
-					answer(s, name, makeCNAMEResponse(dns.Fqdn(name), []string{target}, a))
+					answer(s, name, makeCNAMEResponse(dns.Fqdn(name), targets, a))
 				case 3:
 					// Split across queries, the target's IPs are its origin's
 					// only if the origin's rules were loaded to learn the chain.
@@ -648,7 +799,12 @@ func TestStepWriters_Property(t *testing.T) {
 						decider = ""
 					}
 					target := fmt.Sprintf("t%d.edge.test", nextIP)
-					answer(s, name, makeCNAMEResponse(dns.Fqdn(name), []string{target}, ""))
+					targets := []string{target}
+					if rng.IntN(3) == 0 {
+						targets = append([]string{fmt.Sprintf("h%d.deny.test", nextIP)}, targets...)
+						decider = ""
+					}
+					answer(s, name, makeCNAMEResponse(dns.Fqdn(name), targets, ""))
 					a := ip(job)
 					owner[a] = decider
 					answer(s, target, aResponse(target, a))

@@ -124,9 +124,10 @@ func attachAtTestCgroup(t *testing.T, name string) string {
 
 // Start against the tcbpf collection as cmd/start.go loads it with step
 // attribution off (a non-GitHub run with the cgroup hook on): its step maps
-// shrunk, which the hook's stand-ins must follow or the load is refused,
-// and the step-rules gate both ways, which the hook must be built with.
-// The hook must read TC's own step tags and bindings, or a step's rules
+// shrunk, and its rule maps sized for a policy without steps or with, which
+// the hook's stand-ins must follow or the load is refused; and the
+// step-rules gate both ways, which the hook must be built with. The hook
+// must read TC's own rule maps, step tags and bindings, or a step's rules
 // would never reach the traffic only it can judge.
 func TestStartSharesStepPolicy(t *testing.T) {
 	requireBPFOrigin(t)
@@ -139,6 +140,7 @@ func TestStartSharesStepPolicy(t *testing.T) {
 				spec.Maps[name].MaxEntries = 64
 			}
 			require.NoError(t, bpf.SetStepRules(spec, gate))
+			require.NoError(t, bpf.SizeRuleMaps(spec, gate))
 			var tc bpf.TcBpfObjects
 			require.NoError(t, spec.LoadAndAssign(&tc, nil))
 			t.Cleanup(func() { tc.Close() })
@@ -152,12 +154,21 @@ func TestStartSharesStepPolicy(t *testing.T) {
 			var b uint8
 			require.NoError(t, o.objs.StepRulesEnabled.Get(&b))
 			require.Equal(t, gate, b != 0, "the hook is built with TC's gate")
+			size := bpf.RuleMapEntriesJobOnly
+			if gate {
+				size = bpf.RuleMapEntries
+			}
 			for name, maps := range map[string][2]*ebpf.Map{
 				"map_sock_step":   {o.objs.MapSockStep, tc.MapSockStep},
 				"map_step_policy": {o.objs.MapStepPolicy, tc.MapStepPolicy},
+				"map_cidrs":       {o.objs.MapCidrs, tc.MapCidrs},
+				"map_ports":       {o.objs.MapPorts, tc.MapPorts},
+				"map_cidrs_v6":    {o.objs.MapCidrsV6, tc.MapCidrsV6},
+				"map_ports_v6":    {o.objs.MapPortsV6, tc.MapPortsV6},
 			} {
 				require.Equal(t, mapID(t, maps[1]), mapID(t, maps[0]), "the hook reads TC's %s", name)
 			}
+			require.Equal(t, size, o.objs.MapCidrs.MaxEntries(), "the rule maps at the size the policy gave them")
 		})
 	}
 }

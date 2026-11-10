@@ -73,6 +73,7 @@ func newStepTestFirewall(capacity int, logger *slog.Logger) (*FirewallImpl, step
 		logger:           logger,
 		ipPorts:          make(map[string]*ipPortState),
 	}
+	fw.steps.setBudget(capacity - jobReservedEntries)
 	return fw, maps
 }
 
@@ -139,18 +140,35 @@ func testIPv6(base byte, i int) net.IP {
 
 var tcp443 = []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}
 
-// The split is sized against the maps the BPF objects declare, and every
-// step policy fits a bridge stamp.
+// ruleMapEntries is the rule maps' size for a policy with steps.
+const ruleMapEntries = int(bpf.RuleMapEntries)
+
+// The split is sized against the maps the BPF objects declare, SizeRuleMaps
+// sizes them for a policy without steps or with, and every step policy fits
+// a bridge stamp.
 func TestRuleMapSizes(t *testing.T) {
 	spec, err := bpf.LoadTcBpf()
 	require.NoError(t, err)
 	for m := range numRuleMaps {
 		ms := spec.Maps[m.String()]
 		require.NotNil(t, ms, m.String())
-		assert.Equal(t, uint32(ruleMapEntries), ms.MaxEntries, m.String())
+		assert.Equal(t, uint32(ruleMapEntries), ms.MaxEntries, "%s: verdict.h declares the size with steps", m)
 	}
 	assert.Equal(t, ruleMapEntries, jobReservedEntries+stepEntryBudget)
+	assert.Equal(t, int(bpf.RuleMapEntriesJobOnly), jobReservedEntries)
 	assert.Equal(t, bpf.StepStampPolicyMax, uint32(config.MaxStepPolicies))
+
+	for _, c := range []struct {
+		steps bool
+		want  uint32
+	}{{false, bpf.RuleMapEntriesJobOnly}, {true, bpf.RuleMapEntries}, {false, bpf.RuleMapEntriesJobOnly}} {
+		require.NoError(t, bpf.SizeRuleMaps(spec, c.steps))
+		for m := range numRuleMaps {
+			assert.Equal(t, c.want, spec.Maps[m.String()].MaxEntries, "%s, steps %v", m, c.steps)
+		}
+	}
+	delete(spec.Maps, "map_ports_v6")
+	require.Error(t, bpf.SizeRuleMaps(spec, true), "a stale spec is an error, not a skip")
 }
 
 func TestAddPolicyIP_RefusesTheJobsPolicy(t *testing.T) {
@@ -232,11 +250,13 @@ func TestAddPolicyIP_AccumulatorsArePerPolicy(t *testing.T) {
 	assert.Equal(t, bpf.TcBpfLpmVal{Action: 1, PortSpecific: 1}, maps[ruleMapCIDRs].store[bpf.RuleKey(bpf.PolicyJob, 32, wip)])
 }
 
-// UpdateAllowlistTC writes each step's CIDR rules under its policy, and the
+// UpdateAllowlistTC writes each step's CIDR rules under its policy, gated
+// on the job's CIDR denies and with those inside them carved out, and the
 // job's entries come out exactly as they do with no steps.
 func TestUpdateAllowlistTC_StepRules(t *testing.T) {
 	jobRules := []config.Rule{
 		{Type: config.RuleTypeCIDR, Value: "10.0.0.0/8", Ports: []config.Port{{Port: 22, Protocol: config.ProtocolTCP}}, Action: config.ActionDeny},
+		{Type: config.RuleTypeCIDR, Value: "172.16.5.0/24", Action: config.ActionDeny},
 		{Type: config.RuleTypeCIDR, Value: "8.8.8.8/32", Ports: []config.Port{config.PortDNS}, Action: config.ActionAllow},
 		{Type: config.RuleTypeCIDR, Value: "2001:db8:1::/48", Action: config.ActionAllow},
 		{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []config.Port{{Port: 123, Protocol: config.ProtocolUDP}}, Action: config.ActionAllow},
@@ -244,8 +264,11 @@ func TestUpdateAllowlistTC_StepRules(t *testing.T) {
 	steps := []config.StepConfig{
 		{ID: "a", Rules: []config.Rule{
 			{Type: config.RuleTypeCIDR, Value: "192.168.10.0/24", Ports: tcp443},
-			{Type: config.RuleTypeCIDR, Value: "10.1.2.3"},
+			{Type: config.RuleTypeCIDR, Value: "10.1.2.3"}, // inside the job's 10/8 deny on 22, on all ports: withheld
+			{Type: config.RuleTypeCIDR, Value: "10.1.2.4", Ports: []config.Port{{Port: 22, Protocol: config.ProtocolTCP}, {Port: 443, Protocol: config.ProtocolTCP}}},
 			{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []config.Port{{Port: 9000, Protocol: config.ProtocolTCP}}},
+			{Type: config.RuleTypeCIDR, Value: "172.16.0.0/12"},
+			{Type: config.RuleTypeCIDR, Value: "10.0.0.0/7", Ports: []config.Port{{Port: 22, Protocol: config.ProtocolTCP}, {Port: 443, Protocol: config.ProtocolTCP}}},
 			{Type: config.RuleTypeHostname, Value: "step.example.com"},
 		}},
 		{ID: "b", Rules: []config.Rule{
@@ -268,18 +291,43 @@ func TestUpdateAllowlistTC_StepRules(t *testing.T) {
 
 	net4 := func(s string) uint32 { return binary.NativeEndian.Uint32(net.ParseIP(s).To4()) }
 	net6 := func(s string) (out [16]byte) { copy(out[:], net.ParseIP(s).To16()); return out }
-	allow := bpf.TcBpfLpmVal{Action: 1}
 	portAllow := bpf.TcBpfPortVal{Action: 1}
 
+	carved := func(bits uint8) bpf.TcBpfLpmVal { return bpf.TcBpfLpmVal{Action: 0, HostBits: bits} }
+	portDeny := bpf.TcBpfPortVal{Action: 0}
 	assert.Equal(t, map[any]any{
 		bpf.RuleKey(1, 24, net4("192.168.10.0")): bpf.TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 8},
-		bpf.RuleKey(1, 32, net4("10.1.2.3")):     allow,
+		bpf.RuleKey(1, 32, net4("10.1.2.4")):     bpf.TcBpfLpmVal{Action: 1, PortSpecific: 1},
+		bpf.RuleKey(1, 12, net4("172.16.0.0")):   bpf.TcBpfLpmVal{Action: 1, HostBits: 20},
+		bpf.RuleKey(1, 7, net4("10.0.0.0")):      bpf.TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 25},
+		// The job's 10/8 deny on 22, inside the wildcard and the /7: carved,
+		// denying 22 and allowing the /7's 443, while the wildcard's 9000
+		// reaches through a miss.
+		bpf.RuleKey(1, 8, net4("10.0.0.0")): bpf.TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 24},
+		// The job's 172.16.5.0/24 deny on all ports: carved whole.
+		bpf.RuleKey(1, 24, net4("172.16.5.0")): carved(8),
 	}, entriesOf(t, with[ruleMapCIDRs], 1))
 	assert.Equal(t, map[any]any{
 		bpf.RulePortKey(1, net4("192.168.10.0"), 443, protoTCP, 8): portAllow,
+		bpf.RulePortKey(1, net4("10.1.2.4"), 443, protoTCP, 0):     portAllow,
+		bpf.RulePortKey(1, net4("10.1.2.4"), 22, protoTCP, 0):      portDeny, // trimmed: the job denies 22 there
 		bpf.RulePortKey(1, 0, 9000, protoTCP, 0):                   portAllow,
+		bpf.RulePortKey(1, net4("10.0.0.0"), 22, protoTCP, 25):     portAllow, // the /7's own
+		bpf.RulePortKey(1, net4("10.0.0.0"), 443, protoTCP, 25):    portAllow,
+		bpf.RulePortKey(1, net4("10.0.0.0"), 22, protoTCP, 24):     portDeny,
+		bpf.RulePortKey(1, net4("10.0.0.0"), 443, protoTCP, 24):    portAllow,
 	}, entriesOf(t, with[ruleMapPorts], 1))
-	assert.Equal(t, map[any]any{bpf.RuleKey(2, 0, 0): bpf.TcBpfLpmVal{Action: 1, HostBits: 32}}, entriesOf(t, with[ruleMapCIDRs], 2))
+	assert.Equal(t, map[any]any{
+		bpf.RuleKey(2, 0, 0): bpf.TcBpfLpmVal{Action: 1, HostBits: 32},
+		// Inside step b's 0.0.0.0/0 on all ports: the 10/8 deny on 22 carved
+		// on 22 (the /0 keeps nothing inside it: no entry can say all ports
+		// but 22), the 172.16.5.0/24 deny on all ports carved whole.
+		bpf.RuleKey(2, 8, net4("10.0.0.0")):    bpf.TcBpfLpmVal{Action: 0, PortSpecific: 1, HostBits: 24},
+		bpf.RuleKey(2, 24, net4("172.16.5.0")): carved(8),
+	}, entriesOf(t, with[ruleMapCIDRs], 2))
+	assert.Equal(t, map[any]any{
+		bpf.RulePortKey(2, net4("10.0.0.0"), 22, protoTCP, 24): portDeny,
+	}, entriesOf(t, with[ruleMapPorts], 2))
 	assert.Equal(t, map[any]any{
 		bpf.RuleKeyV6(2, 48, net6("2001:db8:5::")): bpf.TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 80},
 	}, entriesOf(t, with[ruleMapCIDRsV6], 2))
@@ -390,7 +438,7 @@ func TestStepBudget_JobBeyondItsReservationHitsTheMap(t *testing.T) {
 // installed IP is refused without touching its other entries.
 func TestStepBudget_AllOrNothing(t *testing.T) {
 	fw, maps := newStepTestFirewall(ruleMapEntries, nil)
-	fw.steps.budget = 3
+	fw.steps.setBudget(3)
 	two := []config.Port{{Port: 80, Protocol: config.ProtocolTCP}, {Port: 443, Protocol: config.ProtocolTCP}}
 
 	_, err := fw.AddPolicyIP(1, testIPv4(10, 1), two)
@@ -418,6 +466,19 @@ func TestStepBudget_AllOrNothing(t *testing.T) {
 	assert.Equal(t, 3, fw.steps.used(ruleMapPorts))
 }
 
+// A key a write lists twice is charged once: a rule's ports can expand to
+// the same entry twice (443/tcp and 443/all both give 443/tcp).
+func TestStepBudget_DuplicatePortsChargedOnce(t *testing.T) {
+	fw, maps := newStepTestFirewall(ruleMapEntries, nil)
+	fw.steps.setBudget(3)
+	_, err := fw.AddPolicyIP(1, testIPv4(10, 1), []config.Port{
+		{Port: 443, Protocol: config.ProtocolTCP}, {Port: 443, Protocol: config.ProtocolAll},
+	})
+	require.NoError(t, err, "three distinct entries fit a budget of three")
+	assert.Len(t, maps[ruleMapPorts].store, 3)
+	assert.Equal(t, 3, fw.steps.used(ruleMapPorts))
+}
+
 // A step's subnet and wildcard entries are charged too, in both families,
 // and a refusal in the sync is a Warn that leaves the rest of the sync, the
 // job's rules included, in place.
@@ -436,7 +497,7 @@ func TestStepBudget_SyncChargesSubnetsAndWildcards(t *testing.T) {
 		t.Run(c.family, func(t *testing.T) {
 			var logs bytes.Buffer
 			fw, maps := newStepTestFirewall(ruleMapEntries, slog.New(slog.NewTextHandler(&logs, nil)))
-			fw.steps.budget = 3
+			fw.steps.setBudget(3)
 			cm := config.NewConfigManager()
 			require.NoError(t, cm.LoadConfig(writeStepConfig(t,
 				[]config.Rule{{Type: config.RuleTypeCIDR, Value: c.job, Action: config.ActionAllow}},
@@ -451,8 +512,77 @@ func TestStepBudget_SyncChargesSubnetsAndWildcards(t *testing.T) {
 			assert.Len(t, entriesOf(t, maps[c.ports], 1), 2, "the subnet's; the wildcard's didn't fit")
 			assert.Equal(t, 2, fw.steps.used(c.ports))
 			assert.Len(t, entriesOf(t, maps[c.lpm], bpf.PolicyJob), 1)
-			assert.Contains(t, logs.String(), "share of a rule map is full")
+			assert.Contains(t, logs.String(), noRoomStepShare)
 			assert.Contains(t, logs.String(), "destination="+c.wildcard)
+		})
+	}
+}
+
+// The job comes first for room: past its reservation its entries take room
+// the steps' share counts on. A step write the ledger admits but the map has
+// no room for is refused the same way, with the same rate-limited Warn,
+// naming the job's entries as the cause.
+func TestStepBudget_JobPastItsReservation(t *testing.T) {
+	var logs bytes.Buffer
+	fw, maps := newStepTestFirewall(10, slog.New(slog.NewTextHandler(&logs, nil)))
+	fw.steps.setBudget(6) // a reservation of 4
+	for i := range 6 {
+		_, err := fw.AddIP(testIPv4(20, i), config.ActionAllow, nil)
+		require.NoError(t, err, "the job's own policy may hold more than its reservation")
+	}
+	for i := range 4 {
+		_, err := fw.AddPolicyIP(1, testIPv4(10, i), nil)
+		require.NoError(t, err)
+	}
+	require.Equal(t, 4, fw.steps.used(ruleMapCIDRs), "within the steps' share")
+
+	_, err := fw.AddPolicyIP(1, testIPv4(10, 4), nil)
+	require.ErrorIs(t, err, ErrStepBudget)
+	require.ErrorIs(t, err, unix.E2BIG, "the map's own refusal underneath")
+	assert.Len(t, maps[ruleMapCIDRs].store, 10)
+	assert.Contains(t, logs.String(), noRoomJob)
+
+	// The sync's step CIDRs are refused the same way, under the same limit.
+	_, err = fw.AddPolicyIP(1, testIPv4(10, 5), nil)
+	require.ErrorIs(t, err, ErrStepBudget)
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("Step rule entry not installed")), "one Warn per interval, whatever the cause")
+	fw.steps.warned = time.Now().Add(-2 * stepBudgetWarnInterval)
+	fw.installStepCIDRLocked(config.StepRules{StepID: "a", Policy: 1}, config.ResolvedRule{
+		Type: config.RuleTypeCIDR, Value: "10.200.0.0/16", IPNet: &net.IPNet{IP: net.IPv4(10, 200, 0, 0).To4(), Mask: net.CIDRMask(16, 32)},
+	})
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(noRoomJob)))
+	assert.Contains(t, logs.String(), "refused=2", "the refusal held back, and the sync's")
+	assert.NotContains(t, logs.String(), "Step rule not installed;", "a refusal for room is the rate-limited Warn alone")
+}
+
+// The ledger stays what the maps hold when the maps fill too: with the job
+// past its reservation, step writes the ledger admits are refused by the
+// map itself, some part-way, and each is refunded what it didn't write.
+func TestStepLedger_MatchesTheMapsWhenFull(t *testing.T) {
+	for seed := range uint64(20) {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(seed, 202))
+			fw, maps := newStepTestFirewall(24, nil)
+			fw.steps.setBudget(16)
+			ports := [][]config.Port{nil, tcp443, {{Port: 80, Protocol: config.ProtocolTCP}, {Port: 8080, Protocol: config.ProtocolUDP}}}
+			for range 200 {
+				var ip net.IP
+				if rng.IntN(2) == 0 {
+					ip = testIPv4(10, rng.IntN(20))
+				} else {
+					ip = testIPv6(10, rng.IntN(20))
+				}
+				ps := ports[rng.IntN(len(ports))]
+				if rng.IntN(3) == 0 {
+					_, _ = fw.AddIP(ip, config.ActionAllow, ps) // the job may meet a full map too
+				} else if _, err := fw.AddPolicyIP(uint32(1+rng.IntN(3)), ip, ps); err != nil {
+					require.ErrorIs(t, err, ErrStepBudget)
+				}
+				for m := range numRuleMaps {
+					require.Equal(t, stepEntries(t, maps[m]), fw.steps.used(m), "%s ledger", m)
+					require.LessOrEqual(t, fw.steps.used(m), 16, "%s over budget", m)
+				}
+			}
 		})
 	}
 }
@@ -461,20 +591,20 @@ func TestStepBudget_SyncChargesSubnetsAndWildcards(t *testing.T) {
 func TestStepBudget_WarnIsRateLimited(t *testing.T) {
 	var logs bytes.Buffer
 	fw, _ := newStepTestFirewall(ruleMapEntries, slog.New(slog.NewTextHandler(&logs, nil)))
-	fw.steps.budget = 1
+	fw.steps.setBudget(1)
 	_, err := fw.AddPolicyIP(1, testIPv4(10, 0), nil)
 	require.NoError(t, err)
 	for i := 1; i <= 5; i++ {
 		_, err := fw.AddPolicyIP(1, testIPv4(10, i), nil)
 		require.ErrorIs(t, err, ErrStepBudget)
 	}
-	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("share of a rule map is full")))
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(noRoomStepShare)))
 	assert.Contains(t, logs.String(), "refused=1")
 
 	fw.steps.warned = time.Now().Add(-2 * stepBudgetWarnInterval)
 	_, err = fw.AddPolicyIP(1, testIPv4(10, 6), nil)
 	require.ErrorIs(t, err, ErrStepBudget)
-	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte("share of a rule map is full")))
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(noRoomStepShare)))
 	assert.Contains(t, logs.String(), "refused=5", "four held back, and this one")
 }
 
@@ -488,7 +618,7 @@ func TestStepLedger_MatchesTheMaps(t *testing.T) {
 		t.Run(fmt.Sprint(seed), func(t *testing.T) {
 			rng := rand.New(rand.NewPCG(seed, 105))
 			fw, maps := newStepTestFirewall(ruleMapEntries, nil)
-			fw.steps.budget = 40
+			fw.steps.setBudget(40)
 			jobOnly, jobMaps := newStepTestFirewall(ruleMapEntries, nil)
 
 			portPool := []config.Port{

@@ -40,9 +40,14 @@ import (
 //
 // The job's verdict decides first, as it does in the kernel: a name the
 // job's rules deny, on any port, gets no step installs and teaches no step
-// chain. Under a deny default the job writes nothing for a name it denies,
-// it only withholds the allow, and a step entry for the name's IPs would
-// fill that silence, letting a step past the job's deny.
+// chain, on any port. Under a deny default the job writes nothing for a name
+// it denies, it only withholds the allow, and a step entry for the name's
+// IPs would fill that silence, letting a step past the job's deny. The same
+// goes for a CNAME hop: a step's chain stops at the first name the job's
+// rules deny, teaching nothing at or past it and installing none of the
+// addresses it leads to, however the chain is split across answers (the
+// backfill reads the hops an answer's addresses came through from via).
+// Each step allow withheld so is logged once, by step and denied name.
 //
 // The query filter takes the union: a name passes if the job's rules allow
 // it, or, short of a job deny, any step's rules or step chains do.
@@ -57,10 +62,38 @@ import (
 // step's rule can never open its targets for the job.
 type stepTier struct {
 	cname *lruCache[string, stepDerived]
+	// withheld holds the (step, name, denied name) triples logged as
+	// withheld by a job deny, so each is logged once while it stays in the
+	// LRU.
+	withheld *lruCache[string, struct{}]
+	// via holds, by answered name, the CNAME hops each of its addresses
+	// came through, for the backfill's hop check. Every chained answer is
+	// recorded, rules or not: rules can load after the answer.
+	via *lruCache[string, stepVia]
 }
 
 func newStepTier() stepTier {
-	return stepTier{cname: newLRUCache[string, stepDerived](10000)}
+	return stepTier{
+		cname:    newLRUCache[string, stepDerived](10000),
+		withheld: newLRUCache[string, struct{}](1000),
+		via:      newLRUCache[string, stepVia](10000),
+	}
+}
+
+// stepVia maps an address to the CNAME hops it was reached through, from
+// the latest chained answer that carried it.
+type stepVia map[string][]string
+
+// mergeVia composes a name's via entries, the incoming answer's winning.
+func mergeVia(existing, incoming stepVia) stepVia {
+	out := make(stepVia, len(existing)+len(incoming))
+	for ip, hops := range existing {
+		out[ip] = hops
+	}
+	for ip, hops := range incoming {
+		out[ip] = hops
+	}
+	return out
 }
 
 // stepDerived is one CNAME target's derived allows, by step id. Keyed by id,
@@ -105,6 +138,7 @@ type stepAllow struct {
 // name, if any, is the fallback, as the job's derived tier is.
 func (s *Server) stepAllowsFor(name string, verdict config.HostnameVerdict) ([]stepAllow, uint32) {
 	if verdict.HasDeny() {
+		s.noteWithheld(name, verdict)
 		return nil, 0
 	}
 	name = strings.ToLower(name)
@@ -128,10 +162,90 @@ func (s *Server) stepAllowsFor(name string, verdict config.HostnameVerdict) ([]s
 		if !ok {
 			continue
 		}
+		if hop, _ := s.jobDeniedHop(d.chain); hop >= 0 {
+			continue // learned through a name the job's rules have come to deny
+		}
 		allows = append(allows, stepAllow{stepID: id, policy: policy, ports: d.ports, chain: d.chain, rule: "derived"})
 	}
 	slices.SortFunc(allows, func(a, b stepAllow) int { return cmp.Compare(a.policy, b.policy) })
 	return allows, chainReach(exp)
+}
+
+// noteWithheld logs, once per (step, name), each step allow for name, by
+// rule or chain, that the job's deny on it withholds, so an operator can see
+// why a step's allow didn't take.
+func (s *Server) noteWithheld(name string, verdict config.HostnameVerdict) {
+	if s.steps.withheld == nil {
+		return
+	}
+	name = strings.ToLower(name)
+	var steps []stepAllow
+	for _, m := range s.config.MatchStepHostname(name) {
+		steps = append(steps, stepAllow{stepID: m.StepID, rule: m.Rule})
+	}
+	if s.steps.cname != nil {
+		if entry, ok := s.steps.cname.Get(name); ok {
+			for id := range entry {
+				if _, ok := s.config.StepPolicy(id); ok {
+					steps = append(steps, stepAllow{stepID: id, rule: "derived"})
+				}
+			}
+		}
+	}
+	s.logWithheld(steps, name, name, verdict)
+}
+
+// logWithheld logs, once per (step, name, denied name), each step allow for
+// name the job's deny on denied withholds: name itself, or a CNAME hop it
+// leads through.
+func (s *Server) logWithheld(steps []stepAllow, name, denied string, verdict config.HostnameVerdict) {
+	if s.steps.withheld == nil {
+		return
+	}
+	for _, a := range steps {
+		if s.steps.withheld.Merge(a.stepID+"\x00"+name+"\x00"+denied, struct{}{}, 0, func(e, _ struct{}) struct{} { return e }) {
+			continue
+		}
+		attrs := []any{
+			"step", a.stepID,
+			"hostname", name,
+			"step_rule", a.rule,
+			"job_deny_rule", verdict.DenyRule,
+			"job_deny_ports", verdict.DenyPorts,
+		}
+		if denied != name {
+			attrs = append(attrs, "via", denied)
+		}
+		s.logger.Info("Step allow withheld: the job's rules deny the name, or a CNAME hop it leads through, "+
+			"and the job decides first", attrs...)
+	}
+}
+
+// jobDeniedHop returns the first of hops the job's rules deny, on any port,
+// and the job's verdict on it, or -1.
+func (s *Server) jobDeniedHop(hops []string) (int, config.HostnameVerdict) {
+	for i, hop := range hops {
+		if v := s.config.MatchHostnameRule(hop); v.HasDeny() {
+			return i, v
+		}
+	}
+	return -1, config.HostnameVerdict{}
+}
+
+// recordVia records the hops an answer's addresses came through.
+func (s *Server) recordVia(name string, links []cnameLink, ips []net.IP) {
+	if s.steps.via == nil || len(links) == 0 || len(ips) == 0 {
+		return
+	}
+	hops := make([]string, len(links))
+	for i, link := range links {
+		hops[i] = link.target
+	}
+	in := make(stepVia, len(ips))
+	for _, ip := range ips {
+		in[ip.String()] = hops
+	}
+	s.steps.via.Merge(strings.ToLower(name), in, 0, mergeVia)
 }
 
 // chainReach is how long a chain entry expiring at exp can still point
@@ -151,20 +265,36 @@ func chainReach(exp time.Time) uint32 {
 // learnStepTier works out the step allows for one answer's name and learns
 // each one's CNAME targets, with the TTL rules of the job's chain learning,
 // so a step's chain split across queries still reaches its targets. It
-// returns the allows, for installStepTier.
-func (s *Server) learnStepTier(name string, verdict config.HostnameVerdict, links []cnameLink) []stepAllow {
+// returns the allows, for installStepTier: none when the chain leads through
+// a name the job's rules deny, whose addresses are past the job's deny. It
+// learns the targets before that hop alone, and records the answer's hops
+// for the backfill.
+func (s *Server) learnStepTier(name string, verdict config.HostnameVerdict, links []cnameLink, ips []net.IP) []stepAllow {
+	s.recordVia(name, links, ips)
 	allows, derivedReach := s.stepAllowsFor(name, verdict)
-	if len(links) == 0 || s.steps.cname == nil {
+	if len(allows) == 0 || len(links) == 0 {
 		return allows
 	}
+	hops := make([]string, len(links))
+	for i, link := range links {
+		hops[i] = link.target
+	}
+	hop, hopVerdict := s.jobDeniedHop(hops)
+	learn := links
+	if hop >= 0 {
+		learn = links[:hop]
+	}
 	for _, a := range allows {
+		if s.steps.cname == nil {
+			break
+		}
 		path := []string{name}
 		var reach uint32
 		if a.chain != nil {
 			path = append([]string{}, a.chain...)
 			reach = derivedReach
 		}
-		for _, link := range links {
+		for _, link := range learn {
 			reach = min(max(reach, derivedCNAMETTL(link.ttl)), maxDerivedCNAMETTL)
 			ttl := time.Duration(reach) * time.Second
 			path = append(path, link.target)
@@ -183,6 +313,10 @@ func (s *Server) learnStepTier(name string, verdict config.HostnameVerdict, link
 				"inherited_ports", a.ports,
 				"ttl", ttl)
 		}
+	}
+	if hop >= 0 {
+		s.logWithheld(allows, name, hops[hop], hopVerdict)
+		return nil
 	}
 	return allows
 }
@@ -212,19 +346,69 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 }
 
 // backfillStepTier is ApplyRulesToTrackedHostnames' step tier: a name the
-// proxy saw before the rules allowing it loaded gets its IPs installed now.
+// proxy answered before the rules allowing it loaded, or before the firewall
+// was set, gets its IPs installed now. Only the addresses the proxy itself
+// answered for the name: their hops are known, and checked. Never one a
+// system-resolver or reverse lookup put to the name (the job's replay takes
+// those too): the first carries no chain to check, and a reverse lookup's
+// name is whatever the address's owner says. A step starts after cargowall,
+// so it has no connection from before that such an address could serve.
 func (s *Server) backfillStepTier(name string, verdict config.HostnameVerdict, ipSet map[string]bool) {
 	allows, _ := s.stepAllowsFor(name, verdict)
 	if len(allows) == 0 {
 		return
 	}
+	name = strings.ToLower(name)
+	var via stepVia
+	if s.steps.via != nil {
+		via, _ = s.steps.via.Get(name)
+	}
+	s.hostnameIPsMutex.RLock()
+	answered := make(map[string]bool, len(s.hostnameIPs[name]))
+	for ipStr := range s.hostnameIPs[name] {
+		answered[ipStr] = true
+	}
+	s.hostnameIPsMutex.RUnlock()
 	ips := make([]net.IP, 0, len(ipSet))
 	for ipStr := range ipSet {
-		if ip := net.ParseIP(ipStr); ip != nil {
-			ips = append(ips, ip)
+		ip := net.ParseIP(ipStr)
+		if ip == nil || !answered[ipStr] {
+			continue
 		}
+		if hops := via[ipStr]; len(hops) > 0 {
+			if hop, hv := s.jobDeniedHop(hops); hop >= 0 {
+				s.logWithheld(allows, name, hops[hop], hv)
+				continue
+			}
+		}
+		ips = append(ips, ip)
 	}
 	s.installStepTier(allows, name, ips)
+}
+
+// stepAllowRule names what allows domain for a step, for a report that
+// would otherwise show no rule: the first step whose own rule allows it,
+// and that rule, or the first step a chain leads it to, and "derived". It
+// returns empty strings when no step allows domain.
+func (s *Server) stepAllowRule(domain string) (step, rule string) {
+	if m := s.config.MatchStepHostname(domain); len(m) > 0 {
+		return m[0].StepID, m[0].Rule
+	}
+	if s.steps.cname == nil {
+		return "", ""
+	}
+	entry, _ := s.steps.cname.Get(strings.ToLower(domain))
+	ids := make([]string, 0, len(entry))
+	for id := range entry {
+		if _, ok := s.config.StepPolicy(id); ok {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return "", ""
+	}
+	slices.Sort(ids)
+	return ids[0], "derived"
 }
 
 // stepAllowsQuery is the query filter's step tier, consulted only once the

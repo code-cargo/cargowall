@@ -20,7 +20,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"time"
+
+	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/config"
@@ -28,24 +32,36 @@ import (
 
 // The rule maps hold the job's rules, under policy 0, and each step's, under
 // a policy of its own. A map's max_entries covers all of them, so the split
-// is kept here: step writes may never take the room the job had before step
-// policies existed, so what the job can install doesn't depend on steps.
+// is kept here. The maps are sized at load for the policy in hand
+// (bpf.SizeRuleMaps): bpf.RuleMapEntriesJobOnly without steps, and
+// bpf.RuleMapEntries with them. Step writes may never take the room the job
+// had before step policies existed, so what the job can install doesn't
+// depend on steps. The job comes first past that too: its own policy may
+// hold more, and room it takes past its reservation is room the steps'
+// share loses.
 const (
-	// ruleMapEntries is max_entries of each of the four rule maps in
-	// bpf/verdict.h; a test pins it against the generated spec.
-	ruleMapEntries = 16384
 	// jobReservedEntries is the room in each rule map no step write may
-	// take: the maps' whole size before step policies.
-	jobReservedEntries = 4096
+	// take: the maps' whole size before step policies, and their size for a
+	// policy without steps.
+	jobReservedEntries = int(bpf.RuleMapEntriesJobOnly)
 	// stepEntryBudget is what the step policies together may hold in each
-	// rule map.
-	stepEntryBudget = ruleMapEntries - jobReservedEntries
+	// rule map, at its size for a policy with steps.
+	stepEntryBudget = int(bpf.RuleMapEntries) - jobReservedEntries
 )
 
-// ErrStepBudget refuses a step write that would take some of the job's
-// reservation in a rule map. Nothing of the write is installed, so the
-// step's traffic there gets the job's rules alone: fail-closed.
-var ErrStepBudget = errors.New("the step policies' share of a rule map is full")
+// ErrStepBudget refuses a step write the rule maps have no room for: the
+// steps' share of a map is full, or the job's own entries have taken it.
+// The step's traffic there gets the job's rules alone: fail-closed. Nothing
+// of a refused write is installed, except for one the kernel refused
+// part-way (its port entries in, its LPM entry not), whose remains no
+// lookup reads.
+var ErrStepBudget = errors.New("no room for step entries in a rule map")
+
+// Why a step write found no room, for the refusal Warn.
+const (
+	noRoomStepShare = "the step policies' share of the map is full"
+	noRoomJob       = "the map is full: the job's own entries have taken room past its reservation, and the job comes first"
+)
 
 // stepBudgetWarnInterval rate-limits the refusal Warn: a full budget refuses
 // every new step destination, and DNS refreshes retry each one.
@@ -74,21 +90,34 @@ type policyIP struct {
 
 // stepLedger is the step budget's books: every key a step policy holds in
 // each rule map, so a key is charged once however often it is rewritten. A
-// key is charged when its write is admitted, before the write itself, so a
-// failed write can only overcount, the safe direction; its retry is free.
+// key is charged when its write is admitted, before the write itself, and a
+// write that then fails is refunded what it charged and didn't write, so the
+// books stay what the maps hold.
 type stepLedger struct {
 	keys [numRuleMaps]map[any]struct{}
-	// budget overrides stepEntryBudget, for tests; 0 means stepEntryBudget.
-	budget  int
+	// fresh are the keys the step write under way was charged for new.
+	fresh []plannedKey
+	// budget is each map's room for step entries: its size less the job's
+	// reservation, so none at the size for a policy without steps.
+	budget  [numRuleMaps]int
 	refused int       // refusals since the last Warn
 	warned  time.Time // when the last refusal Warn was logged
 }
 
-func (l *stepLedger) limit() int {
-	if l.budget > 0 {
-		return l.budget
+// sizeBudget sets each map's step budget from the map's size.
+func (l *stepLedger) sizeBudget(maps ...*ebpf.Map) {
+	for m, em := range maps {
+		if em != nil {
+			l.budget[m] = max(int(em.MaxEntries())-jobReservedEntries, 0)
+		}
 	}
-	return stepEntryBudget
+}
+
+// setBudget sets every map's step budget to n.
+func (l *stepLedger) setBudget(n int) {
+	for m := range l.budget {
+		l.budget[m] = n
+	}
 }
 
 // used reports how many entries step policies hold in m.
@@ -106,37 +135,94 @@ func (f *FirewallImpl) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port
 	if policy == bpf.PolicyJob {
 		return false, fmt.Errorf("AddPolicyIP writes step policies only; the job's rules are written by AddIP")
 	}
-	pp := expandPorts(ports)
-	if ip4 := ip.To4(); ip4 != nil {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		return f.addIPv4Locked(policy, ip4, ip.String(), 1, pp)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ip4, ip6 := ip.To4(), ip.To16()
+	var dst *net.IPNet
+	switch {
+	case ip4 != nil:
+		dst = &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}
+	case ip6 != nil:
+		dst = &net.IPNet{IP: ip6, Mask: net.CIDRMask(128, 128)}
+	default:
+		return false, fmt.Errorf("invalid IP: %s", ip.String())
 	}
-	if ip6 := ip.To16(); ip6 != nil {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		return f.addIPv6Locked(policy, ip6, ip.String(), 1, pp)
+	allow, deny, ok := f.gateStepLocked(policy, dst, expandPorts(ports))
+	if !ok {
+		return false, f.stepWriteErrLocked(policy, ip.String(), nil)
 	}
-	return false, fmt.Errorf("invalid IP: %s", ip.String())
+	add := func(actionVal uint8, pp []portProto) (bool, error) {
+		var changed bool
+		var err error
+		if ip4 != nil {
+			changed, err = f.addIPv4Locked(policy, ip4, ip.String(), actionVal, pp)
+		} else {
+			changed, err = f.addIPv6Locked(policy, ip6, ip.String(), actionVal, pp)
+		}
+		return changed, f.stepWriteErrLocked(policy, ip.String(), err)
+	}
+	// The ports the job denies here go in first, as denies, so a miss can't
+	// fall through to a step wildcard, and a write the map refuses part-way
+	// leaves fewer allows, never an allow without them.
+	var changed bool
+	var err error
+	if len(deny) > 0 {
+		changed, err = add(0, deny)
+	}
+	if err == nil {
+		var allowed bool
+		allowed, err = add(1, allow)
+		changed = changed || allowed
+	}
+	if err != nil {
+		return false, err
+	}
+	return changed, nil
 }
 
-// installStepRulesLocked writes each step policy's CIDR rules, after the
-// job's. A step's hostname rules get their IPs from the DNS path alone. A
-// step rule that can't be installed is a Warn, not an error: it costs only
-// that step's extra reach, which fails closed to the job's rules. Must be
-// called with f.mu held.
-func (f *FirewallImpl) installStepRulesLocked(steps []config.StepRules) {
-	for _, sr := range steps {
-		for _, rule := range sr.Rules {
-			if rule.Type != config.RuleTypeCIDR {
-				continue
-			}
-			if err := f.addCIDRRuleLocked(sr.Policy, rule, 1); err != nil && !errors.Is(err, ErrStepBudget) {
-				f.logger.Warn("Step rule not installed; the step gets the job's rules there",
-					"step", sr.StepID, "policy", sr.Policy, "rule", rule.Value, "error", err)
-			}
+// stepWriteErrLocked ends a step write, given its error. A failed write is
+// refunded what it was charged for and didn't write. One the kernel refused
+// for room becomes ErrStepBudget, with the refusal Warn: the ledger admitted
+// it, so the steps' share had room, and the job's own entries took it.
+func (f *FirewallImpl) stepWriteErrLocked(policy uint32, label string, err error) error {
+	if err != nil {
+		f.refundLocked()
+	}
+	f.steps.fresh = nil
+	if err == nil || errors.Is(err, ErrStepBudget) || !(errors.Is(err, unix.E2BIG) || errors.Is(err, unix.ENOSPC)) {
+		f.flushNoRoomLocked()
+		return err
+	}
+	f.warnNoRoomLocked(policy, label, noRoomJob)
+	return fmt.Errorf("%w: %w", ErrStepBudget, err)
+}
+
+// refundLocked uncharges the keys the failed write was charged for new that
+// its map doesn't hold. A write the kernel refused part-way keeps the
+// charge for what it did write.
+func (f *FirewallImpl) refundLocked() {
+	for _, k := range f.steps.fresh {
+		if !f.holdsLocked(k.key) {
+			delete(f.steps.keys[k.m], k.key)
 		}
 	}
+}
+
+// holdsLocked reports whether a rule map holds key, by the key's type.
+func (f *FirewallImpl) holdsLocked(key any) bool {
+	var lpm bpf.TcBpfLpmVal
+	var port bpf.TcBpfPortVal
+	switch k := key.(type) {
+	case bpf.TcBpfRuleKey:
+		return f.cidrsMap.Lookup(&k, &lpm) == nil
+	case bpf.TcBpfRuleKeyV6:
+		return f.cidrsV6Map.Lookup(&k, &lpm) == nil
+	case bpf.TcBpfRulePortKey:
+		return f.portsMap.Lookup(&k, &port) == nil
+	case bpf.TcBpfRulePortKeyV6:
+		return f.portsV6Map.Lookup(&k, &port) == nil
+	}
+	return true
 }
 
 // ipStateLocked fetches or creates the accumulator for (policy, ip). On
@@ -237,46 +323,63 @@ func (f *FirewallImpl) admitWildcardLocked(policy uint32, m ruleMap, ports []por
 
 // admitStepLocked admits one step write's keys, all or none: the write is
 // refused with ErrStepBudget, and a rate-limited Warn, if its new keys would
-// take any map past the step budget. Admitted keys are charged at once.
+// take any map past its step budget. Admitted keys are charged at once.
 func (f *FirewallImpl) admitStepLocked(policy uint32, label string, keys []plannedKey) error {
 	l := &f.steps
 	var fresh [numRuleMaps]int
+	var charged []plannedKey
 	for _, k := range keys {
-		if _, held := l.keys[k.m][k.key]; !held {
-			fresh[k.m]++
+		if _, held := l.keys[k.m][k.key]; held || slices.Contains(charged, k) {
+			continue
 		}
+		fresh[k.m]++
+		charged = append(charged, k)
 	}
 	for m := range numRuleMaps {
-		if fresh[m] > 0 && l.used(m)+fresh[m] > l.limit() {
-			f.warnStepBudgetLocked(policy, label, m)
+		if fresh[m] > 0 && l.used(m)+fresh[m] > l.budget[m] {
+			f.warnNoRoomLocked(policy, label, noRoomStepShare, "map", m.String(), "step_budget", l.budget[m])
 			return ErrStepBudget
 		}
 	}
-	for _, k := range keys {
+	for _, k := range charged {
 		if l.keys[k.m] == nil {
 			l.keys[k.m] = make(map[any]struct{})
 		}
 		l.keys[k.m][k.key] = struct{}{}
 	}
+	l.fresh = append(l.fresh, charged...)
 	return nil
 }
 
-// warnStepBudgetLocked logs a refusal, at most once per
-// stepBudgetWarnInterval, with the count since the last Warn.
-func (f *FirewallImpl) warnStepBudgetLocked(policy uint32, label string, m ruleMap) {
+// warnNoRoomLocked logs a refusal for want of room, whatever the reason, at
+// most once per stepBudgetWarnInterval, with the count since the last Warn.
+func (f *FirewallImpl) warnNoRoomLocked(policy uint32, label, reason string, attrs ...any) {
 	l := &f.steps
 	l.refused++
 	now := time.Now()
 	if !l.warned.IsZero() && now.Sub(l.warned) < stepBudgetWarnInterval {
 		return
 	}
-	f.logger.Warn("Step rule entry not installed: the step policies' share of a rule map is full, "+
-		"so the step gets the job's rules there",
-		"policy", policy,
-		"destination", label,
-		"map", m.String(),
-		"step_budget", l.limit(),
-		"job_reserved", jobReservedEntries,
-		"refused", l.refused)
+	f.logger.Warn("Step rule entry not installed: no room in a rule map, so the step gets the job's rules there",
+		append([]any{
+			"reason", reason,
+			"policy", policy,
+			"destination", label,
+			"job_reserved", jobReservedEntries,
+			"refused", l.refused,
+		}, attrs...)...)
 	l.warned, l.refused = now, 0
+}
+
+// flushNoRoomLocked logs the refusals the rate limit held back once their
+// interval is over, so a count is reported even when no refusal follows.
+func (f *FirewallImpl) flushNoRoomLocked() {
+	l := &f.steps
+	if l.refused == 0 || time.Since(l.warned) < stepBudgetWarnInterval {
+		return
+	}
+	f.logger.Warn("Step rule entries not installed for want of room in the rule maps since the last Warn; "+
+		"those steps get the job's rules there",
+		"refused", l.refused)
+	l.warned, l.refused = time.Now(), 0
 }

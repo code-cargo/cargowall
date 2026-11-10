@@ -492,6 +492,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			}
 		}
 	}
+	if err := bpf.SizeRuleMaps(spec, configMgr.HasStepRules()); err != nil {
+		return fmt.Errorf("failed to size the rule maps: %w", err)
+	}
 	var objs bpf.TcBpfObjects
 	if err := cargowallEbpf.LoadObjects(logger, "tcbpf", spec, ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{

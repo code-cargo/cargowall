@@ -174,7 +174,7 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 		// start dropping live parked flows instead.
 		verdict, dcid := st.verdict, st.dcid
 		l.mu.Unlock()
-		if err := l.reassertVerdict(fk, verdict, dcid); err != nil && l.logger != nil {
+		if err := l.reassertVerdict(fk, verdict, dcid, ev.Timestamp); err != nil && l.logger != nil {
 			l.logger.Warn("L7 verdict re-assert failed", "err", err)
 		}
 		return
@@ -423,7 +423,7 @@ func (l *L7) finish(ev *bpf.L7Event, proto sni.Protocol, out L7Outcome, dcid []b
 	out.Protocol = proto
 	out.Enforce = ev.Flags&l7PuntObserve == 0
 
-	if err := l.writeFlowState(ev.FlowKey(), l7FlowState(out.Allowed), dcid); err != nil && l.logger != nil {
+	if err := l.writeFlowState(ev.FlowKey(), l7FlowState(out.Allowed), dcid, ev.Timestamp); err != nil && l.logger != nil {
 		// Warn, not Debug: under enforce a lost verdict write leaves the flow
 		// PENDING, so the kernel drops every retransmit until the punt budget
 		// black-holes it — this line is the only operator-visible signal.
@@ -504,7 +504,7 @@ func refusalReason(ev *bpf.L7Event) L7Reason {
 // lookup narrows the race the same way the kernel's commit re-lookup does;
 // neither closes it, and the converging repin/re-assert cycle repairs the
 // remainder. TCP verdicts carry no DCID and always re-assert.
-func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte) error {
+func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte, punted uint64) error {
 	if len(dcid) > 0 {
 		var cur bpf.OriginBpfL7FlowVal
 		if err := l.flow.Lookup(&key, &cur); err == nil {
@@ -513,7 +513,7 @@ func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byt
 			}
 		}
 	}
-	return l.writeFlowState(key, state, dcid)
+	return l.writeFlowState(key, state, dcid, punted)
 }
 
 // writeFlowState stamps the kernel flow-state map so the client's retransmit
@@ -522,14 +522,17 @@ func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byt
 // TCP. last_punt_seq is deliberately left zero: it is the kernel's PENDING
 // dedup field, never read on a terminal state.
 //
-// It leaves a NEED_HELLO entry alone. Only a connection's first SYN parks
-// one, after which the entry belongs to that connection, not to the cycle
-// this verdict closes, and its own first flight punts with NEW_CONN. The
-// lookup narrows the window a SYN landing between it and the update leaves
-// open; it doesn't close it.
-func (l *L7) writeFlowState(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte) error {
+// It leaves alone a NEED_HELLO entry parked after punted, the kernel time
+// of the punt this verdict answers: only a connection's first SYN parks one,
+// so that entry belongs to a later connection of the socket, whose own first
+// flight punts with NEW_CONN. A NEED_HELLO from before the punt is this
+// connection's own, which the kernel moves to PENDING only after it has
+// submitted the punt, and is written over as usual. The lookup narrows the
+// window a SYN landing between it and the update leaves open; it doesn't
+// close it.
+func (l *L7) writeFlowState(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte, punted uint64) error {
 	var cur bpf.OriginBpfL7FlowVal
-	if err := l.flow.Lookup(&key, &cur); err == nil && cur.State == l7StateNeedHello {
+	if err := l.flow.Lookup(&key, &cur); err == nil && cur.State == l7StateNeedHello && cur.Ts > punted {
 		return nil
 	}
 	val := bpf.OriginBpfL7FlowVal{State: state}

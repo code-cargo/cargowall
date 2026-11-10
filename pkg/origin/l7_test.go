@@ -779,7 +779,9 @@ func TestL7NewConnectionResetsUndecidedCycle(t *testing.T) {
 // TestL7VerdictLeavesANewConnectionAlone: a verdict, or a re-assert of one,
 // that lands after the socket's next connection parked its entry NEED_HELLO
 // belongs to the earlier connection and must not be written over the new
-// one's entry. Over the cycle's own PENDING entry it is written as usual.
+// one's entry. A NEED_HELLO parked before the punt is the connection's own
+// (the kernel submits the punt before it moves the entry to PENDING), and
+// the verdict is written over it, as over the cycle's PENDING.
 func TestL7VerdictLeavesANewConnectionAlone(t *testing.T) {
 	objs := loadL7Objects(t)
 	l := newL7(objs, L7Options{Matcher: allowSet{"auth.docker.io": true}}, nil)
@@ -789,24 +791,37 @@ func TestL7VerdictLeavesANewConnectionAlone(t *testing.T) {
 		require.NoError(t, objs.MapL7Flow.Lookup(ev.FlowKey(), &v))
 		return v.State
 	}
+	hello := func(cookie uint64, punted uint64) *bpf.L7Event {
+		ev := makeL7Event(443, 1000, snitest.BuildClientHello("auth.docker.io"), false)
+		ev.Cookie = cookie
+		ev.Timestamp = punted
+		return ev
+	}
 
-	ev := makeL7Event(443, 1000, snitest.BuildClientHello("auth.docker.io"), false)
+	// A later connection's SYN parked the entry after this cycle's punt.
+	ev := hello(1, 5000)
 	ev.Flags |= l7PuntNewConn
-	require.NoError(t, objs.MapL7Flow.Put(ev.FlowKey(), bpf.OriginBpfL7FlowVal{State: l7StateNeedHello}))
+	require.NoError(t, objs.MapL7Flow.Put(ev.FlowKey(), bpf.OriginBpfL7FlowVal{State: l7StateNeedHello, Ts: 6000}))
 	l.onSample(ev)
 	require.Len(t, *outcomes, 1, "the cycle is still adjudicated and reported")
 	require.Equal(t, l7StateNeedHello, state(ev), "the verdict must not land on the next connection's entry")
 
 	// A stale punt's re-assert must leave it alone too.
-	l.onSample(makeL7Event(443, 1000, snitest.BuildClientHello("auth.docker.io"), false))
+	l.onSample(hello(1, 5500))
 	require.Len(t, *outcomes, 1)
 	require.Equal(t, l7StateNeedHello, state(ev), "a re-assert must not land on the next connection's entry")
 
+	// The connection's own NEED_HELLO, parked before its punt: written over.
+	own := hello(2, 5000)
+	own.Flags |= l7PuntNewConn
+	require.NoError(t, objs.MapL7Flow.Put(own.FlowKey(), bpf.OriginBpfL7FlowVal{State: l7StateNeedHello, Ts: 4000}))
+	l.onSample(own)
+	require.Equal(t, l7StateAllowed, state(own), "a fresh connection's own first flight must get its verdict")
+
 	// Over its own cycle's PENDING entry the verdict is written.
-	other := makeL7Event(443, 1000, snitest.BuildClientHello("auth.docker.io"), false)
-	other.Cookie = 77
-	other.Flags |= l7PuntNewConn
-	require.NoError(t, objs.MapL7Flow.Put(other.FlowKey(), bpf.OriginBpfL7FlowVal{State: 1}))
-	l.onSample(other)
-	require.Equal(t, l7StateAllowed, state(other))
+	pending := hello(3, 5000)
+	pending.Flags |= l7PuntNewConn
+	require.NoError(t, objs.MapL7Flow.Put(pending.FlowKey(), bpf.OriginBpfL7FlowVal{State: 1, Ts: 4000}))
+	l.onSample(pending)
+	require.Equal(t, l7StateAllowed, state(pending))
 }

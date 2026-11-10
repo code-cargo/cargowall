@@ -79,29 +79,6 @@ func validateSudoersInput(username string, cmds []string) error {
 	return nil
 }
 
-// resolveUsername determines the target username from config or auto-detection.
-// When cfgUsername is set it is returned directly. Otherwise the current user
-// is used, falling back to common CI usernames when running as root.
-func resolveUsername(cfgUsername string) (string, error) {
-	if cfgUsername != "" {
-		return cfgUsername, nil
-	}
-	currentUser, err := user.Current()
-	if err != nil {
-		return "", fmt.Errorf("failed to get current user: %w", err)
-	}
-	if currentUser.Uid != "0" {
-		return currentUser.Username, nil
-	}
-	// Running as root — try common CI usernames
-	for _, u := range []string{"runner", "github", "ci"} {
-		if _, err := user.Lookup(u); err == nil {
-			return u, nil
-		}
-	}
-	return "", fmt.Errorf("could not determine target username for sudo lockdown")
-}
-
 // lookupUserGIDs returns the set of group IDs the user belongs to.
 func lookupUserGIDs(username string) (map[string]bool, error) {
 	u, err := user.Lookup(username)
@@ -310,6 +287,22 @@ func recoverLockdownState(dir, main, username string, logger *slog.Logger) *lock
 func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	logger.Info("Enabling sudo lockdown")
 
+	// A root worker's steps have root without sudo, so no lockdown holds
+	// against them, on a host with sudo or without.
+	if slices.Contains(workerOwners(procDir), 0) {
+		return errRootWorker
+	}
+	// No sudo, nothing to take: a job step on this host has no sudo to run,
+	// and the lockdown's guarantee holds as it stands.
+	if found, policy := hasSudo(procDir); !found {
+		if policy != "" {
+			logger.Warn("No sudo binary found, though its policy file is here; nothing to lock down", "policy", policy)
+		} else {
+			logger.Info("No sudo on this host, nothing to lock down")
+		}
+		return nil
+	}
+
 	username, err := resolveUsername(cfg.Username)
 	if err != nil {
 		return err
@@ -393,7 +386,12 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return fmt.Errorf("failed to write temp sudoers file: %w", err)
 	}
 
-	if out, err := exec.Command("visudo", "-cf", tmpFile).CombinedOutput(); err != nil {
+	visudo, err := visudoBinary()
+	if err != nil {
+		os.Remove(tmpFile)
+		return err
+	}
+	if out, err := exec.Command(visudo, "-cf", tmpFile).CombinedOutput(); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("visudo validation failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -428,7 +426,7 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	// roll back if sudo would not parse it. visudo only warns about an alias a
 	// disabled file left undefined, so that does not stop the lockdown;
 	// nothing relies on it, since the appended rules are read last regardless.
-	if out, err := exec.Command("visudo", "-c").CombinedOutput(); err != nil {
+	if out, err := exec.Command(visudo, "-c").CombinedOutput(); err != nil {
 		logger.Warn("Overall sudoers validation failed after modifications, rolling back",
 			"error", err, "output", strings.TrimSpace(string(out)))
 		return fmt.Errorf("sudoers validation failed after lockdown modifications: %w", err)
@@ -520,7 +518,7 @@ func DisableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	if state != nil {
 		username = state.Username
 	}
-	if username == "" {
+	if state != nil && username == "" {
 		resolvedUsername, resolveErr := resolveUsername(cfg.Username)
 		if resolveErr != nil {
 			logger.Warn("Failed to resolve username for group/docker restoration, keeping state for manual recovery",

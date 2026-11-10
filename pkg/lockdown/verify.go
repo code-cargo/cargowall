@@ -76,16 +76,8 @@ type jobView struct {
 // Runner.Worker under procRoot owned by uid. Several workers' groups are
 // joined: a step of any of them is a step this lockdown must hold against.
 func workerView(procRoot string, uid uint32) (groups []uint32, dockerHosts []string, found bool) {
-	entries, err := os.ReadDir(procRoot)
-	if err != nil {
-		return nil, nil, false
-	}
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || procfs.CommIn(procRoot, pid) != procfs.RunnerWorkerComm {
-			continue
-		}
-		owner, gs, ok := parseStatusCreds(filepath.Join(procRoot, e.Name(), "status"))
+	for _, dir := range workerDirs(procRoot) {
+		owner, gs, ok := parseStatusCreds(filepath.Join(dir, "status"))
 		if !ok || owner != uid {
 			continue
 		}
@@ -95,7 +87,7 @@ func workerView(procRoot string, uid uint32) (groups []uint32, dockerHosts []str
 				groups = append(groups, g)
 			}
 		}
-		if h := environValue(filepath.Join(procRoot, e.Name(), "environ"), "DOCKER_HOST"); h != "" && !slices.Contains(dockerHosts, h) {
+		if h := environValue(filepath.Join(dir, "environ"), "DOCKER_HOST"); h != "" && !slices.Contains(dockerHosts, h) {
 			dockerHosts = append(dockerHosts, h)
 		}
 	}
@@ -178,7 +170,7 @@ func lookupJobView(username string, preGIDs map[string]bool) (*jobView, error) {
 		return nil, err
 	}
 	v := &jobView{uid: uint32(uid), gid: uint32(gid)}
-	if gs, hosts, ok := workerView("/proc", v.uid); ok {
+	if gs, hosts, ok := workerView(procDir, v.uid); ok {
 		v.groups, v.dockerHosts, v.from = gs, hosts, procfs.RunnerWorkerComm
 		return v, nil
 	}
@@ -285,8 +277,8 @@ var errLockdownIneffective = errors.New("sudo lockdown does not hold")
 // it — the allowlist may not apply (say, a sudoers.d file never included), or
 // sudo -l needs a password here — that is a Warn, not "Verified".
 func verifyLockdown(v *jobView, allow []string, logger *slog.Logger) error {
-	sudo, err := exec.LookPath("sudo")
-	if err != nil {
+	sudo := sudoBinary()
+	if sudo == "" {
 		logger.Debug("No sudo binary, nothing to verify the lockdown against")
 		return nil
 	}

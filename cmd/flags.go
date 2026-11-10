@@ -159,6 +159,7 @@ type StartCmd struct {
 	// Sudo lockdown (CI security hardening)
 	SudoLockdown      bool   `help:"Enable sudo lockdown to prevent firewall bypass" default:"false" env:"CARGOWALL_SUDO_LOCKDOWN"`
 	SudoAllowCommands string `help:"Comma-separated list of command paths to allow via sudo when lockdown is enabled (e.g. /usr/bin/apt-get,/usr/bin/docker)" default:"" env:"CARGOWALL_SUDO_ALLOW_COMMANDS"`
+	SudoLockdownUser  string `help:"User whose sudo the lockdown restricts: by default the user the runner's Runner.Worker runs as, which this must name when a worker is visible" default:"" env:"CARGOWALL_SUDO_LOCKDOWN_USER"`
 
 	// Audit mode and logging. AuditMode is only the CLI seed: at startup it
 	// is copied into config.Manager, which is the single source of truth

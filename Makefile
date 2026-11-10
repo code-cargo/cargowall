@@ -77,8 +77,8 @@ verifier-budget:
 test-ci:
 	@printf "${GREEN}Running CI tests...${RESET}\n"
 	go run gotest.tools/gotestsum@latest --junitfile test-results.xml --format testdox -- ./...
-	@printf "${GREEN}Running BPF tests with sudo...${RESET}\n"
-	sudo --preserve-env=CARGOWALL_TEST_STRICT go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/steps/ ./pkg/origin/ ./pkg/firewall/
+	@printf "${GREEN}Running BPF and other root-only tests with sudo...${RESET}\n"
+	sudo --preserve-env=CARGOWALL_TEST_STRICT go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/steps/ ./pkg/origin/ ./pkg/firewall/ ./pkg/lockdown/
 	@printf "${GREEN}Running cmd's root-only tests with sudo...${RESET}\n"
 	sudo --preserve-env=CARGOWALL_TEST_STRICT go run gotest.tools/gotestsum@latest --junitfile test-results-cmd-root.xml --format testdox -- -count=1 -run 'Netns$$' ./cmd/
 

@@ -563,8 +563,13 @@ jobs:
           # Poll at 200ms: the hanging fetch only holds startup for the 10s
           # policyFetchTotalBudget, so a 1s-granularity poll plus command
           # overhead could let lockdown be decided before the kill lands.
+          # Wait for the table's output chain, not its name: the install's
+          # batch adds and deletes a placeholder table before the owned one,
+          # and when it has to load an nft module the kernel aborts and
+          # replays it, listing the placeholder for a moment before the
+          # commit.
           for i in $(seq 1 150); do
-            sudo nft list tables 2> /dev/null | grep -qE '^table (ip|inet) cargowall( |$)' && break
+            { sudo nft list chain inet cargowall output || sudo nft list chain ip cargowall output; } > /dev/null 2>&1 && break
             sleep 0.2
           done
           sudo nft list tables 2> /dev/null | grep -qE '^table (ip|inet) cargowall( |$)' \

@@ -76,7 +76,7 @@ func parseSudoAllowCommands(input string, logger *slog.Logger) []string {
 func sudoLockdownConfig(cmd *StartCmd, logger *slog.Logger) *lockdown.SudoLockdownConfig {
 	return &lockdown.SudoLockdownConfig{
 		AllowCommands: parseSudoAllowCommands(cmd.SudoAllowCommands, logger),
-		Username:      "", // Auto-detect
+		Username:      cmd.SudoLockdownUser, // "" auto-detects
 	}
 }
 

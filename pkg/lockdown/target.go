@@ -51,25 +51,65 @@ func resolveUsername(cfgUsername string) (string, error) {
 
 // resolveTarget determines whose sudo the lockdown takes. A worker running
 // as root is an error first of all: its steps have root without sudo, which
-// no lockdown takes away, and locking any account, a configured one
-// included, would report a lockdown that holds against nothing the job runs.
+// no lockdown takes away, and locking any account would report a lockdown
+// that holds against nothing the job runs.
 //
-// A configured user is then taken as given. Otherwise it is the owner of the
-// runner's Runner.Worker, whose job steps the lockdown must hold against.
-// With no worker visible it is the current user when not root, then the
-// first of guesses that exists, then the user who ran cargowall through
-// sudo, unless root: SUDO_USER comes last, since an account that started
-// cargowall before any job ran is not the job's, where an existing runner
-// account is. Workers of several users that sudoUser does not choose
-// between are an error, and so is a worker whose uid /etc/passwd does not
-// name.
+// With workers visible the target is their owner, the user the job's steps
+// run as. A configured user must be that owner, and of workers of several
+// users, the configured user or else SUDO_USER chooses; anything else is an
+// error, as is a worker whose uid /etc/passwd does not name.
+//
+// With no worker visible the target is the configured user, else the
+// current user when not root, else whichever of two candidates exists: the
+// first of guesses, a runner account, and the user who ran cargowall
+// through sudo, unless root. Both existing and differing is an error: either
+// could be the job's (an operator who started cargowall before any job, a
+// CI system's own account on a host that also has a runner account), and
+// locking the other would verify against it and report a lockdown applied.
 func resolveTarget(cfgUsername, procRoot, sudoUser string, current *user.User, guesses []string) (string, error) {
 	owners := workerOwners(procRoot)
 	if slices.Contains(owners, 0) {
 		return "", errRootWorker
 	}
+	if len(owners) > 0 {
+		return workerTarget(owners, cfgUsername, sudoUser)
+	}
 	if cfgUsername != "" {
 		return cfgUsername, nil
+	}
+	if current.Uid != "0" {
+		return current.Username, nil
+	}
+	guess := ""
+	for _, u := range guesses {
+		if _, err := user.Lookup(u); err == nil {
+			guess = u
+			break
+		}
+	}
+	if sudoUser == "root" {
+		sudoUser = ""
+	}
+	switch {
+	case guess != "" && sudoUser != "" && guess != sudoUser:
+		return "", fmt.Errorf("no Runner.Worker is visible, and both the runner account %q and SUDO_USER %q could be the job's user; name it with --sudo-lockdown-user", guess, sudoUser)
+	case guess != "":
+		return guess, nil
+	case sudoUser != "":
+		return sudoUser, nil
+	}
+	return "", errors.New("could not determine target username for sudo lockdown: no Runner.Worker is visible, no runner account exists and SUDO_USER names none; name it with --sudo-lockdown-user")
+}
+
+// workerTarget is the owner of the visible workers, owners, that the
+// configured user, else SUDO_USER, names; with a single owner and neither
+// set, that owner.
+func workerTarget(owners []uint32, cfgUsername, sudoUser string) (string, error) {
+	if cfgUsername != "" {
+		if u, err := user.Lookup(cfgUsername); err == nil && slices.Contains(owners, uidOf(u)) {
+			return cfgUsername, nil
+		}
+		return "", fmt.Errorf("the configured lockdown user %q is not the user the runner's Runner.Worker runs as (uids %v)", cfgUsername, owners)
 	}
 	if len(owners) > 1 {
 		if u, err := user.Lookup(sudoUser); err == nil && sudoUser != "" && slices.Contains(owners, uidOf(u)) {
@@ -77,25 +117,11 @@ func resolveTarget(cfgUsername, procRoot, sudoUser string, current *user.User, g
 		}
 		return "", fmt.Errorf("the runner's Runner.Workers run as several users (uids %v), and SUDO_USER does not name one of them", owners)
 	}
-	if len(owners) == 1 {
-		u, err := user.LookupId(strconv.FormatUint(uint64(owners[0]), 10))
-		if err != nil {
-			return "", fmt.Errorf("the Runner.Worker runs as uid %d, which /etc/passwd does not name: %w", owners[0], err)
-		}
-		return u.Username, nil
+	u, err := user.LookupId(strconv.FormatUint(uint64(owners[0]), 10))
+	if err != nil {
+		return "", fmt.Errorf("the Runner.Worker runs as uid %d, which /etc/passwd does not name: %w", owners[0], err)
 	}
-	if current.Uid != "0" {
-		return current.Username, nil
-	}
-	for _, u := range guesses {
-		if _, err := user.Lookup(u); err == nil {
-			return u, nil
-		}
-	}
-	if sudoUser != "" && sudoUser != "root" {
-		return sudoUser, nil
-	}
-	return "", fmt.Errorf("could not determine target username for sudo lockdown")
+	return u.Username, nil
 }
 
 // uidOf is u's uid, or a value no worker has when it does not parse.
@@ -137,8 +163,11 @@ func workerDirs(procRoot string) []string {
 
 // sudoNames are the names sudo, classic or sudo-rs, is installed under:
 // next to sudo-rs, classic sudo is sudo.ws, and sudo itself is only the
-// alternatives link to one of them.
+// alternatives link to one of them. The first three run commands.
 var sudoNames = []string{"sudo", "sudo.ws", "sudo-rs", "sudoedit", "sudoedit.ws"}
+
+// visudoNames are visudo's names: sudo-rs alone ships it as visudo-rs.
+var visudoNames = []string{"visudo", "visudo-rs"}
 
 // sudoDirs are where sudo is installed, looked in as well as cargowall's own
 // PATH and the runner's workers' PATH, either of which can miss one: a sudo
@@ -153,25 +182,37 @@ var sudoDirs = []string{
 // sudo is worth a Warn, not a lockdown.
 var sudoPolicies = []string{mainSudoers, sudoRsSudoers}
 
-// hasSudo reports whether this host has a sudo for a job step to run: any of
-// sudoNames, a dangling link included, in sudoDirs, in cargowall's PATH or in
-// the PATH of a Runner.Worker under procRoot. When it finds none, policy is
-// a sudo policy file still in place, or "".
-func hasSudo(procRoot string) (found bool, policy string) {
-	dirs := slices.Clone(sudoDirs)
-	dirs = append(dirs, filepath.SplitList(os.Getenv("PATH"))...)
+// toolPaths is every path that holds one of names, in search order: on
+// cargowall's PATH, as a command run by name resolves it, then on the PATH of
+// a Runner.Worker under procRoot, then in sudoDirs. Anything there counts, a
+// dangling link included.
+func toolPaths(names []string, procRoot string) []string {
+	dirs := filepath.SplitList(os.Getenv("PATH"))
 	for _, dir := range workerDirs(procRoot) {
 		dirs = append(dirs, filepath.SplitList(environValue(filepath.Join(dir, "environ"), "PATH"))...)
 	}
+	dirs = append(dirs, sudoDirs...)
+	var found []string
 	for _, dir := range dirs {
 		if !strings.HasPrefix(dir, "/") {
 			continue // a relative PATH entry names nothing fixed
 		}
-		for _, name := range sudoNames {
-			if _, err := os.Lstat(filepath.Join(dir, name)); err == nil {
-				return true, ""
+		for _, name := range names {
+			path := filepath.Join(dir, name)
+			if _, err := os.Lstat(path); err == nil && !slices.Contains(found, path) {
+				found = append(found, path)
 			}
 		}
+	}
+	return found
+}
+
+// hasSudo reports whether this host has a sudo for a job step to run: any of
+// sudoNames where toolPaths looks. When it finds none, policy is a sudo
+// policy file still in place, or "".
+func hasSudo(procRoot string) (found bool, policy string) {
+	if len(toolPaths(sudoNames, procRoot)) > 0 {
+		return true, ""
 	}
 	for _, p := range sudoPolicies {
 		if _, err := os.Lstat(p); err == nil {
@@ -179,4 +220,30 @@ func hasSudo(procRoot string) (found bool, policy string) {
 		}
 	}
 	return false, ""
+}
+
+// runnable is the first of paths that is an executable file, links
+// followed, or "".
+func runnable(paths []string) string {
+	for _, p := range paths {
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
+			return p
+		}
+	}
+	return ""
+}
+
+// sudoBinary is the sudo the verification probes with: the first that runs
+// commands, of those toolPaths finds, or "".
+func sudoBinary(procRoot string) string {
+	return runnable(toolPaths(sudoNames[:3], procRoot))
+}
+
+// visudoBinary is the visudo the lockdown validates sudoers with, found where
+// sudo is.
+func visudoBinary() (string, error) {
+	if p := runnable(toolPaths(visudoNames, procDir)); p != "" {
+		return p, nil
+	}
+	return "", errors.New("no visudo to validate sudoers with")
 }

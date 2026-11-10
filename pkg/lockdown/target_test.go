@@ -38,7 +38,7 @@ func lookupOrSkip(t *testing.T, name string) *user.User {
 
 // The lockdown takes the sudo of the user the runner's job steps run as:
 // the Runner.Worker's owner, whatever the account is called, ahead of
-// SUDO_USER and every guess. A configured user is taken as given.
+// SUDO_USER and every guess. A configured user must be that owner.
 func TestResolveTarget_workerOwner(t *testing.T) {
 	nobody := lookupOrSkip(t, "nobody")
 	root := t.TempDir()
@@ -53,8 +53,12 @@ func TestResolveTarget_workerOwner(t *testing.T) {
 	if got, err := resolveTarget("", root, "daemon", alice, []string{"daemon"}); err != nil || got != "nobody" {
 		t.Errorf("resolveTarget = %q, %v; want the worker's owner ahead of every fallback", got, err)
 	}
-	if got, err := resolveTarget("alice", root, "", asRoot, nil); err != nil || got != "alice" {
-		t.Errorf("a configured user = %q, %v; want alice", got, err)
+	if got, err := resolveTarget("nobody", root, "daemon", asRoot, nil); err != nil || got != "nobody" {
+		t.Errorf("a configured user who is the owner = %q, %v; want nobody", got, err)
+	}
+	lookupOrSkip(t, "daemon")
+	if got, err := resolveTarget("daemon", root, "", asRoot, nil); err == nil || !strings.Contains(err.Error(), "is not the user") {
+		t.Errorf("a configured user who is not the owner = %q, %v; want refused", got, err)
 	}
 }
 
@@ -90,6 +94,9 @@ func TestResolveTarget_severalWorkers(t *testing.T) {
 	if got, err := resolveTarget("", root, "daemon", asRoot, nil); err != nil || got != "daemon" {
 		t.Errorf("SUDO_USER=daemon: %q, %v; want daemon", got, err)
 	}
+	if got, err := resolveTarget("nobody", root, "daemon", asRoot, nil); err != nil || got != "nobody" {
+		t.Errorf("a configured owner over SUDO_USER: %q, %v; want nobody", got, err)
+	}
 	for _, sudoUser := range []string{"", "bin", "no-such-user-here"} {
 		if got, err := resolveTarget("", root, sudoUser, asRoot, nil); err == nil || !strings.Contains(err.Error(), "several users") {
 			t.Errorf("SUDO_USER=%q: %q, %v; want several workers refused", sudoUser, got, err)
@@ -109,29 +116,37 @@ func TestResolveTarget_workerWithoutUser(t *testing.T) {
 	}
 }
 
-// With no worker visible, a non-root current user is the target, then an
-// existing runner account, and only then the user who ran cargowall through
-// sudo: an account that started cargowall before any job ran is not the
-// job's, where an existing runner account is. Root there says nothing.
+// With no worker visible, a configured user is the target, then a non-root
+// current user. Otherwise a runner account and the user who ran cargowall
+// through sudo are the candidates: either alone, or both when they agree, is
+// the target, and both differing is refused, since either could be the
+// job's and locking the other would report a lockdown applied. Root as
+// SUDO_USER names nobody.
 func TestResolveTarget_noWorker(t *testing.T) {
 	lookupOrSkip(t, "nobody")
 	lookupOrSkip(t, "daemon")
 	root := t.TempDir()
+	alice := &user.User{Uid: "4242", Username: "alice"}
 	for _, tc := range []struct {
 		name     string
+		cfg      string
 		sudoUser string
 		current  *user.User
 		guesses  []string
 		want     string
 	}{
-		{"a non-root current user", "daemon", &user.User{Uid: "4242", Username: "alice"}, []string{"nobody"}, "alice"},
-		{"a runner account ahead of SUDO_USER", "daemon", asRoot, []string{"no-such-user-here", "nobody"}, "nobody"},
-		{"SUDO_USER when no guess exists", "daemon", asRoot, []string{"no-such-user-here"}, "daemon"},
-		{"SUDO_USER root names nothing", "root", asRoot, []string{"no-such-user-here"}, ""},
-		{"nothing at all", "", asRoot, nil, ""},
+		{"a configured user", "bin", "daemon", asRoot, []string{"nobody"}, "bin"},
+		{"a non-root current user", "", "daemon", alice, []string{"nobody"}, "alice"},
+		{"a runner account alone", "", "", asRoot, []string{"no-such-user-here", "nobody"}, "nobody"},
+		{"a runner account and SUDO_USER root", "", "root", asRoot, []string{"nobody"}, "nobody"},
+		{"a runner account that is SUDO_USER", "", "nobody", asRoot, []string{"nobody"}, "nobody"},
+		{"a runner account and a different SUDO_USER", "", "daemon", asRoot, []string{"nobody"}, ""},
+		{"SUDO_USER when no runner account exists", "", "daemon", asRoot, []string{"no-such-user-here"}, "daemon"},
+		{"SUDO_USER root names nothing", "", "root", asRoot, []string{"no-such-user-here"}, ""},
+		{"nothing at all", "", "", asRoot, nil, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := resolveTarget("", root, tc.sudoUser, tc.current, tc.guesses)
+			got, err := resolveTarget(tc.cfg, root, tc.sudoUser, tc.current, tc.guesses)
 			if tc.want == "" {
 				if err == nil {
 					t.Errorf("resolveTarget = %q; want no target", got)
@@ -198,4 +213,52 @@ func TestHasSudo(t *testing.T) {
 
 	writeFile(t, dir+"/etc/sudoers", "root ALL=(ALL) ALL\n")
 	check(false, dir+"/etc/sudoers", "a policy left behind by a removed sudo")
+}
+
+// visudo is found where sudo is, under either of its names, and only an
+// executable counts; the verification's sudo is one that runs commands,
+// never sudoedit.
+func TestToolBinaries(t *testing.T) {
+	dir := t.TempDir()
+	old := sudoDirs
+	t.Cleanup(func() { sudoDirs = old })
+	sudoDirs = []string{dir + "/a", dir + "/b"}
+	t.Setenv("PATH", dir+"/path")
+	for _, d := range []string{"a", "b", "path"} {
+		if err := os.MkdirAll(dir+"/"+d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exe := func(path string) {
+		t.Helper()
+		writeFile(t, path, "#!/bin/sh\n")
+		if err := os.Chmod(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	proc := t.TempDir()
+
+	if p, err := visudoBinary(); err == nil {
+		t.Errorf("visudoBinary = %q with none anywhere", p)
+	}
+	writeFile(t, dir+"/a/visudo", "not executable\n")
+	exe(dir + "/b/visudo-rs")
+	if p, err := visudoBinary(); err != nil || p != dir+"/b/visudo-rs" {
+		t.Errorf("visudoBinary = %q, %v; want sudo-rs's visudo-rs, past a non-executable visudo", p, err)
+	}
+
+	if p := sudoBinary(proc); p != "" {
+		t.Errorf("sudoBinary = %q with none anywhere", p)
+	}
+	exe(dir + "/a/sudoedit")
+	if err := os.Symlink(dir+"/gone", dir+"/a/sudo"); err != nil {
+		t.Fatal(err)
+	}
+	if p := sudoBinary(proc); p != "" {
+		t.Errorf("sudoBinary = %q; want neither sudoedit nor a dangling link", p)
+	}
+	exe(dir + "/path/sudo-rs")
+	if p := sudoBinary(proc); p != dir+"/path/sudo-rs" {
+		t.Errorf("sudoBinary = %q; want the sudo-rs on PATH", p)
+	}
 }

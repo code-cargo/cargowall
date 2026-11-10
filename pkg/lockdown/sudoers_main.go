@@ -90,7 +90,11 @@ func notReplaceable(err error) bool {
 // visudoCheckFile validates a candidate sudoers file, includes and all. A
 // var so tests can stand in for visudo, which needs root.
 var visudoCheckFile = func(path string) error {
-	if out, err := exec.Command("visudo", "-cf", path).CombinedOutput(); err != nil {
+	visudo, err := visudoBinary()
+	if err != nil {
+		return err
+	}
+	if out, err := exec.Command(visudo, "-cf", path).CombinedOutput(); err != nil {
 		return fmt.Errorf("visudo rejected %s: %w: %s", path, err, strings.TrimSpace(string(out)))
 	}
 	return nil

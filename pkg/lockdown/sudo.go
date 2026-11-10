@@ -386,7 +386,12 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return fmt.Errorf("failed to write temp sudoers file: %w", err)
 	}
 
-	if out, err := exec.Command("visudo", "-cf", tmpFile).CombinedOutput(); err != nil {
+	visudo, err := visudoBinary()
+	if err != nil {
+		os.Remove(tmpFile)
+		return err
+	}
+	if out, err := exec.Command(visudo, "-cf", tmpFile).CombinedOutput(); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("visudo validation failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -421,7 +426,7 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	// roll back if sudo would not parse it. visudo only warns about an alias a
 	// disabled file left undefined, so that does not stop the lockdown;
 	// nothing relies on it, since the appended rules are read last regardless.
-	if out, err := exec.Command("visudo", "-c").CombinedOutput(); err != nil {
+	if out, err := exec.Command(visudo, "-c").CombinedOutput(); err != nil {
 		logger.Warn("Overall sudoers validation failed after modifications, rolling back",
 			"error", err, "output", strings.TrimSpace(string(out)))
 		return fmt.Errorf("sudoers validation failed after lockdown modifications: %w", err)

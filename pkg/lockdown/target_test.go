@@ -120,3 +120,38 @@ func TestResolveTarget_noWorker(t *testing.T) {
 		}
 	}
 }
+
+// A host has sudo when cargowall's PATH finds one, or when any of the
+// places sudo is installed holds one, a dangling link included: either way a
+// job step may run it.
+func TestHasSudo(t *testing.T) {
+	dir := t.TempDir()
+	old := sudoPaths
+	t.Cleanup(func() { sudoPaths = old })
+	t.Setenv("PATH", dir)
+	sudoPaths = []string{dir + "/elsewhere/sudo", dir + "/link/sudo"}
+	if hasSudo() {
+		t.Fatal("hasSudo with no sudo on PATH or at any install path")
+	}
+
+	writeFile(t, dir+"/sudo", "#!/bin/sh\n")
+	if err := os.Chmod(dir+"/sudo", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !hasSudo() {
+		t.Error("a sudo on PATH was missed")
+	}
+	if err := os.Remove(dir + "/sudo"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(dir+"/link", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(dir+"/gone", dir+"/link/sudo"); err != nil {
+		t.Fatal(err)
+	}
+	if !hasSudo() {
+		t.Error("a sudo at an install path, off PATH, was missed")
+	}
+}

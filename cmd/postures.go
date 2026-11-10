@@ -16,8 +16,9 @@
 
 // Requested-vs-applied postures for the layers a flag requests but the
 // runtime can fail to deliver: the cgroup egress hook, the L7 layer riding
-// it, the DNS redirect, and the sudo lockdown. A lost enforce rung under an enforcing policy
-// fails startup — the operator asked for a guarantee the job would not have.
+// it, the DNS redirect, and the sudo lockdown. A lost enforce rung under an
+// enforcing policy fails startup — the operator asked for a guarantee the job
+// would not have.
 // Under an auditing policy an enforce rung drops nothing (the hook checks the
 // audit gate), so losing it costs only measurement, like a lost observe
 // rung: that warns, and is recorded so the job summary can say the
@@ -147,11 +148,11 @@ func newPostures(cmd *StartCmd, kernel string, enforcing bool, logger *slog.Logg
 		redirect = dnsRedirectOn
 	}
 	p.register(postureDNSRedirect, redirect, dnsRedirectOff, enforcing)
-	lockdown := sudoLockdownOff
+	sudo := sudoLockdownOff
 	if cmd.SudoLockdown {
-		lockdown = sudoLockdownOn
+		sudo = sudoLockdownOn
 	}
-	p.register(postureSudoLockdown, lockdown, sudoLockdownOff, enforcing)
+	p.register(postureSudoLockdown, sudo, sudoLockdownOff, enforcing)
 	return p
 }
 

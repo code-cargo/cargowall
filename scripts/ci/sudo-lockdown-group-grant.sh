@@ -52,6 +52,13 @@ runrootworker() {
     -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh rootworker
 }
 
+# runnosudo is run for the no-sudo scenario, on an image without sudo.
+runnosudo() {
+  local image="$1"
+  docker run --rm --privileged --user root --entrypoint bash \
+    -v "$PWD:/w:ro" "$image" /w/scripts/ci/sudo-lockdown-group-grant.sh nosudo
+}
+
 # runlatefile is run for the later-sorting competing-grant scenario.
 runlatefile() {
   local image="$1"
@@ -323,6 +330,29 @@ rootworker() {
   pristine
 }
 
+# nosudo: a host with no sudo has nothing to lock down, so a requested
+# lockdown is no loss, even under an enforcing policy and with no runner
+# account to name.
+nosudo() {
+  if command -v sudo >/dev/null 2>&1 || [ -e /usr/lib/cargo/bin/sudo ]; then
+    fail "the image has sudo; this test needs one without"
+  fi
+  local upstream
+  upstream="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
+  printf '{"defaultAction":"allow","rules":[],"sudoLockdown":{"enabled":true,"allowCommands":["%s"]}}\n' \
+    "$ALLOWED" > /tmp/policy.json
+  /w/bin/cargowall start --config=/tmp/policy.json --dns-upstream="${upstream}:53" \
+    --ready-file=/tmp/cargowall-ready > /tmp/cw.log 2>&1 &
+  local cw=$!
+  for _ in $(seq 1 60); do [ -f /tmp/cargowall-ready ] && break; sleep 0.5; done
+  [ -f /tmp/cargowall-ready ] || fail "cargowall did not become ready on a host without sudo"
+  grep -q 'No sudo on this host, nothing to lock down' /tmp/cw.log || fail "the missing sudo was not the reason"
+  grep -q 'requested but could not be applied' /tmp/cw.log && fail "a host without sudo lost the lockdown"
+  echo "✅ no sudo: nothing to lock down, an enforcing start comes up"
+  kill -TERM "$cw" 2>/dev/null || true
+  wait "$cw" 2>/dev/null || true
+}
+
 # pristine checks that everything the aborted enable touched is undone.
 pristine() {
   [ -f /etc/sudoers.d/zz-cargowall-lockdown ] && fail "the lockdown sudoers file was left behind"
@@ -341,9 +371,11 @@ case "$cmd" in
   run-escalation) runescalation "$@" ;;
   run-latefile) runlatefile "$@" ;;
   run-rootworker) runrootworker "$@" ;;
+  run-nosudo) runnosudo "$@" ;;
   inside) inside ;;
   escalation) escalation ;;
   latefile) latefile ;;
   rootworker) rootworker ;;
-  *) echo "usage: $0 run <image> | run-escalation <image> | run-latefile <image> | run-rootworker <image> | inside | escalation | latefile | rootworker" >&2; exit 2 ;;
+  nosudo) nosudo ;;
+  *) echo "usage: $0 run|run-escalation|run-latefile|run-rootworker|run-nosudo <image> | inside | escalation | latefile | rootworker | nosudo" >&2; exit 2 ;;
 esac

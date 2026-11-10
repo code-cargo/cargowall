@@ -137,6 +137,29 @@ func resolveTarget(cfgUsername, procRoot, sudoUser string) (string, error) {
 	return "", fmt.Errorf("could not determine target username for sudo lockdown")
 }
 
+// sudoPaths are where sudo, classic or sudo-rs, is installed. They are looked
+// at as well as cargowall's own PATH, which can be narrower than a job's: a
+// sudo missed here would be a lockdown skipped with sudo in place.
+var sudoPaths = []string{
+	"/usr/bin/sudo", "/bin/sudo", "/usr/sbin/sudo", "/sbin/sudo",
+	"/usr/local/bin/sudo", "/usr/local/sbin/sudo",
+	"/usr/lib/cargo/bin/sudo", // sudo-rs, before the alternatives link
+	"/run/wrappers/bin/sudo",  // NixOS's setuid wrapper
+}
+
+// hasSudo reports whether this host has a sudo for a job step to run.
+func hasSudo() bool {
+	if _, err := exec.LookPath("sudo"); err == nil {
+		return true
+	}
+	for _, p := range sudoPaths {
+		if _, err := os.Lstat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // uidOf is u's uid, or a value no worker has when it does not parse.
 func uidOf(u *user.User) uint32 {
 	n, err := strconv.ParseUint(u.Uid, 10, 32)
@@ -353,6 +376,13 @@ func recoverLockdownState(dir, main, username string, logger *slog.Logger) *lock
 // all with an error when sudo does not.
 func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	logger.Info("Enabling sudo lockdown")
+
+	// No sudo, nothing to take: a job step on this host has no sudo to run,
+	// and the lockdown's guarantee holds as it stands.
+	if !hasSudo() {
+		logger.Info("No sudo on this host, nothing to lock down")
+		return nil
+	}
 
 	username, err := resolveUsername(cfg.Username)
 	if err != nil {

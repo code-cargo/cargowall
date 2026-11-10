@@ -201,14 +201,14 @@ func (w *LinkWatcher) drain() bool {
 	if err != nil {
 		return false
 	}
-	any := false
+	queued := false
 	buf := make([]byte, 64<<10)
 	if err := rc.Read(func(fd uintptr) bool {
 		for {
 			_, _, err := unix.Recvfrom(int(fd), buf, unix.MSG_DONTWAIT)
 			switch {
 			case err == nil, errors.Is(err, unix.ENOBUFS):
-				any = true
+				queued = true
 			case errors.Is(err, unix.EINTR):
 			default:
 				return true
@@ -217,7 +217,7 @@ func (w *LinkWatcher) drain() bool {
 	}); err != nil {
 		return false
 	}
-	return any
+	return queued
 }
 
 // sameNetns reports whether the calling thread is in the namespace ns is.

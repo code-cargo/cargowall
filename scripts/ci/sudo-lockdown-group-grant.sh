@@ -326,6 +326,9 @@ rootworker() {
   grep -qx 'refused=sudo-lockdown' /tmp/cargowall-failed \
     || fail "the failure sentinel does not name the posture: $(cat /tmp/cargowall-failed 2>/dev/null)"
   grep -q 'a Runner.Worker runs as root' /tmp/cw.log || fail "the root worker was not the reason"
+  # The teardown's disable finds no state, so it has no user to restore and
+  # nothing to keep.
+  grep -q 'keeping state' /tmp/cw.log && fail "the teardown warned about a state file the refused lockdown never wrote"
   echo "✅ a root Runner.Worker fails startup under an enforcing policy"
   pristine
 }

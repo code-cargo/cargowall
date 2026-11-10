@@ -56,6 +56,7 @@ type bridgeStamp struct {
 	links   map[int]network.Link  // the namespace's interfaces, by index
 	named   map[string]bool       // Docker bridges the tracker reported
 	ports   map[int]tc.Attachment // where the program is attached, by index
+	failed  map[int]bool          // ports the attach failed on, warned of once each
 	watcher io.Closer
 	closed  bool
 }
@@ -74,6 +75,7 @@ func newBridgeStamp(objs *bpf.TcBpfObjects, logger *slog.Logger) *bridgeStamp {
 		links:  make(map[int]network.Link),
 		named:  make(map[string]bool),
 		ports:  make(map[int]tc.Attachment),
+		failed: make(map[int]bool),
 	}
 }
 
@@ -176,11 +178,16 @@ func (b *bridgeStamp) syncPortsOf(index int) {
 
 // sync attaches to or detaches from the interface at index as it now is,
 // with b.mu held: attached if it is a Docker bridge's veth port, and
-// attached afresh if an attachment there has gone dead.
+// attached afresh if an attachment there has gone dead. A port the attach
+// fails on is tried again on its next report, and warned of once, until
+// an attach there works or it is no Docker port.
 func (b *bridgeStamp) sync(index int) {
 	l, ok := b.links[index]
 	want := ok && b.dockerPort(l)
 	a, have := b.ports[index]
+	if !want {
+		delete(b.failed, index)
+	}
 	switch {
 	case want && have && a.Attached():
 	case want:
@@ -190,10 +197,14 @@ func (b *bridgeStamp) sync(index int) {
 		}
 		na, err := b.attach(index, l.Name, b.prog, b.logger)
 		if err != nil {
-			b.logger.Warn("Docker bridge port left unstamped; its container's traffic gets the job's rules, "+
-				"not its step's", "port", l.Name, "bridge", b.links[l.Master].Name, "error", err)
+			if !b.failed[index] {
+				b.failed[index] = true
+				b.logger.Warn("Docker bridge port left unstamped; its container's traffic gets the job's rules, "+
+					"not its step's", "port", l.Name, "bridge", b.links[l.Master].Name, "error", err)
+			}
 			return
 		}
+		delete(b.failed, index)
 		b.ports[index] = na
 	case have:
 		_ = a.Close()

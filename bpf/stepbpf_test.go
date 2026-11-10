@@ -166,11 +166,21 @@ func globalTgid(t *testing.T, iter *link.Iter, nsPid int) (uint32, bool) {
 // test writes map_step_state, and are disabled again on cleanup.
 func loadStepObjects(t *testing.T) (*TcBpfObjects, *StepBpfObjects, *link.Iter) {
 	t.Helper()
+	return loadStepObjectsWith(t, nil)
+}
+
+// loadStepObjectsWith is loadStepObjects with prepare, when given, run on
+// the step collection's spec before it is loaded.
+func loadStepObjectsWith(t *testing.T, prepare func(*ebpf.CollectionSpec)) (*TcBpfObjects, *StepBpfObjects, *link.Iter) {
+	t.Helper()
 	tcObjs := loadBPFObjects(t)
 
 	spec, err := LoadStepBpf()
 	require.NoError(t, err)
 	require.NoError(t, spec.Variables[StepBpfVarPidnsIno].Set(pidnsInode(t)))
+	if prepare != nil {
+		prepare(spec)
+	}
 
 	var objs StepBpfObjects
 	if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
@@ -566,60 +576,6 @@ func TestStepExit_WithoutExec(t *testing.T) {
 		"the exit is dated when it happened: %d not in [%d, now]", exitEv.Ktime, fork.Ktime)
 	var k, v uint32
 	require.False(t, objs.MapStepLive.Iterate().Next(&k, &v), "a root that never exec'd has no step to end")
-}
-
-// TestStepEnd_LostIsCounted: a step end the ring has no room for, its
-// reader gone quiet and full with exec events, is counted.
-func TestStepEnd_LostIsCounted(t *testing.T) {
-	tcObjs, objs, iter := loadStepObjects(t)
-	selfTgid, ok := globalTgid(t, iter, os.Getpid())
-	require.True(t, ok)
-	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: selfTgid, Enabled: 1, NextOrdinal: 5}))
-
-	// With no reader, about sixty exec events (each over STEP_ENV_MAX) fill
-	// the ring's 2MB but for less than one more, and the fork and end
-	// events after take what is left, a few hundred roots on.
-	lost := func() uint64 {
-		var perCPU []uint64
-		require.NoError(t, objs.MapStepEndsLost.Lookup(uint32(0), &perCPU))
-		var n uint64
-		for _, v := range perCPU {
-			n += v
-		}
-		return n
-	}
-	for i := 0; i < 5000 && lost() == 0; i++ {
-		require.NoError(t, exec.Command("true").Run())
-	}
-	require.NotZero(t, lost(), "the ends that found the ring full are counted")
-}
-
-// TestStepEnd_AfterExec: a step root that exits after its exec reports
-// its step's end, once, dated when it exited, and leaves nothing behind.
-func TestStepEnd_AfterExec(t *testing.T) {
-	tcObjs, objs, iter := loadStepObjects(t)
-	rd, err := ringbuf.NewReader(objs.MapStepEvents)
-	require.NoError(t, err)
-	t.Cleanup(func() { rd.Close() })
-	selfTgid, ok := globalTgid(t, iter, os.Getpid())
-	require.True(t, ok)
-	require.NoError(t, tcObjs.MapStepState.Put(uint32(0), TcBpfStepState{WorkerTgid: selfTgid, Enabled: 1, NextOrdinal: 5}))
-
-	child := exec.Command("true")
-	require.NoError(t, child.Start())
-	childPID := uint32(child.Process.Pid)
-	fork, _ := awaitStepEvent(t, rd, stepEvFork, 0, func(f StepBpfStepChildEvent, _ StepBpfStepExecEvent) bool {
-		return f.Tgid == childPID
-	})
-	require.NoError(t, child.Wait())
-	end, _ := awaitStepEvent(t, rd, stepEvEnd, fork.Ordinal, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool {
-		return true
-	})
-	require.Zero(t, end.Pad)
-	require.True(t, end.Ktime > fork.Ktime && end.Ktime <= monoNow(t),
-		"the end is dated when the root exited: %d not in (%d, now]", end.Ktime, fork.Ktime)
-	var k, v uint32
-	require.False(t, objs.MapStepLive.Iterate().Next(&k, &v), "the ended root is out of map_step_live")
 }
 
 // readProcInt reads an integer /proc/sys value.

@@ -19,7 +19,6 @@ package cmd
 import (
 	"log/slog"
 	"net"
-	"os"
 	"os/exec"
 	"slices"
 	"testing"
@@ -31,17 +30,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/cargowall/bpf"
+	"github.com/code-cargo/cargowall/internal/testenv"
 )
-
-// skipUnlessStrict skips t for what the environment lacks, or fails it
-// where CARGOWALL_TEST_STRICT=1 (CI's privileged lanes) says it must not.
-func skipUnlessStrict(t *testing.T, format string, args ...any) {
-	t.Helper()
-	if os.Getenv("CARGOWALL_TEST_STRICT") == "1" {
-		t.Fatalf(format+" (CARGOWALL_TEST_STRICT=1)", args...)
-	}
-	t.Skipf(format, args...)
-}
 
 // stampedPorts is the indexes of the ports b is attached to, sorted, each
 // attached still.
@@ -64,7 +54,7 @@ func stampedPorts(b *bridgeStamp) []int {
 func TestBridgeStampPortsNetns(t *testing.T) {
 	newNetns(t)
 	if _, err := exec.LookPath("ip"); err != nil {
-		skipUnlessStrict(t, "needs iproute2's ip")
+		testenv.SkipUnlessStrict(t, "needs iproute2's ip")
 	}
 	require.NoError(t, rlimit.RemoveMemlock())
 	load := func(stepRules bool) *bpf.TcBpfObjects {
@@ -86,10 +76,10 @@ func TestBridgeStampPortsNetns(t *testing.T) {
 		require.NoError(t, err, "ip %v: %s", args, out)
 	}
 	if out, err := exec.Command("ip", "link", "add", "br-0123456789ab", "type", "bridge").CombinedOutput(); err != nil {
-		skipUnlessStrict(t, "no bridge support: %v: %s", err, out)
+		testenv.SkipUnlessStrict(t, "no bridge support: %v: %s", err, out)
 	}
 	if out, err := exec.Command("ip", "link", "add", "p0h", "type", "veth", "peer", "name", "p0").CombinedOutput(); err != nil {
-		skipUnlessStrict(t, "no veth support: %v: %s", err, out)
+		testenv.SkipUnlessStrict(t, "no veth support: %v: %s", err, out)
 	}
 	ip("link", "add", "virbr9", "type", "bridge")
 	ip("link", "add", "p1h", "type", "veth", "peer", "name", "p1")

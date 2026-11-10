@@ -42,6 +42,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
+	"github.com/code-cargo/cargowall/internal/testenv"
 	"github.com/code-cargo/cargowall/pkg/tc"
 )
 
@@ -112,16 +113,6 @@ const (
 	brForeignMark   uint32 = 0x00010000 | brPolicy // a mark no stamp: its low bits read as brPolicy
 )
 
-// skipUnlessStrict skips t for what the environment lacks, or fails it
-// where CARGOWALL_TEST_STRICT=1 (CI's privileged lanes) says it must not.
-func skipUnlessStrict(t *testing.T, format string, args ...any) {
-	t.Helper()
-	if os.Getenv("CARGOWALL_TEST_STRICT") == "1" {
-		t.Fatalf(format+" (CARGOWALL_TEST_STRICT=1)", args...)
-	}
-	t.Skipf(format, args...)
-}
-
 // TestBridgeStamp drives a container's sockets through the shape Docker
 // gives it: the container's namespace, a veth into the host's, a bridge
 // there with br_netfilter on it, forwarding (masquerading, where iptables
@@ -139,7 +130,11 @@ func skipUnlessStrict(t *testing.T, format string, args ...any) {
 // the port with its socket: BridgeSocketless stays 0.
 //
 // ci-kernels have no bridge or veth: there it skips, and CI's runner
-// kernels run it.
+// kernels run it. On a host without br_netfilter loaded it loads the
+// module, a change to the whole host while it runs (every namespace's
+// bridges are filtered by default then), and unloads it after only if it
+// loaded it and nothing else uses it. The switches it sets are its own
+// namespace's, never the host's.
 func TestBridgeStamp(t *testing.T) {
 	runBridgeStamp(t, true)
 }
@@ -270,16 +265,23 @@ func requireSocketless(t *testing.T, objs *TcBpfObjects, want uint64) {
 	require.Equal(t, want, n, "IP packets at a bridge port's ingress with no socket")
 }
 
-// awaitSocketless waits for the count to pass after.
-func awaitSocketless(t *testing.T, objs *TcBpfObjects, after uint64, what string) uint64 {
+// sendUntilCounted calls send, and again each second it is not yet
+// counted, until the count passes after, and returns the count. One packet
+// alone can be dropped on the way (an IPv6 route not yet there, as a
+// namespace an earlier test made is torn down), and a resend is the same
+// packet.
+func sendUntilCounted(t *testing.T, objs *TcBpfObjects, after uint64, what string, send func()) uint64 {
 	t.Helper()
-	var n uint64
-	require.Eventually(t, func() bool {
-		var err error
-		n, err = objs.BridgeSocketless()
-		return err == nil && n > after
-	}, 5*time.Second, 20*time.Millisecond, "%s reaches the port with no socket, and is counted", what)
-	return n
+	for end := time.Now().Add(10 * time.Second); time.Now().Before(end); {
+		send()
+		for again := time.Now().Add(time.Second); time.Now().Before(again); time.Sleep(20 * time.Millisecond) {
+			if n, err := objs.BridgeSocketless(); err == nil && n > after {
+				return n
+			}
+		}
+	}
+	t.Fatalf("%s never reached the port with no socket and counted", what)
+	return 0
 }
 
 // A packet that reaches a bridge port's ingress with no socket is counted,
@@ -311,9 +313,9 @@ func TestBridgeStampCountsSocketless(t *testing.T) {
 		udp, err := unix.Socket(family, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 		require.NoError(t, err)
 		t.Cleanup(func() { unix.Close(udp) })
-		require.NoError(t, unix.Sendto(udp, []byte("x"), 0, dst))
-		topo.enter(t, topo.rtr)
-		n = awaitSocketless(t, objs, n, fmt.Sprintf("a datagram (family %d) the container forwards", family))
+		n = sendUntilCounted(t, objs, n, fmt.Sprintf("a datagram (family %d) the container forwards", family), func() {
+			require.NoError(t, unix.Sendto(udp, []byte("x"), 0, dst))
+		})
 	}
 
 	topo.enter(t, topo.ctr)
@@ -322,12 +324,17 @@ func TestBridgeStampCountsSocketless(t *testing.T) {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	require.NoError(t, err)
 	t.Cleanup(func() { unix.Close(fd) })
-	require.NoError(t, unix.SetsockoptIPMreqn(fd, unix.IPPROTO_IP, unix.IP_ADD_MEMBERSHIP, &unix.IPMreqn{
-		Multiaddr: [4]byte{239, 1, 2, 3},
-		Ifindex:   int32(c0.Index),
-	}))
+	group := &unix.IPMreqn{Multiaddr: [4]byte{239, 1, 2, 3}, Ifindex: int32(c0.Index)}
+	joined := false
+	// Each join, after a leave, sends a report.
+	sendUntilCounted(t, objs, n, "the IGMP report", func() {
+		if joined {
+			require.NoError(t, unix.SetsockoptIPMreqn(fd, unix.IPPROTO_IP, unix.IP_DROP_MEMBERSHIP, group))
+		}
+		require.NoError(t, unix.SetsockoptIPMreqn(fd, unix.IPPROTO_IP, unix.IP_ADD_MEMBERSHIP, group))
+		joined = true
+	})
 	topo.enter(t, topo.rtr)
-	awaitSocketless(t, objs, n, "the IGMP report")
 }
 
 // markAhead attaches a program that sets mark on every packet at the head
@@ -381,7 +388,7 @@ type bridgeTopology struct {
 func newBridgeTopology(t *testing.T, brNetfilter bool) *bridgeTopology {
 	t.Helper()
 	if _, err := exec.LookPath("ip"); err != nil {
-		skipUnlessStrict(t, "needs iproute2's ip")
+		testenv.SkipUnlessStrict(t, "needs iproute2's ip")
 	}
 	// Ahead of the namespaces, so its cleanup runs after theirs.
 	brNetfilterLoaded := brNetfilter && loadBrNetfilter(t)
@@ -409,10 +416,10 @@ func newBridgeTopology(t *testing.T, brNetfilter bool) *bridgeTopology {
 		ip("-n", ns, "link", "set", "lo", "up")
 	}
 	if out, err := exec.Command("ip", "-n", rtr, "link", "add", "br0", "type", "bridge").CombinedOutput(); err != nil {
-		skipUnlessStrict(t, "no bridge support: %v: %s", err, out)
+		testenv.SkipUnlessStrict(t, "no bridge support: %v: %s", err, out)
 	}
 	if out, err := exec.Command("ip", "-n", rtr, "link", "add", "c0h", "type", "veth", "peer", "name", "c0", "netns", ctr).CombinedOutput(); err != nil {
-		skipUnlessStrict(t, "no veth support: %v: %s", err, out)
+		testenv.SkipUnlessStrict(t, "no veth support: %v: %s", err, out)
 	}
 	// A namespace's own br_netfilter switches, which in a new one start
 	// on once the module is loaded; the host's are never touched.
@@ -472,7 +479,7 @@ func loadBrNetfilter(t *testing.T) bool {
 		return true
 	}
 	if out, err := exec.Command("modprobe", "br_netfilter").CombinedOutput(); err != nil {
-		skipUnlessStrict(t, "cannot load br_netfilter: %v: %s", err, out)
+		testenv.SkipUnlessStrict(t, "cannot load br_netfilter: %v: %s", err, out)
 	}
 	t.Cleanup(func() {
 		if refs, err := os.ReadFile("/sys/module/br_netfilter/refcnt"); err == nil && strings.TrimSpace(string(refs)) == "0" {

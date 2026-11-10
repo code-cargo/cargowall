@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -111,6 +112,7 @@ func newFakeStamp(f *fakePorts, log *bytes.Buffer) *bridgeStamp {
 		links:  make(map[int]network.Link),
 		named:  make(map[string]bool),
 		ports:  make(map[int]tc.Attachment),
+		failed: make(map[int]bool),
 	}
 }
 
@@ -222,8 +224,9 @@ func TestBridgeStamp_TrackerGoneAfterRecreate(t *testing.T) {
 	assert.Empty(t, f.live())
 }
 
-// A port the program can't be attached to is warned, and the rest go on;
-// so is a watch that can't start.
+// A port the program can't be attached to is warned of, once, while the
+// rest go on, and tried again on each report: warned of again only after
+// an attach there worked or it went. So is a watch that can't start.
 func TestBridgeStamp_FailuresWarn(t *testing.T) {
 	f := &fakePorts{
 		initial: []network.Link{bridge(3, "docker0"), port(10, "veth1", "veth", 3), port(11, "veth2", "veth", 3)},
@@ -235,6 +238,20 @@ func TestBridgeStamp_FailuresWarn(t *testing.T) {
 	assert.Equal(t, []int{11}, f.live())
 	assert.Contains(t, log.String(), `level=WARN msg="Docker bridge port left unstamped`)
 	assert.Contains(t, log.String(), "port=veth1 bridge=docker0")
+	warned := func() int { return strings.Count(log.String(), "Docker bridge port left unstamped") }
+	f.onLink(port(10, "veth1", "veth", 3))
+	f.onLink(port(10, "veth1", "veth", 3))
+	assert.Equal(t, 1, warned(), "warned of once")
+	f.onGone(10)
+	f.onLink(port(10, "veth1", "veth", 3))
+	assert.Equal(t, 2, warned(), "a port that went and came is warned of afresh")
+	delete(f.fail, 10)
+	f.onLink(port(10, "veth1", "veth", 3))
+	assert.Equal(t, []int{10, 11}, f.live(), "tried again on its next report")
+	f.fail[10] = errors.New("attach TCX ingress: permission denied")
+	f.links[len(f.links)-1].attached = false
+	f.onLink(port(10, "veth1", "veth", 3))
+	assert.Equal(t, 3, warned(), "warned of afresh after an attach there worked")
 
 	log.Reset()
 	b = newFakeStamp(f, &log)

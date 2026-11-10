@@ -37,6 +37,11 @@ type Link struct {
 	Master int    // the index of the device it is a port of; 0 for none
 }
 
+// linkEventsBuffer is the event socket's receive buffer: room for a burst
+// of containers starting at once. Past it the kernel drops events, and the
+// listing after makes up for them.
+var linkEventsBuffer = 1 << 20
+
 // LinkWatcher reports the interfaces of a network namespace as they come,
 // change and go: see WatchLinks.
 type LinkWatcher struct {
@@ -69,9 +74,7 @@ func WatchLinks(onLink func(Link), onGone func(index int), logger *slog.Logger) 
 		netns.Close()
 		return nil, fmt.Errorf("subscribe to interface events: %w", err)
 	}
-	// Room for a burst of containers starting at once; past it the kernel
-	// drops events, and the listing after makes up for them.
-	_ = events.SetReadBuffer(1 << 20)
+	_ = events.SetReadBuffer(linkEventsBuffer)
 	list, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
 	if err != nil {
 		events.Close()

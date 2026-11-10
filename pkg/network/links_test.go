@@ -17,10 +17,15 @@
 package network
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"log/slog"
 	"net"
 	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -188,4 +193,120 @@ func TestParseLink(t *testing.T) {
 	assert.False(t, ok, "short")
 	_, ok = parseLink(make([]byte, unix.SizeofIfInfomsg))
 	assert.False(t, ok, "no index")
+}
+
+// gatedReports is a LinkWatcher's callbacks that, once held, stop the
+// watcher at its next report until let go, and say when it is stopped.
+type gatedReports struct {
+	mu      sync.Mutex
+	links   map[int]Link
+	held    atomic.Bool
+	gate    chan struct{}
+	stopped chan struct{}
+}
+
+func newGatedReports() *gatedReports {
+	return &gatedReports{links: map[int]Link{}, gate: make(chan struct{}), stopped: make(chan struct{}, 1)}
+}
+
+func (g *gatedReports) wait() {
+	if g.held.Load() {
+		select {
+		case g.stopped <- struct{}{}:
+		default:
+		}
+		<-g.gate
+	}
+}
+
+func (g *gatedReports) onLink(l Link) {
+	g.wait()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.links[l.Index] = l
+}
+
+func (g *gatedReports) onGone(index int) {
+	g.wait()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.links, index)
+}
+
+func (g *gatedReports) named(prefix string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := 0
+	for _, l := range g.links {
+		if strings.HasPrefix(l.Name, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// lockedLog is a log the watcher's goroutine writes while a test reads.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// Events that overrun the socket while the reports are held up are
+// dropped by the kernel; the watcher lists the interfaces again, and
+// reports every one of them.
+func TestWatchLinks_ListsAgainAfterDroppedEvents(t *testing.T) {
+	enterNetns(t)
+	saved := linkEventsBuffer
+	linkEventsBuffer = 1024
+	t.Cleanup(func() { linkEventsBuffer = saved })
+	g := newGatedReports()
+	log := &lockedLog{}
+	w, err := WatchLinks(g.onLink, g.onGone, slog.New(slog.NewTextHandler(log, nil)))
+	require.NoError(t, err)
+	t.Cleanup(func() { w.Close() })
+
+	g.held.Store(true)
+	const burst = 200
+	for i := range burst {
+		require.NoError(t, newLink(fmt.Sprintf("burst%d", i), "dummy", "", nil))
+	}
+	<-g.stopped
+	g.held.Store(false)
+	close(g.gate)
+	require.Eventually(t, func() bool { return g.named("burst") == burst }, 5*time.Second, 10*time.Millisecond,
+		"every interface reported, dropped events or not")
+	assert.Contains(t, log.String(), "Interface events dropped; listing the interfaces again")
+}
+
+// Close returns once the report being made is done, and none comes after.
+func TestWatchLinks_CloseWaitsForTheLastReport(t *testing.T) {
+	enterNetns(t)
+	g := newGatedReports()
+	w, err := WatchLinks(g.onLink, g.onGone, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+
+	g.held.Store(true)
+	require.NoError(t, newLink("p0", "dummy", "", nil))
+	<-g.stopped
+	var closed atomic.Bool
+	go func() {
+		_ = w.Close()
+		closed.Store(true)
+	}()
+	require.Never(t, closed.Load, 200*time.Millisecond, 10*time.Millisecond, "Close waits for the report being made")
+	g.held.Store(false)
+	close(g.gate)
+	require.Eventually(t, closed.Load, 5*time.Second, 10*time.Millisecond)
 }

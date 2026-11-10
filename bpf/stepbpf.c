@@ -188,15 +188,24 @@ struct {
     __uint(max_entries, 1024);
 } map_step_live SEC(".maps");
 
-// Step ends the ring had no room for, per CPU. A lost exec or exit event
-// is made up for from /proc; a lost end leaves its step running as far as
-// userspace knows, and userspace warns of it.
+// Step ends lost, per CPU: one the ring had no room for, or one a root
+// will never report, map_step_live full at its exec. A lost exec or exit
+// event is made up for from /proc; a lost end leaves its step running as
+// far as userspace knows, and userspace warns of it.
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, __u32);
     __type(value, __u64);
     __uint(max_entries, 1);
 } map_step_ends_lost SEC(".maps");
+
+static __always_inline void count_end_lost(void)
+{
+    __u32 k = 0;
+    __u64 *lost = bpf_map_lookup_elem(&map_step_ends_lost, &k);
+    if (lost)
+        *lost += 1;
+}
 
 // One record per task in the daemon's pid-namespace subtree, streamed by
 // cw_step_iter. tid/tgid/ppid are global; ns_tgid is the process id
@@ -369,7 +378,8 @@ static __always_inline void emit_step_exec(struct task_struct *task, __u32 tgid,
         ev->env_len = env_len > 0xffffffff ? 0xffffffff : env_len;
         bpf_ringbuf_submit(ev, 0);
     }
-    bpf_map_update_elem(&map_step_live, &tgid, &ord, BPF_ANY);
+    if (bpf_map_update_elem(&map_step_live, &tgid, &ord, BPF_ANY))
+        count_end_lost();
     bpf_map_delete_elem(&map_step_exec_pending, &tgid);
 }
 
@@ -391,10 +401,7 @@ static __always_inline void emit_step_end(__u32 tgid)
         ev->ktime = bpf_ktime_get_ns();
         bpf_ringbuf_submit(ev, 0);
     } else {
-        __u32 k = 0;
-        __u64 *lost = bpf_map_lookup_elem(&map_step_ends_lost, &k);
-        if (lost)
-            *lost += 1;
+        count_end_lost();
     }
     bpf_map_delete_elem(&map_step_live, &tgid);
 }

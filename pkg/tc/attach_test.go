@@ -32,17 +32,9 @@ import (
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/sys/unix"
-)
 
-// skipUnlessStrict skips t for what the environment lacks, or fails it
-// where CARGOWALL_TEST_STRICT=1 (CI's privileged lanes) says it must not.
-func skipUnlessStrict(t *testing.T, format string, args ...any) {
-	t.Helper()
-	if os.Getenv("CARGOWALL_TEST_STRICT") == "1" {
-		t.Fatalf(format+" (CARGOWALL_TEST_STRICT=1)", args...)
-	}
-	t.Skipf(format, args...)
-}
+	"github.com/code-cargo/cargowall/internal/testenv"
+)
 
 // scratchIndex is the interface index the scratch device takes, so a
 // device recreated behind it takes the same one.
@@ -60,7 +52,7 @@ func scratchNetns(t *testing.T) string {
 	}
 	for _, bin := range []string{"ip", "tc"} {
 		if _, err := exec.LookPath(bin); err != nil {
-			skipUnlessStrict(t, "needs iproute2's %s", bin)
+			testenv.SkipUnlessStrict(t, "needs iproute2's %s", bin)
 		}
 	}
 	// One a run that died left behind, its process gone, is no one's.

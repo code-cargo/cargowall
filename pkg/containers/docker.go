@@ -107,11 +107,14 @@ type containerSummary struct {
 // (only bridge-driver networks are local-only by construction — their routes
 // are on-link; macvlan/ipvlan subnets are physical-network address space)
 // and the IPAM subnets, so networks can be carved without needing a live
-// container on them.
+// container on them. The id and options name a bridge's device
+// (bridgeDevice).
 type networkInspect struct {
-	Name   string `json:"Name"`
-	Driver string `json:"Driver"`
-	IPAM   struct {
+	ID      string            `json:"Id"`
+	Name    string            `json:"Name"`
+	Driver  string            `json:"Driver"`
+	Options map[string]string `json:"Options"`
+	IPAM    struct {
 		Config []struct {
 			Subnet string `json:"Subnet"`
 		} `json:"Config"`

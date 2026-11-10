@@ -18,6 +18,8 @@ type StepBpfStepChildEvent struct {
 	Kind    uint32
 	Tgid    uint32
 	Ordinal uint32
+	Pad     uint32
+	Ktime   uint64
 }
 
 type StepBpfStepEventKind uint32
@@ -26,18 +28,28 @@ const (
 	StepBpfStepEventKindSTEP_EV_FORK StepBpfStepEventKind = 1
 	StepBpfStepEventKindSTEP_EV_EXEC StepBpfStepEventKind = 2
 	StepBpfStepEventKindSTEP_EV_EXIT StepBpfStepEventKind = 3
+	StepBpfStepEventKindSTEP_EV_END  StepBpfStepEventKind = 4
 )
 
 type StepBpfStepExecEvent struct {
-	_       structs.HostLayout
-	Kind    uint32
-	Tgid    uint32
-	Ordinal uint32
-	ArgvLen uint32
-	Argv    [256]int8
-	Comm    [16]int8
-	EnvLen  uint32
-	Env     [32768]int8
+	_         structs.HostLayout
+	Kind      uint32
+	Tgid      uint32
+	Ordinal   uint32
+	ArgvLen   uint32
+	ForkKtime uint64
+	Argv      [256]int8
+	Comm      [16]int8
+	EnvLen    uint32
+	Env       [32768]int8
+	_         [4]byte
+}
+
+type StepBpfStepPending struct {
+	_         structs.HostLayout
+	Ordinal   uint32
+	Pad       uint32
+	ForkKtime uint64
 }
 
 type StepBpfStepState struct {
@@ -61,8 +73,10 @@ type StepBpfTaskIterRec struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	StepBpfMapMapSockStep             = "map_sock_step"
+	StepBpfMapMapStepEndsLost         = "map_step_ends_lost"
 	StepBpfMapMapStepEvents           = "map_step_events"
 	StepBpfMapMapStepExecPending      = "map_step_exec_pending"
+	StepBpfMapMapStepLive             = "map_step_live"
 	StepBpfMapMapStepState            = "map_step_state"
 	StepBpfMapMapTaskNspid            = "map_task_nspid"
 	StepBpfMapMapTaskStep             = "map_task_step"
@@ -132,8 +146,10 @@ type StepBpfProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type StepBpfMapSpecs struct {
 	MapSockStep        *ebpf.MapSpec `ebpf:"map_sock_step"`
+	MapStepEndsLost    *ebpf.MapSpec `ebpf:"map_step_ends_lost"`
 	MapStepEvents      *ebpf.MapSpec `ebpf:"map_step_events"`
 	MapStepExecPending *ebpf.MapSpec `ebpf:"map_step_exec_pending"`
+	MapStepLive        *ebpf.MapSpec `ebpf:"map_step_live"`
 	MapStepState       *ebpf.MapSpec `ebpf:"map_step_state"`
 	MapTaskNspid       *ebpf.MapSpec `ebpf:"map_task_nspid"`
 	MapTaskStep        *ebpf.MapSpec `ebpf:"map_task_step"`
@@ -171,8 +187,10 @@ func (o *StepBpfObjects) Close() error {
 // It can be passed to LoadStepBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type StepBpfMaps struct {
 	MapSockStep        *ebpf.Map `ebpf:"map_sock_step"`
+	MapStepEndsLost    *ebpf.Map `ebpf:"map_step_ends_lost"`
 	MapStepEvents      *ebpf.Map `ebpf:"map_step_events"`
 	MapStepExecPending *ebpf.Map `ebpf:"map_step_exec_pending"`
+	MapStepLive        *ebpf.Map `ebpf:"map_step_live"`
 	MapStepState       *ebpf.Map `ebpf:"map_step_state"`
 	MapTaskNspid       *ebpf.Map `ebpf:"map_task_nspid"`
 	MapTaskStep        *ebpf.Map `ebpf:"map_task_step"`
@@ -181,8 +199,10 @@ type StepBpfMaps struct {
 func (m *StepBpfMaps) Close() error {
 	return _StepBpfClose(
 		m.MapSockStep,
+		m.MapStepEndsLost,
 		m.MapStepEvents,
 		m.MapStepExecPending,
+		m.MapStepLive,
 		m.MapStepState,
 		m.MapTaskNspid,
 		m.MapTaskStep,

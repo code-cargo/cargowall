@@ -475,7 +475,10 @@ func TestStart_TagsWorkerChild(t *testing.T) {
 	require.NoError(t, objs.MapTaskNspid.Lookup(selfTgid, &got))
 	assert.Equal(t, uint32(os.Getpid()), got)
 
+	// Named as a step, as the runner names one: OrdinalAt passes over
+	// roots that are no step.
 	child := exec.Command("sleep", "5")
+	child.Env = append(os.Environ(), "GITHUB_ACTION=tags-worker-child")
 	require.NoError(t, child.Start())
 	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
 	childPID := child.Process.Pid
@@ -493,6 +496,10 @@ func TestStart_TagsWorkerChild(t *testing.T) {
 	assert.GreaterOrEqual(t, ordinal, uint32(100))
 	require.NoError(t, objs.MapTaskNspid.Lookup(childTgid, &got))
 	assert.Equal(t, uint32(childPID), got)
+
+	lost, err := tr.endsLost()
+	require.NoError(t, err)
+	assert.Zero(t, lost, "no step end lost")
 
 	// The reconciler saw the boundary event (its tgid is our numbering, so
 	// the cmdline read behind it works too — visible in -v output).

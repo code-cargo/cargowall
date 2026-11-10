@@ -45,6 +45,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 	"unsafe"
 
@@ -116,6 +117,13 @@ type Tracker struct {
 	// boundary type.
 	boundaryMu sync.Mutex
 	boundaries []boundary
+
+	// endsLost counts the step ends the kernel had no room to report
+	// (map_step_ends_lost), read by run() at most every reportAfter;
+	// endsLostSeen is what it has warned of. See checkEndsLost.
+	endsLost        func() (uint64, error)
+	endsLostSeen    uint64
+	endsLostChecked time.Time
 
 	// DNS-path client attribution (sock_diag lookups, caching, map joins) —
 	// see clientResolver. Constructed in Start, closed in Close.
@@ -263,6 +271,7 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		return nil, fmt.Errorf("failed to create step event reader: %w", err)
 	}
 	t.reader = rd
+	t.endsLost = func() (uint64, error) { return sumPerCPU(t.objs.MapStepEndsLost) }
 	go t.run()
 
 	return t, nil

@@ -44,11 +44,12 @@ const (
 	stepEvFork = uint32(StepBpfStepEventKindSTEP_EV_FORK)
 	stepEvExec = uint32(StepBpfStepEventKindSTEP_EV_EXEC)
 	stepEvExit = uint32(StepBpfStepEventKindSTEP_EV_EXIT)
+	stepEvEnd  = uint32(StepBpfStepEventKindSTEP_EV_END)
 )
 
 // readStepEvent reads the next step event: its kind, and the event decoded
-// as the struct its kind says it is: a fork or an exit is a child event,
-// exactly that size, and an exec an exec event.
+// as the struct its kind says it is: a fork, an exit or an end is a child
+// event, exactly that size, and an exec an exec event.
 func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEvent, StepBpfStepExecEvent) {
 	t.Helper()
 	record, err := rd.Read()
@@ -58,7 +59,7 @@ func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEv
 	var fork StepBpfStepChildEvent
 	var execEv StepBpfStepExecEvent
 	switch kind := *(*uint32)(unsafe.Pointer(&raw[0])); kind {
-	case stepEvFork, stepEvExit:
+	case stepEvFork, stepEvExit, stepEvEnd:
 		require.Len(t, raw, int(unsafe.Sizeof(fork)))
 		fork = *(*StepBpfStepChildEvent)(unsafe.Pointer(&raw[0]))
 		return kind, fork, execEv
@@ -70,6 +71,14 @@ func readStepEvent(t *testing.T, rd *ringbuf.Reader) (uint32, StepBpfStepChildEv
 		t.Fatalf("unknown step event kind %d", kind)
 		return 0, fork, execEv
 	}
+}
+
+// monoNow reads CLOCK_MONOTONIC, the clock bpf_ktime_get_ns reads.
+func monoNow(t *testing.T) uint64 {
+	t.Helper()
+	var ts unix.Timespec
+	require.NoError(t, unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts))
+	return uint64(ts.Nano())
 }
 
 // argvOf returns the argument bytes an exec event copied.
@@ -157,11 +166,21 @@ func globalTgid(t *testing.T, iter *link.Iter, nsPid int) (uint32, bool) {
 // test writes map_step_state, and are disabled again on cleanup.
 func loadStepObjects(t *testing.T) (*TcBpfObjects, *StepBpfObjects, *link.Iter) {
 	t.Helper()
+	return loadStepObjectsWith(t, nil)
+}
+
+// loadStepObjectsWith is loadStepObjects with prepare, when given, run on
+// the step collection's spec before it is loaded.
+func loadStepObjectsWith(t *testing.T, prepare func(*ebpf.CollectionSpec)) (*TcBpfObjects, *StepBpfObjects, *link.Iter) {
+	t.Helper()
 	tcObjs := loadBPFObjects(t)
 
 	spec, err := LoadStepBpf()
 	require.NoError(t, err)
 	require.NoError(t, spec.Variables[StepBpfVarPidnsIno].Set(pidnsInode(t)))
+	if prepare != nil {
+		prepare(spec)
+	}
 
 	var objs StepBpfObjects
 	if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
@@ -236,8 +255,10 @@ func TestStepFork(t *testing.T) {
 		NextOrdinal: wantOrdinal,
 	}))
 
+	before := monoNow(t)
 	child := exec.Command("sleep", "1")
 	require.NoError(t, child.Start())
+	after := monoNow(t)
 	childPID := uint32(child.Process.Pid)
 	defer func() { _ = child.Wait() }()
 
@@ -261,12 +282,16 @@ func TestStepFork(t *testing.T) {
 	})
 	require.Equal(t, got, fork.Ordinal, "map tag and boundary event must agree")
 	require.GreaterOrEqual(t, fork.Ordinal, uint32(wantOrdinal))
+	require.Zero(t, fork.Pad)
+	require.True(t, fork.Ktime >= before && fork.Ktime <= after,
+		"the fork is dated when it happened: %d not in [%d, %d]", fork.Ktime, before, after)
 
 	// Its first exec says what it runs, under the same ordinal and pid.
 	_, execEv := awaitStepEvent(t, rd, stepEvExec, fork.Ordinal, func(StepBpfStepChildEvent, StepBpfStepExecEvent) bool {
 		return true
 	})
 	require.Equal(t, childPID, execEv.Tgid)
+	require.Equal(t, fork.Ktime, execEv.ForkKtime, "the exec event carries the fork's time")
 	require.Equal(t, "sleep\x001\x00", argvOf(execEv))
 	comm := unsafe.Slice((*byte)(unsafe.Pointer(&execEv.Comm[0])), len(execEv.Comm))
 	require.Equal(t, "sleep", strings.TrimRight(string(comm), "\x00"), "the exec event carries the program's name")
@@ -347,7 +372,7 @@ func TestStepExec_CarriesEnvironment(t *testing.T) {
 
 // TestStepExec_FirstExecOnly: a step root that execs again (a shell's
 // `exec`) is reported once, for what the worker started; its later exec
-// and its exit say nothing.
+// says nothing, and its exit only ends the step, once.
 func TestStepExec_FirstExecOnly(t *testing.T) {
 	tcObjs, objs, iter := loadStepObjects(t)
 	rd, err := ringbuf.NewReader(objs.MapStepEvents)
@@ -366,8 +391,9 @@ func TestStepExec_FirstExecOnly(t *testing.T) {
 		return e.Tgid == pid
 	})
 	require.Equal(t, "sh\x00-c\x00exec true\x00", argvOf(first))
-	// Drain what is left: nothing more for this ordinal.
+	// Drain what is left: nothing more for this ordinal but its end.
 	rd.SetDeadline(time.Now().Add(200 * time.Millisecond))
+	ends := 0
 	for {
 		record, err := rd.Read()
 		if err != nil {
@@ -378,9 +404,14 @@ func TestStepExec_FirstExecOnly(t *testing.T) {
 		// Every kind carries its ordinal at the same offset.
 		if kind := *(*uint32)(unsafe.Pointer(&raw[0])); len(raw) >= 12 && kind != stepEvFork {
 			ord := *(*uint32)(unsafe.Pointer(&raw[8]))
+			if kind == stepEvEnd && ord == first.Ordinal {
+				ends++
+				continue
+			}
 			require.NotEqual(t, first.Ordinal, ord, "a second event (kind %d) for the step", kind)
 		}
 	}
+	require.Equal(t, 1, ends, "the root's exit ends the step, once")
 }
 
 // TestHelperExecFromThread is not a test: TestStepExec_FromThreadKeepsTag
@@ -540,6 +571,11 @@ func TestStepExit_WithoutExec(t *testing.T) {
 		return true
 	})
 	require.Equal(t, fork.Tgid, exitEv.Tgid)
+	require.Zero(t, exitEv.Pad)
+	require.True(t, exitEv.Ktime >= fork.Ktime && exitEv.Ktime <= monoNow(t),
+		"the exit is dated when it happened: %d not in [%d, now]", exitEv.Ktime, fork.Ktime)
+	var k, v uint32
+	require.False(t, objs.MapStepLive.Iterate().Next(&k, &v), "a root that never exec'd has no step to end")
 }
 
 // readProcInt reads an integer /proc/sys value.
@@ -761,7 +797,7 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 
 	var ev StepBpfStepChildEvent
 	require.Equal(t, uint32(unsafe.Sizeof(ev)), st.Size, "struct size")
-	require.Len(t, st.Members, 3)
+	require.Len(t, st.Members, 5)
 	for i, w := range []struct {
 		name string
 		off  uintptr
@@ -769,6 +805,8 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 		{"kind", unsafe.Offsetof(ev.Kind)},
 		{"tgid", unsafe.Offsetof(ev.Tgid)},
 		{"ordinal", unsafe.Offsetof(ev.Ordinal)},
+		{"pad", unsafe.Offsetof(ev.Pad)},
+		{"ktime", unsafe.Offsetof(ev.Ktime)},
 	} {
 		require.Equal(t, w.name, st.Members[i].Name)
 		require.Equal(t, w.off, uintptr(st.Members[i].Offset.Bytes()))
@@ -780,7 +818,7 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 	require.True(t, ok, "step_exec_event must be a struct, got %T", typ)
 	var execEv StepBpfStepExecEvent
 	require.Equal(t, uint32(unsafe.Sizeof(execEv)), st.Size, "struct size")
-	require.Len(t, st.Members, 8)
+	require.Len(t, st.Members, 9)
 	for i, w := range []struct {
 		name string
 		off  uintptr
@@ -789,6 +827,7 @@ func TestStepChildEventLayoutMatchesBTF(t *testing.T) {
 		{"tgid", unsafe.Offsetof(execEv.Tgid)},
 		{"ordinal", unsafe.Offsetof(execEv.Ordinal)},
 		{"argv_len", unsafe.Offsetof(execEv.ArgvLen)},
+		{"fork_ktime", unsafe.Offsetof(execEv.ForkKtime)},
 		{"argv", unsafe.Offsetof(execEv.Argv)},
 		{"comm", unsafe.Offsetof(execEv.Comm)},
 		{"env_len", unsafe.Offsetof(execEv.EnvLen)},

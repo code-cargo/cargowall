@@ -87,6 +87,7 @@ type TcBpfStepState struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	TcBpfMapMapAuditMode          = "map_audit_mode"
+	TcBpfMapMapBrSockless         = "map_br_sockless"
 	TcBpfMapMapCidrs              = "map_cidrs"
 	TcBpfMapMapCidrsV6            = "map_cidrs_v6"
 	TcBpfMapMapDefaultAction      = "map_default_action"
@@ -105,6 +106,7 @@ const (
 	TcBpfProgCwCgConnect6         = "cw_cg_connect6"
 	TcBpfProgCwCgSendmsg4         = "cw_cg_sendmsg4"
 	TcBpfProgCwCgSendmsg6         = "cw_cg_sendmsg6"
+	TcBpfProgCwTcBrStamp          = "cw_tc_br_stamp"
 	TcBpfProgCwTcEgress           = "cw_tc_egress"
 	TcBpfProgCwTcIngress          = "cw_tc_ingress"
 	TcBpfVarBtfAnchorBlockedEvent = "btf_anchor_blocked_event"
@@ -157,6 +159,7 @@ type TcBpfProgramSpecs struct {
 	CwCgConnect6 *ebpf.ProgramSpec `ebpf:"cw_cg_connect6"`
 	CwCgSendmsg4 *ebpf.ProgramSpec `ebpf:"cw_cg_sendmsg4"`
 	CwCgSendmsg6 *ebpf.ProgramSpec `ebpf:"cw_cg_sendmsg6"`
+	CwTcBrStamp  *ebpf.ProgramSpec `ebpf:"cw_tc_br_stamp"`
 	CwTcEgress   *ebpf.ProgramSpec `ebpf:"cw_tc_egress"`
 	CwTcIngress  *ebpf.ProgramSpec `ebpf:"cw_tc_ingress"`
 }
@@ -166,6 +169,7 @@ type TcBpfProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type TcBpfMapSpecs struct {
 	MapAuditMode       *ebpf.MapSpec `ebpf:"map_audit_mode"`
+	MapBrSockless      *ebpf.MapSpec `ebpf:"map_br_sockless"`
 	MapCidrs           *ebpf.MapSpec `ebpf:"map_cidrs"`
 	MapCidrsV6         *ebpf.MapSpec `ebpf:"map_cidrs_v6"`
 	MapDefaultAction   *ebpf.MapSpec `ebpf:"map_default_action"`
@@ -211,6 +215,7 @@ func (o *TcBpfObjects) Close() error {
 // It can be passed to LoadTcBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TcBpfMaps struct {
 	MapAuditMode       *ebpf.Map `ebpf:"map_audit_mode"`
+	MapBrSockless      *ebpf.Map `ebpf:"map_br_sockless"`
 	MapCidrs           *ebpf.Map `ebpf:"map_cidrs"`
 	MapCidrsV6         *ebpf.Map `ebpf:"map_cidrs_v6"`
 	MapDefaultAction   *ebpf.Map `ebpf:"map_default_action"`
@@ -230,6 +235,7 @@ type TcBpfMaps struct {
 func (m *TcBpfMaps) Close() error {
 	return _TcBpfClose(
 		m.MapAuditMode,
+		m.MapBrSockless,
 		m.MapCidrs,
 		m.MapCidrsV6,
 		m.MapDefaultAction,
@@ -263,6 +269,7 @@ type TcBpfPrograms struct {
 	CwCgConnect6 *ebpf.Program `ebpf:"cw_cg_connect6"`
 	CwCgSendmsg4 *ebpf.Program `ebpf:"cw_cg_sendmsg4"`
 	CwCgSendmsg6 *ebpf.Program `ebpf:"cw_cg_sendmsg6"`
+	CwTcBrStamp  *ebpf.Program `ebpf:"cw_tc_br_stamp"`
 	CwTcEgress   *ebpf.Program `ebpf:"cw_tc_egress"`
 	CwTcIngress  *ebpf.Program `ebpf:"cw_tc_ingress"`
 }
@@ -273,6 +280,7 @@ func (p *TcBpfPrograms) Close() error {
 		p.CwCgConnect6,
 		p.CwCgSendmsg4,
 		p.CwCgSendmsg6,
+		p.CwTcBrStamp,
 		p.CwTcEgress,
 		p.CwTcIngress,
 	)

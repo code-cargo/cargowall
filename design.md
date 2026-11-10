@@ -832,7 +832,29 @@ to select policy with.
     dockerd reports the container started, or an exec run in it, with the
     step running at that moment (see Container Attribution), so a service
     container started in step 2 is governed by step 2's policy for its
-    lifetime unless an exec re-tags it.
+    lifetime unless an exec re-tags it. The tag is by time, not by cause:
+    whatever drives dockerd while step 2 runs starts containers with step
+    2's tag. Two things keep the time honest. A step starts at its root's
+    fork as the kernel timed it (`bpf_ktime_get_ns` on the fork event,
+    and on the exec event too, for a reader that lost the fork's), not
+    when the reader got to the event. And a root identified as no step
+    (a runner helper, or a copy of Runner.Worker that exits without
+    exec'ing) does not end a step whose root is still running; one forked
+    between steps (a step root's exit is recorded too) does, and is bound
+    no rules, so what it starts gets the job's rules, not the ended step's.
+    A root not identified yet, or never, counts as a step, and is bound no
+    rules. The runner's own docker CLI calls carry no step environment:
+    "Initialize containers" starts job and service containers before any
+    step, so they resolve to those calls and get the job's rules, as does
+    whatever a local action's image build starts, between steps. The
+    `docker run` of a container action, and the `docker exec` a container
+    job runs each step as, carry the step's environment, so the action's
+    container, and each step's exec, get that step's tag. A step root's
+    end lost (the ring full, or `map_step_live` full at its exec) leaves
+    it running as far as this goes, until the next step starts: what a
+    no-step root forked in that window starts gets that step's rules,
+    wider than the job's but no wider than the step that last ran. The
+    kernel counts each lost end, and the tracker warns, naming the step.
   - *What per-step rules do not separate.* They bound what each step's own
     processes reach. Steps of one job share a uid, the workspace and
     dockerd, so a step can shape what a later one runs, or share a socket
@@ -843,13 +865,65 @@ to select policy with.
     each other, the boundary is the job.
   - *Where the two hooks differ.* Both read the same tag for the same
     socket, with two exceptions. TC sees a bridge-networked container's
-    packets post-NAT with no socket, and judges them by the job's rules:
-    a destination only the container's step allows passes the cgroup hook
-    and is still dropped at TC, until the bridge stamp carries the step's
-    policy past NAT. And a SYN-ACK is sent from a request socket, which TC
-    reads as untagged (the job's rules) while the cgroup hook reads the
-    listener's tag; the stricter wins, fail-closed. Accepted sockets carry
-    no tag, so both hooks judge them by the job's rules.
+    packets post-NAT with no socket, and reads the step's policy from the
+    bridge stamp instead (below). And a SYN-ACK is sent from a request
+    socket, which TC reads as untagged (the job's rules) while the cgroup
+    hook reads the listener's tag; the stricter wins, fail-closed.
+    Accepted sockets carry no tag, so both hooks judge them by the job's
+    rules.
+  - *The bridge stamp.* `cw_tc_br_stamp`, at the TC ingress of each
+    Docker bridge port (a container veth's host end), still sees the
+    container's socket. That hook runs in `__netif_receive_skb_core`
+    before the port's rx_handler, `br_handle_frame`, and the first orphan
+    on the path comes after it: br_netfilter's `setup_pre_routing`, under
+    `br_nf_pre_routing` in the bridge's input, where
+    `bridge-nf-call-iptables`/`-ip6tables` are on (as Docker sets them),
+    else `ip_rcv_core` (since 4.19, 9c4c325252c5, below the 5.8 floor).
+    The veth crossing and the bridge's own input orphan nothing (read at
+    v5.15 and v6.6). For a socket whose step has a policy the program
+    writes `0xCA1B0000 | policy` into the packet's mark, which rides the
+    bridge, br_netfilter, forwarding and NAT to the uplink, where
+    `cw_tc_egress` reads it for a packet with no socket, and only then. A
+    stamp can only add a step's allowances: a packet that reaches the
+    uplink without one is judged by the job's rules, never wider, so a
+    kernel that broke the premise would leave container traffic
+    fail-closed. A container cannot forge a stamp: the mark is cleared as
+    a packet leaves the container's namespace, and the port program clears
+    a stamp it did not write. It stamps no packet that already carries
+    another mark, nor a policy past `0xFFFF`. Premises: no rule of the
+    host's sets or changes a forwarded packet's mark in the `0xCA1B` range
+    between the port and the uplink, and every container path to the
+    uplink either clears the mark at a namespace boundary or carries the
+    container's socket. Where neither holds the root premise does: a
+    root-installed program ahead of the stamp at a port's head, or on a
+    path that crosses no stamped port (a plain routed veth, macvlan or
+    ipvlan, whose packets a container with `NET_ADMIN` forwards), can set
+    a mark that is read as a stamp; dockerd grants `NET_ADMIN` to any
+    caller, and a step that can drive dockerd is beyond step rules anyway
+    (see Sudo lockdown). `cmd/bridge_stamp.go` keeps the program on every
+    port there is: rtnetlink's interface events (`network.WatchLinks`)
+    say which veths have a Docker bridge (`network.DockerBridge`'s names,
+    or one the container tracker reports) for their master, by index,
+    and a listing makes up for events the kernel dropped. It runs only
+    with step rules on.
+  - *Checking the premise.* The port program counts the IP packets that
+    reach it with no socket (`map_br_sockless`, per CPU;
+    `TcBpfObjects.BridgeSocketless` sums them), on whatever kernel the job
+    runs: a container's own flows keep the count at 0. Packets with no
+    socket by nature count too: IGMP reports, which the kernel builds
+    without one (a container joining an IPv4 group sends them), and
+    packets a container forwards from a namespace of its own (a nested
+    netns, docker-in-docker). IPv6's neighbor discovery and MLD carry the
+    kernel's socket, and don't count.
+  - *Host-only step rules.* Where the stamp cannot apply, a container's
+    traffic gets the job's rules at TC, never wider: a port the program
+    could not be attached to (warned), a port's packets before the attach
+    lands (on a bridge with a name of its network's choosing, until the
+    stamp has taken the tracker's report of it, which it does on a worker
+    of its own; `docker0` and `br-<id>` are known from the start), a
+    daemon whose bridges are in another network namespace, and a run with
+    no container tracking. Step rules then reach the host's
+    processes alone.
   - The denial UX above applies: UDP fails fast with `EPERM`, TCP times
     out.
 
@@ -906,6 +980,7 @@ documented residuals.
   - Best-effort with a Warn at both call sites: idle entries age out in 30–120s, but an actively-used flow (an open DNS-over-TCP stream) refreshes its entry indefinitely — exactly the flow the flush exists to kill, which is why a failed flush is warned loudly rather than ignored
   - Synthetic names (#126): systemd-resolved answers `_gateway`, `_outbound`, `_localdnsstub`, `_localdnsproxy`, the machine's own hostname (its configured name and, when it carries a domain, its first label — read per lookup, so a rename mid-run is honoured; `/etc/hosts` does not always pin it, and `sudo` warns on every invocation when it fails) and the RFC 6761 localhost family (`localhost`, `localhost.localdomain`, anything beneath either) from local state and never sends them upstream. With the stub DNAT'd and the proxy's upstream deliberately the resolver *behind* resolved, they would NXDOMAIN for the whole run — REFUSED under enforce, silently under audit, where no connection is ever attempted and nothing is logged (`/etc/hosts` covers only the exact name `localhost`). The proxy relays them to the stub on its marked client socket (`pkg/dns/synthetic.go`; the mark return rules pass it through the stub DNAT, as they do the startup cache peek) and writes resolved's own answer back — uncached. `_gateway`, `_outbound` and the machine names get L4 enforcement and attribution like any upstream answer (#129): a hostname rule naming `_gateway` opens the gateway's address on its ports, a deny rule closes it, and with no rule the connection is attributed to `_gateway` rather than a bare IP. They mint no L7 forward-resolution evidence — `enforceDNSResponse(…, localAnswer)` at the synthetic call site, and startup pre-population records its answers through `dns.Server.RecordSystemCacheAnswer`, the same policy: a tracked alias mapped without evidence, a loopback listener recorded nowhere at all — because an alias is never a name the peer presents, and binding it would L7-scope the address against a name no flow can show: an all-ports allow would then drop HTTP to the host agent for carrying `Host: <ip>`. SCOPE IFF BOUND makes the omission sufficient; nothing in the L7 matcher knows about synthetic names. `_localdnsstub`, `_localdnsproxy` and the localhost family are relayed only: loopback, which the proxy's own relay and cache peek depend on, and any label under `.localhost` is accepted, so tracking them would grow the per-host maps without bound. The mDNS `<hostname>.local` form is not relayed: resolved renames it on conflict, and a `.local` query it does not synthesize is multicast to the LAN, whose answer is not local state. Ahead of the filter gate; host listeners and IN class only (a container's native path never resolved them). A stub that does not answer — resolved stopped, or never installed — sends the query down the ordinary path; `/run/systemd/resolve` outlives a stopped resolved (`RuntimeDirectoryPreserve=yes`), so directory presence is no probe, and the connection-refused round trip on loopback is the cheapest true one. The search-expanded form a stub resolver tries first (`<name>.<search>`, for a suffix on the host's own `resolv.conf` search list) is answered NXDOMAIN locally for every one of these names — what the upstream says natively — rather than REFUSED, which c-ares treats as terminal on a multi-label attempt and which therefore left `_gateway` unresolvable for c-ares clients under enforce; it is never relayed to the stub, which would send it upstream unmarked and DNAT it back into the proxy. This is specific to names resolved synthesizes, whose expanded form never exists; for a real host the expanded form is the name that resolves (#127). Residual: a machine hostname that is also a real DNS name resolves to resolved's synthesized local address rather than the upstream record — inherent to making the machine hostname resolve at all, and what the host does natively, since resolved synthesizes its own name before any upstream lookup
 - **Sudo lockdown:** appends the lockdown's rules as the last lines of `/etc/sudoers`; also writes them to `/etc/sudoers.d/zz-cargowall-lockdown` as a harmless duplicate; disables competing sudoers.d files by renaming them to `*.cargowall-disabled` (for reporting); removes the runner user from sudo-granting groups (`sudo`, `admin`, `wheel`) and the `docker` group
+  - Per-step rules rest on it: a step with root, or with the docker socket the lockdown leaves it (see the premise below), could re-tag its sockets or mark its packets, and could reach anything the run allows any step. They bound what each step's own processes reach, and do not isolate steps from each other: between steps that do not trust each other, the boundary is the job
   - **The rules deny first.** The first denies the user every command (`<user> ALL=(ALL:ALL) !ALL`), and the NOPASSWD allowlist follows. Sudoers is last-match-wins, so once read last they hold against any grant read before them, a group's included. Classic sudo and sudo-rs both honour it
   - **Group removal reaches later logins only.** A running process keeps the supplementary groups it started with, and every job step descends from a `Runner.Worker` that started before the lockdown. A `%group` grant therefore still matches for steps under classic sudo, which checks the process's groups; sudo-rs reads the group database. The deny-first rules are what hold against it; the removal still covers later logins
   - **The guarantee: our rules are the last lines sudo reads.** The rules are appended to the end of `/etc/sudoers`, between marker comments, validated with `visudo` before an atomic rename that keeps the file's mode and owner. sudoers is last-match-wins and expands an `@include`/`@includedir` where it stands, so lines at the end of `/etc/sudoers` are read after every `sudoers.d` file and every nested include — whatever they contain, however a grant in them is spelled, and wherever a second includedir or a single-file include points. So the lockdown needs no reader that can tell a grant in those files from an inert line. On an image whose `/etc/sudoers` grants the `sudo` group and includes no `sudoers.d` (the Actions Runner Controller image), and on a distro whose `/etc/sudoers` ends with the includedir, the block goes to the same place: the end. The block is removed by its markers when the lockdown ends, on rollback, and on a stale-state cleanup; `/etc/sudoers` is restored byte for byte, the no-final-newline case included. Nothing else in the file changes. The `sudoers.d` file is a duplicate of the same rules: read earlier on a distro that includes the directory, never read on an image that does not, and load-bearing in neither case — except as the fallback where `/etc/sudoers` cannot be replaced (below)

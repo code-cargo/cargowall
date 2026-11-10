@@ -24,6 +24,7 @@
 #include "verdict.h"
 
 // TC action return codes
+#define TC_ACT_UNSPEC (-1)
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
 
@@ -686,6 +687,48 @@ int cw_tc_egress(struct __sk_buff *skb) {
 
     // Allow non-IP protocols (ARP, etc.) - required for basic networking
     return TC_ACT_OK;
+}
+
+// IP packets that reached a Docker bridge port's ingress with no socket,
+// per CPU (see cw_tc_br_stamp). The stamp rests on the kernel keeping a
+// container's socket on its packets until then: a container's own flows
+// keep this at 0, on whatever kernel the job runs. Packets with no socket
+// by nature count too: see "Checking the premise" in design.md.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, 1);
+} map_br_sockless SEC(".maps");
+
+// Bridge stamp, at a Docker bridge port's ingress: see the bridge stamp
+// section of verdict.h. It stamps a packet whose socket's step has a policy, and
+// clears a stamp it finds on any other; it never touches a mark that is not
+// a stamp, and leaves a packet that carries one unstamped (the job's rules
+// at TC, fail-closed). It counts an IP packet with no socket in
+// map_br_sockless. TC_ACT_UNSPEC, not TC_ACT_OK: a marker must not end
+// the port's chain. Under TCX it is TCX_NEXT, the next program's turn;
+// for a direct-action cls_bpf filter, classification goes on to the next
+// filter; at the end of either the packet passes.
+SEC("classifier/br_stamp")
+int cw_tc_br_stamp(struct __sk_buff *skb) {
+    if (!step_rules_enabled)
+        return TC_ACT_UNSPEC;
+    __u64 cookie = bpf_get_socket_cookie(skb);
+    if (!cookie && (skb->protocol == bpf_htons(ETH_P_IP) || skb->protocol == bpf_htons(ETH_P_IPV6))) {
+        __u32 k = 0;
+        __u64 *n = bpf_map_lookup_elem(&map_br_sockless, &k);
+        if (n)
+            *n += 1;
+    }
+    __u32 policy = cookie ? cookie_step_policy(cookie) : POLICY_JOB;
+    __u32 mark = skb->mark;
+    __u8 ours = (mark & STEP_STAMP_MASK) == STEP_STAMP_MAGIC;
+    if (policy != POLICY_JOB && policy <= STEP_STAMP_POLICY_MAX && (mark == 0 || ours))
+        skb->mark = STEP_STAMP_MAGIC | policy;
+    else if (ours)
+        skb->mark = 0;
+    return TC_ACT_UNSPEC;
 }
 
 // Handle ingress traffic - currently just allows everything

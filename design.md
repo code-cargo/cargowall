@@ -850,9 +850,11 @@ to select policy with.
     `docker run` of a container action, and the `docker exec` a container
     job runs each step as, carry the step's environment, so the action's
     container, and each step's exec, get that step's tag. A step root's
-    exit event lost (the ring full) leaves it running as far as this
-    goes, so a no-step root after it is passed over: the kernel counts
-    each, and the tracker warns of them, naming the step.
+    end lost (the ring full, or `map_step_live` full at its exec) leaves
+    it running as far as this goes, until the next step starts: what a
+    no-step root forked in that window starts gets that step's rules,
+    wider than the job's but no wider than the step that last ran. The
+    kernel counts each lost end, and the tracker warns, naming the step.
   - *What per-step rules do not separate.* They bound what each step's own
     processes reach. Steps of one job share a uid, the workspace and
     dockerd, so a step can shape what a later one runs, or share a socket

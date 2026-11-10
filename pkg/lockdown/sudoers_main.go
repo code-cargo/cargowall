@@ -16,14 +16,16 @@
 
 package lockdown
 
-// The lockdown's rules hold only where sudo reads them last: sudoers is
-// last-match-wins, so a grant read after them still matches. The lockdown
-// file in sudoers.d is read last when /etc/sudoers ends by including that
-// directory, as Debian and Ubuntu ship it. An image whose /etc/sudoers does
-// not, such as one that wrote the file from scratch to grant a group, never
-// reads the lockdown file at all, or reads lines after it; there the same
-// rules are appended to /etc/sudoers itself, between markers, and removed
-// again when the lockdown ends. Nothing else in the file is touched.
+// The lockdown's rules hold because sudo reads them last: sudoers is
+// last-match-wins, so a grant read after them would still match. They are
+// appended as the last lines of /etc/sudoers, between markers, on every
+// shape — a distro file that ends by including sudoers.d as well as an image
+// that wrote the file from scratch to grant a group. sudoers expands an
+// include where it stands, so those lines are read after every sudoers.d file
+// and every nested include, whatever they hold. They are removed again when
+// the lockdown ends, and nothing else in the file is touched. Where
+// /etc/sudoers cannot be replaced (a bind-mounted file), the lockdown falls
+// back to its sudoers.d file, a weaker guarantee that the log names.
 
 import (
 	"errors"
@@ -61,6 +63,28 @@ func isBeginMarker(line string) (addedNL, ok bool) {
 		return true, true
 	}
 	return false, false
+}
+
+// sudoRsSudoers is the file sudo-rs reads in preference to /etc/sudoers when
+// it exists. A var so tests can point it at a scratch file.
+var sudoRsSudoers = "/etc/sudoers-rs"
+
+// renameFile swaps a validated temp file over a sudoers file. A var so tests
+// can make the rename fail the way a bind-mounted file does.
+var renameFile = os.Rename
+
+// errSudoersNotReplaceable is a sudoers file that cannot be replaced by
+// rename: a bind-mounted file (a Kubernetes ConfigMap subPath, a file a
+// container runtime binds in) is a mount point, and rename onto it fails with
+// EBUSY; a read-only filesystem fails with EROFS. It is never written in
+// place instead: such a mount is usually read-only anyway, and a torn write
+// would break sudo for everyone.
+var errSudoersNotReplaceable = errors.New("sudoers file cannot be replaced")
+
+// notReplaceable reports whether err is a rename or create failure that
+// means the file cannot be replaced at all, rather than a transient error.
+func notReplaceable(err error) bool {
+	return errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.EROFS)
 }
 
 // visudoCheckFile validates a candidate sudoers file, includes and all. A
@@ -212,6 +236,9 @@ func replaceSudoers(main, content string) error {
 	}
 	f, err := os.CreateTemp(filepath.Dir(main), sudoersTempPrefix+"*")
 	if err != nil {
+		if notReplaceable(err) {
+			return fmt.Errorf("%w: create a temp file beside %s: %w", errSudoersNotReplaceable, main, err)
+		}
 		return fmt.Errorf("create a temp file beside %s: %w", main, err)
 	}
 	tmp := f.Name()
@@ -232,13 +259,52 @@ func replaceSudoers(main, content string) error {
 		err = visudoCheckFile(tmp)
 	}
 	if err == nil {
-		err = os.Rename(tmp, main)
+		if err = renameFile(tmp, main); err != nil && notReplaceable(err) {
+			os.Remove(tmp)
+			return fmt.Errorf("%w: replace %s: %w", errSudoersNotReplaceable, main, err)
+		}
 	}
 	if err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("replace %s: %w", main, err)
 	}
 	return nil
+}
+
+// applySudoersBlock appends the lockdown rules to main and says in the log
+// what holds the lockdown. The appended lines are the guarantee. Where main
+// cannot be replaced (a bind mount, a read-only file), it falls back, with a
+// Warn naming the weaker guarantee, to the sudoers.d file alone: that holds
+// only if main includes the directory and nothing read after the file grants
+// the user, so competing-file disabling and the step verification carry it.
+// Any other error is returned and fails the lockdown.
+func applySudoersBlock(main, rules string, logger *slog.Logger) (bool, error) {
+	appended, err := appendSudoersBlock(main, rules)
+	switch {
+	case errors.Is(err, errSudoersNotReplaceable):
+		logger.Warn("Cannot append the lockdown rules to sudoers, which cannot be replaced; "+
+			"falling back to the sudoers.d file alone, which holds only if sudoers includes that directory "+
+			"and nothing read after it grants the user; the step verification is the backstop",
+			"path", main, "error", err)
+		return false, nil
+	case err != nil:
+		return false, err
+	case !appended:
+		logger.Warn("No sudoers file to append the lockdown rules to; relying on the sudoers.d file and the step verification", "path", main)
+	case fileExists(sudoRsSudoers):
+		logger.Warn("Appended the lockdown rules to sudoers, but sudo-rs reads its own file in preference to it, "+
+			"so they may not be read there; the step verification is the backstop",
+			"path", main, "sudo_rs_file", sudoRsSudoers)
+	default:
+		logger.Info("Appended the lockdown rules as the last lines of sudoers", "path", main)
+	}
+	return appended, nil
+}
+
+// fileExists reports whether path names an existing file.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // cleanStaleSudoersTemps removes scratch files a crashed run left beside the

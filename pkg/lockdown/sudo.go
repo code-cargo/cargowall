@@ -413,17 +413,13 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	// The same rules go at the end of /etc/sudoers, where sudo reads them
 	// after every sudoers.d file and every include: that is what holds the
 	// lockdown, whatever a competing file contains or how it is spelled. The
-	// sudoers.d file above is a harmless duplicate, read earlier on a distro
-	// whose /etc/sudoers includes the directory, and never read on an image
-	// whose does not.
-	rb.SudoersBlock, err = appendSudoersBlock(mainSudoers, rules)
+	// sudoers.d file above is a duplicate, read earlier on a distro whose
+	// /etc/sudoers includes the directory, and never read on an image whose
+	// does not — except where /etc/sudoers cannot be replaced, when it is the
+	// fallback (applySudoersBlock says so).
+	rb.SudoersBlock, err = applySudoersBlock(mainSudoers, rules, logger)
 	if err != nil {
 		return fmt.Errorf("sudo lockdown incomplete, %s could not be amended with the lockdown rules: %w", mainSudoers, err)
-	}
-	if rb.SudoersBlock {
-		logger.Info("Appended the lockdown rules as the last lines of sudoers", "path", mainSudoers)
-	} else {
-		logger.Warn("No sudoers file to append the lockdown rules to; relying on the sudoers.d file and the step verification", "path", mainSudoers)
 	}
 
 	// Validate the overall sudoers configuration after all modifications.
@@ -437,6 +433,12 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	// Save state first, so a forced teardown during the verification below
 	// restores the groups too, not only the sudoers files. A failed
 	// verification's rollback removes the state (the deferred cleanup).
+	//
+	// A crash before this point leaves no state file. The appended block and
+	// the disabled sudoers.d files are still found and undone by scan (by
+	// their markers and their suffix), but the removed groups are restored
+	// only from state, so they stay removed. Accepted: it matters only on a
+	// reused runner, where teardown work is kept proportionate.
 	if err := saveLockdownState(&rb.lockdownState); err != nil {
 		logger.Warn("Failed to save lockdown state, rolling back", "error", err)
 		return fmt.Errorf("sudo lockdown aborted, state could not be persisted: %w", err)

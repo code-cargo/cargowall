@@ -135,11 +135,6 @@ func TestSudoProbe(t *testing.T) {
 	}
 }
 
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
 // TestRunAs runs probes as another user, with a supplementary group distinct
 // from the primary gid — which setting credentials needs root for. It is what
 // proves runAs applies Credential.Groups: a probe without it would not see

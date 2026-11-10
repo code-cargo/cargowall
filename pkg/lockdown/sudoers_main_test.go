@@ -17,7 +17,9 @@
 package lockdown
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -336,5 +338,115 @@ func TestReplaceSudoers_keepsOwner(t *testing.T) {
 	st := fi.Sys().(*syscall.Stat_t)
 	if st.Uid != 65534 || st.Gid != 65534 {
 		t.Errorf("owner not preserved: uid=%d gid=%d, want 65534/65534", st.Uid, st.Gid)
+	}
+}
+
+// stubRename makes replaceSudoers' rename fail with err, the way a
+// bind-mounted /etc/sudoers (EBUSY) or a read-only one (EROFS) does.
+func stubRename(t *testing.T, err error) {
+	t.Helper()
+	prev := renameFile
+	renameFile = func(oldpath, newpath string) error {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: err}
+	}
+	t.Cleanup(func() { renameFile = prev })
+}
+
+// TestReplaceSudoers_notReplaceable: a rename that fails the way a mount
+// point does is errSudoersNotReplaceable, the file is left untouched, and no
+// temp file is left behind.
+func TestReplaceSudoers_notReplaceable(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.EBUSY, syscall.EROFS} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			stubVisudo(t, nil)
+			stubRename(t, errno)
+			main := writeSudoers(t, arcSudoers)
+			err := replaceSudoers(main, "x\n")
+			if !errors.Is(err, errSudoersNotReplaceable) || !errors.Is(err, errno) {
+				t.Fatalf("replaceSudoers = %v, want errSudoersNotReplaceable wrapping %v", err, errno)
+			}
+			if got := readString(t, main); got != arcSudoers {
+				t.Errorf("file changed: %q", got)
+			}
+			if entries, _ := os.ReadDir(filepath.Dir(main)); len(entries) != 1 {
+				t.Errorf("left files behind: %v", entries)
+			}
+		})
+	}
+}
+
+// TestReplaceSudoers_otherRenameError: a rename failure that is not a mount
+// point or a read-only filesystem is an ordinary error, not the fallback.
+func TestReplaceSudoers_otherRenameError(t *testing.T) {
+	stubVisudo(t, nil)
+	stubRename(t, syscall.EIO)
+	main := writeSudoers(t, arcSudoers)
+	if err := replaceSudoers(main, "x\n"); err == nil || errors.Is(err, errSudoersNotReplaceable) {
+		t.Errorf("replaceSudoers = %v, want an error that is not errSudoersNotReplaceable", err)
+	}
+}
+
+// captureLog is a logger whose output the test can read.
+func captureLog() (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return slog.New(slog.NewTextHandler(&buf, nil)), &buf
+}
+
+// TestApplySudoersBlock_fallsBackWhenNotReplaceable: an /etc/sudoers that
+// cannot be replaced does not fail the lockdown; it falls back to the
+// sudoers.d file with a Warn naming the weaker guarantee.
+func TestApplySudoersBlock_fallsBackWhenNotReplaceable(t *testing.T) {
+	stubVisudo(t, nil)
+	stubRename(t, syscall.EBUSY)
+	main := writeSudoers(t, arcSudoers)
+	logger, buf := captureLog()
+
+	appended, err := applySudoersBlock(main, testRules, logger)
+	if err != nil || appended {
+		t.Fatalf("applySudoersBlock = %v, %v; want false, nil (the fallback)", appended, err)
+	}
+	if got := readString(t, main); got != arcSudoers {
+		t.Errorf("file changed: %q", got)
+	}
+	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "falling back to the sudoers.d file") {
+		t.Errorf("no Warn naming the fallback: %s", out)
+	}
+}
+
+// TestApplySudoersBlock_otherErrorFails: any other failure to amend
+// /etc/sudoers fails the lockdown rather than falling back silently.
+func TestApplySudoersBlock_otherErrorFails(t *testing.T) {
+	stubVisudo(t, errors.New("syntax error"))
+	main := writeSudoers(t, arcSudoers)
+	logger, _ := captureLog()
+	if _, err := applySudoersBlock(main, testRules, logger); err == nil {
+		t.Error("applySudoersBlock: expected an error")
+	}
+}
+
+// TestApplySudoersBlock_logs: the log says what holds the lockdown — an Info
+// that the rules are the last lines of sudoers, or, with an /etc/sudoers-rs
+// present, a Warn that sudo-rs may not read them.
+func TestApplySudoersBlock_logs(t *testing.T) {
+	prev := sudoRsSudoers
+	t.Cleanup(func() { sudoRsSudoers = prev })
+
+	stubVisudo(t, nil)
+	sudoRsSudoers = filepath.Join(t.TempDir(), "absent")
+	logger, buf := captureLog()
+	if appended, err := applySudoersBlock(writeSudoers(t, arcSudoers), testRules, logger); err != nil || !appended {
+		t.Fatalf("applySudoersBlock = %v, %v", appended, err)
+	}
+	if out := buf.String(); !strings.Contains(out, "level=INFO") || !strings.Contains(out, "as the last lines of sudoers") {
+		t.Errorf("no Info that the rules are the last lines: %s", out)
+	}
+
+	sudoRsSudoers = writeSudoers(t, "root ALL=(ALL) ALL\n")
+	logger, buf = captureLog()
+	if appended, err := applySudoersBlock(writeSudoers(t, arcSudoers), testRules, logger); err != nil || !appended {
+		t.Fatalf("applySudoersBlock = %v, %v", appended, err)
+	}
+	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "sudo-rs") || strings.Contains(out, "level=INFO") {
+		t.Errorf("with /etc/sudoers-rs present, want a Warn and no Info: %s", out)
 	}
 }

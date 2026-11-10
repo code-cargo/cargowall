@@ -50,6 +50,7 @@ func TestL7KernelConstantsMatchSniSource(t *testing.T) {
 		"L7_SCOPE_TLS":           uint64(bpf.L7ScopeTLS),
 		"L7_SCOPE_HTTP":          uint64(bpf.L7ScopeHTTP),
 		"L7_SCOPE_QUIC":          uint64(bpf.L7ScopeQUIC),
+		"L7_STATE_NEED_HELLO":    uint64(l7StateNeedHello),
 		"L7_STATE_ALLOWED":       uint64(l7StateAllowed),
 		"L7_STATE_DENIED":        uint64(l7StateDenied),
 		"L7_PUNT_F_NO_STATE":     uint64(l7PuntNoState),
@@ -58,6 +59,7 @@ func TestL7KernelConstantsMatchSniSource(t *testing.T) {
 		"L7_PUNT_F_QUIC":         uint64(l7PuntQUIC),
 		"L7_PUNT_F_REPIN":        uint64(l7PuntRepin),
 		"L7_PUNT_F_REFUSED":      uint64(l7PuntRefused),
+		"L7_PUNT_F_NEW_CONN":     uint64(l7PuntNewConn),
 		// The stat slots the Go mirror (l7Stat*) reads in logStats.
 		"L7_STAT_PUNT":          uint64(l7StatPunt),
 		"L7_STAT_PUNT_DROPPED":  uint64(l7StatPuntDropped),
@@ -69,6 +71,7 @@ func TestL7KernelConstantsMatchSniSource(t *testing.T) {
 		"L7_STAT_PENDING_NO_ID": uint64(l7StatPendingNoID),
 		"L7_STAT_GATE_NO_STATE": uint64(l7StatGateNoState),
 		"L7_STAT_ALT_UNGATED":   uint64(l7StatAltUngated),
+		"L7_STAT_CONTINUATION":  uint64(l7StatContinued),
 	}
 	for name, want := range defines {
 		re := regexp.MustCompile(`(?m)^#define ` + name + `\s+(0x[0-9A-Fa-f]+|\d+)\b`)

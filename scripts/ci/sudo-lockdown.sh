@@ -42,6 +42,9 @@ snapshot() {
   sudo whoami
   echo "--- Save sudoers.d file list for later comparison ---"
   sudo ls /etc/sudoers.d/ | sort > /tmp/sudoers-before.txt
+  # The lockdown appends its rules to the end of /etc/sudoers and removes
+  # them at stop; verify-restored checks the file is byte-identical again.
+  sudo sha256sum /etc/sudoers > /tmp/sudoers-main.sha
 }
 
 # Start cargowall inside a root wrapper that watches for a stop trigger.
@@ -164,6 +167,12 @@ verify_restored() {
     exit 1
   fi
   echo "✅ sudoers.d contents match pre-lockdown state"
+
+  if ! sudo sha256sum -c --quiet /tmp/sudoers-main.sha; then
+    echo "❌ /etc/sudoers differs from its pre-lockdown state"
+    exit 1
+  fi
+  echo "✅ /etc/sudoers restored byte for byte after stop"
 }
 
 verify_full_sudo() {

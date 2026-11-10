@@ -55,6 +55,9 @@ type lockdownState struct {
 	RemovedGroups []string `json:"removedGroups"`
 	DisabledFiles []string `json:"disabledFiles"`
 	DockerRemoved bool     `json:"dockerRemoved"`
+	// SudoersBlock is whether the lockdown rules were also appended to
+	// /etc/sudoers, for a file that does not read sudoers.d last.
+	SudoersBlock bool `json:"sudoersBlock,omitempty"`
 }
 
 const sudoersUnsafeChars = " ,#\n\r\t`;&!()\\|*?[]"
@@ -177,319 +180,6 @@ func restoreToGroups(username string, groups []string, logger *slog.Logger) bool
 	return allOk
 }
 
-// disableCompetingSudoersFiles scans /etc/sudoers.d/ for files that grant
-// sudo access to the given username — whether via a direct user entry,
-// User_Alias membership, or a matching %group grant — and renames them to
-// *.cargowall-disabled. Returns the list of original file paths that were
-// disabled and an error if any matching file could not be disabled (lockdown
-// may be incomplete).
-func disableCompetingSudoersFiles(dir, username string, logger *slog.Logger) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read sudoers.d directory: %w", err)
-	}
-
-	// Resolve user's group memberships once for all file checks.
-	userGIDs, gidErr := lookupUserGIDs(username)
-	if gidErr != nil {
-		logger.Warn("Failed to look up user groups for sudoers scan, group detection disabled",
-			"username", username, "error", gidErr)
-	}
-
-	// Collect User_Alias names containing the target user across all files
-	// so we can detect cross-file alias-based grants (alias defined in one
-	// file, grant using that alias in another).
-	aliases := collectUserAliases(dir, username)
-
-	var disabled []string
-	var renameFailed []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		// Skip our own files and already-disabled files
-		if name == filepath.Base(sudoersFile) ||
-			name == filepath.Base(stateFile) ||
-			strings.HasSuffix(name, ".tmp") ||
-			strings.HasSuffix(name, disabledSuffix) {
-			continue
-		}
-
-		path := filepath.Join(dir, name)
-		grants, readErr := sudoersFileGrantsUser(path, username, userGIDs, aliases)
-		if readErr != nil {
-			logger.Warn("Cannot read sudoers file, treating as potential grant",
-				"path", path, "error", readErr)
-			renameFailed = append(renameFailed, path)
-			continue
-		}
-		if !grants {
-			continue
-		}
-
-		disabledPath := path + disabledSuffix
-		// Use Link+Remove instead of Rename to atomically fail if the
-		// disabled target already exists (Link returns EEXIST).
-		if err := os.Link(path, disabledPath); err != nil {
-			if errors.Is(err, os.ErrExist) {
-				logger.Warn("Disabled target already exists, cannot safely disable sudoers file",
-					"path", path, "disabledPath", disabledPath)
-			} else {
-				logger.Warn("Failed to disable sudoers file",
-					"path", path, "error", err)
-			}
-			renameFailed = append(renameFailed, path)
-			continue
-		}
-		if err := os.Remove(path); err != nil {
-			logger.Warn("Failed to remove original after linking disabled copy, cleaning up",
-				"path", path, "error", err)
-			os.Remove(disabledPath)
-			renameFailed = append(renameFailed, path)
-			continue
-		}
-		logger.Info("Disabled competing sudoers file", "path", path)
-		disabled = append(disabled, path)
-	}
-
-	// Verification re-scan: catch any files that appeared during the disable
-	// pass (narrows the TOCTOU window to microseconds).
-	if len(renameFailed) == 0 {
-		recheck, _ := os.ReadDir(dir)
-		for _, entry := range recheck {
-			if entry.IsDir() {
-				continue
-			}
-			name := entry.Name()
-			if name == filepath.Base(sudoersFile) ||
-				name == filepath.Base(stateFile) ||
-				strings.HasSuffix(name, ".tmp") ||
-				strings.HasSuffix(name, disabledSuffix) {
-				continue
-			}
-			path := filepath.Join(dir, name)
-			if grants, _ := sudoersFileGrantsUser(path, username, userGIDs, aliases); grants {
-				logger.Warn("New sudoers file appeared during lockdown scan",
-					"path", path)
-				renameFailed = append(renameFailed, path)
-			}
-		}
-	}
-
-	if len(renameFailed) > 0 {
-		return disabled, fmt.Errorf("failed to disable competing sudoers files: %v", renameFailed)
-	}
-	return disabled, nil
-}
-
-// sudoersFileGrantsUser returns true if the file contains a non-comment line
-// that either:
-//   - starts with the username followed by whitespace (direct grant),
-//   - contains the username in a User_Alias definition (indirect grant via alias),
-//   - starts with a name present in aliases (cross-file alias grant), or
-//   - contains a %group grant where the user is a member of that group.
-//
-// aliases is the set of User_Alias names (collected across all sudoers.d files)
-// that include the target username; it may be nil when cross-file detection is
-// not needed.
-//
-// Returns an error if the file cannot be read or contains #include directives
-// that cannot be inspected, so the caller can fail closed.
-func sudoersFileGrantsUser(path, username string, userGIDs map[string]bool, aliases map[string]bool) (bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false, fmt.Errorf("failed to read sudoers file %s: %w", path, err)
-	}
-	directPrefix := username + " "
-	directPrefixTab := username + "\t"
-	for _, line := range strings.Split(string(data), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		// #include/#includedir and @include/@includedir are sudoers directives,
-		// NOT comments. Modern sudo (1.9.1+) uses the @ form.
-		if isIncludeDirective(trimmed) {
-			return false, fmt.Errorf("sudoers file %s contains include directive that cannot be inspected", path)
-		}
-		if strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		// Defaults !authenticate disables password prompts for all users,
-		// effectively granting passwordless sudo to anyone with a grant.
-		if strings.HasPrefix(trimmed, "Defaults") && strings.Contains(trimmed, "!authenticate") {
-			return false, fmt.Errorf("sudoers file %s contains 'Defaults !authenticate' which bypasses password requirements", path)
-		}
-		if strings.HasPrefix(trimmed, directPrefix) || strings.HasPrefix(trimmed, directPrefixTab) {
-			return true, nil
-		}
-		// Detect ALL as user specifier — grants every user on the system.
-		if fields := strings.Fields(trimmed); len(fields) > 0 && fields[0] == "ALL" {
-			return true, nil
-		}
-		if strings.HasPrefix(trimmed, "User_Alias ") {
-			if userAliasContains(trimmed, username) {
-				return true, nil
-			}
-		}
-		// Check if line uses a known User_Alias name as a grant (cross-file).
-		if len(aliases) > 0 {
-			if fields := strings.Fields(trimmed); len(fields) > 0 && aliases[fields[0]] {
-				return true, nil
-			}
-		}
-		// Detect %group grants where the user is a member.
-		// When userGIDs is nil (lookup failed), treat any %group line as a
-		// potential grant (fail-closed) rather than skipping.
-		if strings.HasPrefix(trimmed, "%") {
-			if userGIDs == nil {
-				return true, nil
-			}
-			groupName := strings.Fields(trimmed)[0][1:]
-			if grp, err := user.LookupGroup(groupName); err == nil && userGIDs[grp.Gid] {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
-}
-
-// isIncludeDirective returns true if the line is a sudoers #include,
-// #includedir, @include, or @includedir directive. Requires the keyword
-// to be followed by a space (and a path), or to be the entire line.
-func isIncludeDirective(line string) bool {
-	for _, prefix := range []string{"#include ", "#includedir ", "@include ", "@includedir "} {
-		if strings.HasPrefix(line, prefix) {
-			return true
-		}
-	}
-	switch line {
-	case "#include", "#includedir", "@include", "@includedir":
-		return true
-	}
-	return false
-}
-
-// userAliasContains checks whether a User_Alias line includes the given
-// username as a member. Format: "User_Alias NAME = user1, user2, ..."
-// Strips trailing inline comments (# ...) before parsing.
-// Note: sudoers line continuations (\) are not handled; this is rare for
-// User_Alias definitions in practice.
-func userAliasContains(line, username string) bool {
-	_, after, found := strings.Cut(line, "=")
-	if !found {
-		return false
-	}
-	// Strip trailing inline comment
-	if idx := strings.Index(after, "#"); idx >= 0 {
-		after = after[:idx]
-	}
-	for _, member := range strings.Split(after, ",") {
-		if strings.TrimSpace(member) == username {
-			return true
-		}
-	}
-	return false
-}
-
-// userAliasName extracts the alias name from a User_Alias line.
-// Format: "User_Alias NAME = user1, user2, ..."
-func userAliasName(line string) string {
-	fields := strings.Fields(line)
-	if len(fields) < 3 {
-		return ""
-	}
-	return fields[1]
-}
-
-// collectUserAliases scans sudoers files in dir for User_Alias definitions
-// that include the given username and returns the set of alias names. This
-// enables cross-file detection: an alias defined in one file and used as a
-// grant in another.
-func collectUserAliases(dir, username string) map[string]bool {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	aliases := make(map[string]bool)
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if name == filepath.Base(sudoersFile) ||
-			name == filepath.Base(stateFile) ||
-			strings.HasSuffix(name, ".tmp") ||
-			strings.HasSuffix(name, disabledSuffix) {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "User_Alias ") && userAliasContains(trimmed, username) {
-				if alias := userAliasName(trimmed); alias != "" {
-					aliases[alias] = true
-				}
-			}
-		}
-	}
-	return aliases
-}
-
-// restoreDisabledSudoersFiles renames *.cargowall-disabled files back to their
-// original paths. Skips files where the original already exists to avoid
-// clobbering entries recreated while lockdown was active. Returns true if all
-// files were restored successfully (or the list was empty).
-func restoreDisabledSudoersFiles(files []string, logger *slog.Logger) bool {
-	allOk := true
-	for _, original := range files {
-		disabledPath := original + disabledSuffix
-		if _, err := os.Stat(original); err == nil {
-			logger.Warn("Sudoers file already exists at original path, skipping restore",
-				"original", original)
-			allOk = false
-			continue
-		}
-		if err := os.Rename(disabledPath, original); err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				logger.Warn("Failed to restore sudoers file",
-					"original", original, "error", err)
-				allOk = false
-			}
-			continue
-		}
-		logger.Info("Restored sudoers file", "path", original)
-	}
-	return allOk
-}
-
-// findDisabledSudoersFiles scans the sudoers.d directory for files ending in
-// disabledSuffix and returns their original paths (with the suffix stripped).
-// Used as a fallback when the state file is unavailable.
-func findDisabledSudoersFiles(dir string, logger *slog.Logger) []string {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		logger.Warn("Failed to scan sudoers.d for orphaned disabled files", "error", err)
-		return nil
-	}
-	var originals []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if strings.HasSuffix(name, disabledSuffix) {
-			original := filepath.Join(dir, strings.TrimSuffix(name, disabledSuffix))
-			originals = append(originals, original)
-		}
-	}
-	return originals
-}
-
 // rollbackState tracks accumulated system changes during EnableSudoLockdown
 // so they can be undone if the operation fails at any point.
 type rollbackState struct {
@@ -499,6 +189,12 @@ type rollbackState struct {
 
 func (r *rollbackState) rollback() {
 	os.Remove(sudoersFile)
+	// Unconditional: the block is found by its markers, and a run that
+	// crashed after appending it never recorded that it did.
+	if _, err := removeSudoersBlock(mainSudoers); err != nil {
+		r.logger.Warn("Failed to remove the lockdown block from sudoers during rollback",
+			"path", mainSudoers, "error", err)
+	}
 	restoreDisabledSudoersFiles(r.DisabledFiles, r.logger)
 	if r.Username != "" {
 		restoreToGroups(r.Username, r.RemovedGroups, r.logger)
@@ -551,9 +247,17 @@ func removeLockdownState() {
 
 // recoverLockdownState attempts to reconstruct a lockdownState by scanning
 // the filesystem for evidence of a previous lockdown run. Used as a fallback
-// when the state file exists but is corrupted.
-func recoverLockdownState(dir, username string, logger *slog.Logger) *lockdownState {
+// when the state file exists but is corrupted. main is the sudoers file a
+// lockdown block may have been appended to.
+func recoverLockdownState(dir, main, username string, logger *slog.Logger) *lockdownState {
 	recovered := &lockdownState{Username: username}
+
+	if data, err := os.ReadFile(main); err == nil {
+		if _, found, _ := withoutBlock(string(data)); found {
+			recovered.SudoersBlock = true
+			logger.Info("Recovered the lockdown block in sudoers", "path", main)
+		}
+	}
 
 	// Recover disabled files by scanning for *.cargowall-disabled files.
 	recovered.DisabledFiles = findDisabledSudoersFiles(dir, logger)
@@ -600,7 +304,9 @@ func recoverLockdownState(dir, username string, logger *slog.Logger) *lockdownSt
 
 // EnableSudoLockdown configures sudoers to restrict what commands can be run
 // with sudo, removes the target user from sudo-granting and docker groups,
-// and disables competing sudoers.d files.
+// and disables competing sudoers.d files. It then checks, as a job step,
+// that sudo refuses a command the allowlist does not name, and undoes it
+// all with an error when sudo does not.
 func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	logger.Info("Enabling sudo lockdown")
 
@@ -615,7 +321,7 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	if prevErr != nil {
 		logger.Warn("Lockdown state file is corrupted, attempting best-effort recovery",
 			"error", prevErr, "state_file", stateFile)
-		prev = recoverLockdownState(sudoersDir, username, logger)
+		prev = recoverLockdownState(sudoersDir, mainSudoers, username, logger)
 	}
 	if prev != nil {
 		logger.Warn("Found stale lockdown state from previous run, cleaning up first")
@@ -623,6 +329,9 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		stale.rollback()
 		removeLockdownState()
 	}
+
+	// Remove any scratch files a crashed run left beside /etc/sudoers.
+	cleanStaleSudoersTemps(filepath.Dir(mainSudoers), logger)
 
 	// Set up deferred rollback — disabled on success. Every error path after
 	// this point automatically undoes all system modifications.
@@ -634,26 +343,35 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	defer func() {
 		if !success {
 			rb.rollback()
+			// The state is saved before verification, so a failed
+			// verification's rollback removes it too.
+			removeLockdownState()
 		}
 	}()
 
-	// Remove user from sudo-granting groups to neutralize group-based grants
+	// The groups as a process started before the lockdown holds them, which
+	// removing the user from a group below does not change. Both the competing
+	// %group scan and the verification need them as a running step has them.
+	preGIDs, preErr := lookupUserGIDs(username)
+	if preErr != nil {
+		logger.Warn("Failed to look up user groups before lockdown; %group grant detection is fail-closed",
+			"username", username, "error", preErr)
+	}
+
+	// Remove user from sudo-granting groups, for logins after the lockdown;
+	// the rules below are what hold against processes already running.
 	rb.RemovedGroups, err = removeFromSudoGroups(username, logger)
 	if err != nil {
 		return fmt.Errorf("sudo lockdown incomplete, group removal failed: %w", err)
 	}
 
-	// Disable competing sudoers.d files that grant this user access
-	rb.DisabledFiles, err = disableCompetingSudoersFiles(sudoersDir, username, logger)
-	if err != nil {
-		return fmt.Errorf("sudo lockdown incomplete, competing grants remain active: %w", err)
-	}
-
-	// Remove user from docker group to prevent docker-based firewall bypass
+	// Remove user from the docker group. Like the sudo groups, this reaches
+	// only logins after the lockdown: running job steps keep the docker
+	// socket, which warnDockerAccess reports.
 	if out, err := exec.Command("gpasswd", "-d", username, "docker").CombinedOutput(); err != nil {
 		logger.Warn("Failed to remove user from docker group (user may not be in group)", "error", err, "output", strings.TrimSpace(string(out)))
 	} else {
-		logger.Info("Removed user from docker group", "username", username)
+		logger.Info("Removed user from docker group for later logins; running job steps keep it", "username", username)
 		rb.DockerRemoved = true
 	}
 
@@ -662,6 +380,7 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("failed to build sudoers config: %w", err)
 	}
+	rules := lockdownRules(username, cfg.AllowCommands)
 
 	// Ensure sudoers.d directory exists
 	if err := os.MkdirAll(sudoersDir, 0o755); err != nil {
@@ -684,18 +403,59 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return fmt.Errorf("failed to install sudoers file: %w", err)
 	}
 
-	// Validate the overall sudoers configuration after all modifications.
-	// If disabling files broke alias/Defaults dependencies, roll back.
+	// The same rules go at the end of /etc/sudoers, where sudo reads them
+	// after every sudoers.d file and every include: that is what holds the
+	// lockdown, whatever a competing file contains or how it is spelled. The
+	// sudoers.d file above is a duplicate, read earlier on a distro whose
+	// /etc/sudoers includes the directory, and never read on an image whose
+	// does not — except where /etc/sudoers cannot be replaced, when it is the
+	// fallback (applySudoersBlock says so).
+	rb.SudoersBlock, err = applySudoersBlock(mainSudoers, sudoersDir, rules, logger)
+	if err != nil {
+		return fmt.Errorf("sudo lockdown incomplete, %s could not be amended with the lockdown rules: %w", mainSudoers, err)
+	}
+
+	// Disable competing sudoers.d files that grant this user access, matched
+	// against the groups from before the removal above. With the rules
+	// appended, this is for the job summary only and cannot fail the
+	// lockdown; in the fallback it is load-bearing.
+	rb.DisabledFiles, err = disableCompetingSudoersFiles(sudoersDir, username, preGIDs, !rb.SudoersBlock, logger)
+	if err != nil {
+		return fmt.Errorf("sudo lockdown incomplete, competing grants remain active: %w", err)
+	}
+
+	// Validate the overall sudoers configuration after all modifications, and
+	// roll back if sudo would not parse it. visudo only warns about an alias a
+	// disabled file left undefined, so that does not stop the lockdown;
+	// nothing relies on it, since the appended rules are read last regardless.
 	if out, err := exec.Command("visudo", "-c").CombinedOutput(); err != nil {
 		logger.Warn("Overall sudoers validation failed after modifications, rolling back",
 			"error", err, "output", strings.TrimSpace(string(out)))
 		return fmt.Errorf("sudoers validation failed after lockdown modifications: %w", err)
 	}
 
-	// Save state so DisableSudoLockdown can reverse all changes
+	// Save state first, so a forced teardown during the verification below
+	// restores the groups too, not only the sudoers files. A failed
+	// verification's rollback removes the state (the deferred cleanup).
+	//
+	// A crash before this point leaves no state file. The appended block and
+	// the disabled sudoers.d files are still found and undone by scan (by
+	// their markers and their suffix), but the removed groups are restored
+	// only from state, so they stay removed. Accepted: it matters only on a
+	// reused runner, where teardown work is kept proportionate.
 	if err := saveLockdownState(&rb.lockdownState); err != nil {
 		logger.Warn("Failed to save lockdown state, rolling back", "error", err)
 		return fmt.Errorf("sudo lockdown aborted, state could not be persisted: %w", err)
+	}
+
+	// Ask sudo, as a job step, whether the lockdown holds, and report the
+	// docker access it leaves, which fails nothing.
+	if view, err := lookupJobView(username, preGIDs); err != nil {
+		logger.Warn("Cannot verify sudo lockdown, leaving it in place: a job step's credentials are unknown", "username", username, "error", err)
+	} else if err := verifyLockdown(view, cfg.AllowCommands, logger); err != nil {
+		return err
+	} else {
+		warnDockerAccess(view, logger)
 	}
 
 	success = true
@@ -704,7 +464,8 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		"allow_commands", cfg.AllowCommands,
 		"username", username,
 		"removed_groups", rb.RemovedGroups,
-		"disabled_files", rb.DisabledFiles)
+		"disabled_files", rb.DisabledFiles,
+		"sudoers_block", rb.SudoersBlock)
 
 	return nil
 }
@@ -727,8 +488,17 @@ func DisableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		logger.Warn("Failed to remove sudoers file", "error", err)
 	}
 
-	// Restore disabled sudoers.d files
+	// The block goes next, for the same reason. Removed by its markers
+	// whatever the state says, which a crash may have left without it.
 	restoreFailed := false
+	if removed, err := removeSudoersBlock(mainSudoers); err != nil {
+		logger.Warn("Failed to remove the lockdown block from sudoers", "path", mainSudoers, "error", err)
+		restoreFailed = true
+	} else if removed {
+		logger.Info("Removed the lockdown block from sudoers", "path", mainSudoers)
+	}
+
+	// Restore disabled sudoers.d files
 	if state != nil {
 		if !restoreDisabledSudoersFiles(state.DisabledFiles, logger) {
 			restoreFailed = true
@@ -787,6 +557,8 @@ func DisableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		removeLockdownState()
 	}
 
+	cleanStaleSudoersTemps(filepath.Dir(mainSudoers), logger)
+
 	logger.Info("Sudo lockdown disabled")
 	if restoreFailed {
 		return fmt.Errorf("sudo lockdown disable incomplete: some changes could not be restored; see state file %s", stateFile)
@@ -794,11 +566,8 @@ func DisableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	return nil
 }
 
-// buildSudoersConfig generates the sudoers configuration content.
-// The lockdown relies on restricting NOPASSWD to a specific set of commands,
-// removing the user from sudo-granting groups, and disabling competing
-// sudoers.d files. Sudoers negation (!ALL) is intentionally not used because
-// it does not reliably override grants from other sudoers files.
+// buildSudoersConfig generates the sudoers configuration content: a header
+// and lockdownRules.
 func buildSudoersConfig(cfg *SudoLockdownConfig, username string) (string, error) {
 	cmds := slices.Clone(cfg.AllowCommands)
 
@@ -810,16 +579,24 @@ func buildSudoersConfig(cfg *SudoLockdownConfig, username string) (string, error
 # This file restricts sudo access to prevent firewall bypass
 # Generated by cargowall - DO NOT EDIT
 #
-# Effective only when combined with disabling competing sudoers.d files
-# (renamed to *%s) and removing the user from sudo-granting groups.
+# The first rule denies the user every command, and the allowlist follows.
+# Sudoers is last-match-wins, so they hold against any grant read before
+# them, a group's included, whatever groups a running process kept.
+# Competing sudoers.d files are disabled as well (renamed to *%s), and the
+# user is removed from sudo-granting groups for later logins.
 `, disabledSuffix)
 
-	if len(cmds) == 0 {
-		return header, nil
+	return header + "\n" + lockdownRules(username, cmds), nil
+}
+
+// lockdownRules are the lockdown's sudoers rules: everything denied to the
+// user, then the allowlist allowed without a password. The deny holds for
+// any command the allowlist does not name, as the last rule to match it,
+// against every grant read before it. The caller has validated both.
+func lockdownRules(username string, cmds []string) string {
+	rules := username + " ALL=(ALL:ALL) !ALL\n"
+	if len(cmds) > 0 {
+		rules += fmt.Sprintf("%s ALL=(ALL) NOPASSWD: %s\n", username, strings.Join(cmds, ", "))
 	}
-
-	content := header + fmt.Sprintf("\n%s ALL=(ALL) NOPASSWD: %s\n",
-		username, strings.Join(cmds, ", "))
-
-	return content, nil
+	return rules
 }

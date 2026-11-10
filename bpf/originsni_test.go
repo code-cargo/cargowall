@@ -32,6 +32,7 @@ import (
 // L7 constants mirrored from sni.h for the tests.
 const (
 	l7CfgKeyMode  = 2
+	l7ModeOff     = 0
 	l7ModeObserve = 1
 	l7ModeEnforce = 2
 	tcpFlagSYN    = 0x02
@@ -47,6 +48,7 @@ const (
 	l7PuntFlagQUIC    = 0x08
 	l7PuntFlagRepin   = 0x10
 	l7PuntFlagRefused = 0x20
+	l7PuntFlagNewConn = 0x40
 )
 
 // craftIPv4TLSData builds an eth+IPv4+TCP data segment (PSH|ACK) carrying a
@@ -289,15 +291,16 @@ func l7StatSum(t *testing.T, objs *OriginBpfObjects, slot uint32) uint64 {
 // their record policy. A fresh refusal (SYN seen) counts GATE_REFUSED and
 // emits an audit record — the trace the counter-only refusal lacked, so an
 // operator debugging a hung ssh-on-443 sees more than an L4 ALLOW. A no-state
-// refusal (no SYN — an evicted flow's mid-record ciphertext, or a
-// pre-existing connection at attach) counts in the SEPARATE GATE_NO_STATE slot
-// and is counter-only: those are high-volume eviction noise, and folding them
-// into GATE_REFUSED made the enforce-rollout measurement unreadable.
+// refusal (no SYN, and a socket that has had no data acknowledged) counts in
+// the SEPARATE GATE_NO_STATE slot, so it cannot make the enforce-rollout
+// measurement unreadable, and records with the NO_STATE flag.
 //
-// Each Test() call mints a fresh cookie, so the SSH segment here rides a
-// no-state flow — the GATE_NO_STATE arm. The FRESH arm (record + GATE_REFUSED)
-// needs the SYN and the data on ONE cookie, so it is proved on a real socket
-// in TestOriginL7RealSocketFreshRefusalRecorded.
+// Each Test() call mints a fresh cookie on a socket that is not TCP, so the
+// SSH segment here meets a no-state flow that is no continuation — the
+// GATE_NO_STATE arm. The FRESH arm (record + GATE_REFUSED) needs the SYN and
+// the data on ONE cookie, so it is proved on a real socket in
+// TestOriginL7RealSocketFreshRefusalRecorded; the no-state record's rate
+// limit, in TestOriginL7RealSocketNoStateRefusalRecordedOnce.
 func TestOriginL7GateRefusedCounted(t *testing.T) {
 	const (
 		statGateRefused = 6
@@ -327,11 +330,14 @@ func TestOriginL7GateRefusedCounted(t *testing.T) {
 	beforeNoState := l7StatSum(t, objs, statGateNoState)
 
 	// Non-TLS bytes on a scoped 443, on a NO-STATE flow (fresh cookie, no SYN):
-	// dropped, counted in GATE_NO_STATE, and NOT recorded — it must leave the
-	// punt ring empty and must not touch GATE_REFUSED.
+	// dropped, counted in GATE_NO_STATE, and recorded as a no-state refusal —
+	// and it must not touch GATE_REFUSED.
 	require.Equal(t, 0, run(craftIPv4TCPData(edgeIP, 443, []byte("SSH-2.0-OpenSSH\r\n"))),
 		"non-TLS on 443 fails closed")
-	requireNoL7Sample(t, rd)
+	refusal := readL7Sample(t, rd)
+	require.NotZero(t, refusal.Flags&l7PuntFlagRefused, "a no-state refusal must emit a refusal record")
+	require.NotZero(t, refusal.Flags&l7PuntFlagNoState, "the record must say the flow had no entry")
+	require.Zero(t, refusal.Flags&l7PuntFlagObserve, "enforce posture on the refusal record")
 	require.Equal(t, beforeNoState+1, l7StatSum(t, objs, statGateNoState),
 		"a no-state non-protocol refusal must count in GATE_NO_STATE")
 	require.Equal(t, beforeRefused, l7StatSum(t, objs, statGateRefused),

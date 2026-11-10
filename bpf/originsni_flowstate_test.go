@@ -95,19 +95,22 @@ func TestOriginL7FlowStateMachine(t *testing.T) {
 	require.Equal(t, uint8(l7StatePending), fv.State)
 
 	// Mid-record continuation bytes (the second half of a split hello) on a
-	// flow with NO state: not a record start, so the identity gate fails the
-	// segment closed — and must do so WITHOUT punting or writing state. This
-	// is the counterpart that makes the PENDING gate-skip load-bearing: the
-	// same bytes are punted in TestOriginL7RealSocketSplitHello because state
-	// says PENDING, and refused here because nothing says this flow is
-	// mid-handshake.
+	// flow with NO state, from a socket that has had no data acknowledged:
+	// not a record start, so the identity gate fails the segment closed — and
+	// must do so WITHOUT punting or writing state, leaving only a refusal
+	// record. This is the counterpart that makes the PENDING gate-skip
+	// load-bearing: the same bytes are punted in
+	// TestOriginL7RealSocketSplitHello because state says PENDING, and refused
+	// here because nothing says this flow is mid-handshake.
 	cont := hello[mid:]
 	require.NotContains(t, []byte{0x14, 0x15, 0x16, 0x17}, cont[0],
 		"test premise: the continuation must not start on a TLS record-type byte")
 	before := dumpL7Flows(t, objs)
 	require.Equal(t, 0, run(craftIPv4TCPData(edgeIP, 443, cont)),
 		"a stateless mid-record segment must fail closed")
-	requireNoL7Sample(t, rd)
+	ev = readL7Sample(t, rd)
+	require.NotZero(t, ev.Flags&l7PuntFlagRefused, "the drop leaves a refusal record, not a punt")
+	require.NotZero(t, ev.Flags&l7PuntFlagNoState)
 	require.Equal(t, before, dumpL7Flows(t, objs),
 		"a gate drop must neither punt nor write flow state")
 }

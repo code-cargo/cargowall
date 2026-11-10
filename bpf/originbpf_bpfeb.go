@@ -165,6 +165,7 @@ const (
 	OriginBpfMapMapL7Depth           = "map_l7_depth"
 	OriginBpfMapMapL7Events          = "map_l7_events"
 	OriginBpfMapMapL7Flow            = "map_l7_flow"
+	OriginBpfMapMapL7NoStateSeen     = "map_l7_no_state_seen"
 	OriginBpfMapMapL7Scope           = "map_l7_scope"
 	OriginBpfMapMapL7ScopeV6         = "map_l7_scope_v6"
 	OriginBpfMapMapL7Scratch         = "map_l7_scratch"
@@ -243,6 +244,7 @@ type OriginBpfMapSpecs struct {
 	MapL7Depth       *ebpf.MapSpec `ebpf:"map_l7_depth"`
 	MapL7Events      *ebpf.MapSpec `ebpf:"map_l7_events"`
 	MapL7Flow        *ebpf.MapSpec `ebpf:"map_l7_flow"`
+	MapL7NoStateSeen *ebpf.MapSpec `ebpf:"map_l7_no_state_seen"`
 	MapL7Scope       *ebpf.MapSpec `ebpf:"map_l7_scope"`
 	MapL7ScopeV6     *ebpf.MapSpec `ebpf:"map_l7_scope_v6"`
 	MapL7Scratch     *ebpf.MapSpec `ebpf:"map_l7_scratch"`
@@ -297,6 +299,7 @@ type OriginBpfMaps struct {
 	MapL7Depth       *ebpf.Map `ebpf:"map_l7_depth"`
 	MapL7Events      *ebpf.Map `ebpf:"map_l7_events"`
 	MapL7Flow        *ebpf.Map `ebpf:"map_l7_flow"`
+	MapL7NoStateSeen *ebpf.Map `ebpf:"map_l7_no_state_seen"`
 	MapL7Scope       *ebpf.Map `ebpf:"map_l7_scope"`
 	MapL7ScopeV6     *ebpf.Map `ebpf:"map_l7_scope_v6"`
 	MapL7Scratch     *ebpf.Map `ebpf:"map_l7_scratch"`
@@ -322,6 +325,7 @@ func (m *OriginBpfMaps) Close() error {
 		m.MapL7Depth,
 		m.MapL7Events,
 		m.MapL7Flow,
+		m.MapL7NoStateSeen,
 		m.MapL7Scope,
 		m.MapL7ScopeV6,
 		m.MapL7Scratch,

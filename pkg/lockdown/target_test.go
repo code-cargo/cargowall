@@ -142,6 +142,7 @@ func TestResolveTarget_noWorker(t *testing.T) {
 		{"a runner account that is SUDO_USER", "", "nobody", asRoot, []string{"nobody"}, "nobody"},
 		{"a runner account and a different SUDO_USER", "", "daemon", asRoot, []string{"nobody"}, ""},
 		{"SUDO_USER when no runner account exists", "", "daemon", asRoot, []string{"no-such-user-here"}, "daemon"},
+		{"a runner account and a SUDO_USER naming no user", "", "no-such-user-here", asRoot, []string{"nobody"}, "nobody"},
 		{"SUDO_USER root names nothing", "", "root", asRoot, []string{"no-such-user-here"}, ""},
 		{"nothing at all", "", "", asRoot, nil, ""},
 	} {
@@ -229,9 +230,11 @@ func TestToolBinaries(t *testing.T) {
 	dir := t.TempDir()
 	old := sudoDirs
 	t.Cleanup(func() { sudoDirs = old })
-	sudoDirs = []string{dir + "/a", dir + "/b", dir + "/open"}
+	// Every rejected candidate is searched before the one accepted, so each
+	// check is what passes it over.
+	sudoDirs = []string{dir + "/a", dir + "/open", dir + "/b"}
 	t.Setenv("PATH", dir+"/path")
-	for _, d := range []string{"a", "b", "path", "job", "open"} {
+	for _, d := range []string{"a", "b", "path", "job", "open", "theirs"} {
 		if err := os.MkdirAll(dir+"/"+d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -250,12 +253,29 @@ func TestToolBinaries(t *testing.T) {
 	if p, err := visudoBinary(); err == nil {
 		t.Errorf("visudoBinary = %q with none anywhere", p)
 	}
-	writeFile(t, dir+"/a/visudo", "not executable\n")
+	exe(dir+"/path/visudo", 0o775)       // group-writable
+	writeFile(t, dir+"/a/visudo-rs", "") // not executable
+	// Owned by another user: as root, a file given to nobody; otherwise a
+	// link to root's own /bin/true.
+	if os.Geteuid() == 0 {
+		nobody := lookupOrSkip(t, "nobody")
+		exe(dir+"/a/visudo", 0o755)
+		if err := os.Chown(dir+"/a/visudo", int(uidOf(nobody)), 0); err != nil {
+			t.Fatal(err)
+		}
+		// And root's own file in a directory nobody owns.
+		exe(dir+"/theirs/visudo", 0o755)
+		if err := os.Chown(dir+"/theirs", int(uidOf(nobody)), 0); err != nil {
+			t.Fatal(err)
+		}
+		sudoDirs = []string{dir + "/a", dir + "/open", dir + "/theirs", dir + "/b"}
+	} else if err := os.Symlink("/bin/true", dir+"/a/visudo"); err != nil {
+		t.Fatal(err)
+	}
 	exe(dir+"/open/visudo", 0o755) // in a directory anyone can write
-	exe(dir+"/path/visudo", 0o775) // group-writable
 	exe(dir+"/b/visudo-rs", 0o755)
 	if p, err := visudoBinary(); err != nil || p != dir+"/b/visudo-rs" {
-		t.Errorf("visudoBinary = %q, %v; want sudo-rs's visudo-rs, past a non-executable, a group-writable and an exposed visudo", p, err)
+		t.Errorf("visudoBinary = %q, %v; want sudo-rs's visudo-rs, past a group-writable, a non-executable, another user's, an exposed directory's and a directory another user owns", p, err)
 	}
 
 	proc := t.TempDir()

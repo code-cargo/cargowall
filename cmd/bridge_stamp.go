@@ -20,6 +20,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 
@@ -38,7 +39,9 @@ import (
 // The ports come from the kernel (network.WatchLinks): a veth whose master
 // is a Docker bridge, by Docker's names (network.DockerBridge) or a name
 // the container tracker reports. Everything is keyed by interface index,
-// which a removal names exactly.
+// which a removal names exactly. The tracker's reports are queued for a
+// worker of the stamp's own, so its event stream never waits on attach
+// work.
 //
 // A port it can't attach to is warned and left unstamped: its container's
 // traffic gets the job's rules alone, the stricter outcome. So do a port's
@@ -58,7 +61,25 @@ type bridgeStamp struct {
 	ports   map[int]tc.Attachment // where the program is attached, by index
 	failed  map[int]bool          // ports the attach failed on, warned of once each
 	watcher io.Closer
+	working bool // work() runs
 	closed  bool
+
+	// The tracker's reports, queued for work() to take in order: its
+	// callbacks run on its event stream, which must not wait on attach
+	// work, nor on b.mu while a report of the watch's holds it.
+	qmu       sync.Mutex
+	queue     []bridgeReport
+	unsettled atomic.Int64  // reports queued and not yet taken
+	kick      chan struct{} // cap 1: there are reports queued
+	stop      chan struct{}
+	worked    chan struct{} // closed as work() returns
+}
+
+// bridgeReport is one of the tracker's: a bridge it names, up, or the
+// destroy of one's network.
+type bridgeReport struct {
+	dev string
+	up  bool
 }
 
 // newBridgeStamp is the stamp for objs' program, nil with no objects or
@@ -67,15 +88,28 @@ func newBridgeStamp(objs *bpf.TcBpfObjects, logger *slog.Logger) *bridgeStamp {
 	if objs == nil || !objs.StepRules() {
 		return nil
 	}
+	return newStamp(objs.CwTcBrStamp, tc.AttachIngress, watchLinks, logger)
+}
+
+// newStamp is a stamp for prog, attached by attach to the ports watch
+// reports.
+func newStamp(prog *ebpf.Program,
+	attach func(ifindex int, name string, prog *ebpf.Program, logger *slog.Logger) (tc.Attachment, error),
+	watch func(onLink func(network.Link), onGone func(int), logger *slog.Logger) (io.Closer, error),
+	logger *slog.Logger,
+) *bridgeStamp {
 	return &bridgeStamp{
-		prog:   objs.CwTcBrStamp,
-		attach: tc.AttachIngress,
-		watch:  watchLinks,
+		prog:   prog,
+		attach: attach,
+		watch:  watch,
 		logger: logger,
 		links:  make(map[int]network.Link),
 		named:  make(map[string]bool),
 		ports:  make(map[int]tc.Attachment),
 		failed: make(map[int]bool),
+		kick:   make(chan struct{}, 1),
+		stop:   make(chan struct{}),
+		worked: make(chan struct{}),
 	}
 }
 
@@ -84,11 +118,20 @@ func watchLinks(onLink func(network.Link), onGone func(int), logger *slog.Logger
 }
 
 // start watches the namespace's interfaces, attaching to each Docker
-// bridge port there is and each one that comes.
+// bridge port there is and each one that comes, and takes the tracker's
+// reports.
 func (b *bridgeStamp) start() {
 	if b == nil {
 		return
 	}
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	b.working = true
+	b.mu.Unlock()
+	go b.work()
 	// Not under b.mu: the watch reports the interfaces there are before it
 	// returns.
 	w, err := b.watch(b.link, b.linkGone, b.logger)
@@ -135,13 +178,57 @@ func (b *bridgeStamp) linkGone(index int) {
 	b.syncPortsOf(index)
 }
 
-// up is the tracker's report of a Docker bridge, which may carry a name of
-// its network's choosing (com.docker.network.bridge.name): its ports are
-// stamped.
-func (b *bridgeStamp) up(dev string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed || b.named[dev] {
+// up and gone are the tracker's reports, queued for work(): a Docker
+// bridge, which may carry a name of its network's choosing
+// (com.docker.network.bridge.name), and the destroy of one's network.
+func (b *bridgeStamp) up(dev string) { b.report(bridgeReport{dev: dev, up: true}) }
+
+func (b *bridgeStamp) gone(dev string) { b.report(bridgeReport{dev: dev}) }
+
+func (b *bridgeStamp) report(r bridgeReport) {
+	b.unsettled.Add(1)
+	b.qmu.Lock()
+	b.queue = append(b.queue, r)
+	b.qmu.Unlock()
+	select {
+	case b.kick <- struct{}{}:
+	default:
+	}
+}
+
+// work takes the tracker's reports, in order, until Close.
+func (b *bridgeStamp) work() {
+	defer close(b.worked)
+	for {
+		select {
+		case <-b.stop:
+			return
+		case <-b.kick:
+		}
+		b.qmu.Lock()
+		reports := b.queue
+		b.queue = nil
+		b.qmu.Unlock()
+		b.mu.Lock()
+		for _, r := range reports {
+			if b.closed {
+				break
+			}
+			if r.up {
+				b.bridgeUp(r.dev)
+			} else {
+				b.bridgeGone(r.dev)
+			}
+		}
+		b.unsettled.Add(-int64(len(reports)))
+		b.mu.Unlock()
+	}
+}
+
+// bridgeUp names dev a Docker bridge, and stamps its ports, with b.mu
+// held.
+func (b *bridgeStamp) bridgeUp(dev string) {
+	if b.named[dev] {
 		return
 	}
 	b.named[dev] = true
@@ -152,13 +239,11 @@ func (b *bridgeStamp) up(dev string) {
 	}
 }
 
-// gone is the tracker's report that a Docker bridge's network was
-// destroyed. While a device by its name is still there, which is a bridge
+// bridgeGone takes a destroyed network's bridge name back, with b.mu
+// held. While a device by the name is still there, which is a bridge
 // recreated behind the name, reported before this, the name stays
 // Docker's. A removed bridge's ports have gone with it.
-func (b *bridgeStamp) gone(dev string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func (b *bridgeStamp) bridgeGone(dev string) {
 	for _, l := range b.links {
 		if l.Name == dev {
 			return
@@ -246,13 +331,21 @@ func (b *bridgeStamp) Close() {
 		return
 	}
 	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
 	b.closed = true
-	w := b.watcher
+	w, working := b.watcher, b.working
 	b.watcher = nil
 	b.mu.Unlock()
-	// Unlocked: the watch's last report may be waiting on b.mu.
+	// Unlocked: the watch's last report, or work(), may be waiting on b.mu.
 	if w != nil {
 		_ = w.Close()
+	}
+	close(b.stop)
+	if working {
+		<-b.worked
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()

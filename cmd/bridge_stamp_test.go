@@ -25,7 +25,9 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
@@ -48,17 +50,25 @@ type fakeLink struct {
 	closed   int
 }
 
-func (l *fakeLink) Attached() bool { return l.attached && l.closed == 0 }
+func (l *fakeLink) Attached() bool {
+	l.f.mu.Lock()
+	defer l.f.mu.Unlock()
+	return l.attached && l.closed == 0
+}
 
 func (l *fakeLink) Close() error {
+	l.f.mu.Lock()
+	defer l.f.mu.Unlock()
 	l.closed++
 	l.f.order = append(l.f.order, fmt.Sprintf("close %d", l.index))
 	return nil
 }
 
 // fakePorts stands in for the kernel's interfaces, network.WatchLinks and
-// tc.AttachIngress.
+// tc.AttachIngress. The stamp's worker attaches too, so mu guards what the
+// attachments hold.
 type fakePorts struct {
+	mu      sync.Mutex
 	initial []network.Link // what the watch lists when it starts
 	fail    map[int]error  // attach failures, by index
 	links   []*fakeLink
@@ -70,6 +80,8 @@ type fakePorts struct {
 }
 
 func (f *fakePorts) attach(index int, _ string, _ *ebpf.Program, _ *slog.Logger) (tc.Attachment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if err := f.fail[index]; err != nil {
 		return nil, err
 	}
@@ -94,6 +106,8 @@ func (c closerFunc) Close() error { return c() }
 
 // live is the indexes of the attachments not closed, sorted.
 func (f *fakePorts) live() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []int
 	for _, l := range f.links {
 		if l.closed == 0 {
@@ -104,16 +118,20 @@ func (f *fakePorts) live() []int {
 	return out
 }
 
-func newFakeStamp(f *fakePorts, log *bytes.Buffer) *bridgeStamp {
-	return &bridgeStamp{
-		attach: f.attach,
-		watch:  f.watch,
-		logger: slog.New(slog.NewTextHandler(log, nil)),
-		links:  make(map[int]network.Link),
-		named:  make(map[string]bool),
-		ports:  make(map[int]tc.Attachment),
-		failed: make(map[int]bool),
-	}
+func newFakeStamp(f *fakePorts, log io.Writer) *bridgeStamp {
+	return newStamp(nil, f.attach, f.watch, slog.New(slog.NewTextHandler(log, nil)))
+}
+
+// settle waits for the stamp's worker to have taken every tracker report
+// made so far. The worker counts a batch taken while it holds b.mu, so a
+// count of 0 seen under b.mu is a batch done.
+func settle(t *testing.T, b *bridgeStamp) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.unsettled.Load() == 0
+	}, 5*time.Second, time.Millisecond)
 }
 
 func bridge(index int, name string) network.Link {
@@ -169,8 +187,10 @@ func TestBridgeStamp_TrackerNamedBridge(t *testing.T) {
 	f := &fakePorts{initial: []network.Link{bridge(7, "ci-br"), port(20, "veth1", "veth", 7)}}
 	b := newFakeStamp(f, &bytes.Buffer{})
 	b.start()
+	t.Cleanup(b.Close)
 	assert.Empty(t, f.live())
 	b.up("ci-br")
+	settle(t, b)
 	assert.Equal(t, []int{20}, f.live())
 	f.onLink(port(21, "veth2", "veth", 7))
 	assert.Equal(t, []int{20, 21}, f.live())
@@ -210,8 +230,10 @@ func TestBridgeStamp_TrackerGoneAfterRecreate(t *testing.T) {
 	f := &fakePorts{initial: []network.Link{bridge(7, "ci-br"), port(20, "veth1", "veth", 7)}}
 	b := newFakeStamp(f, &bytes.Buffer{})
 	b.start()
+	t.Cleanup(b.Close)
 	b.up("ci-br")
 	b.gone("ci-br")
+	settle(t, b)
 	f.onLink(port(21, "veth2", "veth", 7))
 	assert.Equal(t, []int{20, 21}, f.live(), "a destroy that comes after its recreate leaves the new bridge Docker's")
 
@@ -219,6 +241,7 @@ func TestBridgeStamp_TrackerGoneAfterRecreate(t *testing.T) {
 	f.onGone(21)
 	f.onGone(7)
 	b.gone("ci-br")
+	settle(t, b)
 	f.onLink(bridge(8, "ci-br")) // another bridge by the name, none of Docker's
 	f.onLink(port(22, "veth2", "veth", 8))
 	assert.Empty(t, f.live())
@@ -269,11 +292,43 @@ func TestBridgeStamp_CloseDetachesEverything(t *testing.T) {
 	b := newFakeStamp(f, &bytes.Buffer{})
 	b.start()
 	b.Close()
+	b.Close()
+	select {
+	case <-b.worked:
+	default:
+		t.Fatal("Close returned with the worker still running")
+	}
 	assert.Equal(t, 1, f.stopped)
 	assert.Empty(t, f.live())
 	f.onLink(port(11, "veth2", "veth", 3))
 	b.up("ci-br")
 	assert.Len(t, f.links, 1)
+}
+
+// The tracker's reports are taken on a worker of the stamp's own, so its
+// event stream never waits on the attach work they lead to, nor on the
+// stamp while a report of the watch's holds it.
+func TestBridgeStamp_TrackerReportsDoNotWait(t *testing.T) {
+	f := &fakePorts{initial: []network.Link{bridge(7, "ci-br"), port(20, "veth1", "veth", 7)}}
+	b := newFakeStamp(f, &bytes.Buffer{})
+	b.start()
+	t.Cleanup(b.Close)
+	b.mu.Lock() // a report of the watch's, in the middle of its attach work
+	reported := make(chan struct{})
+	go func() {
+		b.up("ci-br")
+		b.gone("other")
+		close(reported)
+	}()
+	select {
+	case <-reported:
+		b.mu.Unlock()
+	case <-time.After(time.Second):
+		b.mu.Unlock()
+		t.Fatal("the tracker's reports waited on the stamp")
+	}
+	settle(t, b)
+	assert.Equal(t, []int{20}, f.live())
 }
 
 // startUserspace starts the stamp's watch and hands the tracker the
@@ -303,6 +358,7 @@ func TestBridgeStamp_TrackerWiring(t *testing.T) {
 	require.NotNil(t, handed.OnBridge)
 	require.NotNil(t, handed.OnBridgeGone)
 	handed.OnBridge("ci-br")
+	settle(t, a.stamp)
 	assert.Equal(t, []int{20}, f.live())
 	a.Close()
 	assert.Empty(t, f.live())

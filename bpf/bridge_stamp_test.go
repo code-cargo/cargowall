@@ -110,6 +110,8 @@ const (
 	brOrdinal       uint32 = 41                    // bound to brPolicy
 	brOrdinalUnb    uint32 = 42                    // bound to nothing
 	brOrdinalWide   uint32 = 43                    // bound to brPolicyTooWide
+	brPolicyNone    uint32 = 9                     // allows nothing
+	brOrdinalNone   uint32 = 44                    // bound to brPolicyNone
 	brForeignMark   uint32 = 0x00010000 | brPolicy // a mark no stamp: its low bits read as brPolicy
 )
 
@@ -123,11 +125,12 @@ const (
 // socket tagged with a step bound to it may get. Nothing else gets one:
 // not an untagged or unbound socket, nor a mark the container set (cleared
 // as the packet leaves its namespace), or a stamp set on the host's side
-// ahead of the program (cleared), or a packet another mark is on (left as
-// it is, unstamped). A host socket's mark in the stamp's range is never
-// read as one, nor is an AF_PACKET frame a tagged thread sends: packet
-// sockets get no tag. And every one of the container's packets reaches
-// the port with its socket: BridgeSocketless stays 0.
+// ahead of the program (cleared, or rewritten to the packet's own
+// socket's), or a packet another mark is on (left as it is, unstamped).
+// A host socket's mark in the stamp's range is never read as one, nor is
+// an AF_PACKET frame a tagged thread sends: packet sockets get no tag. And
+// every one of the container's packets reaches the port with its socket:
+// BridgeSocketless stays 0.
 //
 // ci-kernels have no bridge or veth: there it skips, and CI's runner
 // kernels run it. On a host without br_netfilter loaded it loads the
@@ -155,6 +158,7 @@ func runBridgeStamp(t *testing.T, brNetfilter bool) {
 	put(objs.MapCidrsV6, RuleKeyV6(brPolicy, 128, netip.MustParseAddr("fd99::20").As16()), TcBpfLpmVal{Action: 1})
 	put(objs.MapStepPolicy, brOrdinal, brPolicy)
 	put(objs.MapStepPolicy, brOrdinalWide, brPolicyTooWide)
+	put(objs.MapStepPolicy, brOrdinalNone, brPolicyNone)
 	events, err := ringbuf.NewReader(objs.MapEvents)
 	require.NoError(t, err)
 	t.Cleanup(func() { events.Close() })
@@ -177,12 +181,16 @@ func runBridgeStamp(t *testing.T, brNetfilter bool) {
 
 	for _, dst := range []netip.Addr{netip.MustParseAddr("10.99.0.20"), netip.MustParseAddr("fd99::20")} {
 		// From the container.
-		check := func(name string, ordinal, mark uint32, want bool) {
+		checkAsked := func(name string, ordinal, mark uint32, want, asked bool) {
 			t.Helper()
 			topo.enter(t, topo.ctr)
 			_, sport := dialSYN(t, objs, dst, ordinal, mark)
 			topo.enter(t, topo.rtr)
-			checkUplink(t, events, fmt.Sprintf("%s to %s", name, dst), dst, sport, want)
+			checkUplinkAsked(t, events, fmt.Sprintf("%s to %s", name, dst), dst, sport, want, asked)
+		}
+		check := func(name string, ordinal, mark uint32, want bool) {
+			t.Helper()
+			checkAsked(name, ordinal, mark, want, want)
 		}
 		check("bound step", brOrdinal, 0, true)
 		check("untagged", 0, 0, false)
@@ -192,6 +200,12 @@ func runBridgeStamp(t *testing.T, brNetfilter bool) {
 
 		if m := markAhead(t, c0h, StepStampMagic|brPolicy); m != nil {
 			check("forged stamp, set on the host's side", 0, 0, false)
+			// A stamp found is rewritten to the packet's own socket's, so
+			// one step's can't stand for another's, in either direction.
+			checkAsked("a step allowed nothing, another step's stamp on its packets", brOrdinalNone, 0, false, true)
+			require.NoError(t, m.Close())
+			m = markAhead(t, c0h, StepStampMagic|brPolicyNone)
+			check("bound step, another step's stamp on its packets", brOrdinal, 0, true)
 			require.NoError(t, m.Close())
 			m = markAhead(t, c0h, brForeignMark)
 			check("bound step, another mark on its packets", brOrdinal, 0, false)
@@ -369,9 +383,16 @@ func interfaceIndex(t *testing.T, name string) int {
 // job's, its step not asked, when not.
 func checkUplink(t *testing.T, events *ringbuf.Reader, name string, dst netip.Addr, sport uint16, want bool) {
 	t.Helper()
+	checkUplinkAsked(t, events, name, dst, sport, want, want)
+}
+
+// checkUplinkAsked is checkUplink for a verdict and a step tier apart: a
+// step whose rules allow nothing there is asked and denies.
+func checkUplinkAsked(t *testing.T, events *ringbuf.Reader, name string, dst netip.Addr, sport uint16, want, asked bool) {
+	t.Helper()
 	ev := readTcEventFor(t, events, dst, 80, sport)
 	require.Equal(t, want, ev.Allowed == 1, "%s: verdict", name)
-	require.Equal(t, want, ev.Flags&0x2 != 0, "%s: EVENT_FLAG_STEP_TIER", name)
+	require.Equal(t, asked, ev.Flags&0x2 != 0, "%s: EVENT_FLAG_STEP_TIER", name)
 }
 
 // bridgeTopology is two scratch namespaces: ctr, a container's, whose c0

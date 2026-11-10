@@ -161,18 +161,20 @@ inside() {
   echo "✅ runner back in the sudo group"
 }
 
-# latefile checks that a competing grant in a file sudo reads after the
-# lockdown's own sudoers.d file is denied anyway — because the lockdown rules
-# are appended to the end of /etc/sudoers, read after every sudoers.d file and
-# every include. The Debian includedir shape, with two later-sorting grants a
-# reader could miss: a quoted user name, and a tab-separated #include that
-# pulls in a grant from another file. Both grant commands the verification
-# probe never tests, so only the appended block stops them.
+# latefile checks that grants read after the lockdown's own sudoers.d file
+# are denied anyway — because the lockdown rules are appended to the end of
+# /etc/sudoers, read after every sudoers.d file and every include. The Debian
+# includedir shape, with three such grants, each of a command the
+# verification probe never tests:
+# - one in /etc/sudoers itself after the includedir, which no sudoers.d scan
+#   can touch: only the appended block stops it, so this leg fails without it;
+# - a later-sorting file with a quoted user name;
+# - a later-sorting file with a tab-separated #include of another file.
 latefile() {
   export DEBIAN_FRONTEND=noninteractive
   command -v sudo >/dev/null || { apt-get update -qq >/dev/null && apt-get install -y -qq sudo >/dev/null; }
   id runner >/dev/null 2>&1 || { getent group docker >/dev/null || groupadd docker; useradd -m -G sudo,users,docker runner; }
-  printf 'root ALL=(ALL:ALL) ALL\n%%sudo ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\n' > /etc/sudoers
+  printf 'root ALL=(ALL:ALL) ALL\n%%sudo ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\nrunner ALL=(ALL) NOPASSWD: /usr/bin/tail\n' > /etc/sudoers
   mkdir -p /etc/sudoers.d
   find /etc/sudoers.d -type f ! -name README -delete
   printf '"runner" ALL=(ALL) NOPASSWD: /bin/cat\n' > /etc/sudoers.d/zzz-quoted
@@ -190,6 +192,7 @@ latefile() {
     while [ ! -f /tmp/go ]; do sleep 0.2; done
     sudo -n /bin/cat /etc/hostname >/dev/null 2>&1; echo \$? > /tmp/cat.rc
     sudo -n /usr/bin/head /etc/hostname >/dev/null 2>&1; echo \$? > /tmp/head.rc
+    sudo -n /usr/bin/tail /etc/hostname >/dev/null 2>&1; echo \$? > /tmp/tail.rc
     touch /tmp/done; sleep 600"' &
   local upstream
   upstream="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
@@ -208,7 +211,8 @@ latefile() {
   [ -f /tmp/done ] || fail "the held step never answered"
   [ "$(cat /tmp/cat.rc)" != 0 ] || fail "sudo cat ran: the quoted later-sorting grant applied"
   [ "$(cat /tmp/head.rc)" != 0 ] || fail "sudo head ran: the tab-include later-sorting grant applied"
-  echo "✅ both later-sorting grants are denied by the appended block"
+  [ "$(cat /tmp/tail.rc)" != 0 ] || fail "sudo tail ran: the grant after the includedir applied, so the rules were not appended last"
+  echo "✅ every grant read after the lockdown's sudoers.d file is denied by the appended block"
 
   kill -TERM "$cw" 2>/dev/null || true
   wait "$cw" 2>/dev/null || true

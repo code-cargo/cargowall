@@ -365,13 +365,6 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return fmt.Errorf("sudo lockdown incomplete, group removal failed: %w", err)
 	}
 
-	// Disable competing sudoers.d files that grant this user access, matched
-	// against the groups from before the removal above.
-	rb.DisabledFiles, err = disableCompetingSudoersFiles(sudoersDir, username, preGIDs, logger)
-	if err != nil {
-		return fmt.Errorf("sudo lockdown incomplete, competing grants remain active: %w", err)
-	}
-
 	// Remove user from the docker group. Like the sudo groups, this reaches
 	// only logins after the lockdown: running job steps keep the docker
 	// socket, which warnDockerAccess reports.
@@ -422,8 +415,19 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 		return fmt.Errorf("sudo lockdown incomplete, %s could not be amended with the lockdown rules: %w", mainSudoers, err)
 	}
 
-	// Validate the overall sudoers configuration after all modifications.
-	// If disabling files broke alias/Defaults dependencies, roll back.
+	// Disable competing sudoers.d files that grant this user access, matched
+	// against the groups from before the removal above. With the rules
+	// appended, this is for the job summary only and cannot fail the
+	// lockdown; in the fallback it is load-bearing.
+	rb.DisabledFiles, err = disableCompetingSudoersFiles(sudoersDir, username, preGIDs, !rb.SudoersBlock, logger)
+	if err != nil {
+		return fmt.Errorf("sudo lockdown incomplete, competing grants remain active: %w", err)
+	}
+
+	// Validate the overall sudoers configuration after all modifications, and
+	// roll back if sudo would not parse it. visudo only warns about an alias a
+	// disabled file left undefined, so that does not stop the lockdown;
+	// nothing relies on it, since the appended rules are read last regardless.
 	if out, err := exec.Command("visudo", "-c").CombinedOutput(); err != nil {
 		logger.Warn("Overall sudoers validation failed after modifications, rolling back",
 			"error", err, "output", strings.TrimSpace(string(out)))

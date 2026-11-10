@@ -57,23 +57,36 @@ func readAfterLockdown(name string) bool {
 }
 
 // disableCompetingSudoersFiles scans /etc/sudoers.d/ for files that could
-// grant the user sudo past the lockdown and renames them to
-// *.cargowall-disabled. Returns the disabled files and an error if any such
-// file could not be disabled (the lockdown may be incomplete).
+// grant the user sudo and renames them to *.cargowall-disabled, returning the
+// files it disabled.
 //
-// A file sudo reads AFTER the lockdown file can override the deny-first
-// rules, so any such file holding a rule line at all — a user specification
-// in any spelling, or an include that pulls in later-read lines — is
-// disabled, without trusting a parser to attribute it to the user. A file
-// read before the lockdown rules is overridden by them whatever it says, so
-// there the parser decides, and a miss cannot matter.
+// loadBearing says whether the lockdown depends on this scan. It does not
+// when the rules are appended as the last lines of /etc/sudoers: those hold
+// whatever a sudoers.d file says, so the scan is for the job summary, and a
+// file it cannot inspect or cannot disable is a Warn, never a failed
+// lockdown. It does in the fallback where /etc/sudoers cannot be replaced
+// and the lockdown rests on its own sudoers.d file: there a file the scan
+// cannot inspect is disabled as if it competed (fail-closed), and a file it
+// cannot disable fails the lockdown.
+//
+// A file sudo reads AFTER the lockdown file can override that file's
+// deny-first rules, so any such file holding a rule line at all — a user
+// specification in any spelling, or an include that pulls in later-read
+// lines — counts, without trusting a parser to attribute it to the user. A
+// file read before the lockdown file is overridden by it whatever it says,
+// so there the parser decides.
 //
 // userGIDs is the user's group memberships as a running job holds them, from
 // before the lockdown removed any. A nil map (the lookup failed) makes any
 // %group a potential grant, fail-closed.
-func disableCompetingSudoersFiles(dir, username string, userGIDs map[string]bool, logger *slog.Logger) ([]string, error) {
+func disableCompetingSudoersFiles(dir, username string, userGIDs map[string]bool, loadBearing bool, logger *slog.Logger) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if !loadBearing {
+			logger.Warn("Cannot scan sudoers.d for competing grants; reporting only, the appended rules hold",
+				"dir", dir, "error", err)
+			return nil, nil
+		}
 		return nil, fmt.Errorf("failed to read sudoers.d directory: %w", err)
 	}
 
@@ -82,44 +95,41 @@ func disableCompetingSudoersFiles(dir, username string, userGIDs map[string]bool
 	// file, grant using that alias in another).
 	aliases := collectUserAliases(dir, username)
 
-	var disabled []string
-	var renameFailed []string
+	var disabled, failed []string
+	// unsettled records a file the scan could not settle: a failure of the
+	// lockdown when the scan is load-bearing, a Warn when it is not.
+	unsettled := func(path, msg string, args ...any) {
+		args = append([]any{"path", path}, args...)
+		if !loadBearing {
+			logger.Warn(msg+"; reporting only, the appended rules hold", args...)
+			return
+		}
+		logger.Warn(msg, args...)
+		failed = append(failed, path)
+	}
+	seen := make(map[string]bool)
 	for _, entry := range entries {
 		if entry.IsDir() || ownSudoersEntry(entry.Name()) {
 			continue
 		}
 		name := entry.Name()
 		path := filepath.Join(dir, name)
+		seen[name] = true
 		competes, reason, readErr := sudoersFileCompetes(path, name, username, userGIDs, aliases)
 		if readErr != nil {
-			logger.Warn("Cannot read sudoers file, treating as a competing grant",
-				"path", path, "error", readErr)
-			renameFailed = append(renameFailed, path)
-			continue
+			if !loadBearing {
+				unsettled(path, "Cannot inspect sudoers file", "error", readErr)
+				continue
+			}
+			// The lockdown rests on this scan: what it cannot inspect is
+			// disabled as if it competed.
+			competes, reason = true, "cannot be inspected: "+readErr.Error()
 		}
 		if !competes {
 			continue
 		}
-
-		disabledPath := path + disabledSuffix
-		// Use Link+Remove instead of Rename to atomically fail if the
-		// disabled target already exists (Link returns EEXIST).
-		if err := os.Link(path, disabledPath); err != nil {
-			if errors.Is(err, os.ErrExist) {
-				logger.Warn("Disabled target already exists, cannot safely disable sudoers file",
-					"path", path, "disabledPath", disabledPath)
-			} else {
-				logger.Warn("Failed to disable sudoers file",
-					"path", path, "error", err)
-			}
-			renameFailed = append(renameFailed, path)
-			continue
-		}
-		if err := os.Remove(path); err != nil {
-			logger.Warn("Failed to remove original after linking disabled copy, cleaning up",
-				"path", path, "error", err)
-			os.Remove(disabledPath)
-			renameFailed = append(renameFailed, path)
+		if err := disableSudoersFile(path); err != nil {
+			unsettled(path, "Failed to disable competing sudoers file", "error", err)
 			continue
 		}
 		logger.Info("Disabled competing sudoers file", "path", path, "reason", reason)
@@ -127,26 +137,44 @@ func disableCompetingSudoersFiles(dir, username string, userGIDs map[string]bool
 	}
 
 	// Verification re-scan: catch any files that appeared during the disable
-	// pass (narrows the TOCTOU window to microseconds).
-	if len(renameFailed) == 0 {
+	// pass (narrows the TOCTOU window to microseconds). Only names the first
+	// pass did not see: one it already settled, or reported, is not new.
+	if len(failed) == 0 {
 		recheck, _ := os.ReadDir(dir)
 		for _, entry := range recheck {
-			if entry.IsDir() || ownSudoersEntry(entry.Name()) {
+			if entry.IsDir() || ownSudoersEntry(entry.Name()) || seen[entry.Name()] {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
-			if competes, _, _ := sudoersFileCompetes(path, entry.Name(), username, userGIDs, aliases); competes {
-				logger.Warn("New sudoers file appeared during lockdown scan",
-					"path", path)
-				renameFailed = append(renameFailed, path)
+			competes, _, err := sudoersFileCompetes(path, entry.Name(), username, userGIDs, aliases)
+			if competes || (err != nil && loadBearing) {
+				unsettled(path, "New sudoers file appeared during lockdown scan")
 			}
 		}
 	}
 
-	if len(renameFailed) > 0 {
-		return disabled, fmt.Errorf("failed to disable competing sudoers files: %v", renameFailed)
+	if len(failed) > 0 {
+		return disabled, fmt.Errorf("failed to disable competing sudoers files: %v", failed)
 	}
 	return disabled, nil
+}
+
+// disableSudoersFile renames path to path+disabledSuffix. It links then
+// removes rather than renaming, so it fails (EEXIST) instead of overwriting a
+// disabled copy that already exists.
+func disableSudoersFile(path string) error {
+	disabledPath := path + disabledSuffix
+	if err := os.Link(path, disabledPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("a disabled copy %s already exists: %w", disabledPath, err)
+		}
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		os.Remove(disabledPath)
+		return fmt.Errorf("remove the original after linking its disabled copy: %w", err)
+	}
+	return nil
 }
 
 // sudoersFileGrantsUser returns true if the file contains a sudoers rule

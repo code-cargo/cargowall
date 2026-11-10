@@ -42,8 +42,8 @@ snapshot() {
   sudo whoami
   echo "--- Save sudoers.d file list for later comparison ---"
   sudo ls /etc/sudoers.d/ | sort > /tmp/sudoers-before.txt
-  # The hosted image's /etc/sudoers ends by including sudoers.d, so the
-  # lockdown never edits it; verify-restored checks it is byte-identical.
+  # The lockdown appends its rules to the end of /etc/sudoers and removes
+  # them at stop; verify-restored checks the file is byte-identical again.
   sudo sha256sum /etc/sudoers > /tmp/sudoers-main.sha
 }
 
@@ -172,7 +172,7 @@ verify_restored() {
     echo "❌ /etc/sudoers differs from its pre-lockdown state"
     exit 1
   fi
-  echo "✅ /etc/sudoers unchanged"
+  echo "✅ /etc/sudoers restored byte for byte after stop"
 }
 
 verify_full_sudo() {

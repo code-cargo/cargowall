@@ -195,7 +195,12 @@ func TestHasSudo(t *testing.T) {
 		return func() { os.Remove(path) }
 	}
 
-	check(false, "", "nothing anywhere")
+	t.Chdir(dir)
+	if err := os.MkdirAll(dir+"/relative/bin", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	place(dir + "/relative/bin/sudo")
+	check(false, "", "nothing anywhere but a relative PATH entry, which names nothing fixed")
 	undo := place(dir + "/notworker/sudo")
 	check(false, "", "a sudo only on a process that is not the worker")
 	undo()
@@ -215,50 +220,65 @@ func TestHasSudo(t *testing.T) {
 	check(false, dir+"/etc/sudoers", "a policy left behind by a removed sudo")
 }
 
-// visudo is found where sudo is, under either of its names, and only an
-// executable counts; the verification's sudo is one that runs commands,
-// never sudoedit.
+// The visudo cargowall runs and the sudo whose answer it trusts come only
+// from cargowall's PATH and the fixed directories, never a worker's PATH,
+// which is the job's; and only as an executable that cargowall's user owns
+// and nobody else can write, in a directory likewise, links resolved.
+// sudoedit never probes.
 func TestToolBinaries(t *testing.T) {
 	dir := t.TempDir()
 	old := sudoDirs
 	t.Cleanup(func() { sudoDirs = old })
-	sudoDirs = []string{dir + "/a", dir + "/b"}
+	sudoDirs = []string{dir + "/a", dir + "/b", dir + "/open"}
 	t.Setenv("PATH", dir+"/path")
-	for _, d := range []string{"a", "b", "path"} {
+	for _, d := range []string{"a", "b", "path", "job", "open"} {
 		if err := os.MkdirAll(dir+"/"+d, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	exe := func(path string) {
+	if err := os.Chmod(dir+"/open", 0o777); err != nil {
+		t.Fatal(err)
+	}
+	exe := func(path string, mode os.FileMode) {
 		t.Helper()
 		writeFile(t, path, "#!/bin/sh\n")
-		if err := os.Chmod(path, 0o755); err != nil {
+		if err := os.Chmod(path, mode); err != nil {
 			t.Fatal(err)
 		}
 	}
-	proc := t.TempDir()
 
 	if p, err := visudoBinary(); err == nil {
 		t.Errorf("visudoBinary = %q with none anywhere", p)
 	}
 	writeFile(t, dir+"/a/visudo", "not executable\n")
-	exe(dir + "/b/visudo-rs")
+	exe(dir+"/open/visudo", 0o755) // in a directory anyone can write
+	exe(dir+"/path/visudo", 0o775) // group-writable
+	exe(dir+"/b/visudo-rs", 0o755)
 	if p, err := visudoBinary(); err != nil || p != dir+"/b/visudo-rs" {
-		t.Errorf("visudoBinary = %q, %v; want sudo-rs's visudo-rs, past a non-executable visudo", p, err)
+		t.Errorf("visudoBinary = %q, %v; want sudo-rs's visudo-rs, past a non-executable, a group-writable and an exposed visudo", p, err)
 	}
 
-	if p := sudoBinary(proc); p != "" {
-		t.Errorf("sudoBinary = %q with none anywhere", p)
+	proc := t.TempDir()
+	fakeProc(t, proc, "40", "Runner.Worker", status("1001", "1001"), "PATH="+dir+"/job")
+	exe(dir+"/job/sudo", 0o755)
+	if found, _ := hasSudo(proc); !found {
+		t.Error("hasSudo missed a sudo on the worker's PATH")
 	}
-	exe(dir + "/a/sudoedit")
+	if p := sudoBinary(); p != "" {
+		t.Errorf("sudoBinary = %q; a sudo only on the worker's PATH must never be the one probed with", p)
+	}
+	exe(dir+"/a/sudoedit", 0o755)
 	if err := os.Symlink(dir+"/gone", dir+"/a/sudo"); err != nil {
 		t.Fatal(err)
 	}
-	if p := sudoBinary(proc); p != "" {
+	if p := sudoBinary(); p != "" {
 		t.Errorf("sudoBinary = %q; want neither sudoedit nor a dangling link", p)
 	}
-	exe(dir + "/path/sudo-rs")
-	if p := sudoBinary(proc); p != dir+"/path/sudo-rs" {
-		t.Errorf("sudoBinary = %q; want the sudo-rs on PATH", p)
+	exe(dir+"/b/sudo-rs.real", 0o755)
+	if err := os.Symlink(dir+"/b/sudo-rs.real", dir+"/path/sudo-rs"); err != nil {
+		t.Fatal(err)
+	}
+	if p := sudoBinary(); p != dir+"/b/sudo-rs.real" {
+		t.Errorf("sudoBinary = %q; want the link on PATH resolved to its target", p)
 	}
 }

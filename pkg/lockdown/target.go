@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/code-cargo/cargowall/pkg/procfs"
 )
@@ -87,8 +88,8 @@ func resolveTarget(cfgUsername, procRoot, sudoUser string, current *user.User, g
 			break
 		}
 	}
-	if sudoUser == "root" {
-		sudoUser = ""
+	if _, err := user.Lookup(sudoUser); sudoUser == "root" || err != nil {
+		sudoUser = "" // root names nobody, and a missing user is no one's
 	}
 	switch {
 	case guess != "" && sudoUser != "" && guess != sudoUser:
@@ -184,12 +185,19 @@ var sudoPolicies = []string{mainSudoers, sudoRsSudoers}
 
 // toolPaths is every path that holds one of names, in search order: on
 // cargowall's PATH, as a command run by name resolves it, then on the PATH of
-// a Runner.Worker under procRoot, then in sudoDirs. Anything there counts, a
-// dangling link included.
-func toolPaths(names []string, procRoot string) []string {
+// a Runner.Worker under procRoot when withWorkers, then in sudoDirs. Anything
+// there counts, a dangling link included.
+//
+// A worker's PATH is the job's own environment, and can name directories the
+// job writes. It is searched only to find whether a sudo is there, where a
+// hit only refuses the no-sudo shortcut; never to pick a binary cargowall
+// runs or trusts (trustedTool).
+func toolPaths(names []string, procRoot string, withWorkers bool) []string {
 	dirs := filepath.SplitList(os.Getenv("PATH"))
-	for _, dir := range workerDirs(procRoot) {
-		dirs = append(dirs, filepath.SplitList(environValue(filepath.Join(dir, "environ"), "PATH"))...)
+	if withWorkers {
+		for _, dir := range workerDirs(procRoot) {
+			dirs = append(dirs, filepath.SplitList(environValue(filepath.Join(dir, "environ"), "PATH"))...)
+		}
 	}
 	dirs = append(dirs, sudoDirs...)
 	var found []string
@@ -208,10 +216,10 @@ func toolPaths(names []string, procRoot string) []string {
 }
 
 // hasSudo reports whether this host has a sudo for a job step to run: any of
-// sudoNames where toolPaths looks. When it finds none, policy is a sudo
-// policy file still in place, or "".
+// sudoNames where toolPaths looks, the workers' PATH included. When it finds
+// none, policy is a sudo policy file still in place, or "".
 func hasSudo(procRoot string) (found bool, policy string) {
-	if len(toolPaths(sudoNames, procRoot)) > 0 {
+	if len(toolPaths(sudoNames, procRoot, true)) > 0 {
 		return true, ""
 	}
 	for _, p := range sudoPolicies {
@@ -222,28 +230,45 @@ func hasSudo(procRoot string) (found bool, policy string) {
 	return false, ""
 }
 
-// runnable is the first of paths that is an executable file, links
-// followed, or "".
-func runnable(paths []string) string {
-	for _, p := range paths {
-		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
-			return p
+// trustedTool is the first of names, on cargowall's PATH or in sudoDirs, that
+// is an executable file cargowall's own user owns and only it can write, in
+// a directory likewise, links resolved; or "". cargowall runs the visudo it
+// returns as root, and trusts the exit status of the sudo it returns, so
+// nothing another user can write is either.
+func trustedTool(names []string) string {
+	for _, p := range toolPaths(names, "", false) {
+		real, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			continue
+		}
+		fi, err := os.Stat(real)
+		if err != nil || !fi.Mode().IsRegular() || fi.Mode()&0o111 == 0 || !ownedAndClosed(fi) {
+			continue
+		}
+		if di, err := os.Stat(filepath.Dir(real)); err == nil && ownedAndClosed(di) {
+			return real
 		}
 	}
 	return ""
 }
 
-// sudoBinary is the sudo the verification probes with: the first that runs
-// commands, of those toolPaths finds, or "".
-func sudoBinary(procRoot string) string {
-	return runnable(toolPaths(sudoNames[:3], procRoot))
+// ownedAndClosed is whether fi is owned by the user cargowall runs as and
+// writable by no group or other user.
+func ownedAndClosed(fi os.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == uint32(os.Geteuid()) && fi.Mode().Perm()&0o022 == 0
 }
 
-// visudoBinary is the visudo the lockdown validates sudoers with, found where
-// sudo is.
+// sudoBinary is the sudo the verification probes with: the first trusted one
+// that runs commands, or "".
+func sudoBinary() string {
+	return trustedTool(sudoNames[:3])
+}
+
+// visudoBinary is the visudo the lockdown validates sudoers with.
 func visudoBinary() (string, error) {
-	if p := runnable(toolPaths(visudoNames, procDir)); p != "" {
+	if p := trustedTool(visudoNames); p != "" {
 		return p, nil
 	}
-	return "", errors.New("no visudo to validate sudoers with")
+	return "", errors.New("no visudo, owned by root and writable by no one else, to validate sudoers with")
 }

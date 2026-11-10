@@ -277,7 +277,7 @@ var errLockdownIneffective = errors.New("sudo lockdown does not hold")
 // it — the allowlist may not apply (say, a sudoers.d file never included), or
 // sudo -l needs a password here — that is a Warn, not "Verified".
 func verifyLockdown(v *jobView, allow []string, logger *slog.Logger) error {
-	sudo := sudoBinary(procDir)
+	sudo := sudoBinary()
 	if sudo == "" {
 		logger.Debug("No sudo binary, nothing to verify the lockdown against")
 		return nil

@@ -85,26 +85,34 @@ func lockdownBlock(rules string, addedNL bool) string {
 // withoutBlock is content with the lockdown block cut out, marker lines
 // included, and whether there was one. When the block's begin marker says it
 // added a preceding newline, that newline is taken back too, so a file with
-// no final newline is restored byte for byte. A begin marker without its end
-// is an error: what follows it is not known to be ours.
+// no final newline is restored byte for byte.
+//
+// Exactly one marker pair is ours: withBlock strips the old block before it
+// appends a new one, and every edit is an atomic replace, so cargowall never
+// leaves two. Any other marker — a begin without its end, an end without its
+// begin, or a second pair anywhere in the file — means the file was edited by
+// someone else, and is an error that leaves it untouched: guessing which
+// lines are ours could delete rules that are not, or leave a stale block's
+// allowlist live after the lockdown ends.
 func withoutBlock(content string) (string, bool, error) {
 	lines := strings.SplitAfter(content, "\n")
 	begin, end := -1, -1
 	addedNL := false
 	for i, line := range lines {
-		if a, ok := isBeginMarker(strings.TrimRight(line, "\n")); ok {
+		l := strings.TrimRight(line, "\n")
+		if a, ok := isBeginMarker(l); ok {
 			if begin >= 0 {
-				return "", false, errors.New("sudoers holds a second lockdown block before the first ends")
+				return "", false, errors.New("sudoers holds more than one lockdown block")
 			}
 			begin, addedNL = i, a
-		} else if strings.TrimRight(line, "\n") == blockEnd {
-			if begin < 0 {
+		} else if l == blockEnd {
+			switch {
+			case begin < 0:
 				return "", false, errors.New("sudoers holds a lockdown block end without its beginning")
+			case end >= 0:
+				return "", false, errors.New("sudoers holds more than one lockdown block")
 			}
 			end = i
-		}
-		if end >= 0 {
-			break
 		}
 	}
 	switch {

@@ -63,6 +63,10 @@ func TestWithoutBlock(t *testing.T) {
 		{name: "begin without end", content: arcSudoers + blockBegin + "\n" + testRules, wantErr: true},
 		{name: "end without begin", content: arcSudoers + blockEnd + "\n", wantErr: true},
 		{name: "second begin", content: blockBegin + "\n" + block, wantErr: true},
+		// A second whole pair, or a stray marker after the pair, is not ours to
+		// guess about: refuse, so a stale block's allowlist can't survive.
+		{name: "two pairs", content: arcSudoers + block + "x\n" + block, wantErr: true},
+		{name: "a pair then a stray end", content: arcSudoers + block + blockEnd + "\n", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

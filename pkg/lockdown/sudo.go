@@ -445,7 +445,7 @@ func EnableSudoLockdown(cfg *SudoLockdownConfig, logger *slog.Logger) error {
 	// Ask sudo, as a job step, whether the lockdown holds, and report the
 	// docker access it leaves, which fails nothing.
 	if view, err := lookupJobView(username, preGIDs); err != nil {
-		logger.Warn("Cannot verify sudo lockdown: the target user's credentials are unknown", "username", username, "error", err)
+		logger.Warn("Cannot verify sudo lockdown, leaving it in place: a job step's credentials are unknown", "username", username, "error", err)
 	} else if err := verifyLockdown(view, cfg.AllowCommands, logger); err != nil {
 		return err
 	} else {

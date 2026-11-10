@@ -274,3 +274,21 @@ func TestLookupJobView_fallbackUsesPreGIDs(t *testing.T) {
 		t.Errorf("fallback groups %v do not include the pre-lockdown gid 4242", view.groups)
 	}
 }
+
+// TestLookupJobView_unknownGroups: with no Runner.Worker and no pre-lockdown
+// groups (the lookup failed), a step's groups are unknown, so the view is an
+// error rather than a probe with the primary gid alone, which could report a
+// lockdown verified that it never tested.
+func TestLookupJobView_unknownGroups(t *testing.T) {
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := lookupJobView(u.Username, nil)
+	if err == nil && view.from == procfs.RunnerWorkerComm {
+		t.Skip("a Runner.Worker of this user is running; the fallback isn't taken")
+	}
+	if err == nil {
+		t.Errorf("lookupJobView with no worker and nil preGIDs = %+v, want an error", view)
+	}
+}

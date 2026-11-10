@@ -159,7 +159,11 @@ func environValue(path, key string) string {
 // lookupJobView is the target user's credentials as a step holds them: the
 // groups of the runner's workers when one is visible, else the groups the
 // user had before the lockdown removed any (preGIDs), which a process
-// started before it still holds.
+// started before it still holds. With neither — no worker visible and the
+// pre-lockdown lookup failed (preGIDs nil) — the groups a step holds are
+// unknown, and a probe with the primary gid alone could miss a group grant
+// and report a lockdown verified that it never tested; that is an error, so
+// the caller leaves the lockdown unverified with a Warn.
 func lookupJobView(username string, preGIDs map[string]bool) (*jobView, error) {
 	u, err := user.Lookup(username)
 	if err != nil {
@@ -177,6 +181,9 @@ func lookupJobView(username string, preGIDs map[string]bool) (*jobView, error) {
 	if gs, hosts, ok := workerView("/proc", v.uid); ok {
 		v.groups, v.dockerHosts, v.from = gs, hosts, procfs.RunnerWorkerComm
 		return v, nil
+	}
+	if preGIDs == nil {
+		return nil, errors.New("no Runner.Worker is visible and the user's groups before the lockdown are unknown")
 	}
 	for g := range preGIDs {
 		n, err := strconv.ParseUint(g, 10, 32)

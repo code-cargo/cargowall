@@ -230,6 +230,8 @@ func TestSudoersFileGrantsUser_groupByID(t *testing.T) {
 		"%#27 ALL=(ALL:ALL) NOPASSWD:ALL\n":        true,
 		"%#28 ALL=(ALL:ALL) NOPASSWD:ALL\n":        false,
 		"%#28, %#27 ALL=(ALL:ALL) NOPASSWD:ALL\n":  true,  // gid in a comma list
+		"%#27,%#28 ALL=(ALL:ALL) NOPASSWD:ALL\n":   true,  // no space after the comma
+		"%#28,%#29 ALL=(ALL:ALL) NOPASSWD:ALL\n":   false, // neither gid is the user's
 		"alice, %#27 ALL=(ALL:ALL) NOPASSWD:ALL\n": true,  // mixed name + gid
 		"%#28, alice ALL=(ALL:ALL) NOPASSWD:ALL\n": false, // neither names runner
 		"ALL, !%#27 ALL=(ALL:ALL) NOPASSWD:ALL\n":  false, // the group negated out of ALL

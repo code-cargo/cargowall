@@ -918,8 +918,11 @@ to select policy with.
   - *Host-only step rules.* Where the stamp cannot apply, a container's
     traffic gets the job's rules at TC, never wider: a port the program
     could not be attached to (warned), a port's packets before the attach
-    lands, a daemon whose bridges are in another network namespace, and a
-    run with no container tracking. Step rules then reach the host's
+    lands (on a bridge with a name of its network's choosing, until the
+    stamp has taken the tracker's report of it, which it does on a worker
+    of its own; `docker0` and `br-<id>` are known from the start), a
+    daemon whose bridges are in another network namespace, and a run with
+    no container tracking. Step rules then reach the host's
     processes alone.
   - The denial UX above applies: UDP fails fast with `EPERM`, TCP times
     out.

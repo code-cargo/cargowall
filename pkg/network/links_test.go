@@ -310,3 +310,39 @@ func TestWatchLinks_CloseWaitsForTheLastReport(t *testing.T) {
 	close(g.gate)
 	require.Eventually(t, closed.Load, 5*time.Second, 10*time.Millisecond)
 }
+
+// A listing made after dropped events leaves nothing out, though more come
+// while its reports are made: the kernel queues and reports none of those
+// until the queue is read empty, and relist lists again for as long as
+// events came while it listed.
+func TestWatchLinks_RelistConverges(t *testing.T) {
+	enterNetns(t)
+	events, err := netlink.Dial(unix.NETLINK_ROUTE, &netlink.Config{Groups: unix.RTMGRP_LINK})
+	require.NoError(t, err)
+	t.Cleanup(func() { events.Close() })
+	require.NoError(t, events.SetReadBuffer(1024))
+	list, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { list.Close() })
+
+	g := newGatedReports()
+	more := 0
+	w := &LinkWatcher{
+		events: events, list: list, known: map[int]bool{}, logger: slog.New(slog.DiscardHandler),
+		onLink: func(l Link) {
+			// Events that come while the first listing's reports are made.
+			if more < 40 {
+				more++
+				require.NoError(t, newLink(fmt.Sprintf("late%d", more), "dummy", "", nil))
+			}
+			g.onLink(l)
+		},
+		onGone: g.onGone,
+	}
+	for i := range 40 {
+		require.NoError(t, newLink(fmt.Sprintf("early%d", i), "dummy", "", nil))
+	}
+	w.relist()
+	assert.Equal(t, 40, g.named("early"))
+	assert.Equal(t, 40, g.named("late"), "the events that came while a listing's reports were made")
+}

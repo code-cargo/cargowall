@@ -305,6 +305,26 @@ func TestBridgeStamp_CloseDetachesEverything(t *testing.T) {
 	assert.Len(t, f.links, 1)
 }
 
+// Reports still queued when Close comes attach nothing after it: Close's
+// detach is the last word on every port, however the worker and Close
+// interleave.
+func TestBridgeStamp_CloseEndsQueuedReports(t *testing.T) {
+	for range 200 {
+		f := &fakePorts{initial: []network.Link{
+			bridge(7, "ci-br"), port(20, "veth1", "veth", 7),
+			bridge(8, "ci-br2"), port(21, "veth2", "veth", 8),
+		}}
+		b := newFakeStamp(f, io.Discard)
+		b.start()
+		b.up("ci-br")
+		b.up("ci-br2")
+		b.gone("other")
+		b.Close()
+		// An attach after the detach would be left open.
+		require.Empty(t, f.live(), "an attach after Close's detach")
+	}
+}
+
 // The tracker's reports are taken on a worker of the stamp's own, so its
 // event stream never waits on the attach work they lead to, nor on the
 // stamp while a report of the watch's holds it.

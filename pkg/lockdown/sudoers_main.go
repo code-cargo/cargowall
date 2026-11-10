@@ -275,21 +275,26 @@ func replaceSudoers(main, content string) error {
 // what holds the lockdown. The appended lines are the guarantee. Where main
 // cannot be replaced (a bind mount, a read-only file), it falls back to the
 // sudoers.d file in dir alone — but only where that holds: main, still
-// readable, must end by including dir, so nothing in main is read after the
-// file. Then competing-file disabling (which keeps later sudoers.d files from
-// overriding it) and the step verification carry the lockdown, and a Warn
-// names the weaker guarantee. Where main does not end that way, the
+// readable, must end by including dir in a spelling both classic sudo and
+// sudo-rs read that way (sudoersEndsWithIncludedir), and sudo-rs must not be
+// reading a file of its own instead. Then competing-file disabling (which
+// keeps later sudoers.d files from overriding it) and the step verification
+// carry the lockdown, and a Warn names the weaker guarantee. Otherwise the
 // lockdown's rules would not be read last, so it fails with that reason. Any
 // other error is returned and fails the lockdown.
 func applySudoersBlock(main, dir, rules string, logger *slog.Logger) (bool, error) {
 	appended, err := appendSudoersBlock(main, rules)
 	switch {
 	case errors.Is(err, errSudoersNotReplaceable):
+		if fileExists(sudoRsSudoers) {
+			return false, fmt.Errorf("%w, and the fallback to %s does not hold: sudo-rs reads %s in preference to %s, and nothing checks it",
+				err, dir, sudoRsSudoers, main)
+		}
 		data, rerr := os.ReadFile(main)
 		if rerr != nil {
 			return false, fmt.Errorf("%w, and it cannot be read to check the fallback: %w", err, rerr)
 		}
-		if last, ok := readsSudoersDLast(string(data), dir); !ok {
+		if last, ok := sudoersEndsWithIncludedir(string(data), dir); !ok {
 			return false, fmt.Errorf("%w, and the fallback to %s does not hold: %s", err, dir, notLastReason(main, dir, last))
 		}
 		logger.Warn("Cannot append the lockdown rules to sudoers, which cannot be replaced; "+
@@ -311,55 +316,114 @@ func applySudoersBlock(main, dir, rules string, logger *slog.Logger) (bool, erro
 	return appended, nil
 }
 
-// readsSudoersDLast reports whether sudo, reading main's content, reads
-// nothing in it after including dir: the last meaningful line is an
-// includedir of dir. It returns that last line too. A line is meaningful
-// unless it is blank or a comment, and a '#' line is a comment only when it
-// is neither a user named by uid ('#' and a digit) nor anything spelled like
-// an include ('#include…', with any separator or none): erring toward
-// "meaningful" only refuses a fallback that might not hold.
-func readsSudoersDLast(content, dir string) (string, bool) {
-	last := ""
-	for _, line := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || isSudoersComment(trimmed) {
-			continue
-		}
-		last = trimmed
+// sudoersEndsWithIncludedir reports whether both classic sudo and sudo-rs,
+// reading content as a whole sudoers file, read nothing in it after an
+// include of dir: its last line either of them acts on is that include. It
+// returns that last line too, for the reason when it does not hold.
+//
+// This is the check the sudoers.d fallback rests on, so it accepts only the
+// intersection of the two parsers, on bytes: a spelling one of them reads
+// differently — as a comment, a dropped line, a rule, or an include of
+// another path — is refused, which only costs the fallback, the safe
+// direction. It is deliberately separate from the competing-file scan's
+// lenient isIncludeDirective, which errs the other way. Measured against sudo
+// 1.9.15p5, 1.9.17p2 and sudo-rs 0.2.13:
+//   - the include is strictIncludedirOf: no leading blanks, the keyword and a
+//     separator, the path, and a real newline;
+//   - the line before it must not end in a backslash, which would continue
+//     a rule into it;
+//   - after it, only lines both parsers skip (skippedByBoth).
+func sudoersEndsWithIncludedir(content, dir string) (string, bool) {
+	lines := strings.Split(content, "\n") // lines[i] for i < len-1 ended in '\n'
+	inc := len(lines) - 1
+	for inc >= 0 && skippedByBoth(lines[inc]) {
+		inc--
 	}
-	return last, isIncludedirOf(last, dir)
+	if inc < 0 {
+		return "", false
+	}
+	line := lines[inc]
+	newline := inc < len(lines)-1 // sudo-rs needs a real '\n' after the path
+	if !newline || !strictIncludedirOf(line, dir) {
+		return line, false
+	}
+	if inc > 0 && strings.HasSuffix(lines[inc-1], `\`) {
+		return line, false
+	}
+	return line, true
 }
 
-// isSudoersComment reports whether a trimmed line is a comment that cannot
-// be a directive or a rule.
-func isSudoersComment(trimmed string) bool {
-	rest, ok := strings.CutPrefix(trimmed, "#")
+// skippedByBoth reports whether both parsers skip a line, so that a line
+// after the include does not matter: empty, only spaces and tabs, or a '#'
+// comment both read as one — '#' alone or followed by a byte that is not a
+// digit, not '-' (classic sudo reads "#-1" as a user id) and that does not
+// begin "include". A line ending in a backslash is never skipped: it
+// continues into the next.
+func skippedByBoth(line string) bool {
+	if strings.HasSuffix(line, `\`) {
+		return false
+	}
+	t := strings.TrimLeft(line, " \t")
+	if t == "" {
+		return true
+	}
+	rest, ok := strings.CutPrefix(t, "#")
 	if !ok {
 		return false
 	}
-	if rest != "" && rest[0] >= '0' && rest[0] <= '9' {
-		return false // a user named by uid
+	if rest == "" {
+		return true
+	}
+	if c := rest[0]; (c >= '0' && c <= '9') || c == '-' {
+		return false
 	}
 	return !strings.HasPrefix(rest, "include")
 }
 
-// isIncludedirOf reports whether line is an #includedir or @includedir of
-// dir, with any separator isIncludeDirective accepts, the path optionally
-// quoted or with a trailing slash. Anything else after the path makes it not
-// one, which only refuses the fallback.
-func isIncludedirOf(line, dir string) bool {
-	for _, kw := range []string{"#includedir", "@includedir"} {
-		rest, ok := strings.CutPrefix(line, kw)
-		if !ok || rest == "" || !strings.ContainsRune(" \t/", rune(rest[0])) {
-			continue
-		}
-		fields := strings.Fields(rest)
-		if len(fields) != 1 {
+// strictIncludedirOf reports whether line is, to both parsers, an includedir
+// of dir: "#includedir" or "@includedir" at the very start of the line; one
+// or more spaces or tabs; the path, either a run of printable ASCII other
+// than space, '"' and '\', or one balanced pair of double quotes around such
+// characters; then only spaces and tabs. The path must be dir, with or
+// without a trailing slash. A Unicode space, a '\r', a vertical tab, an
+// unbalanced quote or a trailing comment all refuse it.
+func strictIncludedirOf(line, dir string) bool {
+	var rest string
+	switch {
+	case strings.HasPrefix(line, "#includedir"):
+		rest = line[len("#includedir"):]
+	case strings.HasPrefix(line, "@includedir"):
+		rest = line[len("@includedir"):]
+	default:
+		return false
+	}
+	after := strings.TrimLeft(rest, " \t")
+	if len(after) == len(rest) {
+		return false // no separator: only sudo-rs reads that as an include
+	}
+	var path string
+	if q, ok := strings.CutPrefix(after, `"`); ok {
+		end := strings.IndexByte(q, '"')
+		if end < 0 {
 			return false
 		}
-		return filepath.Clean(strings.Trim(fields[0], `"`)) == filepath.Clean(dir)
+		path, after = q[:end], q[end+1:]
+		for i := 0; i < len(path); i++ {
+			if c := path[i]; c < 0x20 || c > 0x7e || c == '\\' {
+				return false
+			}
+		}
+	} else {
+		n := 0
+		for n < len(after) && after[n] > 0x20 && after[n] < 0x7f && after[n] != '"' && after[n] != '\\' {
+			n++
+		}
+		path, after = after[:n], after[n:]
 	}
-	return false
+	if strings.Trim(after, " \t") != "" {
+		return false
+	}
+	return path == dir || path == dir+"/"
 }
 
 // notLastReason says why the sudoers.d fallback would not hold.

@@ -314,7 +314,54 @@ func TestVerifyLockdown_allowlistControl(t *testing.T) {
 	if err := verifyLockdown(v, allow, logger); err != nil {
 		t.Fatal(err)
 	}
-	if out := buf.String(); strings.Contains(out, "Verified sudo lockdown") || !strings.Contains(out, "allowlist does not apply") {
+	if out := buf.String(); strings.Contains(out, "Verified sudo lockdown") || !strings.Contains(out, "sudo -l did not confirm") {
 		t.Errorf("allowlist refused: want a Warn and no Verified: %s", out)
+	}
+
+	// The -l check itself never completes (here, a timeout): unverified, a
+	// Warn that the allowlist could not be checked, never "Verified".
+	old := probeTimeout
+	probeTimeout = 200 * time.Millisecond
+	defer func() { probeTimeout = old }()
+	fakeSudo(t, `[ "$2" = "-l" ] && sleep 5; exit 1`)
+	logger, buf = captureLog()
+	if err := verifyLockdown(v, allow, logger); err != nil {
+		t.Fatal(err)
+	}
+	if out := buf.String(); strings.Contains(out, "Verified sudo lockdown") || !strings.Contains(out, "could not be checked") {
+		t.Errorf("-l check failed to run: want a Warn and no Verified: %s", out)
+	}
+	probeTimeout = old
+
+	// No allowlisted command exists to ask about: the control is skipped and
+	// the deny alone is verified.
+	fakeSudo(t, "exit 1")
+	logger, buf = captureLog()
+	if err := verifyLockdown(v, []string{"/no/such/cmd"}, logger); err != nil {
+		t.Fatal(err)
+	}
+	if out := buf.String(); !strings.Contains(out, "Verified sudo lockdown") || !strings.Contains(out, `allowlist_checked=""`) {
+		t.Errorf("no allowlisted command exists: want Verified with nothing checked: %s", out)
+	}
+}
+
+// TestAllowlistProbe: the positive check asks about the first allowlisted
+// command that exists as a regular file, skipping one that doesn't — asking
+// sudo -l about a missing command would fail and read as the allowlist not
+// applying.
+func TestAllowlistProbe(t *testing.T) {
+	dir := t.TempDir()
+	for _, tt := range []struct {
+		allow []string
+		want  string
+	}{
+		{[]string{"/no/such/cmd", "/usr/bin/id"}, "/usr/bin/id"},
+		{[]string{dir, "/usr/bin/id"}, "/usr/bin/id"}, // a directory is not a command
+		{[]string{"/no/such/cmd"}, ""},
+		{nil, ""},
+	} {
+		if got := allowlistProbe(tt.allow); got != tt.want {
+			t.Errorf("allowlistProbe(%v) = %q, want %q", tt.allow, got, tt.want)
+		}
 	}
 }

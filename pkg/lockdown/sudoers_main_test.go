@@ -414,6 +414,21 @@ func TestApplySudoersBlock_fallsBackWhenNotReplaceable(t *testing.T) {
 	}
 }
 
+// TestApplySudoersBlock_fallbackRefusesWithSudoRsFile: sudo-rs reads its
+// own file in preference to /etc/sudoers, and nothing checks that file, so
+// the fallback is refused while it exists.
+func TestApplySudoersBlock_fallbackRefusesWithSudoRsFile(t *testing.T) {
+	prev := sudoRsSudoers
+	t.Cleanup(func() { sudoRsSudoers = prev })
+	stubVisudo(t, nil)
+	stubRename(t, syscall.EBUSY)
+	sudoRsSudoers = writeSudoers(t, "root ALL=(ALL) ALL\n")
+	_, err := applySudoersBlock(writeSudoers(t, ubuntuSudoers), "/etc/sudoers.d", testRules, discardLogger())
+	if err == nil || !strings.Contains(err.Error(), "sudo-rs reads") {
+		t.Errorf("applySudoersBlock with /etc/sudoers-rs present = %v, want a refusal naming sudo-rs's file", err)
+	}
+}
+
 // TestApplySudoersBlock_refusesFallbackThatDoesNotHold: where /etc/sudoers
 // cannot be replaced and the sudoers.d file would not be read last — a grant
 // after the includedir, or no includedir at all (the ARC image) — the
@@ -451,33 +466,64 @@ func TestApplySudoersBlock_otherErrorFails(t *testing.T) {
 	}
 }
 
-// TestReadsSudoersDLast: the fallback holds only if the last line sudo reads
-// in /etc/sudoers includes sudoers.d. #uid lines and anything spelled like an
-// include count as meaningful, so they can't hide behind a comment.
-func TestReadsSudoersDLast(t *testing.T) {
+// TestSudoersEndsWithIncludedir: the fallback holds only where classic sudo
+// and sudo-rs both read /etc/sudoers as ending with an include of sudoers.d.
+// One row per spelling measured against both parsers: every spelling either
+// one reads differently — a comment, a dropped line, a rule after it, an
+// include of another path — must be refused.
+func TestSudoersEndsWithIncludedir(t *testing.T) {
 	const d = "/etc/sudoers.d"
-	for content, want := range map[string]bool{
-		ubuntuSudoers:                            true,
-		"#includedir /etc/sudoers.d\n":           true,
-		"@includedir\t/etc/sudoers.d\n":          true, // a tab
-		"@includedir/etc/sudoers.d\n":            true, // no separator (sudo-rs)
-		"@includedir \"/etc/sudoers.d/\"\n":      true, // quoted, trailing slash
-		"@includedir /etc/sudoers.d\n# note\n\n": true, // a comment after
-		"@includedir /etc/sudoers.d\n#\tnote\n":  true,
-		arcSudoers:                               false,
-		"":                                       false,
-		"@includedir /etc/sudoers.d\nrunner ALL=(ALL) ALL\n":       false,
-		"@includedir /etc/sudoers.d\n#1001 ALL=(ALL) ALL\n":        false, // #uid is a rule
-		"@includedir /etc/sudoers.d\n#include\t/etc/extra\n":       false, // an include after
-		"@includedir /etc/sudoers.d\n#include/etc/extra\n":         false,
-		"@includedir /etc/sudoers.d\n@includedir /etc/sudoers.x\n": false,
-		"@includedir /etc/sudoers.d\nDefaults !lecture\n":          false,
-		"@includedir /etc/sudoers.local\n":                         false, // another directory
-		"@include /etc/sudoers.d/zz-cargowall-lockdown\n":          false, // a single file
-		"@includedir /etc/sudoers.d extra\n":                       false,
+	for _, tt := range []struct {
+		name, content string
+		want          bool
+	}{
+		// Both parsers read these as ending with an include of sudoers.d.
+		{"ubuntu default", ubuntuSudoers, true},
+		{"hash spelling", "#includedir /etc/sudoers.d\n", true},
+		{"a tab separator", "@includedir\t/etc/sudoers.d\n", true},
+		{"a trailing slash", "@includedir /etc/sudoers.d/\n", true},
+		{"quoted with a trailing slash", "@includedir \"/etc/sudoers.d/\"\n", true},
+		{"hash, quoted", "#includedir \"/etc/sudoers.d\"\n", true},
+		{"trailing spaces", "@includedir /etc/sudoers.d   \n", true},
+		{"comments and blanks after", "@includedir /etc/sudoers.d\n# note\n#\tnote\n#\n\n   \n#x note\n", true},
+
+		// Read differently by one parser or both: refused.
+		{"no includedir (arc image)", arcSudoers, false},
+		{"empty", "", false},
+		{"no separator, @", "@includedir/etc/sudoers.d\n", false},   // classic: a syntax error
+		{"no separator, #", "#includedir/etc/sudoers.d\n", false},   // classic: a comment
+		{"leading blanks", "  #includedir /etc/sudoers.d\n", false}, // classic: a comment
+		{"leading tab", "\t@includedir /etc/sudoers.d\n", false},
+		{"a #-1 rule after", "@includedir /etc/sudoers.d\n#-1, runner ALL=(ALL) ALL\n", false}, // classic: a user id
+		{"a #- line after", "@includedir /etc/sudoers.d\n#-x note\n", false},
+		{"a #uid rule after", "@includedir /etc/sudoers.d\n#4242 ALL=(ALL) ALL\n", false},
+		{"a tab include after", "@includedir /etc/sudoers.d\n#include\t/etc/extra\n", false},
+		{"a no-separator include after", "@includedir /etc/sudoers.d\n#include/etc/extra\n", false},
+		{"unterminated quote", "@includedir \"/etc/sudoers.d\n", false},
+		{"trailing quote only", "@includedir /etc/sudoers.d\"\n", false},
+		{"an empty quoted string first", "@includedir \"\"/etc/sudoers.d\n", false},
+		{"a trailing NBSP", "@includedir /etc/sudoers.d\u00a0\n", false},
+		{"a continuation into it", "Defaults env_reset \\\n@includedir /etc/sudoers.d\n", false},
+		{"a rule continued into it", "runner ALL=(ALL) NOPASSWD: /usr/bin/cat \\\n@includedir /etc/sudoers.d\n", false},
+		{"CRLF", "@includedir /etc/sudoers.d\r\n", false}, // sudo-rs drops it
+		{"no final newline", "@includedir /etc/sudoers.d", false},
+		{"a vertical tab", "@includedir /etc/sudoers.d\v\n", false},
+		{"a trailing comment", "@includedir /etc/sudoers.d # note\n", false},
+		{"a second word", "@includedir /etc/sudoers.d extra\n", false},
+		{"a relative path", "@includedir sudoers.d\n", false},
+		{"a single-file include", "#include /etc/sudoers.d\n", false},
+		{"another directory", "@includedir /etc/sudoers.local\n", false},
+		{"a rule after", "@includedir /etc/sudoers.d\nrunner ALL=(ALL) ALL\n", false},
+		{"Defaults after", "@includedir /etc/sudoers.d\nDefaults !lecture\n", false},
+		{"a second includedir after", "@includedir /etc/sudoers.d\n@includedir /etc/sudoers.x\n", false},
+		{"a comment continued into a rule", "@includedir /etc/sudoers.d\n# note \\\nrunner ALL=(ALL) ALL\n", false},
+		{"a CR-only line after", "@includedir /etc/sudoers.d\n\r\n", false},
+		{"a last comment ending in a backslash", "@includedir /etc/sudoers.d\n# note \\\n", false},
+		{"a path that only starts with it", "@includedir /etc/sudoers.d.local\n", false},
+		{"a subdirectory of it", "@includedir /etc/sudoers.d/sub\n", false},
 	} {
-		if _, got := readsSudoersDLast(content, d); got != want {
-			t.Errorf("readsSudoersDLast(%q) = %v, want %v", content, got, want)
+		if _, got := sudoersEndsWithIncludedir(tt.content, d); got != tt.want {
+			t.Errorf("%s: sudoersEndsWithIncludedir(%q) = %v, want %v", tt.name, tt.content, got, tt.want)
 		}
 	}
 }

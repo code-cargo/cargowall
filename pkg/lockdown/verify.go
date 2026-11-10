@@ -281,9 +281,9 @@ var errLockdownIneffective = errors.New("sudo lockdown does not hold")
 //
 // With an allowlist, it also checks the positive half without running
 // anything: that sudo would permit an allowlisted command (sudo -n -l), so
-// the lockdown's own rules are the ones in force. A deny that holds while the
-// allowlist does not apply means those rules are not what sudo reads — say,
-// a sudoers.d file never included — and is a Warn, not "Verified".
+// the lockdown's own rules are the ones in force. If sudo -l does not confirm
+// it — the allowlist may not apply (say, a sudoers.d file never included), or
+// sudo -l needs a password here — that is a Warn, not "Verified".
 func verifyLockdown(v *jobView, allow []string, logger *slog.Logger) error {
 	sudo, err := exec.LookPath("sudo")
 	if err != nil {
@@ -314,8 +314,11 @@ func verifyLockdown(v *jobView, allow []string, logger *slog.Logger) error {
 				"command", cmd, "error", lerr)
 			return nil
 		case lcode != 0:
-			logger.Warn("Sudo lockdown holds, but its allowlist does not apply: sudo would not run an allowlisted command, "+
-				"so the lockdown's rules are not the ones sudo reads",
+			// Not necessarily that the rules are unread: with Defaults
+			// listpw=always or listpw=all, classic sudo asks a password for -l
+			// even where the allowlist applies. sudo's output says which.
+			logger.Warn("Sudo lockdown holds, but sudo -l did not confirm the allowlisted command is permitted; "+
+				"the allowlist may not apply, or sudo -l needs a password here",
 				"command", cmd, "sudo_exit", lcode, "sudo_output", lout, "uid", v.uid, "groups_from", v.from)
 			return nil
 		}

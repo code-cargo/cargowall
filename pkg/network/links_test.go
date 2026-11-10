@@ -346,3 +346,117 @@ func TestWatchLinks_RelistConverges(t *testing.T) {
 	assert.Equal(t, 40, g.named("early"))
 	assert.Equal(t, 40, g.named("late"), "the events that came while a listing's reports were made")
 }
+
+// relistWatcher is a LinkWatcher with no goroutine of its own, its event
+// socket subscribed with a small buffer in the test's namespace, for
+// relist to be called on directly.
+func relistWatcher(t *testing.T, log *lockedLog) *LinkWatcher {
+	t.Helper()
+	events, err := netlink.Dial(unix.NETLINK_ROUTE, &netlink.Config{Groups: unix.RTMGRP_LINK})
+	require.NoError(t, err)
+	t.Cleanup(func() { events.Close() })
+	require.NoError(t, events.SetReadBuffer(1024))
+	list, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { list.Close() })
+	return &LinkWatcher{events: events, list: list, known: map[int]bool{}, logger: slog.New(slog.NewTextHandler(log, nil))}
+}
+
+// A listing is not made again once the watch is closing, though events
+// came during the last.
+func TestWatchLinks_RelistStopsWhenClosing(t *testing.T) {
+	enterNetns(t)
+	w := relistWatcher(t, &lockedLog{})
+	listings := 0
+	w.onGone = func(int) {}
+	w.onLink = func(l Link) {
+		if l.Name != "lo" {
+			return
+		}
+		listings++
+		w.closing.Store(true)
+		require.NoError(t, newLink(fmt.Sprintf("late%d", listings), "dummy", "", nil))
+	}
+	w.relist()
+	assert.Equal(t, 1, listings)
+}
+
+// Events that come during every listing stop relist after relistPasses
+// listings, with a warning, and the last listing's are left queued for
+// the watch to take.
+func TestWatchLinks_RelistIsBounded(t *testing.T) {
+	enterNetns(t)
+	log := &lockedLog{}
+	w := relistWatcher(t, log)
+	listings := 0
+	w.onGone = func(int) {}
+	w.onLink = func(l Link) {
+		if l.Name != "lo" {
+			return
+		}
+		listings++
+		if listings < 4*relistPasses { // were relist unbounded, it would still end
+			require.NoError(t, newLink(fmt.Sprintf("late%d", listings), "dummy", "", nil))
+		}
+	}
+	w.relist()
+	assert.Equal(t, relistPasses, listings)
+	assert.Contains(t, log.String(), "Interface events kept coming while the interfaces were listed")
+	require.NoError(t, w.events.SetReadDeadline(time.Now().Add(time.Second)))
+	msgs, err := w.events.Receive()
+	require.NoError(t, err)
+	assert.NotEmpty(t, msgs, "the last listing's events are left for the watch")
+}
+
+// A closed event socket has nothing to drain.
+func TestWatchLinks_DrainClosed(t *testing.T) {
+	enterNetns(t)
+	w := relistWatcher(t, &lockedLog{})
+	require.NoError(t, w.events.Close())
+	assert.False(t, w.drain())
+}
+
+// Close, called from a report made while the interfaces are listed again
+// after dropped events, returns, with events coming all the while.
+func TestWatchLinks_CloseDuringRelist(t *testing.T) {
+	enterNetns(t)
+	saved := linkEventsBuffer
+	linkEventsBuffer = 1024
+	t.Cleanup(func() { linkEventsBuffer = saved })
+	g := newGatedReports()
+	log := &lockedLog{}
+	closed := make(chan struct{})
+	var w *LinkWatcher
+	var closing, late atomic.Int32
+	onLink := func(l Link) {
+		g.onLink(l)
+		if !strings.Contains(log.String(), "Interface events dropped") {
+			return
+		}
+		if late.Add(1) < 200 {
+			_ = newLink(fmt.Sprintf("late%d", late.Load()), "dummy", "", nil)
+		}
+		if closing.Add(1) == 1 {
+			go func() {
+				_ = w.Close()
+				close(closed)
+			}()
+		}
+	}
+	var err error
+	w, err = WatchLinks(onLink, g.onGone, slog.New(slog.NewTextHandler(log, nil)))
+	require.NoError(t, err)
+
+	g.held.Store(true)
+	for i := range 100 {
+		require.NoError(t, newLink(fmt.Sprintf("burst%d", i), "dummy", "", nil))
+	}
+	<-g.stopped
+	g.held.Store(false)
+	close(g.gate)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close during a listing never returned")
+	}
+}

@@ -160,18 +160,28 @@ func (w *LinkWatcher) run() {
 	}
 }
 
+// relistPasses bounds relist's listings.
+const relistPasses = 5
+
 // relist makes up for events the kernel dropped: it discards what is
 // queued, lists the interfaces and reports the difference, and does it
-// again for as long as events came while it did. Once it has dropped an
-// event, the kernel queues none and reports no other drop until a read
-// finds the queue empty, so a listing made before that leaves out what
-// came while its reports were made: only one with no event during it is
-// known to leave nothing out.
+// again while events came during a listing, up to relistPasses listings
+// and while the watch is not closing. Once it has dropped an event, the
+// kernel queues none and reports no other drop until a read finds the
+// queue empty, so a listing made before that leaves out what came while
+// its reports were made: only one with no event during it is known to
+// leave nothing out. The last listing's events are left queued, the queue
+// read empty before it, for the watch to take as it does any.
 func (w *LinkWatcher) relist() {
 	w.drain()
-	for {
+	for pass := 1; !w.closing.Load(); pass++ {
 		if err := w.resync(); err != nil {
 			w.logger.Warn("Cannot list the interfaces; their changes go unreported until the next one", "error", err)
+			return
+		}
+		if pass == relistPasses {
+			w.logger.Warn("Interface events kept coming while the interfaces were listed; taking the rest as they come",
+				"listings", pass)
 			return
 		}
 		if !w.drain() {
@@ -184,15 +194,16 @@ func (w *LinkWatcher) relist() {
 // finds none, which also lets the kernel queue and report again. It
 // reports whether there were any: a listing after reports their
 // interfaces as they are by then. The reads don't wait, and go past
-// Conn's: a read deadline already past would skip the read.
+// Conn's: a read deadline already past would skip the read. A socket that
+// can't be read, closed by Close, has nothing to drain.
 func (w *LinkWatcher) drain() bool {
 	rc, err := w.events.SyscallConn()
 	if err != nil {
-		return true
+		return false
 	}
 	any := false
 	buf := make([]byte, 64<<10)
-	_ = rc.Read(func(fd uintptr) bool {
+	if err := rc.Read(func(fd uintptr) bool {
 		for {
 			_, _, err := unix.Recvfrom(int(fd), buf, unix.MSG_DONTWAIT)
 			switch {
@@ -203,7 +214,9 @@ func (w *LinkWatcher) drain() bool {
 				return true
 			}
 		}
-	})
+	}); err != nil {
+		return false
+	}
 	return any
 }
 

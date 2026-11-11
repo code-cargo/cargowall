@@ -95,9 +95,8 @@ type FirewallConfig struct {
 	// for query filtering. Used for cloud-internal DNS suffixes where the
 	// network traffic is governed by a CIDR rule and per-hostname tracking
 	// would be wasteful.
-	SearchDomains []string `json:"searchDomains,omitempty"`
-	// Steps are per-step allow rules, added to the job's (steprules.go).
-	Steps []StepConfig `json:"steps,omitempty"`
+	SearchDomains []string     `json:"searchDomains,omitempty"`
+	Steps         []StepConfig `json:"steps,omitempty"` // per-step allow rules, added to the job's (steprules.go)
 }
 
 // Rule represents a firewall Rule
@@ -166,7 +165,7 @@ type Manager struct {
 	mu               sync.RWMutex
 	config           *FirewallConfig
 	resolvedRules    []ResolvedRule
-	steps            []stepPolicy // step allow tiers, by policy (steprules.go)
+	steps            []stepPolicy // step allow tiers by policy, nil until a load (steprules.go)
 	hostnameCache    map[string][]net.IP
 	ipToHostname     map[string]string              // Reverse lookup: IP -> hostname
 	ipToCNAMEOrigins map[string][]cnameOriginRecord // Reverse lookup: IP -> CNAME chains (one per origin) for derived-allow attribution
@@ -1303,9 +1302,8 @@ type formMatch struct {
 	value  string
 }
 
-// matchFormsLocked evaluates the full name and each stripped candidate
-// against rules (the job's, or one step's), in precedence order. Caller
-// must hold cm.mu.RLock and pass lowercase.
+// matchFormsLocked evaluates the full name and each stripped candidate against rules
+// (the job's, or one step's), in precedence order. Caller must hold cm.mu.RLock and pass lowercase.
 func (cm *Manager) matchFormsLocked(rules []ResolvedRule, hostname string) []formMatch {
 	names := append([]string{hostname}, cm.stripCandidatesLocked(hostname)...)
 	forms := make([]formMatch, 0, len(names))
@@ -1635,10 +1633,8 @@ func chosenAttributionName(name, ruleValue string) string {
 	return ruleValue
 }
 
-// GetTrackedHostnames returns the names startup pre-resolution should cover, job and
-// step: the job's tracked hostnames with their actions, and each step's literal hostnames
-// as allows where the job has none of its own (the job's entry and action always win).
-// A copy; the job's own map stays the job's.
+// GetTrackedHostnames returns the names startup pre-resolution covers: a copy of the job's tracked
+// hostnames and actions, plus each step's literal hostnames as allows where the job has none.
 func (cm *Manager) GetTrackedHostnames() map[string]Action {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()

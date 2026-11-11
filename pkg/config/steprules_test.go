@@ -312,6 +312,39 @@ func TestStepsReplacedOnLoad(t *testing.T) {
 	assert.Empty(t, cm.GetStepRules())
 }
 
+// A policy's load makes its step rules known, and final, whatever it holds;
+// before any load they aren't.
+func TestStepRulesKnown(t *testing.T) {
+	cm := NewConfigManager()
+	known, has := cm.StepRulesKnown()
+	assert.False(t, known)
+	assert.False(t, has)
+	cm.EnsureHostnameAllowed("github.com", nil, AutoAddedTypeGitHubService) // no policy yet
+	known, _ = cm.StepRulesKnown()
+	assert.False(t, known, "an auto-allow is not a policy")
+
+	require.NoError(t, cm.LoadConfigFromRules(nil, ActionDeny))
+	known, has = cm.StepRulesKnown()
+	assert.True(t, known)
+	assert.False(t, has)
+
+	require.NoError(t, cm.applyLoadedConfig(&FirewallConfig{
+		DefaultAction: ActionAllow,
+		Steps:         []StepConfig{{ID: "a", Rules: []Rule{{Type: RuleTypeHostname, Value: "step.example.com"}}}},
+	}))
+	known, has = cm.StepRulesKnown()
+	assert.True(t, known)
+	assert.False(t, has, "steps a default allow drops")
+
+	require.NoError(t, cm.applyLoadedConfig(&FirewallConfig{
+		DefaultAction: ActionDeny,
+		Steps:         []StepConfig{{ID: "a", Rules: []Rule{{Type: RuleTypeHostname, Value: "step.example.com"}}}},
+	}))
+	known, has = cm.StepRulesKnown()
+	assert.True(t, known)
+	assert.True(t, has)
+}
+
 // GetStepRules hands out copies.
 func TestGetStepRules_Copies(t *testing.T) {
 	cm := NewConfigManager()

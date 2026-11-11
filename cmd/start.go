@@ -478,26 +478,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	logger.Info("Using network interface", "interface", ifname)
 
 	// Load TC eBPF objects
-	spec, err := bpf.LoadTcBpf()
+	spec, err := loadTcSpec(cmd.StepAttribution, configMgr)
 	if err != nil {
-		return fmt.Errorf("failed to load TC eBPF spec: %w", err)
-	}
-	// The step-attribution maps preallocate ~8MB of kernel memory at their
-	// full size (hash maps preallocate by default). Shrink them when the
-	// feature is off — every non-GitHub run — but never when it is on:
-	// stepbpf.c declares the full sizes and MapReplacements rejects
-	// mismatched specs.
-	if !cmd.StepAttribution {
-		// Present unless the generated spec is stale (go generate not run);
-		// verify-bpf-generated-code guards that, but don't panic if it slips.
-		for _, name := range []string{"map_task_step", "map_sock_step", "map_task_nspid"} {
-			if m := spec.Maps[name]; m != nil {
-				m.MaxEntries = 64
-			}
-		}
-	}
-	if err := bpf.SizeRuleMaps(spec, configMgr.HasStepRules()); err != nil {
-		return fmt.Errorf("failed to size the rule maps: %w", err)
+		return err
 	}
 	var objs bpf.TcBpfObjects
 	if err := cargowallEbpf.LoadObjects(logger, "tcbpf", spec, ebpf.CollectionOptions{

@@ -662,6 +662,72 @@ func TestReconcileRefusedQueries_NamesTheStepRule(t *testing.T) {
 	assert.Contains(t, logs.String(), "allowed_by_step=fetch")
 }
 
+// The via store is kept only while a backfill may read it: until a policy
+// loads, and then only if the policy has step rules. A job without them
+// carries no via state once its policy is in, and the store's memory goes
+// with it. Kept, it neither expires nor evicts: a missing record would read
+// as no chain at all.
+func TestStepVia_KeptOnlyForSteps(t *testing.T) {
+	chained := func(s *Server, name, ip string) {
+		answer(s, name, makeCNAMEResponse(dns.Fqdn(name), []string{"edge." + name}, ip))
+	}
+	held := func(s *Server, name string) bool {
+		s.steps.via.mu.Lock()
+		defer s.steps.via.mu.Unlock()
+		_, ok := s.steps.via.hops[name]
+		return ok
+	}
+	dropped := func(s *Server) bool {
+		s.steps.via.mu.Lock()
+		defer s.steps.via.mu.Unlock()
+		return s.steps.via.dropped && s.steps.via.hops == nil
+	}
+
+	cfg := config.NewConfigManager()
+	s := newStepTestServer(t, cfg, newRecordingFirewall())
+	chained(s, "early.example.com", "10.1.0.40")
+	assert.True(t, held(s, "early.example.com"), "before a policy loads, every chained answer is recorded")
+
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "job.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+	chained(s, "job.example.com", "10.2.0.40")
+	assert.True(t, dropped(s), "a policy without step rules drops the store")
+
+	// With step rules, the store stays, and fills past any LRU's bound.
+	withSteps := config.NewConfigManager()
+	loadStepPolicy(t, withSteps, stepWritersPolicy)
+	s2 := newStepTestServer(t, withSteps, newRecordingFirewall())
+	links := []cnameLink{{target: "edge.example.net"}}
+	for i := range 12000 {
+		s2.recordVia(fmt.Sprintf("n%d.example.com", i), links, []net.IP{net.IPv4(10, 3, byte(i>>8), byte(i))})
+	}
+	assert.True(t, held(s2, "n0.example.com"), "the first record outlives eleven thousand more")
+	s2.steps.via.mu.Lock()
+	assert.Len(t, s2.steps.via.hops, 12000, "none evicted")
+	s2.steps.via.mu.Unlock()
+	s2.ApplyRulesToTrackedHostnames()
+	assert.False(t, dropped(s2), "the backfill keeps it")
+}
+
+// Steps that turn up after a policy without them (no path loads one, so
+// this is the guard) backfill nothing: the hops of the answers before were
+// never kept to check.
+func TestStepVia_DroppedBackfillsNothing(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge.denied.example.com"}, "10.1.0.42"))
+	require.NoError(t, cfg.LoadConfigFromRules(nil, config.ActionDeny))
+	s.ApplyRulesToTrackedHostnames() // drops the store
+	_, kept := s.viaFor("step.example.com")
+	require.False(t, kept)
+
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames()
+	assert.Empty(t, fw.stepIPs(policyFetch))
+}
+
 func TestChainReach(t *testing.T) {
 	assert.Equal(t, uint32(maxDerivedCNAMETTL), chainReach(time.Time{}))
 	assert.Equal(t, uint32(maxDerivedCNAMETTL), chainReach(time.Now().Add(48*time.Hour)))

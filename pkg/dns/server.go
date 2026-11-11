@@ -190,8 +190,8 @@ func (s *Server) EnableQueryFiltering(enable bool) {
 //     rule fires — the firewall layer enforces per-port deny separately.
 //     A pure deny verdict (no allow) blocks the query. A deny rule for
 //     "blocked" still blocks "blocked.compute.internal".
-//  4. Step rules: a step's own rules, or a CNAME chain rooted at one, allow
-//     the name (stepAllowsQuery). After the job's deny, which holds for all.
+//  4. Step rules, short of a job deny: a step's own rules, or a CNAME chain
+//     rooted at one, allow the name (stepAllowsQuery).
 //  5. Derived CNAME-target allow: the name was learned as a CNAME target of
 //     a rule-allowed response → allow. This lets CNAME-chasing clients query
 //     the target directly (e.g. an Akamai edge name an allowed host CNAMEs
@@ -224,12 +224,11 @@ func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 	if verdict.HasAllow() {
 		return true
 	}
-	if verdict.HasDeny() {
-		s.noteWithheld(domain, verdict)
-		return false
-	}
-	if s.stepAllowsQuery(domain) {
+	if s.stepAllowsQuery(domain, verdict) {
 		return true
+	}
+	if verdict.HasDeny() {
+		return false
 	}
 
 	// Derived CNAME-target allow. Populated in handleDNSQuery when an allowed
@@ -780,8 +779,7 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 		// ephemeral cloud-internal names (e.g. ip-X-X-X-X.compute.internal
 		// per EC2 instance) would grow our per-host maps without bound. A
 		// derived-allowed name is exempt from the skip: it's a real CNAME
-		// target of an allowed host whose IPs must be enforced. So is a name
-		// a step allows.
+		// target of an allowed host whose IPs must be enforced; so is a step's.
 		if bypassOnly && !verdict.Matched() && !derived && len(stepAllows) == 0 {
 			s.logger.Debug("Skipping per-host tracking for bypass-only hostname",
 				"hostname", canonicalHostname,

@@ -82,7 +82,7 @@ type stepPolicy struct {
 // rules would add nothing.
 func compileSteps(steps []StepConfig, defaultAction Action) ([]stepPolicy, error) {
 	seen := make(map[string]bool, len(steps))
-	var out []stepPolicy
+	out := []stepPolicy{} // never nil: a load has happened (StepRulesKnown)
 	for i := range steps {
 		st := &steps[i]
 		if err := validateStepID(st.ID); err != nil {
@@ -110,7 +110,7 @@ func compileSteps(steps []StepConfig, defaultAction Action) ([]stepPolicy, error
 	if len(out) > 0 && defaultAction == ActionAllow {
 		slog.Warn("Ignoring step rules: the job's default action is allow, so they have nothing to add",
 			"steps", len(out))
-		return nil, nil
+		return []stepPolicy{}, nil
 	}
 	return out, nil
 }
@@ -273,6 +273,15 @@ func (cm *Manager) HasStepRules() bool {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 	return len(cm.steps) > 0
+}
+
+// StepRulesKnown reports whether a policy has loaded, which makes the run's
+// step rules final (nothing loads a policy after startup), and whether it
+// has any.
+func (cm *Manager) StepRulesKnown() (known, has bool) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.steps != nil, len(cm.steps) > 0
 }
 
 // StepPolicy returns the policy the loaded steps give step id, if a step

@@ -208,6 +208,9 @@ struct {
 } map_sock_step SEC(".maps");
 
 // step ordinal → the policy that holds the step's own allow rules.
+// Requirement: a step may not be bound here until step installs are
+// L7-scoped; until then a step's own entries would open a shared edge IP
+// to it on any SNI.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u32);

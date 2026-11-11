@@ -148,7 +148,10 @@ const maxGatedNotes = 1024
 // get their IPs from the DNS path alone, which the tracked-hostname backfill
 // that follows every sync re-installs. A step rule that can't be installed
 // is a Warn, not an error: it costs only that step's extra reach, which
-// fails closed to the job's rules. Must be called with f.mu held.
+// fails closed to the job's rules. Requirement: anything that reloads step
+// rules at runtime clears the step entries first, as this does, DNS
+// installs included: policies are numbered per load, so a kept entry would
+// be another step's. Must be called with f.mu held.
 func (f *FirewallImpl) syncStepsLocked(jobRules []config.ResolvedRule, steps []config.StepRules) {
 	f.clearStepsLocked()
 	f.jobDenies = jobCIDRDenies(jobRules)

@@ -21,9 +21,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/code-cargo/cargowall/pkg/config"
@@ -52,9 +54,10 @@ import (
 // The query filter takes the union: a name passes if the job's rules allow
 // it, or, short of a job deny, any step's rules or step chains do.
 //
-// L7 scoping of step installs, and step-aware late-allows, are not done
-// here: nothing binds a step to its policy yet, so no traffic is judged by
-// these entries.
+// Requirement: a step may not be bound to its policy (map_step_policy)
+// until step installs are L7-scoped. They aren't here, so until then a
+// step's own entries would open a shared edge IP to it on any SNI.
+// Step-aware late-allows aren't done here either.
 
 // stepTier is the DNS proxy's step-policy state: what step policies' CNAME
 // chains have taught it, by target name. The job's derived allows stay in
@@ -66,34 +69,66 @@ type stepTier struct {
 	// withheld by a job deny, so each is logged once while it stays in the
 	// LRU.
 	withheld *lruCache[string, struct{}]
-	// via holds, by answered name, the CNAME hops each of its addresses
-	// came through, for the backfill's hop check. Every chained answer is
-	// recorded, rules or not: rules can load after the answer.
-	via *lruCache[string, stepVia]
+	// via holds the CNAME hops answers' addresses came through, for the
+	// backfill's hop check (viaStore).
+	via *viaStore
+}
+
+// viaStore holds, by answered name, the CNAME hops each of the name's
+// addresses came through, from the latest chained answer that carried it.
+//
+// It lives as long as the hostnameIPs entries the backfill reads beside it,
+// with no TTL and no eviction: a missing record reads as no chain at all,
+// and would let the backfill install an address whose chain ran through a
+// hop the job denies. A record can only withhold an address, never vouch
+// for one (a clean record reads as no record), so a stale one costs at most
+// an install the next answer for the name makes live.
+//
+// Chained answers are recorded until a policy loads, since its rules can
+// come after the answer, and after that only if the policy has step rules.
+// A policy without them is final (nothing loads one after startup), so no
+// backfill will read the hops: the store is dropped then, and its memory
+// with it.
+type viaStore struct {
+	mu      sync.Mutex
+	hops    map[string]stepVia // nil once dropped
+	dropped bool
+}
+
+// stepVia maps an address to the CNAME hops it was reached through.
+type stepVia map[string][]string
+
+// dropLocked drops the store once the loaded policy has no step rules, and
+// reports whether it is dropped. Caller holds v.mu.
+func (v *viaStore) dropLocked(known, has bool) bool {
+	if !v.dropped && known && !has {
+		v.dropped, v.hops = true, nil
+	}
+	return v.dropped
 }
 
 func newStepTier() stepTier {
 	return stepTier{
 		cname:    newLRUCache[string, stepDerived](10000),
 		withheld: newLRUCache[string, struct{}](1000),
-		via:      newLRUCache[string, stepVia](10000),
+		via:      &viaStore{hops: make(map[string]stepVia)},
 	}
 }
 
-// stepVia maps an address to the CNAME hops it was reached through, from
-// the latest chained answer that carried it.
-type stepVia map[string][]string
-
-// mergeVia composes a name's via entries, the incoming answer's winning.
-func mergeVia(existing, incoming stepVia) stepVia {
-	out := make(stepVia, len(existing)+len(incoming))
-	for ip, hops := range existing {
-		out[ip] = hops
+// viaFor returns a copy of name's via record, and false once the store is
+// dropped.
+func (s *Server) viaFor(name string) (stepVia, bool) {
+	v := s.steps.via
+	if v == nil {
+		return nil, true
 	}
-	for ip, hops := range incoming {
-		out[ip] = hops
+	known, has := s.config.StepRulesKnown()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.dropLocked(known, has) {
+		return nil, false
 	}
-	return out
+	return maps.Clone(v.hops[strings.ToLower(name)]), true
 }
 
 // stepDerived is one CNAME target's derived allows, by step id. Keyed by id,
@@ -234,18 +269,29 @@ func (s *Server) jobDeniedHop(hops []string) (int, config.HostnameVerdict) {
 
 // recordVia records the hops an answer's addresses came through.
 func (s *Server) recordVia(name string, links []cnameLink, ips []net.IP) {
-	if s.steps.via == nil || len(links) == 0 || len(ips) == 0 {
+	v := s.steps.via
+	if v == nil || len(links) == 0 || len(ips) == 0 {
 		return
 	}
+	known, has := s.config.StepRulesKnown()
 	hops := make([]string, len(links))
 	for i, link := range links {
 		hops[i] = link.target
 	}
-	in := make(stepVia, len(ips))
-	for _, ip := range ips {
-		in[ip.String()] = hops
+	name = strings.ToLower(name)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.dropLocked(known, has) {
+		return
 	}
-	s.steps.via.Merge(strings.ToLower(name), in, 0, mergeVia)
+	entry := v.hops[name]
+	if entry == nil {
+		entry = make(stepVia, len(ips))
+		v.hops[name] = entry
+	}
+	for _, ip := range ips {
+		entry[ip.String()] = hops
+	}
 }
 
 // chainReach is how long a chain entry expiring at exp can still point
@@ -354,15 +400,18 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 // name is whatever the address's owner says. A step starts after cargowall,
 // so it has no connection from before that such an address could serve.
 func (s *Server) backfillStepTier(name string, verdict config.HostnameVerdict, ipSet map[string]bool) {
+	via, kept := s.viaFor(name)
 	allows, _ := s.stepAllowsFor(name, verdict)
 	if len(allows) == 0 {
 		return
 	}
-	name = strings.ToLower(name)
-	var via stepVia
-	if s.steps.via != nil {
-		via, _ = s.steps.via.Get(name)
+	if !kept {
+		// Steps after a policy without them: the hops of the answers
+		// before were never kept to check, so nothing is backfilled. A
+		// policy can't follow the startup load, so this is the guard.
+		return
 	}
+	name = strings.ToLower(name)
 	s.hostnameIPsMutex.RLock()
 	answered := make(map[string]bool, len(s.hostnameIPs[name]))
 	for ipStr := range s.hostnameIPs[name] {
@@ -411,10 +460,15 @@ func (s *Server) stepAllowRule(domain string) (step, rule string) {
 	return ids[0], "derived"
 }
 
-// stepAllowsQuery is the query filter's step tier, consulted only once the
-// job's rules have neither allowed nor denied domain: any step's rules, or
-// a live step chain to domain for a step the policy still has.
-func (s *Server) stepAllowsQuery(domain string) bool {
+// stepAllowsQuery is the query filter's step tier, consulted once the job's
+// rules haven't allowed domain: any step's rules, or a live step chain to
+// domain for a step the policy still has. Never past a job deny, which it
+// notes as withholding the steps' allows.
+func (s *Server) stepAllowsQuery(domain string, verdict config.HostnameVerdict) bool {
+	if verdict.HasDeny() {
+		s.noteWithheld(domain, verdict)
+		return false
+	}
 	if s.config.StepAllowsHostname(domain) {
 		return true
 	}

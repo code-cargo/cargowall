@@ -20,6 +20,7 @@ import (
 	"errors"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -179,4 +180,32 @@ func TestStepInstall_ReconcilesItsStepsBlocks(t *testing.T) {
 	assert.Equal(t, "step.example.com", audited[0].MatchedRule)
 	assert.True(t, audited[0].Timestamp.Equal(blockedAt))
 	assert.Len(t, blocks.TakeMatching("10.1.0.66", nil, nil, false), 2, "deploy's block and fetch's on 80 stay")
+}
+
+// A port a job CIDR deny holds at the address stays blocked whatever the
+// step's rules allow there (the job decides first, and the firewall writes
+// the step nothing past it), so a step's install never re-reports a block
+// on it.
+func TestStepInstall_KeepsJobDeniedBlocks(t *testing.T) {
+	cfg := config.NewConfigManager()
+	s := newStepTestServer(t, cfg, newRecordingFirewall())
+	loadStepPolicy(t, cfg, strings.Replace(stepWritersPolicy, `"rules": [`, `"rules": [
+		{"type": "cidr", "value": "10.1.0.68/32", "ports": [{"port": 443, "protocol": "tcp"}], "action": "deny"},
+		{"type": "cidr", "value": "10.1.3.0/24", "action": "deny"},`, 1))
+	auditPath := filepath.Join(t.TempDir(), "audit.ndjson")
+	auditLogger, err := events.NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	s.SetAuditLogger(auditLogger)
+	blocks := events.NewRecentBlocks(0)
+	s.SetRecentBlocks(blocks)
+	s.SetStepBindings(func(uint32) (uint32, bool) { return policyFetch, true })
+	for _, ip := range []string{"10.1.0.68", "10.1.3.5"} {
+		blocks.Consume(events.AuditEvent{
+			Timestamp: time.Now(), EventType: events.EventConnectionBlocked,
+			DstIP: ip, DstPort: 443, Protocol: "TCP", StepOrdinal: 7,
+		})
+	}
+	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.68", "10.1.3.5"))
+	assert.Empty(t, readAuditEvents(t, auditPath))
 }

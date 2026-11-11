@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -295,6 +296,31 @@ func (cm *Manager) SettleStepRules() {
 	if cm.steps == nil {
 		cm.steps = []stepPolicy{}
 	}
+}
+
+// JobCIDRDeniesAt returns the ports the job's CIDR deny rules deny at ip
+// on, union of every one that contains it, and whether one denies every
+// port: what the job's rules still deny there, whatever a step's rules
+// allow, since the job decides first. A more specific job allow the
+// longest match would pick is not subtracted, so this is the most the job
+// can deny there.
+func (cm *Manager) JobCIDRDeniesAt(ip net.IP) (ports []Port, all bool) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	for _, r := range cm.resolvedRules {
+		if r.Type != RuleTypeCIDR || r.Action != ActionDeny || r.IPNet == nil || !r.IPNet.Contains(ip) {
+			continue
+		}
+		if len(r.Ports) == 0 {
+			return nil, true
+		}
+		for _, p := range r.Ports {
+			if !slices.Contains(ports, p) {
+				ports = append(ports, p)
+			}
+		}
+	}
+	return ports, false
 }
 
 // StepPolicy returns the policy the loaded steps give step id, if a step

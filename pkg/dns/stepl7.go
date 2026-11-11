@@ -126,10 +126,15 @@ func (s *Server) StepAllowPorts(policy uint32, name string) ([]config.Port, bool
 }
 
 // reconcileStepBlocks re-reports as late-allowed the recent blocks to ip
-// that a's install opened: on its ports, and of the steps bound to its
-// policy alone, never another step's.
+// that a's install opened: on its ports less those a job CIDR deny holds
+// there, which the job decides first, and of the steps bound to its policy
+// alone, never another step's.
 func (s *Server) reconcileStepBlocks(a stepAllow, name string, ip net.IP) {
 	if s.recentBlocks == nil || s.auditLogger == nil || s.steps.l7 == nil {
+		return
+	}
+	denied, all := s.config.JobCIDRDeniesAt(ip)
+	if all {
 		return
 	}
 	s.steps.l7.mu.Lock()
@@ -142,7 +147,7 @@ func (s *Server) reconcileStepBlocks(a stepAllow, name string, ip net.IP) {
 		policy, ok := bindings(ordinal)
 		return ok && policy == a.policy
 	}
-	s.reportLateAllowed(s.recentBlocks.TakeMatchingFor(ip.String(), bound, a.ports, nil, false), name, a.rule, a.chain)
+	s.reportLateAllowed(s.recentBlocks.TakeMatchingFor(ip.String(), bound, a.ports, denied, len(denied) > 0), name, a.rule, a.chain)
 }
 
 // reportLateAllowed re-reports blocks, taken from the recent-blocks buffer

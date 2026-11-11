@@ -36,20 +36,26 @@ var loadCollection = defaultLoadCollection
 var defaultLoadCollection = cargowallEbpf.LoadObjects
 
 // loadTcObjects loads the tcbpf collection into objs, from loadTcSpec's
-// spec, with step rules on exactly when the startup policy has steps. The
-// gate is decided once, from the policy in hand before the load: it is a
-// load-time constant, and nothing delivers a policy after the load, so a
-// path that ever did would have to reload the collection to change it. On a
-// kernel whose verifier rejects the step lookup, the collection loads
-// without it (bpf.LoadWithStepRules): the steps lose their own rules, with a
-// Warn, and the loss reads as HasStepRules with objs.StepRules false.
+// spec, with step rules on exactly when the startup policy has steps and
+// step attribution is on: without it no socket carries a step's tag, so no
+// step could be judged by its rules. The gate is decided once, from the
+// policy in hand before the load: it is a load-time constant, and nothing
+// delivers a policy after the load, so a path that ever did would have to
+// reload the collection to change it. On a kernel whose verifier rejects
+// the step lookup, the collection loads without it (bpf.LoadWithStepRules):
+// the steps lose their own rules, with a Warn, and the loss reads as
+// HasStepRules with objs.StepRules false.
 func loadTcObjects(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger, objs *bpf.TcBpfObjects) error {
 	spec, steps, err := loadTcSpec(cmd, configMgr)
 	if err != nil {
 		return err
 	}
+	gate := steps && cmd.StepAttribution
+	if steps && !gate {
+		logger.Info("Step rules stay off: without step attribution no socket carries a step, so every step gets the job's rules")
+	}
 	opts := ebpf.CollectionOptions{Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelBranch | ebpf.LogLevelStats}}
-	on, err := bpf.LoadWithStepRules(spec, steps, func(spec *ebpf.CollectionSpec) error {
+	on, err := bpf.LoadWithStepRules(spec, gate, func(spec *ebpf.CollectionSpec) error {
 		return loadCollection(logger, "tcbpf", spec, opts, objs)
 	})
 	if err != nil {
@@ -61,7 +67,7 @@ func loadTcObjects(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger
 		}
 		return fmt.Errorf("failed to load TC eBPF objects: %w", err)
 	}
-	if steps && !on {
+	if gate && !on {
 		logger.Warn("Step rules are off: this kernel's verifier rejected the step lookup, so every step gets the job's rules alone")
 	}
 	return nil

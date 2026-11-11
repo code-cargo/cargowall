@@ -164,7 +164,7 @@ func TestStepGate_NestedJobEntryEitherOrder(t *testing.T) {
 				[]config.Rule{{Type: config.RuleTypeCIDR, Value: "10.98.0.0/16", Action: config.ActionDeny}},
 				[]config.StepConfig{{ID: "a", Rules: []config.Rule{{Type: config.RuleTypeHostname, Value: "svc.example.com"}}}})))
 			step := func() {
-				_, err := fw.AddPolicyIP(1, host, nil)
+				_, err := fw.AddPolicyIP(1, host, nil, nil)
 				require.NoError(t, err)
 			}
 			if c.jobAllowFirst {
@@ -245,7 +245,7 @@ func TestStepGate_Property(t *testing.T) {
 					continue
 				}
 				in := install{policy: uint32(1 + rng.IntN(2)), ip: hostIP(), ports: pick(portSets...)}
-				_, err := fw.AddPolicyIP(in.policy, in.ip, in.ports)
+				_, err := fw.AddPolicyIP(in.policy, in.ip, in.ports, nil)
 				require.NoError(t, err)
 				if synced {
 					after = append(after, in)
@@ -311,7 +311,7 @@ func TestSync_RebuildsTheStepTier(t *testing.T) {
 		{ID: "a", Rules: []config.Rule{{Type: config.RuleTypeCIDR, Value: "10.1.0.0/16"}}},
 		{ID: "b", Rules: []config.Rule{{Type: config.RuleTypeCIDR, Value: "10.2.0.0/16"}}},
 	})
-	_, err := fw.AddPolicyIP(2, net.ParseIP("10.9.0.1"), tcp443) // step b's DNS install
+	_, err := fw.AddPolicyIP(2, net.ParseIP("10.9.0.1"), tcp443, nil) // step b's DNS install
 	require.NoError(t, err)
 	require.Len(t, entriesOf(t, maps[ruleMapCIDRs], 2), 2)
 
@@ -334,20 +334,20 @@ func TestStepBudget_HeldBackCountFlushed(t *testing.T) {
 	var logs bytes.Buffer
 	fw, _ := newStepTestFirewall(ruleMapEntries, slog.New(slog.NewTextHandler(&logs, nil)))
 	fw.steps.setBudget(1)
-	_, err := fw.AddPolicyIP(1, testIPv4(10, 0), nil)
+	_, err := fw.AddPolicyIP(1, testIPv4(10, 0), nil, nil)
 	require.NoError(t, err)
 	for i := 1; i <= 4; i++ {
-		_, err := fw.AddPolicyIP(1, testIPv4(10, i), nil)
+		_, err := fw.AddPolicyIP(1, testIPv4(10, i), nil, nil)
 		require.ErrorIs(t, err, ErrStepBudget)
 	}
 	require.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("Step rule entr")), "three held back")
 
-	_, err = fw.AddPolicyIP(1, testIPv4(10, 0), nil) // a held key: free
+	_, err = fw.AddPolicyIP(1, testIPv4(10, 0), nil, nil) // a held key: free
 	require.NoError(t, err)
 	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("Step rule entr")), "not within the interval")
 
 	fw.steps.warned = time.Now().Add(-2 * stepBudgetWarnInterval)
-	_, err = fw.AddPolicyIP(1, testIPv4(10, 0), nil)
+	_, err = fw.AddPolicyIP(1, testIPv4(10, 0), nil, nil)
 	require.NoError(t, err)
 	assert.Contains(t, logs.String(), "since the last Warn")
 	assert.Contains(t, logs.String(), "refused=3")
@@ -388,7 +388,7 @@ func TestStepGate_PartialWriteFailsClosed(t *testing.T) {
 		// Job: the host's 80 and the deny's 22. Step: the wildcard's 22, the
 		// carve's 22, and room for one more.
 		fw, maps := setup(t, 5, nil)
-		_, err := fw.AddPolicyIP(1, host, []config.Port{p(22), p(443)})
+		_, err := fw.AddPolicyIP(1, host, []config.Port{p(22), p(443)}, nil)
 		require.ErrorIs(t, err, ErrStepBudget)
 		assert.False(t, stepAllows(maps, 22), "the step got past the job's deny on 22")
 		assert.False(t, stepAllows(maps, 443), "fewer allows")
@@ -480,7 +480,7 @@ func TestSync_FailedClearStaysCharged(t *testing.T) {
 	fw, maps := newStepTestFirewall(ruleMapEntries, nil)
 	cidrs := &failingDeletes{cappedMap: maps[ruleMapCIDRs]}
 	fw.cidrsMap = cidrs
-	_, err := fw.AddPolicyIP(1, net.ParseIP("10.9.0.1"), nil)
+	_, err := fw.AddPolicyIP(1, net.ParseIP("10.9.0.1"), nil, nil)
 	require.NoError(t, err)
 
 	cm := config.NewConfigManager()
@@ -752,7 +752,7 @@ func TestStepGate_RefusalProperty(t *testing.T) {
 			}
 			require.NoError(t, fw.UpdateAllowlistTC(cm))
 			for range rng.IntN(5) {
-				_, _ = fw.AddPolicyIP(uint32(1+rng.IntN(len(steps))), net.IPv4(10, 0, 0, byte(rng.IntN(256))), randPorts(0.4))
+				_, _ = fw.AddPolicyIP(uint32(1+rng.IntN(len(steps))), net.IPv4(10, 0, 0, byte(rng.IntN(256))), randPorts(0.4), nil)
 			}
 
 			for last := range 256 {

@@ -47,6 +47,7 @@ type recordingFirewall struct {
 	jobDeny  map[string]bool
 	step     map[uint32]map[string][]config.Port
 	stepErr  error
+	withhold bool          // admits nothing and writes nothing, as the step gate may
 	stepAdd  chan struct{} // signalled on each step write, if set
 	policy0  int           // AddPolicyIP calls naming the job's policy
 }
@@ -82,7 +83,9 @@ func (f *recordingFirewall) AddIP(ip net.IP, action config.Action, ports []confi
 	return true, nil
 }
 
-func (f *recordingFirewall) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port) (bool, error) {
+// AddPolicyIP admits a write unless stepErr refuses it, as the step budget
+// would, before scope runs; scope's error withholds it, as the firewall's.
+func (f *recordingFirewall) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port, scope func() error) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if policy == 0 {
@@ -91,6 +94,14 @@ func (f *recordingFirewall) AddPolicyIP(policy uint32, ip net.IP, ports []config
 	}
 	if f.stepErr != nil {
 		return false, f.stepErr
+	}
+	if f.withhold {
+		return false, nil
+	}
+	if scope != nil {
+		if err := scope(); err != nil {
+			return false, err
+		}
 	}
 	if f.step[policy] == nil {
 		f.step[policy] = map[string][]config.Port{}

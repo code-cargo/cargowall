@@ -64,7 +64,12 @@ and no others. Which step is the kernel's answer, not the oracle's: each
 punt carries the step policy the socket is judged by, read with the punt
 (`l7_event.step_policy`), because a binding landing between the punt and a
 userspace lookup would judge an unbound flow by a step's rules. A step's DNS
-installs are scoped exactly as the job's are.
+installs are scoped as the job's are, once the firewall admits one and before
+any of it is written; one whose scope can't be written is withheld rather
+than opened unscoped. The scope holds for every flow to the address: a job
+flow there, through a job CIDR allow say, must present a name the job's tiers
+allow, as at an address a job hostname resolves to, and until steps are bound
+that narrowing is all a step's rules do here.
 
 A duplicate-SNI hello (two `server_name` extensions, or two `host_name` list
 entries) is rejected as malformed rather than resolved first- or last-wins:

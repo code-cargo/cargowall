@@ -17,6 +17,7 @@
 package firewall
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -98,8 +99,12 @@ type stepLedger struct {
 	// fresh are the keys the step write under way was charged for new.
 	fresh []plannedKey
 	// budget is each map's room for step entries: its size less the job's
-	// reservation, so none at the size for a policy without steps.
-	budget  [numRuleMaps]int
+	// reservation, so none at the size for a policy without steps, and no
+	// more than the steps hold once the map itself refused one for room.
+	budget [numRuleMaps]int
+	// jobFull marks a map that refused a step write for room: the job's own
+	// entries took the rest (shrinkBudget).
+	jobFull [numRuleMaps]bool
 	refused int       // refusals since the last Warn
 	warned  time.Time // when the last refusal Warn was logged
 }
@@ -123,6 +128,15 @@ func (l *stepLedger) setBudget(n int) {
 // used reports how many entries step policies hold in m.
 func (l *stepLedger) used(m ruleMap) int { return len(l.keys[m]) }
 
+// shrinkBudget holds m's step budget to what the steps hold, once m itself
+// refused a step write for room: the job's entries, which only grow, have
+// taken the rest. A later write is then refused at admission, before it
+// scopes or writes anything, rather than by the map.
+func (l *stepLedger) shrinkBudget(m ruleMap) {
+	l.budget[m] = min(l.budget[m], l.used(m))
+	l.jobFull[m] = true
+}
+
 // plannedKey is one key a step write is about to write.
 type plannedKey struct {
 	m   ruleMap
@@ -131,7 +145,7 @@ type plannedKey struct {
 
 // AddPolicyIP adds an allow for ip on ports under a step policy. See the
 // Firewall interface.
-func (f *FirewallImpl) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port) (bool, error) {
+func (f *FirewallImpl) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port, scope func() error) (bool, error) {
 	if policy == bpf.PolicyJob {
 		return false, fmt.Errorf("AddPolicyIP writes step policies only; the job's rules are written by AddIP")
 	}
@@ -147,19 +161,31 @@ func (f *FirewallImpl) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port
 	default:
 		return false, fmt.Errorf("invalid IP: %s", ip.String())
 	}
+	ipStr := ip.String()
 	allow, deny, ok := f.gateStepLocked(policy, dst, expandPorts(ports))
 	if !ok {
-		return false, f.stepWriteErrLocked(policy, ip.String(), nil)
+		return false, f.stepWriteErrLocked(policy, ipStr, nil)
+	}
+	// The whole write is admitted before any of it is written, and scoped
+	// then: a write the budget refuses scopes nothing, and one whose scope
+	// fails writes nothing.
+	keys, writes := f.hostWriteKeysLocked(policy, ip4, ip6, ipStr, deny, allow)
+	if !writes {
+		return false, nil
+	}
+	if err := f.admitStepLocked(policy, ipStr, keys); err != nil {
+		return false, f.stepWriteErrLocked(policy, ipStr, err)
+	}
+	if scope != nil {
+		if err := scope(); err != nil {
+			return false, f.stepWriteErrLocked(policy, ipStr, err)
+		}
 	}
 	add := func(actionVal uint8, pp []portProto) (bool, error) {
-		var changed bool
-		var err error
 		if ip4 != nil {
-			changed, err = f.addIPv4Locked(policy, ip4, ip.String(), actionVal, pp)
-		} else {
-			changed, err = f.addIPv6Locked(policy, ip6, ip.String(), actionVal, pp)
+			return f.addIPv4Locked(policy, ip4, ipStr, actionVal, pp)
 		}
-		return changed, f.stepWriteErrLocked(policy, ip.String(), err)
+		return f.addIPv6Locked(policy, ip6, ipStr, actionVal, pp)
 	}
 	// The ports the job denies here go in first, as denies, so a miss can't
 	// fall through to a step wildcard, and a write the map refuses part-way
@@ -174,10 +200,46 @@ func (f *FirewallImpl) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port
 		allowed, err = add(1, allow)
 		changed = changed || allowed
 	}
-	if err != nil {
+	if err = f.stepWriteErrLocked(policy, ipStr, err); err != nil {
 		return false, err
 	}
 	return changed, nil
+}
+
+// hostWriteKeysLocked is every key a step host write to ip writes, its
+// denies' and its allows', as admitHostV4Locked and admitHostV6Locked plan
+// each, and whether it writes anything at all: an IPv6 write whose ports are
+// all ICMP writes nothing (prepV6Ports).
+func (f *FirewallImpl) hostWriteKeysLocked(policy uint32, ip4, ip6 net.IP, ipStr string, deny, allow []portProto) ([]plannedKey, bool) {
+	if ip4 != nil {
+		network := binary.NativeEndian.Uint32(ip4)
+		keys := []plannedKey{{ruleMapCIDRs, bpf.RuleKey(policy, 32, network)}}
+		for _, pp := range [][]portProto{deny, allow} {
+			if f.hostPortsPlanned(policy, ipStr, pp) {
+				for _, p := range pp {
+					keys = append(keys, plannedKey{ruleMapPorts, bpf.RulePortKey(policy, network, p.Port, p.Proto, 0)})
+				}
+			}
+		}
+		return keys, true
+	}
+	var network [16]byte
+	copy(network[:], ip6)
+	keys := []plannedKey{{ruleMapCIDRsV6, bpf.RuleKeyV6(policy, 128, network)}}
+	writes := false
+	for i, pp := range [][]portProto{deny, allow} {
+		stripped, dropped := stripICMPForV6(pp)
+		if dropped && len(stripped) == 0 || i == 0 && len(pp) == 0 {
+			continue // no write, ICMP alone; or no denies
+		}
+		writes = true
+		if f.hostPortsPlanned(policy, ipStr, stripped) {
+			for _, p := range stripped {
+				keys = append(keys, plannedKey{ruleMapPortsV6, bpf.RulePortKeyV6(policy, network, p.Port, p.Proto, 0)})
+			}
+		}
+	}
+	return keys, writes
 }
 
 // stepWriteErrLocked ends a step write, given its error. A failed write is
@@ -185,28 +247,43 @@ func (f *FirewallImpl) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port
 // for room becomes ErrStepBudget, with the refusal Warn: the ledger admitted
 // it, so the steps' share had room, and the job's own entries took it.
 func (f *FirewallImpl) stepWriteErrLocked(policy uint32, label string, err error) error {
+	var refused ruleMap
+	var refunded bool
 	if err != nil {
-		f.refundLocked()
+		refused, refunded = f.refundLocked()
 	}
 	f.steps.fresh = nil
 	if err == nil || errors.Is(err, ErrStepBudget) || !(errors.Is(err, unix.E2BIG) || errors.Is(err, unix.ENOSPC)) {
 		f.flushNoRoomLocked()
 		return err
 	}
+	if refunded {
+		f.steps.shrinkBudget(refused)
+	}
 	f.warnNoRoomLocked(policy, label, noRoomJob)
 	return fmt.Errorf("%w: %w", ErrStepBudget, err)
 }
 
 // refundLocked uncharges the keys the failed write was charged for new that
-// its map doesn't hold. A write the kernel refused part-way keeps the
-// charge for what it did write.
-func (f *FirewallImpl) refundLocked() {
+// its map doesn't hold, and names the map that refused it. A write the
+// kernel refused part-way keeps the charge for what it did write. Every
+// writer writes a prefix's port entries before its LPM entry, so a refunded
+// port key names its port map as the refuser, and otherwise the trie is.
+func (f *FirewallImpl) refundLocked() (refused ruleMap, ok bool) {
 	for _, k := range f.steps.fresh {
-		if !f.holdsLocked(k.key) {
-			delete(f.steps.keys[k.m], k.key)
+		if f.holdsLocked(k.key) {
+			continue
+		}
+		delete(f.steps.keys[k.m], k.key)
+		if !ok || isPortMap(k.m) && !isPortMap(refused) {
+			refused, ok = k.m, true
 		}
 	}
+	return refused, ok
 }
+
+// isPortMap reports whether m holds port entries.
+func isPortMap(m ruleMap) bool { return m == ruleMapPorts || m == ruleMapPortsV6 }
 
 // holdsLocked reports whether a rule map holds key, by the key's type.
 func (f *FirewallImpl) holdsLocked(key any) bool {
@@ -337,7 +414,11 @@ func (f *FirewallImpl) admitStepLocked(policy uint32, label string, keys []plann
 	}
 	for m := range numRuleMaps {
 		if fresh[m] > 0 && l.used(m)+fresh[m] > l.budget[m] {
-			f.warnNoRoomLocked(policy, label, noRoomStepShare, "map", m.String(), "step_budget", l.budget[m])
+			reason := noRoomStepShare
+			if l.jobFull[m] {
+				reason = noRoomJob
+			}
+			f.warnNoRoomLocked(policy, label, reason, "map", m.String(), "step_budget", l.budget[m])
 			return ErrStepBudget
 		}
 	}

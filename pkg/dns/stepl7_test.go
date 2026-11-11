@@ -17,7 +17,10 @@
 package dns
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"path/filepath"
 	"strings"
@@ -29,28 +32,13 @@ import (
 
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/events"
+	"github.com/code-cargo/cargowall/pkg/firewall"
 )
 
-// orderedRegistrar is a recordingRegistrar that also fails the test when an
-// address is scoped after a step install already opened it.
-type orderedRegistrar struct {
-	recordingRegistrar
-	t  *testing.T
-	fw *recordingFirewall
-}
-
-func (r *orderedRegistrar) ScopeIP(ip net.IP, ports []config.Port) error {
-	for _, policy := range []uint32{policyFetch, policyDeploy} {
-		if _, open := r.fw.snapshot(policy)[ip.String()]; open {
-			r.t.Errorf("%s scoped after its step install opened it", ip)
-		}
-	}
-	return r.recordingRegistrar.ScopeIP(ip, ports)
-}
-
-// A step's DNS install is L7-scoped as the job's are: before the address
-// opens, on the ports it opens on, by rule or by chain. With L7 off nothing
-// is kept for the rewarm.
+// A step's DNS install is L7-scoped as the job's are, on the ports it opens
+// on, by rule or by chain (the firewall runs the scope between admitting
+// and writing: TestAddPolicyIP_ScopesBetweenAdmissionAndWrite). With L7 off
+// nothing is kept for the rewarm.
 func TestStepInstall_L7Scoped(t *testing.T) {
 	cfg := config.NewConfigManager()
 	fw := newRecordingFirewall()
@@ -59,7 +47,7 @@ func TestStepInstall_L7Scoped(t *testing.T) {
 	answer(s, "deploy.example.com", aResponse("deploy.example.com", "10.1.0.60"))
 	assert.Empty(t, s.steps.l7.scoped, "nothing kept with L7 off")
 
-	rec := &orderedRegistrar{t: t, fw: fw}
+	rec := &recordingRegistrar{}
 	s.SetL7Registrar(rec)
 	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.61"))
 	answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge61.akamai.example"}, ""))
@@ -207,5 +195,76 @@ func TestStepInstall_KeepsJobDeniedBlocks(t *testing.T) {
 		})
 	}
 	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.68", "10.1.3.5"))
+	assert.Empty(t, readAuditEvents(t, auditPath))
+}
+
+// failingRegistrar is a registrar whose scope map is full.
+type failingRegistrar struct{ recordingRegistrar }
+
+func (r *failingRegistrar) ScopeIP(net.IP, []config.Port) error {
+	return errors.New("update: argument list too long")
+}
+
+// An install the step budget refuses scopes nothing and is recorded
+// nowhere, however many arrive: refused attempts can't fill the scope map
+// that admitted installs need.
+func TestStepInstall_RefusedScopesNothing(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	fw.stepErr = firewall.ErrStepBudget
+	s := newStepTestServer(t, cfg, fw)
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	for i := range 200 {
+		name := fmt.Sprintf("h%d.cdn-step.example.net", i)
+		answer(s, name, aResponse(name, fmt.Sprintf("10.4.%d.%d", i/250, i%250+1)))
+	}
+	assert.Empty(t, rec.scopes, "no scope for a refused install")
+	assert.Empty(t, s.steps.l7.scoped, "no record of one either")
+}
+
+// A step install whose address the scope map won't take is withheld, never
+// open unscoped, with a rate-limited Warn.
+func TestStepInstall_WithheldWithoutScope(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	var logs bytes.Buffer
+	s := newStepTestServer(t, cfg, fw)
+	s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	s.SetL7Registrar(&failingRegistrar{})
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.69"))
+	answer(s, "deploy.example.com", aResponse("deploy.example.com", "10.1.0.70"))
+	assert.Empty(t, fw.stepIPs(policyFetch), "withheld")
+	assert.Empty(t, fw.stepIPs(policyDeploy), "withheld")
+	assert.Empty(t, s.steps.l7.scoped)
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("Step rule install withheld")), "one Warn a minute")
+	assert.Contains(t, logs.String(), "step=fetch")
+}
+
+// An install the firewall withholds whole, the gate under a job CIDR deny
+// say, opened nothing: it is recorded nowhere and re-reports nothing.
+func TestStepInstall_WithheldWholeRecordsNothing(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	fw.withhold = true
+	s := newStepTestServer(t, cfg, fw)
+	s.SetL7Registrar(&recordingRegistrar{})
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	auditPath := filepath.Join(t.TempDir(), "audit.ndjson")
+	auditLogger, err := events.NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	s.SetAuditLogger(auditLogger)
+	blocks := events.NewRecentBlocks(0)
+	s.SetRecentBlocks(blocks)
+	s.SetStepBindings(func(uint32) (uint32, bool) { return policyFetch, true })
+	blocks.Consume(events.AuditEvent{
+		Timestamp: time.Now(), EventType: events.EventConnectionBlocked,
+		DstIP: "10.1.0.71", DstPort: 443, Protocol: "TCP", StepOrdinal: 7,
+	})
+	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.71"))
+	assert.Empty(t, s.steps.l7.scoped)
 	assert.Empty(t, readAuditEvents(t, auditPath))
 }

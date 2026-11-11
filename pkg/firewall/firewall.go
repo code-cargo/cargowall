@@ -61,8 +61,10 @@ type Firewall interface {
 	// job's (only AddIP writes that), with AddIP's accumulation semantics per
 	// (policy, IP). Step policies share what the job's reservation leaves of
 	// each rule map: a write that would take more is refused with
-	// ErrStepBudget and installs nothing. See policy.go.
-	AddPolicyIP(policy uint32, ip net.IP, ports []config.Port) (bool, error)
+	// ErrStepBudget and installs nothing. scope, if not nil, runs once the
+	// write is admitted and before any of it is written; its error withholds
+	// the write, refunded, and is returned. See policy.go.
+	AddPolicyIP(policy uint32, ip net.IP, ports []config.Port, scope func() error) (bool, error)
 
 	// RemoveIP removes a single IP from the BPF maps
 	RemoveIP(ip net.IP) error

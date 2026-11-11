@@ -298,6 +298,7 @@ func (s *Server) ApplyRulesToTrackedHostnames() {
 				"(stale destinations may stay L7-governed)", "error", err)
 		}
 	}
+	s.rescopeStepTier()
 
 	// Process all tracked hostnames we've seen (stored in hostnameIPs map)
 	s.hostnameIPsMutex.Lock()

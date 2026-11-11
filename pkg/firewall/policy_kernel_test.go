@@ -98,9 +98,9 @@ func TestStepRules_Verdict(t *testing.T) {
 	require.NoError(t, fw.SetDefaultAction(config.ActionDeny))
 	require.NoError(t, fw.UpdateAllowlistTC(cm))
 	// What the DNS path installs for a step's hostname rule.
-	_, err := fw.AddPolicyIP(policyB, net.ParseIP("10.62.0.5"), tcp443)
+	_, err := fw.AddPolicyIP(policyB, net.ParseIP("10.62.0.5"), tcp443, nil)
 	require.NoError(t, err)
-	_, err = fw.AddPolicyIP(policyB, net.ParseIP("2001:db8:62::5"), nil)
+	_, err = fw.AddPolicyIP(policyB, net.ParseIP("2001:db8:62::5"), nil, nil)
 	require.NoError(t, err)
 
 	for _, p := range []struct {
@@ -207,7 +207,7 @@ func TestStepRules_JobCIDRDenyUnderDenyDefault(t *testing.T) {
 	require.NoError(t, fw.UpdateAllowlistTC(cm))
 	// What the DNS path installs if step.example.com resolves into either.
 	for _, ip := range []string{"203.0.113.7", "198.51.100.7"} {
-		_, err := fw.AddPolicyIP(1, net.ParseIP(ip), nil)
+		_, err := fw.AddPolicyIP(1, net.ParseIP(ip), nil, nil)
 		require.NoError(t, err)
 	}
 
@@ -269,7 +269,7 @@ func TestStepBudget_KernelJobOnlySize(t *testing.T) {
 	objs, f := loadSizedObjects(t, false, false)
 	fw := f.(*FirewallImpl)
 	require.Equal(t, bpf.RuleMapEntriesJobOnly, objs.MapCidrs.MaxEntries())
-	_, err := fw.AddPolicyIP(1, testIPv4(10, 0), nil)
+	_, err := fw.AddPolicyIP(1, testIPv4(10, 0), nil, nil)
 	require.ErrorIs(t, err, ErrStepBudget)
 	for i := range jobReservedEntries {
 		_, err := fw.AddIP(testIPv4(20, i), config.ActionAllow, nil)
@@ -308,7 +308,7 @@ func TestStepGate_KernelNestedJobEntry(t *testing.T) {
 				require.NoError(t, err)
 			}
 			step := func() {
-				_, err := fw.AddPolicyIP(1, host, nil)
+				_, err := fw.AddPolicyIP(1, host, nil, nil)
 				require.NoError(t, err)
 			}
 			if c.jobAllowFirst {

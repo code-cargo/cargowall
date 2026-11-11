@@ -869,7 +869,8 @@ to select policy with.
   before it, and the tracked-hostname backfill that follows re-installs
   the DNS path's. A load-time constant (`step_rules_enabled`) turns the
   step lookup on in both hooks exactly when the policy loaded at startup
-  has steps, and prunes it otherwise: then neither the bridge stamp's
+  has steps and step attribution is on (without it no socket carries a
+  step), and prunes it otherwise: then neither the bridge stamp's
   port programs nor its link watcher start either. It is read once, from
   the policy in hand before the tcbpf load (`loadTcObjects`); nothing
   delivers a policy after the load, and a reload path that ever did would
@@ -902,9 +903,16 @@ to select policy with.
     fill that silence (above). Requirement: no step may be bound to its
     policy unless its installs are L7-scoped, or a step's own entries
     would open a shared edge IP to it on any SNI. They are: a step's DNS
-    install scopes its address for the name, before the address opens,
-    as the job's does, and the tracked-hostname replay scopes the step
-    installs again after its scope flush. The kernel stamps each punt with
+    install scopes its address for the name once the firewall admits the
+    install and before any of it is written, as the job's does; an install
+    whose scope can't be written (the scope map full, say) is withheld,
+    never open unscoped, and one the budget refuses scopes nothing. The
+    tracked-hostname replay scopes the step installs again, first, after its
+    scope flush. A step install's scope holds for every flow to the
+    address, not the step's alone: a job flow there, through a job CIDR
+    allow say, must present a name the job's tiers allow, as at an address
+    a job hostname resolves to, and until steps are bound that narrowing is
+    all a step's rules do at L7. The kernel stamps each punt with
     the step policy its socket is judged by (`l7_event.step_policy`), read
     with the punt, so a binding that lands after it can't change the
     judgement; the oracle admits the name by the job's tiers first and
@@ -913,9 +921,13 @@ to select policy with.
     policy therefore reaches a shared edge address only by the names its
     rules allow there. A step's install re-reports as late-allowed only
     the recent blocks of the steps bound to its policy (`RecentBlocks` is
-    kept per step ordinal); a job install re-reports everyone's. The
-    late-allow from the event pipeline still judges by the job's rules
-    alone. And anything
+    kept per step ordinal), never on a port a job CIDR deny holds there,
+    and the summary supersedes a block only by a late-allow of its own
+    step; a job install re-reports everyone's. Requirement: the
+    ordinal-to-policy lookup a step's late-allow reconciles by runs under
+    the recent-blocks buffer's lock, so it must not take a lock held while
+    blocks are consumed. The late-allow from the event pipeline still
+    judges by the job's rules alone. And anything
     that reloads step rules at runtime must clear the step policies'
     entries, the DNS path's included, before installing: policies are
     numbered per load, so a kept entry would be another step's. The sync
@@ -948,7 +960,9 @@ to select policy with.
     takes priority over steps for room: its own policy may hold more than
     its 4096, and room it takes past them is room the steps lose; a step
     write the map then has no room for is refused the same way, the Warn
-    naming the job's entries as the cause. Entries are allocated as they
+    naming the job's entries as the cause, and the steps' share of that map
+    holds at what they have from then on, so a later write is refused at
+    admission, before it scopes or writes anything. Entries are allocated as they
     are written (`BPF_F_NO_PREALLOC`), so a map's size costs memory only as
     it fills, beyond each hash's bucket array.
   - *Which step a socket is judged as.* Its tag: the step of the last

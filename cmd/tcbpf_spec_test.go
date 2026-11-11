@@ -110,8 +110,12 @@ func TestLoadTcObjects_StepRulesGate(t *testing.T) {
 		gates    []uint8 // the gate each load attempt saw
 		warned   bool
 		failWith string
+		// noAttribution turns step attribution off: no socket carries a
+		// step, so the gate stays off whatever the policy.
+		noAttribution bool
 	}{
 		{name: "steps", policy: withSteps, gates: []uint8{1}},
+		{name: "steps without step attribution", policy: withSteps, noAttribution: true, gates: []uint8{0}},
 		{name: "no steps", policy: `{"defaultAction": "deny", "rules": []}`, gates: []uint8{0}},
 		{name: "no policy", gates: []uint8{0}},
 		{
@@ -161,7 +165,7 @@ func TestLoadTcObjects_StepRulesGate(t *testing.T) {
 
 			var logs bytes.Buffer
 			var objs bpf.TcBpfObjects
-			err := loadTcObjects(&StartCmd{}, cm, slog.New(slog.NewTextHandler(&logs, nil)), &objs)
+			err := loadTcObjects(&StartCmd{StepAttribution: !c.noAttribution}, cm, slog.New(slog.NewTextHandler(&logs, nil)), &objs)
 			if c.failWith != "" {
 				require.ErrorContains(t, err, c.failWith)
 			} else {
@@ -169,6 +173,7 @@ func TestLoadTcObjects_StepRulesGate(t *testing.T) {
 			}
 			assert.Equal(t, c.gates, gates)
 			assert.Equal(t, c.warned, bytes.Contains(logs.Bytes(), []byte("Step rules are off")))
+			assert.Equal(t, c.noAttribution, bytes.Contains(logs.Bytes(), []byte("Step rules stay off")))
 		})
 	}
 }

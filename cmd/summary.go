@@ -272,7 +272,9 @@ func (c *SummaryCmd) readAuditLog() ([]events.AuditEvent, error) {
 
 // reconcileLateAllowedBlocks drops blocked events superseded by a late-allow
 // for the same destination at the same time or later: connection_blocked
-// against connection_late_allowed keyed on (dst_ip, dst_port, protocol), and
+// against connection_late_allowed keyed on (dst_ip, dst_port, protocol,
+// step ordinal), since one step's own rules opening a destination open it
+// for that step alone and each re-report carries its own block's ordinal, and
 // dns_blocked against dns_query_late_allowed keyed on the queried name
 // (#119 — a query refused while the rule covering it was still loading). The daemon emits such events when the firewall
 // opens for an IP after it was blocked — either in-band (the blocked event's
@@ -288,6 +290,7 @@ func reconcileLateAllowedBlocks(auditEvents []events.AuditEvent) []events.AuditE
 		ip       string
 		port     uint16
 		protocol string
+		ordinal  uint32
 	}
 	latestLateAllow := make(map[connKey]time.Time)
 	// Queried names are matched case-insensitively: DNS is, and the refusal
@@ -296,7 +299,7 @@ func reconcileLateAllowedBlocks(auditEvents []events.AuditEvent) []events.AuditE
 	for _, e := range auditEvents {
 		switch {
 		case e.EventType == events.EventConnectionLateAllowed && e.DstIP != "":
-			k := connKey{ip: e.DstIP, port: e.DstPort, protocol: e.Protocol}
+			k := connKey{ip: e.DstIP, port: e.DstPort, protocol: e.Protocol, ordinal: e.StepOrdinal}
 			if e.Timestamp.After(latestLateAllow[k]) {
 				latestLateAllow[k] = e.Timestamp
 			}
@@ -315,7 +318,7 @@ func reconcileLateAllowedBlocks(auditEvents []events.AuditEvent) []events.AuditE
 	for _, e := range auditEvents {
 		switch e.EventType {
 		case events.EventConnectionBlocked:
-			ts, ok := latestLateAllow[connKey{ip: e.DstIP, port: e.DstPort, protocol: e.Protocol}]
+			ts, ok := latestLateAllow[connKey{ip: e.DstIP, port: e.DstPort, protocol: e.Protocol, ordinal: e.StepOrdinal}]
 			if ok && !e.Timestamp.After(ts) {
 				continue
 			}

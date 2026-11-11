@@ -173,9 +173,9 @@ func TestRuleMapSizes(t *testing.T) {
 
 func TestAddPolicyIP_RefusesTheJobsPolicy(t *testing.T) {
 	fw, maps := newStepTestFirewall(ruleMapEntries, nil)
-	_, err := fw.AddPolicyIP(bpf.PolicyJob, net.ParseIP("93.184.216.34"), nil)
+	_, err := fw.AddPolicyIP(bpf.PolicyJob, net.ParseIP("93.184.216.34"), nil, nil)
 	require.Error(t, err)
-	_, err = fw.AddPolicyIP(bpf.PolicyJob, net.ParseIP("2606:2800:220:1::1"), tcp443)
+	_, err = fw.AddPolicyIP(bpf.PolicyJob, net.ParseIP("2606:2800:220:1::1"), tcp443, nil)
 	require.Error(t, err)
 	assert.Equal(t, [numRuleMaps]int{}, storeSizes(maps))
 }
@@ -185,19 +185,19 @@ func TestAddPolicyIP_WritesItsPolicyAlone(t *testing.T) {
 	fw, maps := newStepTestFirewall(ruleMapEntries, nil)
 
 	v4 := net.ParseIP("93.184.216.34")
-	changed, err := fw.AddPolicyIP(3, v4, tcp443)
+	changed, err := fw.AddPolicyIP(3, v4, tcp443, nil)
 	require.NoError(t, err)
 	assert.True(t, changed)
 	ip := binary.NativeEndian.Uint32(v4.To4())
 	assert.Equal(t, map[any]any{bpf.RuleKey(3, 32, ip): bpf.TcBpfLpmVal{Action: 1, PortSpecific: 1}}, entriesOf(t, maps[ruleMapCIDRs], 3))
 	assert.Equal(t, map[any]any{bpf.RulePortKey(3, ip, 443, protoTCP, 0): bpf.TcBpfPortVal{Action: 1}}, entriesOf(t, maps[ruleMapPorts], 3))
 
-	changed, err = fw.AddPolicyIP(3, v4, tcp443)
+	changed, err = fw.AddPolicyIP(3, v4, tcp443, nil)
 	require.NoError(t, err)
 	assert.False(t, changed, "a repeat changes nothing")
 
 	v6 := net.ParseIP("2606:2800:220:1::1")
-	_, err = fw.AddPolicyIP(7, v6, nil)
+	_, err = fw.AddPolicyIP(7, v6, nil, nil)
 	require.NoError(t, err)
 	var ip16 [16]byte
 	copy(ip16[:], v6.To16())
@@ -209,7 +209,7 @@ func TestAddPolicyIP_WritesItsPolicyAlone(t *testing.T) {
 
 	// ICMP-only on IPv6 writes nothing (ICMPv6 is always allowed), and
 	// charges nothing.
-	_, err = fw.AddPolicyIP(7, net.ParseIP("2606:2800:220:1::2"), []config.Port{config.PortICMP})
+	_, err = fw.AddPolicyIP(7, net.ParseIP("2606:2800:220:1::2"), []config.Port{config.PortICMP}, nil)
 	require.NoError(t, err)
 	assert.Len(t, maps[ruleMapCIDRsV6].store, 1)
 	assert.Equal(t, 1, fw.steps.used(ruleMapCIDRsV6))
@@ -225,11 +225,11 @@ func TestAddPolicyIP_AccumulatorsArePerPolicy(t *testing.T) {
 
 	_, err := fw.AddIP(v4, config.ActionDeny, nil)
 	require.NoError(t, err)
-	_, err = fw.AddPolicyIP(3, v4, tcp443)
+	_, err = fw.AddPolicyIP(3, v4, tcp443, nil)
 	require.NoError(t, err)
-	_, err = fw.AddPolicyIP(4, v4, nil)
+	_, err = fw.AddPolicyIP(4, v4, nil, nil)
 	require.NoError(t, err)
-	_, err = fw.AddPolicyIP(3, v4, []config.Port{{Port: 80, Protocol: config.ProtocolTCP}})
+	_, err = fw.AddPolicyIP(3, v4, []config.Port{{Port: 80, Protocol: config.ProtocolTCP}}, nil)
 	require.NoError(t, err)
 	_, err = fw.AddIP(v4, config.ActionAllow, tcp443)
 	require.NoError(t, err)
@@ -243,7 +243,7 @@ func TestAddPolicyIP_AccumulatorsArePerPolicy(t *testing.T) {
 	// And the other way: a step's all-ports grant doesn't stick to the job.
 	w := net.ParseIP("93.184.216.35")
 	wip := binary.NativeEndian.Uint32(w.To4())
-	_, err = fw.AddPolicyIP(3, w, nil)
+	_, err = fw.AddPolicyIP(3, w, nil, nil)
 	require.NoError(t, err)
 	_, err = fw.AddIP(w, config.ActionAllow, tcp443)
 	require.NoError(t, err)
@@ -371,7 +371,7 @@ func fillCases() []fillCase {
 				_, err := fw.AddIP(ip(pool, i), config.ActionAllow, ports)
 				return err
 			}
-			_, err := fw.AddPolicyIP(policy, ip(pool, i), ports)
+			_, err := fw.AddPolicyIP(policy, ip(pool, i), ports, nil)
 			return err
 		}
 	}
@@ -421,7 +421,7 @@ func TestStepBudget_FillThenJobInstallLands(t *testing.T) {
 func TestStepBudget_JobBeyondItsReservationHitsTheMap(t *testing.T) {
 	fw, maps := newStepTestFirewall(ruleMapEntries, nil)
 	for i := range stepEntryBudget {
-		_, err := fw.AddPolicyIP(1, testIPv4(10, i), nil)
+		_, err := fw.AddPolicyIP(1, testIPv4(10, i), nil, nil)
 		require.NoError(t, err)
 	}
 	for i := range jobReservedEntries {
@@ -441,27 +441,27 @@ func TestStepBudget_AllOrNothing(t *testing.T) {
 	fw.steps.setBudget(3)
 	two := []config.Port{{Port: 80, Protocol: config.ProtocolTCP}, {Port: 443, Protocol: config.ProtocolTCP}}
 
-	_, err := fw.AddPolicyIP(1, testIPv4(10, 1), two)
+	_, err := fw.AddPolicyIP(1, testIPv4(10, 1), two, nil)
 	require.NoError(t, err)
-	_, err = fw.AddPolicyIP(1, testIPv4(10, 2), two)
+	_, err = fw.AddPolicyIP(1, testIPv4(10, 2), two, nil)
 	require.ErrorIs(t, err, ErrStepBudget, "two more port entries don't fit beside two")
 	assert.Len(t, maps[ruleMapCIDRs].store, 1)
 	assert.Len(t, maps[ruleMapPorts].store, 2)
 	assert.Equal(t, 1, fw.steps.used(ruleMapCIDRs))
 	assert.Nil(t, fw.stepIPs[policyIP{1, testIPv4(10, 2).String()}], "a refused add leaves no accumulator")
 
-	_, err = fw.AddPolicyIP(1, testIPv4(10, 1), []config.Port{{Port: 8080, Protocol: config.ProtocolTCP}})
+	_, err = fw.AddPolicyIP(1, testIPv4(10, 1), []config.Port{{Port: 8080, Protocol: config.ProtocolTCP}}, nil)
 	require.NoError(t, err, "the third port entry fits")
-	_, err = fw.AddPolicyIP(1, testIPv4(10, 1), []config.Port{{Port: 8081, Protocol: config.ProtocolTCP}})
+	_, err = fw.AddPolicyIP(1, testIPv4(10, 1), []config.Port{{Port: 8081, Protocol: config.ProtocolTCP}}, nil)
 	require.ErrorIs(t, err, ErrStepBudget)
 	assert.Len(t, maps[ruleMapPorts].store, 3)
 
 	// An all-ports grant on the installed IP needs no new entry.
-	_, err = fw.AddPolicyIP(1, testIPv4(10, 1), nil)
+	_, err = fw.AddPolicyIP(1, testIPv4(10, 1), nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t, bpf.TcBpfLpmVal{Action: 1}, maps[ruleMapCIDRs].store[bpf.RuleKey(1, 32, binary.NativeEndian.Uint32(testIPv4(10, 1)))])
 	// And under it, port entries are inert, so they're neither written nor charged.
-	_, err = fw.AddPolicyIP(1, testIPv4(10, 1), []config.Port{{Port: 9999, Protocol: config.ProtocolTCP}})
+	_, err = fw.AddPolicyIP(1, testIPv4(10, 1), []config.Port{{Port: 9999, Protocol: config.ProtocolTCP}}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 3, fw.steps.used(ruleMapPorts))
 }
@@ -473,7 +473,7 @@ func TestStepBudget_DuplicatePortsChargedOnce(t *testing.T) {
 	fw.steps.setBudget(3)
 	_, err := fw.AddPolicyIP(1, testIPv4(10, 1), []config.Port{
 		{Port: 443, Protocol: config.ProtocolTCP}, {Port: 443, Protocol: config.ProtocolAll},
-	})
+	}, nil)
 	require.NoError(t, err, "three distinct entries fit a budget of three")
 	assert.Len(t, maps[ruleMapPorts].store, 3)
 	assert.Equal(t, 3, fw.steps.used(ruleMapPorts))
@@ -531,19 +531,19 @@ func TestStepBudget_JobPastItsReservation(t *testing.T) {
 		require.NoError(t, err, "the job's own policy may hold more than its reservation")
 	}
 	for i := range 4 {
-		_, err := fw.AddPolicyIP(1, testIPv4(10, i), nil)
+		_, err := fw.AddPolicyIP(1, testIPv4(10, i), nil, nil)
 		require.NoError(t, err)
 	}
 	require.Equal(t, 4, fw.steps.used(ruleMapCIDRs), "within the steps' share")
 
-	_, err := fw.AddPolicyIP(1, testIPv4(10, 4), nil)
+	_, err := fw.AddPolicyIP(1, testIPv4(10, 4), nil, nil)
 	require.ErrorIs(t, err, ErrStepBudget)
 	require.ErrorIs(t, err, unix.E2BIG, "the map's own refusal underneath")
 	assert.Len(t, maps[ruleMapCIDRs].store, 10)
 	assert.Contains(t, logs.String(), noRoomJob)
 
 	// The sync's step CIDRs are refused the same way, under the same limit.
-	_, err = fw.AddPolicyIP(1, testIPv4(10, 5), nil)
+	_, err = fw.AddPolicyIP(1, testIPv4(10, 5), nil, nil)
 	require.ErrorIs(t, err, ErrStepBudget)
 	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("Step rule entry not installed")), "one Warn per interval, whatever the cause")
 	fw.steps.warned = time.Now().Add(-2 * stepBudgetWarnInterval)
@@ -575,7 +575,7 @@ func TestStepLedger_MatchesTheMapsWhenFull(t *testing.T) {
 				ps := ports[rng.IntN(len(ports))]
 				if rng.IntN(3) == 0 {
 					_, _ = fw.AddIP(ip, config.ActionAllow, ps) // the job may meet a full map too
-				} else if _, err := fw.AddPolicyIP(uint32(1+rng.IntN(3)), ip, ps); err != nil {
+				} else if _, err := fw.AddPolicyIP(uint32(1+rng.IntN(3)), ip, ps, nil); err != nil {
 					require.ErrorIs(t, err, ErrStepBudget)
 				}
 				for m := range numRuleMaps {
@@ -592,17 +592,17 @@ func TestStepBudget_WarnIsRateLimited(t *testing.T) {
 	var logs bytes.Buffer
 	fw, _ := newStepTestFirewall(ruleMapEntries, slog.New(slog.NewTextHandler(&logs, nil)))
 	fw.steps.setBudget(1)
-	_, err := fw.AddPolicyIP(1, testIPv4(10, 0), nil)
+	_, err := fw.AddPolicyIP(1, testIPv4(10, 0), nil, nil)
 	require.NoError(t, err)
 	for i := 1; i <= 5; i++ {
-		_, err := fw.AddPolicyIP(1, testIPv4(10, i), nil)
+		_, err := fw.AddPolicyIP(1, testIPv4(10, i), nil, nil)
 		require.ErrorIs(t, err, ErrStepBudget)
 	}
 	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(noRoomStepShare)))
 	assert.Contains(t, logs.String(), "refused=1")
 
 	fw.steps.warned = time.Now().Add(-2 * stepBudgetWarnInterval)
-	_, err = fw.AddPolicyIP(1, testIPv4(10, 6), nil)
+	_, err = fw.AddPolicyIP(1, testIPv4(10, 6), nil, nil)
 	require.ErrorIs(t, err, ErrStepBudget)
 	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(noRoomStepShare)))
 	assert.Contains(t, logs.String(), "refused=5", "four held back, and this one")
@@ -660,7 +660,7 @@ func TestStepLedger_MatchesTheMaps(t *testing.T) {
 					continue
 				}
 				before := storeSizes(maps)
-				_, err := fw.AddPolicyIP(uint32(1+rng.IntN(4)), ip, ports)
+				_, err := fw.AddPolicyIP(uint32(1+rng.IntN(4)), ip, ports, nil)
 				if err != nil {
 					require.ErrorIs(t, err, ErrStepBudget)
 					require.Equal(t, before, storeSizes(maps), "a refused write installed something")

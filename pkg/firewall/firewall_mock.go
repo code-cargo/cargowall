@@ -80,9 +80,9 @@ func (_c *MockFirewall_AddIP_Call) RunAndReturn(run func(net.IP, config.Action, 
 	return _c
 }
 
-// AddPolicyIP provides a mock function with given fields: policy, ip, ports
-func (_m *MockFirewall) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port) (bool, error) {
-	ret := _m.Called(policy, ip, ports)
+// AddPolicyIP provides a mock function with given fields: policy, ip, ports, scope
+func (_m *MockFirewall) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port, scope func() error) (bool, error) {
+	ret := _m.Called(policy, ip, ports, scope)
 
 	if len(ret) == 0 {
 		panic("no return value specified for AddPolicyIP")
@@ -90,17 +90,17 @@ func (_m *MockFirewall) AddPolicyIP(policy uint32, ip net.IP, ports []config.Por
 
 	var r0 bool
 	var r1 error
-	if rf, ok := ret.Get(0).(func(uint32, net.IP, []config.Port) (bool, error)); ok {
-		return rf(policy, ip, ports)
+	if rf, ok := ret.Get(0).(func(uint32, net.IP, []config.Port, func() error) (bool, error)); ok {
+		return rf(policy, ip, ports, scope)
 	}
-	if rf, ok := ret.Get(0).(func(uint32, net.IP, []config.Port) bool); ok {
-		r0 = rf(policy, ip, ports)
+	if rf, ok := ret.Get(0).(func(uint32, net.IP, []config.Port, func() error) bool); ok {
+		r0 = rf(policy, ip, ports, scope)
 	} else {
 		r0 = ret.Get(0).(bool)
 	}
 
-	if rf, ok := ret.Get(1).(func(uint32, net.IP, []config.Port) error); ok {
-		r1 = rf(policy, ip, ports)
+	if rf, ok := ret.Get(1).(func(uint32, net.IP, []config.Port, func() error) error); ok {
+		r1 = rf(policy, ip, ports, scope)
 	} else {
 		r1 = ret.Error(1)
 	}
@@ -117,13 +117,14 @@ type MockFirewall_AddPolicyIP_Call struct {
 //   - policy uint32
 //   - ip net.IP
 //   - ports []config.Port
-func (_e *MockFirewall_Expecter) AddPolicyIP(policy interface{}, ip interface{}, ports interface{}) *MockFirewall_AddPolicyIP_Call {
-	return &MockFirewall_AddPolicyIP_Call{Call: _e.mock.On("AddPolicyIP", policy, ip, ports)}
+//   - scope func() error
+func (_e *MockFirewall_Expecter) AddPolicyIP(policy interface{}, ip interface{}, ports interface{}, scope interface{}) *MockFirewall_AddPolicyIP_Call {
+	return &MockFirewall_AddPolicyIP_Call{Call: _e.mock.On("AddPolicyIP", policy, ip, ports, scope)}
 }
 
-func (_c *MockFirewall_AddPolicyIP_Call) Run(run func(policy uint32, ip net.IP, ports []config.Port)) *MockFirewall_AddPolicyIP_Call {
+func (_c *MockFirewall_AddPolicyIP_Call) Run(run func(policy uint32, ip net.IP, ports []config.Port, scope func() error)) *MockFirewall_AddPolicyIP_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(uint32), args[1].(net.IP), args[2].([]config.Port))
+		run(args[0].(uint32), args[1].(net.IP), args[2].([]config.Port), args[3].(func() error))
 	})
 	return _c
 }
@@ -133,7 +134,7 @@ func (_c *MockFirewall_AddPolicyIP_Call) Return(_a0 bool, _a1 error) *MockFirewa
 	return _c
 }
 
-func (_c *MockFirewall_AddPolicyIP_Call) RunAndReturn(run func(uint32, net.IP, []config.Port) (bool, error)) *MockFirewall_AddPolicyIP_Call {
+func (_c *MockFirewall_AddPolicyIP_Call) RunAndReturn(run func(uint32, net.IP, []config.Port, func() error) (bool, error)) *MockFirewall_AddPolicyIP_Call {
 	_c.Call.Return(run)
 	return _c
 }

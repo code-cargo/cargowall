@@ -393,14 +393,22 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 	}
 	for _, a := range allows {
 		for _, ip := range ips {
-			s.scopeStepInstall(name, ip, a.ports)
-			changed, err := s.firewall.AddPolicyIP(a.policy, ip, a.ports)
-			if err == nil {
+			// Scoped once the firewall admits the install and before it
+			// writes any of it (stepl7.go).
+			admitted := false
+			changed, err := s.firewall.AddPolicyIP(a.policy, ip, a.ports, func() error {
+				admitted = true
+				return s.scopeStepInstall(name, ip, a.ports)
+			})
+			if err == nil && admitted {
+				s.recordStepScope(name, ip, a.ports)
 				s.reconcileStepBlocks(a, name, ip)
 			}
 			switch {
 			case errors.Is(err, firewall.ErrStepBudget):
 				// The firewall warns, rate-limited.
+			case errors.Is(err, errStepScope):
+				s.warnStepScope(a, name, ip, err)
 			case err != nil:
 				s.logger.Warn("Step rule install failed; the step gets the job's rules there",
 					"step", a.stepID, "policy", a.policy, "hostname", name, "ip", ip.String(), "error", err)
@@ -413,17 +421,15 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 	}
 }
 
-// backfillStepTier is ApplyRulesToTrackedHostnames' step tier. The step
-// installs among ipSet are scoped again, after the replay's scope flush. And
-// a name the proxy answered before the rules allowing it loaded, or before
-// the firewall was set, gets its IPs installed now. Only the addresses the proxy itself
+// backfillStepTier is ApplyRulesToTrackedHostnames' step tier: a name the
+// proxy answered before the rules allowing it loaded, or before the firewall
+// was set, gets its IPs installed now. Only the addresses the proxy itself
 // answered for the name: their hops are known, and checked. Never one a
 // system-resolver or reverse lookup put to the name (the job's replay takes
 // those too): the first carries no chain to check, and a reverse lookup's
 // name is whatever the address's owner says. A step starts after cargowall,
 // so it has no connection from before that such an address could serve.
 func (s *Server) backfillStepTier(name string, verdict config.HostnameVerdict, ipSet map[string]bool) {
-	s.rescopeStepTier(ipSet)
 	via, kept := s.viaFor(name)
 	allows, _ := s.stepAllowsFor(name, verdict)
 	if len(allows) == 0 {

@@ -717,24 +717,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		// Cheap when no tracking has happened yet; idempotent in any case.
 		dnsServer.ApplyRulesToTrackedHostnames()
 
-		// Shared resolver that uses the systemd-resolved stub listener for
-		// looking up cached DNS entries. Used for existing-connection reverse
-		// DNS and Phase 1 cache population. Marked so the redirect's stub
-		// DNAT (installed before this runs) passes these peeks through to
-		// the real stub instead of looping them into the proxy.
-		cacheResolver := &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				d := &net.Dialer{Control: network.MarkDNSProxySocket}
-				return d.DialContext(ctx, "udp", "127.0.0.53:53")
-			},
-		}
-
 		existing := scanExistingForStartup(cmd, logger)
 
 		if cmd.PrepopulateDNSCache {
-			reverseDNSExistingConnections(ctx, existing, configMgr, cacheResolver, logger)
-			prePopulateDNSCache(ctx, configMgr, dnsServer, cacheResolver, logger)
+			preResolve(ctx, existing, configMgr, dnsServer, newStubResolver(), newProxyResolver(), logger)
 		}
 
 		// Flush systemd-resolved's cache now that the redirect is installed
@@ -1510,74 +1496,6 @@ func autoAllowCodeCargoAPI(apiURL string, configMgr *config.Manager, logger *slo
 	}
 	configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
 	logger.Info("Auto-allowed CodeCargo API hostname", "hostname", u.Hostname())
-}
-
-// reverseDNSExistingConnections performs reverse DNS lookups for each
-// scanned existing-connection IP via the cache resolver, updating the config
-// manager's DNS mappings. Derives from ctx so a startup-window shutdown
-// signal drains the lookup loop promptly.
-func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) {
-	if len(conns) == 0 {
-		return
-	}
-
-	lookupCtx, lookupCancel := context.WithTimeout(ctx, 10*time.Second)
-	for ip := range conns {
-		rCtx, rCancel := context.WithTimeout(lookupCtx, 1*time.Second)
-		if names, err := cacheResolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
-			hostname := strings.TrimSuffix(names[0], ".")
-			configMgr.UpdateDNSMapping(hostname, ip)
-			logger.Debug("Reverse DNS for existing connection", "ip", ip, "hostname", hostname)
-		}
-		rCancel()
-	}
-	lookupCancel()
-	logger.Info("Populated reverse DNS cache from existing connections", "ips", len(conns))
-}
-
-// prePopulateDNSCache pre-populates the BPF allowlist and reverse lookup cache
-// so that connections established before cargowall started are not incorrectly
-// blocked. Phase 1 queries systemd-resolved's stub for cached IPs and pushes
-// them into BPF maps. Phase 2 resolves through the DNS proxy for round-robin IPs.
-func prePopulateDNSCache(ctx context.Context, configMgr *config.Manager, dnsServer *dns.Server, cacheResolver *net.Resolver, logger *slog.Logger) {
-	// Phase 1: Query systemd-resolved's stub listener (127.0.0.53) to get
-	// the CACHED IPs — the exact IPs running processes are currently using.
-	// This is loopback traffic so the BPF TC filter on eth0 doesn't touch it.
-	cacheCtx, cacheCancel := context.WithTimeout(ctx, 10*time.Second)
-	for hostname := range configMgr.GetTrackedHostnames() {
-		lookupCtx, lookupCancel := context.WithTimeout(cacheCtx, 2*time.Second)
-		if ips, err := cacheResolver.LookupHost(lookupCtx, hostname); err == nil {
-			dnsServer.RecordSystemCacheAnswer(hostname, ips)
-		} else {
-			logger.Debug("System DNS cache miss", "hostname", hostname, "error", err)
-		}
-		lookupCancel()
-	}
-	cacheCancel()
-
-	// Push cached IPs into BPF maps
-	dnsServer.ApplyRulesToTrackedHostnames()
-	logger.Info("Applied system DNS cache entries to firewall")
-
-	// Phase 2: Also resolve through our DNS proxy to capture any fresh
-	// round-robin IPs and ensure the reverse lookup cache is fully populated.
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{}
-			return d.DialContext(ctx, "udp", "127.0.0.1:53")
-		},
-	}
-	resolveCtx, resolveCancel := context.WithTimeout(ctx, 15*time.Second)
-	for hostname := range configMgr.GetTrackedHostnames() {
-		lookupCtx, lookupCancel := context.WithTimeout(resolveCtx, 3*time.Second)
-		if _, err := resolver.LookupHost(lookupCtx, hostname); err != nil {
-			logger.Debug("Failed to pre-resolve hostname", "hostname", hostname, "error", err)
-		}
-		lookupCancel()
-	}
-	resolveCancel()
-	logger.Info("Pre-resolved tracked hostnames via DNS proxy")
 }
 
 // gateExistingConnections iterates pre-existing connections, blocks those

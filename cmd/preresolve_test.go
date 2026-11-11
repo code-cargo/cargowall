@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,6 +30,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/dns"
 )
 
 // stalledResolver never answers: every lookup waits for its context to end,
@@ -189,4 +191,92 @@ func TestLookupEach_PerLookupBoundIsNotACutOff(t *testing.T) {
 	})
 	assert.Equal(t, 1, ok)
 	assert.Zero(t, cutOff, "a lookup that timed out on its own bound is a failed lookup, not a cut-off one")
+}
+
+// cachedForwardSlowPTR answers forward lookups at once, as resolved's cache
+// does, and reverse lookups late, as a PTR resolved has to ask upstream for.
+type cachedForwardSlowPTR struct {
+	forward  map[string][]string
+	ptrDelay time.Duration
+}
+
+func (r *cachedForwardSlowPTR) LookupHost(_ context.Context, host string) ([]string, error) {
+	if ips, ok := r.forward[host]; ok {
+		return ips, nil
+	}
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+}
+
+func (r *cachedForwardSlowPTR) LookupAddr(ctx context.Context, addr string) ([]string, error) {
+	select {
+	case <-time.After(r.ptrDelay):
+		return []string{"edge-" + addr + ".cdn.example.net."}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// refusingProxy fails every lookup at once, as the proxy does for a name the
+// job denies.
+type refusingProxy struct{}
+
+func (refusingProxy) LookupHost(_ context.Context, host string) ([]string, error) {
+	return nil, &net.DNSError{Err: "server misbehaving", Name: host}
+}
+
+// gateRecorder records what gateExistingConnections writes.
+type gateRecorder struct {
+	mu   sync.Mutex
+	adds map[string]gateWrite
+}
+
+type gateWrite struct {
+	action config.Action
+	ports  []config.Port
+}
+
+func (g *gateRecorder) AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.adds == nil {
+		g.adds = make(map[string]gateWrite)
+	}
+	g.adds[ip.String()+" "+string(action)] = gateWrite{action: action, ports: ports}
+	return true, nil
+}
+
+// An existing connection's address that resolved has cached for a tracked
+// name keeps that name, though its PTR, naming a CDN edge, lands after: the
+// gate must still block the peer the job denies, and give the allowed one its
+// rule's ports. Run through the real DNS server and config manager, with the
+// proxy refusing, as it does a denied name.
+func TestPreResolve_CachedForwardNameWinsOverLatePTR(t *testing.T) {
+	https := []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "denied.example.com", Action: config.ActionDeny},
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow, Ports: https},
+	}, config.ActionDeny))
+	srv := dns.NewServer(cm, nil, "127.0.0.1:1", "127.0.0.1:0", slog.New(slog.DiscardHandler))
+	conns := existingConns{
+		"203.0.113.5": {{Port: 8443, Protocol: config.ProtocolTCP}},
+		"203.0.113.6": {{Port: 8443, Protocol: config.ProtocolTCP}},
+	}
+	stub := &cachedForwardSlowPTR{
+		forward: map[string][]string{
+			"denied.example.com":  {"203.0.113.5"},
+			"allowed.example.com": {"203.0.113.6"},
+		},
+		ptrDelay: 30 * time.Millisecond,
+	}
+
+	preResolve(context.Background(), conns, cm, srv, stub, refusingProxy{}, quietLogger())
+	gate := &gateRecorder{}
+	gateExistingConnections(conns, cm, gate, nil, nil, quietLogger())
+
+	assert.Equal(t, "denied.example.com", cm.LookupHostnameByIP("203.0.113.5"))
+	assert.Equal(t, "allowed.example.com", cm.LookupHostnameByIP("203.0.113.6"))
+	assert.NotContains(t, gate.adds, "203.0.113.5 allow", "the peer the job denies is blocked")
+	require.Contains(t, gate.adds, "203.0.113.6 allow")
+	assert.Equal(t, https, gate.adds["203.0.113.6 allow"].ports, "the allowed peer gets its rule's ports, not its observed one")
 }

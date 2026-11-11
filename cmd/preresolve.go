@@ -66,13 +66,17 @@ const (
 )
 
 // stubResolver is the startup lookup surface: systemd-resolved's stub in
-// production (newStubResolver), a scripted resolver in tests.
+// production (newStubResolver), a scripted resolver in tests. The deadline
+// bounds pre-resolution only if every lookup returns once its ctx ends, so an
+// implementation must honour ctx; Go's resolver does, but a cgo one, whose
+// getaddrinfo can't be cancelled, would not.
 type stubResolver interface {
 	LookupAddr(ctx context.Context, addr string) ([]string, error)
 	LookupHost(ctx context.Context, host string) ([]string, error)
 }
 
 // hostResolver resolves a name; the proxy in production (newProxyResolver).
+// Like stubResolver, it must honour ctx.
 type hostResolver interface {
 	LookupHost(ctx context.Context, host string) ([]string, error)
 }
@@ -114,6 +118,14 @@ func newProxyResolver() *net.Resolver {
 // existing connections' reverse names and the stub-cache snapshot (phase 1)
 // run side by side, both from the stub; the cache entries are applied to the
 // firewall; then the tracked names are resolved through the proxy (phase 2).
+//
+// Phase 1's answers are recorded only once both stub rounds are done. An
+// address both rounds name gets the name the last write gives it, and the
+// cached forward answer, the policy's own name, must be that last word: a
+// PTR name in its place matches no rule, so gateExistingConnections would
+// allow an existing connection to a host the job denies on its observed
+// ports. A cache hit answers at once while a PTR goes upstream, so recording
+// as the answers arrive would let the PTR win.
 // A slow upstream can spend the whole deadline in phase 1, leaving phase 2
 // nothing: that costs only phase 2's head start, never enforcement. Derives
 // from ctx, so a startup-window shutdown signal drains it promptly.
@@ -127,6 +139,8 @@ func preResolve(ctx context.Context, conns existingConns, configMgr *config.Mana
 
 	var wg sync.WaitGroup
 	var cached, cacheCutOff int
+	var answersMu sync.Mutex
+	answers := make(map[string][]string)
 	wg.Go(func() { reverseDNSExistingConnections(ctx, conns, configMgr, stub, logger) })
 	wg.Go(func() {
 		cached, cacheCutOff = lookupEach(ctx, hostnames, preResolveStubLookup, func(ctx context.Context, hostname string) bool {
@@ -135,13 +149,21 @@ func preResolve(ctx context.Context, conns existingConns, configMgr *config.Mana
 				logger.Debug("System DNS cache miss", "hostname", hostname, "error", err)
 				return false
 			}
-			sink.RecordSystemCacheAnswer(hostname, ips)
+			answersMu.Lock()
+			answers[hostname] = ips
+			answersMu.Unlock()
 			return true
 		})
 	})
 	wg.Wait()
 
-	// Local work, so it runs whatever the deadline left.
+	// Local work, so it runs whatever the deadline left; the answers last,
+	// over the reverse names (see above).
+	for _, hostname := range hostnames {
+		if ips, ok := answers[hostname]; ok {
+			sink.RecordSystemCacheAnswer(hostname, ips)
+		}
+	}
 	sink.ApplyRulesToTrackedHostnames()
 	logger.Info("Applied system DNS cache entries to firewall",
 		"hostnames", len(hostnames), "answered", cached, "cut_off", cacheCutOff)

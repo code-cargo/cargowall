@@ -17,11 +17,14 @@
 package config
 
 // RecordReverseName records hostname, a reverse-lookup (PTR) answer, as ip's
-// name, unless ip already has one, and reports whether it did. A PTR name is
-// the destination's own claim, and it decides attribution and which rule a
-// denial is late-allowed under, so it must never replace a forward name: one
-// the proxy recorded from a DNS answer, or a tracked name's cached address.
-// A lookup takes long enough for a forward answer to land while it runs.
+// name, and reports whether it did. It refuses when ip already has a name:
+// an entry in the IP-to-hostname map, or a place among any tracked name's
+// cached addresses. A PTR name is the destination's own claim, and it decides
+// attribution and which rule a denial is late-allowed under, so it must never
+// replace a name a DNS answer gave ip; a lookup takes long enough for one to
+// land while it runs. What it refuses on is not always forward-derived: a PTR
+// name mapped to a tracked rule is cached under that rule like a DNS answer,
+// so it too keeps later PTR names out.
 func (cm *Manager) RecordReverseName(hostname, ip string) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()

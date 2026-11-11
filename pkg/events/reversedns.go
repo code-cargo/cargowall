@@ -211,8 +211,11 @@ func (t *reverseDNSTracker) size() int {
 }
 
 // lookupReverseName runs one claimed reverse lookup of ip, records its
-// outcome in tracker, and returns the hostname it found, or "". A name is
-// recorded as the IP's DNS mapping, so a later event finds it in the cache.
+// outcome in tracker, and returns the name ip goes by: the one it found, or
+// "". A name is recorded as the IP's DNS mapping, so a later event finds it
+// in the cache, but only if the IP has no name yet: a reverse name never
+// replaces a forward one, and one may have landed while the lookup ran. The
+// IP then goes by the forward name.
 func lookupReverseName(tracker *reverseDNSTracker, resolver addrResolver, configMgr *config.Manager,
 	ip string, logger *slog.Logger,
 ) string {
@@ -231,14 +234,19 @@ func lookupReverseName(tracker *reverseDNSTracker, resolver addrResolver, config
 	}
 	// Lowercased so an unmatched PTR name is reported in the same canonical
 	// case as forward mappings and tracked-rule matches, keeping
-	// connection-event output consistent (#65). PTR replies can carry
+	// connection-event output consistent. PTR replies can carry
 	// mixed/0x20-randomized case off the wire.
 	ptrName := strings.ToLower(strings.TrimSuffix(names[0], "."))
 	hostname := ptrName
 	if tracked := configMgr.FindTrackedHostname(ptrName); tracked != "" {
 		hostname = tracked
 	}
-	configMgr.UpdateDNSMapping(hostname, ip)
+	if !configMgr.RecordReverseName(hostname, ip) {
+		forward := configMgr.LookupHostnameByIP(ip)
+		logger.Debug("Lazy reverse DNS resolved, but a forward name came first", "ip", ip,
+			"hostname", forward, "reverse_name", hostname)
+		return forward
+	}
 	logger.Debug("Lazy reverse DNS resolved", "ip", ip, "hostname", hostname)
 	return hostname
 }
@@ -281,9 +289,16 @@ func (r *reverseDNSRetrier) enqueue(ip string, configMgr *config.Manager, logger
 	}
 }
 
+// run works the queue. A retry waits there behind others, and the IP may
+// have been named by a forward answer meanwhile: then it settles without a
+// lookup, since the name it would find could only be refused.
 func (r *reverseDNSRetrier) run() {
 	for retry := range r.queue {
-		lookupReverseName(r.tracker, r.resolver, retry.configMgr, retry.ip, retry.logger)
+		if retry.configMgr.LookupHostnameByIP(retry.ip) != "" {
+			r.tracker.finish(retry.ip, true)
+		} else {
+			lookupReverseName(r.tracker, r.resolver, retry.configMgr, retry.ip, retry.logger)
+		}
 		r.pending.Done()
 	}
 }

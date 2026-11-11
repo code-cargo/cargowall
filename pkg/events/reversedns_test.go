@@ -21,6 +21,7 @@ import (
 	"errors"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -279,49 +280,209 @@ func TestReportVerdict_PTRFailuresSpacedAndCapped(t *testing.T) {
 	assert.Empty(t, fw.addedIPs)
 }
 
-// A retry the full queue can't take gives its claim back: the IP is due
-// again at the next denial, not stuck in flight.
-func TestReverseDNSRetrier_FullQueueReleasesClaim(t *testing.T) {
-	clock := newFakeClock()
-	tr := newReverseDNSTracker(10, clock.now)
-	block := make(chan struct{})
-	res := blockingResolver(block)
-	r := newReverseDNSRetrier(tr, res, 1)
-	t.Cleanup(func() { close(block); r.wait(); close(r.queue) })
-	cm := config.NewConfigManager()
-
-	for _, ip := range []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"} {
-		claimed, _ := tr.begin(ip, true)
-		require.True(t, claimed)
-		tr.finish(ip, false)
-	}
-	clock.advance(reverseDNSBaseBackoff)
-	for i, ip := range []string{"192.0.2.1", "192.0.2.2"} {
-		claimed, first := tr.begin(ip, true)
-		require.True(t, claimed)
-		require.False(t, first)
-		require.True(t, r.enqueue(ip, cm, newTestLogger()))
-		// The first is taken by the worker, which blocks in its lookup; the
-		// second waits in the queue, filling it.
-		require.Eventually(t, func() bool { return len(r.queue) == i }, time.Second, time.Millisecond)
-	}
-
-	claimed, _ := tr.begin("192.0.2.3", true)
-	require.True(t, claimed)
-	if !r.enqueue("192.0.2.3", cm, newTestLogger()) {
-		tr.release("192.0.2.3")
-	}
-	claimed, first := tr.begin("192.0.2.3", true)
-	assert.True(t, claimed, "the released IP is due again")
-	assert.False(t, first)
+// gatedResolver answers retries with each IP's PTR name, but only once its
+// gate is open; until then a lookup waits, the way one waits on a slow
+// upstream. onLookup, when set, runs as a lookup starts.
+type gatedResolver struct {
+	gate     chan struct{}
+	opened   sync.Once
+	onLookup func(ip string)
+	mu       sync.Mutex
+	calls    map[string]int
 }
 
-// blockingResolver's lookups wait until it is closed.
-type blockingResolver chan struct{}
+// open lets every lookup, waiting or to come, through.
+func (g *gatedResolver) open() { g.opened.Do(func() { close(g.gate) }) }
 
-func (b blockingResolver) LookupAddr(context.Context, string) ([]string, error) {
-	<-b
-	return nil, errPTRTimeout
+func newGatedResolver() *gatedResolver {
+	return &gatedResolver{gate: make(chan struct{}), calls: make(map[string]int)}
+}
+
+func (g *gatedResolver) LookupAddr(_ context.Context, ip string) ([]string, error) {
+	g.mu.Lock()
+	g.calls[ip]++
+	g.mu.Unlock()
+	if g.onLookup != nil {
+		g.onLookup(ip)
+	}
+	<-g.gate
+	return []string{"ec2-" + strings.ReplaceAll(ip, ".", "-") + ".compute-1.amazonaws.com."}, nil
+}
+
+func (g *gatedResolver) callsFor(ip string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls[ip]
+}
+
+// useGatedRetries gives the test a retry worker of its own, with a queue of
+// queueLen, answering through gated. Call after useScriptedReverseDNS.
+func useGatedRetries(t *testing.T, gated *gatedResolver, queueLen int) *reverseDNSRetrier {
+	t.Helper()
+	r := newReverseDNSRetrier(reverseDNS, gated, queueLen)
+	prev := reverseDNSRetries
+	reverseDNSRetries = r
+	t.Cleanup(func() {
+		gated.open()
+		r.wait()
+		close(r.queue)
+		reverseDNSRetries = prev
+	})
+	return r
+}
+
+func dropTo(ip string, port uint16) VerdictRecord {
+	rec := builderDrop()
+	rec.DstIP, rec.DstPort = ip, port
+	return rec
+}
+
+func reportDrop(t *testing.T, cm *config.Manager, fw *mockFirewallUpdater, rec VerdictRecord) AuditEvent {
+	t.Helper()
+	auditLogger, err := NewAuditLogger("", false)
+	require.NoError(t, err)
+	sink := &recordingSink{}
+	auditLogger.AddSink(sink)
+	ReportVerdict(rec, cm, nil, auditLogger, fw, nil, newTestLogger())
+	require.Len(t, sink.events, 1)
+	return sink.events[0]
+}
+
+// A retry the full queue can't take gives its claim back, so the IP is due
+// again at its next denial rather than stuck in flight for the run.
+func TestReportVerdict_FullRetryQueueReleasesTheClaim(t *testing.T) {
+	clock, _ := useScriptedReverseDNS(t, scriptedAnswer{err: errPTRTimeout})
+	gated := newGatedResolver()
+	r := useGatedRetries(t, gated, 1)
+	cm := builderPolicy(t)
+	fw := &mockFirewallUpdater{}
+	ips := []string{"198.51.100.1", "198.51.100.2", "198.51.100.3"}
+
+	for _, ip := range ips {
+		reportDrop(t, cm, fw, dropTo(ip, 443)) // the first lookup times out
+	}
+	clock.advance(reverseDNSBaseBackoff)
+	reportDrop(t, cm, fw, dropTo(ips[0], 443))
+	require.Eventually(t, func() bool { return gated.callsFor(ips[0]) == 1 }, time.Second, time.Millisecond,
+		"the worker took the first retry and waits in its lookup")
+	reportDrop(t, cm, fw, dropTo(ips[1], 443)) // fills the queue
+	reportDrop(t, cm, fw, dropTo(ips[2], 443)) // finds it full
+
+	gated.open()
+	r.wait()
+	reportDrop(t, cm, fw, dropTo(ips[2], 443)) // due again, so queued this time
+	r.wait()
+
+	ev := reportDrop(t, cm, fw, dropTo(ips[2], 443))
+	assert.Equal(t, EventConnectionLateAllowed, ev.EventType, "the dropped retry ran at the IP's next denial")
+	assert.Equal(t, 1, gated.callsFor(ips[2]))
+}
+
+// policyWithForwardAndPTRRules allows builder.example by its forward name on
+// tcp/443, and *.compute-1.amazonaws.com by reverse name on tcp/8443: a
+// destination's name decides which rule a denial is judged under.
+func policyWithForwardAndPTRRules(t *testing.T) *config.Manager {
+	t.Helper()
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{
+			Type: config.RuleTypeHostname, Value: "builder.example", Action: config.ActionAllow,
+			Ports: []config.Port{{Port: 443, Protocol: config.ProtocolTCP}},
+		},
+		{
+			Type: config.RuleTypeHostname, Value: "*.compute-1.amazonaws.com", Action: config.ActionAllow,
+			Ports: []config.Port{{Port: 8443, Protocol: config.ProtocolTCP}},
+		},
+	}, config.ActionDeny))
+	return cm
+}
+
+// A forward answer that lands while a retry waits in the queue keeps its
+// name: the worker finds the IP named and settles it without a lookup.
+func TestReverseDNSRetrier_ForwardNameWhileQueuedIsKept(t *testing.T) {
+	clock, _ := useScriptedReverseDNS(t, scriptedAnswer{err: errPTRTimeout})
+	gated := newGatedResolver()
+	r := useGatedRetries(t, gated, 4)
+	cm := policyWithForwardAndPTRRules(t)
+	fw := &mockFirewallUpdater{}
+	const busy, ip = "198.51.100.1", builderIP
+
+	reportDrop(t, cm, fw, dropTo(busy, 8443))
+	reportDrop(t, cm, fw, dropTo(ip, 8443))
+	clock.advance(reverseDNSBaseBackoff)
+	reportDrop(t, cm, fw, dropTo(busy, 8443))
+	require.Eventually(t, func() bool { return gated.callsFor(busy) == 1 }, time.Second, time.Millisecond)
+	reportDrop(t, cm, fw, dropTo(ip, 8443)) // queued behind the busy one
+
+	cm.UpdateDNSMapping("builder.example", ip) // the proxy answers for it meanwhile
+	gated.open()
+	r.wait()
+
+	assert.Zero(t, gated.callsFor(ip), "the IP was named by then: no lookup")
+	assert.Equal(t, "builder.example", cm.LookupHostnameByIP(ip))
+	ev := reportDrop(t, cm, fw, dropTo(ip, 8443))
+	assert.Equal(t, EventConnectionBlocked, ev.EventType, "judged under the forward name's rule, which allows only 443")
+	assert.Equal(t, "builder.example", ev.DstHostname)
+}
+
+// A forward answer that lands while a retry's lookup runs keeps its name: the
+// PTR name the lookup brings back is not recorded over it.
+func TestReverseDNSRetrier_ForwardNameDuringTheLookupIsKept(t *testing.T) {
+	clock, _ := useScriptedReverseDNS(t, scriptedAnswer{err: errPTRTimeout})
+	gated := newGatedResolver()
+	r := useGatedRetries(t, gated, 4)
+	cm := policyWithForwardAndPTRRules(t)
+	fw := &mockFirewallUpdater{}
+	gated.onLookup = func(ip string) { cm.UpdateDNSMapping("builder.example", ip) }
+
+	reportDrop(t, cm, fw, dropTo(builderIP, 8443))
+	clock.advance(reverseDNSBaseBackoff)
+	reportDrop(t, cm, fw, dropTo(builderIP, 8443))
+	gated.open()
+	r.wait()
+
+	assert.Equal(t, 1, gated.callsFor(builderIP))
+	assert.Equal(t, "builder.example", cm.LookupHostnameByIP(builderIP))
+	assert.Equal(t, EventConnectionBlocked, reportDrop(t, cm, fw, dropTo(builderIP, 8443)).EventType)
+	assert.NotContains(t, portsOpened(fw), uint16(8443), "nothing opened under the reverse name's rule")
+}
+
+// forwardDuringLookup is a first lookup's resolver: the proxy records a
+// forward answer for the IP while the PTR query is out.
+type forwardDuringLookup struct{ cm *config.Manager }
+
+func (f forwardDuringLookup) LookupAddr(_ context.Context, ip string) ([]string, error) {
+	f.cm.UpdateDNSMapping("builder.example", ip)
+	return []string{"ec2-198-51-100-7.compute-1.amazonaws.com."}, nil
+}
+
+// The same on the first lookup, which runs while the event is prepared: the
+// event and the run keep the forward name.
+func TestReportVerdict_ForwardNameDuringFirstLookupIsKept(t *testing.T) {
+	useScriptedReverseDNS(t)
+	cm := policyWithForwardAndPTRRules(t)
+	reverseDNSResolver = forwardDuringLookup{cm: cm}
+	fw := &mockFirewallUpdater{}
+
+	ev := reportDrop(t, cm, fw, dropTo(builderIP, 8443))
+
+	assert.Equal(t, EventConnectionBlocked, ev.EventType, "not late-allowed under the reverse name's 8443 rule")
+	assert.Equal(t, "builder.example", ev.DstHostname)
+	assert.Equal(t, "builder.example", cm.LookupHostnameByIP(builderIP))
+	assert.NotContains(t, portsOpened(fw), uint16(8443), "nothing opened under the reverse name's rule")
+}
+
+// portsOpened lists the ports the firewall was asked to allow.
+func portsOpened(fw *mockFirewallUpdater) []uint16 {
+	var ports []uint16
+	for _, call := range fw.addedIPs {
+		if call.action == config.ActionAllow {
+			for _, p := range call.ports {
+				ports = append(ports, p.Port)
+			}
+		}
+	}
+	return ports
 }
 
 func TestReverseDNSTracker_SettledIsFinal(t *testing.T) {

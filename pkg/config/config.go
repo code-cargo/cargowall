@@ -980,10 +980,14 @@ func (cm *Manager) LookupHostnameByIP(ip string) string {
 // hostname is stored canonical-lowercase so reverse lookups, FindTrackedHostname
 // matches, and hostnameCache keys all share the same case-insensitive contract.
 func (cm *Manager) UpdateDNSMapping(hostname string, ip string) {
-	hostname = strings.ToLower(hostname)
-
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+	cm.updateDNSMappingLocked(hostname, ip)
+}
+
+// updateDNSMappingLocked is UpdateDNSMapping, with mu held.
+func (cm *Manager) updateDNSMappingLocked(hostname string, ip string) {
+	hostname = strings.ToLower(hostname)
 
 	if ip != "" {
 		cm.ipToHostname[ip] = hostname

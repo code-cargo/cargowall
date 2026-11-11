@@ -52,6 +52,39 @@ func (o *TcBpfObjects) StepRules() bool {
 	return b != 0
 }
 
+// The rule maps' sizes. verdict.h declares the larger, for a policy with
+// steps, whose rules share each map with the job's. A policy without steps
+// loads them at RuleMapEntriesJobOnly, all they held before step policies,
+// so a job with no step rules pays nothing for them.
+const (
+	RuleMapEntries        uint32 = 16384
+	RuleMapEntriesJobOnly uint32 = 4096
+)
+
+// ruleMaps are the four rule maps, of the same names in every collection
+// that includes verdict.h.
+var ruleMaps = []string{TcBpfMapMapCidrs, TcBpfMapMapPorts, TcBpfMapMapCidrsV6, TcBpfMapMapPortsV6}
+
+// SizeRuleMaps sizes a tcbpf spec's rule maps, before it is loaded, for a
+// policy with steps or without. The size is read once, from the policy in
+// hand at the load: nothing loads a policy after it, and a path that did
+// would have to reload the maps to take steps a small load has no room
+// for. A collection sharing the maps takes the loaded maps' sizes.
+func SizeRuleMaps(spec *ebpf.CollectionSpec, steps bool) error {
+	n := RuleMapEntriesJobOnly
+	if steps {
+		n = RuleMapEntries
+	}
+	for _, name := range ruleMaps {
+		m := spec.Maps[name]
+		if m == nil {
+			return errors.New("spec has no " + name + " map (stale generated code)")
+		}
+		m.MaxEntries = n
+	}
+	return nil
+}
+
 // The bridge stamp, STEP_STAMP_* in verdict.h: a packet's mark carries a
 // step policy as StepStampMagic | policy, from a Docker bridge port's ingress
 // to the uplink's TC egress. A policy past StepStampPolicyMax fits no

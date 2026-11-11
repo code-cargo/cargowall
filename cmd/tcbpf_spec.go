@@ -35,13 +35,14 @@ import (
 // The rule maps are sized for the policy in hand (bpf.SizeRuleMaps): at the
 // job's size alone without step rules, as before step policies, and with
 // room for the steps' with them. The policy is read once, here, before the
-// load; nothing loads one after it.
-func loadTcSpec(stepAttribution bool, configMgr *config.Manager) (*ebpf.CollectionSpec, error) {
+// load; nothing loads one after it. So this settles the step rules: a run
+// that loaded no policy has none (config.Manager.SettleStepRules).
+func loadTcSpec(cmd *StartCmd, configMgr *config.Manager) (*ebpf.CollectionSpec, error) {
 	spec, err := bpf.LoadTcBpf()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load TC eBPF spec: %w", err)
 	}
-	if !stepAttribution {
+	if !cmd.StepAttribution {
 		// Present unless the generated spec is stale (go generate not run);
 		// verify-bpf-generated-code guards that, but don't panic if it slips.
 		for _, name := range []string{"map_task_step", "map_sock_step", "map_task_nspid"} {
@@ -50,6 +51,7 @@ func loadTcSpec(stepAttribution bool, configMgr *config.Manager) (*ebpf.Collecti
 			}
 		}
 	}
+	configMgr.SettleStepRules()
 	if err := bpf.SizeRuleMaps(spec, configMgr.HasStepRules()); err != nil {
 		return nil, fmt.Errorf("failed to size the rule maps: %w", err)
 	}

@@ -343,6 +343,16 @@ func TestStepRulesKnown(t *testing.T) {
 	known, has = cm.StepRulesKnown()
 	assert.True(t, known)
 	assert.True(t, has)
+	cm.SettleStepRules()
+	_, has = cm.StepRulesKnown()
+	assert.True(t, has, "settling keeps a loaded policy's steps")
+
+	// A run that loads no policy settles to none.
+	none := NewConfigManager()
+	none.SettleStepRules()
+	known, has = none.StepRulesKnown()
+	assert.True(t, known)
+	assert.False(t, has)
 }
 
 // GetStepRules hands out copies.

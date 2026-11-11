@@ -663,11 +663,12 @@ func TestReconcileRefusedQueries_NamesTheStepRule(t *testing.T) {
 	assert.Contains(t, logs.String(), "allowed_by_step=fetch")
 }
 
-// The via store is kept only while a backfill may read it: until a policy
-// loads, and then only if the policy has step rules, and only until the
-// startup backfill. A job without them carries no via state once its policy
-// is in, and the store's memory goes with it. Kept, it neither expires nor
-// evicts: a missing record would read as no chain at all.
+// The via store is kept only while a backfill may read it: until the step
+// rules are final (a load, or startup settling them with none loaded), and
+// then only if there are any, and only until the startup backfill. A job
+// without them carries no via state once startup is done loading, and the
+// store's memory goes with it. Kept, it neither expires nor evicts: a
+// missing record would read as no chain at all.
 func TestStepVia_KeptOnlyForSteps(t *testing.T) {
 	chained := func(s *Server, name, ip string) {
 		answer(s, name, makeCNAMEResponse(dns.Fqdn(name), []string{"edge." + name}, ip))
@@ -683,6 +684,15 @@ func TestStepVia_KeptOnlyForSteps(t *testing.T) {
 		defer s.steps.via.mu.Unlock()
 		return s.steps.via.dropped && s.steps.via.hops == nil
 	}
+
+	// A run that loads no policy: its step rules settle to none when startup
+	// is done loading, and the store goes with the next answer.
+	none := config.NewConfigManager()
+	s0 := newStepTestServer(t, none, newRecordingFirewall())
+	chained(s0, "early.example.com", "10.1.0.39")
+	none.SettleStepRules()
+	chained(s0, "after.example.com", "10.1.0.38")
+	assert.True(t, dropped(s0), "settled to no step rules")
 
 	cfg := config.NewConfigManager()
 	s := newStepTestServer(t, cfg, newRecordingFirewall())

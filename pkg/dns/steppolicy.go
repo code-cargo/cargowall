@@ -86,8 +86,10 @@ type stepTier struct {
 //
 // It is kept only while a backfill may still read it, and dropped for good,
 // its memory with it, at whichever comes first:
-//   - a policy without step rules: it is final (nothing loads one after
-//     startup), so no backfill will find a step to install for;
+//   - step rules final and none: a policy without them, or startup settling
+//     a run that loaded none (config.Manager.SettleStepRules). Nothing loads
+//     a policy after startup, so no backfill will find a step to install
+//     for;
 //   - the end of the first backfill with the firewall set (seal): every
 //     answer since installs at answer time, checked against its own
 //     chain. A later backfill finds the store dropped and installs nothing
@@ -420,9 +422,9 @@ func (s *Server) backfillStepTier(name string, verdict config.HostnameVerdict, i
 		return
 	}
 	if !kept {
-		// Past the startup backfill, or steps after a policy without
-		// them: the hops of answers since were never kept to check, so
-		// nothing is backfilled.
+		// Past the startup backfill, or steps after step rules settled
+		// without any: the hops of answers since were never kept to
+		// check, so nothing is backfilled.
 		return
 	}
 	name = strings.ToLower(name)

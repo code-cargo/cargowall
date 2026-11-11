@@ -904,7 +904,12 @@ to select policy with.
     backfill drops it once it is done, since every answer after it is
     installed at answer time against its own chain, and a backfill that
     finds it dropped installs nothing for steps (a missing record would
-    read as a chain with no hop the job denies).
+    read as a chain with no hop the job denies). The cost is an answer that
+    raced the startup load and that neither installed: it waits for its
+    name's next answer, which fails closed. A run without step rules drops
+    the record sooner, once they are final: at its policy's load, or, for a
+    run that loaded none (a failed fetch, a hook's nil policy, a failed
+    file load), when the tcbpf load settles them to none.
   - *Capacity.* The rule maps are sized at load from the policy in hand
     (`bpf.SizeRuleMaps`), read once: no path loads a policy after the tcbpf
     load, and one that did would have to reload the maps itself. Without

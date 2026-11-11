@@ -30,8 +30,9 @@ import (
 
 // The tcbpf spec as startCargoWall loads it: the rule maps at the job's
 // size for a policy without step rules (and for one whose steps a default
-// allow drops), at the size with steps for one with them; the
-// step-attribution maps shrunk when the feature is off.
+// allow drops, and for a run that loaded none), at the size with steps for
+// one with them; the step-attribution maps shrunk when the feature is off.
+// The step rules are settled after it, loaded or not.
 func TestLoadTcSpec(t *testing.T) {
 	ruleMaps := []string{bpf.TcBpfMapMapCidrs, bpf.TcBpfMapMapPorts, bpf.TcBpfMapMapCidrsV6, bpf.TcBpfMapMapPortsV6}
 	tagMaps := []string{"map_task_step", "map_sock_step", "map_task_nspid"}
@@ -49,15 +50,20 @@ func TestLoadTcSpec(t *testing.T) {
 		{"steps", `{"defaultAction": "deny", "rules": [], ` + steps + `}`, true, bpf.RuleMapEntries},
 		{"steps a default allow drops", `{"defaultAction": "allow", "rules": [], ` + steps + `}`, true, bpf.RuleMapEntriesJobOnly},
 		{"steps, step attribution off", `{"defaultAction": "deny", "rules": [], ` + steps + `}`, false, bpf.RuleMapEntries},
+		{"no policy loaded", "", false, bpf.RuleMapEntriesJobOnly},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "policy.json")
-			require.NoError(t, os.WriteFile(path, []byte(c.policy), 0o600))
 			cm := config.NewConfigManager()
-			require.NoError(t, cm.LoadConfig(path))
+			if c.policy != "" {
+				path := filepath.Join(t.TempDir(), "policy.json")
+				require.NoError(t, os.WriteFile(path, []byte(c.policy), 0o600))
+				require.NoError(t, cm.LoadConfig(path))
+			}
 
-			spec, err := loadTcSpec(c.stepAttribution, cm)
+			spec, err := loadTcSpec(&StartCmd{StepAttribution: c.stepAttribution}, cm)
 			require.NoError(t, err)
+			known, _ := cm.StepRulesKnown()
+			assert.True(t, known, "the step rules are settled")
 			for _, name := range ruleMaps {
 				assert.Equal(t, c.ruleSize, spec.Maps[name].MaxEntries, name)
 			}

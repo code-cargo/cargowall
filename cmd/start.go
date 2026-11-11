@@ -478,7 +478,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	logger.Info("Using network interface", "interface", ifname)
 
 	// Load TC eBPF objects
-	spec, err := loadTcSpec(cmd.StepAttribution, configMgr)
+	spec, err := loadTcSpec(cmd, configMgr)
 	if err != nil {
 		return err
 	}

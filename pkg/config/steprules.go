@@ -275,13 +275,26 @@ func (cm *Manager) HasStepRules() bool {
 	return len(cm.steps) > 0
 }
 
-// StepRulesKnown reports whether a policy has loaded, which makes the run's
-// step rules final (nothing loads a policy after startup), and whether it
-// has any.
+// StepRulesKnown reports whether the run's step rules are final, and
+// whether there are any. A load makes them final (nothing loads a policy
+// after startup), and so does SettleStepRules.
 func (cm *Manager) StepRulesKnown() (known, has bool) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 	return cm.steps != nil, len(cm.steps) > 0
+}
+
+// SettleStepRules makes the step rules final once startup is done loading:
+// a run that loaded no policy (a failed fetch under lockdown, a hook's nil
+// policy, a failed file load) has none, so state kept for steps until the
+// load (the DNS proxy's via store) is dropped there too. A loaded policy's
+// are kept.
+func (cm *Manager) SettleStepRules() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.steps == nil {
+		cm.steps = []stepPolicy{}
+	}
 }
 
 // StepPolicy returns the policy the loaded steps give step id, if a step

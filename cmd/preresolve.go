@@ -119,13 +119,16 @@ func newProxyResolver() *net.Resolver {
 // run side by side, both from the stub; the cache entries are applied to the
 // firewall; then the tracked names are resolved through the proxy (phase 2).
 //
-// Phase 1's answers are recorded only once both stub rounds are done. An
-// address both rounds name gets the name the last write gives it, and the
-// cached forward answer, the policy's own name, must be that last word: a
-// PTR name in its place matches no rule, so gateExistingConnections would
-// allow an existing connection to a host the job denies on its observed
-// ports. A cache hit answers at once while a PTR goes upstream, so recording
-// as the answers arrive would let the PTR win.
+// An address both stub rounds name must keep the cached forward answer, the
+// policy's own name: a PTR name in its place matches no rule, so
+// gateExistingConnections would allow an existing connection to a host the
+// job denies on its observed ports. Two things hold that, each enough on its
+// own: the reverse round records a name only for an address with none yet
+// (RecordReverseName), and phase 1's answers, which overwrite, are recorded
+// only once both stub rounds are done, so they are the last write. Without
+// both, the PTR would win, since a cache hit answers at once while a PTR
+// goes upstream.
+//
 // A slow upstream can spend the whole deadline in phase 1, leaving phase 2
 // nothing: that costs only phase 2's head start, never enforcement. Derives
 // from ctx, so a startup-window shutdown signal drains it promptly.

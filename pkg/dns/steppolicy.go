@@ -84,11 +84,15 @@ type stepTier struct {
 // for one (a clean record reads as no record), so a stale one costs at most
 // an install the next answer for the name makes live.
 //
-// Chained answers are recorded until a policy loads, since its rules can
-// come after the answer, and after that only if the policy has step rules.
-// A policy without them is final (nothing loads one after startup), so no
-// backfill will read the hops: the store is dropped then, and its memory
-// with it.
+// It is kept only while a backfill may still read it, and dropped for good,
+// its memory with it, at whichever comes first:
+//   - a policy without step rules: it is final (nothing loads one after
+//     startup), so no backfill will find a step to install for;
+//   - the end of the first backfill with the firewall set (seal): every
+//     answer since installs at answer time, checked against its own
+//     chain. A later backfill finds the store dropped and installs nothing
+//     for steps, so an answer that raced the startup load, and that
+//     neither installed, waits for its name's next answer (fail-closed).
 type viaStore struct {
 	mu      sync.Mutex
 	hops    map[string]stepVia // nil once dropped
@@ -105,6 +109,16 @@ func (v *viaStore) dropLocked(known, has bool) bool {
 		v.dropped, v.hops = true, nil
 	}
 	return v.dropped
+}
+
+// seal drops the store at the end of the startup backfill (viaStore).
+func (v *viaStore) seal() {
+	if v == nil {
+		return
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.dropped, v.hops = true, nil
 }
 
 func newStepTier() stepTier {
@@ -406,9 +420,9 @@ func (s *Server) backfillStepTier(name string, verdict config.HostnameVerdict, i
 		return
 	}
 	if !kept {
-		// Steps after a policy without them: the hops of the answers
-		// before were never kept to check, so nothing is backfilled. A
-		// policy can't follow the startup load, so this is the guard.
+		// Past the startup backfill, or steps after a policy without
+		// them: the hops of answers since were never kept to check, so
+		// nothing is backfilled.
 		return
 	}
 	name = strings.ToLower(name)

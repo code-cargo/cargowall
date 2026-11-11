@@ -209,7 +209,12 @@ type carve struct {
 //  3. each landed carve's allows, for what the written prefixes around it
 //     still allow there (a wildcard's allow reaches through a deny entry's
 //     misses on its own); a landed carve no written prefix needs is removed
-//     again.
+//     again, unless a written prefix sits at its own prefix, whose entries
+//     those are too.
+//
+// Carves and prefixes are written all or none (writeStepEntriesLocked): a
+// refused one is taken out again, and one whose removal a failed delete
+// leaves unconfirmed keeps the carves inside it, as a written one does.
 //
 // A carve where the job denies every port is a deny entry on all ports; so,
 // in effect, is one inside a prefix on all ports, which keeps nothing inside
@@ -234,21 +239,26 @@ func (f *FirewallImpl) writeStepCIDRsLocked(sr config.StepRules) {
 		}
 		c := carve{jd: jd}
 		c.denied, c.whole = f.jobDeniedWithinLocked(jd.net)
-		label := jd.net.String()
-		err := f.stepWriteErrLocked(sr.Policy, label, f.addCIDRPortsLocked(sr.Policy, jd.net, 0, c.denied))
-		f.warnStepRuleLocked(sr, label, err)
-		c.landed = err == nil
+		c.landed, _ = f.writeStepEntriesLocked(sr, jd.net.String(), jd.net, entryWrite{0, c.denied})
 		carves = append(carves, c)
 	}
 
-	var written []stepPrefix
+	var written, unconfirmed []stepPrefix
 	for _, p := range planned {
 		if i := slices.IndexFunc(carves, func(c carve) bool { return !c.landed && strictlyWithin(c.jd.net, p.net) }); i >= 0 {
 			f.noteGatedLocked(sr.Policy, p.net, carves[i].jd, "withheld")
 			continue
 		}
-		if f.writeStepPrefixLocked(sr, p) {
+		// Denies first, as AddPolicyIP writes them.
+		writes := []entryWrite{{1, p.allow}}
+		if len(p.deny) > 0 {
+			writes = []entryWrite{{0, p.deny}, {1, p.allow}}
+		}
+		switch ok, removed := f.writeStepEntriesLocked(sr, p.label, p.net, writes...); {
+		case ok:
 			written = append(written, p)
+		case !removed:
+			unconfirmed = append(unconfirmed, p)
 		}
 	}
 
@@ -257,7 +267,9 @@ func (f *FirewallImpl) writeStepCIDRsLocked(sr config.StepRules) {
 			continue
 		}
 		label := c.jd.net.String()
-		needed, keep := false, []portProto(nil)
+		// A prefix a failed delete may have left partly live needs its carves.
+		needed := slices.ContainsFunc(unconfirmed, func(p stepPrefix) bool { return strictlyWithin(c.jd.net, p.net) })
+		var keep []portProto
 		for _, w := range written {
 			if !strictlyWithin(c.jd.net, w.net) {
 				continue
@@ -272,8 +284,9 @@ func (f *FirewallImpl) writeStepCIDRsLocked(sr config.StepRules) {
 				}
 			}
 		}
+		atOwn := slices.ContainsFunc(written, func(w stepPrefix) bool { return within(w.net, c.jd.net) && within(c.jd.net, w.net) })
 		switch {
-		case !needed:
+		case !needed && !atOwn:
 			f.removeCarveLocked(sr.Policy, c)
 		case !c.whole && len(keep) > 0:
 			f.warnStepRuleLocked(sr, label, f.stepWriteErrLocked(sr.Policy, label, f.addCIDRPortsLocked(sr.Policy, c.jd.net, 1, keep)))
@@ -281,18 +294,55 @@ func (f *FirewallImpl) writeStepCIDRsLocked(sr config.StepRules) {
 	}
 }
 
-// writeStepPrefixLocked writes one gated step prefix, its denies first, as
-// AddPolicyIP writes them, and reports whether it all landed.
-func (f *FirewallImpl) writeStepPrefixLocked(sr config.StepRules, p stepPrefix) bool {
+// entryWrite is one write of a prefix's entries: an action on ports (nil:
+// all).
+type entryWrite struct {
+	action uint8
+	ports  []portProto
+}
+
+// writeStepEntriesLocked makes a step's writes to prefix n, in order, all or
+// none: once one fails, every entry they added comes out again, uncharged.
+// What lands of a write the map refuses part-way can be live without the
+// rest: a wildcard's port entries are read as each lands, and a prefix's
+// allows under the LPM entry its denies wrote. Left in, they would reach
+// inside a job deny whose carve is then removed as unneeded. It reports
+// whether all landed and, if not, whether every delete was confirmed.
+func (f *FirewallImpl) writeStepEntriesLocked(sr config.StepRules, label string, n *net.IPNet, writes ...entryWrite) (ok, removed bool) {
+	var allows, lpms, denies []any // the keys added, which no step write held before
 	var err error
-	if len(p.deny) > 0 {
-		err = f.stepWriteErrLocked(sr.Policy, p.label, f.addCIDRPortsLocked(sr.Policy, p.net, 0, p.deny))
+	for _, w := range writes {
+		err = f.addCIDRPortsLocked(sr.Policy, n, w.action, w.ports)
+		for _, k := range f.steps.fresh {
+			switch {
+			case k.m == ruleMapCIDRs || k.m == ruleMapCIDRsV6:
+				lpms = append(lpms, k.key)
+			case w.action == 1:
+				allows = append(allows, k.key)
+			default:
+				denies = append(denies, k.key)
+			}
+		}
+		if err = f.stepWriteErrLocked(sr.Policy, label, err); err != nil {
+			break
+		}
 	}
+	f.warnStepRuleLocked(sr, label, err)
 	if err == nil {
-		err = f.stepWriteErrLocked(sr.Policy, p.label, f.addCIDRPortsLocked(sr.Policy, p.net, 1, p.allow))
+		return true, true
 	}
-	f.warnStepRuleLocked(sr, p.label, err)
-	return err == nil
+	gone := func(keys []any) bool {
+		all := true
+		for _, k := range keys {
+			all = f.deleteStepKeyLocked(k) && all
+		}
+		return all
+	}
+	// The denies go last, and only once the LPM entries are gone: a port
+	// entry without its LPM entry is never read, but an LPM entry without
+	// its denies lets a miss fall through to a step wildcard.
+	allowsGone := gone(allows)
+	return false, gone(lpms) && gone(denies) && allowsGone
 }
 
 // removeCarveLocked takes out a carve no written prefix needs, and uncharges
@@ -378,18 +428,19 @@ func (f *FirewallImpl) clearStepsLocked() {
 }
 
 // deleteStepKeyLocked deletes a step key from its map and, once it is gone,
-// from the ledger.
-func (f *FirewallImpl) deleteStepKeyLocked(key any) {
+// from the ledger, and reports whether it is gone.
+func (f *FirewallImpl) deleteStepKeyLocked(key any) bool {
 	m, ok := ledgerMap(key)
 	if !ok {
-		return
+		return false
 	}
 	if err := f.deleteKeyLocked(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		f.logger.Warn("Failed to clear a step rule entry; it stays charged, and the next sync retries it",
 			"map", m.String(), "error", err)
-		return
+		return false
 	}
 	delete(f.steps.keys[m], key)
+	return true
 }
 
 // ledgerMap names the rule map a key belongs to, by its type.

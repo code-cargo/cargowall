@@ -52,9 +52,9 @@ const (
 // ErrStepBudget refuses a step write the rule maps have no room for: the
 // steps' share of a map is full, or the job's own entries have taken it.
 // The step's traffic there gets the job's rules alone: fail-closed. Nothing
-// of a refused write is installed, except for one the kernel refused
-// part-way (its port entries in, its LPM entry not), whose remains no
-// lookup reads.
+// of a step CIDR rule's refused write stays installed (the sync takes out
+// what landed); a DNS install the kernel refused part-way keeps what landed,
+// its denies first, so less than it asked for.
 var ErrStepBudget = errors.New("no room for step entries in a rule map")
 
 // Why a step write found no room, for the refusal Warn.

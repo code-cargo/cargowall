@@ -856,7 +856,10 @@ to select policy with.
   policy, as deny entries that a miss can't fall through to a step
   wildcard past. The carves are written before the prefix, which is
   withheld if one is refused, so a refused carve costs the step the
-  prefix, never the job its deny. Host routes and whole-space wildcard
+  prefix, never the job its deny. Each carve and prefix is written all or
+  none: what landed of one the map refused part-way is taken out again,
+  and a prefix whose removal a failed delete leaves unconfirmed keeps its
+  carves, as a written one does. Host routes and whole-space wildcard
   port denies can't be hidden, and aren't gated. An explicit `0.0.0.0/0`
   or `::/0` job deny on all ports, often written beside a deny default
   where it adds nothing for the job, therefore withholds every step
@@ -895,7 +898,13 @@ to select policy with.
     that reloads step rules at runtime must clear the step policies'
     entries, the DNS path's included, before installing: policies are
     numbered per load, so a kept entry would be another step's. The sync
-    does that (above); today it runs once, at startup.
+    does that (above); today it runs once, at startup. And anything that
+    backfills at runtime must keep the backfill's record of the CNAME hops
+    each answered address came through open until it has run: the startup
+    backfill drops it once it is done, since every answer after it is
+    installed at answer time against its own chain, and a backfill that
+    finds it dropped installs nothing for steps (a missing record would
+    read as a chain with no hop the job denies).
   - *Capacity.* The rule maps are sized at load from the policy in hand
     (`bpf.SizeRuleMaps`), read once: no path loads a policy after the tcbpf
     load, and one that did would have to reload the maps itself. Without

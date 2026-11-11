@@ -387,6 +387,7 @@ func (s *Server) ApplyRulesToTrackedHostnames() {
 			}
 		}
 	}
+	s.steps.via.seal()
 }
 
 // Start begins listening for DNS queries

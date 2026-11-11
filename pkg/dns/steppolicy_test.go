@@ -311,6 +311,7 @@ func TestStepWriters(t *testing.T) {
 				s.firewall = nil
 				answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge5.akamai.example"}, "10.1.0.10"))
 				answer(s, "edge5.akamai.example", aResponse("edge5.akamai.example", "10.1.0.11"))
+				s.ApplyRulesToTrackedHostnames() // no firewall: nothing to apply, nothing sealed
 				s.SetFirewall(fw)
 				s.ApplyRulesToTrackedHostnames()
 			},
@@ -663,10 +664,10 @@ func TestReconcileRefusedQueries_NamesTheStepRule(t *testing.T) {
 }
 
 // The via store is kept only while a backfill may read it: until a policy
-// loads, and then only if the policy has step rules. A job without them
-// carries no via state once its policy is in, and the store's memory goes
-// with it. Kept, it neither expires nor evicts: a missing record would read
-// as no chain at all.
+// loads, and then only if the policy has step rules, and only until the
+// startup backfill. A job without them carries no via state once its policy
+// is in, and the store's memory goes with it. Kept, it neither expires nor
+// evicts: a missing record would read as no chain at all.
 func TestStepVia_KeptOnlyForSteps(t *testing.T) {
 	chained := func(s *Server, name, ip string) {
 		answer(s, name, makeCNAMEResponse(dns.Fqdn(name), []string{"edge." + name}, ip))
@@ -707,7 +708,29 @@ func TestStepVia_KeptOnlyForSteps(t *testing.T) {
 	assert.Len(t, s2.steps.via.hops, 12000, "none evicted")
 	s2.steps.via.mu.Unlock()
 	s2.ApplyRulesToTrackedHostnames()
-	assert.False(t, dropped(s2), "the backfill keeps it")
+	assert.True(t, dropped(s2), "the startup backfill seals it")
+	chained(s2, "late.example.com", "10.1.0.41")
+	assert.False(t, held(s2, "late.example.com"), "nothing is recorded after it")
+}
+
+// The startup backfill is the last that reads via: every answer after it is
+// installed at answer time, checked against its own chain. So the backfill
+// seals the store, and a backfill after it installs nothing for steps, even
+// an address the proxy answered since, whose hops were never recorded.
+func TestStepVia_SealedByTheStartupBackfill(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	answer(s, "deploy.example.com", makeCNAMEResponse("deploy.example.com.", []string{"edge8.akamai.example"}, "10.1.0.44"))
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames()
+	assert.Equal(t, map[string][]config.Port{"10.1.0.44": tcp80}, fw.stepIPs(policyDeploy), "backfilled")
+	_, kept := s.viaFor("deploy.example.com")
+	require.False(t, kept, "sealed")
+
+	answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge.denied.example.com"}, "10.1.0.45"))
+	s.ApplyRulesToTrackedHostnames()
+	assert.Empty(t, fw.stepIPs(policyFetch), "past a hop the job denies")
 }
 
 // Steps that turn up after a policy without them (no path loads one, so

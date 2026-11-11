@@ -30,6 +30,7 @@ import (
 
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/steps"
 )
 
 const specSteps = `"steps": [{"id": "fetch", "rules": [{"type": "hostname", "value": "step.example.com"}]}]`
@@ -45,7 +46,8 @@ func loadPolicyFile(t *testing.T, cm *config.Manager, policy string) {
 // The tcbpf spec as startCargoWall loads it: the rule maps at the job's
 // size for a policy without step rules (and for one whose steps a default
 // allow drops, and for a run that loaded none), at the size with steps for
-// one with them; the step-attribution maps shrunk when the feature is off.
+// one with them, unless step attribution is off, which drops them; the
+// step-attribution maps shrunk when the feature is off.
 // The step rules are settled after it, loaded or not.
 func TestLoadTcSpec(t *testing.T) {
 	ruleMaps := []string{bpf.TcBpfMapMapCidrs, bpf.TcBpfMapMapPorts, bpf.TcBpfMapMapCidrsV6, bpf.TcBpfMapMapPortsV6}
@@ -63,7 +65,7 @@ func TestLoadTcSpec(t *testing.T) {
 		{"no steps", `{"defaultAction": "deny", "rules": []}`, true, bpf.RuleMapEntriesJobOnly},
 		{"steps", `{"defaultAction": "deny", "rules": [], ` + steps + `}`, true, bpf.RuleMapEntries},
 		{"steps a default allow drops", `{"defaultAction": "allow", "rules": [], ` + steps + `}`, true, bpf.RuleMapEntriesJobOnly},
-		{"steps, step attribution off", `{"defaultAction": "deny", "rules": [], ` + steps + `}`, false, bpf.RuleMapEntries},
+		{"steps, step attribution off: dropped", `{"defaultAction": "deny", "rules": [], ` + steps + `}`, false, bpf.RuleMapEntriesJobOnly},
 		{"no policy loaded", "", false, bpf.RuleMapEntriesJobOnly},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -153,9 +155,11 @@ func TestLoadTcObjects_StepRulesGate(t *testing.T) {
 				loadPolicyFile(t, cm, c.policy)
 			}
 			var gates []uint8
-			loadCollection = func(_ *slog.Logger, collection string, spec *ebpf.CollectionSpec, _ ebpf.CollectionOptions, _ any) error {
+			var tentative []bool
+			loadCollection = func(_ *slog.Logger, collection string, spec *ebpf.CollectionSpec, _ ebpf.CollectionOptions, _ any, tent bool) error {
 				require.Equal(t, "tcbpf", collection)
 				gates = append(gates, gateOf(spec))
+				tentative = append(tentative, tent)
 				if c.load != nil {
 					return c.load(len(gates)-1, cm)
 				}
@@ -172,8 +176,53 @@ func TestLoadTcObjects_StepRulesGate(t *testing.T) {
 				require.NoError(t, err)
 			}
 			assert.Equal(t, c.gates, gates)
+			for i, g := range gates {
+				assert.Equal(t, g == 1, tentative[i], "only a gate-on attempt is retried, so only its rejection is tentative")
+			}
+			if c.warned {
+				assert.Contains(t, cm.StepRulesLost(), "too complex", "the rejection kept as the reason")
+				assert.False(t, cm.HasStepRules(), "the steps' rules dropped")
+			}
 			assert.Equal(t, c.warned, bytes.Contains(logs.Bytes(), []byte("Step rules are off")))
 			assert.Equal(t, c.noAttribution, bytes.Contains(logs.Bytes(), []byte("Step rules stay off")))
+		})
+	}
+}
+
+// fakeHook is a cgroup hook's step-rules gate.
+type fakeHook struct {
+	on   bool
+	lost string
+}
+
+func (h fakeHook) StepRules() bool { return h.on }
+
+func (h fakeHook) StepRulesLost() string { return h.lost }
+
+// The step tier stays only while something can judge a step by its rules:
+// the step tracker started, and the cgroup hook, if there is one, loaded
+// the step lookup. Otherwise the policy's step rules are dropped, with the
+// reason kept, and the DNS path installs and scopes nothing for a step.
+func TestSettleStepTier(t *testing.T) {
+	withSteps := `{"defaultAction": "deny", "rules": [], ` + specSteps + `}`
+	for _, c := range []struct {
+		name    string
+		tracker *steps.Tracker
+		stepErr error
+		hook    stepRulesHook
+		lost    string
+	}{
+		{"all up", &steps.Tracker{}, nil, fakeHook{on: true}, ""},
+		{"no hook", &steps.Tracker{}, nil, nil, ""},
+		{"the tracker failed", nil, errors.New("no BTF"), fakeHook{on: true}, "step attribution did not start: no BTF"},
+		{"the hook lost the step lookup", &steps.Tracker{}, nil, fakeHook{lost: "verifier rejected cw_cg_egress"}, "originbpf verifier rejected cw_cg_egress"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cm := config.NewConfigManager()
+			loadPolicyFile(t, cm, withSteps)
+			settleStepTier(cm, c.tracker, c.stepErr, c.hook, slog.New(slog.DiscardHandler))
+			assert.Equal(t, c.lost, cm.StepRulesLost())
+			assert.Equal(t, c.lost == "", cm.HasStepRules())
 		})
 	}
 }

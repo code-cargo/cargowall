@@ -876,9 +876,13 @@ to select policy with.
   delivers a policy after the load, and a reload path that ever did would
   have to reload the collections to change it. A kernel whose verifier
   rejects the gate-on load of either collection loads it again with the
-  gate off, with a Warn: the steps lose their own rules there, which
-  fails closed, never the hook. The data plane and the policy's `steps`
-  fill it (below); nothing binds a step yet.
+  gate off: the steps lose their own rules, which fails closed, never the
+  hook. Then, as when step attribution is off or the step tracker doesn't
+  start, the policy's step rules are dropped with a Warn naming why
+  (`config.Manager.StepRulesLost`): nothing judges a step by them, so
+  nothing installs or scopes for one, which would only narrow the job's
+  flows, and no query passes the filter on a step's rules alone. The data plane and the policy's `steps` fill it
+  (below); nothing binds a step yet.
   - *Where a step's rules come from.* The policy's `steps`, one
     `{id, rules}` per step, in the local `--config` (env-var config carries
     none, and a load replaces them wholesale, as it does the rules). The id
@@ -906,9 +910,16 @@ to select policy with.
     install scopes its address for the name once the firewall admits the
     install and before any of it is written, as the job's does; an install
     whose scope can't be written (the scope map full, say) is withheld,
-    never open unscoped, and one the budget refuses scopes nothing. The
-    tracked-hostname replay scopes the step installs again, first, after its
-    scope flush. A step install's scope holds for every flow to the
+    never open unscoped, and one the budget refuses scopes nothing. Step
+    scopes take room only in the steps' share of each scope map, its size
+    less the job's 4096, so the job's own destinations always find room
+    there. The tracked-hostname replay scopes the step installs again,
+    first, after its scope flush, under the latest name bound to each
+    address; an address no name can be bound to again is withdrawn, its
+    step entries taken out. One exception is the job's own (SCOPE IFF
+    BOUND): an address no forward resolution bound to its name, a local
+    alias's or one whose evidence the binding store evicted, is installed
+    unscoped and stays L4-governed. A step install's scope holds for every flow to the
     address, not the step's alone: a job flow there, through a job CIDR
     allow say, must present a name the job's tiers allow, as at an address
     a job hostname resolves to, and until steps are bound that narrowing is
@@ -930,9 +941,10 @@ to select policy with.
     judges by the job's rules alone. And anything
     that reloads step rules at runtime must clear the step policies'
     entries, the DNS path's included, before installing: policies are
-    numbered per load, so a kept entry would be another step's. The sync
-    does that (above); today it runs once, at startup, over an empty step
-    tier. A runtime reload that cannot clear every step entry must treat
+    numbered per load, so a kept entry would be another step's, and must
+    prune the step tier's scope record to what the new rules allow. The
+    sync does that (above); today it runs once, at startup, over an empty
+    step tier. A runtime reload that cannot clear every step entry must treat
     the step tier as failed (write no step entries, Warn), or plan the
     survivors' prefixes as unconfirmed so their carves are kept: the
     rebuild plans as if the maps held no step entries, so a survivor is

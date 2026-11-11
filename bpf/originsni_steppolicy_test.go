@@ -32,12 +32,13 @@ func TestOriginL7PuntCarriesStepPolicy(t *testing.T) {
 	for _, c := range []struct {
 		name       string
 		stepRules  bool
-		bound      bool
+		bound      uint32 // the tag's binding, 0 for none
 		wantPolicy uint16
 	}{
-		{"step rules on, the tag bound", true, true, 3},
-		{"step rules on, the tag unbound", true, false, 0},
-		{"step rules off", false, true, 0},
+		{"step rules on, the tag bound", true, 3, 3},
+		{"step rules on, the tag unbound", true, 0, 0},
+		{"step rules off", false, 3, 0},
+		{"a binding past 16 bits reads as the job's", true, 0x10003, 0},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			requireBPF(t)
@@ -51,8 +52,8 @@ func TestOriginL7PuntCarriesStepPolicy(t *testing.T) {
 
 			conn, cookie, _ := h.dial(t)
 			require.NoError(t, objs.MapSockStep.Put(cookie, uint32(9)))
-			if c.bound {
-				require.NoError(t, objs.MapStepPolicy.Put(uint32(9), uint32(3)))
+			if c.bound != 0 {
+				require.NoError(t, objs.MapStepPolicy.Put(uint32(9), c.bound))
 			}
 			_, err = conn.Write(snitest.BuildClientHello("step.example.com"))
 			require.NoError(t, err)

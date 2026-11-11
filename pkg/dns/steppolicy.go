@@ -129,7 +129,7 @@ func newStepTier() stepTier {
 		cname:    newLRUCache[string, stepDerived](10000),
 		withheld: newLRUCache[string, struct{}](1000),
 		via:      &viaStore{hops: make(map[string]stepVia)},
-		l7:       &stepL7{},
+		l7:       newStepL7(),
 	}
 }
 
@@ -395,13 +395,17 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 		for _, ip := range ips {
 			// Scoped once the firewall admits the install and before it
 			// writes any of it (stepl7.go).
-			admitted := false
+			admitted, scoped := false, false
 			changed, err := s.firewall.AddPolicyIP(a.policy, ip, a.ports, func() error {
 				admitted = true
-				return s.scopeStepInstall(name, ip, a.ports)
+				var err error
+				scoped, err = s.scopeStepInstall(name, ip, a.ports)
+				return err
 			})
 			if err == nil && admitted {
-				s.recordStepScope(name, ip, a.ports)
+				if scoped {
+					s.recordStepScope(a.policy, name, ip, a.ports)
+				}
 				s.reconcileStepBlocks(a, name, ip)
 			}
 			switch {

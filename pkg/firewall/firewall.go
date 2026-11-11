@@ -66,6 +66,12 @@ type Firewall interface {
 	// the write, refunded, and is returned. See policy.go.
 	AddPolicyIP(policy uint32, ip net.IP, ports []config.Port, scope func() error) (bool, error)
 
+	// RemovePolicyIP takes out every entry a step policy holds at ip's host
+	// route, its LPM entry first, uncharged, and its accumulator: the step
+	// gets the job's rules there. It fails, leaving the entries, when the
+	// LPM entry can't be deleted.
+	RemovePolicyIP(policy uint32, ip net.IP) error
+
 	// RemoveIP removes a single IP from the BPF maps
 	RemoveIP(ip net.IP) error
 }

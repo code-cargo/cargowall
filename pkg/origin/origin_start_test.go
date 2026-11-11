@@ -205,21 +205,25 @@ func TestStart_StepRulesFallBackOff(t *testing.T) {
 
 	attempts := 0
 	real := loadObjects
-	swap(t, &loadObjects, func(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any) error {
+	tentative := []bool{}
+	swap(t, &loadObjects, func(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any, tent bool) error {
 		attempts++
+		tentative = append(tentative, tent)
 		var gate uint8
 		require.NoError(t, spec.Variables[bpf.OriginBpfVarStepRulesEnabled].Get(&gate))
 		if gate != 0 {
 			return &ebpf.VerifierError{Cause: errors.New("too complex")}
 		}
-		return real(logger, collection, spec, opts, to)
+		return real(logger, collection, spec, opts, to, tent)
 	})
 	var log bytes.Buffer
 	o, err := Start(&tc, podenv.Scope{}, slog.New(slog.NewTextHandler(&log, nil)))
 	require.NoError(t, err, log.String())
 	t.Cleanup(o.Close)
 	assert.Equal(t, 2, attempts)
+	assert.Equal(t, []bool{true, false}, tentative, "the gate-on attempt's rejection is the retry's to report")
 	assert.False(t, o.StepRules())
 	assert.True(t, tc.StepRules(), "TC keeps its own")
-	assert.Contains(t, log.String(), "Step rules are off at the cgroup egress hook")
+	assert.Contains(t, o.StepRulesLost(), "too complex", "the rejection kept as the reason")
+	assert.Contains(t, log.String(), "loaded without the step lookup")
 }

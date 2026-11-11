@@ -20,9 +20,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
+	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
@@ -32,16 +34,26 @@ import (
 // before any of it is written, the address is scoped for the name, so a
 // flow to it must present a name its own policy allows there; an install
 // whose scope cannot be written is withheld, so no step install is ever
-// open unscoped. The oracle judges that name by the policy the kernel
-// stamped on the punt (config.L7Request.Policy): the job's rules and chains
-// first, then the step's (StepAllowPorts). A step bound to its policy
-// therefore reaches a shared edge address by the names its rules allow and
-// no others, which is what binding a step requires.
+// open unscoped. Step scopes take room only in the steps' share of the
+// scope maps, never the job's. The oracle judges that name by the policy
+// the kernel stamped on the punt (config.L7Request.Policy): the job's rules
+// and chains first, then the step's (StepAllowPorts). A step bound to its
+// policy therefore reaches a shared edge address by the names its rules
+// allow and no others, which is what binding a step requires.
+//
+// One exception, the job's too (SCOPE IFF BOUND): an address no forward
+// resolution bound to its name, a local alias's or one whose evidence the
+// binding store has evicted, is installed unscoped and stays L4-governed.
 
 // errStepScope withholds a step install whose address the L7 scope map
 // would not take: open unscoped, it would reach a shared edge address on
 // any name.
 var errStepScope = errors.New("step install withheld: its address could not be L7-scoped")
+
+// stepScopeShare is the room the steps' scopes may take in each family's
+// scope map: what the job's reservation in the rule maps leaves of it, so
+// the job's own destinations always find room there.
+const stepScopeShare = int(bpf.L7ScopeEntries - bpf.RuleMapEntriesJobOnly)
 
 // stepScopeWarnInterval rate-limits the withheld-install Warn: a full scope
 // map refuses every new step address, and DNS refreshes retry each one.
@@ -53,9 +65,14 @@ type stepL7 struct {
 	// scoped holds, by address, the L7 scope of every step install the
 	// firewall admitted and wrote, for the rewarm after a scope flush
 	// (rescopeStepTier). Kept only while L7 is on, one entry an address,
-	// so it is bounded by the addresses the steps' share of the trie
-	// admits: 12288 of each family.
+	// within the steps' share.
 	scoped map[string]stepScope
+	// charged holds, by family (0 for IPv4), every address whose scope a
+	// step wrote, so the steps' scopes stay within share: an address is
+	// charged when its scope is written, and the charges go with the
+	// scopes, at the flush.
+	charged [2]map[string]struct{}
+	share   int // stepScopeShare, or a test's
 	// bindings resolves a step ordinal to the policy it is bound to, for
 	// the per-step late-allow; nil until something binds steps.
 	bindings func(ordinal uint32) (policy uint32, ok bool)
@@ -65,11 +82,23 @@ type stepL7 struct {
 	warned   time.Time
 }
 
-// stepScope is one address's step scope: a name bound to it, which scoping
-// requires, and the ports every step installed it on.
+// stepScope is one address's step scope: the latest name bound to it, whose
+// evidence the install just refreshed, the ports every step installed it
+// on, and the policies that hold it.
 type stepScope struct {
-	name  string
-	ports []config.Port
+	name     string
+	ports    []config.Port
+	policies []uint32
+}
+
+func newStepL7() *stepL7 { return &stepL7{share: stepScopeShare} }
+
+// family is ip's index in charged.
+func family(ip net.IP) int {
+	if ip.To4() != nil {
+		return 0
+	}
+	return 1
 }
 
 // SetStepBindings installs the ordinal-to-policy lookup a step's late-allow
@@ -89,23 +118,57 @@ func (s *Server) SetStepBindings(bindings func(ordinal uint32) (policy uint32, o
 
 // scopeStepInstall scopes ip for name on ports, as applyVerdictSide does a
 // job install's: the firewall runs it once it admits a step install, and
-// before it writes any of it. An address no forward resolution bound to
-// name stays unscoped, L4-governed as the job's (SCOPE IFF BOUND). A scope
-// the registrar fails to write, the map full say, withholds the install
-// (errStepScope).
-func (s *Server) scopeStepInstall(name string, ip net.IP, ports []config.Port) error {
-	if err := scopeL7Identity(s.l7Registrar(), s.config, name, ip, ports, s.logger); err != nil {
-		return fmt.Errorf("%w: %w", errStepScope, err)
+// before it writes any of it. It reports whether it wrote a scope. An
+// address no forward resolution bound to name stays unscoped (SCOPE IFF
+// BOUND). An address the steps' share of the scope map has no room for, or
+// a scope the registrar fails to write, the map full say, withholds the
+// install (errStepScope).
+func (s *Server) scopeStepInstall(name string, ip net.IP, ports []config.Port) (bool, error) {
+	r, l := s.l7Registrar(), s.steps.l7
+	if r == nil || l == nil || !s.config.NameResolvedToIP(name, ip.String()) {
+		return false, nil
 	}
-	return nil
+	fresh, err := l.charge(ip)
+	if err == nil {
+		if err = r.ScopeIP(ip, ports); err != nil && fresh {
+			l.uncharge(ip)
+		}
+	}
+	if err != nil {
+		return false, fmt.Errorf("%w: %w", errStepScope, err)
+	}
+	return true, nil
 }
 
-// recordStepScope records an admitted, written step install's scope for
-// the rewarm, its ports joined to those of any other step's install there.
-func (s *Server) recordStepScope(name string, ip net.IP, ports []config.Port) {
-	if s.l7Registrar() == nil || s.steps.l7 == nil {
-		return
+// charge charges ip's scope to the steps' share, reporting whether it is
+// new to it; past the share it fails.
+func (l *stepL7) charge(ip net.IP) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	f, key := family(ip), ip.String()
+	if l.charged[f] == nil {
+		l.charged[f] = make(map[string]struct{})
 	}
+	if _, held := l.charged[f][key]; held {
+		return false, nil
+	}
+	if len(l.charged[f]) >= l.share {
+		return false, fmt.Errorf("the steps' share of the scope map, %d, is full", l.share)
+	}
+	l.charged[f][key] = struct{}{}
+	return true, nil
+}
+
+func (l *stepL7) uncharge(ip net.IP) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.charged[family(ip)], ip.String())
+}
+
+// recordStepScope records a scoped step install's scope for the rewarm,
+// under the name it was just scoped for, its ports joined to those of any
+// other step's install there.
+func (s *Server) recordStepScope(policy uint32, name string, ip net.IP, ports []config.Port) {
 	l := s.steps.l7
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -113,35 +176,66 @@ func (s *Server) recordStepScope(name string, ip net.IP, ports []config.Port) {
 		l.scoped = make(map[string]stepScope)
 	}
 	key := ip.String()
+	sc := stepScope{name: name, ports: ports, policies: []uint32{policy}}
 	if prev, ok := l.scoped[key]; ok {
-		ports = config.UnionPorts(prev.ports, ports)
-		name = prev.name
+		sc.ports = config.UnionPorts(prev.ports, ports)
+		sc.policies = prev.policies
+		if !slices.Contains(sc.policies, policy) {
+			sc.policies = append(slices.Clone(sc.policies), policy)
+		}
 	}
-	l.scoped[key] = stepScope{name: name, ports: ports}
+	l.scoped[key] = sc
 }
 
 // rescopeStepTier scopes every recorded step install again. The tracked-
 // hostname replay flushes every L7 scope before it rebuilds them, and a
 // step's installs from after the startup backfill are never backfilled
-// again. It runs first, into the emptied maps, which the steps' share,
-// bounded as the record is, always fits; a scope that fails even so is a
-// Warn.
+// again. It runs first, into the emptied maps, which the steps' share
+// always fits. A record whose name no step it holds still allows is
+// dropped, scoped no more. One that can't be scoped again, its name's
+// evidence gone or the scope refused, is withdrawn: its steps' entries
+// there are taken out, never left open unscoped.
 func (s *Server) rescopeStepTier() {
-	if s.steps.l7 == nil {
+	l := s.steps.l7
+	if l == nil {
 		return
 	}
-	s.steps.l7.mu.Lock()
-	todo := make(map[string]stepScope, len(s.steps.l7.scoped))
-	for ipStr, sc := range s.steps.l7.scoped {
-		todo[ipStr] = sc
-	}
-	s.steps.l7.mu.Unlock()
+	l.mu.Lock()
+	todo := l.scoped
+	l.scoped, l.charged = nil, [2]map[string]struct{}{}
+	l.mu.Unlock()
 	for ipStr, sc := range todo {
-		if err := scopeL7Identity(s.l7Registrar(), s.config, sc.name, net.ParseIP(ipStr), sc.ports, s.logger); err != nil {
-			s.logger.Warn("L7: a step install's scope could not be restored after the flush; "+
-				"the address is open to its steps without name enforcement",
-				"ip", ipStr, "hostname", sc.name, "error", err)
+		ip := net.ParseIP(ipStr)
+		allows, _ := s.stepAllowsFor(sc.name, s.config.MatchHostnameRule(sc.name))
+		if !slices.ContainsFunc(allows, func(a stepAllow) bool { return slices.Contains(sc.policies, a.policy) }) {
+			continue // no step that holds it allows its name: scoped no more
 		}
+		scoped, err := s.scopeStepInstall(sc.name, ip, sc.ports)
+		if scoped {
+			for _, policy := range sc.policies {
+				s.recordStepScope(policy, sc.name, ip, sc.ports)
+			}
+			continue
+		}
+		if err == nil {
+			err = errors.New("its name's forward-resolution evidence is gone")
+		}
+		s.withdrawStepInstall(sc, ip, err)
+	}
+}
+
+// withdrawStepInstall takes out the step entries at an address that lost
+// its scope, so no step reaches it unscoped.
+func (s *Server) withdrawStepInstall(sc stepScope, ip net.IP, why error) {
+	for _, policy := range sc.policies {
+		if err := s.firewall.RemovePolicyIP(policy, ip); err != nil {
+			s.logger.Warn("L7: a step install lost its scope and could not be withdrawn; "+
+				"the address is open to its step without name enforcement",
+				"policy", policy, "ip", ip.String(), "hostname", sc.name, "scope_error", why, "error", err)
+			continue
+		}
+		s.logger.Warn("L7: a step install lost its scope and was withdrawn; the step gets the job's rules there",
+			"policy", policy, "ip", ip.String(), "hostname", sc.name, "error", why)
 	}
 }
 

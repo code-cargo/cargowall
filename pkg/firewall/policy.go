@@ -206,6 +206,48 @@ func (f *FirewallImpl) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port
 	return changed, nil
 }
 
+// RemovePolicyIP takes out every entry step policy holds at ip's host route.
+// See the Firewall interface.
+func (f *FirewallImpl) RemovePolicyIP(policy uint32, ip net.IP) error {
+	if policy == bpf.PolicyJob {
+		return fmt.Errorf("RemovePolicyIP takes out step policies' entries only")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var lpm any
+	var ports []any
+	if ip4 := ip.To4(); ip4 != nil {
+		network := binary.NativeEndian.Uint32(ip4)
+		lpm = bpf.RuleKey(policy, 32, network)
+		for key := range f.steps.keys[ruleMapPorts] {
+			if k := key.(bpf.TcBpfRulePortKey); k.Policy == policy && k.Ip == network && k.HostBits == 0 {
+				ports = append(ports, key)
+			}
+		}
+	} else if ip6 := ip.To16(); ip6 != nil {
+		var network [16]byte
+		copy(network[:], ip6)
+		lpm = bpf.RuleKeyV6(policy, 128, network)
+		for key := range f.steps.keys[ruleMapPortsV6] {
+			if k := key.(bpf.TcBpfRulePortKeyV6); k.Policy == policy && k.Ip == network && k.HostBits == 0 {
+				ports = append(ports, key)
+			}
+		}
+	} else {
+		return fmt.Errorf("invalid IP: %s", ip.String())
+	}
+	// The LPM entry first: its port entries are never read without it, so a
+	// failed delete after it leaves nothing open.
+	if !f.deleteStepKeyLocked(lpm) {
+		return fmt.Errorf("could not take out the step entry for %s", ip)
+	}
+	for _, key := range ports {
+		f.deleteStepKeyLocked(key)
+	}
+	delete(f.stepIPs, policyIP{policy, ip.String()})
+	return nil
+}
+
 // hostWriteKeysLocked is every key a step host write to ip writes, its
 // denies' and its allows', as admitHostV4Locked and admitHostV6Locked plan
 // each, and whether it writes anything at all: an IPv6 write whose ports are

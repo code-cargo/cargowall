@@ -66,20 +66,23 @@ func gateOn(v *ebpf.Variable) bool {
 // and, should the verifier reject that load, once more with the gate off: a
 // kernel that cannot verify the step lookup costs the steps their own rules,
 // never the hook. The steps' traffic then gets the job's rules, which is
-// fail-closed. It reports whether what loaded has the gate on.
-func LoadWithStepRules(spec *ebpf.CollectionSpec, on bool, load func(*ebpf.CollectionSpec) error) (bool, error) {
+// fail-closed. load is told whether a rejection of its attempt would be
+// retried (tentative), so it can leave the reporting to the caller. It
+// reports whether what loaded has the gate on and, when a gate-on load was
+// rejected, why.
+func LoadWithStepRules(spec *ebpf.CollectionSpec, on bool, load func(spec *ebpf.CollectionSpec, tentative bool) error) (stepRules bool, rejected, err error) {
 	if err := SetStepRules(spec, on); err != nil {
-		return false, err
+		return false, nil, err
 	}
-	err := load(spec)
+	err = load(spec, on)
 	var verr *ebpf.VerifierError
 	if err == nil || !on || !errors.As(err, &verr) {
-		return on && err == nil, err
+		return on && err == nil, nil, err
 	}
-	if err := SetStepRules(spec, false); err != nil {
-		return false, err
+	if serr := SetStepRules(spec, false); serr != nil {
+		return false, err, serr
 	}
-	return false, load(spec)
+	return false, err, load(spec, false)
 }
 
 // The rule maps' sizes. verdict.h declares the larger, for a policy with

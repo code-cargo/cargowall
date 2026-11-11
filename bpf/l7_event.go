@@ -33,6 +33,12 @@ const (
 	L7ScopeQUIC uint8 = 0x04 // UDP 443
 )
 
+// L7ScopeEntries is the size of each L7 scope map (map_l7_scope and
+// map_l7_scope_v6 in sni.h), pinned by TestL7ScopeEntriesMatchSpec. The job
+// and every step share it; the steps' share is what the job's reservation
+// in the rule maps (RuleMapEntriesJobOnly) leaves of it.
+const L7ScopeEntries uint32 = 16384
+
 // AltHTTPSPorts and AltHTTPPorts are the alternate ports the big CDNs
 // terminate the SAME shared edge on. They carry the same L7 dimension as
 // 443/80 — pinning only the canonical pair left the tenant swap this layer

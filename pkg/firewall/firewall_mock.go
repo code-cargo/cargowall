@@ -185,6 +185,53 @@ func (_c *MockFirewall_RemoveIP_Call) RunAndReturn(run func(net.IP) error) *Mock
 	return _c
 }
 
+// RemovePolicyIP provides a mock function with given fields: policy, ip
+func (_m *MockFirewall) RemovePolicyIP(policy uint32, ip net.IP) error {
+	ret := _m.Called(policy, ip)
+
+	if len(ret) == 0 {
+		panic("no return value specified for RemovePolicyIP")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(uint32, net.IP) error); ok {
+		r0 = rf(policy, ip)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// MockFirewall_RemovePolicyIP_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'RemovePolicyIP'
+type MockFirewall_RemovePolicyIP_Call struct {
+	*mock.Call
+}
+
+// RemovePolicyIP is a helper method to define mock.On call
+//   - policy uint32
+//   - ip net.IP
+func (_e *MockFirewall_Expecter) RemovePolicyIP(policy interface{}, ip interface{}) *MockFirewall_RemovePolicyIP_Call {
+	return &MockFirewall_RemovePolicyIP_Call{Call: _e.mock.On("RemovePolicyIP", policy, ip)}
+}
+
+func (_c *MockFirewall_RemovePolicyIP_Call) Run(run func(policy uint32, ip net.IP)) *MockFirewall_RemovePolicyIP_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(uint32), args[1].(net.IP))
+	})
+	return _c
+}
+
+func (_c *MockFirewall_RemovePolicyIP_Call) Return(_a0 error) *MockFirewall_RemovePolicyIP_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockFirewall_RemovePolicyIP_Call) RunAndReturn(run func(uint32, net.IP) error) *MockFirewall_RemovePolicyIP_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // SetAuditMode provides a mock function with given fields: enabled
 func (_m *MockFirewall) SetAuditMode(enabled bool) error {
 	ret := _m.Called(enabled)

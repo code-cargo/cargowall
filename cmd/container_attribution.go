@@ -232,6 +232,14 @@ func (a *containerAttribution) originObserver() *origin.Observer {
 	return a.observer
 }
 
+// stepRulesHook is the hook's step-rules gate, nil without a hook.
+func (a *containerAttribution) stepRulesHook() stepRulesHook {
+	if a == nil || a.observer == nil {
+		return nil
+	}
+	return a.observer
+}
+
 // containerEnricher exposes the identity decorator for those same features.
 func (a *containerAttribution) containerEnricher() *containers.Enricher {
 	if a == nil {

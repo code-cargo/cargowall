@@ -166,6 +166,7 @@ type Manager struct {
 	config           *FirewallConfig
 	resolvedRules    []ResolvedRule
 	steps            []stepPolicy // step allow tiers by policy, nil until a load (steprules.go)
+	stepsLost        string       // why the policy's step rules were dropped (DropStepRules)
 	hostnameCache    map[string][]net.IP
 	ipToHostname     map[string]string              // Reverse lookup: IP -> hostname
 	ipToCNAMEOrigins map[string][]cnameOriginRecord // Reverse lookup: IP -> CNAME chains (one per origin) for derived-allow attribution

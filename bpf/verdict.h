@@ -403,12 +403,15 @@ static __always_inline __u32 cookie_step_policy(__u64 cookie) {
 // step_policy_judged is the step policy the socket with cookie is judged
 // by, or POLICY_JOB with step rules off. The L7 oracle judges a flow's name
 // by the policy this read gives with the punt, never by one it reads later,
-// which a binding landing in between would change. Policies fit 16 bits
-// (STEP_STAMP_POLICY_MAX), as the punt carries them.
+// which a binding landing in between would change. The punt carries it in
+// 16 bits, so a policy past STEP_STAMP_POLICY_MAX, which no binding should
+// hold, reads as POLICY_JOB, never as another step's, as the bridge stamp
+// does.
 static __always_inline __u32 step_policy_judged(__u64 cookie) {
     if (!step_rules_enabled)
         return POLICY_JOB;
-    return cookie_step_policy(cookie);
+    __u32 policy = cookie_step_policy(cookie);
+    return policy <= STEP_STAMP_POLICY_MAX ? policy : POLICY_JOB;
 }
 
 // step_policy_of is the step policy skb is judged by: that of the socket it

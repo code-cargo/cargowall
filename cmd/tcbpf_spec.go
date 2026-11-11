@@ -27,36 +27,42 @@ import (
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/config"
 	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
+	"github.com/code-cargo/cargowall/pkg/steps"
 )
 
 // loadCollection loads a collection spec into a bpf2go objects struct
-// (pkg/ebpf.LoadObjects); a seam for the step-rules gate's tests.
+// (pkg/ebpf.LoadObjects, or LoadObjectsTentatively for an attempt a
+// rejection of which is retried); a seam for the step-rules gate's tests.
 var loadCollection = defaultLoadCollection
 
-var defaultLoadCollection = cargowallEbpf.LoadObjects
+func defaultLoadCollection(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any, tentative bool) error {
+	if tentative {
+		return cargowallEbpf.LoadObjectsTentatively(logger, collection, spec, opts, to)
+	}
+	return cargowallEbpf.LoadObjects(logger, collection, spec, opts, to)
+}
 
 // loadTcObjects loads the tcbpf collection into objs, from loadTcSpec's
 // spec, with step rules on exactly when the startup policy has steps and
-// step attribution is on: without it no socket carries a step's tag, so no
-// step could be judged by its rules. The gate is decided once, from the
-// policy in hand before the load: it is a load-time constant, and nothing
-// delivers a policy after the load, so a path that ever did would have to
-// reload the collection to change it. On a kernel whose verifier rejects
-// the step lookup, the collection loads without it (bpf.LoadWithStepRules):
-// the steps lose their own rules, with a Warn, and the loss reads as
-// HasStepRules with objs.StepRules false.
+// step attribution is on (loadTcSpec drops them without it). The gate is
+// decided once, from the policy in hand before the load: it is a load-time
+// constant, and nothing delivers a policy after the load, so a path that
+// ever did would have to reload the collection to change it. On a kernel
+// whose verifier rejects the gate-on load, the collection loads without the
+// step lookup (bpf.LoadWithStepRules), and the policy's step rules are
+// dropped with the rejection as the reason (config.Manager.StepRulesLost):
+// every step gets the job's rules, which fails closed.
 func loadTcObjects(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger, objs *bpf.TcBpfObjects) error {
 	spec, steps, err := loadTcSpec(cmd, configMgr)
 	if err != nil {
 		return err
 	}
-	gate := steps && cmd.StepAttribution
-	if steps && !gate {
-		logger.Info("Step rules stay off: without step attribution no socket carries a step, so every step gets the job's rules")
+	if why := configMgr.StepRulesLost(); why != "" {
+		logger.Info("Step rules stay off: "+why, "result", "every step gets the job's rules")
 	}
 	opts := ebpf.CollectionOptions{Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelBranch | ebpf.LogLevelStats}}
-	on, err := bpf.LoadWithStepRules(spec, gate, func(spec *ebpf.CollectionSpec) error {
-		return loadCollection(logger, "tcbpf", spec, opts, objs)
+	on, rejected, err := bpf.LoadWithStepRules(spec, steps, func(spec *ebpf.CollectionSpec, tentative bool) error {
+		return loadCollection(logger, "tcbpf", spec, opts, objs, tentative)
 	})
 	if err != nil {
 		var verr *ebpf.VerifierError
@@ -67,10 +73,43 @@ func loadTcObjects(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger
 		}
 		return fmt.Errorf("failed to load TC eBPF objects: %w", err)
 	}
-	if gate && !on {
-		logger.Warn("Step rules are off: this kernel's verifier rejected the step lookup, so every step gets the job's rules alone")
+	if steps && !on {
+		dropStepRules(configMgr, "tcbpf "+cargowallEbpf.RejectionReason(rejected), logger)
 	}
 	return nil
+}
+
+// stepRulesHook is the cgroup hook's step-rules gate (origin.Observer).
+type stepRulesHook interface {
+	StepRules() bool
+	StepRulesLost() string
+}
+
+// settleStepTier drops the policy's step rules when, the hooks loaded,
+// nothing can judge a step by them: the step tracker did not start, so no
+// socket carries a step, or the cgroup hook's verifier rejected the step
+// lookup there alone (obs.StepRulesLost). Then the DNS path installs and
+// scopes nothing for a step, which would narrow the job's flows for no
+// step's benefit. obs is nil without the hook.
+func settleStepTier(configMgr *config.Manager, stepTracker *steps.Tracker, stepErr error, obs stepRulesHook, logger *slog.Logger) {
+	if !configMgr.HasStepRules() {
+		return
+	}
+	switch {
+	case stepTracker == nil && stepErr != nil:
+		dropStepRules(configMgr, "step attribution did not start: "+cargowallEbpf.RejectionReason(stepErr), logger)
+	case stepTracker == nil:
+		dropStepRules(configMgr, "step attribution did not start", logger)
+	case obs != nil && !obs.StepRules():
+		dropStepRules(configMgr, "originbpf "+obs.StepRulesLost(), logger)
+	}
+}
+
+// dropStepRules drops the policy's step rules for why, with a Warn.
+func dropStepRules(configMgr *config.Manager, why string, logger *slog.Logger) {
+	if configMgr.DropStepRules(why) {
+		logger.Warn("Step rules are off: "+why, "result", "every step gets the job's rules")
+	}
 }
 
 // loadTcSpec loads the tcbpf collection spec, sized for the run.
@@ -84,7 +123,8 @@ func loadTcObjects(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger
 // job's size alone without step rules, as before step policies, and with
 // room for the steps' with them. The policy is read once, here, before the
 // load; nothing loads one after it. So this settles the step rules: a run
-// that loaded no policy has none (config.Manager.SettleStepRules). It
+// that loaded no policy has none (config.Manager.SettleStepRules), and,
+// with step attribution off, drops them: no socket would carry a step. It
 // reports whether the policy has steps, for the step-rules gate.
 func loadTcSpec(cmd *StartCmd, configMgr *config.Manager) (*ebpf.CollectionSpec, bool, error) {
 	spec, err := bpf.LoadTcBpf()
@@ -101,6 +141,9 @@ func loadTcSpec(cmd *StartCmd, configMgr *config.Manager) (*ebpf.CollectionSpec,
 		}
 	}
 	configMgr.SettleStepRules()
+	if !cmd.StepAttribution {
+		configMgr.DropStepRules("step attribution is off, so no socket carries a step")
+	}
 	steps := configMgr.HasStepRules()
 	if err := bpf.SizeRuleMaps(spec, steps); err != nil {
 		return nil, false, fmt.Errorf("failed to size the rule maps: %w", err)

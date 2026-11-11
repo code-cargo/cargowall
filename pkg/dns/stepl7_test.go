@@ -155,10 +155,10 @@ func TestStepInstall_ReconcilesItsStepsBlocks(t *testing.T) {
 		}
 		return 0, false
 	})
-	fw.stepErr = errors.New("map full")
+	fw.failAfterScope = errors.New("map full") // admitted and scoped, then refused
 	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.66"))
 	assert.Empty(t, readAuditEvents(t, auditPath), "an install that failed opened nothing")
-	fw.stepErr = nil
+	fw.failAfterScope = nil
 	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.66"))
 	audited := readAuditEvents(t, auditPath)
 	require.Len(t, audited, 1)
@@ -267,4 +267,123 @@ func TestStepInstall_WithheldWholeRecordsNothing(t *testing.T) {
 	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.71"))
 	assert.Empty(t, s.steps.l7.scoped)
 	assert.Empty(t, readAuditEvents(t, auditPath))
+}
+
+// cappedRegistrar is a recordingRegistrar over a scope map of capacity
+// addresses, which refuses a new one past it as the kernel's does.
+type cappedRegistrar struct {
+	recordingRegistrar
+	capacity int
+}
+
+func (r *cappedRegistrar) ScopeIP(ip net.IP, ports []config.Port) error {
+	if _, held := r.scopes[ip.String()]; !held && len(r.scopes) >= r.capacity {
+		return errors.New("update: argument list too long")
+	}
+	return r.recordingRegistrar.ScopeIP(ip, ports)
+}
+
+// The steps' scopes stay within their share of the scope map, however many
+// step installs arrive, admitted or admitted and then refused by the map,
+// so the job's own destinations always find room: a job install past them
+// is still scoped. A step install out of scope room is withheld.
+func TestStepScopes_StayInTheStepsShare(t *testing.T) {
+	for _, failAfter := range []bool{false, true} {
+		t.Run(fmt.Sprintf("refused after the scope %v", failAfter), func(t *testing.T) {
+			cfg := config.NewConfigManager()
+			fw := newRecordingFirewall()
+			if failAfter {
+				fw.failAfterScope = fmt.Errorf("%w: map full", firewall.ErrStepBudget)
+			}
+			s := newStepTestServer(t, cfg, fw)
+			s.steps.l7.share = 3
+			rec := &cappedRegistrar{capacity: 5}
+			s.SetL7Registrar(rec)
+			loadStepPolicy(t, cfg, strings.Replace(stepWritersPolicy, `"rules": [`,
+				`"rules": [{"type": "hostname", "value": "*.job-cdn.example.net", "action": "allow"},`, 1))
+			for i := range 10 {
+				name := fmt.Sprintf("h%d.cdn-step.example.net", i)
+				answer(s, name, aResponse(name, fmt.Sprintf("10.5.0.%d", i+1)))
+			}
+			assert.Len(t, rec.scopes, 3, "the steps' share")
+			assert.LessOrEqual(t, len(fw.stepIPs(policyFetch)), 3, "a step install out of scope room never opens")
+			for i := range 2 {
+				name := fmt.Sprintf("j%d.job-cdn.example.net", i)
+				answer(s, name, aResponse(name, fmt.Sprintf("10.6.0.%d", i+1)))
+				assert.Contains(t, rec.scopes, fmt.Sprintf("10.6.0.%d", i+1), "the job's destination is scoped")
+			}
+		})
+	}
+}
+
+// The rewarm scopes a step's address again under the latest name bound to
+// it, whose evidence that install refreshed, not the first, whose evidence
+// ages out first. An address no name can be bound to again is withdrawn:
+// its step entries are taken out, never left open unscoped.
+func TestStepScopes_RebindOrWithdraw(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames() // the startup backfill: seals via
+	answer(s, "a.cdn-step.example.net", aResponse("a.cdn-step.example.net", "10.1.0.90"))
+	answer(s, "c.cdn-step.example.net", aResponse("c.cdn-step.example.net", "10.1.0.91"))
+	for i := range 8200 { // evict both names' evidence
+		cfg.RecordForwardResolution(fmt.Sprintf("other%d.example.org", i), "192.0.2.1")
+	}
+	answer(s, "b.cdn-step.example.net", aResponse("b.cdn-step.example.net", "10.1.0.90"))
+
+	s.ApplyRulesToTrackedHostnames()
+	assert.Equal(t, "all-ports", rec.scopes["10.1.0.90"], "scoped again under b")
+	assert.Contains(t, fw.stepIPs(policyFetch), "10.1.0.90")
+	assert.NotContains(t, rec.scopes, "10.1.0.91", "c's evidence is gone")
+	assert.NotContains(t, fw.stepIPs(policyFetch), "10.1.0.91", "so its install is withdrawn")
+	assert.Contains(t, fw.removed, "10.1.0.91")
+}
+
+// The rewarm scopes again only what a step that holds the address still
+// allows by the recorded name; the rest is dropped from the record.
+func TestStepScopes_PrunedWhenNoStepAllows(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames()
+	answer(s, "deploy.example.com", aResponse("deploy.example.com", "10.1.0.92"))
+	loadStepPolicy(t, cfg, `{"defaultAction": "deny", "rules": [],
+		"steps": [{"id": "deploy", "rules": [{"type": "hostname", "value": "other.example.com"}]}]}`)
+	s.ApplyRulesToTrackedHostnames()
+	assert.NotContains(t, rec.scopes, "10.1.0.92")
+	assert.Empty(t, s.steps.l7.scoped)
+}
+
+// A scope the registrar fails to write is no charge to the steps' share,
+// and a flush gives back the charges of what the rewarm doesn't scope
+// again: neither can wear the share down.
+func TestStepScopes_ShareGivenBack(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	s.steps.l7.share = 1
+	rec := &cappedRegistrar{capacity: 0} // a full map, until it isn't
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames()
+	for i := range 3 {
+		name := fmt.Sprintf("f%d.cdn-step.example.net", i)
+		answer(s, name, aResponse(name, fmt.Sprintf("10.7.0.%d", i+1)))
+	}
+	rec.capacity = 100
+	answer(s, "deploy.example.com", aResponse("deploy.example.com", "10.7.1.1"))
+	require.Contains(t, rec.scopes, "10.7.1.1", "the failed scopes took no share")
+
+	loadStepPolicy(t, cfg, `{"defaultAction": "deny", "rules": [],
+		"steps": [{"id": "fetch", "rules": [{"type": "hostname", "value": "step.example.com"}]}]}`)
+	s.ApplyRulesToTrackedHostnames() // deploy's address is pruned with its rule
+	answer(s, "step.example.com", aResponse("step.example.com", "10.7.1.2"))
+	assert.Contains(t, rec.scopes, "10.7.1.2", "the pruned address's share came back")
 }

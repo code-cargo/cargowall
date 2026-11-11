@@ -302,48 +302,6 @@ func TestGetProtocolName(t *testing.T) {
 	}
 }
 
-// --- reverseDNSAttempted tests (issue #5) ---
-
-func TestReverseDNSAttempted(t *testing.T) {
-	// Reset global cache
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
-
-	// First lookup returns false (not yet attempted)
-	assert.False(t, reverseDNSAttempted("10.0.0.1"))
-
-	// Second lookup returns true (already attempted)
-	assert.True(t, reverseDNSAttempted("10.0.0.1"))
-
-	// Different IP returns false
-	assert.False(t, reverseDNSAttempted("10.0.0.2"))
-}
-
-func TestReverseDNSAttempted_Eviction(t *testing.T) {
-	// Reset global cache
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
-
-	// Fill cache to max
-	for i := range reverseDNSCacheMax {
-		ip := fmt.Sprintf("192.168.%d.%d", i/256, i%256)
-		reverseDNSAttempted(ip)
-	}
-
-	reverseDNSMu.Lock()
-	assert.Equal(t, reverseDNSCacheMax, len(reverseDNSCache))
-	reverseDNSMu.Unlock()
-
-	// Adding one more should evict the oldest and keep size at max
-	assert.False(t, reverseDNSAttempted("172.16.0.1"))
-
-	reverseDNSMu.Lock()
-	assert.Equal(t, reverseDNSCacheMax, len(reverseDNSCache))
-	reverseDNSMu.Unlock()
-}
-
 // --- NotificationTracker tests (issue #6) ---
 
 type mockStateMachineClient struct {
@@ -507,9 +465,7 @@ func TestProcessEvent_IPv4BlockedTCP(t *testing.T) {
 	})
 
 	// Reset reverse DNS cache to avoid cross-test pollution
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, tracker, auditLogger, nil, nil, newTestLogger(), nil)
 
@@ -543,9 +499,7 @@ func TestProcessEvent_IPv4AllowedTCP(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger(), nil)
 
@@ -576,9 +530,7 @@ func TestProcessEvent_ProtocolBlocked(t *testing.T) {
 		DstPort:   1, // ICMP
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, tracker, auditLogger, nil, nil, newTestLogger(), nil)
 
@@ -609,9 +561,7 @@ func TestProcessEvent_LateResolvedIPAddedToFirewall(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, nil, fw, nil, newTestLogger(), nil)
 
@@ -645,9 +595,7 @@ func TestProcessEvent_LateResolvedIPInheritsRulePorts(t *testing.T) {
 		DstPort:   22, // attacker hits a non-allowed port; allow rule is for :443
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, nil, fw, nil, newTestLogger(), nil)
 
@@ -684,9 +632,7 @@ func TestProcessEvent_LateResolvedIPv6InheritsRulePorts(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, nil, fw, nil, newTestLogger(), nil)
 
@@ -727,9 +673,7 @@ func TestProcessEvent_LateResolvedEmitsLateAllowedAudit(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger(), nil)
 
@@ -783,9 +727,7 @@ func TestProcessEvent_LateResolvedMatchedRuleIsRulePatternNotHostname(t *testing
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, fw, nil, newTestLogger(), nil)
 
@@ -828,9 +770,7 @@ func TestProcessEvent_BlockedNoMatchStillLogsBlocked(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger(), nil)
 
@@ -875,9 +815,7 @@ func TestProcessEvent_CNAMEDerivedAttributesToOrigin(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger(), nil)
 
@@ -927,9 +865,7 @@ func TestProcessEvent_CNAMEDerivedBlockedAttributesToOrigin(t *testing.T) {
 		DstPort:   8080, // outside the origin rule's :443 allow set
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, fw, nil, newTestLogger(), nil)
 
@@ -979,9 +915,7 @@ func TestProcessEvent_LateResolvedDstPortNotInRulePortsStaysBlocked(t *testing.T
 		DstPort:   22, // attacker hits non-allowed port
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger(), nil)
 
@@ -1028,9 +962,7 @@ func TestProcessEvent_LateResolvedUDPEventNotAllowedByTCPRule(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger(), nil)
 
@@ -1074,9 +1006,7 @@ func TestProcessEvent_LateResolvedTCPEventAllowedByTCPRule(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger(), nil)
 
@@ -1118,9 +1048,7 @@ func TestProcessEvent_LateResolvedTCPEventAllowedByProtocolAllRule(t *testing.T)
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, tracker, auditLogger, fw, nil, newTestLogger(), nil)
 
@@ -1156,9 +1084,7 @@ func TestProcessEvent_IPv6Event(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger(), nil)
 
@@ -1197,9 +1123,7 @@ func TestProcessEvent_AutoAllowedType(t *testing.T) {
 		DstPort:   53,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger(), nil)
 
@@ -1233,9 +1157,7 @@ func TestProcessEvent_NoAutoAllowedTypeForUserRule(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger(), nil)
 
@@ -1268,9 +1190,7 @@ func TestProcessEvent_MidStreamBlocked(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger(), nil)
 
@@ -1311,9 +1231,7 @@ func TestProcessEvent_MidStreamLateAllowFires(t *testing.T) {
 		DstPort:   443,
 	})
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, fw, nil, newTestLogger(), nil)
 
@@ -1400,9 +1318,7 @@ func TestProcessEvent_EnricherRunsForOrphanBlockedEvent(t *testing.T) {
 	enr := &fakeEnricher{}
 	raw := makeBpfEvent(orphanEvent())
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger(), enr)
 
@@ -1439,9 +1355,7 @@ func TestProcessEvent_LogLineObservesEnrichedIdentity(t *testing.T) {
 	cm := config.NewConfigManager()
 	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
@@ -1475,9 +1389,7 @@ func TestProcessEvent_EnricherRunsForOrphanAllowedEvent(t *testing.T) {
 	ev.Allowed = 1
 	raw := makeBpfEvent(ev)
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(raw, cm, nil, auditLogger, nil, nil, newTestLogger(), enr)
 
@@ -1515,9 +1427,7 @@ func TestProcessEvent_EnricherSkippedWhenAttributed(t *testing.T) {
 			ev.StepOrdinal = tt.ordinal
 			raw := makeBpfEvent(ev)
 
-			reverseDNSMu.Lock()
-			reverseDNSCache = make(map[string]time.Time)
-			reverseDNSMu.Unlock()
+			reverseDNS.reset()
 
 			processEvent(raw, cm, nil, nil, nil, nil, newTestLogger(), enr)
 
@@ -1533,9 +1443,7 @@ func TestProcessEvent_NilEnricherOrphanEventNoPanic(t *testing.T) {
 	cm := config.NewConfigManager()
 	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
 
-	reverseDNSMu.Lock()
-	reverseDNSCache = make(map[string]time.Time)
-	reverseDNSMu.Unlock()
+	reverseDNS.reset()
 
 	processEvent(makeBpfEvent(orphanEvent()), cm, nil, nil, nil, nil, newTestLogger(), nil)
 }

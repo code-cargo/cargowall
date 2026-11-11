@@ -385,7 +385,7 @@ sequenceDiagram
 ### Event Handler (`pkg/events`)
 - Processes both blocked and allowed events from ring buffer (`ip_version`, `allowed`, ports, IPs)
 - PID tracking: reads `pid` field (populated by cgroup programs via `map_sock_pid`), resolves process name from `/proc/<pid>/comm`
-- Lazy reverse DNS: bounded cache (10,000 entries), one PTR attempt per unique IP (500ms timeout), falls back to forward-matching tracked hostnames
+- Lazy reverse DNS: bounded tracker (10,000 IPs), PTR lookups with a 500ms timeout, one at a time per IP, falling back to forward-matching tracked hostnames. A lookup that settles (a name, NXDOMAIN, or an empty answer) is final for the run. A failed one (timeout, SERVFAIL, a network error) leaves the IP eligible again after a backoff that starts at 2s and doubles, up to 6 lookups in all
 - Late-resolved IP addition: if a blocked event resolves to an allowed hostname, adds the IP to the firewall on the fly
 - Audit logging via `AuditLogger` — NDJSON with `would_deny`/`blocked` flags based on audit mode
 - Notification deduplication: one notification per unique destination (`hostname:port` or `ip:port`) via `NotificationTracker`

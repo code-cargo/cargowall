@@ -31,7 +31,6 @@ import (
 	"log/slog"
 	"net"
 	"strings"
-	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -41,13 +40,13 @@ import (
 // resolveDestination turns a destination IP into the hostname a connection
 // event should report, plus the CNAME chain it was reached through.
 //
-// Order matters: the DNS cache first, then a single lazy PTR lookup per
-// unique IP, then forward-matching the tracked hostnames. Finally, if the IP
-// was reached as the CNAME target of an allowed host, the origin hostname
-// the user actually allowed (chain[0]) replaces the resolved name and the
-// full chain is returned as a drill-down — so a blocked derived connection
-// attributes to the origin and the late-allow check below runs against the
-// origin's rule.
+// Order matters: the DNS cache first, then a lazy PTR lookup when
+// reverseDNS allows one, then forward-matching the tracked hostnames.
+// Finally, if the IP was reached as the CNAME target of an allowed host, the
+// origin hostname the user actually allowed (chain[0]) replaces the resolved
+// name and the full chain is returned as a drill-down — so a blocked derived
+// connection attributes to the origin and the late-allow check below runs
+// against the origin's rule.
 func resolveDestination(configMgr *config.Manager, dstIP string, logger *slog.Logger) (hostname string, cnameChain []string) {
 	hostname = configMgr.LookupHostnameByIP(dstIP)
 	if hostname == "" {
@@ -56,12 +55,22 @@ func resolveDestination(configMgr *config.Manager, dstIP string, logger *slog.Lo
 		logger.Debug("DNS cache hit", "hostname", hostname, "ip", dstIP)
 	}
 
-	// Lazy reverse DNS for IPs not in the cache. Each unique IP is only
-	// looked up once.
-	if hostname == "" && !reverseDNSAttempted(dstIP) {
-		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	// Lazy reverse DNS for IPs not in the cache. A lookup that settles is
+	// final for the run. One that failed leaves the IP eligible again after
+	// a backoff, a capped number of times (see reverseDNSTracker): a
+	// transient resolver failure must not leave a destination the policy
+	// allows by name unnamed, and so blocked, for the rest of the run.
+	if hostname == "" && reverseDNS.begin(dstIP) {
+		ctx, cancel := context.WithTimeout(context.Background(), reverseDNSTimeout)
 		names, err := reverseDNSResolver.LookupAddr(ctx, dstIP)
 		cancel()
+		if attempt := reverseDNS.finish(dstIP, reverseLookupSettled(err)); attempt.exhausted {
+			logger.Info("Reverse DNS lookup kept failing; not retrying it this run",
+				"ip", dstIP, "attempts", attempt.failures, "error", err)
+		} else if attempt.failures > 0 {
+			logger.Info("Reverse DNS lookup failed; will retry",
+				"ip", dstIP, "attempt", attempt.failures, "retry_in", attempt.retryIn, "error", err)
+		}
 		if err == nil && len(names) > 0 {
 			// Lowercased so an unmatched PTR name is reported in the same
 			// canonical case as forward mappings and tracked-rule matches,

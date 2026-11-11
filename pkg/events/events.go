@@ -23,7 +23,6 @@ import (
 	"log/slog"
 	"net"
 	"sync"
-	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf/ringbuf"
@@ -163,50 +162,6 @@ func getProtocolName(proto uint8) string {
 		return fmt.Sprintf("Protocol-%d", proto)
 	}
 }
-
-// reverseDNSCache is a bounded cache of IPs we've already attempted reverse
-// DNS for, so each unique IP triggers at most one lookup. Limited to 10000
-// entries to prevent unbounded memory growth.
-var (
-	reverseDNSMu    sync.Mutex
-	reverseDNSCache = make(map[string]time.Time) // IP -> timestamp of attempt
-)
-
-const reverseDNSCacheMax = 10000
-
-// reverseDNSAttempted checks if an IP has been looked up before and marks it if not.
-// Returns true if the IP was already in the cache (i.e., already attempted).
-func reverseDNSAttempted(ip string) bool {
-	reverseDNSMu.Lock()
-	defer reverseDNSMu.Unlock()
-
-	if _, ok := reverseDNSCache[ip]; ok {
-		return true
-	}
-
-	// Evict oldest entries if cache is full
-	if len(reverseDNSCache) >= reverseDNSCacheMax {
-		var oldestKey string
-		var oldestTime time.Time
-		first := true
-		for k, t := range reverseDNSCache {
-			if first || t.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = t
-				first = false
-			}
-		}
-		if !first {
-			delete(reverseDNSCache, oldestKey)
-		}
-	}
-
-	reverseDNSCache[ip] = time.Now()
-	return false
-}
-
-// reverseDNSResolver uses the system default resolver for PTR lookups.
-var reverseDNSResolver = net.DefaultResolver
 
 // IsProtocolBlock reports whether a raw event is the non-TCP/UDP protocol
 // block shape, where dst_port carries the protocol number rather than a port.

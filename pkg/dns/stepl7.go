@@ -118,26 +118,41 @@ func (s *Server) SetStepBindings(bindings func(ordinal uint32) (policy uint32, o
 
 // scopeStepInstall scopes ip for name on ports, as applyVerdictSide does a
 // job install's: the firewall runs it once it admits a step install, and
-// before it writes any of it. It reports whether it wrote a scope. An
-// address no forward resolution bound to name stays unscoped (SCOPE IFF
-// BOUND). An address the steps' share of the scope map has no room for, or
-// a scope the registrar fails to write, the map full say, withholds the
-// install (errStepScope).
-func (s *Server) scopeStepInstall(name string, ip net.IP, ports []config.Port) (bool, error) {
+// before it writes any of it. It reports whether it wrote a scope, and
+// whether that charged the steps' share anew. An address no forward
+// resolution bound to name stays unscoped (SCOPE IFF BOUND). An address the
+// steps' share of the scope map has no room for, or a scope the registrar
+// fails to write, the map full say, withholds the install (errStepScope).
+func (s *Server) scopeStepInstall(name string, ip net.IP, ports []config.Port) (scoped, fresh bool, err error) {
 	r, l := s.l7Registrar(), s.steps.l7
 	if r == nil || l == nil || !s.config.NameResolvedToIP(name, ip.String()) {
-		return false, nil
+		return false, false, nil
 	}
-	fresh, err := l.charge(ip)
+	fresh, err = l.charge(ip)
 	if err == nil {
 		if err = r.ScopeIP(ip, ports); err != nil && fresh {
 			l.uncharge(ip)
 		}
 	}
 	if err != nil {
-		return false, fmt.Errorf("%w: %w", errStepScope, err)
+		return false, false, fmt.Errorf("%w: %w", errStepScope, err)
 	}
-	return true, nil
+	return true, fresh, nil
+}
+
+// unscopeStepInstall takes back the scope a step install wrote whose write
+// the firewall then refused, the map full say: the scope entry goes unless
+// something else holds it (L7Registrar.UnscopeIP), and the steps' share is
+// given back what the write charged.
+func (s *Server) unscopeStepInstall(ip net.IP, ports []config.Port, fresh bool) {
+	if r := s.l7Registrar(); r != nil {
+		if err := r.UnscopeIP(ip, ports); err != nil {
+			s.logger.Debug("L7: taking back a refused step install's scope", "ip", ip.String(), "error", err)
+		}
+	}
+	if fresh && s.steps.l7 != nil {
+		s.steps.l7.uncharge(ip)
+	}
 }
 
 // charge charges ip's scope to the steps' share, reporting whether it is
@@ -210,7 +225,7 @@ func (s *Server) rescopeStepTier() {
 		if !slices.ContainsFunc(allows, func(a stepAllow) bool { return slices.Contains(sc.policies, a.policy) }) {
 			continue // no step that holds it allows its name: scoped no more
 		}
-		scoped, err := s.scopeStepInstall(sc.name, ip, sc.ports)
+		scoped, _, err := s.scopeStepInstall(sc.name, ip, sc.ports)
 		if scoped {
 			for _, policy := range sc.policies {
 				s.recordStepScope(policy, sc.name, ip, sc.ports)

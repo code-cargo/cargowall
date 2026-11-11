@@ -37,6 +37,10 @@ type L7Registrar interface {
 	// with the tracked-hostname replay that re-warms them; scope entries have
 	// no expiry and no reverse index.
 	FlushScopes() error
+	// UnscopeIP takes back one ScopeIP(ip, ports) whose install was refused:
+	// the scope entry goes only if no other ScopeIP since the last flush
+	// holds it.
+	UnscopeIP(ip net.IP, ports []config.Port) error
 }
 
 // SetL7Registrar installs the L7 registrar. Safe to call after the server is

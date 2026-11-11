@@ -39,11 +39,24 @@ import (
 type recordingRegistrar struct {
 	flushes int
 	scopes  map[string]string
+	holds   map[string]int // ScopeIP calls holding each scope, as the oracle counts them
 }
 
 func (r *recordingRegistrar) FlushScopes() error {
 	r.flushes++
-	r.scopes = nil
+	r.scopes, r.holds = nil, nil
+	return nil
+}
+
+func (r *recordingRegistrar) UnscopeIP(ip net.IP, _ []config.Port) error {
+	if r.holds == nil {
+		return nil
+	}
+	key := ip.String()
+	if r.holds[key]--; r.holds[key] <= 0 {
+		delete(r.holds, key)
+		delete(r.scopes, key)
+	}
 	return nil
 }
 
@@ -64,9 +77,10 @@ func portKey(ports []config.Port) string {
 
 func (r *recordingRegistrar) ScopeIP(ip net.IP, ports []config.Port) error {
 	if r.scopes == nil {
-		r.scopes = map[string]string{}
+		r.scopes, r.holds = map[string]string{}, map[string]int{}
 	}
 	r.scopes[ip.String()] = portKey(ports)
+	r.holds[ip.String()]++
 	return nil
 }
 

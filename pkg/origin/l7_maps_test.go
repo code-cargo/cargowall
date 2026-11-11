@@ -144,3 +144,42 @@ func TestL7ScopeIPConcurrentUnion(t *testing.T) {
 		require.Equal(t, bpf.L7ScopeTLS|bpf.L7ScopeQUIC, flags, "iteration %d dropped a scope bit", i)
 	}
 }
+
+// UnscopeIP takes back one ScopeIP: an entry no other call holds goes,
+// leaving the map as it was before; one another call holds stays, with
+// whatever bits the taken-back call added; a call that opened no dimension
+// held nothing to take back.
+func TestL7UnscopeIPTakesBackItsOwnHold(t *testing.T) {
+	objs := loadL7Objects(t)
+	l := newL7(objs, L7Options{Matcher: allowSet{}}, nil)
+	key := func(ip net.IP) uint32 { return binary.NativeEndian.Uint32(ip.To4()) }
+	var flags uint8
+
+	alone := net.ParseIP("104.16.2.1")
+	require.NoError(t, l.ScopeIP(alone, tcpPorts(443)))
+	require.NoError(t, l.UnscopeIP(alone, tcpPorts(443)))
+	require.Error(t, objs.MapL7Scope.Lookup(key(alone), &flags), "no other hold: the entry goes")
+
+	shared := net.ParseIP("104.16.2.2")
+	require.NoError(t, l.ScopeIP(shared, tcpPorts(443))) // the job's
+	require.NoError(t, l.ScopeIP(shared, tcpPorts(80)))  // a step's, then refused
+	require.NoError(t, l.UnscopeIP(shared, tcpPorts(80)))
+	require.NoError(t, objs.MapL7Scope.Lookup(key(shared), &flags), "the job's hold keeps it")
+	require.Equal(t, bpf.L7ScopeTLS|bpf.L7ScopeHTTP, flags)
+
+	require.NoError(t, l.UnscopeIP(shared, tcpPorts(22)), "no dimension: no hold")
+	require.NoError(t, objs.MapL7Scope.Lookup(key(shared), &flags))
+
+	// A flush drops every hold with the entries.
+	require.NoError(t, l.FlushScopes())
+	require.NoError(t, l.ScopeIP(shared, tcpPorts(443)))
+	require.NoError(t, l.UnscopeIP(shared, tcpPorts(443)))
+	require.Error(t, objs.MapL7Scope.Lookup(key(shared), &flags), "no hold from before the flush")
+
+	v6 := net.ParseIP("2606:4700::9")
+	require.NoError(t, l.ScopeIP(v6, udpPorts(443)))
+	require.NoError(t, l.UnscopeIP(v6, udpPorts(443)))
+	var k6 [16]byte
+	copy(k6[:], v6.To16())
+	require.Error(t, objs.MapL7ScopeV6.Lookup(k6, &flags))
+}

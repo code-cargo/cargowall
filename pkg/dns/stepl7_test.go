@@ -305,7 +305,11 @@ func TestStepScopes_StayInTheStepsShare(t *testing.T) {
 				name := fmt.Sprintf("h%d.cdn-step.example.net", i)
 				answer(s, name, aResponse(name, fmt.Sprintf("10.5.0.%d", i+1)))
 			}
-			assert.Len(t, rec.scopes, 3, "the steps' share")
+			if failAfter {
+				assert.Empty(t, rec.scopes, "each refused write's scope taken back")
+			} else {
+				assert.Len(t, rec.scopes, 3, "the steps' share")
+			}
 			assert.LessOrEqual(t, len(fw.stepIPs(policyFetch)), 3, "a step install out of scope room never opens")
 			for i := range 2 {
 				name := fmt.Sprintf("j%d.job-cdn.example.net", i)
@@ -386,4 +390,27 @@ func TestStepScopes_ShareGivenBack(t *testing.T) {
 	s.ApplyRulesToTrackedHostnames() // deploy's address is pruned with its rule
 	answer(s, "step.example.com", aResponse("step.example.com", "10.7.1.2"))
 	assert.Contains(t, rec.scopes, "10.7.1.2", "the pruned address's share came back")
+}
+
+// A scope written for a step install the firewall then refuses, the map
+// full say, is taken back: the scope maps are left as they were, a scope
+// the address already had stays, and the steps' share gets its charge back.
+func TestStepInstall_RefusedAfterScopeTakenBack(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	fw.failAfterScope = fmt.Errorf("%w: map full", firewall.ErrStepBudget)
+	s := newStepTestServer(t, cfg, fw)
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+
+	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.95"))
+	assert.Empty(t, rec.scopes, "the map left as it was")
+	assert.Empty(t, s.steps.l7.charged[0], "the share given back")
+
+	answer(s, "job.example.com", aResponse("job.example.com", "10.1.0.96"))
+	require.Equal(t, "all-ports", rec.scopes["10.1.0.96"])
+	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.96"))
+	assert.Equal(t, "tcp/443", rec.scopes["10.1.0.96"], "the job's scope stays, with the step's bits")
+	assert.Empty(t, s.steps.l7.charged[0])
 }

@@ -913,7 +913,8 @@ to select policy with.
     never open unscoped, and one the budget refuses scopes nothing. Step
     scopes take room only in the steps' share of each scope map, its size
     less the job's 4096, so the job's own destinations always find room
-    there. The tracked-hostname replay scopes the step installs again,
+    there, and a scope written for an install the rule maps then refuse is
+    taken back, unless another install holds the address's scope. The tracked-hostname replay scopes the step installs again,
     first, after its scope flush, under the latest name bound to each
     address; an address no name can be bound to again is withdrawn, its
     step entries taken out. One exception is the job's own (SCOPE IFF

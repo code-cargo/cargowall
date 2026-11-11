@@ -58,6 +58,8 @@ type cmdRecordingRegistrar struct {
 
 func (r *cmdRecordingRegistrar) FlushScopes() error { r.scopes = nil; return nil }
 
+func (r *cmdRecordingRegistrar) UnscopeIP(net.IP, []config.Port) error { return nil }
+
 func (r *cmdRecordingRegistrar) ScopeIP(ip net.IP, ports []config.Port) error {
 	if r.scopes == nil {
 		r.scopes = map[string][]config.Port{}

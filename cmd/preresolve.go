@@ -138,10 +138,10 @@ func preResolve(ctx context.Context, conns existingConns, configMgr *config.Mana
 	hostnames := slices.Sorted(maps.Keys(configMgr.GetTrackedHostnames()))
 
 	var wg sync.WaitGroup
-	var cached, cacheCutOff int
+	var peersCutOff, cached, cacheCutOff int
 	var answersMu sync.Mutex
 	answers := make(map[string][]string)
-	wg.Go(func() { reverseDNSExistingConnections(ctx, conns, configMgr, stub, logger) })
+	wg.Go(func() { peersCutOff = reverseDNSExistingConnections(ctx, conns, configMgr, stub, logger) })
 	wg.Go(func() {
 		cached, cacheCutOff = lookupEach(ctx, hostnames, preResolveStubLookup, func(ctx context.Context, hostname string) bool {
 			ips, err := stub.LookupHost(ctx, hostname)
@@ -178,14 +178,25 @@ func preResolve(ctx context.Context, conns existingConns, configMgr *config.Mana
 	logger.Info("Pre-resolved tracked hostnames via DNS proxy",
 		"hostnames", len(hostnames), "resolved", resolved, "cut_off", cutOff,
 		"elapsed", time.Since(started).Round(time.Millisecond))
+
+	// The deadline cutting a lookup off is the one sign pre-resolution did
+	// less than it set out to, so it is a Warn, not just a count at Info.
+	if cut := peersCutOff + cacheCutOff + cutOff; cut > 0 {
+		logger.Warn("Startup DNS pre-resolution hit its deadline before every lookup finished: "+
+			"existing connections to peers it left unnamed keep their observed-port allows, "+
+			"and names it missed resolve, and are enforced, through the proxy when next queried",
+			"deadline", preResolveDeadline, "cut_off", cut,
+			"peers_cut_off", peersCutOff, "cache_cut_off", cacheCutOff, "proxy_cut_off", cutOff)
+	}
 }
 
 // reverseDNSExistingConnections looks up the reverse name of each scanned
 // existing-connection IP through the stub, recording it as that IP's
-// hostname for gateExistingConnections' attribution.
-func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, stub stubResolver, logger *slog.Logger) {
+// hostname for gateExistingConnections' attribution. It returns how many
+// lookups ctx cut off.
+func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, stub stubResolver, logger *slog.Logger) int {
 	if len(conns) == 0 {
-		return
+		return 0
 	}
 	named, cutOff := lookupEach(ctx, slices.Sorted(maps.Keys(conns)), preResolveStubLookup, func(ctx context.Context, ip string) bool {
 		names, err := stub.LookupAddr(ctx, ip)
@@ -199,6 +210,7 @@ func reverseDNSExistingConnections(ctx context.Context, conns existingConns, con
 	})
 	logger.Info("Populated reverse DNS cache from existing connections",
 		"ips", len(conns), "named", named, "cut_off", cutOff)
+	return cutOff
 }
 
 // lookupEach runs lookup for every item from at most preResolveWorkers

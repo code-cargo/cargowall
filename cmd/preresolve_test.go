@@ -17,7 +17,9 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -109,20 +111,53 @@ func existingPeers(n int) existingConns {
 	return conns
 }
 
+// jsonLogger logs every record to buf as a JSON line.
+func jsonLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// logRecords is what a jsonLogger wrote at level.
+func logRecords(t *testing.T, buf *bytes.Buffer, level slog.Level) []map[string]any {
+	t.Helper()
+	var records []map[string]any
+	for line := range bytes.Lines(buf.Bytes()) {
+		var r map[string]any
+		require.NoError(t, json.Unmarshal(line, &r))
+		if r[slog.LevelKey] == level.String() {
+			records = append(records, r)
+		}
+	}
+	return records
+}
+
 // An upstream that answers nothing must not hold startup past the deadline,
 // however many names and peers there are to look up: every round shares it.
+// What the deadline cut off is logged as a Warn.
 func TestPreResolve_StalledResolverReturnsWithinDeadline(t *testing.T) {
 	cm := policyTracking(t, 3*preResolveWorkers)
 	sink := &recordingCacheSink{}
 	stub, proxy := &stalledResolver{}, &stalledResolver{}
+	var logs bytes.Buffer
 
 	started := time.Now()
-	preResolve(context.Background(), existingPeers(3*preResolveWorkers), cm, sink, stub, proxy, slog.Default())
+	preResolve(context.Background(), existingPeers(3*preResolveWorkers), cm, sink, stub, proxy, jsonLogger(&logs))
 	elapsed := time.Since(started)
 
 	assert.Less(t, elapsed, preResolveDeadline+time.Second, "pre-resolution outlasted its deadline")
 	assert.Equal(t, 1, sink.applied, "the cache entries are applied whatever the deadline left")
 	assert.Positive(t, stub.calls.Load())
+
+	warns := logRecords(t, &logs, slog.LevelWarn)
+	require.Len(t, warns, 1, "the cut-off is logged as one Warn")
+	count := func(key string) float64 {
+		n, ok := warns[0][key].(float64)
+		require.True(t, ok, "the Warn carries %s", key)
+		return n
+	}
+	assert.Positive(t, count("cut_off"))
+	assert.Equal(t, count("cut_off"), count("peers_cut_off")+count("cache_cut_off")+count("proxy_cut_off"),
+		"the Warn's total is its rounds' cut-offs")
+	assert.Contains(t, warns[0][slog.MessageKey], "observed-port allows", "the Warn says what the cut-off costs")
 }
 
 // A shutdown signal during startup drains pre-resolution at once.
@@ -145,9 +180,18 @@ func TestPreResolve_HealthyResolverPopulatesEverything(t *testing.T) {
 	conns := existingPeers(names)
 	sink := &recordingCacheSink{}
 	stub, proxy := &answeringResolver{}, &answeringResolver{}
+	var logs bytes.Buffer
 
-	preResolve(context.Background(), conns, cm, sink, stub, proxy, slog.Default())
+	preResolve(context.Background(), conns, cm, sink, stub, proxy, jsonLogger(&logs))
 
+	assert.Empty(t, logRecords(t, &logs, slog.LevelWarn), "nothing was cut off, so nothing is a Warn")
+	var done []any
+	for _, r := range logRecords(t, &logs, slog.LevelInfo) {
+		if r[slog.MessageKey] == "Pre-resolved tracked hostnames via DNS proxy" {
+			done = append(done, r["resolved"], r["cut_off"])
+		}
+	}
+	assert.Equal(t, []any{float64(names), float64(0)}, done, "the success line reports every name resolved")
 	for ip := range conns {
 		assert.Equal(t, "peer-"+ip+".example", cm.LookupHostnameByIP(ip))
 	}

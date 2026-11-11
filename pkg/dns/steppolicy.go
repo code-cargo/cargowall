@@ -55,9 +55,8 @@ import (
 // it, or, short of a job deny, any step's rules or step chains do.
 //
 // Requirement: a step may not be bound to its policy (map_step_policy)
-// until step installs are L7-scoped. They aren't here, so until then a
-// step's own entries would open a shared edge IP to it on any SNI.
-// Step-aware late-allows aren't done here either.
+// unless step installs are L7-scoped, or a step's own entries would open a
+// shared edge IP to it on any SNI. They are (stepl7.go).
 
 // stepTier is the DNS proxy's step-policy state: what step policies' CNAME
 // chains have taught it, by target name. The job's derived allows stay in
@@ -72,6 +71,8 @@ type stepTier struct {
 	// via holds the CNAME hops answers' addresses came through, for the
 	// backfill's hop check (viaStore).
 	via *viaStore
+	// l7 is the tier's L7 scopes and late-allow bindings (stepl7.go).
+	l7 *stepL7
 }
 
 // viaStore holds, by answered name, the CNAME hops each of the name's
@@ -128,6 +129,7 @@ func newStepTier() stepTier {
 		cname:    newLRUCache[string, stepDerived](10000),
 		withheld: newLRUCache[string, struct{}](1000),
 		via:      &viaStore{hops: make(map[string]stepVia)},
+		l7:       &stepL7{},
 	}
 }
 
@@ -391,7 +393,11 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 	}
 	for _, a := range allows {
 		for _, ip := range ips {
+			s.scopeStepInstall(name, ip, a.ports)
 			changed, err := s.firewall.AddPolicyIP(a.policy, ip, a.ports)
+			if err == nil {
+				s.reconcileStepBlocks(a, name, ip)
+			}
 			switch {
 			case errors.Is(err, firewall.ErrStepBudget):
 				// The firewall warns, rate-limited.
@@ -407,15 +413,17 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 	}
 }
 
-// backfillStepTier is ApplyRulesToTrackedHostnames' step tier: a name the
-// proxy answered before the rules allowing it loaded, or before the firewall
-// was set, gets its IPs installed now. Only the addresses the proxy itself
+// backfillStepTier is ApplyRulesToTrackedHostnames' step tier. The step
+// installs among ipSet are scoped again, after the replay's scope flush. And
+// a name the proxy answered before the rules allowing it loaded, or before
+// the firewall was set, gets its IPs installed now. Only the addresses the proxy itself
 // answered for the name: their hops are known, and checked. Never one a
 // system-resolver or reverse lookup put to the name (the job's replay takes
 // those too): the first carries no chain to check, and a reverse lookup's
 // name is whatever the address's owner says. A step starts after cargowall,
 // so it has no connection from before that such an address could serve.
 func (s *Server) backfillStepTier(name string, verdict config.HostnameVerdict, ipSet map[string]bool) {
+	s.rescopeStepTier(ipSet)
 	via, kept := s.viaFor(name)
 	allows, _ := s.stepAllowsFor(name, verdict)
 	if len(allows) == 0 {

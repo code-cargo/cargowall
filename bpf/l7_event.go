@@ -91,7 +91,7 @@ type L7Event struct {
 	Scope      uint8
 	Seq        uint32
 	PayloadLen uint16
-	Pad        uint16
+	StepPolicy uint16   // the step policy the socket is judged by, 0 for none
 	DcidLen    uint8    // QUIC Initial's DCID length, 0 for TCP
 	Dcid       [20]byte // the connection-attempt identity the verdict pins
 	Pad2       [3]byte

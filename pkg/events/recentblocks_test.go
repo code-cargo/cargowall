@@ -267,12 +267,12 @@ func TestRecentBlocks_MidStreamBlockIsReconcilable(t *testing.T) {
 func TestRecentBlocks_ContestedDestinationDegradesIdentity(t *testing.T) {
 	now := time.Now()
 
-	// Two containers: origin survives, id does not.
+	// Two containers of one step: origin survives, id does not.
 	rb := NewRecentBlocks(0)
 	a := blockedAuditEvent("20.0.0.1", 443, "TCP", now.Add(-2*time.Second))
 	a.ContainerID, a.ContainerOrigin, a.StepOrdinal = "aaa111", true, 3
 	b := blockedAuditEvent("20.0.0.1", 443, "TCP", now.Add(-1*time.Second))
-	b.ContainerID, b.ContainerOrigin, b.StepOrdinal = "bbb222", true, 5
+	b.ContainerID, b.ContainerOrigin, b.StepOrdinal = "bbb222", true, 3
 	b.SrcIP, b.PID = "10.0.0.2", 43
 	rb.Consume(a)
 	rb.Consume(b)
@@ -280,7 +280,7 @@ func TestRecentBlocks_ContestedDestinationDegradesIdentity(t *testing.T) {
 	require.Len(t, taken, 1)
 	assert.Empty(t, taken[0].ContainerID, "naming either container would be a coin flip")
 	assert.True(t, taken[0].ContainerOrigin, "both attempts were containers; the tier claim stands")
-	assert.Zero(t, taken[0].StepOrdinal)
+	assert.Equal(t, uint32(3), taken[0].StepOrdinal, "both were the step's")
 	assert.Zero(t, taken[0].PID)
 	assert.Empty(t, taken[0].SrcIP)
 
@@ -327,4 +327,28 @@ func TestRecentBlocks_ContestedKeepsNewestTimestamp(t *testing.T) {
 	taken := rb.TakeMatching("20.0.0.1", nil, nil, false)
 	require.Len(t, taken, 1)
 	assert.True(t, taken[0].At.Equal(newer.Timestamp), "At is max(prev, next), not last-writer")
+}
+
+// Blocks are kept per step: two steps blocked on one destination are two
+// entries, each with its own identity, and a step's own rules opening the
+// destination (TakeMatchingFor) re-report that step's alone. What the job's
+// rules open (TakeMatching) they open for every step.
+func TestRecentBlocks_PerStep(t *testing.T) {
+	now := time.Now()
+	rb := NewRecentBlocks(0)
+	for _, ordinal := range []uint32{3, 5, 0} {
+		e := blockedAuditEvent("20.0.0.1", 443, "TCP", now.Add(-time.Second))
+		e.StepOrdinal, e.PID = ordinal, 40+ordinal
+		rb.Consume(e)
+	}
+	taken := rb.TakeMatchingFor("20.0.0.1", func(o uint32) bool { return o == 5 }, nil, nil, false)
+	require.Len(t, taken, 1)
+	assert.Equal(t, uint32(5), taken[0].StepOrdinal)
+	assert.Equal(t, uint32(45), taken[0].PID, "its own identity, not degraded by another step's")
+	assert.Empty(t, rb.TakeMatchingFor("20.0.0.1", func(uint32) bool { return false }, nil, nil, false))
+
+	taken = rb.TakeMatching("20.0.0.1", nil, nil, false)
+	require.Len(t, taken, 2, "the others stay until the job's rules open them")
+	assert.ElementsMatch(t, []uint32{3, 0}, []uint32{taken[0].StepOrdinal, taken[1].StepOrdinal})
+	assert.Empty(t, rb.TakeMatching("20.0.0.1", nil, nil, false))
 }

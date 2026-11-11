@@ -1161,43 +1161,7 @@ func (s *Server) reconcileRecentBlocks(ip net.IP, hostname, matchedRule string, 
 	if s.recentBlocks == nil || s.auditLogger == nil {
 		return
 	}
-	for _, b := range s.recentBlocks.TakeMatching(ip.String(), allowPorts, denyPorts, hasDeny) {
-		s.logger.Info("Connection late-allowed (reconciled after DNS resolution)",
-			"dst", hostname,
-			"dst_ip", b.DstIP,
-			"dst_port", b.DstPort,
-			"process", b.Process,
-			"pid", b.PID,
-			"matched_rule", matchedRule)
-		// The caller's chain (from the resolution that opened the firewall)
-		// wins when present; otherwise the chain recorded with the original
-		// blocked attempt is preserved rather than dropped.
-		chain := cnameChain
-		if len(chain) == 0 {
-			chain = b.CNAMEChain
-		}
-		// Dated at the original blocked attempt (b.At), not reconcile time,
-		// so the event supersedes every blocked record at or before it and
-		// step correlation reflects when the connection actually happened.
-		if err := s.auditLogger.LogEvent(events.AuditEvent{
-			Timestamp:       b.At,
-			EventType:       events.EventConnectionLateAllowed,
-			SrcIP:           b.SrcIP,
-			DstIP:           b.DstIP,
-			DstHostname:     hostname,
-			DstPort:         b.DstPort,
-			Protocol:        b.Protocol,
-			Process:         b.Process,
-			PID:             b.PID,
-			MatchedRule:     matchedRule,
-			CNAMEChain:      chain,
-			StepOrdinal:     b.StepOrdinal,
-			ContainerID:     b.ContainerID,
-			ContainerOrigin: b.ContainerOrigin,
-		}); err != nil {
-			s.logger.Error("Failed to write audit log", "error", err)
-		}
-	}
+	s.reportLateAllowed(s.recentBlocks.TakeMatching(ip.String(), allowPorts, denyPorts, hasDeny), hostname, matchedRule, cnameChain)
 }
 
 // maxPreResolveDepth bounds recursive pre-resolution when a pre-resolved

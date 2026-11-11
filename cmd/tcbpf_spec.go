@@ -17,13 +17,55 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 
 	"github.com/cilium/ebpf"
 
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/config"
+	cargowallEbpf "github.com/code-cargo/cargowall/pkg/ebpf"
 )
+
+// loadCollection loads a collection spec into a bpf2go objects struct
+// (pkg/ebpf.LoadObjects); a seam for the step-rules gate's tests.
+var loadCollection = defaultLoadCollection
+
+var defaultLoadCollection = cargowallEbpf.LoadObjects
+
+// loadTcObjects loads the tcbpf collection into objs, from loadTcSpec's
+// spec, with step rules on exactly when the startup policy has steps. The
+// gate is decided once, from the policy in hand before the load: it is a
+// load-time constant, and nothing delivers a policy after the load, so a
+// path that ever did would have to reload the collection to change it. On a
+// kernel whose verifier rejects the step lookup, the collection loads
+// without it (bpf.LoadWithStepRules): the steps lose their own rules, with a
+// Warn, and the loss reads as HasStepRules with objs.StepRules false.
+func loadTcObjects(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger, objs *bpf.TcBpfObjects) error {
+	spec, steps, err := loadTcSpec(cmd, configMgr)
+	if err != nil {
+		return err
+	}
+	opts := ebpf.CollectionOptions{Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelBranch | ebpf.LogLevelStats}}
+	on, err := bpf.LoadWithStepRules(spec, steps, func(spec *ebpf.CollectionSpec) error {
+		return loadCollection(logger, "tcbpf", spec, opts, objs)
+	})
+	if err != nil {
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			logger.Error("eBPF verifier error - Full log follows:")
+			// Print the full log to stderr since it might be very long
+			_, _ = fmt.Fprintf(os.Stderr, "\n=== VERIFIER LOG START ===\n%s\n=== VERIFIER LOG END ===\n", verr.Log)
+		}
+		return fmt.Errorf("failed to load TC eBPF objects: %w", err)
+	}
+	if steps && !on {
+		logger.Warn("Step rules are off: this kernel's verifier rejected the step lookup, so every step gets the job's rules alone")
+	}
+	return nil
+}
 
 // loadTcSpec loads the tcbpf collection spec, sized for the run.
 //
@@ -36,11 +78,12 @@ import (
 // job's size alone without step rules, as before step policies, and with
 // room for the steps' with them. The policy is read once, here, before the
 // load; nothing loads one after it. So this settles the step rules: a run
-// that loaded no policy has none (config.Manager.SettleStepRules).
-func loadTcSpec(cmd *StartCmd, configMgr *config.Manager) (*ebpf.CollectionSpec, error) {
+// that loaded no policy has none (config.Manager.SettleStepRules). It
+// reports whether the policy has steps, for the step-rules gate.
+func loadTcSpec(cmd *StartCmd, configMgr *config.Manager) (*ebpf.CollectionSpec, bool, error) {
 	spec, err := bpf.LoadTcBpf()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load TC eBPF spec: %w", err)
+		return nil, false, fmt.Errorf("failed to load TC eBPF spec: %w", err)
 	}
 	if !cmd.StepAttribution {
 		// Present unless the generated spec is stale (go generate not run);
@@ -52,8 +95,9 @@ func loadTcSpec(cmd *StartCmd, configMgr *config.Manager) (*ebpf.CollectionSpec,
 		}
 	}
 	configMgr.SettleStepRules()
-	if err := bpf.SizeRuleMaps(spec, configMgr.HasStepRules()); err != nil {
-		return nil, fmt.Errorf("failed to size the rule maps: %w", err)
+	steps := configMgr.HasStepRules()
+	if err := bpf.SizeRuleMaps(spec, steps); err != nil {
+		return nil, false, fmt.Errorf("failed to size the rule maps: %w", err)
 	}
-	return spec, nil
+	return spec, steps, nil
 }

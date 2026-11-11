@@ -57,6 +57,15 @@ SNI/Host, which matches no rule, and a rules-only matcher would deny every such
 flow. Derived names are port-scoped by the ports they inherited from their
 origin, and expire exactly when the derived TTL does.
 
+A flow from a step's socket adds a third: that step's own rules and CNAME
+chains (`Server.StepAllowPorts`), after the job's tiers and never past a job
+deny, so a step reaches a shared edge address by the names its rules allow
+and no others. Which step is the kernel's answer, not the oracle's: each
+punt carries the step policy the socket is judged by, read with the punt
+(`l7_event.step_policy`), because a binding landing between the punt and a
+userspace lookup would judge an unbound flow by a step's rules. A step's DNS
+installs are scoped exactly as the job's are.
+
 A duplicate-SNI hello (two `server_name` extensions, or two `host_name` list
 entries) is rejected as malformed rather than resolved first- or last-wins:
 with two names in flight, the enforcer and the server could pick different

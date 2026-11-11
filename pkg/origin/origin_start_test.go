@@ -18,6 +18,7 @@ package origin
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/cargowall/bpf"
@@ -154,6 +156,7 @@ func TestStartSharesStepPolicy(t *testing.T) {
 			var b uint8
 			require.NoError(t, o.objs.StepRulesEnabled.Get(&b))
 			require.Equal(t, gate, b != 0, "the hook is built with TC's gate")
+			require.Equal(t, gate, o.StepRules())
 			size := bpf.RuleMapEntriesJobOnly
 			if gate {
 				size = bpf.RuleMapEntries
@@ -181,4 +184,42 @@ func mapID(t *testing.T, m *ebpf.Map) ebpf.MapID {
 	id, ok := info.ID()
 	require.True(t, ok, "kernel reports no id for %s", m)
 	return id
+}
+
+// A kernel whose verifier rejects the step lookup at the hook alone loads
+// the hook without it, with a Warn: the steps lose their own rules there,
+// never the hook.
+func TestStart_StepRulesFallBackOff(t *testing.T) {
+	requireBPFOrigin(t)
+	attachAtTestCgroup(t, "steps-fallback")
+	spec, err := bpf.LoadTcBpf()
+	require.NoError(t, err)
+	for _, name := range []string{"map_task_step", "map_sock_step", "map_task_nspid"} {
+		spec.Maps[name].MaxEntries = 64
+	}
+	require.NoError(t, bpf.SetStepRules(spec, true))
+	require.NoError(t, bpf.SizeRuleMaps(spec, true))
+	var tc bpf.TcBpfObjects
+	require.NoError(t, spec.LoadAndAssign(&tc, nil))
+	t.Cleanup(func() { tc.Close() })
+
+	attempts := 0
+	real := loadObjects
+	swap(t, &loadObjects, func(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any) error {
+		attempts++
+		var gate uint8
+		require.NoError(t, spec.Variables[bpf.OriginBpfVarStepRulesEnabled].Get(&gate))
+		if gate != 0 {
+			return &ebpf.VerifierError{Cause: errors.New("too complex")}
+		}
+		return real(logger, collection, spec, opts, to)
+	})
+	var log bytes.Buffer
+	o, err := Start(&tc, podenv.Scope{}, slog.New(slog.NewTextHandler(&log, nil)))
+	require.NoError(t, err, log.String())
+	t.Cleanup(o.Close)
+	assert.Equal(t, 2, attempts)
+	assert.False(t, o.StepRules())
+	assert.True(t, tc.StepRules(), "TC keeps its own")
+	assert.Contains(t, log.String(), "Step rules are off at the cgroup egress hook")
 }

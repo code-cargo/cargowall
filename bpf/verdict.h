@@ -192,9 +192,9 @@ struct {
 // helper, an unknown step) and a socket with no tag have no step policy,
 // and the job's rules alone judge them.
 
-// Nonzero when some step has rules of its own. A load-time constant, so a
-// job without step rules runs no step lookup at all: at zero the verifier
-// prunes the branch.
+// Nonzero when the policy loaded at startup has steps with rules of their
+// own. A load-time constant, so a job without step rules runs no step
+// lookup at all: at zero the verifier prunes the branch.
 const volatile __u8 step_rules_enabled = 0;
 
 // socket cookie → step ordinal, written at socket creation (cw_cg_sock_new
@@ -208,9 +208,10 @@ struct {
 } map_sock_step SEC(".maps");
 
 // step ordinal → the policy that holds the step's own allow rules.
-// Requirement: a step may not be bound here until step installs are
-// L7-scoped; until then a step's own entries would open a shared edge IP
-// to it on any SNI.
+// Requirement: a step may be bound here only while step installs are
+// L7-scoped, or a step's own entries would open a shared edge IP to it on
+// any SNI. They are: a step's DNS install scopes its address, and the L7
+// oracle judges a punt's name by the step policy step_policy_judged gives.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u32);
@@ -396,6 +397,17 @@ static __always_inline __u32 cookie_step_policy(__u64 cookie) {
         return POLICY_JOB;
     __u32 *policy = bpf_map_lookup_elem(&map_step_policy, ordinal);
     return policy ? *policy : POLICY_JOB;
+}
+
+// step_policy_judged is the step policy the socket with cookie is judged
+// by, or POLICY_JOB with step rules off. The L7 oracle judges a flow's name
+// by the policy this read gives with the punt, never by one it reads later,
+// which a binding landing in between would change. Policies fit 16 bits
+// (STEP_STAMP_POLICY_MAX), as the punt carries them.
+static __always_inline __u32 step_policy_judged(__u64 cookie) {
+    if (!step_rules_enabled)
+        return POLICY_JOB;
+    return cookie_step_policy(cookie);
 }
 
 // step_policy_of is the step policy skb is judged by: that of the socket it

@@ -867,10 +867,17 @@ to select policy with.
   write in its family; the sync warns, per step. Every sync rebuilds the
   step tier against the denies it wrote, clearing the step entries
   before it, and the tracked-hostname backfill that follows re-installs
-  the DNS path's. A load-time constant (`step_rules_enabled`) prunes the
-  step lookup from both hooks when no step has rules; the data plane is
-  in place, and the policy's `steps` load and fill it (below), but
-  nothing turns it on or binds a step yet.
+  the DNS path's. A load-time constant (`step_rules_enabled`) turns the
+  step lookup on in both hooks exactly when the policy loaded at startup
+  has steps, and prunes it otherwise: then neither the bridge stamp's
+  port programs nor its link watcher start either. It is read once, from
+  the policy in hand before the tcbpf load (`loadTcObjects`); nothing
+  delivers a policy after the load, and a reload path that ever did would
+  have to reload the collections to change it. A kernel whose verifier
+  rejects the gate-on load of either collection loads it again with the
+  gate off, with a Warn: the steps lose their own rules there, which
+  fails closed, never the hook. The data plane and the policy's `steps`
+  fill it (below); nothing binds a step yet.
   - *Where a step's rules come from.* The policy's `steps`, one
     `{id, rules}` per step, in the local `--config` (env-var config carries
     none, and a load replaces them wholesale, as it does the rules). The id
@@ -892,10 +899,23 @@ to select policy with.
     step and to untagged traffic. A name the job's rules deny, on any port,
     gets no step install: under a deny default the job writes nothing for a
     name it denies, it only withholds the allow, and a step entry would
-    fill that silence (above). L7 scoping and the late-allow still judge
-    by the job's rules alone. Requirement: no step may be bound to its
-    policy until step installs are L7-scoped; until then a step's own
-    entries would open a shared edge IP to it on any SNI. And anything
+    fill that silence (above). Requirement: no step may be bound to its
+    policy unless its installs are L7-scoped, or a step's own entries
+    would open a shared edge IP to it on any SNI. They are: a step's DNS
+    install scopes its address for the name, before the address opens,
+    as the job's does, and the tracked-hostname replay scopes the step
+    installs again after its scope flush. The kernel stamps each punt with
+    the step policy its socket is judged by (`l7_event.step_policy`), read
+    with the punt, so a binding that lands after it can't change the
+    judgement; the oracle admits the name by the job's tiers first and
+    then by that policy's own rules and chains, never past a job deny and
+    never for a name the job denies on any port. A step bound to its
+    policy therefore reaches a shared edge address only by the names its
+    rules allow there. A step's install re-reports as late-allowed only
+    the recent blocks of the steps bound to its policy (`RecentBlocks` is
+    kept per step ordinal); a job install re-reports everyone's. The
+    late-allow from the event pipeline still judges by the job's rules
+    alone. And anything
     that reloads step rules at runtime must clear the step policies'
     entries, the DNS path's included, before installing: policies are
     numbered per load, so a kept entry would be another step's. The sync

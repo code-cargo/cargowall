@@ -898,7 +898,12 @@ to select policy with.
     that reloads step rules at runtime must clear the step policies'
     entries, the DNS path's included, before installing: policies are
     numbered per load, so a kept entry would be another step's. The sync
-    does that (above); today it runs once, at startup. And anything that
+    does that (above); today it runs once, at startup, over an empty step
+    tier. A runtime reload that cannot clear every step entry must treat
+    the step tier as failed (write no step entries, Warn), or plan the
+    survivors' prefixes as unconfirmed so their carves are kept: the
+    rebuild plans as if the maps held no step entries, so a survivor is
+    gated against nothing in the new tier. And anything that
     backfills at runtime must keep the backfill's record of the CNAME hops
     each answered address came through open until it has run: the startup
     backfill drops it once it is done, since every answer after it is

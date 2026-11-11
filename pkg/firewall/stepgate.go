@@ -416,7 +416,8 @@ func (f *FirewallImpl) warnStepRuleLocked(sr config.StepRules, label string, err
 // clearStepsLocked deletes every step entry from the rule maps, by the
 // ledger, which holds each, and empties the step accumulators. A key whose
 // delete fails stays in the ledger: still charged, and retried by the next
-// clear, never left in the map untracked.
+// clear, never left in the map untracked. The rebuild after it plans as if
+// it cleared all; design.md's reload requirement covers one that can't.
 func (f *FirewallImpl) clearStepsLocked() {
 	for m := range numRuleMaps {
 		for key := range f.steps.keys[m] {

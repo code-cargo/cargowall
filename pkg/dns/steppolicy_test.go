@@ -694,6 +694,14 @@ func TestStepVia_KeptOnlyForSteps(t *testing.T) {
 	chained(s0, "after.example.com", "10.1.0.38")
 	assert.True(t, dropped(s0), "settled to no step rules")
 
+	// Unsettled, a run that loads no policy loses the store at the startup
+	// backfill all the same.
+	unsettled := newStepTestServer(t, config.NewConfigManager(), newRecordingFirewall())
+	chained(unsettled, "early.example.com", "10.1.0.37")
+	unsettled.ApplyRulesToTrackedHostnames()
+	chained(unsettled, "late.example.com", "10.1.0.36")
+	assert.True(t, dropped(unsettled), "sealed with no policy loaded")
+
 	cfg := config.NewConfigManager()
 	s := newStepTestServer(t, cfg, newRecordingFirewall())
 	chained(s, "early.example.com", "10.1.0.40")

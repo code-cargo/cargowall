@@ -263,7 +263,6 @@ func TestOwnedAddrs_NotAdvertised(t *testing.T) {
 // Info line for the one and a Warn for the other, and Remove takes off what
 // went in.
 func TestOwnedAddrs_ARPGuardBestEffort(t *testing.T) {
-	enterNetns(t)
 	ipOnly := map[string]int{"ip input": 4, "ip forward": 1}
 	for _, c := range []struct {
 		name, level string
@@ -284,6 +283,9 @@ func TestOwnedAddrs_ARPGuardBestEffort(t *testing.T) {
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			// Each subtest runs on its own goroutine, and so on a thread
+			// the parent's namespace never reached: it enters its own.
+			enterNetns(t)
 			var buf bytes.Buffer
 			owned := NewOwnedAddrs(netip.Addr{}, nil, slog.New(slog.NewTextHandler(&buf, nil)))
 			c.setup(t, owned)

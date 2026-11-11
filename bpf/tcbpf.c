@@ -119,10 +119,9 @@ struct {
 // step tier asked) per interval. 10s caps each at 6 events/min, so up to
 // 12 per destination tuple, one series for each tier, while refreshing
 // well inside the 5-minute RecentBlocks TTL, so the late-allow reconciler
-// always has a live entry. 4096 entries matches the rule maps — up to two
-// per distinct blocked destination tuple, one per tier, ~110KB worst
-// case. LRU eviction under pressure costs an occasional duplicate event,
-// never a lost verdict.
+// always has a live entry. 4096 entries: up to two per distinct blocked
+// destination tuple, one per tier, ~110KB worst case. LRU eviction under
+// pressure costs an occasional duplicate event, never a lost verdict.
 #define MIDSTREAM_EMIT_INTERVAL_NS (10ULL * 1000000000ULL)
 
 // One exact destination tuple: the rate-limit key, policy-free since it

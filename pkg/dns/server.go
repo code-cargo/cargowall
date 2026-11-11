@@ -119,6 +119,7 @@ type Server struct {
 	// recentDNSBlocks buffers refused QUERIES for the same reconciliation on
 	// the DNS side (#119); see reconcileRefusedQueries.
 	recentDNSBlocks *events.RecentDNSBlocks
+	steps           stepTier // the step policies' writers' state (steppolicy.go)
 }
 
 // dnsCacheEntry holds a cached DNS response
@@ -145,6 +146,7 @@ func NewServer(cfg *config.Manager, fw firewall.Firewall, upstream, listenAddr s
 		cnameAllowed:  newLRUCache[string, derivedAllow](10000),
 		preResolved:   newLRUCache[string, struct{}](1000),
 		listenerModes: make(map[string]listenerAttribution),
+		steps:         newStepTier(),
 	}
 }
 
@@ -188,20 +190,22 @@ func (s *Server) EnableQueryFiltering(enable bool) {
 //     rule fires — the firewall layer enforces per-port deny separately.
 //     A pure deny verdict (no allow) blocks the query. A deny rule for
 //     "blocked" still blocks "blocked.compute.internal".
-//  4. Derived CNAME-target allow: the name was learned as a CNAME target of
+//  4. Step rules, short of a job deny: a step's own rules, or a CNAME chain
+//     rooted at one, allow the name (stepAllowsQuery).
+//  5. Derived CNAME-target allow: the name was learned as a CNAME target of
 //     a rule-allowed response → allow. This lets CNAME-chasing clients query
 //     the target directly (e.g. an Akamai edge name an allowed host CNAMEs
 //     to) instead of being REFUSED. Checked AFTER the deny rule above, so an
 //     explicit deny on the target still wins.
-//  5. Search-domain bypass: full form ends in a configured suffix → allow.
+//  6. Search-domain bypass: full form ends in a configured suffix → allow.
 //     This is the "let cloud-internal names resolve when no hostname rule
 //     covers them" path; traffic is still governed by hostname/CIDR rules.
-//  6. Default action.
+//  7. Default action.
 //
-// Every path above is deliberately run-wide: this gate must never grow a
-// step dimension, because DNS client attribution cannot be made per-step
-// causal — see "DNS and per-step policy" in design.md. Per-step tightness
-// belongs at the connection verdict, not here.
+// Every path above is deliberately run-wide: step rules join as a union,
+// never keyed by the step that asked, because DNS client attribution cannot
+// be made per-step causal — see "DNS and per-step policy" in design.md.
+// Per-step tightness belongs at the connection verdict, not here.
 func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 	if !s.filterQueries {
 		return true
@@ -218,6 +222,9 @@ func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 
 	verdict := s.config.MatchHostnameRule(domain)
 	if verdict.HasAllow() {
+		return true
+	}
+	if s.stepAllowsQuery(domain, verdict) {
 		return true
 	}
 	if verdict.HasDeny() {
@@ -327,6 +334,7 @@ func (s *Server) ApplyRulesToTrackedHostnames() {
 			continue
 		}
 		verdict := s.config.MatchHostnameRule(hostname)
+		s.backfillStepTier(hostname, verdict, ipSet)
 		if !verdict.Matched() {
 			// The DERIVED tier — the same two-tier selection the live path
 			// applies. A CNAME target a client resolved directly (or that the
@@ -379,6 +387,7 @@ func (s *Server) ApplyRulesToTrackedHostnames() {
 			}
 		}
 	}
+	s.steps.via.seal()
 }
 
 // Start begins listening for DNS queries
@@ -753,6 +762,7 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 				"ttl", ttl)
 		}
 	}
+	stepAllows := s.learnStepTier(canonicalHostname, verdict, links, ips)
 
 	if len(ips) > 0 {
 		s.logger.Debug("DNS resolution intercepted",
@@ -770,8 +780,8 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 		// ephemeral cloud-internal names (e.g. ip-X-X-X-X.compute.internal
 		// per EC2 instance) would grow our per-host maps without bound. A
 		// derived-allowed name is exempt from the skip: it's a real CNAME
-		// target of an allowed host whose IPs must be enforced.
-		if bypassOnly && !verdict.Matched() && !derived {
+		// target of an allowed host whose IPs must be enforced; so is a step's.
+		if bypassOnly && !verdict.Matched() && !derived && len(stepAllows) == 0 {
 			s.logger.Debug("Skipping per-host tracking for bypass-only hostname",
 				"hostname", canonicalHostname,
 				"ip_count", len(ips))
@@ -802,6 +812,7 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 			s.hostnameIPs[canonicalHostname] = newIPSet
 			s.hostnameIPsMutex.Unlock()
 
+			s.installStepTier(stepAllows, canonicalHostname, ips)
 			switch {
 			case verdict.Matched() && s.firewall != nil:
 				s.logger.Debug("Hostname tracked for BPF update",
@@ -923,7 +934,7 @@ func (s *Server) enforceDNSResponse(canonicalHostname string, resp *dns.Msg, dep
 	// firewall opens now rather than at the client's cache expiry.
 	// Depth-bounded so a response chain that keeps terminating in yet
 	// another CNAME can't recurse indefinitely.
-	if len(ips) == 0 && len(links) > 0 && (verdict.HasAllow() || derived) && depth < maxPreResolveDepth {
+	if len(ips) == 0 && len(links) > 0 && (verdict.HasAllow() || derived || len(stepAllows) > 0) && depth < maxPreResolveDepth {
 		s.preResolveCNAMETarget(links[len(links)-1].target, depth+1)
 	}
 }

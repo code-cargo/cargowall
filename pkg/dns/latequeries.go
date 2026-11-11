@@ -77,15 +77,23 @@ func (s *Server) reconcileRefusedQueries() {
 		// The rule that now covers the name, when one does: an allow can
 		// also come from a search-domain suffix, a derived CNAME allow, or a
 		// default-allow policy, none of which name a rule. An empty
-		// matched_rule is the honest rendering of those.
+		// matched_rule is the honest rendering of those. One a step's rules
+		// allow names the step's rule, and the step.
 		matchedRule := s.config.MatchHostnameRule(domain).AllowRule
+		attrs := []any{"domain", block.Domain}
+		if matchedRule == "" {
+			if step, rule := s.stepAllowRule(domain); step != "" {
+				matchedRule = rule
+				attrs = append(attrs, "allowed_by_step", step)
+			}
+		}
 
 		s.logger.Info("DNS query late-allowed (reconciled after rules loaded)",
-			"domain", block.Domain,
-			"matched_rule", matchedRule,
-			"process", block.Process,
-			"pid", block.PID,
-			"refused_at", block.At)
+			append(attrs,
+				"matched_rule", matchedRule,
+				"process", block.Process,
+				"pid", block.PID,
+				"refused_at", block.At)...)
 
 		// Dated at the original refusal (block.At), not reconcile time, so
 		// the event supersedes every dns_blocked record at or before it and

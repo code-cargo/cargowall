@@ -191,9 +191,10 @@ func preResolve(ctx context.Context, conns existingConns, configMgr *config.Mana
 }
 
 // reverseDNSExistingConnections looks up the reverse name of each scanned
-// existing-connection IP through the stub, recording it as that IP's
-// hostname for gateExistingConnections' attribution. It returns how many
-// lookups ctx cut off.
+// existing-connection IP through the stub, recording it as the hostname of
+// each IP that has none yet, for gateExistingConnections' attribution: a
+// reverse name never replaces a forward one. It returns how many lookups ctx
+// cut off.
 func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, stub stubResolver, logger *slog.Logger) int {
 	if len(conns) == 0 {
 		return 0
@@ -204,8 +205,8 @@ func reverseDNSExistingConnections(ctx context.Context, conns existingConns, con
 			return false
 		}
 		hostname := strings.TrimSuffix(names[0], ".")
-		configMgr.UpdateDNSMapping(hostname, ip)
-		logger.Debug("Reverse DNS for existing connection", "ip", ip, "hostname", hostname)
+		recorded := configMgr.RecordReverseName(hostname, ip)
+		logger.Debug("Reverse DNS for existing connection", "ip", ip, "hostname", hostname, "recorded", recorded)
 		return true
 	})
 	logger.Info("Populated reverse DNS cache from existing connections",

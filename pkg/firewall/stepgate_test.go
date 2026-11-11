@@ -19,6 +19,7 @@ package firewall
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	rand "math/rand/v2"
@@ -390,10 +391,137 @@ func TestStepGate_PartialWriteFailsClosed(t *testing.T) {
 		assert.False(t, stepAllows(maps, 443), "fewer allows")
 	})
 	t.Run("a step CIDR rule", func(t *testing.T) {
-		// Job: the host's 80 and the deny's 22. Step: the wildcard's 22 and
-		// the /24's deny on 22; its allow on 443 and the carve find no room.
+		// Job: the host's 80 and the deny's 22. Step: the carve's 22 (carves
+		// go first) and the wildcard's 22; the /24's write finds no room.
 		_, maps := setup(t, 4, config.Rule{Type: config.RuleTypeCIDR, Value: "10.98.0.0/24", Ports: []config.Port{p(22), p(443)}})
 		assert.False(t, stepAllows(maps, 22), "the step got past the job's deny on 22")
 		assert.False(t, stepAllows(maps, 443), "fewer allows")
 	})
+}
+
+// A refused carve costs the step the prefix around it, never the job its
+// deny: the carves go in before any prefix, and a prefix with a refused carve
+// inside it is withheld. Here the job's deny on 22 is hidden at 10.1.2.3 by a
+// job host entry nested inside it, and the steps' share of the port map has
+// no room for the carve's deny entry.
+func TestStepGate_RefusedCarveWithholdsThePrefix(t *testing.T) {
+	host := net.ParseIP("10.1.2.3").To4()
+	p := func(n uint16) config.Port { return config.Port{Port: n, Protocol: config.ProtocolTCP} }
+	var logs bytes.Buffer
+	fw, maps := newStepTestFirewall(ruleMapEntries, slog.New(slog.NewTextHandler(&logs, nil)))
+	fw.steps.budget[ruleMapPorts] = 0
+	_, err := fw.AddIP(host, config.ActionAllow, []config.Port{p(443)}) // nested, before the deny's sync
+	require.NoError(t, err)
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfig(writeStepConfig(t,
+		[]config.Rule{{Type: config.RuleTypeCIDR, Value: "10.1.0.0/16", Ports: []config.Port{p(22)}, Action: config.ActionDeny}},
+		[]config.StepConfig{{ID: "a", Rules: []config.Rule{{Type: config.RuleTypeCIDR, Value: "10.0.0.0/8"}}}})))
+	require.NoError(t, fw.UpdateAllowlistTC(cm))
+
+	assert.False(t, verdictV4(maps, 1, host, 22) && !verdictV4(maps, bpf.PolicyJob, host, 22), "the step got past the job's deny on 22")
+	assert.Empty(t, entriesOf(t, maps[ruleMapCIDRs], 1), "the /8 is withheld with its carve")
+	assert.Contains(t, logs.String(), "Step rule entry withheld")
+	for m := range numRuleMaps {
+		assert.Equal(t, stepEntries(t, maps[m]), fw.steps.used(m), "%s ledger", m)
+	}
+}
+
+// A carve whose prefix is then refused protects nothing, and is taken out
+// again, uncharged.
+func TestStepGate_UnneededCarveRemoved(t *testing.T) {
+	p := func(n uint16) config.Port { return config.Port{Port: n, Protocol: config.ProtocolTCP} }
+	fw, maps := newStepTestFirewall(ruleMapEntries, nil)
+	fw.steps.budget[ruleMapCIDRs] = 1 // the carve's LPM entry, and no room for the /8's
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfig(writeStepConfig(t,
+		[]config.Rule{{Type: config.RuleTypeCIDR, Value: "10.1.0.0/16", Ports: []config.Port{p(22)}, Action: config.ActionDeny}},
+		[]config.StepConfig{{ID: "a", Rules: []config.Rule{{Type: config.RuleTypeCIDR, Value: "10.0.0.0/8"}}}})))
+	require.NoError(t, fw.UpdateAllowlistTC(cm))
+	for m := range numRuleMaps {
+		assert.Zero(t, stepEntries(t, maps[m]), "%s", m)
+		assert.Zero(t, fw.steps.used(m), "%s ledger", m)
+	}
+}
+
+// failingDeletes is a mock map whose Delete fails while fail is set.
+type failingDeletes struct {
+	*cappedMap
+	fail bool
+}
+
+func (m *failingDeletes) Delete(key any) error {
+	if m.fail {
+		return errors.New("delete failed")
+	}
+	return m.cappedMap.Delete(key)
+}
+
+// A step entry whose delete fails at the sync's clear stays in the ledger,
+// charged, and the next sync's clear takes it out.
+func TestSync_FailedClearStaysCharged(t *testing.T) {
+	fw, maps := newStepTestFirewall(ruleMapEntries, nil)
+	cidrs := &failingDeletes{cappedMap: maps[ruleMapCIDRs]}
+	fw.cidrsMap = cidrs
+	_, err := fw.AddPolicyIP(1, net.ParseIP("10.9.0.1"), nil)
+	require.NoError(t, err)
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfig(writeStepConfig(t, nil, nil)))
+	cidrs.fail = true
+	require.NoError(t, fw.UpdateAllowlistTC(cm))
+	assert.Len(t, entriesOf(t, maps[ruleMapCIDRs], 1), 1, "the delete failed")
+	assert.Equal(t, 1, fw.steps.used(ruleMapCIDRs), "so the key stays charged")
+
+	cidrs.fail = false
+	require.NoError(t, fw.UpdateAllowlistTC(cm))
+	assert.Empty(t, entriesOf(t, maps[ruleMapCIDRs], 1))
+	assert.Zero(t, fw.steps.used(ruleMapCIDRs))
+}
+
+// A job deny on a family's whole space, on all ports, leaves a step's rules
+// nothing there; the sync says so, per step and family, naming the rule.
+func TestSync_WarnsOfWholeSpaceDenies(t *testing.T) {
+	var logs bytes.Buffer
+	fw, _ := newStepTestFirewall(ruleMapEntries, slog.New(slog.NewTextHandler(&logs, nil)))
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfig(writeStepConfig(t,
+		[]config.Rule{
+			{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Action: config.ActionDeny},
+			{Type: config.RuleTypeCIDR, Value: "10.0.0.0/8", Action: config.ActionDeny}, // not the whole space
+			{Type: config.RuleTypeCIDR, Value: "::/0", Ports: []config.Port{{Port: 22, Protocol: config.ProtocolTCP}}, Action: config.ActionDeny},
+		},
+		[]config.StepConfig{
+			{ID: "a", Rules: []config.Rule{{Type: config.RuleTypeHostname, Value: "a.example.com"}}},
+			{ID: "b", Rules: []config.Rule{{Type: config.RuleTypeCIDR, Value: "10.0.0.0/8"}}},
+		})))
+	require.NoError(t, fw.UpdateAllowlistTC(cm))
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte("A step's rules allow nothing in IPv4")), "once per step")
+	assert.Contains(t, logs.String(), "job_deny=0.0.0.0/0")
+	assert.NotContains(t, logs.String(), "allow nothing in IPv6", "a deny on some ports leaves the rest")
+}
+
+// A carve's allows are for the prefixes written around it, never one a
+// refused carve withheld: those allows would reach inside the refused
+// carve's deny. Here the job denies 22 in 10.1.0.0/16 and every port in
+// 10.1.5.0/24, the latter hidden at 10.1.5.9 by a nested job entry, and the
+// steps' share of the trie has room for one carve.
+func TestStepGate_CarveKeepsOnlyForWrittenPrefixes(t *testing.T) {
+	host := net.ParseIP("10.1.5.9").To4()
+	p := func(n uint16) config.Port { return config.Port{Port: n, Protocol: config.ProtocolTCP} }
+	fw, maps := newStepTestFirewall(ruleMapEntries, nil)
+	fw.steps.budget[ruleMapCIDRs] = 1
+	_, err := fw.AddIP(host, config.ActionAllow, []config.Port{p(80)})
+	require.NoError(t, err)
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfig(writeStepConfig(t,
+		[]config.Rule{
+			{Type: config.RuleTypeCIDR, Value: "10.1.0.0/16", Ports: []config.Port{p(22)}, Action: config.ActionDeny},
+			{Type: config.RuleTypeCIDR, Value: "10.1.5.0/24", Action: config.ActionDeny},
+		},
+		[]config.StepConfig{{ID: "a", Rules: []config.Rule{{Type: config.RuleTypeCIDR, Value: "10.0.0.0/8", Ports: []config.Port{p(22), p(443)}}}}})))
+	require.NoError(t, fw.UpdateAllowlistTC(cm))
+	assert.False(t, verdictV4(maps, 1, host, 443) && !verdictV4(maps, bpf.PolicyJob, host, 443), "the step got past the job's deny on 443")
+	for m := range numRuleMaps {
+		assert.Zero(t, stepEntries(t, maps[m]), "%s: the /8 withheld, its landed carve taken out", m)
+	}
 }

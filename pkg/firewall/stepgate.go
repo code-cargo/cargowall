@@ -17,6 +17,7 @@
 package firewall
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -143,8 +144,8 @@ const maxGatedNotes = 1024
 
 // syncStepsLocked rebuilds the step tier against the job's rules the sync
 // just wrote: it clears every step entry, takes the job's CIDR denies for
-// the gate, writes each step's CIDR rules, gated, and then carves out of
-// each step's prefixes the job's denies inside them. A step's hostname rules
+// the gate, and writes each step's CIDR rules, gated, with the job's denies
+// inside them carved out (writeStepCIDRsLocked). A step's hostname rules
 // get their IPs from the DNS path alone, which the tracked-hostname backfill
 // that follows every sync re-installs. A step rule that can't be installed
 // is a Warn, not an error: it costs only that step's extra reach, which
@@ -156,86 +157,173 @@ func (f *FirewallImpl) syncStepsLocked(jobRules []config.ResolvedRule, steps []c
 	f.clearStepsLocked()
 	f.jobDenies = jobCIDRDenies(jobRules)
 	for _, sr := range steps {
-		var written []stepPrefix
-		for _, rule := range sr.Rules {
-			if rule.Type == config.RuleTypeCIDR && rule.IPNet != nil {
-				if w, ok := f.installStepCIDRLocked(sr, rule); ok {
-					written = append(written, w)
-				}
-			}
-		}
-		f.carveLocked(sr, written)
+		f.warnWholeSpaceDeniesLocked(sr)
+		f.writeStepCIDRsLocked(sr)
 	}
 }
 
-// stepPrefix is a step CIDR rule as written: its prefix and allowed ports
-// (nil: all).
-type stepPrefix struct {
-	net   *net.IPNet
-	ports []portProto
-}
-
-// installStepCIDRLocked writes one step CIDR rule, gated, and reports what
-// it wrote.
-func (f *FirewallImpl) installStepCIDRLocked(sr config.StepRules, rule config.ResolvedRule) (stepPrefix, bool) {
-	allow, deny, ok := f.gateStepLocked(sr.Policy, rule.IPNet, expandPorts(rule.Ports))
-	if !ok {
-		return stepPrefix{}, false
-	}
-	// Denies first, as AddPolicyIP writes them.
-	var err error
-	if len(deny) > 0 {
-		err = f.stepWriteErrLocked(sr.Policy, rule.Value, f.addCIDRPortsLocked(sr.Policy, rule.IPNet, 0, deny))
-	}
-	if err == nil {
-		err = f.stepWriteErrLocked(sr.Policy, rule.Value, f.addCIDRPortsLocked(sr.Policy, rule.IPNet, 1, allow))
-	}
-	f.warnStepRuleLocked(sr, rule.Value, err)
-	return stepPrefix{net: rule.IPNet, ports: allow}, err == nil
-}
-
-// carveLocked carves out of a step's written prefixes each job CIDR deny
-// strictly inside one of them: at the deny's prefix, deny entries for what
-// the job denies there, by every job deny around it, and allows for what the
-// step's port-listed prefixes around it still allow (a wildcard's allow
-// reaches through a deny entry's misses on its own). Where the job denies
-// every port there, it is carved whole. A step prefix on all ports around
-// it keeps nothing inside it, save what a wildcard reaches: no entry can say
-// all ports but those (fail-closed).
-func (f *FirewallImpl) carveLocked(sr config.StepRules, written []stepPrefix) {
+// warnWholeSpaceDeniesLocked warns that a job deny on a family's whole
+// address space, on all ports, leaves a step's rules nothing to allow in
+// that family: the gate withholds every step write inside it. It is often
+// written beside a deny default, where it adds nothing for the job.
+func (f *FirewallImpl) warnWholeSpaceDeniesLocked(sr config.StepRules) {
 	for i := range f.jobDenies {
 		jd := &f.jobDenies[i]
-		denied, whole := f.jobDeniedWithinLocked(jd.net)
-		var keep []portProto
-		inside := false
+		if !isWholeSpace(jd.net) {
+			continue // the whole space is here on all ports only: with ports it is a wildcard
+		}
+		family := "IPv4"
+		if jd.net.IP.To4() == nil {
+			family = "IPv6"
+		}
+		f.logger.Warn("A step's rules allow nothing in "+family+": the job's rules deny all of it, on every port, "+
+			"and the job decides first",
+			"step", sr.StepID, "policy", sr.Policy, "job_deny", jd.net.String())
+	}
+}
+
+// stepPrefix is a step CIDR rule as the gate leaves it: its prefix, the
+// ports it allows (nil: all) and those a job deny around it takes back.
+type stepPrefix struct {
+	label       string
+	net         *net.IPNet
+	allow, deny []portProto
+}
+
+// carve is one job CIDR deny strictly inside a step's prefixes: what the job
+// denies there, by every job deny around it, and whether that is all ports.
+type carve struct {
+	jd     *jobDeny
+	denied []portProto
+	whole  bool
+	landed bool
+}
+
+// writeStepCIDRsLocked writes one step's CIDR rules, gated, and carves out
+// of them the job's denies inside them, so no prefix is ever live without
+// its carves. In order:
+//  1. the carves, as deny entries alone, for every job deny strictly inside
+//     a prefix the gate lets through;
+//  2. each prefix, only if every carve inside it landed (a refused carve
+//     costs the step the prefix, never the job its deny);
+//  3. each landed carve's allows, for what the written prefixes around it
+//     still allow there (a wildcard's allow reaches through a deny entry's
+//     misses on its own); a landed carve no written prefix needs is removed
+//     again.
+//
+// A carve where the job denies every port is a deny entry on all ports; so,
+// in effect, is one inside a prefix on all ports, which keeps nothing inside
+// it, save what a wildcard reaches: no entry can say all ports but those
+// (fail-closed).
+func (f *FirewallImpl) writeStepCIDRsLocked(sr config.StepRules) {
+	var planned []stepPrefix
+	for _, rule := range sr.Rules {
+		if rule.Type != config.RuleTypeCIDR || rule.IPNet == nil {
+			continue
+		}
+		if allow, deny, ok := f.gateStepLocked(sr.Policy, rule.IPNet, expandPorts(rule.Ports)); ok {
+			planned = append(planned, stepPrefix{label: rule.Value, net: rule.IPNet, allow: allow, deny: deny})
+		}
+	}
+
+	var carves []carve
+	for i := range f.jobDenies {
+		jd := &f.jobDenies[i]
+		if !slices.ContainsFunc(planned, func(p stepPrefix) bool { return strictlyWithin(jd.net, p.net) }) {
+			continue
+		}
+		c := carve{jd: jd}
+		c.denied, c.whole = f.jobDeniedWithinLocked(jd.net)
+		label := jd.net.String()
+		err := f.stepWriteErrLocked(sr.Policy, label, f.addCIDRPortsLocked(sr.Policy, jd.net, 0, c.denied))
+		f.warnStepRuleLocked(sr, label, err)
+		c.landed = err == nil
+		carves = append(carves, c)
+	}
+
+	var written []stepPrefix
+	for _, p := range planned {
+		if i := slices.IndexFunc(carves, func(c carve) bool { return !c.landed && strictlyWithin(c.jd.net, p.net) }); i >= 0 {
+			f.noteGatedLocked(sr.Policy, p.net, carves[i].jd, "withheld")
+			continue
+		}
+		if f.writeStepPrefixLocked(sr, p) {
+			written = append(written, p)
+		}
+	}
+
+	for _, c := range carves {
+		if !c.landed {
+			continue
+		}
+		label := c.jd.net.String()
+		needed, keep := false, []portProto(nil)
 		for _, w := range written {
-			if !within(jd.net, w.net) || within(w.net, jd.net) {
+			if !strictlyWithin(c.jd.net, w.net) {
 				continue
 			}
-			inside = true
-			if len(w.ports) == 0 || isWholeSpace(w.net) {
+			needed = true
+			if len(w.allow) == 0 || isWholeSpace(w.net) {
 				continue // all ports, or a wildcard, which reaches through on its own
 			}
-			for _, pp := range w.ports {
-				if !slices.Contains(denied, pp) && !slices.Contains(keep, pp) {
+			for _, pp := range w.allow {
+				if !slices.Contains(c.denied, pp) && !slices.Contains(keep, pp) {
 					keep = append(keep, pp)
 				}
 			}
 		}
-		if !inside {
-			continue
+		switch {
+		case !needed:
+			f.removeCarveLocked(sr.Policy, c)
+		case !c.whole && len(keep) > 0:
+			f.warnStepRuleLocked(sr, label, f.stepWriteErrLocked(sr.Policy, label, f.addCIDRPortsLocked(sr.Policy, c.jd.net, 1, keep)))
 		}
-		label := jd.net.String()
-		if whole {
-			f.warnStepRuleLocked(sr, label, f.stepWriteErrLocked(sr.Policy, label, f.addCIDRPortsLocked(sr.Policy, jd.net, 0, nil)))
-			continue
-		}
-		err := f.stepWriteErrLocked(sr.Policy, label, f.addCIDRPortsLocked(sr.Policy, jd.net, 0, denied))
-		if err == nil && len(keep) > 0 {
-			err = f.stepWriteErrLocked(sr.Policy, label, f.addCIDRPortsLocked(sr.Policy, jd.net, 1, keep))
-		}
-		f.warnStepRuleLocked(sr, label, err)
 	}
+}
+
+// writeStepPrefixLocked writes one gated step prefix, its denies first, as
+// AddPolicyIP writes them, and reports whether it all landed.
+func (f *FirewallImpl) writeStepPrefixLocked(sr config.StepRules, p stepPrefix) bool {
+	var err error
+	if len(p.deny) > 0 {
+		err = f.stepWriteErrLocked(sr.Policy, p.label, f.addCIDRPortsLocked(sr.Policy, p.net, 0, p.deny))
+	}
+	if err == nil {
+		err = f.stepWriteErrLocked(sr.Policy, p.label, f.addCIDRPortsLocked(sr.Policy, p.net, 1, p.allow))
+	}
+	f.warnStepRuleLocked(sr, p.label, err)
+	return err == nil
+}
+
+// removeCarveLocked takes out a carve no written prefix needs, and uncharges
+// what it took out.
+func (f *FirewallImpl) removeCarveLocked(policy uint32, c carve) {
+	ones, bits := c.jd.net.Mask.Size()
+	hostBits := uint8(bits - ones)
+	var keys []any
+	if ip4 := c.jd.net.IP.To4(); ip4 != nil {
+		network := binary.NativeEndian.Uint32(ip4)
+		keys = append(keys, bpf.RuleKey(policy, uint32(ones), network))
+		for _, pp := range c.denied {
+			keys = append(keys, bpf.RulePortKey(policy, network, pp.Port, pp.Proto, hostBits))
+		}
+	} else {
+		var network [16]byte
+		copy(network[:], c.jd.net.IP.To16())
+		keys = append(keys, bpf.RuleKeyV6(policy, uint32(ones), network))
+		denied, _ := stripICMPForV6(c.denied)
+		for _, pp := range denied {
+			keys = append(keys, bpf.RulePortKeyV6(policy, network, pp.Port, pp.Proto, hostBits))
+		}
+	}
+	for _, key := range keys {
+		f.deleteStepKeyLocked(key)
+	}
+}
+
+// strictlyWithin reports whether prefix a lies within b and is narrower.
+func strictlyWithin(a, b *net.IPNet) bool {
+	return within(a, b) && !within(b, a)
 }
 
 // jobDeniedWithinLocked returns the ports the job's CIDR denies deny all of
@@ -276,18 +364,47 @@ func (f *FirewallImpl) warnStepRuleLocked(sr config.StepRules, label string, err
 }
 
 // clearStepsLocked deletes every step entry from the rule maps, by the
-// ledger, which holds each, and empties the step accumulators and ledger.
+// ledger, which holds each, and empties the step accumulators. A key whose
+// delete fails stays in the ledger: still charged, and retried by the next
+// clear, never left in the map untracked.
 func (f *FirewallImpl) clearStepsLocked() {
 	for m := range numRuleMaps {
 		for key := range f.steps.keys[m] {
-			if err := f.deleteKeyLocked(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-				f.logger.Warn("Failed to clear a step rule entry", "map", m.String(), "error", err)
-			}
+			f.deleteStepKeyLocked(key)
 		}
-		f.steps.keys[m] = nil
 	}
 	f.steps.fresh = nil
 	f.stepIPs = nil
+}
+
+// deleteStepKeyLocked deletes a step key from its map and, once it is gone,
+// from the ledger.
+func (f *FirewallImpl) deleteStepKeyLocked(key any) {
+	m, ok := ledgerMap(key)
+	if !ok {
+		return
+	}
+	if err := f.deleteKeyLocked(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		f.logger.Warn("Failed to clear a step rule entry; it stays charged, and the next sync retries it",
+			"map", m.String(), "error", err)
+		return
+	}
+	delete(f.steps.keys[m], key)
+}
+
+// ledgerMap names the rule map a key belongs to, by its type.
+func ledgerMap(key any) (ruleMap, bool) {
+	switch key.(type) {
+	case bpf.TcBpfRuleKey:
+		return ruleMapCIDRs, true
+	case bpf.TcBpfRuleKeyV6:
+		return ruleMapCIDRsV6, true
+	case bpf.TcBpfRulePortKey:
+		return ruleMapPorts, true
+	case bpf.TcBpfRulePortKeyV6:
+		return ruleMapPortsV6, true
+	}
+	return 0, false
 }
 
 // deleteKeyLocked deletes key from the rule map its type names.

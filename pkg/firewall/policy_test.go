@@ -547,9 +547,9 @@ func TestStepBudget_JobPastItsReservation(t *testing.T) {
 	require.ErrorIs(t, err, ErrStepBudget)
 	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("Step rule entry not installed")), "one Warn per interval, whatever the cause")
 	fw.steps.warned = time.Now().Add(-2 * stepBudgetWarnInterval)
-	fw.installStepCIDRLocked(config.StepRules{StepID: "a", Policy: 1}, config.ResolvedRule{
+	fw.writeStepCIDRsLocked(config.StepRules{StepID: "a", Policy: 1, Rules: []config.ResolvedRule{{
 		Type: config.RuleTypeCIDR, Value: "10.200.0.0/16", IPNet: &net.IPNet{IP: net.IPv4(10, 200, 0, 0).To4(), Mask: net.CIDRMask(16, 32)},
-	})
+	}}})
 	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(noRoomJob)))
 	assert.Contains(t, logs.String(), "refused=2", "the refusal held back, and the sync's")
 	assert.NotContains(t, logs.String(), "Step rule not installed;", "a refusal for room is the rate-limited Warn alone")

@@ -836,31 +836,37 @@ to select policy with.
   the job's deny names only some ports: the step loses its allow for the
   whole name, which is fail-closed. A CNAME hop counts the same: a
   step's chain stops at the first name the job's rules deny, and nothing
-  at or past it is the step's, however the chain is split across answers;
-  the backfill installs for a step only addresses the proxy itself
-  answered for the name, whose hops it saw, never one a system-resolver
-  or reverse lookup put to a name. Each step allow withheld so is logged
-  once, by step and denied name. A job CIDR deny is different, and the
-  asymmetry is deliberate: it is written as a deny entry whatever the
-  default, and the kernel enforces it port by port, so a step may allow
-  a port a job CIDR deny doesn't name, where a job hostname deny
-  withholds the whole name because under a deny default userspace writes
-  nothing per port for it. One thing can hide a job CIDR deny from the
-  job's lookup: an entry nested inside it (a port-specific job entry, or
-  a narrower deny on some ports), whose port misses end the lookup in
-  silence instead of at the deny around it. So no step entry may let a
-  step allow what a job CIDR deny covers either: a step write inside one
-  is withheld on the ports it covers (whole, where the write is on all
-  ports and no entry can say "all but those"), and a job deny inside a
-  step's prefix is carved out of the step's policy, as deny entries that
-  a miss can't fall through to a step wildcard past. Host routes and
-  whole-space wildcard port denies can't be hidden, and aren't gated.
-  Every sync rebuilds the step tier against the denies it wrote,
-  clearing the step entries before it, and the tracked-hostname backfill
-  that follows re-installs the DNS path's. A load-time constant
-  (`step_rules_enabled`) prunes the step lookup from both hooks when no
-  step has rules; the data plane is in place, and the policy's `steps`
-  load and fill it (below), but nothing turns it on or binds a step yet.
+  at or past it is the step's, however the chain is split across
+  answers; the backfill installs for a step only addresses the proxy
+  itself answered for the name, whose hops it saw, never one a
+  system-resolver or reverse lookup put to a name. Each step allow
+  withheld so is logged once, by step and denied name. A job CIDR deny
+  is different, and the asymmetry is deliberate: it is written as a deny
+  entry whatever the default, and the kernel enforces it port by port,
+  so a step may allow a port a job CIDR deny doesn't name, where a job
+  hostname deny withholds the whole name because under a deny default
+  userspace writes nothing per port for it. One thing can hide a job
+  CIDR deny from the job's lookup: an entry nested inside it (a
+  port-specific job entry, or a narrower deny on some ports), whose port
+  misses end the lookup in silence instead of at the deny around it. So
+  no step entry may let a step allow what a job CIDR deny covers either:
+  a step write inside one is withheld on the ports it covers (whole,
+  where the write is on all ports and no entry can say "all but those"),
+  and a job deny inside a step's prefix is carved out of the step's
+  policy, as deny entries that a miss can't fall through to a step
+  wildcard past. The carves are written before the prefix, which is
+  withheld if one is refused, so a refused carve costs the step the
+  prefix, never the job its deny. Host routes and whole-space wildcard
+  port denies can't be hidden, and aren't gated. An explicit `0.0.0.0/0`
+  or `::/0` job deny on all ports, often written beside a deny default
+  where it adds nothing for the job, therefore withholds every step
+  write in its family; the sync warns, per step. Every sync rebuilds the
+  step tier against the denies it wrote, clearing the step entries
+  before it, and the tracked-hostname backfill that follows re-installs
+  the DNS path's. A load-time constant (`step_rules_enabled`) prunes the
+  step lookup from both hooks when no step has rules; the data plane is
+  in place, and the policy's `steps` load and fill it (below), but
+  nothing turns it on or binds a step yet.
   - *Where a step's rules come from.* The policy's `steps`, one
     `{id, rules}` per step, in the local `--config` (env-var config carries
     none, and a load replaces them wholesale, as it does the rules). The id

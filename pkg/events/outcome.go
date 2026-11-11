@@ -26,7 +26,6 @@
 package events
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -46,8 +45,9 @@ import (
 // origin hostname the user actually allowed (chain[0]) replaces the resolved
 // name and the full chain is returned as a drill-down — so a blocked derived
 // connection attributes to the origin and the late-allow check below runs
-// against the origin's rule.
-func resolveDestination(configMgr *config.Manager, dstIP string, logger *slog.Logger) (hostname string, cnameChain []string) {
+// against the origin's rule. denial says whether the event is a denial, the
+// only kind a reverse-lookup retry serves.
+func resolveDestination(configMgr *config.Manager, dstIP string, denial bool, logger *slog.Logger) (hostname string, cnameChain []string) {
 	hostname = configMgr.LookupHostnameByIP(dstIP)
 	if hostname == "" {
 		logger.Debug("DNS cache miss", "ip", dstIP)
@@ -55,43 +55,26 @@ func resolveDestination(configMgr *config.Manager, dstIP string, logger *slog.Lo
 		logger.Debug("DNS cache hit", "hostname", hostname, "ip", dstIP)
 	}
 
-	// Lazy reverse DNS for IPs not in the cache. A lookup that settles is
-	// final for the run. One that failed leaves the IP eligible again after
-	// a backoff, a capped number of times (see reverseDNSTracker): a
-	// transient resolver failure must not leave a destination the policy
-	// allows by name unnamed, and so blocked, for the rest of the run.
-	if hostname == "" && reverseDNS.begin(dstIP) {
-		ctx, cancel := context.WithTimeout(context.Background(), reverseDNSTimeout)
-		names, err := reverseDNSResolver.LookupAddr(ctx, dstIP)
-		cancel()
-		if attempt := reverseDNS.finish(dstIP, reverseLookupSettled(err)); attempt.exhausted {
-			logger.Info("Reverse DNS lookup kept failing; not retrying it this run",
-				"ip", dstIP, "attempts", attempt.failures, "error", err)
-		} else if attempt.failures > 0 {
-			logger.Info("Reverse DNS lookup failed; will retry",
-				"ip", dstIP, "attempt", attempt.failures, "retry_in", attempt.retryIn, "error", err)
-		}
-		if err == nil && len(names) > 0 {
-			// Lowercased so an unmatched PTR name is reported in the same
-			// canonical case as forward mappings and tracked-rule matches,
-			// keeping connection-event output consistent (#65). PTR replies
-			// can carry mixed/0x20-randomized case off the wire.
-			ptrName := strings.ToLower(strings.TrimSuffix(names[0], "."))
-			if tracked := configMgr.FindTrackedHostname(ptrName); tracked != "" {
-				hostname = tracked
-			} else {
-				hostname = ptrName
+	// Lazy reverse DNS for IPs not in the cache (see reverseDNSTracker). The
+	// first lookup of an IP runs here, as an event's preparation always has.
+	// A retry, after a failed lookup and only for a denial, runs on the
+	// retry worker instead: this event is judged without a name, and the
+	// name the retry finds is in the cache for the next one.
+	if hostname == "" {
+		switch claimed, first := reverseDNS.begin(dstIP, denial); {
+		case claimed && first:
+			hostname = lookupReverseName(reverseDNS, reverseDNSResolver, configMgr, dstIP, logger)
+			// If PTR failed, try forward-matching all tracked hostnames.
+			if hostname == "" {
+				if match := configMgr.ForwardMatchIP(dstIP); match != "" {
+					hostname = match
+					configMgr.UpdateDNSMapping(hostname, dstIP)
+					logger.Debug("Forward DNS match resolved", "ip", dstIP, "hostname", hostname)
+				}
 			}
-			configMgr.UpdateDNSMapping(hostname, dstIP)
-			logger.Debug("Lazy reverse DNS resolved", "ip", dstIP, "hostname", hostname)
-		}
-
-		// If PTR failed, try forward-matching all tracked hostnames.
-		if hostname == "" {
-			if match := configMgr.ForwardMatchIP(dstIP); match != "" {
-				hostname = match
-				configMgr.UpdateDNSMapping(hostname, dstIP)
-				logger.Debug("Forward DNS match resolved", "ip", dstIP, "hostname", hostname)
+		case claimed:
+			if !reverseDNSRetries.enqueue(dstIP, configMgr, logger) {
+				reverseDNS.release(dstIP)
 			}
 		}
 	}
@@ -438,7 +421,7 @@ func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegi
 	var hostname string
 	var cnameChain []string
 	if !degraded {
-		hostname, cnameChain = resolveDestination(configMgr, dstIP, logger)
+		hostname, cnameChain = resolveDestination(configMgr, dstIP, denial, logger)
 		if denial {
 			lateAllowed, matchedRule = tryLateAllow(configMgr, fw, l7, hostname, dstIP,
 				dstPort, proto, logger)

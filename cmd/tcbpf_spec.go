@@ -30,17 +30,10 @@ import (
 	"github.com/code-cargo/cargowall/pkg/steps"
 )
 
-// loadCollection loads a collection spec into a bpf2go objects struct
-// (pkg/ebpf.LoadObjects, or LoadObjectsTentatively for an attempt a
-// rejection of which is retried); a seam for the step-rules gate's tests.
-var loadCollection = defaultLoadCollection
-
-func defaultLoadCollection(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any, tentative bool) error {
-	if tentative {
-		return cargowallEbpf.LoadObjectsTentatively(logger, collection, spec, opts, to)
-	}
-	return cargowallEbpf.LoadObjects(logger, collection, spec, opts, to)
-}
+// loadCollection loads a collection spec into a bpf2go objects struct, an
+// attempt a rejection of which is retried tentatively; a seam for the
+// step-rules gate's tests.
+var loadCollection = cargowallEbpf.LoadObjectsAttempt
 
 // loadTcObjects loads the tcbpf collection into objs, from loadTcSpec's
 // spec, with step rules on exactly when the startup policy has steps and

@@ -326,9 +326,11 @@ func (cm *Manager) JobCIDRDeniesAt(ip net.IP) (ports []Port, all bool) {
 // DropStepRules gives up the loaded policy's step rules, for why: the hooks
 // can't judge a step by its own rules (no step attribution to tell steps
 // apart, or a kernel whose verifier rejected the step lookup). Every step
-// then gets the job's rules, which fails closed, and nothing reads, writes,
-// installs or scopes anything for one. It reports whether there were any;
-// StepRulesLost keeps why.
+// then gets the job's rules, which fails closed: nothing installs, scopes
+// or stamps anything for one. A drop after the load leaves the hooks' step
+// lookups in, finding no binding, so whatever binds steps must key off
+// HasStepRules, never a collection's gate. It reports whether there were
+// any; StepRulesLost keeps why.
 func (cm *Manager) DropStepRules(why string) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()

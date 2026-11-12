@@ -62,15 +62,10 @@ import (
 // it, where only its own sockets reach the program.
 var cgroupAttachPath = podenv.CgroupRoot
 
-// loadObjects loads the collection (pkg/ebpf.LoadObjects, or
-// LoadObjectsTentatively for an attempt a rejection of which is retried); a
-// test stands in a verifier that rejects the step lookup.
-var loadObjects = func(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any, tentative bool) error {
-	if tentative {
-		return cargowallEbpf.LoadObjectsTentatively(logger, collection, spec, opts, to)
-	}
-	return cargowallEbpf.LoadObjects(logger, collection, spec, opts, to)
-}
+// loadObjects loads the collection, an attempt a rejection of which is
+// retried tentatively; a test stands in a verifier that rejects the step
+// lookup.
+var loadObjects = cargowallEbpf.LoadObjectsAttempt
 
 // The ringbuf wire layout is bpf.OriginEvent (bpf/origin_event.go) — the one
 // Go mirror of struct origin_event, shared with the BTF layout test so the

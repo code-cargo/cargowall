@@ -557,7 +557,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		return err
 	}
 	defer attribution.Close()
-	settleStepTier(configMgr, stepTracker, stepErr, attribution.stepRulesHook(), logger)
+	attribution.settleSteps(configMgr, stepTracker, stepErr, logger)
 
 	// Userspace half of the loopback carve-out pair — must run before
 	// UpdateAllowlistTC programs the maps below. (Placement relative to the

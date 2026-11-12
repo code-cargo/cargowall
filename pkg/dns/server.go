@@ -292,6 +292,7 @@ func (s *Server) ApplyRulesToTrackedHostnames() {
 	// unaffected (they run before any late-allow); a genuine reload path
 	// should re-scope from the late-allow evidence rather than assume this
 	// loop covers it.
+	release := s.steps.l7.holdInstalls()
 	if r := s.l7Registrar(); r != nil {
 		if err := r.FlushScopes(); err != nil {
 			s.logger.Warn("L7: flushing scope maps on reload "+
@@ -299,6 +300,7 @@ func (s *Server) ApplyRulesToTrackedHostnames() {
 		}
 	}
 	s.rescopeStepTier()
+	release()
 
 	// Process all tracked hostnames we've seen (stored in hostnameIPs map)
 	s.hostnameIPsMutex.Lock()

@@ -19,6 +19,7 @@ package dns
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"slices"
 	"sync"
@@ -52,7 +53,8 @@ var errStepScope = errors.New("step install withheld: its address could not be L
 
 // stepScopeShare is the room the steps' scopes may take in each family's
 // scope map: what the job's reservation in the rule maps leaves of it, so
-// the job's own destinations always find room there.
+// the job's scopes have room for at least as many addresses as that
+// reservation, 4096, however many step installs there are.
 const stepScopeShare = int(bpf.L7ScopeEntries - bpf.RuleMapEntriesJobOnly)
 
 // stepScopeWarnInterval rate-limits the withheld-install Warn: a full scope
@@ -61,7 +63,11 @@ const stepScopeWarnInterval = time.Minute
 
 // stepL7 is the step tier's L7 and late-allow state.
 type stepL7 struct {
-	mu sync.Mutex
+	// install is held from a step install's scope to its record, and across
+	// a scope flush and the rescope after it (holdInstalls). Taken before the
+	// firewall's lock, never under it.
+	install sync.Mutex
+	mu      sync.Mutex
 	// scoped holds, by address, the L7 scope of every step install the
 	// firewall admitted and wrote, for the rewarm after a scope flush
 	// (rescopeStepTier). Kept only while L7 is on, one entry an address,
@@ -84,14 +90,28 @@ type stepL7 struct {
 
 // stepScope is one address's step scope: the latest name bound to it, whose
 // evidence the install just refreshed, the ports every step installed it
-// on, and the policies that hold it.
+// on, and the policies that hold it, each by the latest name it installed
+// it for.
 type stepScope struct {
 	name     string
 	ports    []config.Port
-	policies []uint32
+	policies map[uint32]string
 }
 
 func newStepL7() *stepL7 { return &stepL7{share: stepScopeShare} }
+
+// holdInstalls holds off step installs between their scope and their
+// record, for one install or for a scope flush and the rescope after it, so
+// each sees an install scoped and recorded or not yet scoped: an install
+// scoped before a flush and recorded after it would be open unscoped, with
+// its charge lost. It returns the release. Nil-safe.
+func (l *stepL7) holdInstalls() func() {
+	if l == nil {
+		return func() {}
+	}
+	l.install.Lock()
+	return l.install.Unlock
+}
 
 // family is ip's index in charged.
 func family(ip net.IP) int {
@@ -191,14 +211,12 @@ func (s *Server) recordStepScope(policy uint32, name string, ip net.IP, ports []
 		l.scoped = make(map[string]stepScope)
 	}
 	key := ip.String()
-	sc := stepScope{name: name, ports: ports, policies: []uint32{policy}}
+	sc := stepScope{name: name, ports: ports, policies: map[uint32]string{}}
 	if prev, ok := l.scoped[key]; ok {
 		sc.ports = config.UnionPorts(prev.ports, ports)
 		sc.policies = prev.policies
-		if !slices.Contains(sc.policies, policy) {
-			sc.policies = append(slices.Clone(sc.policies), policy)
-		}
 	}
+	sc.policies[policy] = name
 	l.scoped[key] = sc
 }
 
@@ -206,10 +224,12 @@ func (s *Server) recordStepScope(policy uint32, name string, ip net.IP, ports []
 // hostname replay flushes every L7 scope before it rebuilds them, and a
 // step's installs from after the startup backfill are never backfilled
 // again. It runs first, into the emptied maps, which the steps' share
-// always fits. A record whose name no step it holds still allows is
-// dropped, scoped no more. One that can't be scoped again, its name's
-// evidence gone or the scope refused, is withdrawn: its steps' entries
-// there are taken out, never left open unscoped.
+// always fits, under the flush's hold of step installs (holdInstalls). A
+// step's install whose step no longer allows the name it was for, the chain
+// to it expired say, is withdrawn: its step's entries there are taken out.
+// So is one at an address that can't be scoped again, its latest name's
+// evidence gone or the scope refused. No step install is left open
+// unscoped.
 func (s *Server) rescopeStepTier() {
 	l := s.steps.l7
 	if l == nil {
@@ -221,36 +241,54 @@ func (s *Server) rescopeStepTier() {
 	l.mu.Unlock()
 	for ipStr, sc := range todo {
 		ip := net.ParseIP(ipStr)
-		allows, _ := s.stepAllowsFor(sc.name, s.config.MatchHostnameRule(sc.name))
-		if !slices.ContainsFunc(allows, func(a stepAllow) bool { return slices.Contains(sc.policies, a.policy) }) {
-			continue // no step that holds it allows its name: scoped no more
-		}
-		scoped, _, err := s.scopeStepInstall(sc.name, ip, sc.ports)
-		if scoped {
-			for _, policy := range sc.policies {
-				s.recordStepScope(policy, sc.name, ip, sc.ports)
+		kept, lost := map[uint32]string{}, map[uint32]string{}
+		for policy, name := range sc.policies {
+			if _, ok := s.StepAllowPorts(policy, name); ok {
+				kept[policy] = name
+			} else {
+				lost[policy] = name
 			}
+		}
+		disallowed := errors.New("its step no longer allows the name")
+		var scoped bool
+		var err error
+		if len(kept) > 0 {
+			if scoped, _, err = s.scopeStepInstall(sc.name, ip, sc.ports); !scoped && err == nil {
+				err = errors.New("its name's forward-resolution evidence is gone")
+			}
+		}
+		s.withdrawStepInstall(lost, ip, scoped, disallowed)
+		if !scoped {
+			s.withdrawStepInstall(kept, ip, false, err)
 			continue
 		}
-		if err == nil {
-			err = errors.New("its name's forward-resolution evidence is gone")
+		sc.policies = kept
+		l.mu.Lock()
+		if l.scoped == nil {
+			l.scoped = make(map[string]stepScope)
 		}
-		s.withdrawStepInstall(sc, ip, err)
+		l.scoped[ipStr] = sc
+		l.mu.Unlock()
 	}
 }
 
-// withdrawStepInstall takes out the step entries at an address that lost
-// its scope, so no step reaches it unscoped.
-func (s *Server) withdrawStepInstall(sc stepScope, ip net.IP, why error) {
-	for _, policy := range sc.policies {
+// withdrawStepInstall takes out the entries the holders' DNS installs, by
+// policy and the name each was for, hold at ip, for why: no step reaches an
+// address unscoped, nor by a name its rules no longer allow. scoped is
+// whether ip stays scoped for other installs there.
+func (s *Server) withdrawStepInstall(holders map[uint32]string, ip net.IP, scoped bool, why error) {
+	for _, policy := range slices.Sorted(maps.Keys(holders)) {
+		attrs := []any{"policy", policy, "ip", ip.String(), "hostname", holders[policy], "reason", why}
 		if err := s.firewall.RemovePolicyIP(policy, ip); err != nil {
-			s.logger.Warn("L7: a step install lost its scope and could not be withdrawn; "+
-				"the address is open to its step without name enforcement",
-				"policy", policy, "ip", ip.String(), "hostname", sc.name, "scope_error", why, "error", err)
+			stays := "the address is open to its step without name enforcement"
+			if scoped {
+				stays = "it stays, under the address's scope"
+			}
+			s.logger.Warn("L7: a step install could not be withdrawn; "+stays, append(attrs, "error", err)...)
 			continue
 		}
-		s.logger.Warn("L7: a step install lost its scope and was withdrawn; the step gets the job's rules there",
-			"policy", policy, "ip", ip.String(), "hostname", sc.name, "error", why)
+		s.logger.Warn("L7: a step's DNS install was withdrawn; the step gets the job's rules there, "+
+			"and its own CIDR rules'", attrs...)
 	}
 }
 

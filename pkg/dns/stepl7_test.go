@@ -24,6 +24,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,6 +83,7 @@ func TestStepScopes_RewarmedAfterFlush(t *testing.T) {
 	assert.Equal(t, 2, rec.flushes)
 	assert.Equal(t, map[string]string{"10.1.0.64": "tcp/443,tcp/80", "10.2.0.64": "all-ports"}, rec.scopes,
 		"the steps' scopes come back with the job's, on every step's ports")
+	assert.Empty(t, fw.removed, "each step still allows the name it installed for, though deploy's is the latest")
 }
 
 // StepAllowPorts is the oracle's step tier: the ports a step policy's own
@@ -347,22 +349,85 @@ func TestStepScopes_RebindOrWithdraw(t *testing.T) {
 	assert.Contains(t, fw.removed, "10.1.0.91")
 }
 
-// The rewarm scopes again only what a step that holds the address still
-// allows by the recorded name; the rest is dropped from the record.
-func TestStepScopes_PrunedWhenNoStepAllows(t *testing.T) {
+// The rewarm takes back a step's install whose step no longer allows the
+// name it was for, here once the chain that led the step to it has
+// expired: the step's entries there are withdrawn, never left open
+// unscoped. Another step's install at the address, still allowed, is
+// scoped again, and the record keeps it alone.
+func TestStepScopes_WithdrawnWhenItsStepNoLongerAllows(t *testing.T) {
 	cfg := config.NewConfigManager()
 	fw := newRecordingFirewall()
 	s := newStepTestServer(t, cfg, fw)
 	rec := &recordingRegistrar{}
 	s.SetL7Registrar(rec)
 	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames() // the startup backfill: seals via
+	answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge81.akamai.example"}, ""))
+	answer(s, "edge81.akamai.example", aResponse("edge81.akamai.example", "10.1.0.81", "10.1.0.82"))
+	answer(s, "deploy.example.com", aResponse("deploy.example.com", "10.1.0.82")) // deploy's, on 80
+	require.Contains(t, fw.stepIPs(policyFetch), "10.1.0.81")
+	require.Equal(t, "tcp/80", rec.scopes["10.1.0.82"])
+
+	s.steps.cname.Delete("edge81.akamai.example") // the chain expired, or was evicted
 	s.ApplyRulesToTrackedHostnames()
-	answer(s, "deploy.example.com", aResponse("deploy.example.com", "10.1.0.92"))
-	loadStepPolicy(t, cfg, `{"defaultAction": "deny", "rules": [],
-		"steps": [{"id": "deploy", "rules": [{"type": "hostname", "value": "other.example.com"}]}]}`)
-	s.ApplyRulesToTrackedHostnames()
-	assert.NotContains(t, rec.scopes, "10.1.0.92")
-	assert.Empty(t, s.steps.l7.scoped)
+	assert.NotContains(t, rec.scopes, "10.1.0.81")
+	assert.NotContains(t, fw.stepIPs(policyFetch), "10.1.0.81", "fetch's install there is withdrawn")
+	assert.NotContains(t, fw.stepIPs(policyFetch), "10.1.0.82", "and at the shared address")
+	assert.Contains(t, fw.stepIPs(policyDeploy), "10.1.0.82", "deploy's stays")
+	assert.Equal(t, "tcp/443,tcp/80", rec.scopes["10.1.0.82"], "scoped again for it")
+	assert.Equal(t, map[uint32]string{policyDeploy: "deploy.example.com"}, s.steps.l7.scoped["10.1.0.82"].policies)
+	assert.ElementsMatch(t, []string{"10.1.0.81", "10.1.0.82"}, fw.removed)
+}
+
+// scopeSignalling is a recordingRegistrar that signals its first scope.
+type scopeSignalling struct {
+	recordingRegistrar
+	scoped chan struct{}
+	once   sync.Once
+}
+
+func (r *scopeSignalling) ScopeIP(ip net.IP, ports []config.Port) error {
+	defer r.once.Do(func() { close(r.scoped) })
+	return r.recordingRegistrar.ScopeIP(ip, ports)
+}
+
+// A step install holds off the replay's scope flush from its scope to its
+// record: an install scoped before the flush and recorded after it would
+// be open unscoped, its record never scoped again, its charge lost.
+func TestStepScopes_FlushWaitsForAnInstallsRecord(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	rec := &scopeSignalling{scoped: make(chan struct{})}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames() // the startup backfill: seals via
+	fw.stepAdd = make(chan struct{}) // holds the install at its write
+	installed := make(chan struct{})
+	go func() {
+		defer close(installed)
+		answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.83"))
+	}()
+	<-rec.scoped
+	replayed := make(chan struct{})
+	go func() {
+		defer close(replayed)
+		s.ApplyRulesToTrackedHostnames()
+	}()
+	select {
+	case <-replayed: // only without the hold
+	case <-time.After(200 * time.Millisecond):
+	}
+	<-fw.stepAdd
+	go func() {
+		for range fw.stepAdd {
+		}
+	}()
+	<-installed
+	<-replayed
+	assert.Equal(t, "tcp/443", rec.scopes["10.1.0.83"], "the install is scoped after the flush")
+	assert.Contains(t, s.steps.l7.scoped, "10.1.0.83")
+	assert.Contains(t, s.steps.l7.charged[0], "10.1.0.83")
 }
 
 // A scope the registrar fails to write is no charge to the steps' share,

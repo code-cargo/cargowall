@@ -206,35 +206,31 @@ func (f *FirewallImpl) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port
 	return changed, nil
 }
 
-// RemovePolicyIP takes out every entry step policy holds at ip's host route.
-// See the Firewall interface.
+// stepHostBase is what the sync wrote at one step host route, for the step's
+// own /32 or /128 CIDR rule or a carve: the LPM entry's value, the port
+// entries' keys, and the accumulator they came with. RemovePolicyIP keeps
+// it, and takes out only what DNS installs added there since.
+type stepHostBase struct {
+	val   bpf.TcBpfLpmVal
+	ports []any
+	st    ipPortState
+}
+
+// RemovePolicyIP takes out what step policy's DNS installs added at ip's
+// host route. See the Firewall interface.
 func (f *FirewallImpl) RemovePolicyIP(policy uint32, ip net.IP) error {
 	if policy == bpf.PolicyJob {
 		return fmt.Errorf("RemovePolicyIP takes out step policies' entries only")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var lpm any
-	var ports []any
-	if ip4 := ip.To4(); ip4 != nil {
-		network := binary.NativeEndian.Uint32(ip4)
-		lpm = bpf.RuleKey(policy, 32, network)
-		for key := range f.steps.keys[ruleMapPorts] {
-			if k := key.(bpf.TcBpfRulePortKey); k.Policy == policy && k.Ip == network && k.HostBits == 0 {
-				ports = append(ports, key)
-			}
-		}
-	} else if ip6 := ip.To16(); ip6 != nil {
-		var network [16]byte
-		copy(network[:], ip6)
-		lpm = bpf.RuleKeyV6(policy, 128, network)
-		for key := range f.steps.keys[ruleMapPortsV6] {
-			if k := key.(bpf.TcBpfRulePortKeyV6); k.Policy == policy && k.Ip == network && k.HostBits == 0 {
-				ports = append(ports, key)
-			}
-		}
-	} else {
+	lpm, ports, ok := f.hostKeysLocked(policy, ip)
+	if !ok {
 		return fmt.Errorf("invalid IP: %s", ip.String())
+	}
+	pi := policyIP{policy, ip.String()}
+	if base, synced := f.stepBase[pi]; synced {
+		return f.restoreStepBaseLocked(pi, lpm, ports, base)
 	}
 	// The LPM entry first: its port entries are never read without it, so a
 	// failed delete after it leaves nothing open.
@@ -244,8 +240,98 @@ func (f *FirewallImpl) RemovePolicyIP(policy uint32, ip net.IP) error {
 	for _, key := range ports {
 		f.deleteStepKeyLocked(key)
 	}
-	delete(f.stepIPs, policyIP{policy, ip.String()})
+	delete(f.stepIPs, pi)
 	return nil
+}
+
+// restoreStepBaseLocked puts a step host route back as the sync wrote it:
+// the LPM entry gets the sync's value back, then the port entries DNS
+// installs added go. Those are read under it, so the call fails while one
+// stays.
+func (f *FirewallImpl) restoreStepBaseLocked(pi policyIP, lpm any, ports []any, base stepHostBase) error {
+	if err := f.updateLPMLocked(lpm, base.val); err != nil {
+		return fmt.Errorf("could not restore the step entry for %s: %w", pi.ip, err)
+	}
+	st := base.st
+	st.ports = slices.Clone(base.st.ports)
+	f.stepIPs[pi] = &st
+	stuck := 0
+	for _, key := range ports {
+		if !slices.Contains(base.ports, key) && !f.deleteStepKeyLocked(key) {
+			stuck++
+		}
+	}
+	if stuck > 0 {
+		return fmt.Errorf("could not take out %d of the step's port entries for %s", stuck, pi.ip)
+	}
+	return nil
+}
+
+// recordStepBaseLocked records, at the end of a sync, what it wrote at each
+// step host route it left an entry at (stepHostBase), in place of the last
+// sync's.
+func (f *FirewallImpl) recordStepBaseLocked() {
+	f.stepBase = nil
+	for pi, st := range f.stepIPs {
+		lpm, ports, _ := f.hostKeysLocked(pi.policy, net.ParseIP(pi.ip))
+		val, held := f.lpmValLocked(lpm)
+		if !held {
+			continue // taken out again: refused, or a carve no prefix needs
+		}
+		if f.stepBase == nil {
+			f.stepBase = make(map[policyIP]stepHostBase)
+		}
+		f.stepBase[pi] = stepHostBase{val: val, ports: ports, st: ipPortState{
+			allPortsAllow: st.allPortsAllow, allPortsDeny: st.allPortsDeny, ports: slices.Clone(st.ports),
+		}}
+	}
+}
+
+// hostKeysLocked is step policy's LPM key for ip's host route, and the port
+// keys the ledger holds there; false for an invalid ip.
+func (f *FirewallImpl) hostKeysLocked(policy uint32, ip net.IP) (lpm any, ports []any, ok bool) {
+	if ip4 := ip.To4(); ip4 != nil {
+		network := binary.NativeEndian.Uint32(ip4)
+		for key := range f.steps.keys[ruleMapPorts] {
+			if k := key.(bpf.TcBpfRulePortKey); k.Policy == policy && k.Ip == network && k.HostBits == 0 {
+				ports = append(ports, key)
+			}
+		}
+		return bpf.RuleKey(policy, 32, network), ports, true
+	}
+	if ip6 := ip.To16(); ip6 != nil {
+		var network [16]byte
+		copy(network[:], ip6)
+		for key := range f.steps.keys[ruleMapPortsV6] {
+			if k := key.(bpf.TcBpfRulePortKeyV6); k.Policy == policy && k.Ip == network && k.HostBits == 0 {
+				ports = append(ports, key)
+			}
+		}
+		return bpf.RuleKeyV6(policy, 128, network), ports, true
+	}
+	return nil, nil, false
+}
+
+// lpmValLocked looks up an LPM key's value, by the key's family.
+func (f *FirewallImpl) lpmValLocked(key any) (val bpf.TcBpfLpmVal, ok bool) {
+	switch k := key.(type) {
+	case bpf.TcBpfRuleKey:
+		ok = f.cidrsMap.Lookup(&k, &val) == nil
+	case bpf.TcBpfRuleKeyV6:
+		ok = f.cidrsV6Map.Lookup(&k, &val) == nil
+	}
+	return val, ok
+}
+
+// updateLPMLocked writes an LPM key's value, by the key's family.
+func (f *FirewallImpl) updateLPMLocked(key any, val bpf.TcBpfLpmVal) error {
+	switch k := key.(type) {
+	case bpf.TcBpfRuleKey:
+		return f.cidrsMap.Update(&k, &val, ebpf.UpdateAny)
+	case bpf.TcBpfRuleKeyV6:
+		return f.cidrsV6Map.Update(&k, &val, ebpf.UpdateAny)
+	}
+	return fmt.Errorf("not an LPM key: %T", key)
 }
 
 // hostWriteKeysLocked is every key a step host write to ip writes, its

@@ -191,6 +191,10 @@ func LogVerifierRejection(logger *slog.Logger, collection string, err error) boo
 	return logVerifierRejection(logger, slog.LevelError, collection, err)
 }
 
+// newCollection loads a collection; a test stands in a verifier that
+// rejects it.
+var newCollection = ebpf.NewCollectionWithOptions
+
 func logVerifierRejection(logger *slog.Logger, level slog.Level, collection string, err error) bool {
 	r, ok := ParseRejection(err)
 	if !ok {
@@ -217,19 +221,19 @@ func logVerifierRejection(logger *slog.Logger, level slog.Level, collection stri
 // CollectionOptions — the log levels differ on purpose — and may still
 // inspect the returned error for the verifier log.
 func LoadObjects(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any) error {
-	return loadObjects(logger, slog.LevelError, collection, spec, opts, to)
+	return LoadObjectsAttempt(logger, collection, spec, opts, to, false)
 }
 
-// LoadObjectsTentatively is LoadObjects for an attempt its caller loads
-// again another way should the verifier reject it: the rejection is then
-// the caller's to report, so it is logged at Debug, not as an error of a
-// run that goes on to start normally.
-func LoadObjectsTentatively(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any) error {
-	return loadObjects(logger, slog.LevelDebug, collection, spec, opts, to)
-}
-
-func loadObjects(logger *slog.Logger, rejection slog.Level, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any) error {
-	coll, err := ebpf.NewCollectionWithOptions(spec, opts)
+// LoadObjectsAttempt is LoadObjects for an attempt that may be tentative:
+// one its caller loads again another way should the verifier reject it.
+// That rejection is the caller's to report, so it is logged at Debug, not
+// as an error of a run that goes on to start normally.
+func LoadObjectsAttempt(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any, tentative bool) error {
+	rejection := slog.LevelError
+	if tentative {
+		rejection = slog.LevelDebug
+	}
+	coll, err := newCollection(spec, opts)
 	if err != nil {
 		logVerifierRejection(logger, rejection, collection, err)
 		return err

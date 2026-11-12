@@ -394,7 +394,8 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 	for _, a := range allows {
 		for _, ip := range ips {
 			// Scoped once the firewall admits the install and before it
-			// writes any of it (stepl7.go).
+			// writes any of it, and recorded, under one hold (stepl7.go).
+			release := s.steps.l7.holdInstalls()
 			admitted, scoped, fresh := false, false, false
 			changed, err := s.firewall.AddPolicyIP(a.policy, ip, a.ports, func() error {
 				admitted = true
@@ -403,13 +404,14 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 				return err
 			})
 			switch {
-			case err == nil && admitted:
-				if scoped {
-					s.recordStepScope(a.policy, name, ip, a.ports)
-				}
-				s.reconcileStepBlocks(a, name, ip)
+			case err == nil && scoped:
+				s.recordStepScope(a.policy, name, ip, a.ports)
 			case err != nil && scoped:
 				s.unscopeStepInstall(ip, a.ports, fresh) // scoped, then refused
+			}
+			release()
+			if err == nil && admitted {
+				s.reconcileStepBlocks(a, name, ip)
 			}
 			switch {
 			case errors.Is(err, firewall.ErrStepBudget):

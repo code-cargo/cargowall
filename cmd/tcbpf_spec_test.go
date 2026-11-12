@@ -156,6 +156,8 @@ func TestLoadTcObjects_StepRulesGate(t *testing.T) {
 			}
 			var gates []uint8
 			var tentative []bool
+			saved := loadCollection
+			t.Cleanup(func() { loadCollection = saved })
 			loadCollection = func(_ *slog.Logger, collection string, spec *ebpf.CollectionSpec, _ ebpf.CollectionOptions, _ any, tent bool) error {
 				require.Equal(t, "tcbpf", collection)
 				gates = append(gates, gateOf(spec))
@@ -165,7 +167,6 @@ func TestLoadTcObjects_StepRulesGate(t *testing.T) {
 				}
 				return nil
 			}
-			t.Cleanup(func() { loadCollection = defaultLoadCollection })
 
 			var logs bytes.Buffer
 			var objs bpf.TcBpfObjects
@@ -225,4 +226,33 @@ func TestSettleStepTier(t *testing.T) {
 			assert.Equal(t, c.lost == "", cm.HasStepRules())
 		})
 	}
+}
+
+// Steps dropped after the load leave the bridge stamp off: tcbpf's gate is
+// on, but nothing binds a step, so there is nothing to stamp. Kept, the
+// stamp stays to start. Without attribution the steps settle all the same.
+func TestSettleStepTier_StampOffOnceStepsDrop(t *testing.T) {
+	withSteps := `{"defaultAction": "deny", "rules": [], ` + specSteps + `}`
+	discard := slog.New(slog.DiscardHandler)
+	for _, c := range []struct {
+		name    string
+		tracker *steps.Tracker
+	}{
+		{"kept", &steps.Tracker{}},
+		{"dropped", nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cm := config.NewConfigManager()
+			loadPolicyFile(t, cm, withSteps)
+			a := &containerAttribution{stamp: newStamp(nil, nil, nil, discard)}
+			a.settleSteps(cm, c.tracker, nil, discard)
+			assert.Equal(t, cm.HasStepRules(), a.stamp != nil)
+			assert.Equal(t, c.tracker != nil, cm.HasStepRules())
+		})
+	}
+	cm := config.NewConfigManager()
+	loadPolicyFile(t, cm, withSteps)
+	var none *containerAttribution
+	none.settleSteps(cm, nil, errors.New("no BTF"), discard)
+	assert.False(t, cm.HasStepRules())
 }

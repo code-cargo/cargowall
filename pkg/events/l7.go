@@ -37,7 +37,7 @@ type L7LateRegistrar interface {
 // step ordinal that the job's rules don't open, it opens ip under the
 // policy ordinal is bound to, where that step's own rules allow hostname
 // there, and reports whether the step's retry on port passes now, and by
-// what rule.
+// what rule. A container's verdict never asks it (withoutStepTier).
 type StepLateAllower interface {
 	LateAllowStep(ordinal uint32, hostname string, ip net.IP, port uint16, proto uint8) (allowed bool, matchedRule string)
 }

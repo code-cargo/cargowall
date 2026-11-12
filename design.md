@@ -977,15 +977,18 @@ to select policy with.
     don't allow (`dns.Server.LateAllowStep`): it opens the address under
     that step's policy alone, by a name the proxy itself answered the
     address for, never one a reverse lookup put to it, whatever the
-    address's owner says. And anything that reloads step rules at runtime
-    must clear the step policies' entries, the DNS path's included, before
-    installing: policies are numbered per load, so a kept entry would be
-    another step's. It must clear the step tier's scope record with them,
-    for the same reason: the installs it records are gone, under the old
-    load's policies. The sync does the first (above); today it runs once,
-    at startup, over an empty step tier. A runtime reload that cannot
-    clear every step entry must treat the step tier as failed (write no
-    step entries, Warn), or plan the survivors' prefixes as unconfirmed so
+    address's owner says. A container's verdict never asks it: where the
+    container's packets aren't stamped, TC judges its retry as the job's,
+    so the step's rules opening the address need not let it through. And
+    anything that reloads step rules at runtime must clear the step
+    policies' entries, the DNS path's included, before installing:
+    policies are numbered per load, so a kept entry would be another
+    step's. It must clear the step tier's scope record with them, for the
+    same reason: the installs it records are gone, under the old load's
+    policies. The sync does the first (above); today it runs once, at
+    startup, over an empty step tier. A runtime reload that cannot clear
+    every step entry must treat the step tier as failed (write no step
+    entries, Warn), or plan the survivors' prefixes as unconfirmed so
     their carves are kept: the rebuild plans as if the maps held no step
     entries, so a survivor is gated against nothing in the new tier. And
     anything that backfills at runtime must keep the backfill's record of

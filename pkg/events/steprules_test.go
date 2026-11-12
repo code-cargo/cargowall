@@ -145,4 +145,14 @@ func TestTryLateAllow_StepTier(t *testing.T) {
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, EventConnectionLateAllowed, sink.events[0].EventType)
 	assert.Equal(t, uint32(7), sink.events[0].StepOrdinal)
+
+	// A container's is never asked: TC may judge its retry as the job's.
+	reg.asked = nil
+	ctr := verdictRec(true)
+	ctr.Decorate = func(a *AuditEvent) { a.ContainerOrigin, a.ContainerID = true, "c0ffee" }
+	ReportVerdict(ctr, cm, nil, auditLogger, fw, reg, newTestLogger())
+	assert.Empty(t, reg.asked)
+	require.Len(t, sink.events, 2)
+	assert.Equal(t, EventConnectionBlocked, sink.events[1].EventType)
+	assert.Equal(t, "c0ffee", sink.events[1].ContainerID)
 }

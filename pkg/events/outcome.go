@@ -477,6 +477,26 @@ func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegi
 	return out, lateAllowed, matchedRule
 }
 
+// fromContainer reports whether rec's socket is a container's, by the
+// identity its decoration attaches.
+func fromContainer(rec VerdictRecord) bool {
+	if rec.Decorate == nil {
+		return false
+	}
+	var probe AuditEvent
+	rec.Decorate(&probe)
+	return probe.ContainerID != "" || probe.ContainerOrigin
+}
+
+// withoutStepTier is an L7 registrar with its step tier hidden, for a
+// container's verdict: the hook judges the container's sockets by its
+// step's policy, but where its packets aren't stamped (an unattached bridge
+// port, before the attach, a daemon's bridges in another namespace) TC
+// judges them as the job's, so the step's rules opening the address need
+// not let its retry through. Its block stays reported as one, which is the
+// safe way round.
+type withoutStepTier struct{ L7LateRegistrar }
+
 // VerdictRecord is one policy outcome reported by a hook that adjudicates in
 // socket context rather than from a packet at TC — today, the root-cgroup
 // egress hook. Addresses are already resolved to strings by the producer,
@@ -535,6 +555,9 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 	// pipeline with the slow work flagged off (see prepareOutcome) rather
 	// than a parallel construction that could drift from it.
 	denial := rec.Dropped
+	if l7 != nil && fromContainer(rec) {
+		l7 = withoutStepTier{l7}
+	}
 	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, l7, logger,
 		denial, rec.Degraded, rec.SrcIP, rec.DstIP, rec.SrcPort, rec.DstPort, rec.Proto,
 		rec.PID, rec.StepOrdinal)

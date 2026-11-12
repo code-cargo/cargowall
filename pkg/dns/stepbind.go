@@ -66,7 +66,9 @@ func (s *Server) ReconcileBoundStep(ordinal, policy uint32, stepID string) {
 	blocks := s.recentBlocks.TakeStep(ordinal, func(b events.RecentBlock) bool {
 		proto, ok := ipProto(b.Protocol)
 		ip := net.ParseIP(b.DstIP)
-		return ok && ip != nil && s.firewall.Allows(policy, ip, b.DstPort, proto)
+		// The zero address is never a rule host (firewall/unspecified.go):
+		// no rule of the step's opened it.
+		return ok && ip != nil && !ip.IsUnspecified() && s.firewall.Allows(policy, ip, b.DstPort, proto)
 	})
 	for _, b := range blocks {
 		hostname := s.config.LookupHostnameByIP(b.DstIP)
@@ -89,7 +91,9 @@ func (s *Server) ReconcileBoundStep(ordinal, policy uint32, stepID string) {
 // address, which is whatever the address's owner says.
 func (s *Server) LateAllowStep(ordinal uint32, hostname string, ip net.IP, port uint16, proto uint8) (bool, string) {
 	policy, ok := s.boundPolicy(ordinal)
-	if !ok || s.firewall == nil || ip == nil {
+	// The firewall never installs the unspecified address
+	// (firewall/unspecified.go), so a late allow there would open nothing.
+	if !ok || s.firewall == nil || ip == nil || ip.IsUnspecified() {
 		return false, ""
 	}
 	name := strings.ToLower(hostname)

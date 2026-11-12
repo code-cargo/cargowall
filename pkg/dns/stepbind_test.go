@@ -142,3 +142,57 @@ func TestReconcileBoundStep(t *testing.T) {
 	assert.Len(t, blocks.TakeMatching("10.1.0.121", nil, nil, false), 2, "fetch's on 80 and the other step's stay")
 	assert.Len(t, blocks.TakeMatching("10.1.0.124", nil, nil, false), 1, "and the container's")
 }
+
+// The zero address is never a rule host. As the proxy's forward evidence
+// for a name a bound step's rules allow, in any spelling, it installs
+// nothing, scopes nothing and passes nothing, and the step's 0.0.0.0/0 and
+// ::/0 port entries, which are keyed on the zero address as a host entry
+// there would be, stay as they were. Nor does binding the step re-report
+// a block to it.
+func TestLateAllowStep_ZeroAddressIsNeverARuleHost(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	auditPath := filepath.Join(t.TempDir(), "audit.ndjson")
+	auditLogger, err := events.NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	s.SetAuditLogger(auditLogger)
+	blocks := events.NewRecentBlocks(0)
+	s.SetRecentBlocks(blocks)
+	bindStep(s, map[uint32]uint32{7: policyFetch})
+	tcp := uint8(unix.IPPROTO_TCP)
+
+	// The step's 0.0.0.0/0 and ::/0 on tcp/9000, at the keys they hold.
+	tcp9000 := []config.Port{{Port: 9000, Protocol: config.ProtocolTCP}}
+	fw.step[policyFetch] = map[string][]config.Port{"0.0.0.0": tcp9000, "::": tcp9000}
+	wildcards := fw.stepIPs(policyFetch)
+
+	for _, addr := range []string{"0.0.0.0", "::", "::ffff:0.0.0.0"} {
+		ip := net.ParseIP(addr)
+		cfg.RecordForwardResolution("step.example.com", ip.String())
+		for _, port := range []uint16{443, 9000} {
+			ok, rule := s.LateAllowStep(7, "step.example.com", ip, port, tcp)
+			assert.False(t, ok, "%s, port %d", addr, port)
+			assert.Empty(t, rule, "%s, port %d", addr, port)
+		}
+	}
+	assert.Equal(t, wildcards, fw.stepIPs(policyFetch), "the step's wildcard entries")
+	assert.Empty(t, fw.removed)
+	assert.Empty(t, rec.scopes)
+	assert.Empty(t, s.steps.l7.scoped)
+
+	for _, addr := range []string{"0.0.0.0", "::"} {
+		blocks.Consume(events.AuditEvent{
+			Timestamp: time.Now().Add(-time.Second), EventType: events.EventConnectionBlocked,
+			DstIP: addr, DstPort: 9000, Protocol: "TCP", StepOrdinal: 7,
+		})
+	}
+	s.ReconcileBoundStep(7, policyFetch, "fetch")
+	assert.Empty(t, readAuditEvents(t, auditPath))
+	assert.Len(t, blocks.TakeMatching("0.0.0.0", nil, nil, false), 1)
+	assert.Len(t, blocks.TakeMatching("::", nil, nil, false), 1)
+}

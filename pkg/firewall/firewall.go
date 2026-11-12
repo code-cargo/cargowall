@@ -120,6 +120,9 @@ type FirewallImpl struct {
 	// every step write; gated holds the gated writes logged (stepgate.go).
 	jobDenies []jobDeny
 	gated     map[string]struct{}
+	// unspecifiedWarned holds the unspecified addresses already refused as
+	// host entries and logged (unspecified.go).
+	unspecifiedWarned map[string]struct{}
 }
 
 // portProto carries a port number and its IANA protocol number for BPF map keys.
@@ -610,6 +613,9 @@ func (f *FirewallImpl) AddIP(ip net.IP, action config.Action, ports []config.Por
 // by AddIP, AddPolicyIP and UpdateAllowlistTC (via addCIDRv4), under policy.
 // Must be called with f.mu held.
 func (f *FirewallImpl) addIPv4Locked(policy uint32, ip4 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
+	if f.refuseUnspecifiedLocked(policy, ip4, ipStr) {
+		return false, nil
+	}
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
 
 	key := bpf.RuleKey(policy, 32, ipUint32)
@@ -737,6 +743,9 @@ func mergePorts(existing, additions []portProto) []portProto {
 // by AddIP, AddPolicyIP and UpdateAllowlistTC (via addCIDRv6), under policy.
 // Must be called with f.mu held.
 func (f *FirewallImpl) addIPv6Locked(policy uint32, ip6 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
+	if f.refuseUnspecifiedLocked(policy, ip6, ipStr) {
+		return false, nil
+	}
 	ports, skip := f.prepV6Ports(ports, "ip", ipStr)
 	if skip {
 		return false, nil
@@ -806,6 +815,11 @@ func (f *FirewallImpl) writePortsV6(policy uint32, ip16 [16]byte, ipStr string, 
 
 // RemoveIP removes a single IP from the BPF maps
 func (f *FirewallImpl) RemoveIP(ip net.IP) error {
+	// Nothing is installed at the unspecified address, and the job's port
+	// keys there are the wildcard entries (unspecified.go).
+	if ip.IsUnspecified() {
+		return nil
+	}
 	if ip4 := ip.To4(); ip4 != nil {
 		return f.removeIPv4(ip4, ip)
 	}

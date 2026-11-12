@@ -128,7 +128,9 @@ func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegist
 	}
 	matchedRule = verdict.AllowRule
 	ip := net.ParseIP(dstIP)
-	if ip == nil {
+	// The firewall never installs the unspecified address
+	// (firewall/unspecified.go), so a late allow there would open nothing.
+	if ip == nil || ip.IsUnspecified() {
 		return false, matchedRule
 	}
 

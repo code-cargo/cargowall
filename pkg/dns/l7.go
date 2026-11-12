@@ -107,7 +107,9 @@ func RegisterL7Identity(r L7Registrar, cm *config.Manager, hostname string, ip n
 // scopeL7Identity is RegisterL7Identity, returning the registrar's error for
 // a scope it could not write. An unbound IP is no error: it stays L4-governed.
 func scopeL7Identity(r L7Registrar, cm *config.Manager, hostname string, ip net.IP, ports []config.Port, logger *slog.Logger) error {
-	if r == nil || cm == nil || ip == nil {
+	// The unspecified address never gets an L4 entry (firewall/unspecified.go),
+	// so it gets no scope either.
+	if r == nil || cm == nil || ip == nil || ip.IsUnspecified() {
 		return nil
 	}
 	if !cm.NameResolvedToIP(hostname, ip.String()) {

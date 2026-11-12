@@ -368,10 +368,14 @@ func TestStartCmd_AfterApply_OrthogonalFlagsPreservedWhenSetExplicitly(t *testin
 
 // Any loopback upstream loops under the redirect: the resolver there
 // re-queries from an unmarked socket, which is DNAT'd back into the proxy.
+// The unspecified address reaches the local host too, so it counts.
 // Without the redirect (or with DNS tracking off, which disables it) a
 // loopback upstream is fine, and a real resolver is fine either way.
 func TestStartCmd_AfterApply_LoopbackUpstreamRefusedUnderRedirect(t *testing.T) {
-	for _, upstream := range []string{"127.0.0.100:53", "127.0.0.53:53", "127.0.0.1:53", "[::1]:53", "[::ffff:127.0.0.1]:53", "localhost:53", "127.0.0.100"} {
+	for _, upstream := range []string{
+		"127.0.0.100:53", "127.0.0.53:53", "127.0.0.1:53", "[::1]:53", "[::ffff:127.0.0.1]:53", "localhost:53", "127.0.0.100",
+		"0.0.0.0:53", "[::]:53", "[::ffff:0.0.0.0]:53", "0.0.0.0",
+	} {
 		cmd := &StartCmd{DNSRedirect: true, DNSUpstream: upstream}
 		require.ErrorContains(t, cmd.AfterApply(), "is a loopback resolver", upstream)
 	}

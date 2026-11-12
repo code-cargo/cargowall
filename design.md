@@ -287,7 +287,7 @@ classDiagram
         +uint32 pid
         +uint32 _pad2
     }
-    note for LPM_Val "host_bits: 32 (128 for v6) minus the prefix length, 0 = host route\na port-specific rule's port entries are keyed by its network address + host_bits\nthe verdict masks dst by the matched rule's host_bits to find them\nwildcard-port entries: ip 0, host_bits 0"
+    note for LPM_Val "host_bits: 32 (128 for v6) minus the prefix length, 0 = host route\na port-specific rule's port entries are keyed by its network address + host_bits\nthe verdict masks dst by the matched rule's host_bits to find them\nwildcard-port entries: ip 0, host_bits 0\nthe unspecified address is never a host entry: its port keys would be the wildcard's"
     note for Rule_Key "prefixlen: 32 policy bits + the rule's prefix length\npolicy 0 = the job's rules; every lookup matches the policy whole,\nso one policy's entries (a /0 included) never answer another's lookup"
     note for Blocked_Event "64 bytes total\nip_version: 4 or 6\nallowed: 0=blocked, 1=allowed\ntimestamp: bpf_ktime_get_ns()\npid: from map_sock_pid via socket cookie"
 

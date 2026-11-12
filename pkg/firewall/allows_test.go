@@ -63,6 +63,7 @@ func allowsPolicy(t *testing.T, fw *FirewallImpl, defaultAction config.Action) {
 				{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: tcpPorts(9000)},
 				{Type: config.RuleTypeCIDR, Value: "10.41.0.0/16", Ports: tcpPorts(8443)},
 				{Type: config.RuleTypeCIDR, Value: "2001:db8:41::/48", Ports: tcpPorts(8443)},
+				{Type: config.RuleTypeCIDR, Value: "::/0", Ports: tcpPorts(9001)},
 				{Type: config.RuleTypeHostname, Value: "a.example.com"},
 			}},
 			{ID: "b", Rules: []config.Rule{{Type: config.RuleTypeHostname, Value: "b.example.com"}}},
@@ -101,6 +102,11 @@ var allowsCases = []allowsCase{
 	{2, "10.9.9.9", 9000, false, false},
 	{1, "2001:db8:1::2", 443, true, false},
 	{0, "2001:db8:1::2", 443, false, false},
+	{1, "2001:db8:1::2", 80, false, false},   // a port-specific host route, past its ports
+	{1, "2001:db8:99::1", 9001, true, false}, // the step's IPv6 wildcard port
+	{0, "2001:db8:99::1", 9001, false, false},
+	{1, "2001:db8:1::2", 9001, true, false}, // past a host route's ports, to the wildcard
+	{1, "2001:db8:99::1", 9002, false, false},
 }
 
 func TestAllows_JobFirstThenTheStep(t *testing.T) {
@@ -115,6 +121,9 @@ func TestAllows_JobFirstThenTheStep(t *testing.T) {
 	require.NoError(t, fw.SetDefaultAction(config.ActionAllow))
 	assert.True(t, fw.Allows(0, net.ParseIP("10.9.9.9"), 22, unix.IPPROTO_TCP), "the default decides the rest")
 	assert.False(t, fw.Allows(1, net.ParseIP("10.1.0.3"), 443, unix.IPPROTO_TCP), "whatever it is")
+
+	fw, _ = newStepTestFirewall(ruleMapEntries, nil)
+	assert.False(t, fw.Allows(0, net.ParseIP("10.9.9.9"), 22, unix.IPPROTO_TCP), "no default written denies, as the kernel's")
 }
 
 // Allows says what cw_tc_egress decides, on the real maps, where the trie's
@@ -140,8 +149,13 @@ func TestAllows_KernelParity(t *testing.T) {
 		allowsCase{1, "10.41.7.7", 9000, true, false}, // past the subnet's ports, to the wildcard
 		allowsCase{1, "10.41.7.7", 22, false, false},
 		allowsCase{0, "2001:db8:40::7", 443, true, false},
+		allowsCase{0, "2001:db8:40:ffff::7", 443, true, false},
 		allowsCase{0, "2001:db8:40::7", 80, false, false},
+		allowsCase{1, "2001:db8:40::7", 80, false, false},
 		allowsCase{1, "2001:db8:41::9", 8443, true, false},
+		allowsCase{1, "2001:db8:41:ffff::9", 8443, true, false},
+		allowsCase{1, "2001:db8:41::9", 22, false, false},
+		allowsCase{1, "2001:db8:41::9", 9001, true, false}, // past the subnet's ports, to the wildcard
 		allowsCase{0, "2001:db8:41::9", 8443, false, false},
 		allowsCase{0, "10.43.1.1", 5353, true, true},
 		allowsCase{0, "10.43.1.1", 5353, false, false}, // TCP, where the rule names UDP

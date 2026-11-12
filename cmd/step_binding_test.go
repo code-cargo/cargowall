@@ -82,9 +82,9 @@ func step(id string) steps.Identity {
 }
 
 // A step is bound to the policy its id's rules sit under, once, when it is
-// identified, and the DNS proxy's lookup reads it. A runner helper, an
-// unknown step, a step without rules and one under another id's spelling
-// are bound to nothing: they get the job's rules.
+// identified, its id compared without case, and the DNS proxy's lookup
+// reads it. A runner helper, an unknown step and a step without rules are
+// bound to nothing: they get the job's rules.
 func TestStepBinder_BindsIdentifiedSteps(t *testing.T) {
 	cm := config.NewConfigManager()
 	loadPolicyFile(t, cm, stepsPolicy)
@@ -97,7 +97,7 @@ func TestStepBinder_BindsIdentifiedSteps(t *testing.T) {
 	b.identified(11, step("lint"))
 	b.identified(12, step("__run"))
 	b.identified(13, step("Fetch"))
-	assert.Equal(t, map[uint32]uint32{7: 1, 8: 2}, m.snapshot())
+	assert.Equal(t, map[uint32]uint32{7: 1, 8: 2, 13: 1}, m.snapshot())
 
 	m.held = nil
 	b.identified(7, step("deploy"))
@@ -144,8 +144,19 @@ func TestStepBinder_ReconcilesOffTheReader(t *testing.T) {
 		<-release
 	}
 	go b.work()
-	b.identified(7, step("fetch"))
-	b.identified(8, step("deploy")) // queued behind the first, which blocks
+	// identified runs on the tracker's reader: it must return at once,
+	// whatever the re-report does.
+	returned := make(chan struct{})
+	go func() {
+		b.identified(7, step("fetch"))
+		b.identified(8, step("deploy")) // queued behind the first, which blocks
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("identified waited on a re-report")
+	}
 	select {
 	case s := <-got:
 		assert.Equal(t, boundStep{7, 1, "fetch"}, s)

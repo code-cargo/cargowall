@@ -1054,21 +1054,28 @@ to select policy with.
   - *Binding.* The step binder (`cmd/step_binding.go`) writes
     `map_step_policy` once a step, when the tracker identifies it at its
     root's first exec: the policy of the step's id, if its rules have one.
-    Ids compare exactly, as the runner hands them, its workflow's
-    spelling, case and all; a composite action's steps carry the outer
-    step's id (the CI step-identity check), so they are bound as the outer
-    step. A step never identified (its exec event lost) or not yet, one
-    whose id has no rules, and one the map has no room for (4096 bindings,
-    warned of once) get the job's rules, which fails closed. The binder is
-    armed only once the step rules have settled with some left (above),
-    and the tracker keeps the steps it identifies before then for it
-    (`steps.Tracker.SetOnIdentified`), so none is missed. A step is
+    Ids compare without case, as GitHub compares them and as the load does
+    in refusing two that differ only in case, so at most one policy
+    matches; the runner hands a step its id as written, and the CI e2e
+    names the step in another case. A composite action's steps carry the
+    outer step's id (the CI step-identity check), so they are bound as the
+    outer step. A step never identified (its exec event lost) or not yet,
+    one whose id has no rules, and one the map has no room for (4096
+    bindings, warned of once) get the job's rules, which fails closed. The
+    binder is armed only once the step rules have settled with some left
+    (above), and the tracker keeps the steps it identifies before then for
+    it (`steps.Tracker.SetOnIdentified`), so none is missed. A step is
     identified after its program starts, so its first connections can be
     judged as the job's: once it is bound, its recent blocks its policy
     now lets through, by the verdict over the maps
     (`firewall.Firewall.Allows`), are re-reported as late-allowed, under
-    its own ordinal (`dns.Server.ReconcileBoundStep`). The binder's lookup
-    is the one the DNS path's per-step late-allows reconcile by
+    its own ordinal (`dns.Server.ReconcileBoundStep`), never a
+    container's, whose packets TC may still judge as the job's, and by a
+    name rule only where the proxy answered the name for the address. That
+    verdict is L4's: at an L7-scoped address, a retry the step reaches by
+    a CIDR rule must still present a name allowed there, so a re-report
+    can claim a retry L7 then drops, as the job tier's can. The binder's
+    lookup is the one the DNS path's per-step late-allows reconcile by
     (`dns.Server.SetStepBindings`).
   - *What per-step rules do not separate.* They bound what each step's own
     processes reach. Steps of one job share a uid, the workspace and

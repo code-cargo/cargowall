@@ -18,11 +18,12 @@
 # a step's identity is the workflow step it runs in.
 #
 # The policy allows the job nothing of its own, and allows one step,
-# Rules-Allowed, a host the job's rules don't: that step reaches it, and the
-# step after it, which has no rules, is blocked from it. Step rules come
-# only from a local --config, so cargowall runs straight from the binary
-# rather than through the action, with the GitHub preset and L7 enforced,
-# which step rules need.
+# Rules-Allowed, a host the job's rules don't, naming the step in another
+# case, as GitHub matches ids. That step reaches the host, and the step
+# after it, which has no rules, is blocked from it. Step rules come only
+# from a local --config, so cargowall runs straight from the binary rather
+# than through the action, with the GitHub preset and L7 enforced, which
+# step rules need.
 #
 # Usage: step-rules.sh policy|start|allowed|blocked|verify|stop|emergency
 
@@ -43,7 +44,7 @@ policy() {
   "defaultAction": "deny",
   "rules": [],
   "steps": [
-    {"id": "Rules-Allowed", "rules": [
+    {"id": "rules-allowed", "rules": [
       {"type": "hostname", "value": "$HOST", "ports": [{"port": 443, "protocol": "tcp"}]}
     ]}
   ]
@@ -118,8 +119,8 @@ verify() {
   local allowed_ord blocked_ord
   allowed_ord=$(ordinal_of Rules-Allowed)
   blocked_ord=$(ordinal_of rules-blocked)
-  # The runner hands a step its id as written, case and all: the policy
-  # names it the same way, and binding compares ids exactly.
+  # The runner hands a step its id as written, case and all; the policy
+  # names it in another case, which binds all the same.
   if [ -z "$allowed_ord" ] || [ -z "$blocked_ord" ]; then
     echo "❌ a step's boundary is missing, or its id is not as written: Rules-Allowed=${allowed_ord:-none} rules-blocked=${blocked_ord:-none}"
     failed=true

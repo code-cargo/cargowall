@@ -56,7 +56,9 @@ func (s *Server) boundPolicy(ordinal uint32) (uint32, bool) {
 // address maps to, by the step's rule for that name where the proxy itself
 // answered the name for the address, and otherwise by stepID: a name a
 // reverse lookup put to the address is whatever its owner says, and never
-// names the rule.
+// names the rule. The verdict is L4's: at an L7-scoped address a retry the
+// step reaches by a CIDR rule must still present a name allowed there, so
+// the re-report can claim a retry L7 then drops, as the job tier's can.
 func (s *Server) ReconcileBoundStep(ordinal, policy uint32, stepID string) {
 	if s.recentBlocks == nil || s.auditLogger == nil || s.firewall == nil {
 		return

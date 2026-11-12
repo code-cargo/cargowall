@@ -360,12 +360,12 @@ func TestRecentBlocks_PerStep(t *testing.T) {
 func TestRecentBlocks_StepTakesLeaveContainers(t *testing.T) {
 	rb := NewRecentBlocks(time.Minute)
 	now := time.Now()
-	host := blockedAuditEvent("10.1.2.3", 443, "TCP", now.Add(-2*time.Second))
-	host.StepOrdinal = 7
-	ctr := host
-	ctr.Timestamp, ctr.ContainerID, ctr.PID = now.Add(-time.Second), "c0ffee", 77
-	rb.Consume(host)
+	ctr := blockedAuditEvent("10.1.2.3", 443, "TCP", now.Add(-2*time.Second))
+	ctr.StepOrdinal, ctr.ContainerID, ctr.PID = 7, "c0ffee", 77
+	host := ctr
+	host.Timestamp, host.ContainerID, host.PID = now.Add(-time.Second), "", 42
 	rb.Consume(ctr)
+	rb.Consume(host) // the later attempt, the host's
 	all := func(uint32) bool { return true }
 	assert.Empty(t, rb.TakeStep(7, func(RecentBlock) bool { return true }))
 	assert.Empty(t, rb.TakeMatchingFor("10.1.2.3", all, nil, nil, false))

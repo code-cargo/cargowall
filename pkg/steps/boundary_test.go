@@ -502,3 +502,43 @@ func TestFormatCmdline(t *testing.T) {
 	assert.Equal(t, "/tmp/é...", formatCmdline([]byte("/tmp/é\xe2\x82"), true))
 	assert.Equal(t, "/tmp/é€...", formatCmdline([]byte("/tmp/é€"), true))
 }
+
+// Steps identified before SetOnIdentified are told to its callback first,
+// in order, and later ones as they come: a callback set up after Start
+// misses none. A runner helper is never kept, nor a step past the bound,
+// and a nil callback keeps nothing from then on.
+func TestSetOnIdentified_TellsTheEarlierSteps(t *testing.T) {
+	stepEnv := func(id string) string { return "GITHUB_ACTION=" + id + "\x00" }
+	exec := func(tr *Tracker, ordinal uint32, env string) {
+		tr.handleStepEvent(execEventEnv(evExec, 40+ordinal, ordinal, "sh\x00", 3, "sh", env, uint32(len(env))),
+			wallClock(time.Unix(1000, 0)))
+	}
+
+	tr, sink := newBoundaryTracker(t)
+	ids := &identities{sink: sink}
+	exec(tr, 7, stepEnv("build"))
+	exec(tr, 8, "HOME=/home/runner\x00") // a runner helper
+	exec(tr, 9, stepEnv("test"))
+	tr.SetOnIdentified(ids.record)
+	exec(tr, 10, stepEnv("deploy"))
+	var got []uint32
+	for _, i := range ids.got {
+		got = append(got, i.ordinal)
+	}
+	assert.Equal(t, []uint32{7, 9, 10}, got)
+	assert.Equal(t, Identity{StepID: "build", Class: events.StepClassStep}, ids.got[0].id)
+	assert.Empty(t, tr.early)
+
+	tr, _ = newBoundaryTracker(t)
+	for i := range maxEarlyIdentities + 2 {
+		exec(tr, uint32(100+i), stepEnv("s"))
+	}
+	n := 0
+	tr.SetOnIdentified(func(uint32, Identity) { n++ })
+	assert.Equal(t, maxEarlyIdentities, n, "the bound")
+
+	tr, _ = newBoundaryTracker(t)
+	tr.SetOnIdentified(nil)
+	exec(tr, 7, stepEnv("build"))
+	assert.Empty(t, tr.early, "nothing kept once settled with no callback")
+}

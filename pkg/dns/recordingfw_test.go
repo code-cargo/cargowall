@@ -124,6 +124,21 @@ func (f *recordingFirewall) RemovePolicyIP(policy uint32, ip net.IP) error {
 	return nil
 }
 
+// Allows models the verdict over what was written: a job deny decides, then
+// the job's allows, then policy's own. Ports nil are all ports.
+func (f *recordingFirewall) Allows(policy uint32, ip net.IP, port uint16, proto uint8) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.jobDeny[ip.String()] {
+		return false
+	}
+	if ports, ok := f.jobAllow[ip.String()]; ok && config.DstPortAllowedByRule(port, proto, ports) {
+		return true
+	}
+	ports, ok := f.step[policy][ip.String()]
+	return policy != 0 && ok && config.DstPortAllowedByRule(port, proto, ports)
+}
+
 func (f *recordingFirewall) snapshot(policy uint32) map[string][]config.Port {
 	f.mu.Lock()
 	defer f.mu.Unlock()

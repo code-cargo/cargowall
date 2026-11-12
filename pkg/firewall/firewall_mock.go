@@ -139,6 +139,55 @@ func (_c *MockFirewall_AddPolicyIP_Call) RunAndReturn(run func(uint32, net.IP, [
 	return _c
 }
 
+// Allows provides a mock function with given fields: policy, ip, port, proto
+func (_m *MockFirewall) Allows(policy uint32, ip net.IP, port uint16, proto uint8) bool {
+	ret := _m.Called(policy, ip, port, proto)
+
+	if len(ret) == 0 {
+		panic("no return value specified for Allows")
+	}
+
+	var r0 bool
+	if rf, ok := ret.Get(0).(func(uint32, net.IP, uint16, uint8) bool); ok {
+		r0 = rf(policy, ip, port, proto)
+	} else {
+		r0 = ret.Get(0).(bool)
+	}
+
+	return r0
+}
+
+// MockFirewall_Allows_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'Allows'
+type MockFirewall_Allows_Call struct {
+	*mock.Call
+}
+
+// Allows is a helper method to define mock.On call
+//   - policy uint32
+//   - ip net.IP
+//   - port uint16
+//   - proto uint8
+func (_e *MockFirewall_Expecter) Allows(policy interface{}, ip interface{}, port interface{}, proto interface{}) *MockFirewall_Allows_Call {
+	return &MockFirewall_Allows_Call{Call: _e.mock.On("Allows", policy, ip, port, proto)}
+}
+
+func (_c *MockFirewall_Allows_Call) Run(run func(policy uint32, ip net.IP, port uint16, proto uint8)) *MockFirewall_Allows_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(uint32), args[1].(net.IP), args[2].(uint16), args[3].(uint8))
+	})
+	return _c
+}
+
+func (_c *MockFirewall_Allows_Call) Return(_a0 bool) *MockFirewall_Allows_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockFirewall_Allows_Call) RunAndReturn(run func(uint32, net.IP, uint16, uint8) bool) *MockFirewall_Allows_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // RemoveIP provides a mock function with given fields: ip
 func (_m *MockFirewall) RemoveIP(ip net.IP) error {
 	ret := _m.Called(ip)

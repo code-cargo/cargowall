@@ -75,8 +75,10 @@ on its kept installs' ports alone. SCOPE IFF BOUND holds for them as for the
 job: an address with no forward-resolution evidence for its name is installed
 unscoped. The scope holds for every flow to the address: a job flow there,
 through a job CIDR allow say, must present a name the job's tiers allow, as at
-an address a job hostname resolves to, and until steps are bound that
-narrowing is all a step's rules do here.
+an address a job hostname resolves to. Steps are bound to their policies only
+while L7 runs, so a step's installs are always scoped; under
+`--tls-sni=observe`, which drops nothing, a bound step's exposure at a shared
+edge address is the job's own there, no more.
 
 A duplicate-SNI hello (two `server_name` extensions, or two `host_name` list
 entries) is rejected as malformed rather than resolved first- or last-wins:

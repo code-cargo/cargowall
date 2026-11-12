@@ -393,40 +393,45 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 	}
 	for _, a := range allows {
 		for _, ip := range ips {
-			// Scoped once the firewall admits the install and before it
-			// writes any of it, and recorded, under one hold (stepl7.go).
-			release := s.steps.l7.holdInstalls()
-			admitted, scoped, fresh := false, false, false
-			changed, err := s.firewall.AddPolicyIP(a.policy, ip, a.ports, func() error {
-				admitted = true
-				var err error
-				scoped, fresh, err = s.scopeStepInstall(name, ip, a.ports)
-				return err
-			})
-			switch {
-			case err == nil && scoped:
-				s.recordStepScope(a.policy, name, a.chain == nil, ip, a.ports)
-			case err != nil && scoped:
-				s.unscopeStepInstall(ip, a.ports, fresh) // scoped, then refused
-			}
-			release()
-			if err == nil && admitted {
-				s.reconcileStepBlocks(a, name, ip)
-			}
-			switch {
-			case errors.Is(err, firewall.ErrStepBudget):
-				// The firewall warns, rate-limited.
-			case errors.Is(err, errStepScope):
-				s.warnStepScope(a, name, ip, err)
-			case err != nil:
-				s.logger.Warn("Step rule install failed; the step gets the job's rules there",
-					"step", a.stepID, "policy", a.policy, "hostname", name, "ip", ip.String(), "error", err)
-			case changed:
-				s.logger.Info("DNS resolution: added to step policy",
-					"step", a.stepID, "policy", a.policy, "hostname", name, "ip", ip.String(),
-					"ports", a.ports, "rule", a.rule)
-			}
+			s.installStepAllow(a, name, ip)
 		}
+	}
+}
+
+// installStepAllow installs ip under a's policy, for name: scoped once the
+// firewall admits the install and before it writes any of it, and
+// recorded, under one hold (stepl7.go). Caller checks s.firewall.
+func (s *Server) installStepAllow(a stepAllow, name string, ip net.IP) {
+	release := s.steps.l7.holdInstalls()
+	admitted, scoped, fresh := false, false, false
+	changed, err := s.firewall.AddPolicyIP(a.policy, ip, a.ports, func() error {
+		admitted = true
+		var err error
+		scoped, fresh, err = s.scopeStepInstall(name, ip, a.ports)
+		return err
+	})
+	switch {
+	case err == nil && scoped:
+		s.recordStepScope(a.policy, name, a.chain == nil, ip, a.ports)
+	case err != nil && scoped:
+		s.unscopeStepInstall(ip, a.ports, fresh) // scoped, then refused
+	}
+	release()
+	if err == nil && admitted {
+		s.reconcileStepBlocks(a, name, ip)
+	}
+	switch {
+	case errors.Is(err, firewall.ErrStepBudget):
+		// The firewall warns, rate-limited.
+	case errors.Is(err, errStepScope):
+		s.warnStepScope(a, name, ip, err)
+	case err != nil:
+		s.logger.Warn("Step rule install failed; the step gets the job's rules there",
+			"step", a.stepID, "policy", a.policy, "hostname", name, "ip", ip.String(), "error", err)
+	case changed:
+		s.logger.Info("DNS resolution: added to step policy",
+			"step", a.stepID, "policy", a.policy, "hostname", name, "ip", ip.String(),
+			"ports", a.ports, "rule", a.rule)
 	}
 }
 

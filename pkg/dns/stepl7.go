@@ -163,11 +163,12 @@ func family(ip net.IP) int {
 }
 
 // SetStepBindings installs the ordinal-to-policy lookup a step's late-allow
-// reconciles by: a step policy's install re-reports only the blocks of the
-// steps bound to it. Until it is set, a step install re-reports none.
-// Requirement: bindings runs under the recent-blocks buffer's lock
-// (events.RecentBlocks.TakeMatchingFor), so it must not take a lock that
-// is held while blocks are consumed.
+// reconciles by, the step binder's: a step policy's install re-reports only
+// the blocks of the steps bound to it, and the event pipeline's step tier
+// (LateAllowStep) opens an address only for a bound step. Until it is set,
+// neither does anything. Requirement: bindings runs under the recent-blocks
+// buffer's lock (events.RecentBlocks.TakeMatchingFor), so it must not take
+// a lock that is held while blocks are consumed.
 func (s *Server) SetStepBindings(bindings func(ordinal uint32) (policy uint32, ok bool)) {
 	if s.steps.l7 == nil {
 		return
@@ -421,13 +422,20 @@ func (s *Server) warnStepScope(a stepAllow, name string, ip net.IP, err error) {
 // tier (config.L7Policy.WithSteps). A name the job's rules deny on any port
 // is no step's (stepAllowsFor).
 func (s *Server) StepAllowPorts(policy uint32, name string) ([]config.Port, bool) {
+	a, ok := s.stepAllowFor(policy, name)
+	return a.ports, ok
+}
+
+// stepAllowFor is step policy's allow of name, by its own rule or else its
+// chain to name, past the job's rules (stepAllowsFor).
+func (s *Server) stepAllowFor(policy uint32, name string) (stepAllow, bool) {
 	allows, _ := s.stepAllowsFor(name, s.config.MatchHostnameRule(name))
 	for _, a := range allows {
 		if a.policy == policy {
-			return a.ports, true
+			return a, true
 		}
 	}
-	return nil, false
+	return stepAllow{}, false
 }
 
 // reconcileStepBlocks re-reports as late-allowed the recent blocks to ip

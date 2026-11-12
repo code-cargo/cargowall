@@ -84,9 +84,14 @@ type Options struct {
 	// call ahead of the step's first connection. A step whose exec event
 	// never comes, and a root that exits without exec'ing, are never
 	// identified. Only events.StepClassStep identifies a step, and see
-	// Identity for what it does and doesn't vouch for.
+	// Identity for what it does and doesn't vouch for. Without it, the
+	// steps identified are kept until SetOnIdentified.
 	OnIdentified func(ordinal uint32, id Identity)
 }
+
+// maxEarlyIdentities bounds the steps kept for SetOnIdentified: one a step
+// policy can be bound for each (map_step_policy's size).
+const maxEarlyIdentities = 4096
 
 // maxOrdinalBase bounds --step-ordinal-base away from the reserved
 // StepOrdinal* sentinels: the kernel increments a u64 counter but truncates
@@ -111,7 +116,15 @@ type Tracker struct {
 	auditLogger   *events.AuditLogger
 	logger        *slog.Logger
 	done          chan struct{}
-	onIdentified  func(ordinal uint32, id Identity)
+
+	// idMu guards onIdentified and the steps identified before it was set
+	// (SetOnIdentified): early, idSettled once it was, and earlyLost, the
+	// steps past maxEarlyIdentities.
+	idMu         sync.Mutex
+	onIdentified func(ordinal uint32, id Identity)
+	early        []earlyIdentity
+	idSettled    bool
+	earlyLost    int
 
 	// Boundary history for OrdinalAt and for reporting steps — see the
 	// boundary type.
@@ -196,6 +209,7 @@ func Start(tcObjs *bpf.TcBpfObjects, opts Options, auditLogger *events.AuditLogg
 		logger:        logger,
 		done:          make(chan struct{}),
 		onIdentified:  opts.OnIdentified,
+		idSettled:     opts.OnIdentified != nil,
 		resolver:      newClientResolver(tcObjs.MapSockStep, tcObjs.MapSockPid, logger),
 	}
 	t.snapshotFn = t.iterSnapshot

@@ -17,6 +17,7 @@
 package events
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -44,7 +45,7 @@ func TestTryLateAllow_StepOnlyNameWritesNothing(t *testing.T) {
 	cm.UpdateDNSMapping("step.example.com", "93.184.216.34")
 
 	fw := &mockFirewallUpdater{}
-	allowed, rule := tryLateAllow(cm, fw, nil, "step.example.com", "93.184.216.34", 443, unix.IPPROTO_TCP, newTestLogger())
+	allowed, rule := tryLateAllow(cm, fw, nil, "step.example.com", "93.184.216.34", 443, unix.IPPROTO_TCP, 0, newTestLogger())
 	assert.False(t, allowed)
 	assert.Empty(t, rule)
 
@@ -59,7 +60,75 @@ func TestTryLateAllow_StepOnlyNameWritesNothing(t *testing.T) {
 
 	// The job's own name still late-allows, through the same path.
 	cm.UpdateDNSMapping("job.example.com", "93.184.216.34")
-	allowed, _ = tryLateAllow(cm, fw, nil, "job.example.com", "93.184.216.34", 443, unix.IPPROTO_TCP, newTestLogger())
+	allowed, _ = tryLateAllow(cm, fw, nil, "job.example.com", "93.184.216.34", 443, unix.IPPROTO_TCP, 0, newTestLogger())
 	assert.True(t, allowed)
 	assert.Len(t, fw.addedIPs, 1)
+}
+
+// stepTierRegistrar is an L7 registrar with the step tier, recording the
+// steps it was asked for.
+type stepTierRegistrar struct {
+	allow bool
+	asked []uint32
+}
+
+func (r *stepTierRegistrar) RegisterLateAllow(string, net.IP, []config.Port) {}
+
+func (r *stepTierRegistrar) LateAllowStep(ordinal uint32, _ string, _ net.IP, _ uint16, _ uint8) (bool, string) {
+	r.asked = append(r.asked, ordinal)
+	return r.allow, "step.example.com"
+}
+
+// A name the job's rules don't allow is the step tier's, where the
+// registrar has one: it opens the address for the step that made the
+// connection alone, and the job's policy is written nothing. A name the
+// job allows, or denies, is never asked of it.
+func TestTryLateAllow_StepTier(t *testing.T) {
+	cm := config.NewConfigManager()
+	path := filepath.Join(t.TempDir(), "policy.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{
+		"defaultAction": "deny",
+		"rules": [
+			{"type": "hostname", "value": "job.example.com", "action": "allow"},
+			{"type": "hostname", "value": "denied.example.com", "action": "deny"}
+		],
+		"steps": [{"id": "fetch", "rules": [{"type": "hostname", "value": "step.example.com"}]}]
+	}`), 0o600))
+	require.NoError(t, cm.LoadConfig(path))
+	fw := &mockFirewallUpdater{}
+	reg := &stepTierRegistrar{allow: true}
+	const ip = "93.184.216.34"
+
+	allowed, rule := tryLateAllow(cm, fw, reg, "step.example.com", ip, 443, unix.IPPROTO_TCP, 7, newTestLogger())
+	assert.True(t, allowed)
+	assert.Equal(t, "step.example.com", rule)
+	assert.Equal(t, []uint32{7}, reg.asked)
+	assert.Empty(t, fw.addedIPs, "the job's policy written nothing")
+
+	reg.allow = false
+	allowed, _ = tryLateAllow(cm, fw, reg, "step.example.com", ip, 80, unix.IPPROTO_TCP, 7, newTestLogger())
+	assert.False(t, allowed, "the step tier's answer")
+
+	for _, name := range []string{"job.example.com", "denied.example.com"} {
+		reg.asked = nil
+		tryLateAllow(cm, fw, reg, name, ip, 443, unix.IPPROTO_TCP, 7, newTestLogger())
+		assert.Empty(t, reg.asked, name)
+	}
+	reg.asked = nil
+	tryLateAllow(cm, fw, reg, "step.example.com", ip, 443, unix.IPPROTO_ICMP, 7, newTestLogger())
+	assert.Empty(t, reg.asked, "TCP and UDP alone")
+
+	// A hook's denial asks it for the step that made the connection, and
+	// reports the late-allow the step tier gives.
+	reg.allow, reg.asked = true, nil
+	cm.UpdateDNSMapping("step.example.com", ip)
+	auditLogger, err := NewAuditLogger("", false)
+	require.NoError(t, err)
+	sink := &recordingSink{}
+	auditLogger.AddSink(sink)
+	ReportVerdict(verdictRec(true), cm, nil, auditLogger, fw, reg, newTestLogger())
+	assert.Equal(t, []uint32{7}, reg.asked)
+	require.Len(t, sink.events, 1)
+	assert.Equal(t, EventConnectionLateAllowed, sink.events[0].EventType)
+	assert.Equal(t, uint32(7), sink.events[0].StepOrdinal)
 }

@@ -193,9 +193,9 @@ struct {
 // and the job's rules alone judge them.
 
 // Nonzero only when the policy loaded at startup has steps with rules of
-// their own, and step attribution is on (zero after the gate-off fallback
-// too). A load-time constant, so a job without step rules runs no step
-// lookup at all: at zero the verifier prunes the branch.
+// their own, and step attribution and --tls-sni are on (zero after the
+// gate-off fallback too). A load-time constant, so a job without step rules
+// runs no step lookup at all: at zero the verifier prunes the branch.
 const volatile __u8 step_rules_enabled = 0;
 
 // socket cookie → step ordinal, written at socket creation (cw_cg_sock_new

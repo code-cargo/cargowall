@@ -110,15 +110,25 @@ func isTCPOrUDP(proto uint8) bool {
 // allowed. Without it, a denial that policy would permit never self-heals —
 // which is why both hooks must run it, not just TC.
 //
+// A name the job's rules don't allow may still be one the own rules of the
+// step that made the connection allow: the step tier then opens it under
+// that step's policy alone, never the job's (StepLateAllower), for a step
+// bound to one (ordinal).
+//
 // Restricted to TCP/UDP — see isTCPOrUDP.
 func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegistrar,
-	hostname, dstIP string, dstPort uint16, proto uint8, logger *slog.Logger,
+	hostname, dstIP string, dstPort uint16, proto uint8, ordinal uint32, logger *slog.Logger,
 ) (lateAllowed bool, matchedRule string) {
 	if hostname == "" || fw == nil || !isTCPOrUDP(proto) {
 		return false, ""
 	}
 	verdict := configMgr.MatchHostnameRule(hostname)
 	if !verdict.HasAllow() {
+		if steps, ok := l7.(StepLateAllower); ok && !verdict.HasDeny() {
+			if ip := net.ParseIP(dstIP); ip != nil {
+				return steps.LateAllowStep(ordinal, hostname, ip, dstPort, proto)
+			}
+		}
 		return false, ""
 	}
 	matchedRule = verdict.AllowRule
@@ -424,7 +434,7 @@ func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegi
 		hostname, cnameChain = resolveDestination(configMgr, dstIP, denial, logger)
 		if denial {
 			lateAllowed, matchedRule = tryLateAllow(configMgr, fw, l7, hostname, dstIP,
-				dstPort, proto, logger)
+				dstPort, proto, ordinal, logger)
 		}
 	}
 

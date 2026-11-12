@@ -172,3 +172,32 @@ func TestL7Policy_BindsTheStepTier(t *testing.T) {
 	assert.Equal(t, config.L7NoMatch, m.MatchName(q(0)))
 	assert.Equal(t, config.L7NoMatch, l7Policy(cm, nil).MatchName(q(1)))
 }
+
+// The L4 paths' registrar carries the proxy's step tier exactly while the
+// policy's step rules stand: a dropped tier, or no proxy, leaves the plain
+// registrar, so the event pipeline asks no step.
+func TestL7Registrar_CarriesTheStepTier(t *testing.T) {
+	withSteps := `{"defaultAction": "deny", "rules": [], ` + specSteps + `}`
+	srv := dns.NewServer(config.NewConfigManager(), nil, "192.0.2.1:53", "127.0.0.1:0", slog.Default())
+	for _, c := range []struct {
+		name  string
+		dns   *dns.Server
+		drop  bool
+		steps bool
+	}{
+		{"steps", srv, false, true},
+		{"steps dropped", srv, true, false},
+		{"no proxy", nil, false, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cm := config.NewConfigManager()
+			loadPolicyFile(t, cm, withSteps)
+			if c.drop {
+				cm.DropStepRules("L7 is not running")
+			}
+			f := &l7Feature{cm: cm, dns: c.dns, logger: slog.Default()}
+			_, ok := f.registrar().(events.StepLateAllower)
+			assert.Equal(t, c.steps, ok)
+		})
+	}
+}

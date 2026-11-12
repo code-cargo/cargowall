@@ -252,6 +252,37 @@ func (rb *RecentBlocks) TakeMatchingFor(dstIP string, steps func(ordinal uint32)
 	return taken
 }
 
+// TakeStep removes and returns the unexpired blocks of step ordinal, at any
+// destination, that allowed picks, ordered by attempt time: what binding the
+// step to its policy now lets through. allowed runs under the buffer's lock,
+// so it must not take a lock that is held while blocks are consumed.
+func (rb *RecentBlocks) TakeStep(ordinal uint32, allowed func(RecentBlock) bool) []RecentBlock {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	cutoff := time.Now().Add(-rb.ttl)
+	var taken []RecentBlock
+	for ip, byKey := range rb.byIP {
+		for key, b := range byKey {
+			switch {
+			case key.ordinal != ordinal:
+				continue
+			case b.At.Before(cutoff):
+			case !allowed(b):
+				continue
+			default:
+				taken = append(taken, b)
+			}
+			delete(byKey, key)
+			rb.size--
+		}
+		if len(byKey) == 0 {
+			delete(rb.byIP, ip)
+		}
+	}
+	sort.Slice(taken, func(i, j int) bool { return taken[i].At.Before(taken[j].At) })
+	return taken
+}
+
 // pruneExpiredLocked drops every expired entry. Called with rb.mu held, only
 // when the buffer is full — steady-state expiry is handled lazily per-IP in
 // TakeMatching.

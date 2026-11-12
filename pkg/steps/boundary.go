@@ -350,12 +350,48 @@ func (t *Tracker) handleStepEvent(raw []byte, now clock) {
 	}
 }
 
+// earlyIdentity is a step identified before SetOnIdentified.
+type earlyIdentity struct {
+	ordinal uint32
+	id      Identity
+}
+
 // identified hands a step's identity to Options.OnIdentified, ahead of the
-// step's report: a policy bound on it applies the sooner.
+// step's report: a policy bound on it applies the sooner. Until a callback
+// is set, a step's is kept for SetOnIdentified.
 func (t *Tracker) identified(ordinal uint32, id Identity) {
-	if t.onIdentified != nil {
+	t.idMu.Lock()
+	defer t.idMu.Unlock()
+	switch {
+	case t.onIdentified != nil:
 		t.onIdentified(ordinal, id)
+	case t.idSettled || id.Class != events.StepClassStep:
+	case len(t.early) < maxEarlyIdentities:
+		t.early = append(t.early, earlyIdentity{ordinal: ordinal, id: id})
+	default:
+		t.earlyLost++
 	}
+}
+
+// SetOnIdentified sets Options.OnIdentified once the tracker runs, telling
+// fn first, in order, of every step identified before it, so a caller set
+// up after Start misses none. Only steps are kept for it, never a runner
+// helper or an unknown, and at most maxEarlyIdentities. A nil fn keeps none
+// from then on. Call it once whatever fn is: until then, the tracker keeps
+// what it identifies.
+func (t *Tracker) SetOnIdentified(fn func(ordinal uint32, id Identity)) {
+	t.idMu.Lock()
+	defer t.idMu.Unlock()
+	if fn != nil {
+		for _, e := range t.early {
+			fn(e.ordinal, e.id)
+		}
+		if t.earlyLost > 0 {
+			t.logger.Warn("Steps identified before their policies could be bound were not kept; "+
+				"those steps get the job's rules", "steps", t.earlyLost)
+		}
+	}
+	t.onIdentified, t.early, t.idSettled = fn, nil, true
 }
 
 // cBytes views a bpf2go char array as bytes.

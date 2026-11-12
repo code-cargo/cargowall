@@ -40,7 +40,10 @@ policy() {
       "action": "allow"
     }
   ],
-  "searchDomains": [".compute.internal"]
+  "searchDomains": [".compute.internal"],
+  "steps": [
+    {"id": "build", "rules": [{"type": "hostname", "value": "example.org"}]}
+  ]
 }
 JSON
 }
@@ -212,6 +215,21 @@ verify_audit() {
   echo "✅ Audit log contains $BLOCKED would-deny events"
 }
 
+# The policy's step rules need step attribution, which only the GitHub
+# preset turns on: here they are dropped, and the step-rules posture the
+# summary reads says so, with why.
+verify_step_rules_lost() {
+  local line
+  line=$(sudo jq -c '.[] | select(.posture == "step-rules")' /tmp/cargowall-postures)
+  echo "step-rules posture: ${line:-none}"
+  if [ -z "$line" ] || ! echo "$line" | jq -e '.requested == "on" and .applied == "off"
+      and (.reason | test("step attribution is off"))' > /dev/null; then
+    echo "❌ the dropped step rules are not recorded as such"
+    exit 1
+  fi
+  echo "✅ the dropped step rules are recorded, with why"
+}
+
 stop() {
   sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid --timeout 15s
   echo "✅ stop subcommand returned cleanly"
@@ -237,6 +255,7 @@ case "${1:-}" in
   start) start ;;
   verify-flush) verify_flush ;;
   verify-pidfile) verify_pidfile ;;
+  verify-step-rules-lost) verify_step_rules_lost ;;
   allowed) allowed ;;
   disallowed) disallowed ;;
   dns-bypass) dns_bypass ;;

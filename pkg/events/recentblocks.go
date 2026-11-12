@@ -65,8 +65,11 @@ type RecentBlock struct {
 	CNAMEChain      []string
 	At              time.Time
 	// container is whether any attempt the entry folds in came from a
-	// container, kept though a disagreement blanks the identity fields: a
-	// step tier's take leaves such an entry (TakeMatchingFor, TakeStep).
+	// container, or carried no socket at TC, whatever enrichment attributed
+	// it to, kept though a disagreement blanks the identity fields: a step
+	// tier's take leaves such an entry (TakeMatchingFor, TakeStep). TC
+	// judges a socketless packet by the job's rules unless a bridge stamp
+	// reached it, which nothing here can tell.
 	container bool
 }
 
@@ -158,7 +161,7 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 		ContainerOrigin: event.ContainerOrigin,
 		CNAMEChain:      event.CNAMEChain,
 		At:              event.Timestamp,
-		container:       event.ContainerID != "" || event.ContainerOrigin,
+		container:       event.ContainerID != "" || event.ContainerOrigin || event.socketless,
 	}
 	// The key is the destination and the step, so two sources of one step
 	// (containers A and B, or a container and a host process) blocked on the

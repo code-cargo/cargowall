@@ -977,32 +977,36 @@ to select policy with.
     don't allow (`dns.Server.LateAllowStep`): it opens the address under
     that step's policy alone, by a name the proxy itself answered the
     address for, never one a reverse lookup put to it, whatever the
-    address's owner says. A container's verdict never asks it: where the
-    container's packets aren't stamped, TC judges its retry as the job's,
-    so the step's rules opening the address need not let it through. And
-    anything that reloads step rules at runtime must clear the step
-    policies' entries, the DNS path's included, before installing:
-    policies are numbered per load, so a kept entry would be another
-    step's. It must clear the step tier's scope record with them, for the
-    same reason: the installs it records are gone, under the old load's
-    policies. The sync does the first (above); today it runs once, at
-    startup, over an empty step tier. A runtime reload that cannot clear
-    every step entry must treat the step tier as failed (write no step
-    entries, Warn), or plan the survivors' prefixes as unconfirmed so
-    their carves are kept: the rebuild plans as if the maps held no step
-    entries, so a survivor is gated against nothing in the new tier. And
-    anything that backfills at runtime must keep the backfill's record of
-    the CNAME hops each answered address came through open until it has
-    run: the startup backfill drops it once it is done, since every answer
-    after it is installed at answer time against its own chain, and a
-    backfill that finds it dropped installs nothing for steps (a missing
-    record would read as a chain with no hop the job denies). The cost is
-    an answer that raced the startup load and that neither installed: it
-    waits for its name's next answer, which fails closed. A run without
-    step rules drops the record sooner, once they are final: at its
-    policy's load, or, for a run that loaded none (a failed fetch, a
-    hook's nil policy, a failed file load), when the tcbpf load settles
-    them to none.
+    address's owner says. Only a verdict from a socket of cargowall's own
+    network namespace asks it, its source being one of the namespace's
+    addresses (listed at most every 5 s; on an ARC pod the pod's, which
+    dind's dockerd shares, while its containers send from their own), and
+    never one the tracker classifies as a container's: a container's, a
+    nested namespace's or another runtime's packets aren't stamped there,
+    so TC judges the retry as the job's, and the step's rules opening the
+    address need not let it through. And anything that reloads step rules
+    at runtime must clear the step policies' entries, the DNS path's
+    included, before installing: policies are numbered per load, so a kept
+    entry would be another step's. It must clear the step tier's scope
+    record with them, for the same reason: the installs it records are
+    gone, under the old load's policies. The sync does the first (above);
+    today it runs once, at startup, over an empty step tier. A runtime
+    reload that cannot clear every step entry must treat the step tier as
+    failed (write no step entries, Warn), or plan the survivors' prefixes
+    as unconfirmed so their carves are kept: the rebuild plans as if the
+    maps held no step entries, so a survivor is gated against nothing in
+    the new tier. And anything that backfills at runtime must keep the
+    backfill's record of the CNAME hops each answered address came through
+    open until it has run: the startup backfill drops it once it is done,
+    since every answer after it is installed at answer time against its
+    own chain, and a backfill that finds it dropped installs nothing for
+    steps (a missing record would read as a chain with no hop the job
+    denies). The cost is an answer that raced the startup load and that
+    neither installed: it waits for its name's next answer, which fails
+    closed. A run without step rules drops the record sooner, once they
+    are final: at its policy's load, or, for a run that loaded none (a
+    failed fetch, a hook's nil policy, a failed file load), when the tcbpf
+    load settles them to none.
   - *Capacity.* The rule maps are sized at load from the policy in hand
     (`bpf.SizeRuleMaps`), read once: no path loads a policy after the tcbpf
     load, and one that did would have to reload the maps itself. Without
@@ -1073,13 +1077,14 @@ to select policy with.
     now lets through, by the verdict over the maps
     (`firewall.Firewall.Allows`), are re-reported as late-allowed, under
     its own ordinal (`dns.Server.ReconcileBoundStep`), never a
-    container's, whose packets TC may still judge as the job's, and by a
-    name rule only where the proxy answered the name for the address. That
-    verdict is L4's: at an L7-scoped address, a retry the step reaches by
-    a CIDR rule must still present a name allowed there, so a re-report
-    can claim a retry L7 then drops, as the job tier's can. The binder's
-    lookup is the one the DNS path's per-step late-allows reconcile by
-    (`dns.Server.SetStepBindings`).
+    container's, nor one TC saw with no socket whatever enrichment
+    attributed it to, whose packets TC may still judge as the job's, and
+    by a name rule only where the proxy answered the name for the address.
+    That verdict is L4's: at an L7-scoped address, a retry the step
+    reaches by a CIDR rule must still present a name allowed there, so a
+    re-report can claim a retry L7 then drops, as the job tier's can. The
+    binder's lookup is the one the DNS path's per-step late-allows
+    reconcile by (`dns.Server.SetStepBindings`).
   - *What per-step rules do not separate.* They bound what each step's own
     processes reach. Steps of one job share a uid, the workspace and
     dockerd, so a step can shape what a later one runs, or share a socket

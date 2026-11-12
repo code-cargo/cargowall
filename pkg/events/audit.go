@@ -221,6 +221,12 @@ type AuditEvent struct {
 	AttributionKind string  `json:"attribution_kind,omitempty"` // container_attribution only: "start" | "exec" | "reconcile"
 	TagLatencyMS    float64 `json:"tag_latency_ms,omitempty"`   // container_attribution only: docker event → tag-complete latency
 	Privileged      bool    `json:"privileged,omitempty"`       // container_attribution only: container runs --privileged (host-root equivalent)
+
+	// socketless marks a TC event whose packet carried no socket at TC (pid
+	// and ordinal 0), a NATed container's say, whatever enrichment then
+	// attributed it to: a step tier never re-reports its block
+	// (RecentBlocks). In-process only.
+	socketless bool
 }
 
 // EventSink receives every audit event after the audit/enforce mode flags

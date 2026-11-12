@@ -409,3 +409,33 @@ func TestRecentBlocks_TakeStepJudgesOutsideTheLock(t *testing.T) {
 	require.Len(t, left, 1)
 	assert.True(t, left[0].At.Equal(later.Timestamp))
 }
+
+// hostFlowEnricher attributes a socketless TC event to a host process of a
+// step, as the enricher's "host flow the join missed" branch does: the
+// origin record's PID and ordinal, no container.
+type hostFlowEnricher struct{}
+
+func (hostFlowEnricher) Enrich(audit *AuditEvent, _ *BpfBlockedEvent) {
+	audit.PID, audit.StepOrdinal = 4242, 7
+}
+
+// A block TC saw with no socket stays out of a step tier's takes whatever
+// enrichment then attributed it to: unless a bridge stamp reached it, which
+// nothing here can tell, TC judged it by the job's rules, and still will.
+func TestRecentBlocks_SocketlessAtTCLeftToTheJob(t *testing.T) {
+	auditLogger, err := NewAuditLogger("", false)
+	require.NoError(t, err)
+	rb := NewRecentBlocks(time.Minute)
+	auditLogger.AddSink(rb)
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+	reverseDNS.reset()
+
+	processEvent(makeBpfEvent(orphanEvent()), cm, nil, auditLogger, nil, nil, newTestLogger(), hostFlowEnricher{})
+	all := func(uint32) bool { return true }
+	assert.Empty(t, rb.TakeStep(7, func(RecentBlock) bool { return true }))
+	assert.Empty(t, rb.TakeMatchingFor("93.184.216.34", all, nil, nil, false))
+	taken := rb.TakeMatching("93.184.216.34", nil, nil, false)
+	require.Len(t, taken, 1, "the job's take has it")
+	assert.Equal(t, uint32(7), taken[0].StepOrdinal)
+}

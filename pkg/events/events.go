@@ -218,7 +218,8 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	// pid=0 AND ordinal=0 is the no-socket-at-TC signature (NATed container
 	// flows, plus rare map_sock_pid evictions); anything with either field
 	// set was attributed normally and must not be second-guessed.
-	if enricher != nil && event.Pid == 0 && event.StepOrdinal == 0 {
+	out.Audit.socketless = event.Pid == 0 && event.StepOrdinal == 0
+	if enricher != nil && out.Audit.socketless {
 		enricher.Enrich(&out.Audit, event)
 	}
 

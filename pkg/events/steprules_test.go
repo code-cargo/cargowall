@@ -132,27 +132,47 @@ func TestTryLateAllow_StepTier(t *testing.T) {
 	assert.True(t, allowed, "the step's port")
 	assert.Equal(t, []uint32{7}, reg.asked)
 
-	// A hook's denial asks it for the step that made the connection, and
-	// reports the late-allow the step tier gives.
+	// A hook's denial for a socket of cargowall's own namespace asks it for
+	// the step that made the connection, and reports the late-allow the
+	// step tier gives.
+	(&fakeHostAddrs{addrs: []string{"10.1.0.11/24"}}).set(t)
 	reg.allow, reg.asked = true, nil
 	cm.UpdateDNSMapping("step.example.com", ip)
 	auditLogger, err := NewAuditLogger("", false)
 	require.NoError(t, err)
 	sink := &recordingSink{}
 	auditLogger.AddSink(sink)
-	ReportVerdict(verdictRec(true), cm, nil, auditLogger, fw, reg, newTestLogger())
+	host := verdictRec(true)
+	host.SrcIP = "10.1.0.11"
+	ReportVerdict(host, cm, nil, auditLogger, fw, reg, newTestLogger())
 	assert.Equal(t, []uint32{7}, reg.asked)
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, EventConnectionLateAllowed, sink.events[0].EventType)
 	assert.Equal(t, uint32(7), sink.events[0].StepOrdinal)
 
-	// A container's is never asked: TC may judge its retry as the job's.
-	reg.asked = nil
-	ctr := verdictRec(true)
-	ctr.Decorate = func(a *AuditEvent) { a.ContainerOrigin, a.ContainerID = true, "c0ffee" }
-	ReportVerdict(ctr, cm, nil, auditLogger, fw, reg, newTestLogger())
-	assert.Empty(t, reg.asked)
-	require.Len(t, sink.events, 2)
-	assert.Equal(t, EventConnectionBlocked, sink.events[1].EventType)
-	assert.Equal(t, "c0ffee", sink.events[1].ContainerID)
+	// A container's is never asked, the tracker's classification aside: TC
+	// may judge its retry as the job's.
+	for _, c := range []struct {
+		name string
+		rec  func() VerdictRecord
+	}{
+		{"classified", func() VerdictRecord {
+			r := host
+			r.Decorate = func(a *AuditEvent) { a.ContainerOrigin, a.ContainerID = true, "c0ffee" }
+			return r
+		}},
+		{"unclassified, from another namespace", func() VerdictRecord {
+			r := host
+			r.SrcIP = "10.244.0.5"
+			r.Decorate = func(*AuditEvent) {}
+			return r
+		}},
+	} {
+		reg.asked = nil
+		n := len(sink.events)
+		ReportVerdict(c.rec(), cm, nil, auditLogger, fw, reg, newTestLogger())
+		assert.Empty(t, reg.asked, c.name)
+		require.Len(t, sink.events, n+1, c.name)
+		assert.Equal(t, EventConnectionBlocked, sink.events[n].EventType, c.name)
+	}
 }

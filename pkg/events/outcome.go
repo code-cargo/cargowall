@@ -557,7 +557,16 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 	// pipeline with the slow work flagged off (see prepareOutcome) rather
 	// than a parallel construction that could drift from it.
 	denial := rec.Dropped
-	if l7 != nil && denial && !rec.Degraded && (!hostAddrs.has(rec.SrcIP) || fromContainer(rec)) {
+	// A drop the step tier may not answer for, now or in a later re-report:
+	// not from a socket of cargowall's own namespace (its source isn't one
+	// of hostAddrs), or from a container the tracker classifies (see
+	// withoutStepTier). The late-allow here doesn't ask it, and the mark
+	// keeps its block out of a step tier's takes (RecentBlocks). A degraded
+	// record is marked too, the snapshot being local and bounded, but skips
+	// the decoration probe, as it skips the late-allow: the decoration
+	// below marks a container's block all the same.
+	jobJudged := denial && (!hostAddrs.has(rec.SrcIP) || (!rec.Degraded && fromContainer(rec)))
+	if l7 != nil && jobJudged {
 		l7 = withoutStepTier{l7}
 	}
 	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, l7, logger,
@@ -567,6 +576,7 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 	if rec.Decorate != nil {
 		rec.Decorate(&out.Audit)
 	}
+	out.Audit.jobJudged = jobJudged
 
 	if rec.Degraded {
 		// The notification client reaches the SaaS backend — unbounded

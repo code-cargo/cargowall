@@ -984,10 +984,14 @@ to select policy with.
     never one the tracker classifies as a container's: a container's, a
     nested namespace's or another runtime's packets aren't stamped there,
     so TC judges the retry as the job's, and the step's rules opening the
-    address need not let it through. And anything that reloads step rules
-    at runtime must clear the step policies' entries, the DNS path's
-    included, before installing: policies are numbered per load, so a kept
-    entry would be another step's. It must clear the step tier's scope
+    address need not let it through. Such a drop is marked so for the
+    re-reports too (`AuditEvent.jobJudged`, as a TC event with no socket
+    is): neither a step's install nor its binding re-reports its block,
+    which stays reported until the job's rules open the address. And
+    anything that reloads step rules at runtime must clear the step
+    policies' entries, the DNS path's included, before installing:
+    policies are numbered per load, so a kept entry would be another
+    step's. It must clear the step tier's scope
     record with them, for the same reason: the installs it records are
     gone, under the old load's policies. The sync does the first (above);
     today it runs once, at startup, over an empty step tier. A runtime
@@ -1078,7 +1082,8 @@ to select policy with.
     (`firewall.Firewall.Allows`), are re-reported as late-allowed, under
     its own ordinal (`dns.Server.ReconcileBoundStep`), never a
     container's, nor one TC saw with no socket whatever enrichment
-    attributed it to, whose packets TC may still judge as the job's, and
+    attributed it to, nor a hook drop the step tier may not answer for
+    (above), whose packets TC may still judge as the job's, and
     by a name rule only where the proxy answered the name for the address.
     That verdict is L4's: at an L7-scoped address, a retry the step
     reaches by a CIDR rule must still present a name allowed there, so a

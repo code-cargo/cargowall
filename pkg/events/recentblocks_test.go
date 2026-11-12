@@ -439,3 +439,44 @@ func TestRecentBlocks_SocketlessAtTCLeftToTheJob(t *testing.T) {
 	require.Len(t, taken, 1, "the job's take has it")
 	assert.Equal(t, uint32(7), taken[0].StepOrdinal)
 }
+
+// A hook drop the step tier may not answer for is marked so for the
+// re-reports too: a pod of a nested namespace in step 7, which the tracker
+// doesn't classify, keeps its block reported when step 7 is bound or its
+// rules open the address, since TC may still judge its retry as the job's.
+// A degraded record is marked the same. A drop from a socket of cargowall's
+// own namespace is the step tier's to take.
+func TestRecentBlocks_HookDropsTheStepTierCannotAnswer(t *testing.T) {
+	(&fakeHostAddrs{addrs: []string{"10.1.0.11/24"}}).set(t)
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+	reverseDNS.reset()
+	const dst = "93.184.216.34"
+	all := func(uint32) bool { return true }
+	report := func(src string, degraded bool) *RecentBlocks {
+		auditLogger, err := NewAuditLogger("", false)
+		require.NoError(t, err)
+		rb := NewRecentBlocks(time.Minute)
+		auditLogger.AddSink(rb)
+		rec := verdictRec(true)
+		rec.SrcIP, rec.Degraded = src, degraded
+		rec.Decorate = func(*AuditEvent) {}
+		ReportVerdict(rec, cm, nil, auditLogger, nil, nil, newTestLogger())
+		return rb
+	}
+
+	for _, degraded := range []bool{false, true} {
+		name := fmt.Sprintf("degraded=%v", degraded)
+		rb := report("10.244.0.5", degraded)
+		assert.Empty(t, rb.TakeStep(7, func(RecentBlock) bool { return true }), name)
+		assert.Empty(t, rb.TakeMatchingFor(dst, all, nil, nil, false), name)
+		taken := rb.TakeMatching(dst, nil, nil, false)
+		require.Len(t, taken, 1, "the job's take has it, "+name)
+		assert.Equal(t, uint32(7), taken[0].StepOrdinal, name)
+
+		rb = report("10.1.0.11", degraded)
+		assert.Len(t, rb.TakeStep(7, func(RecentBlock) bool { return true }), 1, name)
+		rb = report("10.1.0.11", degraded)
+		assert.Len(t, rb.TakeMatchingFor(dst, all, nil, nil, false), 1, name)
+	}
+}

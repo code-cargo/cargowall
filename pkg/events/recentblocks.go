@@ -64,13 +64,13 @@ type RecentBlock struct {
 	ContainerOrigin bool
 	CNAMEChain      []string
 	At              time.Time
-	// container is whether any attempt the entry folds in came from a
-	// container, or carried no socket at TC, whatever enrichment attributed
-	// it to, kept though a disagreement blanks the identity fields: a step
-	// tier's take leaves such an entry (TakeMatchingFor, TakeStep). TC
-	// judges a socketless packet by the job's rules unless a bridge stamp
-	// reached it, which nothing here can tell.
-	container bool
+	// jobJudged is whether TC may judge the retry of any attempt the entry
+	// folds in by the job's rules: one from a container, or marked so by its
+	// reporter (AuditEvent.jobJudged), kept though a disagreement blanks the
+	// identity fields. A step tier's take leaves such an entry
+	// (TakeMatchingFor, TakeStep): whether a bridge stamp reaches its
+	// packets, nothing here can tell.
+	jobJudged bool
 }
 
 // recentBlockKey keys a destination's blocks by port, protocol and step
@@ -161,7 +161,7 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 		ContainerOrigin: event.ContainerOrigin,
 		CNAMEChain:      event.CNAMEChain,
 		At:              event.Timestamp,
-		container:       event.ContainerID != "" || event.ContainerOrigin || event.socketless,
+		jobJudged:       event.ContainerID != "" || event.ContainerOrigin || event.jobJudged,
 	}
 	// The key is the destination and the step, so two sources of one step
 	// (containers A and B, or a container and a host process) blocked on the
@@ -188,7 +188,7 @@ func degradeDisagreement(prev, next RecentBlock) RecentBlock {
 	if next.At.Before(prev.At) {
 		next.At = prev.At
 	}
-	next.container = next.container || prev.container
+	next.jobJudged = next.jobJudged || prev.jobJudged
 	if prev.SrcIP != next.SrcIP {
 		next.SrcIP = ""
 	}
@@ -223,11 +223,12 @@ func (rb *RecentBlocks) TakeMatching(dstIP string, allowPorts, denyPorts []confi
 // TakeMatchingFor is TakeMatching for the blocks of the step ordinals steps
 // picks (nil: every one), and leaves the rest: what one step's own rules
 // open, they open for that step alone. A step tier's take (steps set) also
-// leaves every block from a container: where its packets aren't stamped
-// with its step's policy (an unattached bridge port, before the attach, a
-// daemon's bridges in another namespace), TC judges them by the job's rules
-// alone, so a step's rules opening the address need not let its retry
-// through. Leaving the block reported is the safe way round.
+// leaves every block TC may judge as the job's (RecentBlock.jobJudged), a
+// container's among them: where its packets aren't stamped with its step's
+// policy (an unattached bridge port, before the attach, a daemon's bridges
+// in another namespace), TC judges them by the job's rules alone, so a
+// step's rules opening the address need not let its retry through.
+// Leaving the block reported is the safe way round.
 func (rb *RecentBlocks) TakeMatchingFor(dstIP string, steps func(ordinal uint32) bool, allowPorts, denyPorts []config.Port, hasDeny bool) []RecentBlock {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -245,7 +246,7 @@ func (rb *RecentBlocks) TakeMatchingFor(dstIP string, steps func(ordinal uint32)
 			rb.size--
 			continue
 		}
-		if steps != nil && (b.container || !steps(key.ordinal)) {
+		if steps != nil && (b.jobJudged || !steps(key.ordinal)) {
 			continue
 		}
 		proto, _ := protocolTypeForAuditName(b.Protocol) // recorded entries always map
@@ -269,11 +270,11 @@ func (rb *RecentBlocks) TakeMatchingFor(dstIP string, steps func(ordinal uint32)
 
 // TakeStep removes and returns the unexpired blocks of step ordinal, at any
 // destination, that allowed picks, ordered by attempt time: what binding the
-// step to its policy now lets through. Blocks from a container stay, as in
-// a step tier's TakeMatchingFor. allowed runs outside the buffer's lock, on
-// the step's blocks picked under it, so the event reader's Consume never
-// waits on it; a block whose entry has moved on meanwhile, taken or folded
-// into a later attempt, is left.
+// step to its policy now lets through. Blocks TC may judge as the job's
+// stay, as in a step tier's TakeMatchingFor. allowed runs outside the
+// buffer's lock, on the step's blocks picked under it, so the event
+// reader's Consume never waits on it; a block whose entry has moved on
+// meanwhile, taken or folded into a later attempt, is left.
 func (rb *RecentBlocks) TakeStep(ordinal uint32, allowed func(RecentBlock) bool) []RecentBlock {
 	type candidate struct {
 		ip  string
@@ -285,7 +286,7 @@ func (rb *RecentBlocks) TakeStep(ordinal uint32, allowed func(RecentBlock) bool)
 	cutoff := time.Now().Add(-rb.ttl)
 	for ip, byKey := range rb.byIP {
 		for key, b := range byKey {
-			if key.ordinal != ordinal || b.container {
+			if key.ordinal != ordinal || b.jobJudged {
 				continue
 			}
 			if b.At.Before(cutoff) {
@@ -308,7 +309,7 @@ func (rb *RecentBlocks) TakeStep(ordinal uint32, allowed func(RecentBlock) bool)
 	for _, c := range candidates {
 		byKey := rb.byIP[c.ip]
 		b, ok := byKey[c.key]
-		if !ok || !b.At.Equal(c.b.At) || b.container {
+		if !ok || !b.At.Equal(c.b.At) || b.jobJudged {
 			continue
 		}
 		delete(byKey, c.key)

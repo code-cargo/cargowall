@@ -114,3 +114,37 @@ func TestGroupThousands(t *testing.T) {
 		assert.Equal(t, want, groupThousands(n))
 	}
 }
+
+// A collection the verifier rejects logs the rejection as an error of the
+// run, unless its caller loads it again another way should that happen (a
+// tentative attempt): then it is the caller's to report, and logs at Debug.
+func TestLoadObjectsAttempt_RejectionLevel(t *testing.T) {
+	saved := newCollection
+	t.Cleanup(func() { newCollection = saved })
+	rejected := fmt.Errorf("program cw_cg_egress: load program: %w", &ebpf.VerifierError{
+		Cause: unix.E2BIG, Log: []string{"BPF program is too large. Processed 1000001 insn"},
+	})
+	newCollection = func(*ebpf.CollectionSpec, ebpf.CollectionOptions) (*ebpf.Collection, error) { return nil, rejected }
+
+	for _, c := range []struct {
+		name  string
+		load  func(logger *slog.Logger) error
+		level string
+	}{
+		{"LoadObjects", func(l *slog.Logger) error { return LoadObjects(l, "originbpf", nil, ebpf.CollectionOptions{}, nil) }, "level=ERROR"},
+		{"an attempt", func(l *slog.Logger) error {
+			return LoadObjectsAttempt(l, "originbpf", nil, ebpf.CollectionOptions{}, nil, false)
+		}, "level=ERROR"},
+		{"a tentative attempt", func(l *slog.Logger) error {
+			return LoadObjectsAttempt(l, "originbpf", nil, ebpf.CollectionOptions{}, nil, true)
+		}, "level=DEBUG"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := c.load(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			assert.ErrorIs(t, err, unix.E2BIG)
+			assert.Contains(t, buf.String(), c.level+` msg="BPF program rejected by the verifier"`)
+			assert.Contains(t, buf.String(), "program=cw_cg_egress")
+		})
+	}
+}

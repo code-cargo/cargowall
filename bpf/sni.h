@@ -144,7 +144,7 @@ struct l7_event {
     __u8 scope;         // the ONE L7_SCOPE_* bit that applied
     __u32 seq;          // TCP sequence (punt dedup); 0 for QUIC
     __u16 payload_len;  // valid bytes in payload[]
-    __u16 pad;
+    __u16 step_policy;  // the step policy the socket is judged by, 0 for none
     // The Initial's exact DCID (0 for TCP): the kernel already walked the long
     // header, so the oracle stamps THIS into the verdict rather than running a
     // second decoder over the payload.
@@ -439,7 +439,7 @@ static __always_inline void l7_fill_event(struct l7_event *e, struct l7_ctx *c,
     e->flags = flags;
     e->scope = scope;
     e->seq = c->seq;
-    e->pad = 0;
+    e->step_policy = (__u16)step_policy_judged(c->cookie);
     e->dcid_len = c->quic.dcid_len;
     __builtin_memcpy(e->dcid, c->quic.dcid, 20);
     __builtin_memset(e->pad2, 0, sizeof(e->pad2));

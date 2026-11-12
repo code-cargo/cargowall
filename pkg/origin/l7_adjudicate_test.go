@@ -19,8 +19,10 @@ package origin
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/sni"
 	"github.com/code-cargo/cargowall/pkg/sni/snitest"
@@ -157,4 +159,35 @@ func TestL7AdjudicatePerIPBinding(t *testing.T) {
 	require.False(t, out.WouldNarrow, "an enforced deny is not a would-narrow")
 	require.Equal(t, L7NameNotAtIP, out.Reason)
 	require.NotEqual(t, L7Mismatch, out.Reason, "must stay distinct from an unallowed name")
+}
+
+// policyAllowSet allows a name only for the step policies it lists, so the
+// policy the punt carries is what the decision turns on.
+type policyAllowSet map[string]uint32
+
+func (a policyAllowSet) MatchName(q config.L7Request) config.L7Match {
+	if p, ok := a[q.Name]; ok && p == q.Policy {
+		return config.L7MatchOK
+	}
+	return config.L7NoMatch
+}
+
+// The oracle judges a name by the step policy the kernel stamped on the
+// punt, never one it looks up itself later, which a binding landing in
+// between would change.
+func TestL7Accumulate_JudgesByThePuntsPolicy(t *testing.T) {
+	hello := snitest.BuildClientHello("step.example.com")
+	l := &L7{matcher: policyAllowSet{"step.example.com": 3}, flows: map[bpf.OriginBpfL7FlowKey]*l7flow{}}
+	for _, c := range []struct {
+		policy uint16
+		allow  bool
+	}{{3, true}, {0, false}, {4, false}} {
+		ev := makeL7Event(443, 100, hello, false)
+		ev.StepPolicy = c.policy
+		st := &l7flow{proto: sni.ProtoTLS}
+		l.flows[ev.FlowKey()] = st
+		needMore, out := accumulateDrive(l, st, ev, hello)
+		require.False(t, needMore)
+		assert.Equal(t, c.allow, out.Allowed, "policy %d", c.policy)
+	}
 }

@@ -64,7 +64,7 @@ type containerAttribution struct {
 	observer    *origin.Observer // nil when the hook failed to load/attach under observe
 	enricher    *containers.Enricher
 	tracker     *containers.Tracker // nil until startUserspace succeeds
-	stamp       *bridgeStamp        // nil with step rules off
+	stamp       *bridgeStamp        // nil with step rules off or dropped (settleSteps)
 	postures    *postureLedger      // decides what losing the posture means
 	scope       scopeDecision       // the daemon's rules, left for it to decide once it answers
 	logger      *slog.Logger
@@ -230,6 +230,26 @@ func (a *containerAttribution) originObserver() *origin.Observer {
 		return nil
 	}
 	return a.observer
+}
+
+// stepRulesHook is the hook's step-rules gate, nil without a hook.
+func (a *containerAttribution) stepRulesHook() stepRulesHook {
+	if a == nil || a.observer == nil {
+		return nil
+	}
+	return a.observer
+}
+
+// settleSteps settles the policy's step rules once the hooks are loaded
+// (settleStepTier), and keeps the bridge stamp off once they are dropped:
+// tcbpf's gate stays on over a dropped step tier, but nothing binds a step
+// then, so there is nothing to stamp. Without attribution the steps are
+// settled all the same.
+func (a *containerAttribution) settleSteps(configMgr *config.Manager, stepTracker *steps.Tracker, stepErr error, logger *slog.Logger) {
+	settleStepTier(configMgr, stepTracker, stepErr, a.stepRulesHook(), logger)
+	if a != nil && !configMgr.HasStepRules() {
+		a.stamp = nil
+	}
 }
 
 // containerEnricher exposes the identity decorator for those same features.

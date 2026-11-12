@@ -19,9 +19,15 @@ package cmd
 import (
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/dns"
 	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/origin"
 )
@@ -51,6 +57,8 @@ type cmdRecordingRegistrar struct {
 }
 
 func (r *cmdRecordingRegistrar) FlushScopes() error { r.scopes = nil; return nil }
+
+func (r *cmdRecordingRegistrar) UnscopeIP(net.IP, []config.Port) error { return nil }
 
 func (r *cmdRecordingRegistrar) ScopeIP(ip net.IP, ports []config.Port) error {
 	if r.scopes == nil {
@@ -143,4 +151,24 @@ func TestGateExistingConnectionsSkipsUnboundIP(t *testing.T) {
 	if _, scoped := rec.scopes["203.0.113.9"]; scoped {
 		t.Errorf("scoped an IP with no forward-resolution evidence: %v", rec.scopes)
 	}
+}
+
+// The oracle's name authority is bound to the proxy's tiers, its step tier
+// included: a flow judged as step policy 1 is admitted by that step's own
+// rule, a flow judged as the job is not, and without a proxy there is no
+// step tier at all.
+func TestL7Policy_BindsTheStepTier(t *testing.T) {
+	cm := config.NewConfigManager()
+	path := filepath.Join(t.TempDir(), "policy.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"defaultAction": "deny", "rules": [],
+		"steps": [{"id": "fetch", "rules": [{"type": "hostname", "value": "step.example.com"}]}]}`), 0o600))
+	require.NoError(t, cm.LoadConfig(path))
+	cm.RecordForwardResolution("step.example.com", "104.16.1.1")
+	q := func(policy uint32) config.L7Request {
+		return config.L7Request{Name: "step.example.com", DstIP: "104.16.1.1", DstPort: 443, Proto: 6, Policy: policy}
+	}
+	m := l7Policy(cm, dns.NewServer(cm, nil, "192.0.2.1:53", "127.0.0.1:0", slog.Default()))
+	assert.Equal(t, config.L7MatchOK, m.MatchName(q(1)))
+	assert.Equal(t, config.L7NoMatch, m.MatchName(q(0)))
+	assert.Equal(t, config.L7NoMatch, l7Policy(cm, nil).MatchName(q(1)))
 }

@@ -17,6 +17,7 @@
 package ebpf
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -149,6 +150,19 @@ func (r Rejection) On(kernel string) string {
 	return fmt.Sprintf("verifier rejected %s: %s insns", subject, groupThousands(r.Insns))
 }
 
+// RejectionReason is one line saying why a load failed: the verifier's
+// rejection (Rejection.On), or the error's first line.
+func RejectionReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	if r, ok := ParseRejection(err); ok {
+		return r.On("")
+	}
+	first, _, _ := strings.Cut(err.Error(), "\n")
+	return first
+}
+
 // groupThousands renders n with comma separators: an instruction count next
 // to the 1,000,000 limit is unreadable without them.
 func groupThousands(n int) string {
@@ -174,6 +188,14 @@ func groupThousands(n int) string {
 // log has none. Returns false (and logs nothing) when err is not a verifier
 // rejection.
 func LogVerifierRejection(logger *slog.Logger, collection string, err error) bool {
+	return logVerifierRejection(logger, slog.LevelError, collection, err)
+}
+
+// newCollection loads a collection; a test stands in a verifier that
+// rejects it.
+var newCollection = ebpf.NewCollectionWithOptions
+
+func logVerifierRejection(logger *slog.Logger, level slog.Level, collection string, err error) bool {
 	r, ok := ParseRejection(err)
 	if !ok {
 		return false
@@ -183,7 +205,7 @@ func LogVerifierRejection(logger *slog.Logger, collection string, err error) boo
 		attrs = append(attrs, "processed_insns", r.Insns, "pct", 100*float64(r.Insns)/InsnLimit)
 	}
 	attrs = append(attrs, "limit", InsnLimit, "error", r.Cause)
-	logger.Error("BPF program rejected by the verifier", attrs...)
+	logger.Log(context.Background(), level, "BPF program rejected by the verifier", attrs...)
 	return true
 }
 
@@ -199,9 +221,21 @@ func LogVerifierRejection(logger *slog.Logger, collection string, err error) boo
 // CollectionOptions — the log levels differ on purpose — and may still
 // inspect the returned error for the verifier log.
 func LoadObjects(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any) error {
-	coll, err := ebpf.NewCollectionWithOptions(spec, opts)
+	return LoadObjectsAttempt(logger, collection, spec, opts, to, false)
+}
+
+// LoadObjectsAttempt is LoadObjects for an attempt that may be tentative:
+// one its caller loads again another way should the verifier reject it.
+// That rejection is the caller's to report, so it is logged at Debug, not
+// as an error of a run that goes on to start normally.
+func LoadObjectsAttempt(logger *slog.Logger, collection string, spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions, to any, tentative bool) error {
+	rejection := slog.LevelError
+	if tentative {
+		rejection = slog.LevelDebug
+	}
+	coll, err := newCollection(spec, opts)
 	if err != nil {
-		LogVerifierRejection(logger, collection, err)
+		logVerifierRejection(logger, rejection, collection, err)
 		return err
 	}
 	LogVerifierStats(logger, collection, coll.Programs)

@@ -57,6 +57,27 @@ SNI/Host, which matches no rule, and a rules-only matcher would deny every such
 flow. Derived names are port-scoped by the ports they inherited from their
 origin, and expire exactly when the derived TTL does.
 
+A flow from a step's socket adds a third: that step's own rules and CNAME
+chains (`Server.StepAllowPorts`), after the job's tiers and never past a job
+deny, so a step reaches a shared edge address by the names its rules allow and
+no others. Which step is the kernel's answer, not the oracle's: each punt
+carries the step policy the socket is judged by, read with the punt
+(`l7_event.step_policy`), because a binding landing between the punt and a
+userspace lookup would judge an unbound flow by a step's rules. A step's DNS
+installs are scoped as the job's are, once the firewall admits one and before
+any of it is written; one whose scope can't be written is withheld rather than
+opened unscoped. Step scopes take room only in the steps' share of each scope
+map, what the job's reservation leaves, so they can't fill it under the job,
+which keeps room for at least 4096 addresses. The replay after a scope flush
+scopes them again, and withdraws a step's install it can't, or one whose step
+allows none of the names it was installed for any more, and scopes the address
+on its kept installs' ports alone. SCOPE IFF BOUND holds for them as for the
+job: an address with no forward-resolution evidence for its name is installed
+unscoped. The scope holds for every flow to the address: a job flow there,
+through a job CIDR allow say, must present a name the job's tiers allow, as at
+an address a job hostname resolves to, and until steps are bound that
+narrowing is all a step's rules do here.
+
 A duplicate-SNI hello (two `server_name` extensions, or two `host_name` list
 entries) is rejected as malformed rather than resolved first- or last-wins:
 with two names in flight, the enforcer and the server could pick different

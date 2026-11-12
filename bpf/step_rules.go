@@ -45,11 +45,44 @@ func SetStepRules(spec *ebpf.CollectionSpec, on bool) error {
 // it cannot read reads as on: the lookup then runs, and where no step is
 // bound to a policy it finds none, so it changes no verdict.
 func (o *TcBpfObjects) StepRules() bool {
+	return gateOn(o.StepRulesEnabled)
+}
+
+// StepRules reports the step-rules gate a loaded originbpf collection was
+// built with, as TcBpfObjects.StepRules does tcbpf's.
+func (o *OriginBpfObjects) StepRules() bool {
+	return gateOn(o.StepRulesEnabled)
+}
+
+func gateOn(v *ebpf.Variable) bool {
 	var b uint8
-	if o.StepRulesEnabled == nil || o.StepRulesEnabled.Get(&b) != nil {
+	if v == nil || v.Get(&b) != nil {
 		return true
 	}
 	return b != 0
+}
+
+// LoadWithStepRules loads spec by load with the step-rules gate set to on
+// and, should the verifier reject that load, once more with the gate off: a
+// kernel that cannot verify the step lookup costs the steps their own rules,
+// never the hook. The steps' traffic then gets the job's rules, which is
+// fail-closed. load is told whether a rejection of its attempt would be
+// retried (tentative), so it can leave the reporting to the caller. It
+// reports whether what loaded has the gate on and, when a gate-on load was
+// rejected, why.
+func LoadWithStepRules(spec *ebpf.CollectionSpec, on bool, load func(spec *ebpf.CollectionSpec, tentative bool) error) (stepRules bool, rejected, err error) {
+	if err := SetStepRules(spec, on); err != nil {
+		return false, nil, err
+	}
+	err = load(spec, on)
+	var verr *ebpf.VerifierError
+	if err == nil || !on || !errors.As(err, &verr) {
+		return on && err == nil, nil, err
+	}
+	if serr := SetStepRules(spec, false); serr != nil {
+		return false, err, serr
+	}
+	return false, err, load(spec, false)
 }
 
 // The rule maps' sizes. verdict.h declares the larger, for a policy with

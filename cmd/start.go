@@ -478,25 +478,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	logger.Info("Using network interface", "interface", ifname)
 
 	// Load TC eBPF objects
-	spec, err := loadTcSpec(cmd, configMgr)
-	if err != nil {
-		return err
-	}
 	var objs bpf.TcBpfObjects
-	if err := cargowallEbpf.LoadObjects(logger, "tcbpf", spec, ebpf.CollectionOptions{
-		Programs: ebpf.ProgramOptions{
-			KernelTypes: nil,
-			LogLevel:    ebpf.LogLevelBranch | ebpf.LogLevelStats,
-		},
-	}, &objs); err != nil {
-		// Try to get the full verifier log
-		var verr *ebpf.VerifierError
-		if errors.As(err, &verr) {
-			logger.Error("eBPF verifier error - Full log follows:")
-			// Print the full log to stderr since it might be very long
-			_, _ = fmt.Fprintf(os.Stderr, "\n=== VERIFIER LOG START ===\n%s\n=== VERIFIER LOG END ===\n", verr.Log)
-		}
-		return fmt.Errorf("failed to load TC eBPF objects: %w", err)
+	if err := loadTcObjects(cmd, configMgr, logger, &objs); err != nil {
+		return err
 	}
 	defer objs.Close()
 
@@ -573,6 +557,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		return err
 	}
 	defer attribution.Close()
+	attribution.settleSteps(configMgr, stepTracker, stepErr, logger)
 
 	// Userspace half of the loopback carve-out pair — must run before
 	// UpdateAllowlistTC programs the maps below. (Placement relative to the

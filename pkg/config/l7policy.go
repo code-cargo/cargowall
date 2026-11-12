@@ -23,6 +23,9 @@ type L7Request struct {
 	DstIP   string // destination address, string form (the DNS/audit vocabulary)
 	DstPort uint16
 	Proto   uint8 // L4 protocol number
+	// Policy is the step policy the flow's socket is judged by, as the
+	// kernel read it with the punt; 0 (the job's) for none.
+	Policy uint32
 }
 
 // L7Match is the answer MatchName gives. Three states rather than a bool
@@ -52,12 +55,22 @@ type L7Policy struct {
 	// its inherited allow ports. Nil when there is no DNS proxy, in which case
 	// no name could have been derived in the first place.
 	derived func(name string) ([]Port, bool)
+	// steps resolves the ports a step policy's own rules or chains allow a
+	// name on, past the job's. Nil without step rules.
+	steps func(policy uint32, name string) ([]Port, bool)
 }
 
 // NewL7Policy binds a Manager to the proxy's derived-target lookup. Pass a nil
 // derived when there is no DNS proxy.
 func NewL7Policy(cm *Manager, derived func(name string) ([]Port, bool)) L7Policy {
 	return L7Policy{cm: cm, derived: derived}
+}
+
+// WithSteps binds the step tier: the ports step policy's own rules or
+// chains allow a name on.
+func (p L7Policy) WithSteps(steps func(policy uint32, name string) ([]Port, bool)) L7Policy {
+	p.steps = steps
+	return p
 }
 
 // MatchName decides whether a recovered destination name is admitted ON THIS
@@ -88,6 +101,14 @@ func (p L7Policy) MatchName(q L7Request) L7Match {
 	allowedByName := v.HasAllow() && DstPortAllowedByRule(q.DstPort, q.Proto, v.AllowPorts)
 	if !allowedByName && derived != nil {
 		if ports, ok := derived(q.Name); ok {
+			allowedByName = DstPortAllowedByRule(q.DstPort, q.Proto, ports)
+		}
+	}
+	// Then the flow's step, as its packets are judged: its own rules and
+	// chains add to the job's, never past a job deny. A name the job's
+	// rules deny on any port is no step's, as the DNS path withholds it.
+	if !allowedByName && q.Policy != 0 && p.steps != nil && !v.HasDeny() {
+		if ports, ok := p.steps(q.Policy, q.Name); ok {
 			allowedByName = DstPortAllowedByRule(q.DstPort, q.Proto, ports)
 		}
 	}

@@ -26,7 +26,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -38,92 +37,6 @@ import (
 	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/firewall"
 )
-
-// recordingFirewall is a firewall.Firewall that keeps what was written under
-// which policy: the job's allows (AddIP) and each step policy's (AddPolicyIP).
-type recordingFirewall struct {
-	mu       sync.Mutex
-	jobAllow map[string][]config.Port
-	jobDeny  map[string]bool
-	step     map[uint32]map[string][]config.Port
-	stepErr  error
-	stepAdd  chan struct{} // signalled on each step write, if set
-	policy0  int           // AddPolicyIP calls naming the job's policy
-}
-
-func newRecordingFirewall() *recordingFirewall {
-	return &recordingFirewall{
-		jobAllow: map[string][]config.Port{},
-		jobDeny:  map[string]bool{},
-		step:     map[uint32]map[string][]config.Port{},
-	}
-}
-
-func (f *recordingFirewall) SetDefaultAction(config.Action) error { return nil }
-
-func (f *recordingFirewall) SetAuditMode(bool) error { return nil }
-
-func (f *recordingFirewall) UpdateAllowlistTC(cm *config.Manager) error { return nil }
-
-func (f *recordingFirewall) RemoveIP(net.IP) error { return nil }
-
-func (f *recordingFirewall) stepIPs(policy uint32) map[string][]config.Port {
-	return f.snapshot(policy)
-}
-
-func (f *recordingFirewall) AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if action == config.ActionAllow {
-		f.jobAllow[ip.String()] = config.UnionPorts(f.jobAllow[ip.String()], ports)
-	} else {
-		f.jobDeny[ip.String()] = true
-	}
-	return true, nil
-}
-
-func (f *recordingFirewall) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if policy == 0 {
-		f.policy0++
-		return false, errors.New("AddPolicyIP under the job's policy")
-	}
-	if f.stepErr != nil {
-		return false, f.stepErr
-	}
-	if f.step[policy] == nil {
-		f.step[policy] = map[string][]config.Port{}
-	}
-	prev, seen := f.step[policy][ip.String()]
-	if seen {
-		ports = config.UnionPorts(prev, ports)
-	}
-	f.step[policy][ip.String()] = ports
-	if f.stepAdd != nil {
-		f.stepAdd <- struct{}{}
-	}
-	return true, nil
-}
-
-func (f *recordingFirewall) snapshot(policy uint32) map[string][]config.Port {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := map[string][]config.Port{}
-	for ip, ps := range f.step[policy] {
-		out[ip] = ps
-	}
-	return out
-}
-
-func (f *recordingFirewall) jobAllows(ip string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.jobAllow[ip]
-	return ok
-}
-
-var _ firewall.Firewall = (*recordingFirewall)(nil)
 
 // discardWriter is a dns.ResponseWriter that drops the reply.
 type discardWriter struct{ MockResponseWriter }

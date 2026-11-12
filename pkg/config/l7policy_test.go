@@ -244,3 +244,57 @@ func TestMatchL7_NilDerived(t *testing.T) {
 		t.Errorf("unknown name with no derived tier = %v, want L7NoMatch", got)
 	}
 }
+
+// The step tier: a flow whose punt names step policy k is admitted by the
+// job's tiers or else by k's (WithSteps), never by another step's, never on
+// a port k's rules don't name, and never for a name the job denies on any
+// port. A flow judged as the job (policy 0) gets the job's tiers alone.
+func TestMatchL7_StepTier(t *testing.T) {
+	cm := NewConfigManager()
+	if err := cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeHostname, Value: "job.example", Action: ActionAllow},
+		{Type: RuleTypeHostname, Value: "mixed.example", Ports: []Port{{Port: 80, Protocol: ProtocolTCP}}, Action: ActionDeny},
+	}, ActionDeny); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"job.example", "step.example", "mixed.example"} {
+		cm.RecordForwardResolution(name, "104.16.1.1")
+	}
+	https := []Port{{Port: 443, Protocol: ProtocolTCP}}
+	asked := 0
+	p := NewL7Policy(cm, nil).WithSteps(func(policy uint32, name string) ([]Port, bool) {
+		asked++
+		if policy == 2 && (name == "step.example" || name == "mixed.example") {
+			return https, true
+		}
+		return nil, false
+	})
+	q := func(name string, policy uint32, port uint16) L7Request {
+		return L7Request{Name: name, DstIP: "104.16.1.1", DstPort: port, Proto: 6, Policy: policy}
+	}
+	for _, c := range []struct {
+		desc string
+		q    L7Request
+		want L7Match
+	}{
+		{"the step's name, as the step", q("step.example", 2, 443), L7MatchOK},
+		{"the step's name, as the job", q("step.example", 0, 443), L7NoMatch},
+		{"the step's name, as another step", q("step.example", 3, 443), L7NoMatch},
+		{"the step's name, on a port its rule doesn't name", q("step.example", 2, 8443), L7NoMatch},
+		{"the job's name, as the step", q("job.example", 2, 443), L7MatchOK},
+		{"a name the job denies on another port", q("mixed.example", 2, 443), L7NoMatch},
+	} {
+		if got := p.MatchName(c.q); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.desc, got, c.want)
+		}
+	}
+	asked = 0
+	_ = p.MatchName(q("job.example", 2, 443))
+	_ = p.MatchName(q("step.example", 0, 443))
+	if asked != 0 {
+		t.Errorf("the step tier was asked %d times past the job's allow or for the job's flow", asked)
+	}
+	if got := NewL7Policy(cm, nil).MatchName(q("step.example", 2, 443)); got != L7NoMatch {
+		t.Errorf("without a step tier, the step's name = %v, want L7NoMatch", got)
+	}
+}

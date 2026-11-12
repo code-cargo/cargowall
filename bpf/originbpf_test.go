@@ -856,7 +856,7 @@ func TestL7EventLayoutMatchesBTF(t *testing.T) {
 		"scope":       unsafe.Offsetof(evt.Scope),
 		"seq":         unsafe.Offsetof(evt.Seq),
 		"payload_len": unsafe.Offsetof(evt.PayloadLen),
-		"pad":         unsafe.Offsetof(evt.Pad),
+		"step_policy": unsafe.Offsetof(evt.StepPolicy),
 		"dcid_len":    unsafe.Offsetof(evt.DcidLen),
 		"dcid":        unsafe.Offsetof(evt.Dcid),
 		"pad2":        unsafe.Offsetof(evt.Pad2),

@@ -37,6 +37,10 @@ type L7Registrar interface {
 	// with the tracked-hostname replay that re-warms them; scope entries have
 	// no expiry and no reverse index.
 	FlushScopes() error
+	// UnscopeIP takes back one ScopeIP(ip, ports) whose install was refused:
+	// the scope entry goes only if no other ScopeIP since the last flush
+	// holds it.
+	UnscopeIP(ip net.IP, ports []config.Port) error
 }
 
 // SetL7Registrar installs the L7 registrar. Safe to call after the server is
@@ -95,17 +99,23 @@ func (s *Server) registerL7(hostname string, ip net.IP, ports []config.Port) {
 // and cannot launder attacker-controlled attribution into L7 coverage.
 // Un-bindable destinations stay L4-governed; design-l7.md states that residual.
 func RegisterL7Identity(r L7Registrar, cm *config.Manager, hostname string, ip net.IP, ports []config.Port, logger *slog.Logger) {
+	if err := scopeL7Identity(r, cm, hostname, ip, ports, logger); err != nil && logger != nil {
+		logger.Debug("L7: scoping IP", "ip", ip.String(), "hostname", hostname, "error", err)
+	}
+}
+
+// scopeL7Identity is RegisterL7Identity, returning the registrar's error for
+// a scope it could not write. An unbound IP is no error: it stays L4-governed.
+func scopeL7Identity(r L7Registrar, cm *config.Manager, hostname string, ip net.IP, ports []config.Port, logger *slog.Logger) error {
 	if r == nil || cm == nil || ip == nil {
-		return
+		return nil
 	}
 	if !cm.NameResolvedToIP(hostname, ip.String()) {
 		if logger != nil {
 			logger.Debug("L7: not scoping an IP with no forward-resolution evidence",
 				"ip", ip.String(), "hostname", hostname)
 		}
-		return
+		return nil
 	}
-	if err := r.ScopeIP(ip, ports); err != nil && logger != nil {
-		logger.Debug("L7: scoping IP", "ip", ip.String(), "hostname", hostname, "error", err)
-	}
+	return r.ScopeIP(ip, ports)
 }

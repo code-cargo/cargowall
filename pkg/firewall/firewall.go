@@ -61,8 +61,19 @@ type Firewall interface {
 	// job's (only AddIP writes that), with AddIP's accumulation semantics per
 	// (policy, IP). Step policies share what the job's reservation leaves of
 	// each rule map: a write that would take more is refused with
-	// ErrStepBudget and installs nothing. See policy.go.
-	AddPolicyIP(policy uint32, ip net.IP, ports []config.Port) (bool, error)
+	// ErrStepBudget and installs nothing. scope, if not nil, runs once the
+	// write is admitted and before any of it is written; its error withholds
+	// the write, refunded, and is returned. See policy.go.
+	AddPolicyIP(policy uint32, ip net.IP, ports []config.Port, scope func() error) (bool, error)
+
+	// RemovePolicyIP takes out what a step policy's DNS installs (AddPolicyIP)
+	// added at ip's host route, uncharged: the step gets the job's rules
+	// there, and its own CIDR rules'. What the sync wrote there for the step,
+	// its /32 or /128 rule or a carve, stays as the sync left it, the LPM
+	// entry's value and the accumulator too. Otherwise the LPM entry goes
+	// first, then its port entries and the accumulator, and the call fails,
+	// leaving them all, when the LPM entry can't be deleted.
+	RemovePolicyIP(policy uint32, ip net.IP) error
 
 	// RemoveIP removes a single IP from the BPF maps
 	RemoveIP(ip net.IP) error
@@ -93,7 +104,10 @@ type FirewallImpl struct {
 	ipPorts map[string]*ipPortState
 
 	stepIPs map[policyIP]*ipPortState
-	steps   stepLedger
+	// stepBase is what the last sync wrote at each step host route, which
+	// RemovePolicyIP keeps (policy.go).
+	stepBase map[policyIP]stepHostBase
+	steps    stepLedger
 	// jobDenies are the job's CIDR denies the last sync wrote, which gate
 	// every step write; gated holds the gated writes logged (stepgate.go).
 	jobDenies []jobDeny

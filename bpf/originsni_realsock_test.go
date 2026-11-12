@@ -79,7 +79,12 @@ type l7RealSocketHarness struct {
 
 func newL7RealSocketHarness(t *testing.T, l7mode uint8, port uint16, scope uint8) *l7RealSocketHarness {
 	t.Helper()
-	objs := loadOriginObjects(t)
+	return l7HarnessFor(t, loadOriginObjects(t), l7mode, port, scope)
+}
+
+// l7HarnessFor is newL7RealSocketHarness on objs, loaded as the test needs.
+func l7HarnessFor(t *testing.T, objs *OriginBpfObjects, l7mode uint8, port uint16, scope uint8) *l7RealSocketHarness {
+	t.Helper()
 	setOriginMode(t, objs, originModeObserve)
 	require.NoError(t, objs.MapAuditMode.Put(uint32(0), uint8(0)))
 	require.NoError(t, objs.MapOriginConfig.Put(uint32(l7CfgKeyMode), l7mode))

@@ -62,6 +62,11 @@ import (
 // it, where only its own sockets reach the program.
 var cgroupAttachPath = podenv.CgroupRoot
 
+// loadObjects loads the collection, an attempt a rejection of which is
+// retried tentatively; a test stands in a verifier that rejects the step
+// lookup.
+var loadObjects = cargowallEbpf.LoadObjectsAttempt
+
 // The ringbuf wire layout is bpf.OriginEvent (bpf/origin_event.go) — the one
 // Go mirror of struct origin_event, shared with the BTF layout test so the
 // struct this reader casts bytes to is the struct the test validates.
@@ -191,14 +196,17 @@ const (
 // Observer owns the loaded collection, its root-cgroup attachment, the
 // ringbuf reader, the verdict-reporting worker, and the join store.
 type Observer struct {
-	objs     bpf.OriginBpfObjects
-	cgroups  *cgroupScope // the cgroups a scoped hook judges; nil unscoped
-	link     link.Link
-	reader   *ringbuf.Reader
-	sockPid  *ebpf.Map
-	sockStep *ebpf.Map
-	logger   *slog.Logger
-	done     chan struct{}
+	objs bpf.OriginBpfObjects
+	// stepRulesLost is why the hook loaded without the step lookup though
+	// tcbpf has it, or "".
+	stepRulesLost string
+	cgroups       *cgroupScope // the cgroups a scoped hook judges; nil unscoped
+	link          link.Link
+	reader        *ringbuf.Reader
+	sockPid       *ebpf.Map
+	sockStep      *ebpf.Map
+	logger        *slog.Logger
+	done          chan struct{}
 	// verdicts is the callback for records carrying a would-block/block
 	// decision. Atomic because SetVerdictSink installs it from the main
 	// goroutine after Start has already launched the goroutines that load it
@@ -342,10 +350,6 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 	for name, m := range replacements {
 		spec.Maps[name].MaxEntries = m.MaxEntries()
 	}
-	// Built as TC was, so the two hooks prune or ask the step tier together.
-	if err := bpf.SetStepRules(spec, tcObjs.StepRules()); err != nil {
-		return nil, fmt.Errorf("failed to set the step-rules gate: %w", err)
-	}
 	if scope.Limited() {
 		// Set before load, with the map it reads: the program never judges,
 		// even briefly, a socket that is not this job's. The stand-in takes
@@ -361,7 +365,11 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		spec.Maps[bpf.OriginBpfMapMapScopeCgroups].MaxEntries = s.cgroups().MaxEntries()
 		replacements[bpf.OriginBpfMapMapScopeCgroups] = s.cgroups()
 	}
-	if err := cargowallEbpf.LoadObjects(logger, "originbpf", spec, ebpf.CollectionOptions{
+	// Built as TC was, so the two hooks prune or ask the step tier together,
+	// unless this kernel's verifier rejects the step lookup here alone: then
+	// the hook loads without it, and the steps' traffic it judges gets the
+	// job's rules (bpf.LoadWithStepRules).
+	opts := ebpf.CollectionOptions{
 		MapReplacements: replacements,
 		// Stats ONLY, unlike the TC and step collections: the count is the
 		// one number that predicts whether this program loads on an older
@@ -374,8 +382,16 @@ func Start(tcObjs *bpf.TcBpfObjects, scope podenv.Scope, logger *slog.Logger) (*
 		// that rejects it the retry loop would grow the log buffer to match.
 		// LoadObjects still logs the count of a rejection.
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
-	}, &o.objs); err != nil {
+	}
+	steps, rejected, err := bpf.LoadWithStepRules(spec, tcObjs.StepRules(), func(spec *ebpf.CollectionSpec, tentative bool) error {
+		return loadObjects(logger, "originbpf", spec, opts, &o.objs, tentative)
+	})
+	if err != nil {
 		return nil, fmt.Errorf("failed to load origin BPF objects: %w", err)
+	}
+	if tcObjs.StepRules() && !steps {
+		o.stepRulesLost = cargowallEbpf.RejectionReason(rejected)
+		logger.Warn("The cgroup egress hook loaded without the step lookup", "reason", o.stepRulesLost)
 	}
 
 	// Arm the loopback-device carve-out before attach: traffic egressing lo
@@ -518,6 +534,14 @@ func (o *Observer) Close() {
 
 // Program exposes the observer program for BPF runtime-stats logging.
 func (o *Observer) Program() *ebpf.Program { return o.objs.CwCgEgress }
+
+// StepRules reports whether the hook asks the step tier: tcbpf's gate,
+// unless this kernel's verifier rejected the step lookup here.
+func (o *Observer) StepRules() bool { return o.objs.StepRules() }
+
+// StepRulesLost reports why the hook loaded without the step lookup though
+// tcbpf has it, or "".
+func (o *Observer) StepRulesLost() string { return o.stepRulesLost }
 
 // ResolveCookie resolves a socket cookie against the tcbpf pid/step identity
 // maps — the same join insert applies to every origin record, exposed so the

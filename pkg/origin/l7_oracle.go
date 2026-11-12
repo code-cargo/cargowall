@@ -351,7 +351,7 @@ func (l *L7) accumulate(st *l7flow, ev *bpf.L7Event, payload []byte) (bool, L7Ou
 	// ev.DstAddr owns the wire->address conversion (shared with the audit
 	// sink), so the string the matcher sees is the spelling the DNS layer
 	// recorded.
-	q := config.L7Request{DstIP: ev.DstAddr().String(), DstPort: ev.DstPort, Proto: ev.IpProto}
+	q := config.L7Request{DstIP: ev.DstAddr().String(), DstPort: ev.DstPort, Proto: ev.IpProto, Policy: uint32(ev.StepPolicy)}
 	return adjudicate(st.proto, st.asm.Bytes(), q, l.matcher, l.pinIP)
 }
 

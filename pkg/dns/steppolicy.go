@@ -55,9 +55,8 @@ import (
 // it, or, short of a job deny, any step's rules or step chains do.
 //
 // Requirement: a step may not be bound to its policy (map_step_policy)
-// until step installs are L7-scoped. They aren't here, so until then a
-// step's own entries would open a shared edge IP to it on any SNI.
-// Step-aware late-allows aren't done here either.
+// unless step installs are L7-scoped, or a step's own entries would open a
+// shared edge IP to it on any SNI. They are (stepl7.go).
 
 // stepTier is the DNS proxy's step-policy state: what step policies' CNAME
 // chains have taught it, by target name. The job's derived allows stay in
@@ -72,6 +71,8 @@ type stepTier struct {
 	// via holds the CNAME hops answers' addresses came through, for the
 	// backfill's hop check (viaStore).
 	via *viaStore
+	// l7 is the tier's L7 scopes and late-allow bindings (stepl7.go).
+	l7 *stepL7
 }
 
 // viaStore holds, by answered name, the CNAME hops each of the name's
@@ -128,6 +129,7 @@ func newStepTier() stepTier {
 		cname:    newLRUCache[string, stepDerived](10000),
 		withheld: newLRUCache[string, struct{}](1000),
 		via:      &viaStore{hops: make(map[string]stepVia)},
+		l7:       newStepL7(),
 	}
 }
 
@@ -391,10 +393,31 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 	}
 	for _, a := range allows {
 		for _, ip := range ips {
-			changed, err := s.firewall.AddPolicyIP(a.policy, ip, a.ports)
+			// Scoped once the firewall admits the install and before it
+			// writes any of it, and recorded, under one hold (stepl7.go).
+			release := s.steps.l7.holdInstalls()
+			admitted, scoped, fresh := false, false, false
+			changed, err := s.firewall.AddPolicyIP(a.policy, ip, a.ports, func() error {
+				admitted = true
+				var err error
+				scoped, fresh, err = s.scopeStepInstall(name, ip, a.ports)
+				return err
+			})
+			switch {
+			case err == nil && scoped:
+				s.recordStepScope(a.policy, name, a.chain == nil, ip, a.ports)
+			case err != nil && scoped:
+				s.unscopeStepInstall(ip, a.ports, fresh) // scoped, then refused
+			}
+			release()
+			if err == nil && admitted {
+				s.reconcileStepBlocks(a, name, ip)
+			}
 			switch {
 			case errors.Is(err, firewall.ErrStepBudget):
 				// The firewall warns, rate-limited.
+			case errors.Is(err, errStepScope):
+				s.warnStepScope(a, name, ip, err)
 			case err != nil:
 				s.logger.Warn("Step rule install failed; the step gets the job's rules there",
 					"step", a.stepID, "policy", a.policy, "hostname", name, "ip", ip.String(), "error", err)

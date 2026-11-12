@@ -120,6 +120,10 @@ type L7 struct {
 	// dimension (fail-open on that protocol). It also guards scopeFullWarned.
 	scopeMu         sync.Mutex
 	scopeFullWarned bool
+	// scopeHolds counts, by address, the ScopeIP calls that wrote its scope
+	// entry since the last flush, so UnscopeIP takes back one call's and the
+	// entry goes only with the last. Bounded by the scope maps' entries.
+	scopeHolds map[string]int
 	// scopeFullDrops counts destinations that could not be scoped because the
 	// map was full — each one is an IP L7 no longer covers.
 	scopeFullDrops atomic.Uint64
@@ -236,25 +240,67 @@ func (l *L7) ScopeIP(ip net.IP, ports []config.Port) error {
 	}
 	l.scopeMu.Lock()
 	defer l.scopeMu.Unlock()
+	var err error
 	if ip4 := ip.To4(); ip4 != nil {
 		key := binary.NativeEndian.Uint32(ip4) // network-order bytes, per pkg/firewall
 		var cur uint8
 		if err := l.scope.Lookup(key, &cur); err == nil {
 			flags |= cur
 		}
-		return l.scopeFull(l.scope.Put(key, flags), ip, l.scope)
+		err = l.scopeFull(l.scope.Put(key, flags), ip, l.scope)
+	} else {
+		ip6 := ip.To16()
+		if ip6 == nil {
+			return fmt.Errorf("l7: not an IP: %v", ip)
+		}
+		var key [16]byte
+		copy(key[:], ip6)
+		var cur uint8
+		if err := l.scopeV6.Lookup(key, &cur); err == nil {
+			flags |= cur
+		}
+		err = l.scopeFull(l.scopeV6.Put(key, flags), ip, l.scopeV6)
 	}
-	ip6 := ip.To16()
-	if ip6 == nil {
-		return fmt.Errorf("l7: not an IP: %v", ip)
+	if err == nil {
+		if l.scopeHolds == nil {
+			l.scopeHolds = make(map[string]int)
+		}
+		l.scopeHolds[ip.String()]++
 	}
-	var key [16]byte
-	copy(key[:], ip6)
-	var cur uint8
-	if err := l.scopeV6.Lookup(key, &cur); err == nil {
-		flags |= cur
+	return err
+}
+
+// UnscopeIP takes back one ScopeIP(ip, ports) whose install was then
+// refused: the entry goes only when no other call holds it, so a scope
+// another name or tier wrote stays, with whatever bits this one added (they
+// only narrow). A call that opened no L7 dimension held nothing.
+func (l *L7) UnscopeIP(ip net.IP, ports []config.Port) error {
+	if l7ScopeFromPorts(ports) == 0 {
+		return nil
 	}
-	return l.scopeFull(l.scopeV6.Put(key, flags), ip, l.scopeV6)
+	l.scopeMu.Lock()
+	defer l.scopeMu.Unlock()
+	key := ip.String()
+	switch n := l.scopeHolds[key]; {
+	case n == 0:
+		return nil
+	case n > 1:
+		l.scopeHolds[key] = n - 1
+		return nil
+	}
+	delete(l.scopeHolds, key)
+	var err error
+	if ip4 := ip.To4(); ip4 != nil {
+		err = l.scope.Delete(binary.NativeEndian.Uint32(ip4))
+	} else {
+		var k [16]byte
+		copy(k[:], ip.To16())
+		err = l.scopeV6.Delete(k)
+	}
+	if errors.Is(err, ebpf.ErrKeyNotExist) {
+		return nil
+	}
+	return err
 }
 
 // FlushScopes empties both scope maps. Called on policy reload, immediately
@@ -271,6 +317,7 @@ func (l *L7) FlushScopes() error {
 	// post-reload fill is as loud as the first. The cumulative drop counter is
 	// left intact for a run-wide total at close.
 	l.scopeFullWarned = false
+	l.scopeHolds = nil
 	// BOTH maps, always. Returning on the v4 error left every v6 entry in
 	// place while the caller logged a warning and re-warmed on top of it, so a
 	// dropped rule's v6 IPs stayed L7-governed forever and the dead entries

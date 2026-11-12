@@ -32,16 +32,17 @@ import (
 const DefaultRecentBlocksTTL = 5 * time.Minute
 
 // maxRecentBlocks caps buffer growth under a default-deny flood. Each unique
-// (dst_ip, dst_port, protocol) is one entry; overflow drops new blocks rather
-// than evicting — reconciliation is best-effort reporting and enforcement is
-// unaffected.
+// (dst_ip, dst_port, protocol, step ordinal) is one entry; overflow drops new
+// blocks rather than evicting — reconciliation is best-effort reporting and
+// enforcement is unaffected.
 const maxRecentBlocks = 4096
 
 // RecentBlock is the most recent blocked attempt for a (dst_ip, dst_port,
-// protocol) tuple, carrying the attribution needed to re-report that attempt
-// as late-allowed. At is the timestamp of the latest attempt so that a
-// reconciliation event dated At supersedes every recorded retry for the tuple
-// (the summary drops blocked events at or before the late-allowed timestamp).
+// protocol, step ordinal) tuple, carrying the attribution needed to re-report
+// that attempt as late-allowed. At is the timestamp of the latest attempt so
+// that a reconciliation event dated At supersedes every recorded retry for
+// the tuple (the summary drops blocked events at or before the late-allowed
+// timestamp).
 type RecentBlock struct {
 	SrcIP       string
 	DstIP       string
@@ -64,9 +65,13 @@ type RecentBlock struct {
 	At              time.Time
 }
 
+// recentBlockKey keys a destination's blocks by port, protocol and step
+// ordinal: a step's own rules opening a destination re-report that step's
+// blocks there, never another's (TakeMatchingFor).
 type recentBlockKey struct {
 	port     uint16
 	protocol string
+	ordinal  uint32
 }
 
 // RecentBlocks is a short-TTL buffer of recently blocked TCP/UDP connections
@@ -101,9 +106,9 @@ func NewRecentBlocks(ttl time.Duration) *RecentBlocks {
 }
 
 // Consume records connection_blocked TCP/UDP events, keeping one entry per
-// (dst_ip, dst_port, protocol): the latest attempt's timestamp, with
-// identity fields degraded when live attempts from different origins
-// disagree (see degradeDisagreement). Other event types — and protocols
+// (dst_ip, dst_port, protocol, step ordinal): the latest attempt's
+// timestamp, with identity fields degraded when live attempts from
+// different origins disagree (see degradeDisagreement). Other event types — and protocols
 // whose retries can't benefit from a late allow — are ignored, mirroring
 // the restriction on the in-band late-allow path.
 func (rb *RecentBlocks) Consume(event AuditEvent) {
@@ -117,7 +122,7 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	key := recentBlockKey{port: event.DstPort, protocol: event.Protocol}
+	key := recentBlockKey{port: event.DstPort, protocol: event.Protocol, ordinal: event.StepOrdinal}
 	if _, exists := rb.byIP[event.DstIP][key]; !exists {
 		if rb.size >= maxRecentBlocks {
 			rb.pruneExpiredLocked(time.Now())
@@ -149,9 +154,9 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 		CNAMEChain:      event.CNAMEChain,
 		At:              event.Timestamp,
 	}
-	// The key is destination-only, so two sources (containers A and B, or a
-	// container and a host process) blocked on the same tuple collapse into
-	// one entry. Last-writer-wins would let the single late-allow re-report
+	// The key is the destination and the step, so two sources of one step
+	// (containers A and B, or a container and a host process) blocked on the
+	// same tuple collapse into one entry. Last-writer-wins would let the single late-allow re-report
 	// state the last writer's identity as fact for every attempt — the
 	// coin-flip attribution resolveJoin's disagreement policy exists to
 	// prevent, on a different path. Keep the newest timestamp (the supersede
@@ -183,9 +188,6 @@ func degradeDisagreement(prev, next RecentBlock) RecentBlock {
 	if prev.PID != next.PID {
 		next.PID = 0
 	}
-	if prev.StepOrdinal != next.StepOrdinal {
-		next.StepOrdinal = 0
-	}
 	if prev.ContainerID != next.ContainerID {
 		next.ContainerID = ""
 	}
@@ -202,8 +204,16 @@ func degradeDisagreement(prev, next RecentBlock) RecentBlock {
 // denyPorts with hasDeny means deny-all. A deny-covered entry is removed
 // without being returned: its block was and remains correct, so it must not
 // linger for a later reconcile pass to mislabel. Results are ordered by
-// attempt time for deterministic reporting.
+// attempt time for deterministic reporting. Every step's blocks are taken:
+// what the job's rules open, they open for every step.
 func (rb *RecentBlocks) TakeMatching(dstIP string, allowPorts, denyPorts []config.Port, hasDeny bool) []RecentBlock {
+	return rb.TakeMatchingFor(dstIP, nil, allowPorts, denyPorts, hasDeny)
+}
+
+// TakeMatchingFor is TakeMatching for the blocks of the step ordinals steps
+// picks (nil: every one), and leaves the rest: what one step's own rules
+// open, they open for that step alone.
+func (rb *RecentBlocks) TakeMatchingFor(dstIP string, steps func(ordinal uint32) bool, allowPorts, denyPorts []config.Port, hasDeny bool) []RecentBlock {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
@@ -218,6 +228,9 @@ func (rb *RecentBlocks) TakeMatching(dstIP string, allowPorts, denyPorts []confi
 		if b.At.Before(cutoff) {
 			delete(byKey, key)
 			rb.size--
+			continue
+		}
+		if steps != nil && !steps(key.ordinal) {
 			continue
 		}
 		proto, _ := protocolTypeForAuditName(b.Protocol) // recorded entries always map

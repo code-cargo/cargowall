@@ -19,6 +19,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"testing"
 
@@ -379,4 +380,27 @@ func TestValidateStepID(t *testing.T) {
 			assert.True(t, strings.Contains(err.Error(), "generated"), bad)
 		}
 	}
+}
+
+// JobCIDRDeniesAt is the union of the job's CIDR denies containing an
+// address, host routes and the whole space included, and all ports once
+// one denies every port.
+func TestJobCIDRDeniesAt(t *testing.T) {
+	cm := NewConfigManager()
+	p := func(n uint16) Port { return Port{Port: n, Protocol: ProtocolTCP} }
+	require.NoError(t, cm.LoadConfigFromRules([]Rule{
+		{Type: RuleTypeCIDR, Value: "10.0.0.0/8", Ports: []Port{p(22)}, Action: ActionDeny},
+		{Type: RuleTypeCIDR, Value: "10.1.2.3/32", Ports: []Port{p(443)}, Action: ActionDeny},
+		{Type: RuleTypeCIDR, Value: "0.0.0.0/0", Ports: []Port{p(25)}, Action: ActionDeny},
+		{Type: RuleTypeCIDR, Value: "10.9.0.0/16", Action: ActionDeny},
+		{Type: RuleTypeCIDR, Value: "10.1.0.0/16", Ports: []Port{p(80)}, Action: ActionAllow},
+	}, ActionDeny))
+	ports, all := cm.JobCIDRDeniesAt(net.ParseIP("10.1.2.3"))
+	assert.False(t, all)
+	assert.ElementsMatch(t, []Port{p(22), p(443), p(25)}, ports)
+	_, all = cm.JobCIDRDeniesAt(net.ParseIP("10.9.1.1"))
+	assert.True(t, all)
+	ports, all = cm.JobCIDRDeniesAt(net.ParseIP("192.0.2.1"))
+	assert.False(t, all)
+	assert.Equal(t, []Port{p(25)}, ports)
 }

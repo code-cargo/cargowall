@@ -66,16 +66,8 @@ func startL7(cmd *StartCmd, obs *origin.Observer, enricher *containers.Enricher,
 		return nil, p.lose(postureTLSSNI, "the cgroup egress hook it rides is not running")
 	}
 
-	// The policy's second tier is bound to the live proxy, so the set the
-	// oracle consults is the same one the query gate uses and stays current as
-	// chains are learned.
-	var derived func(name string) ([]config.Port, bool)
-	if dnsServer != nil {
-		derived = dnsServer.DerivedAllowPorts
-	}
-
 	oracle, err := obs.EnableL7(origin.L7Options{
-		Matcher: config.NewL7Policy(configMgr, derived),
+		Matcher: l7Policy(configMgr, dnsServer),
 		PinIP:   cmd.TLSSNI == TLSSNIEnforcePinned,
 		Sink:    l7Sink(obs, enricher, configMgr, auditLogger, notificationTracker, logger),
 	})
@@ -98,6 +90,17 @@ func startL7(cmd *StartCmd, obs *origin.Observer, enricher *containers.Enricher,
 	logger.Info("L7 SNI enforcement prepared",
 		"target_mode", l7ModeName(f.targetMode), "pin_ip", cmd.TLSSNI == TLSSNIEnforcePinned)
 	return f, nil
+}
+
+// l7Policy is the oracle's name authority. Its second tier is bound to the
+// live proxy, so the set the oracle consults is the same one the query gate
+// uses and stays current as chains are learned; so is its step tier, by the
+// step policy a flow's punt names.
+func l7Policy(configMgr *config.Manager, dnsServer *dns.Server) config.L7Policy {
+	if dnsServer == nil {
+		return config.NewL7Policy(configMgr, nil)
+	}
+	return config.NewL7Policy(configMgr, dnsServer.DerivedAllowPorts).WithSteps(dnsServer.StepAllowPorts)
 }
 
 // raise lifts the L7 mode gate to its target posture. Called from the boot

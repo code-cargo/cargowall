@@ -19,6 +19,7 @@ package firewall
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"log/slog"
 	"net"
 	"os"
@@ -98,9 +99,9 @@ func TestStepRules_Verdict(t *testing.T) {
 	require.NoError(t, fw.SetDefaultAction(config.ActionDeny))
 	require.NoError(t, fw.UpdateAllowlistTC(cm))
 	// What the DNS path installs for a step's hostname rule.
-	_, err := fw.AddPolicyIP(policyB, net.ParseIP("10.62.0.5"), tcp443)
+	_, err := fw.AddPolicyIP(policyB, net.ParseIP("10.62.0.5"), tcp443, nil)
 	require.NoError(t, err)
-	_, err = fw.AddPolicyIP(policyB, net.ParseIP("2001:db8:62::5"), nil)
+	_, err = fw.AddPolicyIP(policyB, net.ParseIP("2001:db8:62::5"), nil, nil)
 	require.NoError(t, err)
 
 	for _, p := range []struct {
@@ -207,7 +208,7 @@ func TestStepRules_JobCIDRDenyUnderDenyDefault(t *testing.T) {
 	require.NoError(t, fw.UpdateAllowlistTC(cm))
 	// What the DNS path installs if step.example.com resolves into either.
 	for _, ip := range []string{"203.0.113.7", "198.51.100.7"} {
-		_, err := fw.AddPolicyIP(1, net.ParseIP(ip), nil)
+		_, err := fw.AddPolicyIP(1, net.ParseIP(ip), nil, nil)
 		require.NoError(t, err)
 	}
 
@@ -269,7 +270,7 @@ func TestStepBudget_KernelJobOnlySize(t *testing.T) {
 	objs, f := loadSizedObjects(t, false, false)
 	fw := f.(*FirewallImpl)
 	require.Equal(t, bpf.RuleMapEntriesJobOnly, objs.MapCidrs.MaxEntries())
-	_, err := fw.AddPolicyIP(1, testIPv4(10, 0), nil)
+	_, err := fw.AddPolicyIP(1, testIPv4(10, 0), nil, nil)
 	require.ErrorIs(t, err, ErrStepBudget)
 	for i := range jobReservedEntries {
 		_, err := fw.AddIP(testIPv4(20, i), config.ActionAllow, nil)
@@ -308,7 +309,7 @@ func TestStepGate_KernelNestedJobEntry(t *testing.T) {
 				require.NoError(t, err)
 			}
 			step := func() {
-				_, err := fw.AddPolicyIP(1, host, nil)
+				_, err := fw.AddPolicyIP(1, host, nil, nil)
 				require.NoError(t, err)
 			}
 			if c.jobAllowFirst {
@@ -331,4 +332,61 @@ func TestStepGate_KernelNestedJobEntry(t *testing.T) {
 			require.Equal(t, uint32(verdictDrop), ret)
 		})
 	}
+}
+
+// refusingDeletes is a real map whose deletes fail.
+type refusingDeletes struct{ *ebpf.Map }
+
+func (refusingDeletes) Delete(any) error { return errors.New("delete failed") }
+
+// RemovePolicyIP on the real maps. The LPM entry goes first, so a port
+// entry whose delete then fails is left where nothing reads it: the trie's
+// longest match for the address under the step's policy is the step's
+// covering prefix, whose port entries the verdict looks up by that prefix,
+// not by the address. A step's own /32 rule at an address a DNS install
+// also opened keeps its entry, at the sync's value, and its port entry.
+func TestRemovePolicyIP_KernelMaps(t *testing.T) {
+	requireRootBPF(t)
+	objs, f := loadStepRulesObjects(t, true)
+	fw := f.(*FirewallImpl)
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfig(writeStepConfig(t, []config.Rule{}, []config.StepConfig{{ID: "a", Rules: []config.Rule{
+		{Type: config.RuleTypeCIDR, Value: "10.61.0.0/24", Ports: tcp443},
+		{Type: config.RuleTypeCIDR, Value: "10.98.0.9/32", Ports: tcpPorts(8443)},
+		{Type: config.RuleTypeHostname, Value: "a.example.com"},
+	}}})))
+	require.NoError(t, fw.UpdateAllowlistTC(cm))
+	inPrefix, atRule, v6 := net.ParseIP("10.61.0.5"), net.ParseIP("10.98.0.9"), net.ParseIP("2001:db8:62::5")
+	for _, ip := range []net.IP{inPrefix, atRule, v6} {
+		_, err := fw.AddPolicyIP(1, ip, tcpPorts(443, 8080), nil)
+		require.NoError(t, err)
+	}
+	v4 := func(ip net.IP) uint32 { return binary.NativeEndian.Uint32(ip.To4()) }
+	var val bpf.TcBpfLpmVal
+	var portVal bpf.TcBpfPortVal
+
+	fw.portsMap = refusingDeletes{objs.MapPorts}
+	require.NoError(t, fw.RemovePolicyIP(1, inPrefix))
+	require.NoError(t, objs.MapCidrs.Lookup(bpf.RuleKey(1, 32, v4(inPrefix)), &val))
+	require.Equal(t, bpf.TcBpfLpmVal{Action: 1, PortSpecific: 1, HostBits: 8}, val, "the longest match is the step's /24")
+	require.NoError(t, objs.MapPorts.Lookup(bpf.RulePortKey(1, v4(inPrefix), 8080, protoTCP, 0), &portVal),
+		"the refused delete left the install's port entry")
+	require.ErrorIs(t, objs.MapPorts.Lookup(bpf.RulePortKey(1, v4(net.ParseIP("10.61.0.0")), 8080, protoTCP, 8), &portVal),
+		ebpf.ErrKeyNotExist, "and the /24's lookup doesn't reach it")
+	fw.portsMap = objs.MapPorts
+
+	require.NoError(t, fw.RemovePolicyIP(1, atRule))
+	require.NoError(t, objs.MapCidrs.Lookup(bpf.RuleKey(1, 32, v4(atRule)), &val))
+	require.Equal(t, bpf.TcBpfLpmVal{Action: 1, PortSpecific: 1}, val, "the step's /32 rule stays")
+	require.NoError(t, objs.MapPorts.Lookup(bpf.RulePortKey(1, v4(atRule), 8443, protoTCP, 0), &portVal))
+	for _, port := range []uint16{443, 8080} {
+		require.ErrorIs(t, objs.MapPorts.Lookup(bpf.RulePortKey(1, v4(atRule), port, protoTCP, 0), &portVal),
+			ebpf.ErrKeyNotExist, "the install's port %d goes", port)
+	}
+
+	require.NoError(t, fw.RemovePolicyIP(1, v6))
+	var n6 [16]byte
+	copy(n6[:], v6.To16())
+	require.ErrorIs(t, objs.MapCidrsV6.Lookup(bpf.RuleKeyV6(1, 128, n6), &val), ebpf.ErrKeyNotExist)
+	require.ErrorIs(t, objs.MapPortsV6.Lookup(bpf.RulePortKeyV6(1, n6, 443, protoTCP, 0), &portVal), ebpf.ErrKeyNotExist)
 }

@@ -265,6 +265,7 @@ func canonicalCIDR(value string) string {
 // the assembled FirewallConfig here for the canonical tail.
 func (cm *Manager) applyLoadedConfig(cfg *FirewallConfig) error {
 	normalizeRules(cfg.Rules)
+	cfg.Rules = dropUnspecifiedHosts(cfg.Rules)
 	if err := validateRules(cfg.Rules); err != nil {
 		return err
 	}

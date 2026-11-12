@@ -162,6 +162,11 @@ func (f *FirewallImpl) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port
 		return false, fmt.Errorf("invalid IP: %s", ip.String())
 	}
 	ipStr := ip.String()
+	// Refused before the write is planned: the planned port keys would be
+	// the step's wildcard keys (unspecified.go).
+	if f.refuseUnspecifiedLocked(policy, dst.IP, ipStr) {
+		return false, nil
+	}
 	allow, deny, ok := f.gateStepLocked(policy, dst, expandPorts(ports))
 	if !ok {
 		return false, f.stepWriteErrLocked(policy, ipStr, nil)
@@ -224,6 +229,11 @@ func (f *FirewallImpl) RemovePolicyIP(policy uint32, ip net.IP) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Nothing is installed at the unspecified address, and the port keys the
+	// ledger holds there are the step's wildcard entries (unspecified.go).
+	if ip.IsUnspecified() {
+		return nil
+	}
 	lpm, ports, ok := f.hostKeysLocked(policy, ip)
 	if !ok {
 		return fmt.Errorf("invalid IP: %s", ip.String())

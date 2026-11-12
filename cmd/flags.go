@@ -308,8 +308,9 @@ func (c *StartCmd) AfterApply() error {
 
 // loopbackUpstream reports whether a --dns-upstream value ("host:port", or a
 // bare host) names a loopback resolver: anything in 127.0.0.0/8, ::1, an
-// IPv4-mapped loopback, or localhost. A hostname that is not an address is
-// not judged here.
+// IPv4-mapped loopback, localhost, or the unspecified address in any
+// spelling, which the kernel routes to the local host. A hostname that is
+// not an address is not judged here.
 func loopbackUpstream(upstream string) bool {
 	host, _, err := net.SplitHostPort(upstream)
 	if err != nil {
@@ -319,7 +320,11 @@ func loopbackUpstream(upstream string) bool {
 		return true
 	}
 	addr, err := netip.ParseAddr(host)
-	return err == nil && addr.Unmap().IsLoopback()
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	return addr.IsLoopback() || addr.IsUnspecified()
 }
 
 // --container-egress values, in ascending strictness. The root-cgroup hook has

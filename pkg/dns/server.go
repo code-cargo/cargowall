@@ -1118,6 +1118,11 @@ func (s *Server) extractIPsFromResponse(msg *dns.Msg) ([]net.IP, uint32) {
 // for the IP necessarily came from such a deny entry, which this call did
 // not remove.
 func (s *Server) applyVerdictSide(ip net.IP, hostname string, action config.Action, ports []config.Port, isReprocess bool) bool {
+	// The firewall never installs the unspecified address
+	// (firewall/unspecified.go), so an answer naming it opens nothing.
+	if ip.IsUnspecified() {
+		return false
+	}
 	ipStr := ip.String()
 	finalAction, hasConflict, conflictingRule := s.config.CheckIPRuleConflict(ip, hostname, action, ports)
 	if hasConflict {

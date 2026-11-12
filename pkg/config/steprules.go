@@ -135,6 +135,7 @@ func validateStepID(id string) error {
 // normalize, validate and merge, and resolves them.
 func compileStepRules(st *StepConfig) ([]ResolvedRule, error) {
 	normalizeRules(st.Rules)
+	st.Rules = dropUnspecifiedHosts(st.Rules)
 	for i := range st.Rules {
 		r := &st.Rules[i]
 		if r.Action == "" {

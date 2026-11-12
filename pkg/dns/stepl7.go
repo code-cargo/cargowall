@@ -287,9 +287,10 @@ func (s *Server) recordStepScope(policy uint32, name string, rule bool, ip net.I
 // first of their own names that still has forward-resolution evidence;
 // with none, or with the scope refused, every kept holder is withdrawn
 // too. A holder whose withdrawal fails stays open there, so its ports stay
-// in the scope and it stays in the record, for the next replay to try
-// again. No step install is left open unscoped while a name can bind the
-// address. A withdrawal is of everything a policy's DNS installs added at
+// in the scope and it stays in the record, for a later replay to try
+// again: none runs after startup today, so one stuck at the last stays
+// that way for the run. No step install is left open unscoped while a name
+// can bind the address. A withdrawal is of everything a policy's DNS installs added at
 // the address, whichever name they were for (Firewall.RemovePolicyIP).
 func (s *Server) rescopeStepTier() {
 	l := s.steps.l7
@@ -380,11 +381,12 @@ func (s *Server) withdrawHolders(holders stepScope, policies []uint32, ip net.IP
 
 // warnStuck logs the withdrawals that failed: those installs stay open, on
 // their ports under ip's scope when it was scoped again, and without name
-// enforcement when not, until the next replay tries again.
+// enforcement when not, until a replay tries again, if one runs.
 func (s *Server) warnStuck(holders stepScope, stuck map[uint32]stuckWithdrawal, ip net.IP, scoped bool) {
-	stays := "it stays open to its step without name enforcement until the next replay tries again"
+	stays := "it stays open to its step without name enforcement until a replay tries again (none run after startup)"
 	if scoped {
-		stays = "it stays open to its step on its ports, under the address's scope, until the next replay tries again"
+		stays = "it stays open to its step on its ports, under the address's scope, until a replay tries again " +
+			"(none run after startup)"
 	}
 	for _, policy := range slices.Sorted(maps.Keys(stuck)) {
 		w := stuck[policy]

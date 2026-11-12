@@ -921,14 +921,18 @@ to select policy with.
     addresses however many step installs there are, and a scope written
     for an install the rule maps then refuse is taken back, unless another
     install holds the address's scope. The tracked-hostname replay scopes
-    the step installs again, first, after its scope flush, under the
-    latest name bound to each address, and under one hold of step installs
-    with the flush, which each install also takes from its scope to its
-    record, so none is scoped before the flush and recorded after it. A
-    step's install whose step no longer allows the name it was installed
-    for (the chain to it expired, say) is withdrawn, and so is every
-    install at an address no name can be bound to again. A withdrawal
-    takes out what the step's DNS installs added at the address and keeps
+    the step installs again, first, after its scope flush, and under one
+    hold of step installs with the flush, which each install also takes
+    from its scope to its record, so none is scoped before the flush and
+    recorded after it. Each address's record keeps, for each policy that
+    holds it, the latest few names its installs there were for and their
+    ports. A policy stays while it allows any of its own names; one that
+    allows none any more (the chain to it expired, say) is withdrawn, and
+    its names and ports leave the record and the scope. The address is
+    scoped again on the kept holders' ports, by the first of their names
+    that still has forward-resolution evidence; with none, every install
+    there is withdrawn. A withdrawal takes out everything the policy's DNS
+    installs added at the address, whichever name they were for, and keeps
     what the sync wrote there for it, its own `/32` or `/128` CIDR rule or
     a carve. One exception is the job's own (SCOPE IFF BOUND): an address
     no forward resolution bound to its name, a local alias's or one whose

@@ -88,14 +88,37 @@ type stepL7 struct {
 	warned   time.Time
 }
 
-// stepScope is one address's step scope: the latest name bound to it, whose
-// evidence the install just refreshed, the ports every step installed it
-// on, and the policies that hold it, each by the latest name it installed
-// it for.
-type stepScope struct {
-	name     string
-	ports    []config.Port
-	policies map[uint32]string
+// stepScope is one address's step scope: each policy that holds it, by
+// what its installs there were for.
+type stepScope map[uint32]stepHolder
+
+// stepHolder is what one policy's installs at an address were for: the
+// names, latest last, and the ports.
+type stepHolder struct {
+	names []string
+	ports []config.Port
+}
+
+// stepScopeNames bounds the names a holder's record keeps, the latest ones:
+// a shared edge address can be bound to any number of names. A holder is
+// judged by its kept names alone, so one only an older, dropped name still
+// allowed is withdrawn, which fails closed.
+const stepScopeNames = 8
+
+// policies is the holders' policies, in order.
+func (sc stepScope) policies() []uint32 { return slices.Sorted(maps.Keys(sc)) }
+
+// ports is the union of the holders' ports: the address's scope.
+func (sc stepScope) ports() []config.Port {
+	var ports []config.Port
+	for i, policy := range sc.policies() {
+		if i == 0 {
+			ports = sc[policy].ports
+			continue
+		}
+		ports = config.UnionPorts(ports, sc[policy].ports)
+	}
+	return ports
 }
 
 func newStepL7() *stepL7 { return &stepL7{share: stepScopeShare} }
@@ -201,8 +224,8 @@ func (l *stepL7) uncharge(ip net.IP) {
 }
 
 // recordStepScope records a scoped step install's scope for the rewarm,
-// under the name it was just scoped for, its ports joined to those of any
-// other step's install there.
+// under its policy: the name it was just scoped for, the latest, and its
+// ports, joined to those of the policy's other installs there.
 func (s *Server) recordStepScope(policy uint32, name string, ip net.IP, ports []config.Port) {
 	l := s.steps.l7
 	l.mu.Lock()
@@ -211,25 +234,40 @@ func (s *Server) recordStepScope(policy uint32, name string, ip net.IP, ports []
 		l.scoped = make(map[string]stepScope)
 	}
 	key := ip.String()
-	sc := stepScope{name: name, ports: ports, policies: map[uint32]string{}}
-	if prev, ok := l.scoped[key]; ok {
-		sc.ports = config.UnionPorts(prev.ports, ports)
-		sc.policies = prev.policies
+	sc := l.scoped[key]
+	if sc == nil {
+		sc = stepScope{}
+		l.scoped[key] = sc
 	}
-	sc.policies[policy] = name
-	l.scoped[key] = sc
+	h, held := sc[policy]
+	if held {
+		h.ports = config.UnionPorts(h.ports, ports)
+	} else {
+		h.ports = ports
+	}
+	h.names = append(slices.DeleteFunc(slices.Clone(h.names), func(n string) bool { return n == name }), name)
+	if len(h.names) > stepScopeNames {
+		h.names = h.names[len(h.names)-stepScopeNames:]
+	}
+	sc[policy] = h
 }
 
 // rescopeStepTier scopes every recorded step install again. The tracked-
 // hostname replay flushes every L7 scope before it rebuilds them, and a
 // step's installs from after the startup backfill are never backfilled
 // again. It runs first, into the emptied maps, which the steps' share
-// always fits, under the flush's hold of step installs (holdInstalls). A
-// step's install whose step no longer allows the name it was for, the chain
-// to it expired say, is withdrawn: its step's entries there are taken out.
-// So is one at an address that can't be scoped again, its latest name's
-// evidence gone or the scope refused. No step install is left open
-// unscoped.
+// always fits, under the flush's hold of step installs (holdInstalls).
+//
+// A policy that holds an address stays while it still allows any of the
+// names its installs there were for; one that allows none of them any
+// more, the chain to it expired say, is withdrawn: its entries there are
+// taken out, and its names and ports leave the record and the scope. The
+// address is scoped again on the kept holders' ports, by the first of
+// their own names that still has forward-resolution evidence. With none,
+// or with the scope refused, every kept holder is withdrawn too. No step
+// install is left open unscoped. A withdrawal is of everything a policy's
+// DNS installs added at the address, whichever name they were for
+// (Firewall.RemovePolicyIP).
 func (s *Server) rescopeStepTier() {
 	l := s.steps.l7
 	if l == nil {
@@ -239,46 +277,60 @@ func (s *Server) rescopeStepTier() {
 	todo := l.scoped
 	l.scoped, l.charged = nil, [2]map[string]struct{}{}
 	l.mu.Unlock()
-	for ipStr, sc := range todo {
+	for ipStr, holders := range todo {
 		ip := net.ParseIP(ipStr)
-		kept, lost := map[uint32]string{}, map[uint32]string{}
-		for policy, name := range sc.policies {
-			if _, ok := s.StepAllowPorts(policy, name); ok {
-				kept[policy] = name
-			} else {
-				lost[policy] = name
+		kept := stepScope{}
+		var lost []uint32
+		for _, policy := range holders.policies() {
+			h := holders[policy]
+			allowed := slices.DeleteFunc(slices.Clone(h.names), func(name string) bool {
+				_, ok := s.StepAllowPorts(policy, name)
+				return !ok
+			})
+			if len(allowed) == 0 {
+				lost = append(lost, policy)
+				continue
 			}
+			kept[policy] = stepHolder{names: allowed, ports: h.ports}
 		}
-		disallowed := errors.New("its step no longer allows the name")
-		var scoped bool
-		var err error
-		if len(kept) > 0 {
-			if scoped, _, err = s.scopeStepInstall(sc.name, ip, sc.ports); !scoped && err == nil {
-				err = errors.New("its name's forward-resolution evidence is gone")
-			}
-		}
-		s.withdrawStepInstall(lost, ip, scoped, disallowed)
+		scoped, err := s.rescopeAddress(kept, ip)
+		s.withdrawStepInstall(holders, lost, ip, scoped, errors.New("its step allows none of its names any more"))
 		if !scoped {
-			s.withdrawStepInstall(kept, ip, false, err)
+			s.withdrawStepInstall(holders, kept.policies(), ip, false, err)
 			continue
 		}
-		sc.policies = kept
 		l.mu.Lock()
 		if l.scoped == nil {
 			l.scoped = make(map[string]stepScope)
 		}
-		l.scoped[ipStr] = sc
+		l.scoped[ipStr] = kept
 		l.mu.Unlock()
 	}
 }
 
-// withdrawStepInstall takes out the entries the holders' DNS installs, by
-// policy and the name each was for, hold at ip, for why: no step reaches an
-// address unscoped, nor by a name its rules no longer allow. scoped is
+// rescopeAddress scopes ip again for its kept holders, on their ports, by
+// the first of their names, each holder's latest first, that still has
+// forward-resolution evidence. It reports whether it did, and why not.
+func (s *Server) rescopeAddress(kept stepScope, ip net.IP) (bool, error) {
+	ports := kept.ports()
+	for _, policy := range kept.policies() {
+		names := kept[policy].names
+		for i := len(names) - 1; i >= 0; i-- {
+			if scoped, _, err := s.scopeStepInstall(names[i], ip, ports); scoped || err != nil {
+				return scoped, err
+			}
+		}
+	}
+	return false, errors.New("no name its steps installed it for has forward-resolution evidence any more")
+}
+
+// withdrawStepInstall takes out the entries policies' DNS installs hold at
+// ip, for why: no step reaches an address unscoped, nor by names its rules
+// no longer allow. holders names what each installed there for; scoped is
 // whether ip stays scoped for other installs there.
-func (s *Server) withdrawStepInstall(holders map[uint32]string, ip net.IP, scoped bool, why error) {
-	for _, policy := range slices.Sorted(maps.Keys(holders)) {
-		attrs := []any{"policy", policy, "ip", ip.String(), "hostname", holders[policy], "reason", why}
+func (s *Server) withdrawStepInstall(holders stepScope, policies []uint32, ip net.IP, scoped bool, why error) {
+	for _, policy := range policies {
+		attrs := []any{"policy", policy, "ip", ip.String(), "hostnames", holders[policy].names, "reason", why}
 		if err := s.firewall.RemovePolicyIP(policy, ip); err != nil {
 			stays := "the address is open to its step without name enforcement"
 			if scoped {

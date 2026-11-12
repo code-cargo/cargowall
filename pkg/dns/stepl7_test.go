@@ -353,7 +353,7 @@ func TestStepScopes_RebindOrWithdraw(t *testing.T) {
 // name it was for, here once the chain that led the step to it has
 // expired: the step's entries there are withdrawn, never left open
 // unscoped. Another step's install at the address, still allowed, is
-// scoped again, and the record keeps it alone.
+// scoped again on its own ports alone, and the record keeps it alone.
 func TestStepScopes_WithdrawnWhenItsStepNoLongerAllows(t *testing.T) {
 	cfg := config.NewConfigManager()
 	fw := newRecordingFirewall()
@@ -374,9 +374,86 @@ func TestStepScopes_WithdrawnWhenItsStepNoLongerAllows(t *testing.T) {
 	assert.NotContains(t, fw.stepIPs(policyFetch), "10.1.0.81", "fetch's install there is withdrawn")
 	assert.NotContains(t, fw.stepIPs(policyFetch), "10.1.0.82", "and at the shared address")
 	assert.Contains(t, fw.stepIPs(policyDeploy), "10.1.0.82", "deploy's stays")
-	assert.Equal(t, "tcp/443,tcp/80", rec.scopes["10.1.0.82"], "scoped again for it")
-	assert.Equal(t, map[uint32]string{policyDeploy: "deploy.example.com"}, s.steps.l7.scoped["10.1.0.82"].policies)
+	assert.Equal(t, "tcp/80", rec.scopes["10.1.0.82"], "scoped again for it, on its ports alone")
+	assert.Equal(t, stepScope{policyDeploy: {names: []string{"deploy.example.com"}, ports: tcp80}},
+		s.steps.l7.scoped["10.1.0.82"], "the record keeps deploy alone")
 	assert.ElementsMatch(t, []string{"10.1.0.81", "10.1.0.82"}, fw.removed)
+}
+
+// A policy stays at an address while it allows any of the names its
+// installs there were for, the latest or not: here fetch's own rule name
+// still does once the chain it installed the address for since has
+// expired. The expired name leaves the record; the ports stay fetch's.
+func TestStepScopes_KeptWhileAnyNameIsAllowed(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames() // the startup backfill: seals via
+	answer(s, "a.cdn-step.example.net", aResponse("a.cdn-step.example.net", "10.1.0.70"))
+	answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge70.akamai.example"}, ""))
+	answer(s, "edge70.akamai.example", aResponse("edge70.akamai.example", "10.1.0.70"))
+	require.Equal(t, []string{"a.cdn-step.example.net", "edge70.akamai.example"}, s.steps.l7.scoped["10.1.0.70"][policyFetch].names)
+
+	s.steps.cname.Delete("edge70.akamai.example")
+	s.ApplyRulesToTrackedHostnames()
+	assert.Empty(t, fw.removed)
+	assert.Contains(t, fw.stepIPs(policyFetch), "10.1.0.70")
+	assert.Equal(t, "all-ports", rec.scopes["10.1.0.70"])
+	assert.Equal(t, stepScope{policyFetch: {names: []string{"a.cdn-step.example.net"}}}, s.steps.l7.scoped["10.1.0.70"])
+}
+
+// The address is scoped again by the first of its kept holders' own names
+// that still has forward-resolution evidence, not the address's latest
+// alone: at one address the evidence left is an older name of fetch's,
+// at the other deploy's, the second holder's. Every install stays, under
+// the address's scope.
+func TestStepScopes_ScopedByAnyNameWithEvidence(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames() // the startup backfill: seals via
+	for _, ip := range []string{"10.1.0.80", "10.1.0.86"} {
+		answer(s, "a.cdn-step.example.net", aResponse("a.cdn-step.example.net", ip))
+		answer(s, "c.cdn-step.example.net", aResponse("c.cdn-step.example.net", ip))
+		answer(s, "deploy.example.com", aResponse("deploy.example.com", ip))
+	}
+	for i := range 8200 { // evict every name's evidence
+		cfg.RecordForwardResolution(fmt.Sprintf("other%d.example.org", i), "192.0.2.1")
+	}
+	cfg.RecordForwardResolution("a.cdn-step.example.net", "10.1.0.80") // and bind some again
+	cfg.RecordForwardResolution("deploy.example.com", "10.1.0.86")
+	require.False(t, cfg.NameResolvedToIP("c.cdn-step.example.net", "10.1.0.80"))
+
+	s.ApplyRulesToTrackedHostnames()
+	assert.Empty(t, fw.removed)
+	for _, ip := range []string{"10.1.0.80", "10.1.0.86"} {
+		assert.Contains(t, fw.stepIPs(policyFetch), ip)
+		assert.Contains(t, fw.stepIPs(policyDeploy), ip)
+		assert.Equal(t, "all-ports", rec.scopes[ip], ip)
+	}
+}
+
+// A holder's record keeps its latest stepScopeNames names, each once.
+func TestStepScopes_NamesBounded(t *testing.T) {
+	cfg := config.NewConfigManager()
+	s := newStepTestServer(t, cfg, newRecordingFirewall())
+	s.SetL7Registrar(&recordingRegistrar{})
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	var want []string
+	for i := range stepScopeNames + 2 {
+		name := fmt.Sprintf("h%d.cdn-step.example.net", i)
+		answer(s, name, aResponse(name, "10.1.0.85"))
+		want = append(want, name)
+	}
+	answer(s, want[5], aResponse(want[5], "10.1.0.85"))
+	want = append(append(want[2:5:5], want[6:]...), want[5])
+	assert.Equal(t, want, s.steps.l7.scoped["10.1.0.85"][policyFetch].names)
 }
 
 // scopeSignalling is a recordingRegistrar that signals its first scope.
@@ -408,7 +485,15 @@ func TestStepScopes_FlushWaitsForAnInstallsRecord(t *testing.T) {
 		defer close(installed)
 		answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.83"))
 	}()
-	<-rec.scoped
+	wait := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no %s", what)
+		}
+	}
+	wait(rec.scoped, "scope")
 	replayed := make(chan struct{})
 	go func() {
 		defer close(replayed)
@@ -418,13 +503,13 @@ func TestStepScopes_FlushWaitsForAnInstallsRecord(t *testing.T) {
 	case <-replayed: // only without the hold
 	case <-time.After(200 * time.Millisecond):
 	}
-	<-fw.stepAdd
+	wait(fw.stepAdd, "write")
 	go func() {
 		for range fw.stepAdd {
 		}
 	}()
-	<-installed
-	<-replayed
+	wait(installed, "install")
+	wait(replayed, "replay")
 	assert.Equal(t, "tcp/443", rec.scopes["10.1.0.83"], "the install is scoped after the flush")
 	assert.Contains(t, s.steps.l7.scoped, "10.1.0.83")
 	assert.Contains(t, s.steps.l7.charged[0], "10.1.0.83")

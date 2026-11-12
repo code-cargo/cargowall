@@ -70,8 +70,9 @@ opened unscoped. Step scopes take room only in the steps' share of each scope
 map, what the job's reservation leaves, so they can't fill it under the job,
 which keeps room for at least 4096 addresses. The replay after a scope flush
 scopes them again, and withdraws a step's install it can't, or one whose step
-no longer allows its name. SCOPE IFF BOUND holds for them as for the job: an
-address with no forward-resolution evidence for its name is installed
+allows none of the names it was installed for any more, and scopes the address
+on its kept installs' ports alone. SCOPE IFF BOUND holds for them as for the
+job: an address with no forward-resolution evidence for its name is installed
 unscoped. The scope holds for every flow to the address: a job flow there,
 through a job CIDR allow say, must present a name the job's tiers allow, as at
 an address a job hostname resolves to, and until steps are bound that

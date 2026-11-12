@@ -375,7 +375,7 @@ func TestStepScopes_WithdrawnWhenItsStepNoLongerAllows(t *testing.T) {
 	assert.NotContains(t, fw.stepIPs(policyFetch), "10.1.0.82", "and at the shared address")
 	assert.Contains(t, fw.stepIPs(policyDeploy), "10.1.0.82", "deploy's stays")
 	assert.Equal(t, "tcp/80", rec.scopes["10.1.0.82"], "scoped again for it, on its ports alone")
-	assert.Equal(t, stepScope{policyDeploy: {names: []string{"deploy.example.com"}, ports: tcp80}},
+	assert.Equal(t, stepScope{policyDeploy: {names: []stepName{{"deploy.example.com", true}}, ports: tcp80}},
 		s.steps.l7.scoped["10.1.0.82"], "the record keeps deploy alone")
 	assert.ElementsMatch(t, []string{"10.1.0.81", "10.1.0.82"}, fw.removed)
 }
@@ -395,14 +395,14 @@ func TestStepScopes_KeptWhileAnyNameIsAllowed(t *testing.T) {
 	answer(s, "a.cdn-step.example.net", aResponse("a.cdn-step.example.net", "10.1.0.70"))
 	answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge70.akamai.example"}, ""))
 	answer(s, "edge70.akamai.example", aResponse("edge70.akamai.example", "10.1.0.70"))
-	require.Equal(t, []string{"a.cdn-step.example.net", "edge70.akamai.example"}, s.steps.l7.scoped["10.1.0.70"][policyFetch].names)
+	require.Equal(t, []string{"a.cdn-step.example.net", "edge70.akamai.example"}, s.steps.l7.scoped["10.1.0.70"][policyFetch].hostnames())
 
 	s.steps.cname.Delete("edge70.akamai.example")
 	s.ApplyRulesToTrackedHostnames()
 	assert.Empty(t, fw.removed)
 	assert.Contains(t, fw.stepIPs(policyFetch), "10.1.0.70")
 	assert.Equal(t, "all-ports", rec.scopes["10.1.0.70"])
-	assert.Equal(t, stepScope{policyFetch: {names: []string{"a.cdn-step.example.net"}}}, s.steps.l7.scoped["10.1.0.70"])
+	assert.Equal(t, stepScope{policyFetch: {names: []stepName{{"a.cdn-step.example.net", true}}}}, s.steps.l7.scoped["10.1.0.70"])
 }
 
 // The address is scoped again by the first of its kept holders' own names
@@ -453,7 +453,101 @@ func TestStepScopes_NamesBounded(t *testing.T) {
 	}
 	answer(s, want[5], aResponse(want[5], "10.1.0.85"))
 	want = append(append(want[2:5:5], want[6:]...), want[5])
-	assert.Equal(t, want, s.steps.l7.scoped["10.1.0.85"][policyFetch].names)
+	assert.Equal(t, want, s.steps.l7.scoped["10.1.0.85"][policyFetch].hostnames())
+}
+
+// A holder past its stepScopeNames names loses its oldest chain name
+// first: a rule's name never expires, so it keeps the holder judged right
+// once every chain has expired.
+func TestStepScopes_RuleNameOutlastsChains(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	s.SetL7Registrar(&recordingRegistrar{})
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames() // the startup backfill: seals via
+	answer(s, "a.cdn-step.example.net", aResponse("a.cdn-step.example.net", "10.1.0.99"))
+	var edges []string
+	for i := range stepScopeNames + 1 {
+		edge := fmt.Sprintf("e%d.akamai.example", i)
+		answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{edge}, ""))
+		answer(s, edge, aResponse(edge, "10.1.0.99"))
+		edges = append(edges, edge)
+	}
+	assert.Equal(t, append([]string{"a.cdn-step.example.net"}, edges[2:]...), s.steps.l7.scoped["10.1.0.99"][policyFetch].hostnames())
+
+	for _, edge := range edges {
+		s.steps.cname.Delete(edge)
+	}
+	s.ApplyRulesToTrackedHostnames()
+	assert.Empty(t, fw.removed, "the rule's name still allows the address")
+	assert.Contains(t, fw.stepIPs(policyFetch), "10.1.0.99")
+}
+
+// A holder whose withdrawal fails stays open there: its ports stay in the
+// address's scope, with another holder's or alone, and it stays in the
+// record, so the next replay withdraws it.
+func TestStepScopes_FailedWithdrawalStaysScoped(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	var logs bytes.Buffer
+	s := newStepTestServer(t, cfg, fw)
+	s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames() // the startup backfill: seals via
+	answer(s, "step.example.com", makeCNAMEResponse("step.example.com.", []string{"edge90.akamai.example"}, ""))
+	answer(s, "edge90.akamai.example", aResponse("edge90.akamai.example", "10.1.0.89", "10.1.0.90"))
+	answer(s, "deploy.example.com", aResponse("deploy.example.com", "10.1.0.90")) // deploy's, on 80
+
+	s.steps.cname.Delete("edge90.akamai.example")
+	fw.removeErr = errors.New("map delete failed")
+	s.ApplyRulesToTrackedHostnames()
+	assert.Contains(t, fw.stepIPs(policyFetch), "10.1.0.90", "fetch's install stays")
+	assert.Equal(t, "tcp/443,tcp/80", rec.scopes["10.1.0.90"], "so its port stays scoped, beside deploy's")
+	assert.Equal(t, "tcp/443", rec.scopes["10.1.0.89"], "and alone, by its own name's evidence")
+	for _, ip := range []string{"10.1.0.89", "10.1.0.90"} {
+		assert.Contains(t, s.steps.l7.scoped[ip], policyFetch, "kept for the next replay, at %s", ip)
+	}
+	assert.Equal(t, 2, strings.Count(logs.String(), "could not be withdrawn; it stays open to its step on its ports, under the address's scope"))
+
+	fw.removeErr = nil
+	s.ApplyRulesToTrackedHostnames()
+	assert.NotContains(t, fw.stepIPs(policyFetch), "10.1.0.90")
+	assert.Equal(t, "tcp/80", rec.scopes["10.1.0.90"])
+	assert.NotContains(t, rec.scopes, "10.1.0.89")
+	assert.NotContains(t, s.steps.l7.scoped, "10.1.0.89")
+	assert.Equal(t, []uint32{policyDeploy}, s.steps.l7.scoped["10.1.0.90"].policies())
+}
+
+// A holder whose address can't be scoped again, and whose withdrawal then
+// fails, stays in the record, unscoped, and the next replay withdraws it.
+func TestStepScopes_FailedWithdrawalRetried(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	var logs bytes.Buffer
+	s := newStepTestServer(t, cfg, fw)
+	s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	s.ApplyRulesToTrackedHostnames() // the startup backfill: seals via
+	answer(s, "c.cdn-step.example.net", aResponse("c.cdn-step.example.net", "10.1.0.91"))
+	for i := range 8200 { // evict its evidence
+		cfg.RecordForwardResolution(fmt.Sprintf("other%d.example.org", i), "192.0.2.1")
+	}
+	fw.removeErr = errors.New("map delete failed")
+	s.ApplyRulesToTrackedHostnames()
+	assert.Contains(t, fw.stepIPs(policyFetch), "10.1.0.91")
+	assert.NotContains(t, rec.scopes, "10.1.0.91")
+	assert.Contains(t, s.steps.l7.scoped["10.1.0.91"], policyFetch, "kept for the next replay")
+	assert.Contains(t, logs.String(), "could not be withdrawn; it stays open to its step without name enforcement")
+
+	fw.removeErr = nil
+	s.ApplyRulesToTrackedHostnames()
+	assert.NotContains(t, fw.stepIPs(policyFetch), "10.1.0.91")
+	assert.Empty(t, s.steps.l7.scoped)
 }
 
 // scopeSignalling is a recordingRegistrar that signals its first scope.

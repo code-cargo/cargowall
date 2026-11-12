@@ -931,54 +931,58 @@ to select policy with.
     its names and ports leave the record and the scope. The address is
     scoped again on the kept holders' ports, by the first of their names
     that still has forward-resolution evidence; with none, every install
-    there is withdrawn. A withdrawal takes out everything the policy's DNS
-    installs added at the address, whichever name they were for, and keeps
-    what the sync wrote there for it, its own `/32` or `/128` CIDR rule or
-    a carve. One exception is the job's own (SCOPE IFF BOUND): an address
-    no forward resolution bound to its name, a local alias's or one whose
-    evidence the binding store evicted, is installed unscoped and stays
-    L4-governed. A step install's scope holds for every flow to the
-    address, not the step's alone: a job flow there, through a job CIDR
-    allow say, must present a name the job's tiers allow, as at an address
-    a job hostname resolves to, and until steps are bound that narrowing
-    is all a step's rules do at L7. The kernel stamps each punt with the
-    step policy its socket is judged by (`l7_event.step_policy`), read
-    with the punt, so a binding that lands after it can't change the
-    judgement; the oracle admits the name by the job's tiers first and
-    then by that policy's own rules and chains, never past a job deny and
-    never for a name the job denies on any port. A step bound to its
-    policy therefore reaches a shared edge address only by the names its
-    rules allow there. A step's install re-reports as late-allowed only
-    the recent blocks of the steps bound to its policy (`RecentBlocks` is
-    kept per step ordinal), never on a port a job CIDR deny holds there,
-    and the summary supersedes a block only by a late-allow of its own
-    step; a job install re-reports everyone's. Requirement: the
-    ordinal-to-policy lookup a step's late-allow reconciles by runs under
-    the recent-blocks buffer's lock, so it must not take a lock held while
-    blocks are consumed. The late-allow from the event pipeline still
-    judges by the job's rules alone. And anything that reloads step rules
-    at runtime must clear the step policies' entries, the DNS path's
-    included, before installing: policies are numbered per load, so a kept
-    entry would be another step's. It must clear the step tier's scope
-    record with them, for the same reason: the installs it records are
-    gone, under the old load's policies. The sync does the first (above);
-    today it runs once, at startup, over an empty step tier. A runtime
-    reload that cannot clear every step entry must treat the step tier as
-    failed (write no step entries, Warn), or plan the survivors' prefixes
-    as unconfirmed so their carves are kept: the rebuild plans as if the
-    maps held no step entries, so a survivor is gated against nothing in
-    the new tier. And anything that backfills at runtime must keep the
-    backfill's record of the CNAME hops each answered address came through
-    open until it has run: the startup backfill drops it once it is done,
-    since every answer after it is installed at answer time against its
-    own chain, and a backfill that finds it dropped installs nothing for
-    steps (a missing record would read as a chain with no hop the job
-    denies). The cost is an answer that raced the startup load and that
-    neither installed: it waits for its name's next answer, which fails
-    closed. A run without step rules drops the record sooner, once they
-    are final: at its policy's load, or, for a run that loaded none (a
-    failed fetch, a hook's nil policy, a failed file load), when the tcbpf
-    load settles them to none.
+    there is withdrawn. The lost holders are withdrawn first, and one
+    whose withdrawal fails stays open there, so its ports stay in the
+    scope and it stays in the record for the next replay to withdraw. Past
+    a holder's few names its oldest chain name goes first and a rule's
+    name last, since a rule's never expires. A withdrawal takes out
+    everything the policy's DNS installs added at the address, whichever
+    name they were for, and keeps what the sync wrote there for it, its
+    own `/32` or `/128` CIDR rule or a carve. One exception is the job's
+    own (SCOPE IFF BOUND): an address no forward resolution bound to its
+    name, a local alias's or one whose evidence the binding store evicted,
+    is installed unscoped and stays L4-governed. A step install's scope
+    holds for every flow to the address, not the step's alone: a job flow
+    there, through a job CIDR allow say, must present a name the job's
+    tiers allow, as at an address a job hostname resolves to, and until
+    steps are bound that narrowing is all a step's rules do at L7. The
+    kernel stamps each punt with the step policy its socket is judged by
+    (`l7_event.step_policy`), read with the punt, so a binding that lands
+    after it can't change the judgement; the oracle admits the name by the
+    job's tiers first and then by that policy's own rules and chains,
+    never past a job deny and never for a name the job denies on any port.
+    A step bound to its policy therefore reaches a shared edge address
+    only by the names its rules allow there. A step's install re-reports
+    as late-allowed only the recent blocks of the steps bound to its
+    policy (`RecentBlocks` is kept per step ordinal), never on a port a
+    job CIDR deny holds there, and the summary supersedes a block only by
+    a late-allow of its own step; a job install re-reports everyone's.
+    Requirement: the ordinal-to-policy lookup a step's late-allow
+    reconciles by runs under the recent-blocks buffer's lock, so it must
+    not take a lock held while blocks are consumed. The late-allow from
+    the event pipeline still judges by the job's rules alone. And anything
+    that reloads step rules at runtime must clear the step policies'
+    entries, the DNS path's included, before installing: policies are
+    numbered per load, so a kept entry would be another step's. It must
+    clear the step tier's scope record with them, for the same reason: the
+    installs it records are gone, under the old load's policies. The sync
+    does the first (above); today it runs once, at startup, over an empty
+    step tier. A runtime reload that cannot clear every step entry must
+    treat the step tier as failed (write no step entries, Warn), or plan
+    the survivors' prefixes as unconfirmed so their carves are kept: the
+    rebuild plans as if the maps held no step entries, so a survivor is
+    gated against nothing in the new tier. And anything that backfills at
+    runtime must keep the backfill's record of the CNAME hops each
+    answered address came through open until it has run: the startup
+    backfill drops it once it is done, since every answer after it is
+    installed at answer time against its own chain, and a backfill that
+    finds it dropped installs nothing for steps (a missing record would
+    read as a chain with no hop the job denies). The cost is an answer
+    that raced the startup load and that neither installed: it waits for
+    its name's next answer, which fails closed. A run without step rules
+    drops the record sooner, once they are final: at its policy's load,
+    or, for a run that loaded none (a failed fetch, a hook's nil policy, a
+    failed file load), when the tcbpf load settles them to none.
   - *Capacity.* The rule maps are sized at load from the policy in hand
     (`bpf.SizeRuleMaps`), read once: no path loads a policy after the tcbpf
     load, and one that did would have to reload the maps itself. Without

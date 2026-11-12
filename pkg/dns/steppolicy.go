@@ -405,7 +405,7 @@ func (s *Server) installStepTier(allows []stepAllow, name string, ips []net.IP) 
 			})
 			switch {
 			case err == nil && scoped:
-				s.recordStepScope(a.policy, name, ip, a.ports)
+				s.recordStepScope(a.policy, name, a.chain == nil, ip, a.ports)
 			case err != nil && scoped:
 				s.unscopeStepInstall(ip, a.ports, fresh) // scoped, then refused
 			}

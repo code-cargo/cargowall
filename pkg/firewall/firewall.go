@@ -83,6 +83,10 @@ type FirewallImpl struct {
 	// port-specific entries (for cleanup) plus the sticky all-ports grant, so a
 	// shared IP's effective LPM entry reflects every rule that resolved to it.
 	ipPorts map[string]*ipPortState
+
+	// unspecifiedWarned holds the unspecified addresses already refused and
+	// logged (unspecified.go).
+	unspecifiedWarned map[string]struct{}
 }
 
 // portProto carries a port number and its IANA protocol number for BPF map keys.
@@ -358,6 +362,14 @@ func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, 
 	// which is required for LPM trie prefix matching.
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
 
+	// A port entry at the zero network address is the any-destination
+	// wildcard, so a port-scoped subnet at 0.0.0.0 (any prefix but /0, which
+	// UpdateAllowlistTC writes as the real wildcard) is refused here as a
+	// backstop for the auto-allows that bypass the load-time drop.
+	if ipUint32 == 0 && len(ports) > 0 && f.refuseUnspecifiedLocked(ip4, label) {
+		return nil
+	}
+
 	key := bpf.TcBpfLpmKey{
 		Prefixlen: prefixLen,
 		Ip:        ipUint32,
@@ -402,6 +414,10 @@ func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, 
 
 	ports, skip := f.prepV6Ports(ports, "label", label)
 	if skip {
+		return nil
+	}
+
+	if isZeroV6(ip6) && len(ports) > 0 && f.refuseUnspecifiedLocked(ip6, label) {
 		return nil
 	}
 
@@ -543,6 +559,9 @@ func (f *FirewallImpl) AddIP(ip net.IP, action config.Action, ports []config.Por
 // by both AddIP and UpdateAllowlistTC (via addCIDRv4). Must be called with
 // f.mu held.
 func (f *FirewallImpl) addIPv4Locked(ip4 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
+	if f.refuseUnspecifiedLocked(ip4, ipStr) {
+		return false, nil
+	}
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
 
 	key := bpf.TcBpfLpmKey{
@@ -679,6 +698,9 @@ func mergePorts(existing, additions []portProto) []portProto {
 // by both AddIP and UpdateAllowlistTC (via addCIDRv6). Must be called with
 // f.mu held.
 func (f *FirewallImpl) addIPv6Locked(ip6 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
+	if f.refuseUnspecifiedLocked(ip6, ipStr) {
+		return false, nil
+	}
 	ports, skip := f.prepV6Ports(ports, "ip", ipStr)
 	if skip {
 		return false, nil
@@ -766,6 +788,12 @@ func (f *FirewallImpl) removeIPv4(ip4 net.IP, origIP net.IP) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// Nothing is installed at the unspecified address, and its port keys are
+	// the any-destination wildcard's (unspecified.go).
+	if ip4.IsUnspecified() {
+		return nil
+	}
+
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
 
 	key := bpf.TcBpfLpmKey{
@@ -806,6 +834,10 @@ func (f *FirewallImpl) removeIPv4(ip4 net.IP, origIP net.IP) error {
 func (f *FirewallImpl) removeIPv6(ip6 net.IP, origIP net.IP) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if ip6.IsUnspecified() {
+		return nil
+	}
 
 	var key bpf.TcBpfLpmKeyV6
 	key.Prefixlen = 128

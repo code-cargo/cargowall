@@ -17,6 +17,7 @@
 package events
 
 import (
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -63,6 +64,10 @@ type RecentBlock struct {
 	ContainerOrigin bool
 	CNAMEChain      []string
 	At              time.Time
+	// container is whether any attempt the entry folds in came from a
+	// container, kept though a disagreement blanks the identity fields: a
+	// step tier's take leaves such an entry (TakeMatchingFor, TakeStep).
+	container bool
 }
 
 // recentBlockKey keys a destination's blocks by port, protocol and step
@@ -153,6 +158,7 @@ func (rb *RecentBlocks) Consume(event AuditEvent) {
 		ContainerOrigin: event.ContainerOrigin,
 		CNAMEChain:      event.CNAMEChain,
 		At:              event.Timestamp,
+		container:       event.ContainerID != "" || event.ContainerOrigin,
 	}
 	// The key is the destination and the step, so two sources of one step
 	// (containers A and B, or a container and a host process) blocked on the
@@ -179,6 +185,7 @@ func degradeDisagreement(prev, next RecentBlock) RecentBlock {
 	if next.At.Before(prev.At) {
 		next.At = prev.At
 	}
+	next.container = next.container || prev.container
 	if prev.SrcIP != next.SrcIP {
 		next.SrcIP = ""
 	}
@@ -212,7 +219,12 @@ func (rb *RecentBlocks) TakeMatching(dstIP string, allowPorts, denyPorts []confi
 
 // TakeMatchingFor is TakeMatching for the blocks of the step ordinals steps
 // picks (nil: every one), and leaves the rest: what one step's own rules
-// open, they open for that step alone.
+// open, they open for that step alone. A step tier's take (steps set) also
+// leaves every block from a container: where its packets aren't stamped
+// with its step's policy (an unattached bridge port, before the attach, a
+// daemon's bridges in another namespace), TC judges them by the job's rules
+// alone, so a step's rules opening the address need not let its retry
+// through. Leaving the block reported is the safe way round.
 func (rb *RecentBlocks) TakeMatchingFor(dstIP string, steps func(ordinal uint32) bool, allowPorts, denyPorts []config.Port, hasDeny bool) []RecentBlock {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -230,7 +242,7 @@ func (rb *RecentBlocks) TakeMatchingFor(dstIP string, steps func(ordinal uint32)
 			rb.size--
 			continue
 		}
-		if steps != nil && !steps(key.ordinal) {
+		if steps != nil && (b.container || !steps(key.ordinal)) {
 			continue
 		}
 		proto, _ := protocolTypeForAuditName(b.Protocol) // recorded entries always map
@@ -254,30 +266,54 @@ func (rb *RecentBlocks) TakeMatchingFor(dstIP string, steps func(ordinal uint32)
 
 // TakeStep removes and returns the unexpired blocks of step ordinal, at any
 // destination, that allowed picks, ordered by attempt time: what binding the
-// step to its policy now lets through. allowed runs under the buffer's lock,
-// so it must not take a lock that is held while blocks are consumed.
+// step to its policy now lets through. Blocks from a container stay, as in
+// a step tier's TakeMatchingFor. allowed runs outside the buffer's lock, on
+// the step's blocks picked under it, so the event reader's Consume never
+// waits on it; a block whose entry has moved on meanwhile, taken or folded
+// into a later attempt, is left.
 func (rb *RecentBlocks) TakeStep(ordinal uint32, allowed func(RecentBlock) bool) []RecentBlock {
+	type candidate struct {
+		ip  string
+		key recentBlockKey
+		b   RecentBlock
+	}
+	var candidates []candidate
 	rb.mu.Lock()
-	defer rb.mu.Unlock()
 	cutoff := time.Now().Add(-rb.ttl)
-	var taken []RecentBlock
 	for ip, byKey := range rb.byIP {
 		for key, b := range byKey {
-			switch {
-			case key.ordinal != ordinal:
+			if key.ordinal != ordinal || b.container {
 				continue
-			case b.At.Before(cutoff):
-			case !allowed(b):
-				continue
-			default:
-				taken = append(taken, b)
 			}
-			delete(byKey, key)
-			rb.size--
+			if b.At.Before(cutoff) {
+				delete(byKey, key)
+				rb.size--
+				continue
+			}
+			candidates = append(candidates, candidate{ip, key, b})
 		}
 		if len(byKey) == 0 {
 			delete(rb.byIP, ip)
 		}
+	}
+	rb.mu.Unlock()
+
+	candidates = slices.DeleteFunc(candidates, func(c candidate) bool { return !allowed(c.b) })
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	var taken []RecentBlock
+	for _, c := range candidates {
+		byKey := rb.byIP[c.ip]
+		b, ok := byKey[c.key]
+		if !ok || !b.At.Equal(c.b.At) || b.container {
+			continue
+		}
+		delete(byKey, c.key)
+		rb.size--
+		if len(byKey) == 0 {
+			delete(rb.byIP, c.ip)
+		}
+		taken = append(taken, b)
 	}
 	sort.Slice(taken, func(i, j int) bool { return taken[i].At.Before(taken[j].At) })
 	return taken

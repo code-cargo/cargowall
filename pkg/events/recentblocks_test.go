@@ -352,3 +352,60 @@ func TestRecentBlocks_PerStep(t *testing.T) {
 	assert.ElementsMatch(t, []uint32{3, 0}, []uint32{taken[0].StepOrdinal, taken[1].StepOrdinal})
 	assert.Empty(t, rb.TakeMatching("20.0.0.1", nil, nil, false))
 }
+
+// A step tier's takes leave every block a container contributed to, though
+// a disagreement with a host attempt on the same tuple blanked its
+// container's identity: TC may judge a container's packets as the job's.
+// The job tier's take still has it.
+func TestRecentBlocks_StepTakesLeaveContainers(t *testing.T) {
+	rb := NewRecentBlocks(time.Minute)
+	now := time.Now()
+	host := blockedAuditEvent("10.1.2.3", 443, "TCP", now.Add(-2*time.Second))
+	host.StepOrdinal = 7
+	ctr := host
+	ctr.Timestamp, ctr.ContainerID, ctr.PID = now.Add(-time.Second), "c0ffee", 77
+	rb.Consume(host)
+	rb.Consume(ctr)
+	all := func(uint32) bool { return true }
+	assert.Empty(t, rb.TakeStep(7, func(RecentBlock) bool { return true }))
+	assert.Empty(t, rb.TakeMatchingFor("10.1.2.3", all, nil, nil, false))
+	taken := rb.TakeMatching("10.1.2.3", nil, nil, false)
+	require.Len(t, taken, 1)
+	assert.Empty(t, taken[0].ContainerID, "the identity degraded")
+}
+
+// TakeStep judges outside the buffer's lock, so a block consumed meanwhile
+// waits on nothing, and an entry that moved on meanwhile, folded into a
+// later attempt, is left for that attempt's own reconcile.
+func TestRecentBlocks_TakeStepJudgesOutsideTheLock(t *testing.T) {
+	rb := NewRecentBlocks(time.Minute)
+	now := time.Now()
+	first := blockedAuditEvent("10.1.2.4", 443, "TCP", now.Add(-2*time.Second))
+	first.StepOrdinal = 7
+	other := blockedAuditEvent("10.1.2.5", 443, "TCP", now.Add(-2*time.Second))
+	other.StepOrdinal = 7
+	rb.Consume(first)
+	rb.Consume(other)
+	later := first
+	later.Timestamp = now.Add(-time.Second)
+
+	done := make(chan []RecentBlock)
+	go func() {
+		done <- rb.TakeStep(7, func(b RecentBlock) bool {
+			if b.DstIP == "10.1.2.4" {
+				rb.Consume(later) // a retry, blocked while the step is judged
+			}
+			return true
+		})
+	}()
+	select {
+	case taken := <-done:
+		require.Len(t, taken, 1)
+		assert.Equal(t, "10.1.2.5", taken[0].DstIP)
+	case <-time.After(5 * time.Second):
+		t.Fatal("TakeStep held the lock while judging")
+	}
+	left := rb.TakeMatching("10.1.2.4", nil, nil, false)
+	require.Len(t, left, 1)
+	assert.True(t, left[0].At.Equal(later.Timestamp))
+}

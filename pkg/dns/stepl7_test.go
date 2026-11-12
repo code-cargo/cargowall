@@ -118,8 +118,9 @@ func TestStepAllowPorts(t *testing.T) {
 
 // A step's install re-reports as late-allowed the recent blocks there of the
 // steps bound to its policy, on its ports, and no other step's: those stay
-// for the job's rules, or their own step's, to open. Until something binds
-// steps, a step install re-reports none.
+// for the job's rules, or their own step's, to open. Nor a container's,
+// whose packets TC may judge as the job's. Until something binds steps, a
+// step install re-reports none.
 func TestStepInstall_ReconcilesItsStepsBlocks(t *testing.T) {
 	cfg := config.NewConfigManager()
 	fw := newRecordingFirewall()
@@ -144,13 +145,17 @@ func TestStepInstall_ReconcilesItsStepsBlocks(t *testing.T) {
 	block("10.1.0.66", 443, 8) // step ordinal 8, bound to deploy
 	block("10.1.0.66", 80, 7)  // fetch's rule names 443 alone
 	block("10.1.0.67", 443, 7)
+	blocks.Consume(events.AuditEvent{ // a container's, of step ordinal 9, bound to fetch
+		Timestamp: blockedAt, EventType: events.EventConnectionBlocked,
+		DstIP: "10.1.0.66", DstPort: 443, Protocol: "TCP", StepOrdinal: 9, ContainerID: "c0ffee",
+	})
 
 	answer(s, "step.example.com", aResponse("step.example.com", "10.1.0.67"))
 	assert.Empty(t, readAuditEvents(t, auditPath), "no bindings, no re-report")
 
 	s.SetStepBindings(func(ordinal uint32) (uint32, bool) {
 		switch ordinal {
-		case 7:
+		case 7, 9:
 			return policyFetch, true
 		case 8:
 			return policyDeploy, true
@@ -169,7 +174,7 @@ func TestStepInstall_ReconcilesItsStepsBlocks(t *testing.T) {
 	assert.Equal(t, uint16(443), audited[0].DstPort)
 	assert.Equal(t, "step.example.com", audited[0].MatchedRule)
 	assert.True(t, audited[0].Timestamp.Equal(blockedAt))
-	assert.Len(t, blocks.TakeMatching("10.1.0.66", nil, nil, false), 2, "deploy's block and fetch's on 80 stay")
+	assert.Len(t, blocks.TakeMatching("10.1.0.66", nil, nil, false), 3, "deploy's block, fetch's on 80 and the container's stay")
 }
 
 // A port a job CIDR deny holds at the address stays blocked whatever the

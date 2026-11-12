@@ -30,6 +30,9 @@ set -euo pipefail
 
 HOST=example.com
 URL="https://$HOST/"
+# Only ever PRESENTED, as the SNI of a flow to $HOST's address: never
+# resolved, and allowed by no rule.
+DENIED_SNI=denied.example.net
 AUDIT_LOG=/tmp/cargowall-audit.json
 LOG=/tmp/cargowall.log
 
@@ -76,14 +79,23 @@ start() {
 # which can trail the step's first connection: until then the step gets
 # the job's rules. So the step retries, as any client would a refused
 # connection, and must get through.
+# The step's own allow is name-scoped like the job's: the same address, by
+# a name no rule allows, is dropped at L7.
 allowed() {
-  if curl -sf -o /dev/null --connect-timeout 5 --max-time 15 \
-    --retry 10 --retry-all-errors --retry-delay 1 "$URL"; then
-    echo "✅ Rules-Allowed reached $HOST through its own rule"
-  else
+  local ip code
+  if ! ip=$(curl -sf -o /dev/null -w '%{remote_ip}' --connect-timeout 5 --max-time 15 \
+    --retry 10 --retry-all-errors --retry-delay 1 "$URL"); then
     echo "❌ Rules-Allowed could not reach $HOST, which its own rule allows"
     exit 1
   fi
+  echo "✅ Rules-Allowed reached $HOST at $ip through its own rule"
+  code=$(curl -s -k -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \
+    --resolve "$DENIED_SNI:443:$ip" "https://$DENIED_SNI/" || true)
+  if [ "$code" != "000" ]; then
+    echo "❌ SNI $DENIED_SNI reached $ip (HTTP $code): the step's allow is not name-scoped"
+    exit 1
+  fi
+  echo "✅ SNI $DENIED_SNI to $ip dropped: the step's allow is name-scoped"
 }
 
 blocked() {
@@ -126,6 +138,24 @@ verify() {
   fi
 
   local n
+  n=$(sudo jq -s --argjson o "${allowed_ord:-0}" '[.[] | select(.event_type == "l7_blocked"
+    and .step_ordinal == $o and .l7_name == "'"$DENIED_SNI"'")] | length' "$AUDIT_LOG")
+  if [ "$n" -ge 1 ]; then
+    echo "✅ the foreign SNI was dropped at L7 under Rules-Allowed's ordinal"
+  else
+    echo "❌ no l7_blocked event for $DENIED_SNI under Rules-Allowed (ordinal ${allowed_ord:-none})"
+    sudo jq -c 'select(.event_type | startswith("l7_"))' "$AUDIT_LOG" | head -5 || true
+    failed=true
+  fi
+
+  n=$(sudo grep -cE "Connection allowed .*dst=$HOST .*step_ordinal=${allowed_ord:-none}\b" "$LOG" || true)
+  if [ "$n" -ge 1 ]; then
+    echo "✅ Rules-Allowed's connection was allowed under its own ordinal"
+  else
+    echo "❌ no allowed connection to $HOST under Rules-Allowed's ordinal ${allowed_ord:-none}"
+    failed=true
+  fi
+
   n=$(sudo jq -s --argjson o "${blocked_ord:-0}" '[.[] | select(.event_type == "connection_blocked"
     and .step_ordinal == $o and .dst_port == 443)] | length' "$AUDIT_LOG")
   if [ "$n" -ge 1 ]; then

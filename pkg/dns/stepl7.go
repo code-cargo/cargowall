@@ -441,7 +441,8 @@ func (s *Server) stepAllowFor(policy uint32, name string) (stepAllow, bool) {
 // reconcileStepBlocks re-reports as late-allowed the recent blocks to ip
 // that a's install opened: on its ports less those a job CIDR deny holds
 // there, which the job decides first, and of the steps bound to its policy
-// alone, never another step's.
+// alone, never another step's, nor a container's
+// (events.RecentBlocks.TakeMatchingFor).
 func (s *Server) reconcileStepBlocks(a stepAllow, name string, ip net.IP) {
 	if s.recentBlocks == nil || s.auditLogger == nil || s.steps.l7 == nil {
 		return

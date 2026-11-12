@@ -20,6 +20,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
@@ -50,6 +51,9 @@ type stepBinder struct {
 	mu    sync.RWMutex
 	bound map[uint32]uint32 // step ordinal to policy
 	full  bool              // the map refused a binding for room, warned of once
+	// queueFull is whether a binding's re-report was dropped for a full
+	// queue, warned of once.
+	queueFull atomic.Bool
 
 	queue chan boundStep
 	stop  chan struct{}
@@ -69,7 +73,9 @@ type boundStep struct {
 
 // stepBindQueue bounds the bindings waiting for their re-report: a step
 // bound while it is full is bound all the same, and its blocks from before
-// stay as they were reported.
+// stay as they were reported, which is warned of once. Only a burst of
+// steps identified before the binder was armed, replayed at once, could
+// fill it.
 const stepBindQueue = 256
 
 // armStepBinder starts binding steps, once the policy's step rules have
@@ -152,7 +158,10 @@ func (b *stepBinder) identified(ordinal uint32, id steps.Identity) {
 	case b.queue <- boundStep{ordinal: ordinal, policy: policy, stepID: id.StepID}:
 	case <-b.stop:
 	default:
-		b.logger.Debug("Bound step's earlier blocks not re-reported: the queue is full", "step", id.StepID)
+		if !b.queueFull.Swap(true) {
+			b.logger.Warn("A bound step's blocks from before its binding are not re-reported as late-allowed: "+
+				"too many steps were bound at once; they stay reported as blocked", "step", id.StepID)
+		}
 	}
 }
 

@@ -51,9 +51,12 @@ func (s *Server) boundPolicy(ordinal uint32) (uint32, bool) {
 // ReconcileBoundStep re-reports as late-allowed the recent blocks of step
 // ordinal, just bound to policy, that the rule maps now let through for it
 // (firewall.Firewall.Allows): connections the step made before its binding
-// landed, judged as the job's then. Each is reported under the name its
-// address maps to, by the step's rule for that name, or by stepID where
-// its own rules allow the address but not by that name (a CIDR rule's).
+// landed, judged as the job's then. A container's blocks stay
+// (events.RecentBlocks.TakeStep). Each is reported under the name its
+// address maps to, by the step's rule for that name where the proxy itself
+// answered the name for the address, and otherwise by stepID: a name a
+// reverse lookup put to the address is whatever its owner says, and never
+// names the rule.
 func (s *Server) ReconcileBoundStep(ordinal, policy uint32, stepID string) {
 	if s.recentBlocks == nil || s.auditLogger == nil || s.firewall == nil {
 		return
@@ -66,7 +69,7 @@ func (s *Server) ReconcileBoundStep(ordinal, policy uint32, stepID string) {
 	for _, b := range blocks {
 		hostname := s.config.LookupHostnameByIP(b.DstIP)
 		rule := "step " + stepID
-		if hostname != "" {
+		if s.config.NameResolvedToIP(hostname, b.DstIP) {
 			if a, ok := s.stepAllowFor(policy, hostname); ok {
 				rule = a.rule
 			}

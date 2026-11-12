@@ -110,10 +110,10 @@ func isTCPOrUDP(proto uint8) bool {
 // allowed. Without it, a denial that policy would permit never self-heals —
 // which is why both hooks must run it, not just TC.
 //
-// A name the job's rules don't allow may still be one the own rules of the
-// step that made the connection allow: the step tier then opens it under
-// that step's policy alone, never the job's (StepLateAllower), for a step
-// bound to one (ordinal).
+// A name the job's rules don't allow, or allow on other ports alone, may
+// still be one the own rules of the step that made the connection allow:
+// the step tier then opens it under that step's policy alone, never the
+// job's (StepLateAllower), for a step bound to one (ordinal).
 //
 // Restricted to TCP/UDP — see isTCPOrUDP.
 func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegistrar,
@@ -124,12 +124,7 @@ func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegist
 	}
 	verdict := configMgr.MatchHostnameRule(hostname)
 	if !verdict.HasAllow() {
-		if steps, ok := l7.(StepLateAllower); ok && !verdict.HasDeny() {
-			if ip := net.ParseIP(dstIP); ip != nil {
-				return steps.LateAllowStep(ordinal, hostname, ip, dstPort, proto)
-			}
-		}
-		return false, ""
+		return stepLateAllow(l7, verdict, ordinal, hostname, dstIP, dstPort, proto)
 	}
 	matchedRule = verdict.AllowRule
 	ip := net.ParseIP(dstIP)
@@ -196,7 +191,26 @@ func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegist
 	allowMatches := config.DstPortAllowedByRule(dstPort, proto, verdict.AllowPorts)
 	denyMatches := verdict.HasDeny() &&
 		config.DstPortAllowedByRule(dstPort, proto, verdict.DenyPorts)
+	if !allowMatches {
+		if allowed, rule := stepLateAllow(l7, verdict, ordinal, hostname, dstIP, dstPort, proto); allowed {
+			return true, rule
+		}
+	}
 	return allowMatches && !denyMatches, matchedRule
+}
+
+// stepLateAllow is tryLateAllow's step tier (StepLateAllower), for a name
+// the job's rules don't deny: they decide first, and a name they deny on
+// any port is no step's.
+func stepLateAllow(l7 L7LateRegistrar, verdict config.HostnameVerdict, ordinal uint32,
+	hostname, dstIP string, dstPort uint16, proto uint8,
+) (bool, string) {
+	steps, ok := l7.(StepLateAllower)
+	ip := net.ParseIP(dstIP)
+	if !ok || verdict.HasDeny() || ip == nil {
+		return false, ""
+	}
+	return steps.LateAllowStep(ordinal, hostname, ip, dstPort, proto)
 }
 
 // OutcomeKind is the POLICY outcome: what the ruleset decided about a

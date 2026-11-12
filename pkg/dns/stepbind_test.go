@@ -76,9 +76,9 @@ func TestLateAllowStep(t *testing.T) {
 
 // A step's blocks from before its binding are re-reported as late-allowed
 // once it is bound, where its policy now lets them through: under the name
-// the address maps to, by the step's rule for it, or by the step where its
-// rules allow the address by no name. Its other blocks, and other steps',
-// stay.
+// the address maps to, by the step's rule for it where the proxy answered
+// the name for the address, and otherwise by the step, a reverse lookup's
+// name included. Its other blocks, its containers', and other steps', stay.
 func TestReconcileBoundStep(t *testing.T) {
 	cfg := config.NewConfigManager()
 	fw := newRecordingFirewall()
@@ -100,7 +100,9 @@ func TestReconcileBoundStep(t *testing.T) {
 		})
 	}
 	cfg.UpdateDNSMapping("step.example.com", "10.1.0.121")
-	for _, ip := range []string{"10.1.0.121", "10.1.0.122"} {
+	cfg.RecordForwardResolution("step.example.com", "10.1.0.121")
+	require.True(t, cfg.RecordReverseName("step.example.com", "10.1.0.123"), "a PTR claims the name")
+	for _, ip := range []string{"10.1.0.121", "10.1.0.122", "10.1.0.123", "10.1.0.124"} {
 		_, err := fw.AddPolicyIP(policyFetch, net.ParseIP(ip), tcp443, nil)
 		require.NoError(t, err)
 	}
@@ -108,6 +110,11 @@ func TestReconcileBoundStep(t *testing.T) {
 	block("10.1.0.122", 443, 7) // fetch's, at an address no name maps to
 	block("10.1.0.121", 80, 7)  // fetch's, on a port its rule doesn't name
 	block("10.1.0.121", 443, 8) // another step's
+	block("10.1.0.123", 443, 7) // fetch's, at an address only a PTR names
+	blocks.Consume(events.AuditEvent{
+		Timestamp: blockedAt, EventType: events.EventConnectionBlocked,
+		DstIP: "10.1.0.124", DstPort: 443, Protocol: "TCP", StepOrdinal: 7, ContainerID: "c0ffee",
+	})
 
 	// fetch's, expired
 	blocks.Consume(events.AuditEvent{
@@ -119,7 +126,7 @@ func TestReconcileBoundStep(t *testing.T) {
 
 	s.ReconcileBoundStep(7, policyFetch, "fetch")
 	audited := readAuditEvents(t, auditPath)
-	require.Len(t, audited, 2)
+	require.Len(t, audited, 3)
 	byIP := map[string]events.AuditEvent{}
 	for _, e := range audited {
 		assert.Equal(t, events.EventConnectionLateAllowed, e.EventType)
@@ -130,5 +137,8 @@ func TestReconcileBoundStep(t *testing.T) {
 	assert.Equal(t, "step.example.com", byIP["10.1.0.121"].DstHostname)
 	assert.Equal(t, "step.example.com", byIP["10.1.0.121"].MatchedRule)
 	assert.Equal(t, "step fetch", byIP["10.1.0.122"].MatchedRule)
+	assert.Equal(t, "step.example.com", byIP["10.1.0.123"].DstHostname, "the PTR's name, shown")
+	assert.Equal(t, "step fetch", byIP["10.1.0.123"].MatchedRule, "but never naming the rule")
 	assert.Len(t, blocks.TakeMatching("10.1.0.121", nil, nil, false), 2, "fetch's on 80 and the other step's stay")
+	assert.Len(t, blocks.TakeMatching("10.1.0.124", nil, nil, false), 1, "and the container's")
 }

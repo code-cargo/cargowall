@@ -17,6 +17,7 @@
 package firewall
 
 import (
+	"encoding/binary"
 	"net"
 	"testing"
 
@@ -28,12 +29,21 @@ import (
 	"github.com/code-cargo/cargowall/pkg/config"
 )
 
-// allowsCase is a packet Allows judges, and what it should say.
+// allowsCase is a packet Allows judges, and what it should say: TCP, or
+// UDP with udp set.
 type allowsCase struct {
 	policy uint32
 	dst    string
 	port   uint16
 	want   bool
+	udp    bool
+}
+
+func (c allowsCase) proto() uint8 {
+	if c.udp {
+		return unix.IPPROTO_UDP
+	}
+	return unix.IPPROTO_TCP
 }
 
 // allowsPolicy writes the policy the Allows tests judge by: the job's host
@@ -43,11 +53,16 @@ func allowsPolicy(t *testing.T, fw *FirewallImpl, defaultAction config.Action) {
 	t.Helper()
 	cm := config.NewConfigManager()
 	require.NoError(t, cm.LoadConfig(writeStepConfig(t,
-		[]config.Rule{{Type: config.RuleTypeCIDR, Value: "10.40.0.0/16", Ports: tcp443, Action: config.ActionAllow}},
+		[]config.Rule{
+			{Type: config.RuleTypeCIDR, Value: "10.40.0.0/16", Ports: tcp443, Action: config.ActionAllow},
+			{Type: config.RuleTypeCIDR, Value: "2001:db8:40::/48", Ports: tcp443, Action: config.ActionAllow},
+			{Type: config.RuleTypeCIDR, Value: "10.43.0.0/16", Ports: []config.Port{{Port: 5353, Protocol: config.ProtocolUDP}}, Action: config.ActionAllow},
+		},
 		[]config.StepConfig{
 			{ID: "a", Rules: []config.Rule{
 				{Type: config.RuleTypeCIDR, Value: "0.0.0.0/0", Ports: tcpPorts(9000)},
 				{Type: config.RuleTypeCIDR, Value: "10.41.0.0/16", Ports: tcpPorts(8443)},
+				{Type: config.RuleTypeCIDR, Value: "2001:db8:41::/48", Ports: tcpPorts(8443)},
 				{Type: config.RuleTypeHostname, Value: "a.example.com"},
 			}},
 			{ID: "b", Rules: []config.Rule{{Type: config.RuleTypeHostname, Value: "b.example.com"}}},
@@ -72,27 +87,27 @@ func allowsPolicy(t *testing.T, fw *FirewallImpl, defaultAction config.Action) {
 // the rest. Host routes and wildcard ports, which an exact lookup finds;
 // TestAllows_KernelParity takes the subnets, on the trie's own match.
 var allowsCases = []allowsCase{
-	{0, "10.1.0.1", 443, true},
-	{1, "10.1.0.1", 443, true},
-	{0, "10.1.0.1", 80, false},
-	{0, "10.1.0.2", 443, false},
-	{1, "10.1.0.2", 443, true},
-	{2, "10.1.0.2", 443, false},
-	{1, "10.1.0.2", 80, false},
-	{1, "10.1.0.3", 443, false}, // the job's deny decides
-	{1, "10.1.0.3", 80, true},   // the job's silence, the step's all ports
-	{1, "10.9.9.9", 9000, true}, // the step's wildcard port
-	{0, "10.9.9.9", 9000, false},
-	{2, "10.9.9.9", 9000, false},
-	{1, "2001:db8:1::2", 443, true},
-	{0, "2001:db8:1::2", 443, false},
+	{0, "10.1.0.1", 443, true, false},
+	{1, "10.1.0.1", 443, true, false},
+	{0, "10.1.0.1", 80, false, false},
+	{0, "10.1.0.2", 443, false, false},
+	{1, "10.1.0.2", 443, true, false},
+	{2, "10.1.0.2", 443, false, false},
+	{1, "10.1.0.2", 80, false, false},
+	{1, "10.1.0.3", 443, false, false}, // the job's deny decides
+	{1, "10.1.0.3", 80, true, false},   // the job's silence, the step's all ports
+	{1, "10.9.9.9", 9000, true, false}, // the step's wildcard port
+	{0, "10.9.9.9", 9000, false, false},
+	{2, "10.9.9.9", 9000, false, false},
+	{1, "2001:db8:1::2", 443, true, false},
+	{0, "2001:db8:1::2", 443, false, false},
 }
 
 func TestAllows_JobFirstThenTheStep(t *testing.T) {
 	fw, _ := newStepTestFirewall(ruleMapEntries, nil)
 	allowsPolicy(t, fw, config.ActionDeny)
 	for _, c := range allowsCases {
-		assert.Equal(t, c.want, fw.Allows(c.policy, net.ParseIP(c.dst), c.port, unix.IPPROTO_TCP),
+		assert.Equal(t, c.want, fw.Allows(c.policy, net.ParseIP(c.dst), c.port, c.proto()),
 			"policy %d to %s:%d", c.policy, c.dst, c.port)
 	}
 	assert.False(t, fw.Allows(1, net.ParseIP("10.1.0.2"), 443, unix.IPPROTO_UDP), "by protocol")
@@ -115,24 +130,58 @@ func TestAllows_KernelParity(t *testing.T) {
 	fw := f.(*FirewallImpl)
 	allowsPolicy(t, fw, config.ActionDeny)
 	cases := append(append([]allowsCase(nil), allowsCases...),
-		allowsCase{0, "10.40.7.7", 443, true},
-		allowsCase{0, "10.40.7.7", 80, false},
-		allowsCase{1, "10.40.7.7", 443, true},
-		allowsCase{1, "10.40.7.7", 8443, false},
-		allowsCase{1, "10.41.7.7", 8443, true},
-		allowsCase{0, "10.41.7.7", 8443, false},
-		allowsCase{2, "10.41.7.7", 8443, false},
-		allowsCase{1, "10.41.7.7", 9000, true}, // past the subnet's ports, to the wildcard
-		allowsCase{1, "10.41.7.7", 22, false},
+		allowsCase{0, "10.40.7.7", 443, true, false},
+		allowsCase{0, "10.40.7.7", 80, false, false},
+		allowsCase{1, "10.40.7.7", 443, true, false},
+		allowsCase{1, "10.40.7.7", 8443, false, false},
+		allowsCase{1, "10.41.7.7", 8443, true, false},
+		allowsCase{0, "10.41.7.7", 8443, false, false},
+		allowsCase{2, "10.41.7.7", 8443, false, false},
+		allowsCase{1, "10.41.7.7", 9000, true, false}, // past the subnet's ports, to the wildcard
+		allowsCase{1, "10.41.7.7", 22, false, false},
+		allowsCase{0, "2001:db8:40::7", 443, true, false},
+		allowsCase{0, "2001:db8:40::7", 80, false, false},
+		allowsCase{1, "2001:db8:41::9", 8443, true, false},
+		allowsCase{0, "2001:db8:41::9", 8443, false, false},
+		allowsCase{0, "10.43.1.1", 5353, true, true},
+		allowsCase{0, "10.43.1.1", 5353, false, false}, // TCP, where the rule names UDP
+		allowsCase{0, "10.40.7.7", 443, false, true},
 	)
 	for _, c := range cases {
-		assert.Equal(t, c.want, fw.Allows(c.policy, net.ParseIP(c.dst), c.port, unix.IPPROTO_TCP),
-			"Allows, policy %d to %s:%d", c.policy, c.dst, c.port)
+		assert.Equal(t, c.want, fw.Allows(c.policy, net.ParseIP(c.dst), c.port, c.proto()),
+			"Allows, policy %d to %s:%d udp=%v", c.policy, c.dst, c.port, c.udp)
 		if c.policy != bpf.PolicyJob {
 			continue
 		}
-		ret, _, err := objs.CwTcEgress.Test(tcpSYN(t, c.dst, c.port))
+		pkt := tcpSYN(t, c.dst, c.port)
+		if c.udp {
+			pkt = udpPacket(t, c.dst, c.port)
+		}
+		ret, _, err := objs.CwTcEgress.Test(pkt)
 		require.NoError(t, err)
-		assert.Equal(t, c.want, ret == verdictPass, "the kernel, to %s:%d", c.dst, c.port)
+		assert.Equal(t, c.want, ret == verdictPass, "the kernel, to %s:%d udp=%v", c.dst, c.port, c.udp)
 	}
+}
+
+// udpPacket builds an Ethernet frame carrying a UDP datagram to dst:port.
+func udpPacket(t *testing.T, dst string, port uint16) []byte {
+	t.Helper()
+	pkt := tcpSYN(t, dst, port)
+	ip4 := net.ParseIP(dst).To4() != nil
+	l3, protoAt := 14+20, 14+9
+	if !ip4 {
+		l3, protoAt = 14+40, 14+6
+	}
+	pkt[protoAt] = unix.IPPROTO_UDP
+	udp := make([]byte, 8)
+	binary.BigEndian.PutUint16(udp[0:], 40000)
+	binary.BigEndian.PutUint16(udp[2:], port)
+	binary.BigEndian.PutUint16(udp[4:], 8)
+	pkt = append(pkt[:l3], udp...)
+	if ip4 {
+		binary.BigEndian.PutUint16(pkt[14+2:], uint16(20+len(udp)))
+	} else {
+		binary.BigEndian.PutUint16(pkt[14+4:], uint16(len(udp)))
+	}
+	return pkt
 }

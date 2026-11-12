@@ -212,3 +212,19 @@ func TestArmStepBinder_HandsTheProxyItsLookup(t *testing.T) {
 	ok, _ = srv.LateAllowStep(7, "step.example.com", ip, 443, unix.IPPROTO_TCP)
 	assert.True(t, ok, "bound, by the binder's lookup")
 }
+
+// Re-reports past the queue's room are dropped, warned of once, and the
+// steps are bound all the same.
+func TestStepBinder_FullQueueWarnsOnce(t *testing.T) {
+	cm := config.NewConfigManager()
+	loadPolicyFile(t, cm, stepsPolicy)
+	var logs bytes.Buffer
+	b := newStepBinder(cm, &policyMap{}, slog.New(slog.NewTextHandler(&logs, nil)))
+	b.reconcile = func(uint32, uint32, string) {}
+	for o := range uint32(stepBindQueue + 5) {
+		b.identified(100+o, step("fetch"))
+	}
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("are not re-reported as late-allowed")))
+	_, ok := b.policyOf(100 + stepBindQueue + 4)
+	assert.True(t, ok, "bound all the same")
+}

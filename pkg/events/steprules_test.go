@@ -90,9 +90,13 @@ func TestTryLateAllow_StepTier(t *testing.T) {
 		"defaultAction": "deny",
 		"rules": [
 			{"type": "hostname", "value": "job.example.com", "action": "allow"},
-			{"type": "hostname", "value": "denied.example.com", "action": "deny"}
+			{"type": "hostname", "value": "denied.example.com", "action": "deny"},
+			{"type": "hostname", "value": "shared.example.com", "ports": [{"port": 80, "protocol": "tcp"}], "action": "allow"}
 		],
-		"steps": [{"id": "fetch", "rules": [{"type": "hostname", "value": "step.example.com"}]}]
+		"steps": [{"id": "fetch", "rules": [
+			{"type": "hostname", "value": "step.example.com"},
+			{"type": "hostname", "value": "shared.example.com", "ports": [{"port": 443, "protocol": "tcp"}]}
+		]}]
 	}`), 0o600))
 	require.NoError(t, cm.LoadConfig(path))
 	fw := &mockFirewallUpdater{}
@@ -117,6 +121,16 @@ func TestTryLateAllow_StepTier(t *testing.T) {
 	reg.asked = nil
 	tryLateAllow(cm, fw, reg, "step.example.com", ip, 443, unix.IPPROTO_ICMP, 7, newTestLogger())
 	assert.Empty(t, reg.asked, "TCP and UDP alone")
+
+	// A name the job allows on other ports than the blocked one is the
+	// step tier's on that one.
+	reg.allow, reg.asked = true, nil
+	allowed, _ = tryLateAllow(cm, fw, reg, "shared.example.com", ip, 80, unix.IPPROTO_TCP, 7, newTestLogger())
+	assert.True(t, allowed, "the job's own port")
+	assert.Empty(t, reg.asked)
+	allowed, _ = tryLateAllow(cm, fw, reg, "shared.example.com", ip, 443, unix.IPPROTO_TCP, 7, newTestLogger())
+	assert.True(t, allowed, "the step's port")
+	assert.Equal(t, []uint32{7}, reg.asked)
 
 	// A hook's denial asks it for the step that made the connection, and
 	// reports the late-allow the step tier gives.

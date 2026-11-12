@@ -45,7 +45,7 @@ jobs:
 
       # Audit mode: this probes shared infrastructure, so it blocks nothing.
       - name: Start CargoWall (audit)
-        uses: code-cargo/cargowall-action@54543fe6625329de4260870e78b5202ab0ee1e6e # main, v2.0.0-rc.14
+        uses: code-cargo/cargowall-action@872edd556d53b64821765543552b50d8cf5471f4 # main, v2.0.0-rc.15
         with:
           mode: audit
           offline: 'true'

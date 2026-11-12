@@ -21,17 +21,21 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/dns"
 	"github.com/code-cargo/cargowall/pkg/events"
+	"github.com/code-cargo/cargowall/pkg/firewall"
 	"github.com/code-cargo/cargowall/pkg/steps"
 )
 
@@ -183,4 +187,28 @@ func TestArmStepBinder_OnlyWithStepRules(t *testing.T) {
 	b := armStepBinder(cm, &steps.Tracker{}, &policyMap{}, nil, logger)
 	require.NotNil(t, b)
 	b.Close()
+}
+
+// The binder hands the DNS proxy its lookup: a step it binds is one the
+// event pipeline's step tier opens an address for.
+func TestArmStepBinder_HandsTheProxyItsLookup(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cm := config.NewConfigManager()
+	loadPolicyFile(t, cm, stepsPolicy)
+	srv := dns.NewServer(cm, nil, "192.0.2.1:53", "127.0.0.1:0", logger)
+	fw := firewall.NewMockFirewall(t)
+	fw.EXPECT().AddPolicyIP(uint32(1), mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+	fw.EXPECT().Allows(uint32(1), mock.Anything, uint16(443), uint8(unix.IPPROTO_TCP)).Return(true)
+	srv.SetFirewall(fw)
+	ip := net.ParseIP("10.1.0.130")
+	cm.RecordForwardResolution("step.example.com", ip.String())
+
+	b := armStepBinder(cm, &steps.Tracker{}, &policyMap{}, srv, logger)
+	require.NotNil(t, b)
+	defer b.Close()
+	ok, _ := srv.LateAllowStep(7, "step.example.com", ip, 443, unix.IPPROTO_TCP)
+	assert.False(t, ok, "not bound yet")
+	b.identified(7, step("fetch"))
+	ok, _ = srv.LateAllowStep(7, "step.example.com", ip, 443, unix.IPPROTO_TCP)
+	assert.True(t, ok, "bound, by the binder's lookup")
 }

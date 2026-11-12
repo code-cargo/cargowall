@@ -108,7 +108,9 @@ func TestReconcileBoundStep(t *testing.T) {
 	block("10.1.0.122", 443, 7) // fetch's, at an address no name maps to
 	block("10.1.0.121", 80, 7)  // fetch's, on a port its rule doesn't name
 	block("10.1.0.121", 443, 8) // another step's
-	blocks.Consume(events.AuditEvent{ // fetch's, expired
+
+	// fetch's, expired
+	blocks.Consume(events.AuditEvent{
 		Timestamp: time.Now().Add(-time.Hour), EventType: events.EventConnectionBlocked,
 		DstIP: "10.1.0.122", DstPort: 8443, Protocol: "TCP", StepOrdinal: 7,
 	})

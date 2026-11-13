@@ -883,11 +883,18 @@ to select policy with.
   nothing installs or scopes for one, which would only narrow the job's
   flows, and no query passes the filter on a step's rules alone. A drop
   after the load leaves the hooks' step lookups in, finding no binding,
-  and the bridge stamp off. The data plane and the policy's `steps` fill
-  it (below); nothing binds a step yet. Requirement: whatever binds steps
-  keys off the config manager (`HasStepRules`, `StepRulesLost`), never a
-  collection's gate (`StepRules()` on the objects), which such a drop
-  leaves on.
+  and the bridge stamp off. Step rules take effect only while L7 runs
+  (`--tls-sni` observe or enforce), since no step may be bound while its
+  DNS installs can't be name-scoped (below): with `--tls-sni` off they are
+  dropped before the tcbpf load, and where L7 doesn't start (no cgroup
+  hook, or the oracle fails) after it. Every drop is the `step-rules`
+  posture's loss: the summary's postures table names why, and the postures
+  record carries it to the action. It is never fatal, the steps getting
+  the job's rules. The data plane and the policy's `steps` fill the tier
+  (below), and the step binder binds each step to its policy (*Binding*,
+  below). It keys off the config manager (`HasStepRules`,
+  `StepRulesLost`), never a collection's gate (`StepRules()` on the
+  objects), which such a drop leaves on.
   - *Where a step's rules come from.* The policy's `steps`, one
     `{id, rules}` per step, in the local `--config` (env-var config carries
     none, and a load replaces them wholesale, as it does the rules). The id
@@ -911,44 +918,47 @@ to select policy with.
     name it denies, it only withholds the allow, and a step entry would
     fill that silence (above). Requirement: no step may be bound to its
     policy unless its installs are L7-scoped, or a step's own entries
-    would open a shared edge IP to it on any SNI. They are: a step's DNS
-    install scopes its address for the name once the firewall admits the
-    install and before any of it is written, as the job's does; an install
-    whose scope can't be written (the scope map full, say) is withheld,
-    never open unscoped, and one the budget refuses scopes nothing. Step
-    scopes take room only in the steps' share of each scope map, its size
-    less the job's 4096, so the job's scopes have room for at least 4096
-    addresses however many step installs there are, and a scope written
-    for an install the rule maps then refuse is taken back, unless another
-    install holds the address's scope. The tracked-hostname replay scopes
-    the step installs again, first, after its scope flush, and under one
-    hold of step installs with the flush, which each install also takes
-    from its scope to its record, so none is scoped before the flush and
-    recorded after it. Each address's record keeps, for each policy that
-    holds it, the latest few names its installs there were for and their
-    ports. A policy stays while it allows any of its own names; one that
-    allows none any more (the chain to it expired, say) is withdrawn, and
-    its names and ports leave the record and the scope. The address is
-    scoped again on the kept holders' ports, by the first of their names
-    that still has forward-resolution evidence; with none, every install
-    there is withdrawn. The lost holders are withdrawn first, and one
-    whose withdrawal fails stays open there, so its ports stay in the
-    scope and it stays in the record for a later replay to withdraw. No
-    replay runs after startup today, so one stuck at the last stays open,
-    under the scope or, when the address can't be scoped again, without
-    name enforcement, for the rest of the run. Past a holder's few names
-    its oldest chain name goes first and a rule's name last, since a
-    rule's never expires. A withdrawal takes out everything the policy's
-    DNS installs added at the address, whichever name they were for, and
-    keeps what the sync wrote there for it, its own `/32` or `/128` CIDR
-    rule or a carve. One exception is the job's own (SCOPE IFF BOUND): an
-    address no forward resolution bound to its name, a local alias's or
-    one whose evidence the binding store evicted, is installed unscoped
-    and stays L4-governed. A step install's scope holds for every flow to
-    the address, not the step's alone: a job flow there, through a job
-    CIDR allow say, must present a name the job's tiers allow, as at an
-    address a job hostname resolves to, and until steps are bound that
-    narrowing is all a step's rules do at L7. The kernel stamps each punt
+    would open a shared edge IP to it on any SNI; so steps are bound only
+    while L7 runs (above). Under `--tls-sni=observe` L7 drops nothing, so
+    there a bound step reaches a shared edge address its installs opened
+    on any name, as the job does one its own installs opened: its exposure
+    there is the job's own, no more. Step installs are scoped: a step's
+    DNS install scopes its address for the name once the firewall admits
+    the install and before any of it is written, as the job's does; an
+    install whose scope can't be written (the scope map full, say) is
+    withheld, never open unscoped, and one the budget refuses scopes
+    nothing. Step scopes take room only in the steps' share of each scope
+    map, its size less the job's 4096, so the job's scopes have room for
+    at least 4096 addresses however many step installs there are, and a
+    scope written for an install the rule maps then refuse is taken back,
+    unless another install holds the address's scope. The tracked-hostname
+    replay scopes the step installs again, first, after its scope flush,
+    and under one hold of step installs with the flush, which each install
+    also takes from its scope to its record, so none is scoped before the
+    flush and recorded after it. Each address's record keeps, for each
+    policy that holds it, the latest few names its installs there were for
+    and their ports. A policy stays while it allows any of its own names;
+    one that allows none any more (the chain to it expired, say) is
+    withdrawn, and its names and ports leave the record and the scope. The
+    address is scoped again on the kept holders' ports, by the first of
+    their names that still has forward-resolution evidence; with none,
+    every install there is withdrawn. The lost holders are withdrawn
+    first, and one whose withdrawal fails stays open there, so its ports
+    stay in the scope and it stays in the record for a later replay to
+    withdraw. No replay runs after startup today, so one stuck at the last
+    stays open, under the scope or, when the address can't be scoped
+    again, without name enforcement, for the rest of the run. Past a
+    holder's few names its oldest chain name goes first and a rule's name
+    last, since a rule's never expires. A withdrawal takes out everything
+    the policy's DNS installs added at the address, whichever name they
+    were for, and keeps what the sync wrote there for it, its own `/32` or
+    `/128` CIDR rule or a carve. One exception is the job's own (SCOPE IFF
+    BOUND): an address no forward resolution bound to its name, a local
+    alias's or one whose evidence the binding store evicted, is installed
+    unscoped and stays L4-governed. A step install's scope holds for every
+    flow to the address, not the step's alone: a job flow there, through a
+    job CIDR allow say, must present a name the job's tiers allow, as at
+    an address a job hostname resolves to. The kernel stamps each punt
     with the step policy its socket is judged by (`l7_event.step_policy`),
     read with the punt, so a binding that lands after it can't change the
     judgement; the oracle admits the name by the job's tiers first and
@@ -962,11 +972,26 @@ to select policy with.
     step; a job install re-reports everyone's. Requirement: the
     ordinal-to-policy lookup a step's late-allow reconciles by runs under
     the recent-blocks buffer's lock, so it must not take a lock held while
-    blocks are consumed. The late-allow from the event pipeline still
-    judges by the job's rules alone. And anything that reloads step rules
-    at runtime must clear the step policies' entries, the DNS path's
-    included, before installing: policies are numbered per load, so a kept
-    entry would be another step's. It must clear the step tier's scope
+    blocks are consumed. The late-allow from the event pipeline asks the
+    step tier too, for a block by a bound step whose name the job's rules
+    don't allow (`dns.Server.LateAllowStep`): it opens the address under
+    that step's policy alone, by a name the proxy itself answered the
+    address for, never one a reverse lookup put to it, whatever the
+    address's owner says. Only a verdict from a socket of cargowall's own
+    network namespace asks it, its source being one of the namespace's
+    addresses (listed at most every 5 s; on an ARC pod the pod's, which
+    dind's dockerd shares, while its containers send from their own), and
+    never one the tracker classifies as a container's: a container's, a
+    nested namespace's or another runtime's packets aren't stamped there,
+    so TC judges the retry as the job's, and the step's rules opening the
+    address need not let it through. Such a drop is marked so for the
+    re-reports too (`AuditEvent.jobJudged`, as a TC event with no socket
+    is): neither a step's install nor its binding re-reports its block,
+    which stays reported until the job's rules open the address. And
+    anything that reloads step rules at runtime must clear the step
+    policies' entries, the DNS path's included, before installing:
+    policies are numbered per load, so a kept entry would be another
+    step's. It must clear the step tier's scope
     record with them, for the same reason: the installs it records are
     gone, under the old load's policies. The sync does the first (above);
     today it runs once, at startup, over an empty step tier. A runtime
@@ -1037,6 +1062,34 @@ to select policy with.
     no-step root forked in that window starts gets that step's rules,
     wider than the job's but no wider than the step that last ran. The
     kernel counts each lost end, and the tracker warns, naming the step.
+  - *Binding.* The step binder (`cmd/step_binding.go`) writes
+    `map_step_policy` once a step, when the tracker identifies it at its
+    root's first exec: the policy of the step's id, if its rules have one.
+    Ids compare without case, as GitHub compares them and as the load does
+    in refusing two that differ only in case, so at most one policy
+    matches; the runner hands a step its id as written, and the CI e2e
+    names the step in another case. A composite action's steps carry the
+    outer step's id (the CI step-identity check), so they are bound as the
+    outer step. A step never identified (its exec event lost) or not yet,
+    one whose id has no rules, and one the map has no room for (4096
+    bindings, warned of once) get the job's rules, which fails closed. The
+    binder is armed only once the step rules have settled with some left
+    (above), and the tracker keeps the steps it identifies before then for
+    it (`steps.Tracker.SetOnIdentified`), so none is missed. A step is
+    identified after its program starts, so its first connections can be
+    judged as the job's: once it is bound, its recent blocks its policy
+    now lets through, by the verdict over the maps
+    (`firewall.Firewall.Allows`), are re-reported as late-allowed, under
+    its own ordinal (`dns.Server.ReconcileBoundStep`), never a
+    container's, nor one TC saw with no socket whatever enrichment
+    attributed it to, nor a hook drop the step tier may not answer for
+    (above), whose packets TC may still judge as the job's, and
+    by a name rule only where the proxy answered the name for the address.
+    That verdict is L4's: at an L7-scoped address, a retry the step
+    reaches by a CIDR rule must still present a name allowed there, so a
+    re-report can claim a retry L7 then drops, as the job tier's can. The
+    binder's lookup is the one the DNS path's per-step late-allows
+    reconcile by (`dns.Server.SetStepBindings`).
   - *What per-step rules do not separate.* They bound what each step's own
     processes reach. Steps of one job share a uid, the workspace and
     dockerd, so a step can shape what a later one runs, or share a socket

@@ -184,7 +184,7 @@ func TestRefusalExit(t *testing.T) {
 // cargowall-action), so a posture named outside it would fail open there.
 func TestPostureNames_MatchTheActionsPattern(t *testing.T) {
 	pattern := regexp.MustCompile(`^[a-z][a-z-]{0,63}$`)
-	for _, name := range []string{postureContainerEgress, postureTLSSNI, postureDNSRedirect} {
+	for _, name := range []string{postureContainerEgress, postureTLSSNI, postureDNSRedirect, postureSudoLockdown, postureStepRules} {
 		assert.Regexp(t, pattern, name)
 	}
 }
@@ -517,4 +517,31 @@ func TestSummary_Run_LostPostureRenderedAboveLink(t *testing.T) {
 	require.GreaterOrEqual(t, link, 0, rendered)
 	assert.Less(t, block, link, "postures must render above the link")
 	assert.Contains(t, rendered, "1,000,001 insns")
+}
+
+// The step-rules posture is the policy's: requested when the policy had
+// steps with rules, applied off with why when they were dropped, never
+// fatal and logged by the drop alone. A policy without steps records none,
+// and the posture settles once.
+func TestPostures_StepRules(t *testing.T) {
+	var buf bytes.Buffer
+	p := newPostures(&StartCmd{}, "6.6.141", true, slog.New(slog.NewTextHandler(&buf, nil)))
+	p.settleStepRules(false, "")
+	assert.Empty(t, p.lines(), "no steps, nothing requested")
+
+	p.settleStepRules(true, "")
+	assert.Equal(t, []postureLine{{Posture: postureStepRules, Requested: stepRulesOn, Applied: stepRulesOn}}, p.lines())
+
+	p = newPostures(&StartCmd{}, "6.6.141", true, slog.New(slog.NewTextHandler(&buf, nil)))
+	p.settleStepRules(true, "--tls-sni is off, so a step's DNS installs can't be name-scoped")
+	p.settleStepRules(true, "a second settle")
+	assert.Equal(t, []postureLine{{
+		Posture: postureStepRules, Requested: stepRulesOn, Applied: stepRulesOff,
+		Reason: "--tls-sni is off, so a step's DNS installs can't be name-scoped",
+	}}, p.lines())
+	assert.Empty(t, buf.String(), "the drop logs, not the ledger")
+
+	var out bytes.Buffer
+	renderPostures(&out, p.lines())
+	assert.Contains(t, out.String(), "| `step-rules` | on | **off** | --tls-sni is off")
 }

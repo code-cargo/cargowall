@@ -34,11 +34,11 @@ func TestTryLateAllow_UnspecifiedOpensNothing(t *testing.T) {
 	}, config.ActionDeny))
 	fw := &mockFirewallUpdater{}
 	for _, addr := range []string{"0.0.0.0", "::", "::ffff:0.0.0.0"} {
-		allowed, _ := tryLateAllow(cm, fw, nil, "zero.example.com", addr, 443, unix.IPPROTO_TCP, newTestLogger())
+		allowed, _ := tryLateAllow(cm, fw, nil, "zero.example.com", addr, 443, unix.IPPROTO_TCP, 0, newTestLogger())
 		assert.False(t, allowed, addr)
 	}
 	assert.Empty(t, fw.addedIPs)
 
-	allowed, _ := tryLateAllow(cm, fw, nil, "zero.example.com", "93.184.216.34", 443, unix.IPPROTO_TCP, newTestLogger())
+	allowed, _ := tryLateAllow(cm, fw, nil, "zero.example.com", "93.184.216.34", 443, unix.IPPROTO_TCP, 0, newTestLogger())
 	assert.True(t, allowed)
 }

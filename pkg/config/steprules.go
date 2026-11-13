@@ -352,13 +352,14 @@ func (cm *Manager) StepRulesLost() string {
 }
 
 // StepPolicy returns the policy the loaded steps give step id, if a step
-// with that id has rules.
+// with that id has rules. Ids compare without case, as GitHub compares them:
+// the load refuses two that differ only in case, so at most one matches.
 func (cm *Manager) StepPolicy(id string) (uint32, bool) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
 	for i := range cm.steps {
-		if cm.steps[i].id == id {
+		if strings.EqualFold(cm.steps[i].id, id) {
 			return cm.steps[i].policy, true
 		}
 	}

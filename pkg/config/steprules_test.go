@@ -69,8 +69,9 @@ func TestLoadConfig_Steps(t *testing.T) {
 	assert.Equal(t, uint32(2), p)
 	_, ok = cm.StepPolicy("lint")
 	assert.False(t, ok, "a step without rules has no policy")
-	_, ok = cm.StepPolicy("Build")
-	assert.False(t, ok, "policy lookups take the id as written")
+	p, ok = cm.StepPolicy("Deploy_2")
+	assert.True(t, ok, "ids compare without case, as GitHub's do")
+	assert.Equal(t, uint32(2), p)
 }
 
 // Every malformed step fails the load and leaves the loaded policy in place.

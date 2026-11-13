@@ -110,16 +110,21 @@ func isTCPOrUDP(proto uint8) bool {
 // allowed. Without it, a denial that policy would permit never self-heals —
 // which is why both hooks must run it, not just TC.
 //
+// A name the job's rules don't allow, or allow on other ports alone, may
+// still be one the own rules of the step that made the connection allow:
+// the step tier then opens it under that step's policy alone, never the
+// job's (StepLateAllower), for a step bound to one (ordinal).
+//
 // Restricted to TCP/UDP — see isTCPOrUDP.
 func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegistrar,
-	hostname, dstIP string, dstPort uint16, proto uint8, logger *slog.Logger,
+	hostname, dstIP string, dstPort uint16, proto uint8, ordinal uint32, logger *slog.Logger,
 ) (lateAllowed bool, matchedRule string) {
 	if hostname == "" || fw == nil || !isTCPOrUDP(proto) {
 		return false, ""
 	}
 	verdict := configMgr.MatchHostnameRule(hostname)
 	if !verdict.HasAllow() {
-		return false, ""
+		return stepLateAllow(l7, verdict, ordinal, hostname, dstIP, dstPort, proto)
 	}
 	matchedRule = verdict.AllowRule
 	ip := net.ParseIP(dstIP)
@@ -188,7 +193,26 @@ func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegist
 	allowMatches := config.DstPortAllowedByRule(dstPort, proto, verdict.AllowPorts)
 	denyMatches := verdict.HasDeny() &&
 		config.DstPortAllowedByRule(dstPort, proto, verdict.DenyPorts)
+	if !allowMatches {
+		if allowed, rule := stepLateAllow(l7, verdict, ordinal, hostname, dstIP, dstPort, proto); allowed {
+			return true, rule
+		}
+	}
 	return allowMatches && !denyMatches, matchedRule
+}
+
+// stepLateAllow is tryLateAllow's step tier (StepLateAllower), for a name
+// the job's rules don't deny: they decide first, and a name they deny on
+// any port is no step's.
+func stepLateAllow(l7 L7LateRegistrar, verdict config.HostnameVerdict, ordinal uint32,
+	hostname, dstIP string, dstPort uint16, proto uint8,
+) (bool, string) {
+	steps, ok := l7.(StepLateAllower)
+	ip := net.ParseIP(dstIP)
+	if !ok || verdict.HasDeny() || ip == nil {
+		return false, ""
+	}
+	return steps.LateAllowStep(ordinal, hostname, ip, dstPort, proto)
 }
 
 // OutcomeKind is the POLICY outcome: what the ruleset decided about a
@@ -426,7 +450,7 @@ func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegi
 		hostname, cnameChain = resolveDestination(configMgr, dstIP, denial, logger)
 		if denial {
 			lateAllowed, matchedRule = tryLateAllow(configMgr, fw, l7, hostname, dstIP,
-				dstPort, proto, logger)
+				dstPort, proto, ordinal, logger)
 		}
 	}
 
@@ -454,6 +478,28 @@ func prepareOutcome(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegi
 	}
 	return out, lateAllowed, matchedRule
 }
+
+// fromContainer reports whether rec's socket is a container's, by the
+// identity its decoration attaches.
+func fromContainer(rec VerdictRecord) bool {
+	if rec.Decorate == nil {
+		return false
+	}
+	var probe AuditEvent
+	rec.Decorate(&probe)
+	return probe.ContainerID != "" || probe.ContainerOrigin
+}
+
+// withoutStepTier is an L7 registrar with its step tier hidden, for a
+// verdict not from a socket of cargowall's own namespace (its source isn't
+// one of hostAddrs), or from a container the tracker classifies: the hook
+// judges such a socket by its step's policy, but where its packets aren't
+// stamped (an unattached bridge port, before the attach, a daemon's bridges
+// in another namespace, a nested namespace, a runtime nothing watches) TC
+// judges them as the job's, so the step's rules opening the address need
+// not let its retry through. Its block stays reported as one, which is the
+// safe way round.
+type withoutStepTier struct{ L7LateRegistrar }
 
 // VerdictRecord is one policy outcome reported by a hook that adjudicates in
 // socket context rather than from a packet at TC — today, the root-cgroup
@@ -513,6 +559,18 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 	// pipeline with the slow work flagged off (see prepareOutcome) rather
 	// than a parallel construction that could drift from it.
 	denial := rec.Dropped
+	// A drop the step tier may not answer for, now or in a later re-report:
+	// not from a socket of cargowall's own namespace (its source isn't one
+	// of hostAddrs), or from a container the tracker classifies (see
+	// withoutStepTier). The late-allow here doesn't ask it, and the mark
+	// keeps its block out of a step tier's takes (RecentBlocks). A degraded
+	// record is marked too, the snapshot being local and bounded, but skips
+	// the decoration probe, as it skips the late-allow: the decoration
+	// below marks a container's block all the same.
+	jobJudged := denial && (!hostAddrs.has(rec.SrcIP) || (!rec.Degraded && fromContainer(rec)))
+	if l7 != nil && jobJudged {
+		l7 = withoutStepTier{l7}
+	}
 	out, lateAllowed, matchedRule := prepareOutcome(configMgr, fw, l7, logger,
 		denial, rec.Degraded, rec.SrcIP, rec.DstIP, rec.SrcPort, rec.DstPort, rec.Proto,
 		rec.PID, rec.StepOrdinal)
@@ -520,6 +578,7 @@ func ReportVerdict(rec VerdictRecord, configMgr *config.Manager, notificationTra
 	if rec.Decorate != nil {
 		rec.Decorate(&out.Audit)
 	}
+	out.Audit.jobJudged = jobJudged
 
 	if rec.Degraded {
 		// The notification client reaches the SaaS backend — unbounded

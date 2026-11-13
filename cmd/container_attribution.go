@@ -240,13 +240,16 @@ func (a *containerAttribution) stepRulesHook() stepRulesHook {
 	return a.observer
 }
 
-// settleSteps settles the policy's step rules once the hooks are loaded
-// (settleStepTier), and keeps the bridge stamp off once they are dropped:
-// tcbpf's gate stays on over a dropped step tier, but nothing binds a step
-// then, so there is nothing to stamp. Without attribution the steps are
-// settled all the same.
-func (a *containerAttribution) settleSteps(configMgr *config.Manager, stepTracker *steps.Tracker, stepErr error, logger *slog.Logger) {
-	settleStepTier(configMgr, stepTracker, stepErr, a.stepRulesHook(), logger)
+// settleSteps settles the policy's step rules once the hooks and L7 are up
+// (settleStepTier) and records the outcome in the step-rules posture, and
+// keeps the bridge stamp off once they are dropped: tcbpf's gate stays on
+// over a dropped step tier, but nothing binds a step then, so there is
+// nothing to stamp. Without attribution the steps are settled all the same.
+func (a *containerAttribution) settleSteps(configMgr *config.Manager, stepTracker *steps.Tracker, stepErr error,
+	l7 bool, p *postureLedger, logger *slog.Logger,
+) {
+	settleStepTier(configMgr, stepTracker, stepErr, a.stepRulesHook(), l7, logger)
+	p.settleStepRules(configMgr.HasStepRules() || configMgr.StepRulesLost() != "", configMgr.StepRulesLost())
 	if a != nil && !configMgr.HasStepRules() {
 		a.stamp = nil
 	}

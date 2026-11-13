@@ -75,6 +75,14 @@ type Firewall interface {
 	// leaving them all, when the LPM entry can't be deleted.
 	RemovePolicyIP(policy uint32, ip net.IP) error
 
+	// Allows reports what the rule maps decide for a packet to ip on port
+	// and proto from a socket judged by step policy, as the hooks' verdict
+	// does: the job's rules first; where they decide nothing, policy's own
+	// may allow it, never deny it; the job's default action decides the
+	// rest. Policy 0 is the job's rules alone. It reads what the maps hold
+	// now, for reporting: the hooks' verdict is the enforcement.
+	Allows(policy uint32, ip net.IP, port uint16, proto uint8) bool
+
 	// RemoveIP removes a single IP from the BPF maps
 	RemoveIP(ip net.IP) error
 }

@@ -31,6 +31,17 @@ type L7LateRegistrar interface {
 	RegisterLateAllow(hostname string, ip net.IP, allowPorts []config.Port)
 }
 
+// StepLateAllower is tryLateAllow's step tier, the L7 registrar's while step
+// rules are on: a step is bound to its policy only while L7 runs, so a
+// registrar without it has no step to open anything for. For a block by
+// step ordinal that the job's rules don't open, it opens ip under the
+// policy ordinal is bound to, where that step's own rules allow hostname
+// there, and reports whether the step's retry on port passes now, and by
+// what rule. A container's verdict never asks it (withoutStepTier).
+type StepLateAllower interface {
+	LateAllowStep(ordinal uint32, hostname string, ip net.IP, port uint16, proto uint8) (allowed bool, matchedRule string)
+}
+
 // ScopeAllowedIP is THE "L4 just opened this hostname's IP, so L7 must govern
 // it too" step, called by every path that opens a /32 for a named host. Map
 // writes are idempotent, so repeat calls are free.

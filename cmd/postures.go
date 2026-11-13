@@ -53,6 +53,18 @@ const (
 	postureTLSSNI          = "tls-sni"
 	postureDNSRedirect     = "dns-redirect"
 	postureSudoLockdown    = "sudo-lockdown"
+	// postureStepRules is the policy's step rules rather than a flag's:
+	// requested when the loaded policy has steps with rules, lost when they
+	// are dropped (config.Manager.StepRulesLost). The steps then get the
+	// job's rules, which fails closed, so the loss is never fatal: the
+	// summary says why.
+	postureStepRules = "step-rules"
+)
+
+// The step-rules posture's values.
+const (
+	stepRulesOn  = "on"
+	stepRulesOff = "off"
 )
 
 // The redirect's flag is a bool; these are its values in the record,
@@ -154,6 +166,22 @@ func newPostures(cmd *StartCmd, kernel string, enforcing bool, logger *slog.Logg
 	}
 	p.register(postureSudoLockdown, sudo, sudoLockdownOff, enforcing)
 	return p
+}
+
+// settleStepRules records the step-rules posture once the policy's step
+// rules have settled: requested when the policy had steps with rules, and
+// lost, with why, when they were dropped. The drop has logged already.
+func (p *postureLedger) settleStepRules(had bool, lost string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !had || p.find(postureStepRules) != nil {
+		return
+	}
+	p.register(postureStepRules, stepRulesOn, stepRulesOff, false)
+	if lost != "" {
+		r := p.find(postureStepRules)
+		r.Applied, r.Reason = stepRulesOff, truncateReason(lost)
+	}
 }
 
 func (p *postureLedger) register(posture, requested, off string, failClosed bool) {

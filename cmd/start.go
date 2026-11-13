@@ -435,7 +435,6 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		recentBlocks := events.NewRecentBlocks(0)
 		auditLogger.AddSink(recentBlocks)
 		dnsServer.SetRecentBlocks(recentBlocks)
-
 	}
 
 	// Log the effective posture now that config load has settled it on the
@@ -557,7 +556,6 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		return err
 	}
 	defer attribution.Close()
-	attribution.settleSteps(configMgr, stepTracker, stepErr, logger)
 
 	// Userspace half of the loopback carve-out pair — must run before
 	// UpdateAllowlistTC programs the maps below. (Placement relative to the
@@ -574,6 +572,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	if err != nil {
 		return err
 	}
+	attribution.settleSteps(configMgr, stepTracker, stepErr, l7f != nil, postures, logger)
 
 	// DNS infrastructure, port 53 (dnsInfraIPs). Previously this lived in
 	// the CI-only config path, so `--container-egress=enforce
@@ -710,6 +709,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		// Gate AFTER pre-population so reverse-DNS attribution is available.
 		gatedExisting = gateExistingStartupConnections(cmd, existing, configMgr, fw, l7Reg, auditLogger, logger)
 	}
+	defer armStepBinder(configMgr, stepTracker, objs.MapStepPolicy, dnsServer, logger).Close()
 
 	// Re-scan just before attach so connections established during the DNS
 	// pre-population window survive.

@@ -42,7 +42,10 @@ type l7Feature struct {
 	// warmed, mirroring how the origin mode is raised after the allowlist.
 	targetMode uint8
 	postures   *postureLedger
-	logger     *slog.Logger
+	// dns is the proxy, whose step tier the registrar carries while step
+	// rules are on (stepLateRegistrar); nil without one.
+	dns    *dns.Server
+	logger *slog.Logger
 }
 
 // startL7 constructs and starts the oracle, and hands the DNS proxy the
@@ -75,7 +78,7 @@ func startL7(cmd *StartCmd, obs *origin.Observer, enricher *containers.Enricher,
 		return nil, p.lose(postureTLSSNI, p.errReason(err))
 	}
 
-	f := &l7Feature{oracle: oracle, cm: configMgr, targetMode: origin.L7ModeObserve, postures: p, logger: logger}
+	f := &l7Feature{oracle: oracle, cm: configMgr, targetMode: origin.L7ModeObserve, postures: p, dns: dnsServer, logger: logger}
 	if cmd.TLSSNI == TLSSNIEnforce || cmd.TLSSNI == TLSSNIEnforcePinned {
 		f.targetMode = origin.L7ModeEnforce
 	}
@@ -121,8 +124,14 @@ func (f *l7Feature) raise() error {
 // registrar is what the L4 paths take alongside the firewall so a /32 they
 // open is scoped in the same reconciliation. Passed explicitly; nil when L7 is
 // off, so a caller cannot silently drop it by handing over the raw firewall.
+// With step rules on, settled by now, it carries the proxy's step tier for
+// the event pipeline's late-allow (events.StepLateAllower).
 func (f *l7Feature) registrar() events.L7LateRegistrar {
-	return l7LateRegistrar{l7: f.oracle, cm: f.cm, logger: f.logger}
+	r := l7LateRegistrar{l7: f.oracle, cm: f.cm, logger: f.logger}
+	if f.dns != nil && f.cm.HasStepRules() {
+		return stepLateRegistrar{l7LateRegistrar: r, steps: f.dns}
+	}
+	return r
 }
 
 // l7Sink adapts denied oracle outcomes onto the shared reporting helper. Only
@@ -179,6 +188,16 @@ type l7LateRegistrar struct {
 
 func (r l7LateRegistrar) RegisterLateAllow(hostname string, ip net.IP, allowPorts []config.Port) {
 	dns.RegisterL7Identity(r.l7, r.cm, hostname, ip, allowPorts, r.logger)
+}
+
+// stepLateRegistrar is l7LateRegistrar with the proxy's step tier.
+type stepLateRegistrar struct {
+	l7LateRegistrar
+	steps *dns.Server
+}
+
+func (r stepLateRegistrar) LateAllowStep(ordinal uint32, hostname string, ip net.IP, port uint16, proto uint8) (bool, string) {
+	return r.steps.LateAllowStep(ordinal, hostname, ip, port, proto)
 }
 
 func l7ModeName(mode uint8) string {

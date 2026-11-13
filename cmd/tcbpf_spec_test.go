@@ -46,8 +46,8 @@ func loadPolicyFile(t *testing.T, cm *config.Manager, policy string) {
 // The tcbpf spec as startCargoWall loads it: the rule maps at the job's
 // size for a policy without step rules (and for one whose steps a default
 // allow drops, and for a run that loaded none), at the size with steps for
-// one with them, unless step attribution is off, which drops them; the
-// step-attribution maps shrunk when the feature is off.
+// one with them, unless step attribution or --tls-sni is off, which drops
+// them; the step-attribution maps shrunk when the feature is off.
 // The step rules are settled after it, loaded or not.
 func TestLoadTcSpec(t *testing.T) {
 	ruleMaps := []string{bpf.TcBpfMapMapCidrs, bpf.TcBpfMapMapPorts, bpf.TcBpfMapMapCidrsV6, bpf.TcBpfMapMapPortsV6}
@@ -60,13 +60,22 @@ func TestLoadTcSpec(t *testing.T) {
 		name            string
 		policy          string
 		stepAttribution bool
+		tlsSNI          string
 		ruleSize        uint32
+		lost            string
 	}{
-		{"no steps", `{"defaultAction": "deny", "rules": []}`, true, bpf.RuleMapEntriesJobOnly},
-		{"steps", `{"defaultAction": "deny", "rules": [], ` + steps + `}`, true, bpf.RuleMapEntries},
-		{"steps a default allow drops", `{"defaultAction": "allow", "rules": [], ` + steps + `}`, true, bpf.RuleMapEntriesJobOnly},
-		{"steps, step attribution off: dropped", `{"defaultAction": "deny", "rules": [], ` + steps + `}`, false, bpf.RuleMapEntriesJobOnly},
-		{"no policy loaded", "", false, bpf.RuleMapEntriesJobOnly},
+		{"no steps", `{"defaultAction": "deny", "rules": []}`, true, TLSSNIEnforce, bpf.RuleMapEntriesJobOnly, ""},
+		{"steps", `{"defaultAction": "deny", "rules": [], ` + steps + `}`, true, TLSSNIObserve, bpf.RuleMapEntries, ""},
+		{"steps a default allow drops", `{"defaultAction": "allow", "rules": [], ` + steps + `}`, true, TLSSNIEnforce, bpf.RuleMapEntriesJobOnly, ""},
+		{
+			"steps, step attribution off: dropped", `{"defaultAction": "deny", "rules": [], ` + steps + `}`, false, TLSSNIEnforce,
+			bpf.RuleMapEntriesJobOnly, "step attribution is off",
+		},
+		{
+			"steps, --tls-sni off: dropped", `{"defaultAction": "deny", "rules": [], ` + steps + `}`, true, TLSSNIOff,
+			bpf.RuleMapEntriesJobOnly, "--tls-sni is off",
+		},
+		{"no policy loaded", "", false, TLSSNIOff, bpf.RuleMapEntriesJobOnly, ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cm := config.NewConfigManager()
@@ -74,8 +83,13 @@ func TestLoadTcSpec(t *testing.T) {
 				loadPolicyFile(t, cm, c.policy)
 			}
 
-			spec, hasSteps, err := loadTcSpec(&StartCmd{StepAttribution: c.stepAttribution}, cm)
+			spec, hasSteps, err := loadTcSpec(&StartCmd{StepAttribution: c.stepAttribution, TLSSNI: c.tlsSNI}, cm)
 			require.NoError(t, err)
+			if c.lost != "" {
+				assert.Contains(t, cm.StepRulesLost(), c.lost)
+			} else {
+				assert.Empty(t, cm.StepRulesLost())
+			}
 			assert.Equal(t, c.ruleSize == bpf.RuleMapEntries, hasSteps, "steps, for the gate")
 			known, _ := cm.StepRulesKnown()
 			assert.True(t, known, "the step rules are settled")
@@ -170,7 +184,8 @@ func TestLoadTcObjects_StepRulesGate(t *testing.T) {
 
 			var logs bytes.Buffer
 			var objs bpf.TcBpfObjects
-			err := loadTcObjects(&StartCmd{StepAttribution: !c.noAttribution}, cm, slog.New(slog.NewTextHandler(&logs, nil)), &objs)
+			err := loadTcObjects(&StartCmd{StepAttribution: !c.noAttribution, TLSSNI: TLSSNIEnforce}, cm,
+				slog.New(slog.NewTextHandler(&logs, nil)), &objs)
 			if c.failWith != "" {
 				require.ErrorContains(t, err, c.failWith)
 			} else {
@@ -201,9 +216,10 @@ func (h fakeHook) StepRules() bool { return h.on }
 func (h fakeHook) StepRulesLost() string { return h.lost }
 
 // The step tier stays only while something can judge a step by its rules:
-// the step tracker started, and the cgroup hook, if there is one, loaded
-// the step lookup. Otherwise the policy's step rules are dropped, with the
-// reason kept, and the DNS path installs and scopes nothing for a step.
+// the step tracker started, the cgroup hook, if there is one, loaded the
+// step lookup, and L7 runs, so a step's DNS installs are name-scoped.
+// Otherwise the policy's step rules are dropped, with the reason kept, and
+// the DNS path installs and scopes nothing for a step.
 func TestSettleStepTier(t *testing.T) {
 	withSteps := `{"defaultAction": "deny", "rules": [], ` + specSteps + `}`
 	for _, c := range []struct {
@@ -211,17 +227,29 @@ func TestSettleStepTier(t *testing.T) {
 		tracker *steps.Tracker
 		stepErr error
 		hook    stepRulesHook
+		l7      bool
 		lost    string
 	}{
-		{"all up", &steps.Tracker{}, nil, fakeHook{on: true}, ""},
-		{"no hook", &steps.Tracker{}, nil, nil, ""},
-		{"the tracker failed", nil, errors.New("no BTF"), fakeHook{on: true}, "step attribution did not start: no BTF"},
-		{"the hook lost the step lookup", &steps.Tracker{}, nil, fakeHook{lost: "verifier rejected cw_cg_egress"}, "originbpf verifier rejected cw_cg_egress"},
+		{"all up", &steps.Tracker{}, nil, fakeHook{on: true}, true, ""},
+		{"no hook", &steps.Tracker{}, nil, nil, true, ""},
+		{"the tracker failed", nil, errors.New("no BTF"), fakeHook{on: true}, true, "step attribution did not start: no BTF"},
+		{
+			"the hook lost the step lookup", &steps.Tracker{}, nil,
+			fakeHook{lost: "verifier rejected cw_cg_egress"},
+			true,
+			"originbpf verifier rejected cw_cg_egress",
+		},
+		{
+			"L7 is not running", &steps.Tracker{}, nil,
+			fakeHook{on: true},
+			false,
+			"L7 is not running (see the tls-sni posture), so a step's DNS installs can't be name-scoped",
+		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cm := config.NewConfigManager()
 			loadPolicyFile(t, cm, withSteps)
-			settleStepTier(cm, c.tracker, c.stepErr, c.hook, slog.New(slog.DiscardHandler))
+			settleStepTier(cm, c.tracker, c.stepErr, c.hook, c.l7, slog.New(slog.DiscardHandler))
 			assert.Equal(t, c.lost, cm.StepRulesLost())
 			assert.Equal(t, c.lost == "", cm.HasStepRules())
 		})
@@ -245,14 +273,20 @@ func TestSettleStepTier_StampOffOnceStepsDrop(t *testing.T) {
 			cm := config.NewConfigManager()
 			loadPolicyFile(t, cm, withSteps)
 			a := &containerAttribution{stamp: newStamp(nil, nil, nil, discard)}
-			a.settleSteps(cm, c.tracker, nil, discard)
+			p := newPostures(&StartCmd{}, "", true, discard)
+			a.settleSteps(cm, c.tracker, nil, true, p, discard)
 			assert.Equal(t, cm.HasStepRules(), a.stamp != nil)
 			assert.Equal(t, c.tracker != nil, cm.HasStepRules())
+			want := postureLine{Posture: postureStepRules, Requested: stepRulesOn, Applied: stepRulesOn}
+			if c.tracker == nil {
+				want.Applied, want.Reason = stepRulesOff, "step attribution did not start"
+			}
+			assert.Equal(t, []postureLine{want}, p.lines(), "the step-rules posture")
 		})
 	}
 	cm := config.NewConfigManager()
 	loadPolicyFile(t, cm, withSteps)
 	var none *containerAttribution
-	none.settleSteps(cm, nil, errors.New("no BTF"), discard)
+	none.settleSteps(cm, nil, errors.New("no BTF"), true, newPostures(&StartCmd{}, "", true, discard), discard)
 	assert.False(t, cm.HasStepRules())
 }

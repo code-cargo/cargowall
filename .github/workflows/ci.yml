@@ -378,6 +378,63 @@ jobs:
       - name: Verify L7 enforcement
         run: bash scripts/ci/tls-sni.sh verify
 
+  test-cargowall-step-rules:
+    name: Integration Test (Step Rules)
+    needs: build-binary
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cargowall-binary
+          path: bin
+
+      - name: Make binary executable
+        run: chmod +x bin/cargowall
+
+      # Step bodies live in scripts/ci/step-rules.sh; the YAML is wiring.
+      # Each step below is a workflow step of its own, since a step's
+      # identity is the step it runs in.
+      - name: Write a policy with a step's own rules
+        run: bash scripts/ci/step-rules.sh policy
+
+      - name: Start CargoWall with step rules and L7 enforced
+        run: bash scripts/ci/step-rules.sh start
+
+      - name: Wait for ready
+        run: ./bin/cargowall wait-ready --timeout 60s
+
+      - name: A step reaches the host its own rule allows
+        id: Rules-Allowed
+        run: bash scripts/ci/step-rules.sh allowed
+
+      - name: A step without rules is kept from it
+        id: rules-blocked
+        run: bash scripts/ci/step-rules.sh blocked
+
+      - name: Verify bindings and reports
+        run: bash scripts/ci/step-rules.sh verify
+
+      - name: Show the log (debug aid)
+        if: always()
+        run: sudo cat /tmp/cargowall.log || true
+
+      - name: Stop CargoWall
+        run: bash scripts/ci/step-rules.sh stop
+
+      - name: Emergency cleanup
+        if: always()
+        run: bash scripts/ci/step-rules.sh emergency
+
   test-cargowall-audit:
     name: Integration Test (Audit Mode)
     needs: build-binary
@@ -612,6 +669,9 @@ jobs:
 
       - name: Verify pidfile written
         run: bash scripts/ci/gitlab-ci.sh verify-pidfile
+
+      - name: Verify the dropped step rules are recorded
+        run: bash scripts/ci/gitlab-ci.sh verify-step-rules-lost
 
       - name: Allowed call reaches github.com
         run: bash scripts/ci/gitlab-ci.sh allowed

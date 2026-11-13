@@ -81,10 +81,14 @@ type stepRulesHook interface {
 // settleStepTier drops the policy's step rules when, the hooks loaded,
 // nothing can judge a step by them: the step tracker did not start, so no
 // socket carries a step, or the cgroup hook's verifier rejected the step
-// lookup there alone (obs.StepRulesLost). Then the DNS path installs and
-// scopes nothing for a step, which would narrow the job's flows for no
-// step's benefit. obs is nil without the hook.
-func settleStepTier(configMgr *config.Manager, stepTracker *steps.Tracker, stepErr error, obs stepRulesHook, logger *slog.Logger) {
+// lookup there alone (obs.StepRulesLost); or when L7 isn't running, so a
+// step's DNS installs couldn't be name-scoped, and no step may be bound
+// to its policy unless they are. Then the DNS path installs and scopes
+// nothing for a step, which would narrow the job's flows for no step's
+// benefit. obs is nil without the hook.
+func settleStepTier(configMgr *config.Manager, stepTracker *steps.Tracker, stepErr error, obs stepRulesHook, l7 bool,
+	logger *slog.Logger,
+) {
 	if !configMgr.HasStepRules() {
 		return
 	}
@@ -95,6 +99,9 @@ func settleStepTier(configMgr *config.Manager, stepTracker *steps.Tracker, stepE
 		dropStepRules(configMgr, "step attribution did not start", logger)
 	case obs != nil && !obs.StepRules():
 		dropStepRules(configMgr, "originbpf "+obs.StepRulesLost(), logger)
+	case !l7:
+		dropStepRules(configMgr, "L7 is not running (see the tls-sni posture), so a step's DNS installs "+
+			"can't be name-scoped", logger)
 	}
 }
 
@@ -117,8 +124,10 @@ func dropStepRules(configMgr *config.Manager, why string, logger *slog.Logger) {
 // room for the steps' with them. The policy is read once, here, before the
 // load; nothing loads one after it. So this settles the step rules: a run
 // that loaded no policy has none (config.Manager.SettleStepRules), and,
-// with step attribution off, drops them: no socket would carry a step. It
-// reports whether the policy has steps, for the step-rules gate.
+// with step attribution off, drops them, since no socket would carry a
+// step, as with --tls-sni off, since no step may be bound while its DNS
+// installs can't be name-scoped. It reports whether the policy has steps,
+// for the step-rules gate.
 func loadTcSpec(cmd *StartCmd, configMgr *config.Manager) (*ebpf.CollectionSpec, bool, error) {
 	spec, err := bpf.LoadTcBpf()
 	if err != nil {
@@ -134,8 +143,11 @@ func loadTcSpec(cmd *StartCmd, configMgr *config.Manager) (*ebpf.CollectionSpec,
 		}
 	}
 	configMgr.SettleStepRules()
-	if !cmd.StepAttribution {
+	switch {
+	case !cmd.StepAttribution:
 		configMgr.DropStepRules("step attribution is off, so no socket carries a step")
+	case cmd.TLSSNI == "" || cmd.TLSSNI == TLSSNIOff:
+		configMgr.DropStepRules("--tls-sni is off, so a step's DNS installs can't be name-scoped")
 	}
 	steps := configMgr.HasStepRules()
 	if err := bpf.SizeRuleMaps(spec, steps); err != nil {

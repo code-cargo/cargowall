@@ -352,3 +352,131 @@ func TestRecentBlocks_PerStep(t *testing.T) {
 	assert.ElementsMatch(t, []uint32{3, 0}, []uint32{taken[0].StepOrdinal, taken[1].StepOrdinal})
 	assert.Empty(t, rb.TakeMatching("20.0.0.1", nil, nil, false))
 }
+
+// A step tier's takes leave every block a container contributed to, though
+// a disagreement with a host attempt on the same tuple blanked its
+// container's identity: TC may judge a container's packets as the job's.
+// The job tier's take still has it.
+func TestRecentBlocks_StepTakesLeaveContainers(t *testing.T) {
+	rb := NewRecentBlocks(time.Minute)
+	now := time.Now()
+	ctr := blockedAuditEvent("10.1.2.3", 443, "TCP", now.Add(-2*time.Second))
+	ctr.StepOrdinal, ctr.ContainerID, ctr.PID = 7, "c0ffee", 77
+	host := ctr
+	host.Timestamp, host.ContainerID, host.PID = now.Add(-time.Second), "", 42
+	rb.Consume(ctr)
+	rb.Consume(host) // the later attempt, the host's
+	all := func(uint32) bool { return true }
+	assert.Empty(t, rb.TakeStep(7, func(RecentBlock) bool { return true }))
+	assert.Empty(t, rb.TakeMatchingFor("10.1.2.3", all, nil, nil, false))
+	taken := rb.TakeMatching("10.1.2.3", nil, nil, false)
+	require.Len(t, taken, 1)
+	assert.Empty(t, taken[0].ContainerID, "the identity degraded")
+}
+
+// TakeStep judges outside the buffer's lock, so a block consumed meanwhile
+// waits on nothing, and an entry that moved on meanwhile, folded into a
+// later attempt, is left for that attempt's own reconcile.
+func TestRecentBlocks_TakeStepJudgesOutsideTheLock(t *testing.T) {
+	rb := NewRecentBlocks(time.Minute)
+	now := time.Now()
+	first := blockedAuditEvent("10.1.2.4", 443, "TCP", now.Add(-2*time.Second))
+	first.StepOrdinal = 7
+	other := blockedAuditEvent("10.1.2.5", 443, "TCP", now.Add(-2*time.Second))
+	other.StepOrdinal = 7
+	rb.Consume(first)
+	rb.Consume(other)
+	later := first
+	later.Timestamp = now.Add(-time.Second)
+
+	done := make(chan []RecentBlock)
+	go func() {
+		done <- rb.TakeStep(7, func(b RecentBlock) bool {
+			if b.DstIP == "10.1.2.4" {
+				rb.Consume(later) // a retry, blocked while the step is judged
+			}
+			return true
+		})
+	}()
+	select {
+	case taken := <-done:
+		require.Len(t, taken, 1)
+		assert.Equal(t, "10.1.2.5", taken[0].DstIP)
+	case <-time.After(5 * time.Second):
+		t.Fatal("TakeStep held the lock while judging")
+	}
+	left := rb.TakeMatching("10.1.2.4", nil, nil, false)
+	require.Len(t, left, 1)
+	assert.True(t, left[0].At.Equal(later.Timestamp))
+}
+
+// hostFlowEnricher attributes a socketless TC event to a host process of a
+// step, as the enricher's "host flow the join missed" branch does: the
+// origin record's PID and ordinal, no container.
+type hostFlowEnricher struct{}
+
+func (hostFlowEnricher) Enrich(audit *AuditEvent, _ *BpfBlockedEvent) {
+	audit.PID, audit.StepOrdinal = 4242, 7
+}
+
+// A block TC saw with no socket stays out of a step tier's takes whatever
+// enrichment then attributed it to: unless a bridge stamp reached it, which
+// nothing here can tell, TC judged it by the job's rules, and still will.
+func TestRecentBlocks_SocketlessAtTCLeftToTheJob(t *testing.T) {
+	auditLogger, err := NewAuditLogger("", false)
+	require.NoError(t, err)
+	rb := NewRecentBlocks(time.Minute)
+	auditLogger.AddSink(rb)
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+	reverseDNS.reset()
+
+	processEvent(makeBpfEvent(orphanEvent()), cm, nil, auditLogger, nil, nil, newTestLogger(), hostFlowEnricher{})
+	all := func(uint32) bool { return true }
+	assert.Empty(t, rb.TakeStep(7, func(RecentBlock) bool { return true }))
+	assert.Empty(t, rb.TakeMatchingFor("93.184.216.34", all, nil, nil, false))
+	taken := rb.TakeMatching("93.184.216.34", nil, nil, false)
+	require.Len(t, taken, 1, "the job's take has it")
+	assert.Equal(t, uint32(7), taken[0].StepOrdinal)
+}
+
+// A hook drop the step tier may not answer for is marked so for the
+// re-reports too: a pod of a nested namespace in step 7, which the tracker
+// doesn't classify, keeps its block reported when step 7 is bound or its
+// rules open the address, since TC may still judge its retry as the job's.
+// A degraded record is marked the same. A drop from a socket of cargowall's
+// own namespace is the step tier's to take.
+func TestRecentBlocks_HookDropsTheStepTierCannotAnswer(t *testing.T) {
+	(&fakeHostAddrs{addrs: []string{"10.1.0.11/24"}}).set(t)
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules(nil, config.ActionDeny))
+	reverseDNS.reset()
+	const dst = "93.184.216.34"
+	all := func(uint32) bool { return true }
+	report := func(src string, degraded bool) *RecentBlocks {
+		auditLogger, err := NewAuditLogger("", false)
+		require.NoError(t, err)
+		rb := NewRecentBlocks(time.Minute)
+		auditLogger.AddSink(rb)
+		rec := verdictRec(true)
+		rec.SrcIP, rec.Degraded = src, degraded
+		rec.Decorate = func(*AuditEvent) {}
+		ReportVerdict(rec, cm, nil, auditLogger, nil, nil, newTestLogger())
+		return rb
+	}
+
+	for _, degraded := range []bool{false, true} {
+		name := fmt.Sprintf("degraded=%v", degraded)
+		rb := report("10.244.0.5", degraded)
+		assert.Empty(t, rb.TakeStep(7, func(RecentBlock) bool { return true }), name)
+		assert.Empty(t, rb.TakeMatchingFor(dst, all, nil, nil, false), name)
+		taken := rb.TakeMatching(dst, nil, nil, false)
+		require.Len(t, taken, 1, "the job's take has it, "+name)
+		assert.Equal(t, uint32(7), taken[0].StepOrdinal, name)
+
+		rb = report("10.1.0.11", degraded)
+		assert.Len(t, rb.TakeStep(7, func(RecentBlock) bool { return true }), 1, name)
+		rb = report("10.1.0.11", degraded)
+		assert.Len(t, rb.TakeMatchingFor(dst, all, nil, nil, false), 1, name)
+	}
+}

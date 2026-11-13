@@ -221,6 +221,14 @@ type AuditEvent struct {
 	AttributionKind string  `json:"attribution_kind,omitempty"` // container_attribution only: "start" | "exec" | "reconcile"
 	TagLatencyMS    float64 `json:"tag_latency_ms,omitempty"`   // container_attribution only: docker event → tag-complete latency
 	Privileged      bool    `json:"privileged,omitempty"`       // container_attribution only: container runs --privileged (host-root equivalent)
+
+	// jobJudged marks a block whose retry TC may judge by the job's rules
+	// whatever step made it, since no bridge stamp need reach its packets:
+	// a TC event whose packet carried no socket (pid and ordinal 0, a NATed
+	// container's say), whatever enrichment then attributed it to, and a
+	// hook drop the step tier may not answer for (ReportVerdict). A step
+	// tier never re-reports its block (RecentBlocks). In-process only.
+	jobJudged bool
 }
 
 // EventSink receives every audit event after the audit/enforce mode flags

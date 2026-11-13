@@ -1,0 +1,198 @@
+//   Copyright 2026 BoxBuild Inc DBA CodeCargo
+//
+//   Licensed under the Apache License, Version 2.0 (the "License");
+//   you may not use this file except in compliance with the License.
+//   You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+//   Unless required by applicable law or agreed to in writing, software
+//   distributed under the License is distributed on an "AS IS" BASIS,
+//   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//   See the License for the specific language governing permissions and
+//   limitations under the License.
+
+//go:build linux
+
+package dns
+
+import (
+	"net"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+
+	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/events"
+)
+
+// bindStep binds ordinal to policy, as the step binder's lookup does.
+func bindStep(s *Server, binds map[uint32]uint32) {
+	s.SetStepBindings(func(ordinal uint32) (uint32, bool) {
+		p, ok := binds[ordinal]
+		return p, ok
+	})
+}
+
+// The event pipeline's step tier opens an address for a bound step whose
+// own rules allow a name the proxy answered it for, under that step's
+// policy alone, and says whether the retry passes. Nothing for an unbound
+// step, a name with no evidence for the address (a reverse lookup's), or a
+// name another step's rules allow.
+func TestLateAllowStep(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	ip := net.ParseIP("10.1.0.120")
+	tcp := uint8(unix.IPPROTO_TCP)
+
+	ok, _ := s.LateAllowStep(7, "step.example.com", ip, 443, tcp)
+	assert.False(t, ok, "no bindings yet")
+	bindStep(s, map[uint32]uint32{7: policyFetch, 8: policyDeploy})
+	ok, _ = s.LateAllowStep(7, "step.example.com", ip, 443, tcp)
+	assert.False(t, ok, "no forward resolution put the name to the address")
+	assert.Empty(t, fw.stepIPs(policyFetch))
+
+	cfg.RecordForwardResolution("step.example.com", ip.String())
+	ok, _ = s.LateAllowStep(9, "step.example.com", ip, 443, tcp)
+	assert.False(t, ok, "an unbound step")
+	ok, _ = s.LateAllowStep(8, "step.example.com", ip, 443, tcp)
+	assert.False(t, ok, "another step's name")
+	assert.Empty(t, fw.stepIPs(policyDeploy))
+
+	ok, rule := s.LateAllowStep(7, "Step.Example.COM", ip, 443, tcp)
+	assert.True(t, ok)
+	assert.Equal(t, "step.example.com", rule)
+	assert.Equal(t, tcp443, fw.stepIPs(policyFetch)[ip.String()], "installed under the step's policy")
+	assert.False(t, fw.jobAllows(ip.String()), "and never the job's")
+	ok, _ = s.LateAllowStep(7, "step.example.com", ip, 80, tcp)
+	assert.False(t, ok, "the rule's ports alone")
+}
+
+// A step's blocks from before its binding are re-reported as late-allowed
+// once it is bound, where its policy now lets them through: under the name
+// the address maps to, by the step's rule for it where the proxy answered
+// the name for the address, and otherwise by the step, a reverse lookup's
+// name included. Its other blocks, its containers', and other steps', stay.
+func TestReconcileBoundStep(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	auditPath := filepath.Join(t.TempDir(), "audit.ndjson")
+	auditLogger, err := events.NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	s.SetAuditLogger(auditLogger)
+	blocks := events.NewRecentBlocks(0)
+	s.SetRecentBlocks(blocks)
+
+	blockedAt := time.Now().Add(-3 * time.Second)
+	block := func(ip string, port uint16, ordinal uint32) {
+		blocks.Consume(events.AuditEvent{
+			Timestamp: blockedAt, EventType: events.EventConnectionBlocked,
+			DstIP: ip, DstPort: port, Protocol: "TCP", StepOrdinal: ordinal,
+		})
+	}
+	cfg.UpdateDNSMapping("step.example.com", "10.1.0.121")
+	cfg.RecordForwardResolution("step.example.com", "10.1.0.121")
+	require.True(t, cfg.RecordReverseName("step.example.com", "10.1.0.123"), "a PTR claims the name")
+	for _, ip := range []string{"10.1.0.121", "10.1.0.122", "10.1.0.123", "10.1.0.124"} {
+		_, err := fw.AddPolicyIP(policyFetch, net.ParseIP(ip), tcp443, nil)
+		require.NoError(t, err)
+	}
+	block("10.1.0.121", 443, 7) // fetch's, its rule now opens
+	block("10.1.0.122", 443, 7) // fetch's, at an address no name maps to
+	block("10.1.0.121", 80, 7)  // fetch's, on a port its rule doesn't name
+	block("10.1.0.121", 443, 8) // another step's
+	block("10.1.0.123", 443, 7) // fetch's, at an address only a PTR names
+	blocks.Consume(events.AuditEvent{
+		Timestamp: blockedAt, EventType: events.EventConnectionBlocked,
+		DstIP: "10.1.0.124", DstPort: 443, Protocol: "TCP", StepOrdinal: 7, ContainerID: "c0ffee",
+	})
+
+	// fetch's, expired
+	blocks.Consume(events.AuditEvent{
+		Timestamp: time.Now().Add(-time.Hour), EventType: events.EventConnectionBlocked,
+		DstIP: "10.1.0.122", DstPort: 8443, Protocol: "TCP", StepOrdinal: 7,
+	})
+	_, err = fw.AddPolicyIP(policyFetch, net.ParseIP("10.1.0.122"), []config.Port{{Port: 8443, Protocol: config.ProtocolTCP}}, nil)
+	require.NoError(t, err)
+
+	s.ReconcileBoundStep(7, policyFetch, "fetch")
+	audited := readAuditEvents(t, auditPath)
+	require.Len(t, audited, 3)
+	byIP := map[string]events.AuditEvent{}
+	for _, e := range audited {
+		assert.Equal(t, events.EventConnectionLateAllowed, e.EventType)
+		assert.Equal(t, uint32(7), e.StepOrdinal)
+		assert.True(t, e.Timestamp.Equal(blockedAt), "dated at the attempt")
+		byIP[e.DstIP] = e
+	}
+	assert.Equal(t, "step.example.com", byIP["10.1.0.121"].DstHostname)
+	assert.Equal(t, "step.example.com", byIP["10.1.0.121"].MatchedRule)
+	assert.Equal(t, "step fetch", byIP["10.1.0.122"].MatchedRule)
+	assert.Equal(t, "step.example.com", byIP["10.1.0.123"].DstHostname, "the PTR's name, shown")
+	assert.Equal(t, "step fetch", byIP["10.1.0.123"].MatchedRule, "but never naming the rule")
+	assert.Len(t, blocks.TakeMatching("10.1.0.121", nil, nil, false), 2, "fetch's on 80 and the other step's stay")
+	assert.Len(t, blocks.TakeMatching("10.1.0.124", nil, nil, false), 1, "and the container's")
+}
+
+// The zero address is never a rule host. As the proxy's forward evidence
+// for a name a bound step's rules allow, in any spelling, it installs
+// nothing, scopes nothing and passes nothing, and the step's 0.0.0.0/0 and
+// ::/0 port entries, which are keyed on the zero address as a host entry
+// there would be, stay as they were. Nor does binding the step re-report
+// a block to it.
+func TestLateAllowStep_ZeroAddressIsNeverARuleHost(t *testing.T) {
+	cfg := config.NewConfigManager()
+	fw := newRecordingFirewall()
+	s := newStepTestServer(t, cfg, fw)
+	rec := &recordingRegistrar{}
+	s.SetL7Registrar(rec)
+	loadStepPolicy(t, cfg, stepWritersPolicy)
+	auditPath := filepath.Join(t.TempDir(), "audit.ndjson")
+	auditLogger, err := events.NewAuditLogger(auditPath, false)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+	s.SetAuditLogger(auditLogger)
+	blocks := events.NewRecentBlocks(0)
+	s.SetRecentBlocks(blocks)
+	bindStep(s, map[uint32]uint32{7: policyFetch})
+	tcp := uint8(unix.IPPROTO_TCP)
+
+	// The step's 0.0.0.0/0 and ::/0 on tcp/9000, at the keys they hold.
+	tcp9000 := []config.Port{{Port: 9000, Protocol: config.ProtocolTCP}}
+	fw.step[policyFetch] = map[string][]config.Port{"0.0.0.0": tcp9000, "::": tcp9000}
+	wildcards := fw.stepIPs(policyFetch)
+
+	for _, addr := range []string{"0.0.0.0", "::", "::ffff:0.0.0.0"} {
+		ip := net.ParseIP(addr)
+		cfg.RecordForwardResolution("step.example.com", ip.String())
+		for _, port := range []uint16{443, 9000} {
+			ok, rule := s.LateAllowStep(7, "step.example.com", ip, port, tcp)
+			assert.False(t, ok, "%s, port %d", addr, port)
+			assert.Empty(t, rule, "%s, port %d", addr, port)
+		}
+	}
+	assert.Equal(t, wildcards, fw.stepIPs(policyFetch), "the step's wildcard entries")
+	assert.Empty(t, fw.removed)
+	assert.Empty(t, rec.scopes)
+	assert.Empty(t, s.steps.l7.scoped)
+
+	for _, addr := range []string{"0.0.0.0", "::"} {
+		blocks.Consume(events.AuditEvent{
+			Timestamp: time.Now().Add(-time.Second), EventType: events.EventConnectionBlocked,
+			DstIP: addr, DstPort: 9000, Protocol: "TCP", StepOrdinal: 7,
+		})
+	}
+	s.ReconcileBoundStep(7, policyFetch, "fetch")
+	assert.Empty(t, readAuditEvents(t, auditPath))
+	assert.Len(t, blocks.TakeMatching("0.0.0.0", nil, nil, false), 1)
+	assert.Len(t, blocks.TakeMatching("::", nil, nil, false), 1)
+}

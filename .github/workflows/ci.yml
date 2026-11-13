@@ -30,9 +30,9 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # The tools are built by the Go they run under, and one built by an
-      # older Go refuses a module that needs a newer one, so the key carries
-      # the Go version as well as the Makefile's pins.
+      # A tool built by an older Go than the one it runs beside fails on the
+      # newer standard library, so the key carries the Go version as well as
+      # the Makefile's pins.
       - name: Cache Go tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:

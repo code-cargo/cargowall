@@ -1403,8 +1403,12 @@ func autoAllowCodeCargoAPI(apiURL string, configMgr *config.Manager, logger *slo
 
 // reverseDNSExistingConnections performs reverse DNS lookups for each
 // scanned existing-connection IP via the cache resolver, updating the config
-// manager's DNS mappings. Derives from ctx so a startup-window shutdown
-// signal drains the lookup loop promptly.
+// manager's DNS mappings. Only a name a rule allows, whose forward lookup
+// leads back to the IP, is recorded (see events.UsableReverseNames and
+// events.ConfirmReverseName): gateExistingConnections
+// opens a named IP on its rule's ports, so a forged PTR record must not
+// choose the rule. Derives from ctx so a startup-window shutdown signal
+// drains the lookup loop promptly.
 func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) {
 	if len(conns) == 0 {
 		return
@@ -1414,9 +1418,17 @@ func reverseDNSExistingConnections(ctx context.Context, conns existingConns, con
 	for ip := range conns {
 		rCtx, rCancel := context.WithTimeout(lookupCtx, 1*time.Second)
 		if names, err := cacheResolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
-			hostname := strings.TrimSuffix(names[0], ".")
-			configMgr.UpdateDNSMapping(hostname, ip)
-			logger.Debug("Reverse DNS for existing connection", "ip", ip, "hostname", hostname)
+			var hostname string
+			if usable := events.UsableReverseNames(configMgr, names); len(usable) > 0 {
+				hostname, _, _ = events.ConfirmReverseName(rCtx, cacheResolver, ip, usable)
+			}
+			if hostname != "" {
+				configMgr.UpdateDNSMapping(hostname, ip)
+				logger.Debug("Reverse DNS for existing connection", "ip", ip, "hostname", hostname)
+			} else {
+				logger.Debug("No reverse DNS name a rule allows resolves back to the peer; leaving it unnamed",
+					"ip", ip, "reverse_names", names)
+			}
 		}
 		rCancel()
 	}

@@ -206,6 +206,31 @@ func reverseDNSAttempted(ip string) bool {
 	return false
 }
 
+// reverseDNSMaxRetries caps the extra lookups that transient confirmation
+// failures buy one IP in a run.
+const reverseDNSMaxRetries = 2
+
+// reverseDNSRetried counts each IP's retries. Guarded by reverseDNSMu.
+var reverseDNSRetried = make(map[string]int)
+
+// reverseDNSRetry forgets ip's lookup attempt, so the IP's next event (its
+// client's SYN retransmit) looks it up again, and reports whether it did. A
+// confirmation that timed out or failed transiently says nothing about the
+// name, and without this one lost packet would block a destination its
+// reverse name allows for the rest of the run. At most reverseDNSMaxRetries
+// times per IP, and only while the count of retries has room.
+func reverseDNSRetry(ip string) bool {
+	reverseDNSMu.Lock()
+	defer reverseDNSMu.Unlock()
+	n, seen := reverseDNSRetried[ip]
+	if n >= reverseDNSMaxRetries || (!seen && len(reverseDNSRetried) >= reverseDNSCacheMax) {
+		return false
+	}
+	reverseDNSRetried[ip] = n + 1
+	delete(reverseDNSCache, ip)
+	return true
+}
+
 // reverseDNSResolver uses the system default resolver for PTR lookups.
 var reverseDNSResolver = net.DefaultResolver
 
@@ -302,12 +327,31 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			names, err := reverseDNSResolver.LookupAddr(ctx, dstIP)
 			cancel()
-			if err == nil && len(names) > 0 {
-				// Lowercased so an unmatched PTR name is reported in the same
-				// canonical case as forward mappings and tracked-rule matches,
-				// keeping connection-event output consistent (#65). PTR replies
-				// can carry mixed/0x20-randomized case off the wire.
-				ptrName := strings.ToLower(strings.TrimSuffix(names[0], "."))
+			var ptrName string
+			if err == nil {
+				// Only a name a rule allows, whose forward lookup leads back
+				// to dstIP, may name it: a PTR record is the destination's
+				// own claim, and the name decides which rule late-allows it.
+				// The name comes back lowercased, to match forward mappings
+				// and rules, since PTR replies can carry mixed or
+				// 0x20-randomized case off the wire.
+				var settled bool
+				var confirmErr error
+				if usable := UsableReverseNames(configMgr, names); len(usable) > 0 {
+					confirmCtx, confirmCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+					ptrName, settled, confirmErr = ConfirmReverseName(confirmCtx, reverseDNSResolver, dstIP, usable)
+					confirmCancel()
+					if ptrName == "" && !settled && reverseDNSRetry(dstIP) {
+						logger.Debug("Reverse DNS name not confirmed; will retry at the IP's next event",
+							"ip", dstIP, "reverse_names", usable, "error", confirmErr)
+					}
+				}
+				if ptrName == "" {
+					logger.Debug("No reverse DNS name a rule allows resolves back to the IP; not using one",
+						"ip", dstIP, "reverse_names", names, "error", confirmErr)
+				}
+			}
+			if ptrName != "" {
 				// Try to match PTR result to a tracked hostname
 				if tracked := configMgr.FindTrackedHostname(ptrName); tracked != "" {
 					hostname = tracked

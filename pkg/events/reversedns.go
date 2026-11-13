@@ -21,6 +21,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -28,17 +29,34 @@ import (
 	"github.com/code-cargo/cargowall/pkg/config"
 )
 
-// addrResolver is the reverse-lookup surface resolveDestination uses: the
-// system resolver in production, a scripted one in tests.
+// HostResolver is the forward-lookup surface ConfirmReverseName uses.
+type HostResolver interface {
+	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
+}
+
+// addrResolver is the lookup surface resolveDestination uses: the system
+// resolver in production, a scripted one in tests. It looks up an IP's
+// reverse name, then confirms that name with a forward lookup.
 type addrResolver interface {
+	HostResolver
 	LookupAddr(ctx context.Context, addr string) ([]string, error)
 }
 
-// reverseDNSResolver uses the system default resolver for PTR lookups. The
+// reverseDNSResolver uses the system default resolver for PTR lookups, and
+// for the forward lookups that confirm the names they return. The
 // binary is built without cgo, so this is Go's own resolver, which reports
 // NXDOMAIN and an answer with no PTR record as *net.DNSError IsNotFound, and
 // timeouts, SERVFAIL and socket errors as IsTimeout or IsTemporary.
 var reverseDNSResolver addrResolver = net.DefaultResolver
+
+// SetReverseDNSResolver points the lazy reverse lookups and their retries at
+// r. Call it before events flow. cargowall passes a resolver that reaches its
+// DNS upstream directly, so its own lookups never pass through the proxy,
+// whose filter would refuse them and record them as the job's queries.
+func SetReverseDNSResolver(r *net.Resolver) {
+	reverseDNSResolver = r
+	reverseDNSRetries.resolver = r
+}
 
 const (
 	// reverseDNSCacheMax bounds the IPs tracked, so a flood of distinct
@@ -71,17 +89,89 @@ var (
 	reverseDNSRetries = newReverseDNSRetrier(reverseDNS, reverseDNSResolver, reverseDNSRetryQueue)
 )
 
-// reverseLookupSettled reports whether a LookupAddr result is final for the
-// run. Only an answer — names, or an authoritative "no such name" or empty
-// answer — is. Anything else (a timeout, SERVFAIL, a network error) says
-// nothing about the IP and must not stop a later lookup from finding the
-// name a rule would match.
+// reverseLookupSettled reports whether a lookup result (a PTR lookup, or the
+// forward lookup confirming its name) is final for the run. Only an answer —
+// names, or an authoritative "no such name" or empty answer — is. Anything
+// else (a timeout, SERVFAIL, a network error) says nothing about the IP and
+// must not stop a later lookup from finding the name a rule would match.
 func reverseLookupSettled(err error) bool {
 	if err == nil {
 		return true
 	}
 	var dnsErr *net.DNSError
 	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
+}
+
+// ConfirmReverseName returns the first of names, a reverse lookup's answer
+// for ip, whose own forward lookup includes ip: lowercased, without its
+// trailing dot. It returns "" when none does. settled reports whether that
+// outcome is final. It is false when no name was confirmed and a forward
+// lookup failed in a way that says nothing about the name (a timeout,
+// SERVFAIL, a network error), so a later attempt may still confirm it.
+//
+// A PTR record is the destination's own claim. Whoever controls an address's
+// reverse zone can make it name any host, including one a rule allows, so an
+// unconfirmed reverse name must never decide which rule a connection is
+// judged under. The forward answer is controlled by the owner of the name's
+// domain, so a name whose forward answer leads back to ip is one that
+// domain's owner vouches for.
+//
+// Each name gets one lookup in ip's own family, on the rooted name: one query
+// has one error, so settled never depends on which of an A and an AAAA answer
+// arrived first, and a rooted name skips the resolv.conf search list, which
+// could otherwise confirm the name through a record under a search domain.
+// err is the last forward lookup's error, for logging.
+func ConfirmReverseName(ctx context.Context, r HostResolver, ip string, names []string) (
+	name string, settled bool, err error,
+) {
+	want, parseErr := netip.ParseAddr(ip)
+	if parseErr != nil {
+		return "", true, nil
+	}
+	want = want.Unmap()
+	family := "ip6"
+	if want.Is4() {
+		family = "ip4"
+	}
+	settled = true
+	for _, n := range names {
+		n = strings.ToLower(strings.TrimSuffix(n, "."))
+		if n == "" {
+			continue
+		}
+		addrs, lookupErr := r.LookupNetIP(ctx, family, n+".")
+		if lookupErr != nil {
+			err = lookupErr
+			if !reverseLookupSettled(lookupErr) {
+				settled = false
+			}
+			continue
+		}
+		for _, a := range addrs {
+			if a.Unmap() == want {
+				return n, true, nil
+			}
+		}
+	}
+	return "", settled, err
+}
+
+// UsableReverseNames returns the names among a reverse lookup's answer that a
+// rule could use, lowercased and without the trailing dot: those a job rule
+// allows, or a step's own rules allow. Only those can change a verdict, so
+// only those are worth confirming. Any other name is neither looked up nor
+// used as a label, so no query goes to a zone the destination's owner chose,
+// and the proxy, which forwards exactly these names, never sees one it would
+// refuse.
+func UsableReverseNames(cm *config.Manager, names []string) []string {
+	var usable []string
+	for _, n := range names {
+		n = strings.ToLower(strings.TrimSuffix(n, "."))
+		if n != "" && (cm.MatchHostnameRule(n).HasAllow() || cm.StepAllowsHostname(n)) {
+			usable = append(usable, n)
+		}
+	}
+	return usable
 }
 
 type reverseDNSEntry struct {
@@ -210,33 +300,49 @@ func (t *reverseDNSTracker) size() int {
 	return len(t.entries)
 }
 
-// lookupReverseName runs one claimed reverse lookup of ip, records its
-// outcome in tracker, and returns the name ip goes by: the one it found, or
-// "". A name is recorded as the IP's DNS mapping, so a later event finds it
-// in the cache, but only if the IP has no name yet: a reverse name never
-// replaces a forward one, and one may have landed while the lookup ran. The
-// IP then goes by the forward name.
+// lookupReverseName runs one claimed reverse lookup of ip, confirms the names
+// it finds that a rule could use (see UsableReverseNames and
+// ConfirmReverseName), records the outcome in tracker, and returns the name ip
+// goes by: the confirmed one, or "". Any other name is neither returned nor
+// recorded, so it can neither late-allow nor label a connection. A name is recorded as the IP's
+// DNS mapping, so a later event finds it in the cache, but only if the IP
+// has no name yet: a reverse name never replaces a forward one, and one may
+// have landed while the lookup ran. The IP then goes by the forward name.
 func lookupReverseName(tracker *reverseDNSTracker, resolver addrResolver, configMgr *config.Manager,
 	ip string, logger *slog.Logger,
 ) string {
 	ctx, cancel := context.WithTimeout(context.Background(), reverseDNSTimeout)
 	names, err := resolver.LookupAddr(ctx, ip)
 	cancel()
-	if attempt := tracker.finish(ip, reverseLookupSettled(err)); attempt.exhausted {
+	settled := reverseLookupSettled(err)
+	var ptrName string
+	var confirmErr error
+	if err == nil {
+		if usable := UsableReverseNames(configMgr, names); len(usable) > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), reverseDNSTimeout)
+			ptrName, settled, confirmErr = ConfirmReverseName(ctx, resolver, ip, usable)
+			cancel()
+		}
+		if ptrName == "" {
+			logger.Debug("No reverse DNS name a rule allows resolves back to the IP; not using one",
+				"ip", ip, "reverse_names", names, "settled", settled, "error", confirmErr)
+		}
+	}
+	attempt := tracker.finish(ip, settled)
+	switch {
+	case attempt.exhausted:
 		logger.Info("Reverse DNS lookup kept failing; not retrying it this run",
-			"ip", ip, "attempts", attempt.failures, "error", err)
-	} else if attempt.failures > 0 {
+			"ip", ip, "attempts", attempt.failures, "error", errors.Join(err, confirmErr))
+	case attempt.failures > 0 && err == nil:
+		logger.Info("Reverse DNS name not confirmed; will retry",
+			"ip", ip, "attempt", attempt.failures, "retry_in", attempt.retryIn, "error", confirmErr)
+	case attempt.failures > 0:
 		logger.Info("Reverse DNS lookup failed; will retry",
 			"ip", ip, "attempt", attempt.failures, "retry_in", attempt.retryIn, "error", err)
 	}
-	if err != nil || len(names) == 0 {
+	if ptrName == "" {
 		return ""
 	}
-	// Lowercased so an unmatched PTR name is reported in the same canonical
-	// case as forward mappings and tracked-rule matches, keeping
-	// connection-event output consistent. PTR replies can carry
-	// mixed/0x20-randomized case off the wire.
-	ptrName := strings.ToLower(strings.TrimSuffix(names[0], "."))
 	hostname := ptrName
 	if tracked := configMgr.FindTrackedHostname(ptrName); tracked != "" {
 		hostname = tracked

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -57,14 +58,20 @@ func (c *fakeClock) advance(d time.Duration) {
 
 // scriptedResolver answers LookupAddr from a script, one entry per call; the
 // last entry repeats. It records when each call happened. The retry worker
-// calls it from its own goroutine.
+// calls it from its own goroutine. LookupHost, the forward lookup confirming
+// a reverse name, answers from forwardScript the same way when it is set,
+// and otherwise as public DNS does (see publicForward).
 type scriptedResolver struct {
-	clock   *fakeClock
-	results []scriptedAnswer
-	mu      sync.Mutex
-	calls   []time.Time
+	clock         *fakeClock
+	results       []scriptedAnswer
+	forwardScript []scriptedAnswer
+	mu            sync.Mutex
+	calls         []time.Time
+	forwardCalls  int
 }
 
+// scriptedAnswer is one scripted lookup result: names for a reverse lookup,
+// addresses for a forward one.
 type scriptedAnswer struct {
 	names []string
 	err   error
@@ -76,6 +83,46 @@ func (r *scriptedResolver) LookupAddr(context.Context, string) ([]string, error)
 	r.calls = append(r.calls, r.clock.now())
 	a := r.results[min(len(r.calls), len(r.results))-1]
 	return a.names, a.err
+}
+
+func (r *scriptedResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.forwardCalls++
+	if len(r.forwardScript) == 0 {
+		return publicForward(host)
+	}
+	a := r.forwardScript[min(r.forwardCalls, len(r.forwardScript))-1]
+	return toAddrs(a.names), a.err
+}
+
+func (r *scriptedResolver) forwardCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.forwardCalls
+}
+
+func toAddrs(ss []string) []netip.Addr {
+	addrs := make([]netip.Addr, 0, len(ss))
+	for _, s := range ss {
+		addrs = append(addrs, netip.MustParseAddr(s))
+	}
+	return addrs
+}
+
+// publicForward answers a forward lookup as public DNS does for the names
+// these tests use: an EC2 public name (ec2-A-B-C-D.<region>.amazonaws.com)
+// resolves to the address it spells, and any other name does not exist. A
+// PTR record can claim any name, but only the claimed domain's owner decides
+// where that name resolves.
+func publicForward(host string) ([]netip.Addr, error) {
+	label, rest, _ := strings.Cut(strings.TrimSuffix(host, "."), ".")
+	if strings.HasPrefix(label, "ec2-") && strings.HasSuffix(rest, ".amazonaws.com") {
+		if ip, err := netip.ParseAddr(strings.ReplaceAll(strings.TrimPrefix(label, "ec2-"), "-", ".")); err == nil {
+			return []netip.Addr{ip}, nil
+		}
+	}
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 }
 
 func (r *scriptedResolver) callTimes() []time.Time {
@@ -280,6 +327,170 @@ func TestReportVerdict_PTRFailuresSpacedAndCapped(t *testing.T) {
 	assert.Empty(t, fw.addedIPs)
 }
 
+// githubPolicy allows github.com on tcp/443, as the GitHub Actions preset's
+// service-host rule does: the kind of rule a forged PTR record aims at.
+func githubPolicy(t *testing.T) *config.Manager {
+	t.Helper()
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{{
+		Type:   config.RuleTypeHostname,
+		Value:  "github.com",
+		Action: config.ActionAllow,
+		Ports:  []config.Port{{Port: 443, Protocol: config.ProtocolTCP}},
+	}}, config.ActionDeny))
+	return cm
+}
+
+// attackerIP is an address whose owner set its PTR record to a name under an
+// allowed host.
+const attackerIP = "203.0.113.66"
+
+// forgedPTR is the reverse lookup's answer for attackerIP.
+var forgedPTR = scriptedAnswer{names: []string{"exfil.github.com."}}
+
+// forgedNameForwards are the forward answers the forged name can get: the
+// owner of github.com decides them, and neither leads back to attackerIP.
+var forgedNameForwards = map[string]scriptedAnswer{
+	"the claimed name does not exist":     {err: &net.DNSError{Err: "no such host", IsNotFound: true}},
+	"the claimed name resolves elsewhere": {names: []string{"140.82.112.3"}},
+}
+
+// A PTR record is the address owner's claim, and can name any host. One
+// naming a subdomain of an allowed host must neither late-allow nor label a
+// denied connection to an address that host's own DNS never gave, or anyone
+// who controls a reverse zone could open the firewall to their own server.
+func TestReportVerdict_ForgedPTRDoesNotLateAllow(t *testing.T) {
+	for name, forward := range forgedNameForwards {
+		t.Run(name, func(t *testing.T) {
+			clock, res := useScriptedReverseDNS(t, forgedPTR)
+			res.forwardScript = []scriptedAnswer{forward}
+			cm := githubPolicy(t)
+			fw := &mockFirewallUpdater{}
+
+			for range 3 { // the client's SYN retransmits, each past any backoff
+				ev := reportDrop(t, cm, fw, dropTo(attackerIP, 443))
+				assert.Equal(t, EventConnectionBlocked, ev.EventType)
+				assert.Empty(t, ev.DstHostname, "the forged name labels nothing")
+				assert.Empty(t, ev.MatchedRule)
+				reverseDNSRetries.wait()
+				clock.advance(reverseDNSBaseBackoff << reverseDNSMaxAttempts)
+			}
+			reverseDNSRetries.wait()
+			assert.Empty(t, fw.addedIPs, "nothing opened under the forged name")
+			assert.Empty(t, cm.LookupHostnameByIP(attackerIP), "the forged name is not cached")
+			assert.Len(t, res.callTimes(), 1, "a refuted name is a settled answer: no retry")
+		})
+	}
+}
+
+// The same on the TC path, whose events are prepared on the ring-buffer
+// reader.
+func TestProcessEvent_ForgedPTRDoesNotLateAllow(t *testing.T) {
+	for name, forward := range forgedNameForwards {
+		t.Run(name, func(t *testing.T) {
+			_, res := useScriptedReverseDNS(t, forgedPTR)
+			res.forwardScript = []scriptedAnswer{forward}
+			cm := githubPolicy(t)
+			fw := &mockFirewallUpdater{}
+			auditLogger, err := NewAuditLogger("", false)
+			require.NoError(t, err)
+			sink := &recordingSink{}
+			auditLogger.AddSink(sink)
+
+			for range 3 { // the client's SYN retransmits
+				processEvent(makeBpfEvent(BpfBlockedEvent{
+					IpVersion: 4, IpProto: unix.IPPROTO_TCP,
+					SrcIp: ipv4ToUint32("10.1.0.5"), DstIp: ipv4ToUint32(attackerIP), SrcPort: 40001, DstPort: 443,
+				}), cm, nil, auditLogger, fw, nil, newTestLogger(), nil)
+			}
+			reverseDNSRetries.wait()
+
+			require.Len(t, sink.events, 3)
+			for _, ev := range sink.events {
+				assert.Equal(t, EventConnectionBlocked, ev.EventType)
+				assert.Empty(t, ev.DstHostname, "the forged name labels nothing")
+			}
+			assert.Empty(t, fw.addedIPs, "nothing opened under the forged name")
+		})
+	}
+}
+
+// A PTR answer can carry several names. A forged one first must not stop a
+// genuine one after it from naming the IP, and the genuine one is matched and
+// reported lowercased, whatever case it came back in.
+func TestReportVerdict_GenuinePTRNameAfterAForgedOneLateAllows(t *testing.T) {
+	useScriptedReverseDNS(t, scriptedAnswer{names: []string{
+		"exfil.github.com.", "Ec2-198-51-100-7.Compute-1.Amazonaws.Com.",
+	}})
+	https := []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "github.com", Action: config.ActionAllow, Ports: https},
+		{Type: config.RuleTypeHostname, Value: "*.compute-1.amazonaws.com", Action: config.ActionAllow, Ports: https},
+	}, config.ActionDeny))
+	fw := &mockFirewallUpdater{}
+
+	ev := reportBuilderDrop(t, cm, fw)
+
+	assert.Equal(t, EventConnectionLateAllowed, ev.EventType)
+	assert.Equal(t, "*.compute-1.amazonaws.com", ev.MatchedRule)
+	assert.Equal(t, "ec2-198-51-100-7.compute-1.amazonaws.com", ev.DstHostname)
+	require.Len(t, fw.addedIPs, 1)
+	assert.True(t, fw.addedIPs[0].ip.Equal(net.ParseIP(builderIP)))
+}
+
+// A reverse name no rule allows can't change a verdict, so it is neither
+// confirmed nor used as a label: no forward query goes to a zone the
+// destination's owner chose, and none reaches the proxy's filter, which would
+// refuse it and record it as the job's query.
+func TestReportVerdict_PTRNameNoRuleAllowsIsNotLookedUp(t *testing.T) {
+	clock, res := useScriptedReverseDNS(t, scriptedAnswer{names: []string{"server9.hosting.example."}})
+	cm := githubPolicy(t)
+	fw := &mockFirewallUpdater{}
+
+	for range 2 {
+		ev := reportDrop(t, cm, fw, dropTo(attackerIP, 443))
+		assert.Equal(t, EventConnectionBlocked, ev.EventType)
+		assert.Empty(t, ev.DstHostname, "a name no rule allows labels nothing")
+		reverseDNSRetries.wait()
+		clock.advance(reverseDNSBaseBackoff << reverseDNSMaxAttempts)
+	}
+
+	assert.Zero(t, res.forwardCount(), "no forward query for a name no rule allows")
+	assert.Len(t, res.callTimes(), 1, "the PTR answer settled the IP")
+	assert.Empty(t, fw.addedIPs)
+}
+
+// A forward lookup that fails says nothing about the reverse name, any more
+// than a failed PTR lookup does: the IP is looked up again after the backoff,
+// and the name, once confirmed, late-allows. A transient failure must not
+// block a destination its reverse name allows for the rest of the run.
+func TestReportVerdict_ConfirmationTimeoutRetriesThenLateAllows(t *testing.T) {
+	clock, res := useScriptedReverseDNS(t,
+		scriptedAnswer{names: []string{"ec2-198-51-100-7.compute-1.amazonaws.com."}})
+	res.forwardScript = []scriptedAnswer{{err: errPTRTimeout}, {names: []string{builderIP}}}
+	cm := builderPolicy(t)
+	fw := &mockFirewallUpdater{}
+
+	ev := reportBuilderDrop(t, cm, fw)
+	assert.Equal(t, EventConnectionBlocked, ev.EventType)
+	assert.Empty(t, ev.DstHostname, "the name is not confirmed yet")
+	assert.Empty(t, fw.addedIPs)
+
+	clock.advance(reverseDNSBaseBackoff)
+	ev = reportBuilderDrop(t, cm, fw)
+	assert.Equal(t, EventConnectionBlocked, ev.EventType, "the retry runs off the reporting path")
+	reverseDNSRetries.wait()
+
+	ev = reportBuilderDrop(t, cm, fw)
+	assert.Equal(t, EventConnectionLateAllowed, ev.EventType)
+	assert.Equal(t, "*.compute-1.amazonaws.com", ev.MatchedRule)
+	assert.Equal(t, "ec2-198-51-100-7.compute-1.amazonaws.com", ev.DstHostname)
+	require.Len(t, fw.addedIPs, 1)
+	assert.True(t, fw.addedIPs[0].ip.Equal(net.ParseIP(builderIP)))
+	assert.Len(t, res.callTimes(), 2)
+}
+
 // gatedResolver answers retries with each IP's PTR name, but only once its
 // gate is open; until then a lookup waits, the way one waits on a slow
 // upstream. onLookup, when set, runs as a lookup starts.
@@ -307,6 +518,10 @@ func (g *gatedResolver) LookupAddr(_ context.Context, ip string) ([]string, erro
 	}
 	<-g.gate
 	return []string{"ec2-" + strings.ReplaceAll(ip, ".", "-") + ".compute-1.amazonaws.com."}, nil
+}
+
+func (g *gatedResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	return publicForward(host)
 }
 
 func (g *gatedResolver) callsFor(ip string) int {
@@ -454,6 +669,10 @@ type forwardDuringLookup struct{ cm *config.Manager }
 func (f forwardDuringLookup) LookupAddr(_ context.Context, ip string) ([]string, error) {
 	f.cm.UpdateDNSMapping("builder.example", ip)
 	return []string{"ec2-198-51-100-7.compute-1.amazonaws.com."}, nil
+}
+
+func (forwardDuringLookup) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	return publicForward(host)
 }
 
 // The same on the first lookup, which runs while the event is prepared: the

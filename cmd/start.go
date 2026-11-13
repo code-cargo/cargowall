@@ -265,6 +265,10 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		// Get upstream DNS server (defaults to Kubernetes DNS)
 		upstream := cmd.DNSUpstream
 
+		// cargowall's own reverse lookups go to the upstream directly, never
+		// through the proxy (see newUpstreamResolver). Set before events flow.
+		events.SetReverseDNSResolver(newUpstreamResolver(upstream))
+
 		// Listen on localhost port 53 for DNS interception
 		listenAddr := "127.0.0.1:53"
 		dnsServer = dns.NewServer(
@@ -690,7 +694,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		existing := scanExistingForStartup(cmd, logger)
 
 		if cmd.PrepopulateDNSCache {
-			preResolve(ctx, existing, configMgr, dnsServer, newStubResolver(), newProxyResolver(), logger)
+			preResolve(ctx, existing, configMgr, dnsServer, newStubResolver(), newProxyResolver(),
+				newUpstreamResolver(cmd.DNSUpstream), logger)
 		}
 
 		// Flush systemd-resolved's cache now that the redirect is installed

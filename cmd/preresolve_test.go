@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -51,14 +53,31 @@ func (r *stalledResolver) LookupHost(ctx context.Context, _ string) ([]string, e
 	return nil, ctx.Err()
 }
 
-// answeringResolver answers every lookup at once.
+func (r *stalledResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+	r.calls.Add(1)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// answeringResolver answers every lookup at once. Its reverse names fall under
+// policyTracking's first rule and resolve back to their address, as a
+// forward-confirmed PTR does; hosts records the names LookupHost resolved.
 type answeringResolver struct {
 	mu    sync.Mutex
 	hosts []string
 }
 
 func (r *answeringResolver) LookupAddr(_ context.Context, addr string) ([]string, error) {
-	return []string{"peer-" + addr + ".example."}, nil
+	return []string{"peer-" + addr + ".host0.example.com."}, nil
+}
+
+func (r *answeringResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	if addr, ok := strings.CutPrefix(host, "peer-"); ok {
+		if addr, ok = strings.CutSuffix(addr, ".host0.example.com."); ok {
+			return []netip.Addr{netip.MustParseAddr(addr)}, nil
+		}
+	}
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 }
 
 func (r *answeringResolver) LookupHost(_ context.Context, host string) ([]string, error) {
@@ -140,7 +159,7 @@ func TestPreResolve_StalledResolverReturnsWithinDeadline(t *testing.T) {
 	var logs bytes.Buffer
 
 	started := time.Now()
-	preResolve(context.Background(), existingPeers(3*preResolveWorkers), cm, sink, stub, proxy, jsonLogger(&logs))
+	preResolve(context.Background(), existingPeers(3*preResolveWorkers), cm, sink, stub, proxy, stub, jsonLogger(&logs))
 	elapsed := time.Since(started)
 
 	assert.Less(t, elapsed, preResolveDeadline+time.Second, "pre-resolution outlasted its deadline")
@@ -167,7 +186,8 @@ func TestPreResolve_CancelledContextReturnsAtOnce(t *testing.T) {
 	cancel()
 
 	started := time.Now()
-	preResolve(ctx, existingPeers(8), cm, &recordingCacheSink{}, &stalledResolver{}, &stalledResolver{}, slog.Default())
+	preResolve(ctx, existingPeers(8), cm, &recordingCacheSink{},
+		&stalledResolver{}, &stalledResolver{}, &stalledResolver{}, slog.Default())
 	assert.Less(t, time.Since(started), time.Second)
 }
 
@@ -182,7 +202,7 @@ func TestPreResolve_HealthyResolverPopulatesEverything(t *testing.T) {
 	stub, proxy := &answeringResolver{}, &answeringResolver{}
 	var logs bytes.Buffer
 
-	preResolve(context.Background(), conns, cm, sink, stub, proxy, jsonLogger(&logs))
+	preResolve(context.Background(), conns, cm, sink, stub, proxy, stub, jsonLogger(&logs))
 
 	assert.Empty(t, logRecords(t, &logs, slog.LevelWarn), "nothing was cut off, so nothing is a Warn")
 	var done []any
@@ -193,7 +213,7 @@ func TestPreResolve_HealthyResolverPopulatesEverything(t *testing.T) {
 	}
 	assert.Equal(t, []any{float64(names), float64(0)}, done, "the success line reports every name resolved")
 	for ip := range conns {
-		assert.Equal(t, "peer-"+ip+".example", cm.LookupHostnameByIP(ip))
+		assert.Equal(t, "peer-"+ip+".host0.example.com", cm.LookupHostnameByIP(ip))
 	}
 	assert.Len(t, sink.answers, names)
 	assert.Equal(t, 1, sink.applied)
@@ -248,6 +268,10 @@ func (r *cachedForwardSlowPTR) LookupHost(_ context.Context, host string) ([]str
 	if ips, ok := r.forward[host]; ok {
 		return ips, nil
 	}
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+}
+
+func (r *cachedForwardSlowPTR) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
 	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 }
 
@@ -314,7 +338,7 @@ func TestPreResolve_CachedForwardNameWinsOverLatePTR(t *testing.T) {
 		ptrDelay: 30 * time.Millisecond,
 	}
 
-	preResolve(context.Background(), conns, cm, srv, stub, refusingProxy{}, quietLogger())
+	preResolve(context.Background(), conns, cm, srv, stub, refusingProxy{}, stub, quietLogger())
 	gate := &gateRecorder{}
 	gateExistingConnections(conns, cm, gate, nil, nil, quietLogger())
 
@@ -323,4 +347,42 @@ func TestPreResolve_CachedForwardNameWinsOverLatePTR(t *testing.T) {
 	assert.NotContains(t, gate.adds, "203.0.113.5 allow", "the peer the job denies is blocked")
 	require.Contains(t, gate.adds, "203.0.113.6 allow")
 	assert.Equal(t, https, gate.adds["203.0.113.6 allow"].ports, "the allowed peer gets its rule's ports, not its observed one")
+}
+
+// forgedPTRStub is systemd-resolved's stub for a peer whose owner set its PTR
+// record to a name under an allowed host. That name has no forward record:
+// only the allowed host's owner could give it one.
+type forgedPTRStub struct{}
+
+func (forgedPTRStub) LookupAddr(context.Context, string) ([]string, error) {
+	return []string{"exfil.allowed.example.com."}, nil
+}
+
+func (forgedPTRStub) LookupHost(_ context.Context, host string) ([]string, error) {
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+}
+
+func (forgedPTRStub) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+}
+
+// A forged PTR record must not name an existing connection's peer: the gate
+// opens a named peer on its rule's ports, which for an all-ports allow is
+// every port. The peer stays unnamed and keeps only its observed port.
+func TestPreResolve_ForgedPTRKeepsExistingConnectionToItsObservedPort(t *testing.T) {
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allowed.example.com", Action: config.ActionAllow},
+	}, config.ActionDeny))
+	srv := dns.NewServer(cm, nil, "127.0.0.1:1", "127.0.0.1:0", slog.New(slog.DiscardHandler))
+	observed := []config.Port{{Port: 8443, Protocol: config.ProtocolTCP}}
+	conns := existingConns{"203.0.113.66": observed}
+
+	preResolve(context.Background(), conns, cm, srv, forgedPTRStub{}, refusingProxy{}, forgedPTRStub{}, quietLogger())
+	gate := &gateRecorder{}
+	gateExistingConnections(conns, cm, gate, nil, nil, quietLogger())
+
+	assert.Empty(t, cm.LookupHostnameByIP("203.0.113.66"), "the forged name is not recorded")
+	require.Contains(t, gate.adds, "203.0.113.66 allow")
+	assert.Equal(t, observed, gate.adds["203.0.113.66 allow"].ports, "only the observed port, not the rule's")
 }

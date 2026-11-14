@@ -2,6 +2,8 @@ module github.com/code-cargo/cargowall
 
 go 1.25.0
 
+toolchain go1.26.11
+
 require (
 	github.com/alecthomas/kong v1.15.0
 	github.com/cilium/ebpf v0.21.0

@@ -63,9 +63,9 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # A tool built by an older Go than the one it runs beside fails on the
-      # newer standard library, so the key carries the Go version as well as
-      # the Makefile's pins.
+      # Keyed on the Go version too, so a toolchain bump saves a fresh set:
+      # install-tools rebuilds any tool a different Go built, and a cache hit
+      # never saves, so a key without it would rebuild them on every run.
       - name: Cache Go tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:

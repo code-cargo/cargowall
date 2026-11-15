@@ -22,12 +22,12 @@ import (
 	"maps"
 	"net"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/network"
 )
 
@@ -71,8 +71,15 @@ const (
 // implementation must honour ctx; Go's resolver does, but a cgo one, whose
 // getaddrinfo can't be cancelled, would not.
 type stubResolver interface {
-	LookupAddr(ctx context.Context, addr string) ([]string, error)
 	LookupHost(ctx context.Context, host string) ([]string, error)
+}
+
+// reverseResolver names the existing connections' peers: cargowall's DNS
+// upstream in production (newUpstreamResolver), a scripted resolver in tests.
+// Like stubResolver, it must honour ctx.
+type reverseResolver interface {
+	LookupAddr(ctx context.Context, addr string) ([]string, error)
+	events.HostResolver
 }
 
 // hostResolver resolves a name; the proxy in production (newProxyResolver).
@@ -102,6 +109,22 @@ func newStubResolver() *net.Resolver {
 	}
 }
 
+// newUpstreamResolver resolves through cargowall's DNS upstream directly,
+// marked like the proxy's own upstream client so the redirect passes it
+// through. It serves the lookups cargowall makes for itself, naming and
+// confirming peers by reverse DNS: those must not reach the proxy, whose
+// filter would refuse them and record them as the job's queries, and whose
+// answers would count as the job's forward resolutions.
+func newUpstreamResolver(upstream string) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, proto, _ string) (net.Conn, error) {
+			d := &net.Dialer{Control: network.MarkDNSProxySocket}
+			return d.DialContext(ctx, proto, upstream)
+		},
+	}
+}
+
 // newProxyResolver resolves through cargowall's own DNS proxy, which writes
 // the answers it enforces to the firewall.
 func newProxyResolver() *net.Resolver {
@@ -115,8 +138,8 @@ func newProxyResolver() *net.Resolver {
 }
 
 // preResolve runs startup pre-resolution under preResolveDeadline. The
-// existing connections' reverse names and the stub-cache snapshot (phase 1)
-// run side by side, both from the stub; the cache entries are applied to the
+// existing connections' reverse names, from rev, and the stub-cache snapshot
+// (phase 1) run side by side; the cache entries are applied to the
 // firewall; then the tracked names are resolved through the proxy (phase 2).
 //
 // An address both stub rounds name must keep the cached forward answer, the
@@ -133,7 +156,7 @@ func newProxyResolver() *net.Resolver {
 // nothing: that costs only phase 2's head start, never enforcement. Derives
 // from ctx, so a startup-window shutdown signal drains it promptly.
 func preResolve(ctx context.Context, conns existingConns, configMgr *config.Manager, sink cacheSink,
-	stub stubResolver, proxy hostResolver, logger *slog.Logger,
+	stub stubResolver, proxy hostResolver, rev reverseResolver, logger *slog.Logger,
 ) {
 	ctx, cancel := context.WithTimeout(ctx, preResolveDeadline)
 	defer cancel()
@@ -144,7 +167,7 @@ func preResolve(ctx context.Context, conns existingConns, configMgr *config.Mana
 	var peersCutOff, cached, cacheCutOff int
 	var answersMu sync.Mutex
 	answers := make(map[string][]string)
-	wg.Go(func() { peersCutOff = reverseDNSExistingConnections(ctx, conns, configMgr, stub, logger) })
+	wg.Go(func() { peersCutOff = reverseDNSExistingConnections(ctx, conns, configMgr, rev, logger) })
 	wg.Go(func() {
 		cached, cacheCutOff = lookupEach(ctx, hostnames, preResolveStubLookup, func(ctx context.Context, hostname string) bool {
 			ips, err := stub.LookupHost(ctx, hostname)
@@ -194,20 +217,33 @@ func preResolve(ctx context.Context, conns existingConns, configMgr *config.Mana
 }
 
 // reverseDNSExistingConnections looks up the reverse name of each scanned
-// existing-connection IP through the stub, recording it as the hostname of
-// each IP that has none yet, for gateExistingConnections' attribution: a
-// reverse name never replaces a forward one. It returns how many lookups ctx
-// cut off.
-func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, stub stubResolver, logger *slog.Logger) int {
+// existing-connection IP through rev, recording it as the hostname of each IP
+// that has none yet, for gateExistingConnections' attribution: a reverse name
+// never replaces a forward one. Only a name a rule could use, whose forward
+// lookup leads back to the IP, is recorded (see events.UsableReverseNames and
+// events.ConfirmReverseName): the gate opens a named IP on its rule's ports,
+// so a forged PTR record must not choose the rule. It returns how many
+// lookups ctx cut off.
+func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager,
+	rev reverseResolver, logger *slog.Logger,
+) int {
 	if len(conns) == 0 {
 		return 0
 	}
 	named, cutOff := lookupEach(ctx, slices.Sorted(maps.Keys(conns)), preResolveStubLookup, func(ctx context.Context, ip string) bool {
-		names, err := stub.LookupAddr(ctx, ip)
+		names, err := rev.LookupAddr(ctx, ip)
 		if err != nil || len(names) == 0 {
 			return false
 		}
-		hostname := strings.TrimSuffix(names[0], ".")
+		var hostname string
+		if usable := events.UsableReverseNames(configMgr, names); len(usable) > 0 {
+			hostname, _, _ = events.ConfirmReverseName(ctx, rev, ip, usable)
+		}
+		if hostname == "" {
+			logger.Debug("No reverse DNS name a rule allows resolves back to the peer; leaving it unnamed",
+				"ip", ip, "reverse_names", names)
+			return false
+		}
 		recorded := configMgr.RecordReverseName(hostname, ip)
 		logger.Debug("Reverse DNS for existing connection", "ip", ip, "hostname", hostname, "recorded", recorded)
 		return true

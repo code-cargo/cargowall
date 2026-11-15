@@ -95,10 +95,17 @@ verify_http() {
 # wget times out, its TLS helper (ssl_client) stays blocked in the dropped
 # handshake holding whatever pipe it inherited, and a reader of that pipe
 # waits until the server gives up — minutes. The container's exit kills it.
+#
+# The probe waits a second before it connects. cargowall learns a container
+# from Docker's start event, which dockerd publishes once the container's
+# process is already running, so a connection made at once can beat it: that
+# is the start window, whose flows are reported without the container. The
+# check below wants the drop attributed to the container, so the probe starts
+# after the window.
 container_probe() {
   local name=$1 ip=$2
   docker run --rm --add-host "$name:$ip" alpine:latest sh -c \
-    "timeout 20 wget -S -O /dev/null --timeout=8 --no-check-certificate https://$name/ > /tmp/probe 2>&1; if grep -q 'HTTP/' /tmp/probe; then echo REACHED; else echo BLOCKED; fi" 2>&1 || true
+    "sleep 1; timeout 20 wget -S -O /dev/null --timeout=8 --no-check-certificate https://$name/ > /tmp/probe 2>&1; if grep -q 'HTTP/' /tmp/probe; then echo REACHED; else echo BLOCKED; fi" 2>&1 || true
 }
 
 # Container traffic meets the same hook in its own netns, before NAT.

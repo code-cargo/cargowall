@@ -28,8 +28,12 @@ import (
 	"github.com/code-cargo/cargowall/pkg/config"
 )
 
+// edgeAddrs are the addresses edge.cdn.example.net resolves to.
+var edgeAddrs = []string{"203.0.113.5", "203.0.113.6"}
+
 // ptrServer is a Go resolver for a local DNS server that names every
-// address edge.cdn.example.net by PTR.
+// address edge.cdn.example.net by PTR, and resolves that name to edgeAddrs,
+// so the PTR name is forward-confirmed for them.
 func ptrServer(t *testing.T) *net.Resolver {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -42,11 +46,20 @@ func ptrServer(t *testing.T) *net.Resolver {
 			m := new(dns.Msg)
 			m.SetReply(r)
 			m.RecursionAvailable = true
-			if r.Question[0].Qtype == dns.TypePTR {
+			q := r.Question[0]
+			switch {
+			case q.Qtype == dns.TypePTR:
 				m.Answer = append(m.Answer, &dns.PTR{
-					Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 60},
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 60},
 					Ptr: "edge.cdn.example.net.",
 				})
+			case q.Qtype == dns.TypeA && q.Name == "edge.cdn.example.net.":
+				for _, a := range edgeAddrs {
+					m.Answer = append(m.Answer, &dns.A{
+						Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+						A:   net.ParseIP(a),
+					})
+				}
 			}
 			_ = w.WriteMsg(m)
 		}),
@@ -69,6 +82,9 @@ func ptrServer(t *testing.T) *net.Resolver {
 // the proxy already named, the policy's name rules match, keeps that name.
 func TestReverseDNSExistingConnections_KeepsAForwardName(t *testing.T) {
 	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "cdn.example.net", Action: config.ActionAllow},
+	}, config.ActionDeny))
 	cm.UpdateDNSMapping("denied.example.com", "203.0.113.5")
 	https := []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}
 	conns := existingConns{"203.0.113.5": https, "203.0.113.6": https}

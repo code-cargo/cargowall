@@ -307,7 +307,10 @@ func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 
 		case config.RuleTypeHostname:
 			// Resolved hostnames are added as /32 or /128 entries
-			hostPortValues := expandPorts(rule.Ports)
+			hostPortValues, ok := f.rulePorts(rule.Ports, actionVal, rule.Value)
+			if !ok {
+				continue
+			}
 			for _, ip := range rule.IPs {
 				if ip4 := ip.To4(); ip4 != nil {
 					if err := f.addCIDRv4(bpf.PolicyJob, ip4, 32, actionVal, hostPortValues, rule.Value); err != nil {
@@ -334,7 +337,11 @@ func (f *FirewallImpl) addCIDRRuleLocked(policy uint32, rule config.ResolvedRule
 		return nil // Skip invalid CIDR rules
 	}
 	// Expand ports with protocol info for BPF maps
-	return f.addCIDRPortsLocked(policy, rule.IPNet, actionVal, expandPorts(rule.Ports))
+	ports, ok := f.rulePorts(rule.Ports, actionVal, rule.Value)
+	if !ok {
+		return nil
+	}
+	return f.addCIDRPortsLocked(policy, rule.IPNet, actionVal, ports)
 }
 
 // addCIDRPortsLocked writes a prefix on expanded ports under policy, as
@@ -506,6 +513,29 @@ func (f *FirewallImpl) addCIDRv6(policy uint32, ip6 net.IP, prefixLen uint32, ac
 	return nil
 }
 
+// errNoKnownPort refuses an allow none of whose ports has a known protocol.
+var errNoKnownPort = errors.New("no port the rule names has a protocol cargowall knows")
+
+// rulePorts expands a rule's ports for the maps. A rule that names ports,
+// none of which has a protocol cargowall knows, must never reach the maps
+// on every port: an allow is refused (ok false), and a deny keeps every
+// port, which is the closed side. The loaders refuse such a port, so this
+// is the firewall's own guard against a gap in them, and logs an Error.
+func (f *FirewallImpl) rulePorts(ports []config.Port, actionVal uint8, label string) ([]portProto, bool) {
+	pp := expandPorts(ports)
+	if len(ports) == 0 || len(pp) > 0 {
+		return pp, true
+	}
+	if actionVal == 1 {
+		f.logger.Error("Refusing an allow rule none of whose ports has a known protocol, which would allow every port",
+			"rule", label, "ports", ports)
+		return nil, false
+	}
+	f.logger.Error("Keeping a deny rule none of whose ports has a known protocol on every port",
+		"rule", label, "ports", ports)
+	return nil, true
+}
+
 // expandPorts converts config.Port entries into portProto values for BPF map keys.
 // ProtocolAll expands to ICMP, TCP, and UDP entries so that the BPF lookup
 // (which always uses the packet's exact protocol) matches correctly.
@@ -591,10 +621,13 @@ func (f *FirewallImpl) prepV6Ports(ports []portProto, labelKey, labelVal string)
 // all-ports grant, returns (false, nil). See the Firewall interface for the
 // accumulation and all-ports-stickiness semantics.
 func (f *FirewallImpl) AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error) {
-	pp := expandPorts(ports)
 	var actionVal uint8 = 0
 	if action == config.ActionAllow {
 		actionVal = 1
+	}
+	pp, ok := f.rulePorts(ports, actionVal, ip.String())
+	if !ok {
+		return false, errNoKnownPort
 	}
 	if ip4 := ip.To4(); ip4 != nil {
 		f.mu.Lock()

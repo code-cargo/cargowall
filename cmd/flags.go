@@ -82,7 +82,7 @@ type StartCmd struct {
 	refusedLate string
 
 	// Configuration
-	Config    string `help:"Path to configuration file" default:"/etc/cargowall/config.json" env:"CARGOWALL_CONFIG"`
+	Config    string `help:"Path to configuration file (default /etc/cargowall/config.json). A file named here that doesn't load fails startup whenever it is the configuration that applies" env:"CARGOWALL_CONFIG"`
 	Interface string `help:"Network interface to attach to (auto-detect if empty)" env:"CARGOWALL_INTERFACE"`
 
 	Token  string `help:"codecargo token" env:"CODECARGO_AUTH_TOKEN"`

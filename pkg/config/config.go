@@ -17,7 +17,6 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -698,9 +697,9 @@ func (cm *Manager) LoadConfig(path string) error {
 		return fmt.Errorf("read config file: %w", err)
 	}
 
-	var config FirewallConfig
-	if err := json.Unmarshal(data, &config); err != nil {
-		return fmt.Errorf("parse config: %w", err)
+	config, err := decodeLocalConfig(data)
+	if err != nil {
+		return err
 	}
 
 	config.SearchDomains = normalizeSearchDomains(config.SearchDomains)
@@ -708,7 +707,7 @@ func (cm *Manager) LoadConfig(path string) error {
 		return err
 	}
 
-	if err := cm.applyLoadedConfig(&config); err != nil {
+	if err := cm.applyLoadedConfig(config); err != nil {
 		return err
 	}
 	slog.Info("Config loaded successfully",

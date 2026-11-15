@@ -386,7 +386,9 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
 	var apiPolicyLoaded bool
 	if cmd.CIMode() != CIModeNone {
-		apiPolicyLoaded = loadCIConfig(ctx, cmd, configMgr, auditLogger, logger)
+		if apiPolicyLoaded, err = loadCIConfig(ctx, cmd, configMgr, auditLogger, logger); err != nil {
+			return err
+		}
 	} else if hooks != nil && hooks.LoadPolicy != nil {
 		// Extension hook: load policy from external source (e.g., NATS state machine)
 		policy, hookSmClient, cleanup, err := hooks.LoadPolicy(ctx, cmd)
@@ -412,12 +414,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			notificationTracker = events.NewNotificationTracker(hookSmClient, logger)
 			logger.Info("CargoWall block notifications enabled via hook")
 		}
-	} else {
-		// Load from file (original behavior)
-		if err := configMgr.LoadConfig(cmd.Config); err != nil {
-			logger.Error("Failed to load config", "error", err, "path", cmd.Config)
-			// Continue with default deny-all policy
-		}
+	} else if err := loadPlainConfig(cmd, configMgr, logger); err != nil {
+		return err
 	}
 
 	// The loopback and docker-bridge carve-outs are owned by the
@@ -817,7 +815,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		logger.Info("CargoWall TC firewall started",
 			"interface", ifname,
 			"config_source", "file",
-			"config_path", cmd.Config)
+			"config_path", cmd.configFile())
 	}
 
 	if startupInterrupted(ctx, logger, "post-attach") {
@@ -1046,7 +1044,7 @@ func writeModeFile(auditMode bool, logger *slog.Logger) {
 // Returns true if SaaS API policy was loaded. Posture changes land on
 // configMgr (the single source of truth); under --api-failure-mode=fail
 // cmd.policyLockdown is set in place.
-func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, logger *slog.Logger) bool {
+func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, logger *slog.Logger) (bool, error) {
 	logger.Info("Running in CI mode", "mode", string(cmd.CIMode()))
 
 	var apiPolicyLoaded bool
@@ -1097,7 +1095,7 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 				// The fetch died because a shutdown signal cancelled the
 				// context, not because of the network — don't misreport a
 				// posture change (or write sentinels) while unwinding.
-				return false
+				return false, nil
 			}
 			handlePolicyFetchFailure(cmd, configMgr, auditLogger, err, logger)
 		}
@@ -1107,12 +1105,8 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 	// lockdown: --api-failure-mode=fail means "do not trust local config",
 	// so the deny-all bootstrap loaded before the fetch stays in force.
 	if !apiPolicyLoaded && !cmd.policyLockdown {
-		if err := configMgr.LoadFromEnv(); err != nil {
-			logger.Debug("No environment config found, trying file", "error", err)
-			if err := configMgr.LoadConfig(cmd.Config); err != nil {
-				logger.Warn("No config loaded — defaulting to deny-all. Infrastructure hosts will be auto-allowed.",
-					"error", err, "path", cmd.Config)
-			}
+		if err := loadLocalConfig(cmd, configMgr, logger); err != nil {
+			return false, err
 		}
 	}
 
@@ -1120,7 +1114,7 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 	// DNS listeners) are NOT added here: they run unconditionally in
 	// startCargoWall after config load, independent of CI mode.
 
-	return apiPolicyLoaded
+	return apiPolicyLoaded, nil
 }
 
 // handlePolicyFetchFailure applies the --api-failure-mode posture to a failed

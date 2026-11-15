@@ -424,8 +424,8 @@ func TestLoadConfig(t *testing.T) {
 	configData := `{
 		"rules": [
 			{"type": "cidr", "value": "192.168.1.0/24", "action": "allow"},
-			{"type": "cidr", "value": "10.0.0.0/8", "ports": [{"value": 80, "protocol": "all"}, {"value": 443, "protocol": "all"}], "action": "allow"},
-			{"type": "hostname", "value": "localhost", "ports": [{"value": 8080, "protocol": "all"}], "action": "allow"}
+			{"type": "cidr", "value": "10.0.0.0/8", "ports": [{"port": 80, "protocol": "all"}, {"port": 443, "protocol": "all"}], "action": "allow"},
+			{"type": "hostname", "value": "localhost", "ports": [{"port": 8080, "protocol": "all"}], "action": "allow"}
 		],
 		"defaultAction": "deny"
 	}`
@@ -1496,7 +1496,7 @@ func TestLoadConfig_SudoLockdown(t *testing.T) {
 
 	configData := `{
 		"rules": [
-			{"type": "hostname", "value": "github.com", "ports": [{"value": 443, "protocol": "tcp"}], "action": "allow"}
+			{"type": "hostname", "value": "github.com", "ports": [{"port": 443, "protocol": "tcp"}], "action": "allow"}
 		],
 		"defaultAction": "deny",
 		"sudoLockdown": {

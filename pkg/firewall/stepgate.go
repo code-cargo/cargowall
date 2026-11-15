@@ -229,7 +229,11 @@ func (f *FirewallImpl) writeStepCIDRsLocked(sr config.StepRules) {
 		if rule.Type != config.RuleTypeCIDR || rule.IPNet == nil {
 			continue
 		}
-		if allow, deny, ok := f.gateStepLocked(sr.Policy, rule.IPNet, expandPorts(rule.Ports)); ok {
+		ports, ok := f.rulePorts(rule.Ports, 1, rule.Value)
+		if !ok {
+			continue
+		}
+		if allow, deny, ok := f.gateStepLocked(sr.Policy, rule.IPNet, ports); ok {
 			planned = append(planned, stepPrefix{label: rule.Value, net: rule.IPNet, allow: allow, deny: deny})
 		}
 	}

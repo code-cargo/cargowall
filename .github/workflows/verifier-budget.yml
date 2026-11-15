@@ -60,7 +60,7 @@ jobs:
       matrix:
         kernel: ["5.15", "6.6", "longterm"]
     steps:
-      - uses: code-cargo/cargowall-action@872edd556d53b64821765543552b50d8cf5471f4 # main, v2.0.0-rc.15
+      - uses: code-cargo/cargowall-action@576b6827746edaa3bc67537959d0e28ef9b45ac7 # main, v2.0.0-rc.16
         with:
           mode: audit
           offline: ${{ env.CW_OFFLINE }}

@@ -71,8 +71,9 @@ type StartCmd struct {
 	// withheld so the action fails the job with the failure sentinel's
 	// reason. Unexported: internal state, not a flag.
 	policyLockdown bool
-	// refusedPosture names the fail-closed posture whose loss failed
-	// startup, set by postureLedger.lose: StartCargoWall puts it in the
+	// refusedPosture names what startup refused: the fail-closed posture
+	// whose loss failed it, set by postureLedger.lose, or a local
+	// configuration that didn't load (refusedConfig). StartCargoWall puts it in the
 	// failure sentinel and the exit status (see exitRefused). Unexported:
 	// internal state, not a flag.
 	refusedPosture string
@@ -82,7 +83,7 @@ type StartCmd struct {
 	refusedLate string
 
 	// Configuration
-	Config    string `help:"Path to configuration file" default:"/etc/cargowall/config.json" env:"CARGOWALL_CONFIG"`
+	Config    string `help:"Path to configuration file (default /etc/cargowall/config.json). Whenever it is the configuration that applies, a file named here must be there, and a file here or at the default path that doesn't load refuses startup. In CI mode, naming a file here beside the environment configuration (CARGOWALL_DEFAULT_ACTION and the rest) refuses startup too" env:"CARGOWALL_CONFIG"`
 	Interface string `help:"Network interface to attach to (auto-detect if empty)" env:"CARGOWALL_INTERFACE"`
 
 	Token  string `help:"codecargo token" env:"CODECARGO_AUTH_TOKEN"`

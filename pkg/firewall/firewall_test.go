@@ -635,21 +635,23 @@ func TestUpdateAllowlistTC_PortSpecificSubnet(t *testing.T) {
 // --- expandPorts protocol translation ---
 
 func TestExpandPorts_ICMP(t *testing.T) {
-	got := expandPorts([]config.Port{{Port: 0, Protocol: config.ProtocolICMP}})
+	got, known := expandPorts([]config.Port{{Port: 0, Protocol: config.ProtocolICMP}})
 	assert.Equal(t, []portProto{{Port: 0, Proto: protoICMP}}, got)
+	assert.True(t, known)
 }
 
 func TestExpandPorts_AllIncludesICMP(t *testing.T) {
-	got := expandPorts([]config.Port{{Port: 443, Protocol: config.ProtocolAll}})
+	got, known := expandPorts([]config.Port{{Port: 443, Protocol: config.ProtocolAll}})
 	assert.Equal(t, []portProto{
 		{Port: 0, Proto: protoICMP},
 		{Port: 443, Proto: protoTCP},
 		{Port: 443, Proto: protoUDP},
 	}, got)
+	assert.True(t, known)
 }
 
 func TestExpandPorts_MixedICMPAndTCP(t *testing.T) {
-	got := expandPorts([]config.Port{
+	got, known := expandPorts([]config.Port{
 		{Port: 0, Protocol: config.ProtocolICMP},
 		{Port: 443, Protocol: config.ProtocolTCP},
 	})
@@ -657,6 +659,7 @@ func TestExpandPorts_MixedICMPAndTCP(t *testing.T) {
 		{Port: 0, Proto: protoICMP},
 		{Port: 443, Proto: protoTCP},
 	}, got)
+	assert.True(t, known)
 }
 
 func TestStripICMPForV6_NilInput(t *testing.T) {

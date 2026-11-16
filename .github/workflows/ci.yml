@@ -405,6 +405,9 @@ jobs:
       - name: Make binary executable
         run: chmod +x bin/cargowall
 
+      - name: A --config that doesn't load fails startup
+        run: bash scripts/ci/config-strict.sh
+
       # Step bodies live in scripts/ci/step-rules.sh; the YAML is wiring.
       # Each step below is a workflow step of its own, since a step's
       # identity is the step it runs in.

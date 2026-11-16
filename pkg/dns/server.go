@@ -18,6 +18,7 @@ package dns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -1147,6 +1148,11 @@ func (s *Server) applyVerdictSide(ip net.IP, hostname string, action config.Acti
 		return false // the default already covers this IP; no L4 write needed
 	}
 	if err := s.addIPToBPFMaps(ip, hostname, finalAction, ports); err != nil {
+		// The firewall logs a rule naming an unknown protocol once; this
+		// asks again for every answer.
+		if errors.Is(err, config.ErrUnknownProtocol) {
+			return false
+		}
 		s.logger.Error(maybeReprocessMsg("Failed to add IP to BPF maps", isReprocess),
 			"hostname", hostname,
 			"ip", ipStr,

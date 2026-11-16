@@ -322,7 +322,7 @@ func (p *postureLedger) loseLate(posture, reason string) {
 }
 
 // exitRefused is `cargowall start`'s exit status when startup failed on a
-// refused posture, or on a local config file that didn't load
+// refused posture, or on a local configuration that didn't load
 // (refusedConfig). The failure sentinel names it too (see
 // writeFailureSentinel); the status is the channel that needs no file, for
 // a sentinel that could not be written. The action fails the step on
@@ -340,7 +340,7 @@ func (refusalError) ExitCode() int { return exitRefused }
 func (e refusalError) Unwrap() error { return e.error }
 
 // refusalExit is err as StartCargoWall returns it: carrying exitRefused
-// when startup was refused for a posture or a local config file, and, for
+// when startup was refused for a posture or a local configuration, and, for
 // a run that stopped cleanly, when a fail-closed posture was lost after
 // startup (loseLate).
 func refusalExit(err error, cmd *StartCmd) error {

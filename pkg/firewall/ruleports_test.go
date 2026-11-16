@@ -30,14 +30,18 @@ import (
 	"github.com/code-cargo/cargowall/pkg/config"
 )
 
-// unknownPorts names a port, but with no protocol cargowall knows, so
-// nothing of it expands.
+// unknownPorts names a port, but with a protocol cargowall doesn't know.
 var unknownPorts = []config.Port{{Port: 443, Protocol: "TCP"}}
 
-// A rule that names ports none of which expands never reaches the maps on
-// every port, whatever its source: an allow is refused, and a deny keeps
-// every port, the closed side. The loaders refuse such ports first.
-func TestRulePorts_NoKnownProtocolFailsClosed(t *testing.T) {
+// partlyKnownPorts names one port cargowall knows the protocol of, and one
+// it doesn't.
+var partlyKnownPorts = []config.Port{{Port: 443, Protocol: config.ProtocolTCP}, {Port: 80, Protocol: "TCP"}}
+
+// A rule naming a port whose protocol cargowall doesn't know never reaches
+// the maps as another rule, whatever its source: an allow is refused, and a
+// deny keeps every port, the closed side. The loaders refuse such ports
+// first.
+func TestRulePorts_UnknownProtocolFailsClosed(t *testing.T) {
 	var logs bytes.Buffer
 	fw, maps := newStepTestFirewall(ruleMapEntries, slog.New(slog.NewTextHandler(&logs, nil)))
 	host := func(a, b, c, d byte) *net.IPNet {
@@ -49,20 +53,20 @@ func TestRulePorts_NoKnownProtocolFailsClosed(t *testing.T) {
 		Type: config.RuleTypeCIDR, Value: "10.1.0.0/16", Action: config.ActionAllow, Ports: unknownPorts,
 		IPNet: &net.IPNet{IP: net.IPv4(10, 1, 0, 0).To4(), Mask: net.CIDRMask(16, 32)},
 	}, 1))
-	assert.Empty(t, maps[ruleMapCIDRs].store, "an allow on no known port was written")
+	assert.Empty(t, maps[ruleMapCIDRs].store, "an allow on an unknown protocol was written")
 	require.NoError(t, fw.addCIDRRuleLocked(bpf.PolicyJob, config.ResolvedRule{
 		Type: config.RuleTypeCIDR, Value: "10.2.0.0/16", Action: config.ActionDeny, Ports: unknownPorts,
 		IPNet: &net.IPNet{IP: net.IPv4(10, 2, 0, 0).To4(), Mask: net.CIDRMask(16, 32)},
 	}, 0))
 	require.Len(t, maps[ruleMapCIDRs].store, 1)
 	for _, v := range maps[ruleMapCIDRs].store {
-		assert.Equal(t, bpf.TcBpfLpmVal{Action: 0, PortSpecific: 0, HostBits: 16}, v, "a deny on no known port denies every port")
+		assert.Equal(t, bpf.TcBpfLpmVal{Action: 0, PortSpecific: 0, HostBits: 16}, v, "a deny on an unknown protocol denies every port")
 	}
 	assert.Empty(t, maps[ruleMapPorts].store)
 
 	// The DNS path: an allow is refused with an error; a deny is all ports.
 	_, err := fw.AddIP(net.IPv4(93, 184, 216, 34), config.ActionAllow, unknownPorts)
-	require.ErrorIs(t, err, config.ErrNoKnownPort)
+	require.ErrorIs(t, err, config.ErrUnknownProtocol)
 	assert.Len(t, maps[ruleMapCIDRs].store, 1, "the refused allow wrote nothing")
 	_, err = fw.AddIP(net.IPv4(93, 184, 216, 35), config.ActionDeny, unknownPorts)
 	require.NoError(t, err)
@@ -73,7 +77,7 @@ func TestRulePorts_NoKnownProtocolFailsClosed(t *testing.T) {
 	// step's own CIDR rule at the sync: both are allows, so both refused.
 	scoped := false
 	_, err = fw.AddPolicyIP(1, net.IPv4(93, 184, 216, 36), unknownPorts, func() error { scoped = true; return nil })
-	require.ErrorIs(t, err, config.ErrNoKnownPort)
+	require.ErrorIs(t, err, config.ErrUnknownProtocol)
 	assert.False(t, scoped)
 	fw.writeStepCIDRsLocked(config.StepRules{StepID: "a", Policy: 1, Rules: []config.ResolvedRule{{
 		Type: config.RuleTypeCIDR, Value: "10.3.0.1/32", Action: config.ActionAllow, Ports: unknownPorts, IPNet: host(10, 3, 0, 1),
@@ -82,12 +86,13 @@ func TestRulePorts_NoKnownProtocolFailsClosed(t *testing.T) {
 	assert.Empty(t, fw.steps.keys[ruleMapCIDRs])
 
 	assert.Contains(t, logs.String(), "level=ERROR")
-	assert.Contains(t, logs.String(), "Refusing an allow rule none of whose ports has a known protocol")
-	assert.Contains(t, logs.String(), "Keeping a deny rule none of whose ports has a known protocol on every port")
+	assert.Contains(t, logs.String(), "Refusing an allow rule naming a port whose protocol cargowall doesn't know")
+	assert.Contains(t, logs.String(), "Keeping a deny rule naming a port whose protocol cargowall doesn't know on every port")
 }
 
 // The sync's hostname rules take the same guard: a policy loader that let
-// an unknown protocol through would still install no allow on every port.
+// an unknown protocol through would still have its allow refused and its
+// deny kept on every port.
 func TestRulePorts_SyncHostnameRule(t *testing.T) {
 	fw, maps := newStepTestFirewall(ruleMapEntries, slog.New(slog.DiscardHandler))
 	cm := config.NewConfigManager()
@@ -117,22 +122,54 @@ func TestRulePorts_LogsOncePerPortList(t *testing.T) {
 	fw, _ := newStepTestFirewall(ruleMapEntries, slog.New(slog.NewTextHandler(&logs, nil)))
 	for _, ip := range []net.IP{net.IPv4(93, 184, 216, 34), net.IPv4(93, 184, 216, 35), net.IPv4(93, 184, 216, 34)} {
 		_, err := fw.AddIP(ip, config.ActionAllow, unknownPorts)
-		require.ErrorIs(t, err, config.ErrNoKnownPort)
+		require.ErrorIs(t, err, config.ErrUnknownProtocol)
 	}
 	_, err := fw.AddIP(net.IPv4(93, 184, 216, 36), config.ActionAllow, []config.Port{{Port: 80, Protocol: "TCP"}})
-	require.ErrorIs(t, err, config.ErrNoKnownPort)
+	require.ErrorIs(t, err, config.ErrUnknownProtocol)
 	_, err = fw.AddIP(net.IPv4(93, 184, 216, 37), config.ActionDeny, unknownPorts)
 	require.NoError(t, err)
 	assert.Equal(t, 3, bytes.Count(logs.Bytes(), []byte("level=ERROR")), "one per action and port list: %s", logs.String())
 }
 
-// Ports that do expand pass through unchanged, a partly known list keeping
-// only its known entries, and no ports means every port, as always.
+// A list with one port of an unknown protocol is the rule written no more
+// than one with only such ports: the allow is refused rather than installed
+// on its other ports, and the deny kept on every port, by the sync, the DNS
+// path and the step gate's reading of the job's denies alike.
+func TestRulePorts_PartlyKnownListFailsClosed(t *testing.T) {
+	fw, maps := newStepTestFirewall(ruleMapEntries, slog.New(slog.DiscardHandler))
+	pp, ok := fw.rulePorts(partlyKnownPorts, 1, "r")
+	assert.False(t, ok)
+	assert.Nil(t, pp)
+	pp, ok = fw.rulePorts(partlyKnownPorts, 0, "r")
+	assert.True(t, ok)
+	assert.Nil(t, pp, "every port")
+
+	_, err := fw.AddIP(net.IPv4(93, 184, 216, 34), config.ActionAllow, partlyKnownPorts)
+	require.ErrorIs(t, err, config.ErrUnknownProtocol)
+	assert.Empty(t, maps[ruleMapCIDRs].store)
+	_, err = fw.AddIP(net.IPv4(93, 184, 216, 35), config.ActionDeny, partlyKnownPorts)
+	require.NoError(t, err)
+	require.Len(t, maps[ruleMapCIDRs].store, 1)
+	for _, v := range maps[ruleMapCIDRs].store {
+		assert.Equal(t, uint8(0), v.(bpf.TcBpfLpmVal).PortSpecific, "the deny is on every port")
+	}
+	assert.Empty(t, maps[ruleMapPorts].store)
+
+	denies := jobCIDRDenies([]config.ResolvedRule{{
+		Type: config.RuleTypeCIDR, Value: "10.2.0.0/16", Action: config.ActionDeny, Ports: partlyKnownPorts,
+		IPNet: &net.IPNet{IP: net.IPv4(10, 2, 0, 0).To4(), Mask: net.CIDRMask(16, 32)},
+	}})
+	require.Len(t, denies, 1)
+	assert.Nil(t, denies[0].ports, "the step gate reads the deny on every port, as the sync wrote it")
+}
+
+// Ports that do expand pass through unchanged, and no ports means every
+// port, as always.
 func TestRulePorts_KnownPortsUnchanged(t *testing.T) {
 	fw, _ := newStepTestFirewall(ruleMapEntries, nil)
-	pp, ok := fw.rulePorts([]config.Port{{Port: 443, Protocol: config.ProtocolTCP}, {Port: 80, Protocol: "TCP"}}, 1, "r")
+	pp, ok := fw.rulePorts([]config.Port{{Port: 443, Protocol: config.ProtocolTCP}, {Port: 53, Protocol: config.ProtocolUDP}}, 1, "r")
 	assert.True(t, ok)
-	assert.Equal(t, []portProto{{Port: 443, Proto: protoTCP}}, pp)
+	assert.Equal(t, []portProto{{Port: 443, Proto: protoTCP}, {Port: 53, Proto: protoUDP}}, pp)
 	pp, ok = fw.rulePorts(nil, 1, "r")
 	assert.True(t, ok)
 	assert.Nil(t, pp)

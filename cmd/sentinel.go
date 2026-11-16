@@ -119,12 +119,12 @@ func readStateFile(path string) (stateFile, bool) {
 // the first line (so a reader can tell THIS run's sentinel from a previous
 // run's leftover by comparing against the pidfile, which mtime alone cannot
 // do after a SIGKILL), then, when startup failed on a refused posture or
-// config file, a `refused=<name>` line naming it (see exitRefused), then a
-// bounded, control-character-stripped reason — unsanitized text here
-// reaches CI logs, where an embedded newline plus a `::`-prefixed line is a
-// workflow-command injection. The refusal rides here rather than in a file
-// of its own: the action reads this file to decide anyway, so a refusal
-// cannot be lost to a second write that failed.
+// local configuration, a `refused=<name>` line naming it (see
+// exitRefused), then a bounded, control-character-stripped reason —
+// unsanitized text here reaches CI logs, where an embedded newline plus a
+// `::`-prefixed line is a workflow-command injection. The refusal rides
+// here rather than in a file of its own: the action reads this file to
+// decide anyway, so a refusal cannot be lost to a second write that failed.
 func writeFailureSentinel(path, reason, refused string) error {
 	head := fmt.Sprintf("pid=%d\n", os.Getpid())
 	if refused != "" {

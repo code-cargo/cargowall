@@ -75,7 +75,9 @@ func jobCIDRDenies(rules []config.ResolvedRule) []jobDeny {
 			continue
 		}
 		ones, bits := r.IPNet.Mask.Size()
-		ports := expandPorts(r.Ports)
+		// An unknown protocol leaves ports nil, every port, as the sync
+		// keeps such a deny (rulePorts).
+		ports, _ := expandPorts(r.Ports)
 		if ones == 0 && len(ports) > 0 || ones == bits {
 			continue // a wildcard entry, or a host route: never hidden
 		}

@@ -735,9 +735,9 @@ func (cm *Manager) LoadFromEnv() error {
 	blockedCIDRs := os.Getenv("CARGOWALL_BLOCKED_CIDRS")
 	searchDomains := os.Getenv("CARGOWALL_SEARCH_DOMAINS")
 
-	// If no env vars are set, return an error to fall back to file config
-	if defaultAction == "" && allowedHosts == "" && allowedCIDRs == "" && blockedHosts == "" && blockedCIDRs == "" && searchDomains == "" {
-		return fmt.Errorf("no environment configuration found")
+	// If no env vars are set, return ErrNoEnvConfig to fall back to file config
+	if len(SetEnvConfigVars()) == 0 {
+		return ErrNoEnvConfig
 	}
 
 	// Set default action

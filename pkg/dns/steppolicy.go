@@ -425,7 +425,7 @@ func (s *Server) installStepAllow(a stepAllow, name string, ip net.IP) {
 		// The firewall warns, rate-limited.
 	case errors.Is(err, errStepScope):
 		s.warnStepScope(a, name, ip, err)
-	case errors.Is(err, config.ErrNoKnownPort):
+	case errors.Is(err, config.ErrUnknownProtocol):
 		// The firewall logs it once per rule; this runs for every answer
 		// and every late allow.
 	case err != nil:

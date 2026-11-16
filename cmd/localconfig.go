@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"strings"
 
 	"github.com/code-cargo/cargowall/pkg/config"
 )
@@ -38,8 +39,9 @@ func (c *StartCmd) configFile() string {
 	return defaultConfigPath
 }
 
-// refusedConfig names a local config file that didn't load in the failure
-// sentinel's refused= line, after its flag, as a refused posture is named.
+// refusedConfig names a local configuration that didn't load, a file's or
+// the environment's, in the failure sentinel's refused= line, after the
+// --config flag, as a refused posture is named after its flag.
 const refusedConfig = "config"
 
 // loadConfigFile loads the local config file. A file that is there and
@@ -70,13 +72,26 @@ func loadConfigFile(cmd *StartCmd, configMgr *config.Manager) (unloaded, fatal e
 
 // loadLocalConfig loads CI mode's local configuration, read only when no
 // CodeCargo policy loaded and the run isn't in policy lockdown: the
-// environment's, or failing that the config file.
+// environment's when any of its variables is set, the config file only
+// when none is. The two never combine. An environment configuration that
+// doesn't load is refused as a file that doesn't load is, rather than
+// leaving the file to apply in its place; and one beside a file --config
+// names is refused, since either could be the one meant to apply.
 func loadLocalConfig(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger) error {
 	err := configMgr.LoadFromEnv()
-	if err == nil {
+	switch {
+	case errors.Is(err, config.ErrNoEnvConfig):
+	case cmd.Config != "":
+		cmd.refusedPosture = refusedConfig
+		return fmt.Errorf("the config file %s and the environment configuration (%s) are both set; set one",
+			cmd.Config, strings.Join(config.SetEnvConfigVars(), ", "))
+	case err != nil:
+		cmd.refusedPosture = refusedConfig
+		return fmt.Errorf("environment configuration did not load: %w", err)
+	default:
 		return nil
 	}
-	logger.Debug("No environment config found, trying file", "error", err)
+	logger.Debug("No environment config found, trying file")
 	unloaded, fatal := loadConfigFile(cmd, configMgr)
 	if fatal != nil {
 		return fatal

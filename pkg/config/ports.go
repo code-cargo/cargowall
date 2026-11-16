@@ -22,11 +22,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// ErrNoKnownPort is the firewall's refusal of an allow rule that names ports
-// none of which has a protocol cargowall knows: installed, it would allow
-// every port. A caller treats it as not installed, and needn't log it, as
-// the firewall does, once per such rule.
-var ErrNoKnownPort = errors.New("no port the rule names has a protocol cargowall knows")
+// ErrUnknownProtocol is the firewall's refusal of an allow rule naming a
+// port whose protocol cargowall doesn't know: installed, it would be some
+// other rule than the one written, on every port when it names no other. A
+// caller treats it as not installed, and needn't log it, as the firewall
+// does, once per such rule.
+var ErrUnknownProtocol = errors.New("a port the rule names has a protocol cargowall doesn't know")
 
 // PortsCover reports whether a rule-side port list covers (port, proto). An
 // empty list means the side applies to all ports, matching rule semantics;

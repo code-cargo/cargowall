@@ -30,15 +30,15 @@ import (
 	"github.com/code-cargo/cargowall/pkg/firewall"
 )
 
-// An answer whose rule the firewall refuses for naming no known port opens
-// nothing, and isn't logged again for each answer: the firewall logs it once.
-func TestApplyVerdictSide_NoKnownPortIsQuietAndNotOpened(t *testing.T) {
+// An answer whose rule the firewall refuses for naming an unknown protocol
+// opens nothing, and isn't logged again for each answer: the firewall logs it once.
+func TestApplyVerdictSide_UnknownProtocolIsQuietAndNotOpened(t *testing.T) {
 	cfg := config.NewConfigManager()
 	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
 		{Type: config.RuleTypeHostname, Value: "web.example", Action: config.ActionAllow},
 	}, config.ActionDeny))
 	mockFw := firewall.NewMockFirewall(t)
-	mockFw.On("AddIP", mock.Anything, config.ActionAllow, mock.Anything).Return(false, config.ErrNoKnownPort).Times(2)
+	mockFw.On("AddIP", mock.Anything, config.ActionAllow, mock.Anything).Return(false, config.ErrUnknownProtocol).Times(2)
 	server := newTestServer(t, cfg, mockFw)
 	var logs bytes.Buffer
 	server.logger = slog.New(slog.NewTextHandler(&logs, nil))
@@ -50,12 +50,12 @@ func TestApplyVerdictSide_NoKnownPortIsQuietAndNotOpened(t *testing.T) {
 	assert.NotContains(t, logs.String(), "Failed to add IP to BPF maps")
 }
 
-// A step install the firewall refuses for naming no known port records
-// nothing and isn't warned about per answer.
-func TestStepInstall_NoKnownPortIsQuietAndRecordsNothing(t *testing.T) {
+// A step install the firewall refuses for naming an unknown protocol
+// records nothing and isn't warned about per answer.
+func TestStepInstall_UnknownProtocolIsQuietAndRecordsNothing(t *testing.T) {
 	cfg := config.NewConfigManager()
 	fw := newRecordingFirewall()
-	fw.stepErr = config.ErrNoKnownPort
+	fw.stepErr = config.ErrUnknownProtocol
 	var logs bytes.Buffer
 	s := newStepTestServer(t, cfg, fw)
 	s.logger = slog.New(slog.NewTextHandler(&logs, nil))

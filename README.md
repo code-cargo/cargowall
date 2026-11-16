@@ -222,7 +222,13 @@ The file is read strictly, so that a file that loads means what it says. It load
 
 A rule for the unspecified address with ports is dropped with a warning, and the rest loads.
 
-A config file that is there and doesn't load (it doesn't parse, or can't be read) refuses startup, whether `--config` (or `CARGOWALL_CONFIG`) names it or it sits at the default path, whenever it's the configuration that applies: no CodeCargo policy loaded and the run isn't in policy lockdown. A file `--config` names must also be there. The refusal is reported as a refused posture's is: the failure sentinel carries a `refused=config` line and names the file, and `cargowall start` exits with status 3, so the action fails the step even with `fail-on-unsupported: false`. A loaded policy still wins, and the file isn't read then. With no `--config` and no file at the default path, cargowall runs deny-all, with only its infrastructure auto-allows, as before.
+A config file that is there and doesn't load (it doesn't parse, or can't be read) refuses startup, whether `--config` (or `CARGOWALL_CONFIG`) names it or it sits at the default path, whenever it's the configuration that applies: no CodeCargo policy loaded and the run isn't in policy lockdown. A file `--config` names must also be there. The refusal is reported as a refused posture's is: the failure sentinel carries a `refused=config` line and names the file, and `cargowall start` exits with status 3, so the action fails the step even with `fail-on-unsupported: false`. A loaded policy still wins, and the file isn't read then. With no `--config` and no file at the default path (a dangling symlink there counts as no file), cargowall runs deny-all, with only its infrastructure auto-allows, as before.
+
+In CI mode (`--github-action`, `--gitlab-ci`), an environment configuration is read ahead of any file. Whenever one of `CARGOWALL_DEFAULT_ACTION`, `CARGOWALL_ALLOWED_HOSTS`, `CARGOWALL_ALLOWED_CIDRS`, `CARGOWALL_BLOCKED_HOSTS`, `CARGOWALL_BLOCKED_CIDRS` or `CARGOWALL_SEARCH_DOMAINS` is set, it is the local configuration and no file is read. One that doesn't load refuses startup the same way, and so does one set beside a file `--config` names: set one or the other.
+
+A refused startup exits before the firewall attaches, so a launcher must not carry on without ready: gate the job on `cargowall wait-ready` (or on `cargowall start`'s exit status), and fail it when that fails.
+
+**Upgrading to 2.0.0:** a file with a key cargowall doesn't read, such as `"_comment"` or `"description"`, or with a key in another case, such as `"Rules"`, loaded before and now refuses startup. Fix such files before upgrading.
 
 ## Run
 

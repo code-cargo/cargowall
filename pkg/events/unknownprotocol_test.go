@@ -29,18 +29,18 @@ import (
 	"github.com/code-cargo/cargowall/pkg/config"
 )
 
-// refusingFirewall refuses every add as a rule naming no known port.
+// refusingFirewall refuses every add as a rule naming an unknown protocol.
 type refusingFirewall struct{ calls int }
 
 func (f *refusingFirewall) AddIP(net.IP, config.Action, []config.Port) (bool, error) {
 	f.calls++
-	return false, config.ErrNoKnownPort
+	return false, config.ErrUnknownProtocol
 }
 
-// A blocked packet whose rule the firewall refuses for naming no known port
-// is not late-allowed, and isn't logged per packet: the firewall logs it
+// A blocked packet whose rule the firewall refuses for naming an unknown
+// protocol is not late-allowed, and isn't logged per packet: the firewall logs it
 // once, and the late allow runs for every blocked packet.
-func TestTryLateAllow_NoKnownPortIsQuietAndNotAllowed(t *testing.T) {
+func TestTryLateAllow_UnknownProtocolIsQuietAndNotAllowed(t *testing.T) {
 	cm := config.NewConfigManager()
 	require.NoError(t, cm.LoadConfigFromRules([]config.Rule{
 		{Type: config.RuleTypeHostname, Value: "job.example.com", Action: config.ActionAllow},

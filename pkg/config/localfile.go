@@ -107,11 +107,16 @@ func checkObject(dec *json.Decoder, t reflect.Type, where string) error {
 
 // checkValue checks the next value against t: an object decoding into a
 // struct, or an array of them, is checked in turn; anything else is left to
-// the decoder, which refuses a value of the wrong type.
+// the decoder, which refuses a value of the wrong type. A null is refused
+// wherever it stands: the decoder reads it as the key left out, so
+// `"ports": null` would mean every port where `"ports": []` is refused.
 func checkValue(dec *json.Decoder, t reflect.Type, where string) error {
 	tok, err := dec.Token()
 	if err != nil {
 		return fmt.Errorf("parse config: %w", err)
+	}
+	if tok == nil {
+		return fmt.Errorf("parse config: %s is null; leave it out instead", where)
 	}
 	d, ok := tok.(json.Delim)
 	if !ok {

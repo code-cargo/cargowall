@@ -111,11 +111,78 @@ func TestLoadCIConfig_DefaultPathAndEnvUnchanged(t *testing.T) {
 	assert.Empty(t, cm.GetResolvedRules())
 	assert.Empty(t, cmd.refusedPosture)
 
+	old := defaultConfigPath
+	defaultConfigPath = badConfig(t)
+	t.Cleanup(func() { defaultConfigPath = old })
 	t.Setenv("CARGOWALL_ALLOWED_HOSTS", "github.com")
 	cm = config.NewConfigManager()
-	_, err = loadCIConfig(context.Background(), &StartCmd{GithubAction: true, Config: badConfig(t)}, cm, nil, quietLogger())
+	_, err = loadCIConfig(context.Background(), &StartCmd{GithubAction: true}, cm, nil, quietLogger())
 	require.NoError(t, err, "the environment's configuration applies, so the file is never read")
 	assert.Len(t, cm.GetResolvedRules(), 1)
+}
+
+// An environment configuration is the local configuration whenever any of
+// its variables is set: one that doesn't load refuses startup rather than
+// leave a config file to apply in its place, and one beside a file
+// --config names is refused, since either could be the one meant to apply.
+func TestLoadCIConfig_EnvConfigRefusals(t *testing.T) {
+	redirectStateFiles(t)
+	allow := filepath.Join(t.TempDir(), "allow.json")
+	require.NoError(t, os.WriteFile(allow, []byte(`{"defaultAction": "allow"}`), 0o600))
+	old := defaultConfigPath
+	defaultConfigPath = allow
+	t.Cleanup(func() { defaultConfigPath = old })
+
+	for _, tc := range []struct {
+		name   string
+		env    map[string]string
+		config string
+		want   string
+	}{
+		{
+			"a malformed entry",
+			map[string]string{"CARGOWALL_DEFAULT_ACTION": "deny", "CARGOWALL_ALLOWED_HOSTS": "github.com:https"},
+			"",
+			"environment configuration did not load: invalid CARGOWALL_ALLOWED_HOSTS entry",
+		},
+		{
+			"an unknown default action",
+			map[string]string{"CARGOWALL_DEFAULT_ACTION": "Allow"},
+			"",
+			"environment configuration did not load: invalid CARGOWALL_DEFAULT_ACTION",
+		},
+		{
+			"beside an explicit file",
+			map[string]string{"CARGOWALL_DEFAULT_ACTION": "deny"},
+			allow,
+			"the config file " + allow + " and the environment configuration (CARGOWALL_DEFAULT_ACTION) are both set",
+		},
+		{
+			"beside a missing explicit file",
+			map[string]string{"CARGOWALL_SEARCH_DOMAINS": ".internal"},
+			filepath.Join(t.TempDir(), "missing.json"),
+			"and the environment configuration (CARGOWALL_SEARCH_DOMAINS) are both set",
+		},
+		{
+			"malformed, beside an explicit file",
+			map[string]string{"CARGOWALL_ALLOWED_HOSTS": "github.com:https"},
+			allow,
+			"are both set",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			cm := config.NewConfigManager()
+			cmd := &StartCmd{GithubAction: true, Config: tc.config}
+			_, err := loadCIConfig(context.Background(), cmd, cm, nil, quietLogger())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+			assert.Equal(t, refusedConfig, cmd.refusedPosture)
+			assert.NotEqual(t, config.ActionAllow, cm.GetDefaultAction(), "the file at the default path was never read")
+		})
+	}
 }
 
 // When a CodeCargo policy loads, or the run is in policy lockdown, the

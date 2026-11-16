@@ -16,8 +16,10 @@
 # A local --config that doesn't load fails startup. Each file below spells
 # something cargowall would read loosely: a port with no protocol, which a
 # loose read leaves on every port; a key cargowall doesn't read; a key in
-# another case. For each, `cargowall start` must exit non-zero, and its
-# failure sentinel must name the file. Then DNS must still resolve, since a
+# another case. For each, `cargowall start` must refuse startup: exit with
+# the refusal status, 3, with a failure sentinel whose refused= line names
+# the config and whose reason names the file, so the action fails the step
+# whatever fail-on-unsupported says. Then DNS must still resolve, since a
 # failed start tears down what it set up. Runs from the binary, ahead of the
 # step-rules job's own start.
 #
@@ -52,9 +54,14 @@ for f in "$dir"/*.json; do
     --failure-file "$FAILED" \
     --pidfile /tmp/cargowall-config-strict.pid \
     > "$dir/$name.log" 2>&1 || rc=$?
-  if [ "$rc" -eq 0 ] || [ "$rc" -eq 124 ]; then
-    echo "::error::cargowall start with $name didn't fail startup (exit $rc)"
+  if [ "$rc" -ne 3 ]; then
+    echo "::error::cargowall start with $name didn't refuse startup (exit $rc, not 3)"
     cat "$dir/$name.log"
+    exit 1
+  fi
+  if [ "$(sudo sed -n 2p "$FAILED")" != "refused=config" ]; then
+    echo "::error::the failure sentinel for $name has no refused=config line"
+    sudo cat "$FAILED" 2>/dev/null || true
     exit 1
   fi
   if ! sudo grep -F -- "config file $f did not load" "$FAILED"; then
@@ -62,7 +69,7 @@ for f in "$dir"/*.json; do
     sudo cat "$FAILED" 2>/dev/null || true
     exit 1
   fi
-  echo "$name: startup failed (exit $rc), as required"
+  echo "$name: startup refused (exit 3, refused=config), as required"
 done
 
 getent hosts github.com > /dev/null || { echo "::error::DNS doesn't resolve after the failed starts"; exit 1; }

@@ -214,7 +214,7 @@ Drop a policy file at `/etc/cargowall/config.json` (or any path — see `--confi
 ```
 
 The file is read strictly, so that a file that loads means what it says. It loads only when:
-- its top level is a JSON object;
+- its top level is a JSON object, with nothing but space after it;
 - every key, at every level, is exactly one cargowall reads, given once (a key in another case, or repeated, is refused);
 - every rule's `type` is `hostname` or `cidr`, its `value` resolves (a CIDR or IP that parses, a hostname pattern that compiles), and a job rule's `action` is `allow` or `deny`;
 - every port entry's `protocol` is exactly `all`, `tcp`, `udp` or `icmp`, and `ports`, when given, isn't empty (leave it out for every port);
@@ -222,7 +222,7 @@ The file is read strictly, so that a file that loads means what it says. It load
 
 A rule for the unspecified address with ports is dropped with a warning, and the rest loads.
 
-A config file that is there and doesn't load fails startup, with the failure sentinel naming it and a non-zero exit, whether `--config` (or `CARGOWALL_CONFIG`) names it or it sits at the default path, whenever it's the configuration that applies: no CodeCargo policy loaded and the run isn't in policy lockdown. A file `--config` names must also be there. A loaded policy still wins, and the file isn't read then. With no `--config` and no file at the default path, cargowall runs deny-all, with only its infrastructure auto-allows, as before.
+A config file that is there and doesn't load (it doesn't parse, or can't be read) refuses startup, whether `--config` (or `CARGOWALL_CONFIG`) names it or it sits at the default path, whenever it's the configuration that applies: no CodeCargo policy loaded and the run isn't in policy lockdown. A file `--config` names must also be there. The refusal is reported as a refused posture's is: the failure sentinel carries a `refused=config` line and names the file, and `cargowall start` exits with status 3, so the action fails the step even with `fail-on-unsupported: false`. A loaded policy still wins, and the file isn't read then. With no `--config` and no file at the default path, cargowall runs deny-all, with only its infrastructure auto-allows, as before.
 
 ## Run
 

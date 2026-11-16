@@ -38,14 +38,22 @@ func (c *StartCmd) configFile() string {
 	return defaultConfigPath
 }
 
+// refusedConfig names a local config file that didn't load in the failure
+// sentinel's refused= line, after its flag, as a refused posture is named.
+const refusedConfig = "config"
+
 // loadConfigFile loads the local config file. A file that is there and
 // doesn't load is a startup failure, whether --config named it or it sits
 // at the default path: either way it is the configuration meant to apply,
 // and running on without it would leave a caller waiting on a firewall that
-// enforces something else. A file --config names must also be there. Only
-// a default path with no file at it leaves the deny-all default in place,
-// as it always has; that load error is returned as unloaded for the caller
-// to report.
+// enforces something else. A file --config names must also be there. The
+// failure is a refusal (refusedConfig, exitRefused), as a fail-closed
+// posture's loss is: cargowall could run, just not with the configuration
+// meant to apply, so a launcher must fail the job rather than run it with
+// no firewall, as it may for a runner that can't run cargowall at all.
+// Only a default path with no file at it leaves the deny-all default in
+// place, as it always has; that load error is returned as unloaded for the
+// caller to report.
 func loadConfigFile(cmd *StartCmd, configMgr *config.Manager) (unloaded, fatal error) {
 	path := cmd.configFile()
 	err := configMgr.LoadConfig(path)
@@ -55,6 +63,7 @@ func loadConfigFile(cmd *StartCmd, configMgr *config.Manager) (unloaded, fatal e
 	case cmd.Config == "" && errors.Is(err, fs.ErrNotExist):
 		return err, nil
 	default:
+		cmd.refusedPosture = refusedConfig
 		return nil, fmt.Errorf("config file %s did not load: %w", path, err)
 	}
 }

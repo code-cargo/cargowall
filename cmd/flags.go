@@ -71,8 +71,9 @@ type StartCmd struct {
 	// withheld so the action fails the job with the failure sentinel's
 	// reason. Unexported: internal state, not a flag.
 	policyLockdown bool
-	// refusedPosture names the fail-closed posture whose loss failed
-	// startup, set by postureLedger.lose: StartCargoWall puts it in the
+	// refusedPosture names what startup refused: the fail-closed posture
+	// whose loss failed it, set by postureLedger.lose, or a local config
+	// file that didn't load (refusedConfig). StartCargoWall puts it in the
 	// failure sentinel and the exit status (see exitRefused). Unexported:
 	// internal state, not a flag.
 	refusedPosture string

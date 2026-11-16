@@ -521,8 +521,9 @@ func (f *FirewallImpl) addCIDRv6(policy uint32, ip6 net.IP, prefixLen uint32, ac
 // port, which is the closed side. The loaders refuse such a port, so this
 // is the firewall's own guard against a gap in them. It logs an Error once
 // per action and port list, since the DNS and late-allow paths ask again
-// for every answer and every blocked packet. Must be called with f.mu held.
-func (f *FirewallImpl) rulePorts(ports []config.Port, actionVal uint8, label string) ([]portProto, bool) {
+// for every answer and every blocked packet; target, what the rule names (a
+// hostname, CIDR or IP), is the first one's. Must be called with f.mu held.
+func (f *FirewallImpl) rulePorts(ports []config.Port, actionVal uint8, target string) ([]portProto, bool) {
 	pp := expandPorts(ports)
 	if len(ports) == 0 || len(pp) > 0 {
 		return pp, true
@@ -537,11 +538,11 @@ func (f *FirewallImpl) rulePorts(ports []config.Port, actionVal uint8, label str
 	f.unexpandedLogged[key] = struct{}{}
 	if actionVal == 1 {
 		f.logger.Error("Refusing an allow rule none of whose ports has a known protocol, which would allow every port",
-			"rule", label, "ports", ports)
+			"target", target, "ports", ports)
 		return nil, false
 	}
 	f.logger.Error("Keeping a deny rule none of whose ports has a known protocol on every port",
-		"rule", label, "ports", ports)
+		"target", target, "ports", ports)
 	return nil, true
 }
 

@@ -34,22 +34,19 @@ import (
 // port. So a file must spell what cargowall reads, exactly, or not load at
 // all: a file that loads is never wider than it reads.
 
-// decodeLocalConfig decodes a local config file: a JSON object whose keys,
-// at every level, are exactly FirewallConfig's, each given once
-// (checkExactKeys, which leaves no unknown key for the decoder to ignore),
-// whose default action is allow or deny when given, and whose rules resolve
-// as written (validateLocalRules).
+// decodeLocalConfig decodes a local config file: a JSON object, with nothing
+// but space after it, whose keys, at every level, are exactly
+// FirewallConfig's, each given once (checkExactKeys, which leaves no unknown
+// key for the decoder to ignore), whose default action is allow or deny when
+// given, and whose rules resolve as written (validateLocalRules).
 func decodeLocalConfig(data []byte) (*FirewallConfig, error) {
 	if err := checkExactKeys(data, reflect.TypeFor[FirewallConfig]()); err != nil {
 		return nil, err
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
+	// Unmarshal, not a Decoder, as it refuses anything after the value.
 	var cfg FirewallConfig
-	if err := dec.Decode(&cfg); err != nil {
+	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
-	}
-	if dec.More() {
-		return nil, errors.New("parse config: data after the top-level object")
 	}
 	switch cfg.DefaultAction {
 	case "", ActionAllow, ActionDeny:

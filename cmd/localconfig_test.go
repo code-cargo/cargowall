@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -58,42 +59,57 @@ func TestLoadCIConfig_ExplicitConfigThatDoesNotLoadFails(t *testing.T) {
 			require.Error(t, err)
 			assert.False(t, loaded)
 			assert.Contains(t, err.Error(), "config file "+path+" did not load")
+			assert.Equal(t, refusedConfig, cmd.refusedPosture)
 		})
 	}
 }
 
 // A file at the default path is the configuration meant to apply as much as
-// one --config names: when it's there and doesn't load, startup fails, and
-// the failure sentinel names it. Only a default path with no file at it
-// leaves deny-all.
+// one --config names: when it's there and doesn't load, whether it doesn't
+// parse or can't be read, startup fails, and the failure sentinel names it.
+// Only a default path with no file at it leaves deny-all.
 func TestLoadCIConfig_BrokenDefaultFileFails(t *testing.T) {
 	redirectStateFiles(t)
-	old := defaultConfigPath
-	defaultConfigPath = badConfig(t)
-	t.Cleanup(func() { defaultConfigPath = old })
+	for name, path := range map[string]string{
+		"refused by the strict read": badConfig(t),
+		"a directory":                t.TempDir(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			old := defaultConfigPath
+			defaultConfigPath = path
+			t.Cleanup(func() { defaultConfigPath = old })
 
-	cmd := &StartCmd{GithubAction: true}
-	loaded, err := loadCIConfig(context.Background(), cmd, config.NewConfigManager(), nil, quietLogger())
-	require.Error(t, err)
-	assert.False(t, loaded)
-	sentinel := filepath.Join(t.TempDir(), "cargowall-failed")
-	publishStartupFailure(sentinel, err, cmd.refusedPosture, quietLogger())
-	data, rerr := os.ReadFile(sentinel)
-	require.NoError(t, rerr)
-	assert.Contains(t, string(data), "config file "+defaultConfigPath+" did not load")
+			cmd := &StartCmd{GithubAction: true}
+			loaded, err := loadCIConfig(context.Background(), cmd, config.NewConfigManager(), nil, quietLogger())
+			require.Error(t, err)
+			assert.False(t, loaded)
+			assert.Equal(t, refusedConfig, cmd.refusedPosture)
+			sentinel := filepath.Join(t.TempDir(), "cargowall-failed")
+			publishStartupFailure(sentinel, err, cmd.refusedPosture, quietLogger())
+			data, rerr := os.ReadFile(sentinel)
+			require.NoError(t, rerr)
+			assert.Contains(t, string(data), "\nrefused=config\n")
+			assert.Contains(t, string(data), "config file "+path+" did not load")
 
-	require.Error(t, loadPlainConfig(&StartCmd{}, config.NewConfigManager(), quietLogger()), "plain mode too")
+			plain := &StartCmd{}
+			require.Error(t, loadPlainConfig(plain, config.NewConfigManager(), quietLogger()), "plain mode too")
+			assert.Equal(t, refusedConfig, plain.refusedPosture)
+		})
+	}
 }
 
 // Without --config, the default path with no file at it leaves deny-all,
-// as before, and an environment configuration is read ahead of any file.
+// as before, and refuses nothing; an environment configuration is read
+// ahead of any file.
 func TestLoadCIConfig_DefaultPathAndEnvUnchanged(t *testing.T) {
 	redirectStateFiles(t)
 	cm := config.NewConfigManager()
-	loaded, err := loadCIConfig(context.Background(), &StartCmd{GithubAction: true}, cm, nil, quietLogger())
+	cmd := &StartCmd{GithubAction: true}
+	loaded, err := loadCIConfig(context.Background(), cmd, cm, nil, quietLogger())
 	require.NoError(t, err)
 	assert.False(t, loaded)
 	assert.Empty(t, cm.GetResolvedRules())
+	assert.Empty(t, cmd.refusedPosture)
 
 	t.Setenv("CARGOWALL_ALLOWED_HOSTS", "github.com")
 	cm = config.NewConfigManager()
@@ -111,6 +127,7 @@ func TestLoadCIConfig_BrokenConfigIgnoredWhenPolicyOrLockdown(t *testing.T) {
 	loaded, err := loadCIConfig(context.Background(), cmd, config.NewConfigManager(), nil, quietLogger())
 	require.NoError(t, err)
 	assert.True(t, loaded)
+	assert.Empty(t, cmd.refusedPosture)
 
 	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -123,21 +140,28 @@ func TestLoadCIConfig_BrokenConfigIgnoredWhenPolicyOrLockdown(t *testing.T) {
 	_, err = loadCIConfig(context.Background(), cmd, config.NewConfigManager(), nil, quietLogger())
 	require.NoError(t, err)
 	assert.True(t, cmd.policyLockdown)
+	assert.Empty(t, cmd.refusedPosture)
 }
 
 // Outside CI mode the config file is all there is: an explicit --config
 // that doesn't load fails startup, and the default path not loading leaves
 // deny-all.
 func TestLoadPlainConfig(t *testing.T) {
-	err := loadPlainConfig(&StartCmd{Config: badConfig(t)}, config.NewConfigManager(), quietLogger())
+	cmd := &StartCmd{Config: badConfig(t)}
+	err := loadPlainConfig(cmd, config.NewConfigManager(), quietLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "did not load")
-	require.NoError(t, loadPlainConfig(&StartCmd{}, config.NewConfigManager(), quietLogger()))
+	assert.Equal(t, refusedConfig, cmd.refusedPosture)
+
+	cmd = &StartCmd{}
+	require.NoError(t, loadPlainConfig(cmd, config.NewConfigManager(), quietLogger()))
+	assert.Empty(t, cmd.refusedPosture)
 }
 
-// The error a bad explicit --config returns takes the path every startup
-// failure does: the failure sentinel names it, and the process exits
-// non-zero, as no posture was refused.
+// A config file that doesn't load is a refusal, as a fail-closed posture's
+// loss is: the failure sentinel names it on a refused= line and the file in
+// the reason, and the process exits with the refusal status, so the action
+// fails the step whatever fail-on-unsupported says.
 func TestBadConfigStartupFailure(t *testing.T) {
 	cmd := &StartCmd{GithubAction: true, Config: badConfig(t)}
 	_, err := loadCIConfig(context.Background(), cmd, config.NewConfigManager(), nil, quietLogger())
@@ -147,11 +171,13 @@ func TestBadConfigStartupFailure(t *testing.T) {
 	publishStartupFailure(sentinel, err, cmd.refusedPosture, quietLogger())
 	data, rerr := os.ReadFile(sentinel)
 	require.NoError(t, rerr)
-	assert.Contains(t, string(data), "cargowall startup failed: config file "+cmd.Config+" did not load")
-	assert.NotContains(t, string(data), "refused=")
+	pid, rest, _ := strings.Cut(string(data), "\n")
+	assert.True(t, strings.HasPrefix(pid, "pid="))
+	assert.True(t, strings.HasPrefix(rest, "refused=config\ncargowall startup failed: config file "+cmd.Config+" did not load"), rest)
 
 	exit := refusalExit(err, cmd)
-	require.Error(t, exit)
 	var refusal refusalError
-	assert.False(t, errors.As(exit, &refusal), "a config failure exits 1, not with the refusal status")
+	require.True(t, errors.As(exit, &refusal), "a config failure exits with the refusal status")
+	assert.Equal(t, exitRefused, refusal.ExitCode())
+	assert.ErrorIs(t, exit, err)
 }

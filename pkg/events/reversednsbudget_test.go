@@ -69,6 +69,24 @@ func TestReverseDNSBudget_PerNetworkCap(t *testing.T) {
 	assert.NotContains(t, logs.String(), runCapLog)
 }
 
+// A local address is always let through and never counted: neither its
+// network's cap nor its family's run cap is spent on it.
+func TestReverseDNSBudget_LocalAddressesAreNotCounted(t *testing.T) {
+	var logs bytes.Buffer
+	logger := infoLogger(&logs)
+	b := newReverseDNSBudget(reverseDNSPerNetwork, reverseDNSRunMaxV4, reverseDNSRunMaxV6)
+	for i := range reverseDNSRunMaxV4 + 10 {
+		require.True(t, b.take(fmt.Sprintf("10.96.%d.%d", i/200, i%200), logger), i)
+	}
+	for _, ip := range []string{"100.64.0.1", "100.64.0.2", "100.64.0.3", "fd00::1", "fd00::2", "fd00::3", "::ffff:10.96.0.9"} {
+		assert.True(t, b.take(ip, logger), ip)
+	}
+	for i := range reverseDNSRunMaxV4 {
+		require.True(t, b.take(v4Network(i), logger), "the IPv4 run cap is untouched: %d", i)
+	}
+	assert.Empty(t, logs.String(), "no cap was reached on the local addresses")
+}
+
 // v4Network and v6Network return the i-th of distinct IPv4 /24s and IPv6
 // /48s, an address in each.
 func v4Network(i int) string { return fmt.Sprintf("203.%d.%d.1", i/256, i%256) }
@@ -280,6 +298,21 @@ func TestReportVerdict_IPv6DenialsLeaveAnIPv4BuilderNamed(t *testing.T) {
 	assert.Equal(t, "ec2-198-51-100-7.compute-1.amazonaws.com", ev.DstHostname)
 	require.Len(t, fw.addedIPs, 1)
 	assert.Len(t, res.callTimes(), reverseDNSRunMaxV6+1)
+}
+
+// Denied local addresses, cluster service addresses dialled by IP for
+// instance, are each looked up however many share a /24, so the one a rule
+// allows by its reverse name is still named.
+func TestReportVerdict_LocalAddressesAreLookedUpUncapped(t *testing.T) {
+	_, res := useScriptedReverseDNS(t, scriptedAnswer{err: errPTRNotFound})
+	cm := builderPolicy(t)
+	fw := &mockFirewallUpdater{}
+	logger := newTestLogger()
+	for _, ip := range []string{"10.96.0.10", "10.96.0.11", "10.96.0.12", "10.96.0.1"} {
+		reportDropTo(t, cm, fw, ip, logger)
+	}
+	reverseDNSRetries.wait()
+	assert.Len(t, res.callTimes(), 4)
 }
 
 // A lookup for an allowed connection is only a label, and costs nothing of

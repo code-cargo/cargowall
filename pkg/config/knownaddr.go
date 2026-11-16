@@ -21,6 +21,19 @@ import (
 	"net/netip"
 )
 
+// sharedAddressSpace is 100.64.0.0/10 (RFC 6598), as used for carrier-grade
+// NAT and cluster networks.
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+// LocalAddress reports whether addr is private, loopback, link-local,
+// unique-local or in the shared address space: the ranges whose reverse
+// zones resolvers serve locally (RFC 6303, RFC 7793). An IPv4-mapped
+// address counts as its IPv4 address.
+func LocalAddress(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	return addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || sharedAddressSpace.Contains(addr)
+}
+
 // KnownAddress reports whether addr is an address the run already knows:
 // one with a name, which a DNS answer, a CNAME chain from an allowed name,
 // or a confirmed reverse lookup gave it, or one inside an allow rule's

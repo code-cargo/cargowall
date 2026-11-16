@@ -205,6 +205,29 @@ func TestIsQueryAllowed_ReverseLookupsOfAutoAllowedAddresses(t *testing.T) {
 	assert.False(t, server.isQueryAllowed(wireserver, dns.TypePTR), "an explicit deny keeps the address unknown")
 }
 
+// A hostname rule for a reverse-lookup name is dropped at load, so it
+// opens nothing under the reverse zones: an unknown address's reverse
+// lookup, and any other query type under its name, stay refused. The
+// reverse lookup of an address an allow CIDR covers still passes.
+func TestIsQueryAllowed_ReverseLookupHostRulesOpenNothing(t *testing.T) {
+	cfg := config.NewConfigManager()
+	loadStepPolicy(t, cfg, `{"defaultAction": "deny", "rules": [
+		{"type": "hostname", "value": "7.2.0.192.in-addr.arpa", "action": "allow"},
+		{"type": "hostname", "value": "**.ip6.arpa", "action": "allow"},
+		{"type": "cidr", "value": "203.0.113.0/24", "action": "allow"}],
+		"steps": [{"id": "build", "rules": [{"type": "hostname", "value": "*.in-addr.arpa"}]}]}`)
+	server := newTestServer(t, cfg, firewall.NewMockFirewall(t))
+	server.filterQueries = true
+
+	v4 := reverseName(t, "192.0.2.7")
+	assert.False(t, server.isQueryAllowed(v4, dns.TypePTR))
+	assert.False(t, server.isQueryAllowed(v4, dns.TypeTXT))
+	assert.False(t, server.isQueryAllowed("data."+v4, dns.TypeTXT))
+	assert.False(t, server.isQueryAllowed(reverseName(t, "2001:db8:abcd::1"), dns.TypePTR))
+	assert.False(t, server.isQueryAllowed("a.b."+reverseName(t, "2001:db8:abcd::1"), dns.TypeA))
+	assert.True(t, server.isQueryAllowed(reverseName(t, "203.0.113.9"), dns.TypePTR), "an allowed address")
+}
+
 // An unknown address's reverse lookup is judged by the rules like any
 // other name, so a default allow allows it.
 func TestIsQueryAllowed_ReverseLookupOfUnknownAddressFollowsTheDefault(t *testing.T) {

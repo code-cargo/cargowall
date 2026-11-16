@@ -20,31 +20,22 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+
+	"github.com/code-cargo/cargowall/pkg/config"
 )
 
 // reverseQueryKnown reports whether domain, a canonical PTR name (see
 // isValidReverseDNS), asks about an address the run already knows, the only
 // reverse lookups query filtering answers on their shape alone: a local
-// address (localAddress), or one the config manager knows (KnownAddress). A
-// reverse lookup of any other address is judged like any other name.
+// address (config.LocalAddress), or one the config manager knows
+// (KnownAddress). A reverse lookup of any other address is judged like any
+// other name.
 func (s *Server) reverseQueryKnown(domain string) bool {
 	addr, ok := reverseQueryAddr(domain)
 	if !ok {
 		return false
 	}
-	return localAddress(addr) || s.config.KnownAddress(addr)
-}
-
-// sharedAddressSpace is 100.64.0.0/10 (RFC 6598), as used for carrier-grade
-// NAT and cluster networks.
-var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
-
-// localAddress reports whether addr is private, loopback, link-local,
-// unique-local or in the shared address space: the ranges whose reverse
-// zones resolvers serve locally (RFC 6303, RFC 7793).
-func localAddress(addr netip.Addr) bool {
-	return addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() ||
-		sharedAddressSpace.Contains(addr.Unmap())
+	return config.LocalAddress(addr) || s.config.KnownAddress(addr)
 }
 
 // reverseQueryAddr returns the address a canonical PTR name asks about: an

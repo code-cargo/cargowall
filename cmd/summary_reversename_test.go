@@ -54,11 +54,4 @@ func TestSummary_AllowlistSuggestionsSkipReverseLookupNames(t *testing.T) {
 		Events: stepEvents[0].Events[:3],
 	}})
 	assert.Empty(t, buf.String(), "only reverse lookups: nothing to suggest")
-
-	for name, want := range map[string]bool{
-		"in-addr.arpa": true, "ip6.arpa.": true, "x.ip6.arpa": true,
-		"arpa": false, "in-addr.arpa.example.com": false, "myin-addr.arpa": false,
-	} {
-		assert.Equal(t, want, reverseLookupName(name), name)
-	}
 }

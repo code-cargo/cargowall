@@ -20,6 +20,8 @@ import (
 	"log/slog"
 	"net/netip"
 	"sync"
+
+	"github.com/code-cargo/cargowall/pkg/config"
 )
 
 // reverseDNSFamily indexes the budget's per-family counts.
@@ -40,13 +42,16 @@ func (f reverseDNSFamily) String() string {
 // reverseDNSBudget decides which denied destinations a run may look up the
 // reverse name of: at most perNetwork distinct addresses in each IPv4 /24 or
 // IPv6 /48, and max[family] of each family in all (reverseDNSPerNetwork,
-// reverseDNSRunMaxV4, reverseDNSRunMaxV6). An address it has let through is
-// let through again, so its retries cost nothing more, even after the
-// tracker evicted it. One past a cap goes unnamed, with no lookup, and the
-// cap is logged at Info once: once per network, and once per family's run
-// cap. Each of its maps holds at most the two run caps' entries, since a
-// network is logged only once it holds perNetwork addresses, so a run's
-// denials can't grow it.
+// reverseDNSRunMaxV4, reverseDNSRunMaxV6). A local address
+// (config.LocalAddress) is always let through and never counted: its reverse
+// zone is served locally, where the job's own reverse lookups go unbounded
+// anyway, so counting it would only spend the caps public builders need.
+// An address it has let through is let through again, so its retries cost
+// nothing more, even after the tracker evicted it. One past a cap goes
+// unnamed, with no lookup, and the cap is logged at Info once: once per
+// network, and once per family's run cap. Each of its maps holds at most
+// the two run caps' entries, since a network is logged only once it holds
+// perNetwork addresses, so a run's denials can't grow it.
 type reverseDNSBudget struct {
 	mu         sync.Mutex
 	perNetwork int
@@ -72,6 +77,9 @@ func (b *reverseDNSBudget) take(ip string, logger *slog.Logger) bool {
 		return false
 	}
 	addr = addr.Unmap()
+	if config.LocalAddress(addr) {
+		return true
+	}
 	family := reverseDNSIPv6
 	if addr.Is4() {
 		family = reverseDNSIPv4

@@ -39,6 +39,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/code-cargo/cargowall/bpf"
@@ -250,6 +251,13 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			dnsServer.EnableQueryFiltering(true)
 			logger.Info("DNS query filtering enabled (blocks DNS tunneling)")
 		}
+
+		// cargowall's own reverse lookups of blocked destinations, and the
+		// forward lookups that confirm their names, go to the upstream
+		// directly: with query filtering on, the proxy answers a reverse
+		// lookup only for an address the run allows, so a lookup through it
+		// would be refused.
+		events.SetReverseDNSResolver(newUpstreamReverseResolver(upstream))
 
 		if cmd.DockerDNSInterception {
 			var err error
@@ -1399,6 +1407,30 @@ func autoAllowCodeCargoAPI(apiURL string, configMgr *config.Manager, logger *slo
 	}
 	configMgr.EnsureHostnameAllowed(u.Hostname(), []config.Port{config.PortHTTPS}, config.AutoAddedTypeCodeCargoService)
 	logger.Info("Auto-allowed CodeCargo API hostname", "hostname", u.Hostname())
+}
+
+// newUpstreamReverseResolver resolves straight to the DNS upstream, marking
+// its socket (DNSProxyFWMark) so the redirect exempts it and it bypasses the
+// proxy. cargowall's own reverse and confirming lookups use it, since the
+// proxy's filter would refuse a reverse lookup of a blocked destination.
+func newUpstreamReverseResolver(upstream string) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, proto, _ string) (net.Conn, error) {
+			d := &net.Dialer{
+				Control: func(_, _ string, c syscall.RawConn) error {
+					var sErr error
+					if err := c.Control(func(fd uintptr) {
+						sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_MARK, network.DNSProxyFWMark)
+					}); err != nil {
+						return err
+					}
+					return sErr
+				},
+			}
+			return d.DialContext(ctx, proto, upstream)
+		},
+	}
 }
 
 // reverseDNSExistingConnections performs reverse DNS lookups for each

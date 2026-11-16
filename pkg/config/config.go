@@ -245,7 +245,7 @@ func canonicalCIDR(value string) string {
 // the assembled FirewallConfig here for the canonical tail.
 func (cm *Manager) applyLoadedConfig(cfg *FirewallConfig) error {
 	normalizeRules(cfg.Rules)
-	cfg.Rules = dropUnspecifiedNetworks(cfg.Rules)
+	cfg.Rules = dropReverseLookupHosts(dropUnspecifiedNetworks(cfg.Rules))
 	if err := validateRules(cfg.Rules); err != nil {
 		return err
 	}
@@ -440,7 +440,7 @@ func normalizeSearchDomains(domains []string) []string {
 		}
 		normalized[i] = d
 	}
-	return mergeNormalizedSearchDomains(nil, normalized)
+	return dropReverseZoneSearchDomains(mergeNormalizedSearchDomains(nil, normalized))
 }
 
 // validateSearchDomain rejects a single normalized suffix that would be too
@@ -2016,7 +2016,7 @@ func (cm *Manager) AddSearchDomains(domains []string, logger *slog.Logger) {
 		}
 		valid = append(valid, d)
 	}
-	if len(valid) == 0 {
+	if valid = dropReverseZoneSearchDomains(valid); len(valid) == 0 {
 		return
 	}
 

@@ -175,6 +175,25 @@ var (
 
 const reverseDNSCacheMax = 10000
 
+// reverseDNSPerNetwork caps the distinct denied addresses a run looks up in
+// one IPv4 /24 or IPv6 /48, and reverseDNSRunMaxV4 and reverseDNSRunMaxV6
+// the distinct denied addresses of each family it looks up in all. However
+// many destinations a job's connections are denied at, the lookups they
+// cost stay few per network and few in the run. Retries of an address
+// already looked up don't count again (reverseDNSBudget). Past a family's
+// run cap a denied address goes unnamed, so one only a reverse name could
+// allow stays blocked. The families are counted apart, so IPv6 denials
+// never spend the IPv4 cap.
+const (
+	reverseDNSPerNetwork = 2
+	reverseDNSRunMaxV4   = 256
+	reverseDNSRunMaxV6   = 64
+)
+
+// reverseDNSBudgetState bounds cargowall's own reverse lookups of denied
+// destinations per network and per family (reverseDNSBudget).
+var reverseDNSBudgetState = newReverseDNSBudget(reverseDNSPerNetwork, reverseDNSRunMaxV4, reverseDNSRunMaxV6)
+
 // reverseDNSAttempted checks if an IP has been looked up before and marks it if not.
 // Returns true if the IP was already in the cache (i.e., already attempted).
 func reverseDNSAttempted(ip string) bool {
@@ -231,8 +250,25 @@ func reverseDNSRetry(ip string) bool {
 	return true
 }
 
-// reverseDNSResolver uses the system default resolver for PTR lookups.
-var reverseDNSResolver = net.DefaultResolver
+// reverseDNSResolver looks up the reverse names of blocked destinations and
+// the forward lookups that confirm them. cargowall points it at a resolver
+// that reaches the DNS upstream directly (SetReverseDNSResolver), so its own
+// lookups never pass through the proxy, whose filter answers a reverse
+// lookup only for an address the run allows and would refuse them.
+var reverseDNSResolver HostResolverFull = net.DefaultResolver
+
+// HostResolverFull is the resolver surface the lazy reverse lookups use: a
+// PTR lookup and the forward lookup that confirms its name.
+type HostResolverFull interface {
+	HostResolver
+	LookupAddr(ctx context.Context, addr string) ([]string, error)
+}
+
+// SetReverseDNSResolver points the lazy reverse lookups at r. Call it before
+// events flow.
+func SetReverseDNSResolver(r HostResolverFull) {
+	reverseDNSResolver = r
+}
 
 // ipProtoToConfigProtocol maps the L4 protocol byte from a BpfBlockedEvent to
 // the corresponding config.ProtocolType. The bool reports whether the proto
@@ -286,6 +322,18 @@ func rulePortCovered(ports []config.Port, port uint16, proto config.ProtocolType
 	return false
 }
 
+// budgetAllowsLookup reports whether a reverse lookup of dstIP may run: an
+// allowed connection's lookup only labels it, so it is never budgeted; a
+// denied one is bounded (reverseDNSBudgetState.take, which never counts a
+// local address). Called once per address, after reverseDNSAttempted has
+// marked it, so a denial past a cap stays unnamed for the run.
+func budgetAllowsLookup(denial bool, dstIP string, logger *slog.Logger) bool {
+	if !denial {
+		return true
+	}
+	return reverseDNSBudgetState.take(dstIP, logger)
+}
+
 // processEvent handles a single blocked/allowed event from the ring buffer.
 func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *NotificationTracker,
 	auditLogger *AuditLogger, fw FirewallUpdater, logger *slog.Logger,
@@ -322,7 +370,12 @@ func processEvent(raw []byte, configMgr *config.Manager, notificationTracker *No
 	// Lazy reverse DNS for IPs not in the cache.
 	// Each unique IP is only looked up once.
 	if hostname == "" {
-		if !reverseDNSAttempted(dstIP) {
+		// A denial's lookup is bounded per network and per family
+		// (reverseDNSBudgetState); a local address, whose reverse zone is
+		// served locally, isn't counted. Past a cap a denied address goes
+		// unnamed, with no lookup, and reverseDNSAttempted has marked it, so
+		// it is final for the run.
+		if !reverseDNSAttempted(dstIP) && budgetAllowsLookup(event.Allowed == 0, dstIP, logger) {
 			// Step 1: Try PTR lookup
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			names, err := reverseDNSResolver.LookupAddr(ctx, dstIP)

@@ -170,7 +170,7 @@ func (s *Server) SetRecentBlocks(rb *events.RecentBlocks) {
 }
 
 // EnableQueryFiltering enables DNS query filtering.
-// When enabled, only queries for domains that match allowed hostname rules will be forwarded.
+// When enabled, only queries for domains that match allowed hostname rules, and reverse lookups of known addresses, will be forwarded.
 // Queries for non-allowed domains will receive REFUSED responses.
 // This prevents DNS tunneling attacks where data is exfiltrated via DNS queries.
 func (s *Server) EnableQueryFiltering(enable bool) {
@@ -181,9 +181,9 @@ func (s *Server) EnableQueryFiltering(enable bool) {
 //
 // Precedence, in order:
 //  1. Filtering disabled → allow.
-//  2. Canonical PTR queries (Qtype=PTR and well-formed in-addr.arpa /
-//     ip6.arpa name) → allow. The double gate (Qtype + shape) is what
-//     prevents using PTR-shaped names as a tunneling channel via TXT/A/etc.
+//  2. Canonical PTR queries (Qtype=PTR, a well-formed in-addr.arpa /
+//     ip6.arpa name) for an address the run knows → allow. Any other PTR
+//     query is judged by the steps below, like any other name.
 //  3. Explicit hostname rule. MatchHostnameRule handles search-domain
 //     stripping internally and can return a mixed verdict (one form deny,
 //     other form allow). At the DNS gate we allow the query if ANY allow
@@ -211,12 +211,12 @@ func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 		return true
 	}
 
-	// Allow reverse DNS lookups, but only true PTR queries with the
-	// canonical shape (exactly 4 numeric octets for IPv4, exactly 32 hex
-	// nibbles for IPv6). The Qtype gate stops TXT/A/NS queries against
-	// PTR-shaped names from slipping through this exception; the shape gate
-	// stops shortened/padded labels from carrying tunneled data.
-	if qtype == dns.TypePTR && isValidReverseDNS(domain) {
+	// Allow reverse DNS lookups only as true PTR queries of canonical shape
+	// (exactly 4 numeric octets for IPv4, exactly 32 hex nibbles for IPv6),
+	// and only for an address the run already knows (reverseQueryKnown).
+	// The Qtype gate keeps TXT/A/NS queries of PTR-shaped names out, the
+	// shape gate shortened or padded labels, and the address gate the rest.
+	if qtype == dns.TypePTR && isValidReverseDNS(domain) && s.reverseQueryKnown(domain) {
 		return true
 	}
 

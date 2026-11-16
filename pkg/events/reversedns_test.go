@@ -571,7 +571,8 @@ func TestReportVerdict_FullRetryQueueReleasesTheClaim(t *testing.T) {
 	r := useGatedRetries(t, gated, 1)
 	cm := builderPolicy(t)
 	fw := &mockFirewallUpdater{}
-	ips := []string{"198.51.100.1", "198.51.100.2", "198.51.100.3"}
+	// In networks of their own, so no per-network cap decides this.
+	ips := []string{"198.51.100.1", "198.51.101.2", "198.51.102.3"}
 
 	for _, ip := range ips {
 		reportDrop(t, cm, fw, dropTo(ip, 443)) // the first lookup times out

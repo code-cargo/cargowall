@@ -78,6 +78,15 @@ const (
 	// worker. A retry that finds it full is dropped, and the next denial of
 	// that IP asks again.
 	reverseDNSRetryQueue = 16
+
+	// reverseDNSPerNetwork caps the distinct denied addresses a run looks up
+	// in one IPv4 /24 or IPv6 /48, and reverseDNSRunMax the distinct denied
+	// addresses it looks up in all. However many destinations a job's
+	// connections are denied at, the lookups they cost stay few per network
+	// and few in the run. Retries of an address already looked up don't
+	// count again (reverseDNSBudget).
+	reverseDNSPerNetwork = 2
+	reverseDNSRunMax     = 64
 )
 
 var (
@@ -193,10 +202,14 @@ type reverseDNSTracker struct {
 	entries map[string]*reverseDNSEntry
 	max     int
 	now     func() time.Time
+	budget  *reverseDNSBudget // the denied addresses a run may look up
 }
 
 func newReverseDNSTracker(maxEntries int, now func() time.Time) *reverseDNSTracker {
-	return &reverseDNSTracker{entries: make(map[string]*reverseDNSEntry), max: maxEntries, now: now}
+	return &reverseDNSTracker{
+		entries: make(map[string]*reverseDNSEntry), max: maxEntries, now: now,
+		budget: newReverseDNSBudget(reverseDNSPerNetwork, reverseDNSRunMax),
+	}
 }
 
 // begin reports whether a lookup of ip may run now, and whether it is the
@@ -286,11 +299,13 @@ func (t *reverseDNSTracker) insertLocked(ip string, now time.Time) *reverseDNSEn
 	return e
 }
 
-// reset forgets every IP. Tests use it to keep runs independent.
+// reset forgets every IP, and the budget spent. Tests use it to keep runs
+// independent.
 func (t *reverseDNSTracker) reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.entries = make(map[string]*reverseDNSEntry)
+	t.budget.reset()
 }
 
 // size reports how many IPs the tracker holds.

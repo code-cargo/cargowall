@@ -61,7 +61,7 @@ func (s *Server) reconcileRefusedQueries() {
 	for _, domain := range s.recentDNSBlocks.Domains() {
 		// TypeA, not the refusal's own qtype: the qtype gate in
 		// isQueryAllowed only ever WIDENS (a canonically shaped reverse-DNS
-		// PTR is allowed unconditionally), so evaluating the strict form
+		// PTR for a known address is allowed), so evaluating the strict form
 		// cannot late-allow a name the live path would still refuse.
 		if !s.isQueryAllowed(domain, dns.TypeA) {
 			continue

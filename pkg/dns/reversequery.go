@@ -24,9 +24,8 @@ import (
 
 // reverseQueryKnown reports whether domain, a canonical PTR name (see
 // isValidReverseDNS), asks about an address the run already knows, the only
-// reverse lookups query filtering answers on their shape alone: a private,
-// loopback, link-local or unique-local address, whose reverse zone the
-// local resolver serves, or one the config manager knows (KnownAddress). A
+// reverse lookups query filtering answers on their shape alone: a local
+// address (localAddress), or one the config manager knows (KnownAddress). A
 // reverse lookup of any other address is judged like any other name.
 func (s *Server) reverseQueryKnown(domain string) bool {
 	addr, ok := reverseQueryAddr(domain)
@@ -36,10 +35,16 @@ func (s *Server) reverseQueryKnown(domain string) bool {
 	return localAddress(addr) || s.config.KnownAddress(addr)
 }
 
-// localAddress reports whether addr is private, loopback, link-local or
-// unique-local.
+// sharedAddressSpace is 100.64.0.0/10 (RFC 6598), as used for carrier-grade
+// NAT and cluster networks.
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+// localAddress reports whether addr is private, loopback, link-local,
+// unique-local or in the shared address space: the ranges whose reverse
+// zones resolvers serve locally (RFC 6303, RFC 7793).
 func localAddress(addr netip.Addr) bool {
-	return addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast()
+	return addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() ||
+		sharedAddressSpace.Contains(addr.Unmap())
 }
 
 // reverseQueryAddr returns the address a canonical PTR name asks about: an
@@ -54,7 +59,7 @@ func reverseQueryAddr(domain string) (netip.Addr, bool) {
 		labels := strings.Split(rest, ".")
 		var b [4]byte
 		for i, l := range labels {
-			n, err := strconv.Atoi(l)
+			n, err := strconv.ParseUint(l, 10, 8)
 			if err != nil {
 				return netip.Addr{}, false
 			}

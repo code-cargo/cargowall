@@ -327,6 +327,18 @@ func (c *SummaryCmd) eventTypeLabel(eventType events.AuditEventType) string {
 	}
 }
 
+// reverseLookupName reports whether name is under in-addr.arpa or ip6.arpa:
+// a lookup of an address's name, never a host to allow.
+func reverseLookupName(name string) bool {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	for _, zone := range []string{"in-addr.arpa", "ip6.arpa"} {
+		if name == zone || strings.HasSuffix(name, "."+zone) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *SummaryCmd) generateAllowlistSuggestions(stepEvents []StepEvents) {
 	// Count occurrences of each destination
 	destCounts := make(map[string]int)
@@ -339,7 +351,9 @@ func (c *SummaryCmd) generateAllowlistSuggestions(stepEvents []StepEvents) {
 			// the already-allowed origin its edge IP resolves to.
 			switch event.EventType {
 			case events.EventConnectionBlocked, events.EventDNSBlocked, events.EventL7Blocked:
-				destCounts[event.ReportedDestName()]++
+				if name := event.ReportedDestName(); !reverseLookupName(name) {
+					destCounts[name]++
+				}
 			}
 		}
 	}

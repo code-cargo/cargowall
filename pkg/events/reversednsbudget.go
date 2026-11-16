@@ -22,27 +22,44 @@ import (
 	"sync"
 )
 
+// reverseDNSFamily indexes the budget's per-family counts.
+type reverseDNSFamily int
+
+const (
+	reverseDNSIPv4 reverseDNSFamily = iota
+	reverseDNSIPv6
+)
+
+func (f reverseDNSFamily) String() string {
+	if f == reverseDNSIPv4 {
+		return "IPv4"
+	}
+	return "IPv6"
+}
+
 // reverseDNSBudget decides which denied destinations a run may look up the
 // reverse name of: at most perNetwork distinct addresses in each IPv4 /24 or
-// IPv6 /48, and max in all (reverseDNSPerNetwork, reverseDNSRunMax). An
-// address it has let through is let through again, so its retries cost
-// nothing more, even after the tracker evicted it. One past a cap goes
-// unnamed, with no lookup, and the cap is logged at Info once: once per
-// network, and once for the run's. Each of its maps holds at most max
-// entries, since a network is logged only once it holds perNetwork
-// addresses, so a run's denials can't grow it.
+// IPv6 /48, and max[family] of each family in all (reverseDNSPerNetwork,
+// reverseDNSRunMaxV4, reverseDNSRunMaxV6). An address it has let through is
+// let through again, so its retries cost nothing more, even after the
+// tracker evicted it. One past a cap goes unnamed, with no lookup, and the
+// cap is logged at Info once: once per network, and once per family's run
+// cap. Each of its maps holds at most the two run caps' entries, since a
+// network is logged only once it holds perNetwork addresses, so a run's
+// denials can't grow it.
 type reverseDNSBudget struct {
 	mu         sync.Mutex
 	perNetwork int
-	max        int
+	max        [2]int
 	looked     map[netip.Addr]struct{}   // addresses let through
+	perFamily  [2]int                    // addresses let through, per family
 	networks   map[netip.Prefix]int      // addresses let through, per network
 	logged     map[netip.Prefix]struct{} // networks whose cap was logged
-	loggedRun  bool                      // the run's cap was logged
+	loggedRun  [2]bool                   // the family's run cap was logged
 }
 
-func newReverseDNSBudget(perNetwork, maxAddrs int) *reverseDNSBudget {
-	b := &reverseDNSBudget{perNetwork: perNetwork, max: maxAddrs}
+func newReverseDNSBudget(perNetwork, maxV4, maxV6 int) *reverseDNSBudget {
+	b := &reverseDNSBudget{perNetwork: perNetwork, max: [2]int{maxV4, maxV6}}
 	b.resetLocked()
 	return b
 }
@@ -55,16 +72,20 @@ func (b *reverseDNSBudget) take(ip string, logger *slog.Logger) bool {
 		return false
 	}
 	addr = addr.Unmap()
+	family := reverseDNSIPv6
+	if addr.Is4() {
+		family = reverseDNSIPv4
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if _, ok := b.looked[addr]; ok {
 		return true
 	}
-	if len(b.looked) >= b.max {
-		if !b.loggedRun {
-			b.loggedRun = true
-			logger.Info("Reverse DNS lookups of denied destinations reached the run's cap; further ones go unnamed",
-				"cap", b.max)
+	if b.perFamily[family] >= b.max[family] {
+		if !b.loggedRun[family] {
+			b.loggedRun[family] = true
+			logger.Info("Reverse DNS lookups of denied destinations reached the run's cap for the family; further ones go unnamed",
+				"family", family.String(), "cap", b.max[family])
 		}
 		return false
 	}
@@ -78,6 +99,7 @@ func (b *reverseDNSBudget) take(ip string, logger *slog.Logger) bool {
 		return false
 	}
 	b.looked[addr] = struct{}{}
+	b.perFamily[family]++
 	b.networks[network]++
 	return true
 }
@@ -91,9 +113,10 @@ func (b *reverseDNSBudget) reset() {
 
 func (b *reverseDNSBudget) resetLocked() {
 	b.looked = make(map[netip.Addr]struct{})
+	b.perFamily = [2]int{}
 	b.networks = make(map[netip.Prefix]int)
 	b.logged = make(map[netip.Prefix]struct{})
-	b.loggedRun = false
+	b.loggedRun = [2]bool{}
 }
 
 // reverseDNSNetwork is the network addr's cap counts in: its IPv4 /24, or

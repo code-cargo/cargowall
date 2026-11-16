@@ -131,6 +131,11 @@ func TestIsQueryAllowed_ReverseLookupsOfKnownAddressesOnly(t *testing.T) {
 		{"169.254.169.254", true, "link-local"},
 		{"fe80::1", true, "link-local"},
 		{"fd00:1::1", true, "unique-local"},
+		{"100.64.0.1", true, "shared address space"},
+		{"100.127.255.254", true, "shared address space"},
+		{"::ffff:100.100.1.1", true, "the IPv4-mapped form of a shared address"},
+		{"100.128.0.1", false, "just past the shared address space"},
+		{"100.63.255.255", false, "just before the shared address space"},
 		{"192.0.2.11", false, "unknown, beside a named address"},
 		{"2001:db8:abcd:1234:5678:9abc:def0:1234", false, "unknown"},
 		{"::ffff:192.0.2.11", false, "the IPv4-mapped form of an unknown address"},
@@ -152,6 +157,33 @@ func TestIsQueryAllowed_ReverseLookupsOfKnownAddressesOnly(t *testing.T) {
 
 	// Only a PTR query of a known address: another type stays refused.
 	assert.False(t, server.isQueryAllowed(reverseName(t, "192.0.2.10"), dns.TypeTXT))
+}
+
+// An address cargowall auto-allows as infrastructure (EnsureInfraAllowed)
+// or as its DNS upstream (EnsureDNSAllowed) is inside an allow CIDR, so its
+// reverse lookup passes the gate. One auto-allowed nowhere is refused, and
+// so is one an explicit deny covers, where the auto-allow is skipped.
+func TestIsQueryAllowed_ReverseLookupsOfAutoAllowedAddresses(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules(nil, config.ActionDeny))
+	cfg.EnsureInfraAllowed([]string{"168.63.129.16"}, []config.Port{{Port: 80, Protocol: config.ProtocolTCP}},
+		config.AutoAddedTypeAzureInfrastructure)
+	cfg.EnsureDNSAllowed([]string{"9.9.9.9", "2620:fe::fe"})
+	server := newTestServer(t, cfg, firewall.NewMockFirewall(t))
+	server.filterQueries = true
+	for ip, want := range map[string]bool{"168.63.129.16": true, "9.9.9.9": true, "2620:fe::fe": true, "8.8.4.4": false} {
+		assert.Equal(t, want, server.isQueryAllowed(reverseName(t, ip), dns.TypePTR), ip)
+	}
+
+	denied := config.NewConfigManager()
+	require.NoError(t, denied.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeCIDR, Value: "168.63.129.16/32", Action: config.ActionDeny},
+	}, config.ActionDeny))
+	denied.EnsureInfraAllowed([]string{"168.63.129.16"}, nil, config.AutoAddedTypeAzureInfrastructure)
+	server = newTestServer(t, denied, firewall.NewMockFirewall(t))
+	server.filterQueries = true
+	assert.False(t, server.isQueryAllowed(reverseName(t, "168.63.129.16"), dns.TypePTR),
+		"an explicit deny keeps the address unknown")
 }
 
 // An unknown address's reverse lookup is judged by the rules like any

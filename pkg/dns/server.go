@@ -491,10 +491,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 			isAuditMode := s.config.IsAuditMode()
 
 			attr := s.attributeClient(w)
-			ev := events.AuditEvent{
-				EventType:   events.EventDNSBlocked,
-				DstHostname: domain,
-			}
+			ev := blockedQueryEvent(domain)
 			attr.apply(&ev)
 
 			logAttrs := attr.logAttrs("domain", domain, "from", w.RemoteAddr().String())

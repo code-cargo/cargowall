@@ -160,10 +160,15 @@ func TestLocalAddress(t *testing.T) {
 // configured: a reverse lookup is answered for an address the run allows,
 // never by a search domain.
 func TestValidateSearchDomain_ReverseLookupZones(t *testing.T) {
-	for _, d := range []string{".100.51.198.in-addr.arpa", ".in-addr.arpa", ".8.b.d.0.1.0.0.2.ip6.arpa", ".IP6.ARPA"} {
+	for d, want := range map[string]string{
+		".100.51.198.in-addr.arpa":  "under a reverse-lookup zone",
+		".8.b.d.0.1.0.0.2.ip6.arpa": "under a reverse-lookup zone",
+		".in-addr.arpa":             "is a public suffix", // the zone apexes are public suffixes
+		".IP6.ARPA":                 "is a public suffix",
+	} {
 		err := validateSearchDomain(strings.ToLower(d))
 		require.Error(t, err, d)
-		assert.Contains(t, err.Error(), "under a reverse-lookup zone", d)
+		assert.Contains(t, err.Error(), want, d)
 	}
 	assert.NoError(t, validateSearchDomain(".compute.internal"))
 }

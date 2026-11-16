@@ -55,3 +55,29 @@ func TestSummary_AllowlistSuggestionsSkipReverseLookupNames(t *testing.T) {
 	}})
 	assert.Empty(t, buf.String(), "only reverse lookups: nothing to suggest")
 }
+
+// A refused reverse lookup is recorded by the address it asked about, with
+// no hostname: the summary shows the address, as for any bare-IP block, and
+// never suggests allowing it, since the lookup says nothing of a host the
+// job needed.
+func TestSummary_RefusedReverseLookupRecordedByAddress(t *testing.T) {
+	ts := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	refused := makeEvent(t, events.EventDNSBlocked, "", "192.0.2.7", "dig", 0, ts)
+	refused6 := makeEvent(t, events.EventDNSBlocked, "", "2001:db8:abcd::1", "dig", 0, ts)
+	stepEvents := []StepEvents{{
+		Step:   GitHubStep{Name: "build", Number: 1, StartedAt: ts, CompletedAt: ts.Add(time.Minute)},
+		Events: []events.AuditEvent{refused, refused6},
+	}}
+	assert.Equal(t, "192.0.2.7", refused.ReportedDestName())
+
+	var buf bytes.Buffer
+	(&SummaryCmd{output: &buf}).generateAllowlistSuggestions(stepEvents)
+	assert.Empty(t, buf.String(), "nothing to suggest")
+
+	buf.Reset()
+	(&SummaryCmd{output: &buf}).generateSummary(summaryData{groups: stepEvents})
+	out := buf.String()
+	assert.Contains(t, out, "192.0.2.7")
+	assert.Contains(t, out, "2001:db8:abcd::1")
+	assert.NotContains(t, out, "### Recommended Allowlist Additions")
+}

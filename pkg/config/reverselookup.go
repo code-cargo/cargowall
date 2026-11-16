@@ -17,6 +17,7 @@
 package config
 
 import (
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -52,4 +53,15 @@ func dropReverseLookupHosts(rules []Rule) []Rule {
 			"value", rule.Value, "action", rule.Action, "ports", rule.Ports)
 		return true
 	})
+}
+
+// reverseZoneSearchDomain refuses d, a search domain whose bare form is
+// bare, when it is, or is under, a reverse-lookup zone (ReverseLookupName):
+// a reverse lookup is answered only for an address the run allows, never by
+// a search domain. Its zone apexes are public suffixes, refused before this.
+func reverseZoneSearchDomain(d, bare string) error {
+	if ReverseLookupName(bare) {
+		return fmt.Errorf("search domain %q is under a reverse-lookup zone; a reverse lookup is answered for an address the run allows, so allow the address instead", d)
+	}
+	return nil
 }

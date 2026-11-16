@@ -24,7 +24,20 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/events"
 )
+
+// blockedQueryEvent is the dns_blocked record of a refused query for domain.
+// A refused reverse lookup records the address it asked about as the
+// destination IP, with no hostname, as a denial of that address would be:
+// its name names a zone, not a host. Any other refused name, a reverse-
+// lookup name that names no single address included, is the hostname.
+func blockedQueryEvent(domain string) events.AuditEvent {
+	if addr, ok := reverseQueryAddr(domain); ok {
+		return events.AuditEvent{EventType: events.EventDNSBlocked, DstIP: addr.String()}
+	}
+	return events.AuditEvent{EventType: events.EventDNSBlocked, DstHostname: domain}
+}
 
 // reverseNameVerdict decides a query for domain when domain is a
 // reverse-lookup name (config.ReverseLookupName), and reports whether it is

@@ -514,9 +514,6 @@ func normalizeSearchDomains(domains []string) []string {
 //     domain would silently elevate them to bypass and let K8s service
 //     names skip per-hostname DNS filtering — surface as a config error
 //     so the operator decides explicitly.
-//  4. Reverse-lookup zones: must not be, or be under, in-addr.arpa or
-//     ip6.arpa (ReverseLookupName). A reverse lookup is answered only for
-//     an address the run allows, never by a search domain.
 func validateSearchDomain(d string) error {
 	if d == "" || d == "." {
 		return fmt.Errorf("search domain must not be empty")
@@ -548,13 +545,10 @@ func validateSearchDomain(d string) error {
 	// publicsuffix.PublicSuffix returns the longest known public suffix
 	// for the input. If the user's suffix IS that public suffix, they're
 	// trying to use a TLD-equivalent as a bypass — reject.
-	if ReverseLookupName(bare) {
-		return fmt.Errorf("search domain %q is under a reverse-lookup zone; a reverse lookup is answered for an address the run allows, so allow the address instead", d)
-	}
 	if eTLD, _ := publicsuffix.PublicSuffix(bare); eTLD == bare {
 		return fmt.Errorf("search domain %q is a public suffix (per Mozilla PSL); use a more specific private suffix", d)
 	}
-	return nil
+	return reverseZoneSearchDomain(d, bare)
 }
 
 // validateSearchDomains validates a batch of normalized suffixes, returning

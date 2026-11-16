@@ -326,13 +326,17 @@ func TestIsQueryAllowed_ReverseZoneDenyUnderAnAllowDefault(t *testing.T) {
 // A search domain under a reverse zone is refused at load, from a local
 // file or the environment, so it can never allow a reverse-lookup name.
 func TestSearchDomainsUnderReverseZonesAreRefused(t *testing.T) {
-	for _, d := range []string{".100.51.198.in-addr.arpa", ".in-addr.arpa", ".d.c.b.a.8.b.d.0.1.0.0.2.ip6.arpa"} {
+	for d, want := range map[string]string{
+		".100.51.198.in-addr.arpa":          "under a reverse-lookup zone",
+		".d.c.b.a.8.b.d.0.1.0.0.2.ip6.arpa": "under a reverse-lookup zone",
+		".in-addr.arpa":                     "is a public suffix", // a zone apex
+	} {
 		cfg := config.NewConfigManager()
 		path := t.TempDir() + "/policy.json"
 		require.NoError(t, os.WriteFile(path, []byte(`{"defaultAction": "deny", "searchDomains": ["`+d+`"]}`), 0o600))
 		err := cfg.LoadConfig(path)
 		require.Error(t, err, d)
-		assert.Contains(t, err.Error(), "under a reverse-lookup zone", d)
+		assert.Contains(t, err.Error(), want, d)
 	}
 	t.Setenv("CARGOWALL_SEARCH_DOMAINS", ".100.51.198.in-addr.arpa")
 	err := config.NewConfigManager().LoadFromEnv()
@@ -353,8 +357,9 @@ func TestIsQueryAllowed_ReverseLookupOfUnknownAddressFollowsTheDefault(t *testin
 
 // A reverse lookup the gate refuses takes the refusal path every filtered
 // query takes: REFUSED and a dns_blocked record under enforce, and in audit
-// mode the record and the query forwarded. A known address's lookup is
-// answered, and writes no record.
+// mode the record and the query forwarded. The record names the address
+// the lookup asked about as its destination IP, with no hostname. A known
+// address's lookup is answered, and writes no record.
 func TestHandleDNSQuery_ReverseLookupRefusal(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -418,7 +423,25 @@ func TestHandleDNSQuery_ReverseLookupRefusal(t *testing.T) {
 			evs := readDNSAuditEvents(t, auditFile)
 			require.Len(t, evs, 1)
 			assert.Equal(t, events.EventDNSBlocked, evs[0].EventType)
-			assert.Equal(t, strings.TrimSuffix(qname, "."), evs[0].DstHostname)
+			assert.Equal(t, netip.MustParseAddr(tc.ip).String(), evs[0].DstIP)
+			assert.Empty(t, evs[0].DstHostname)
+			assert.Equal(t, tc.audit, evs[0].WouldDeny)
 		})
+	}
+}
+
+// A refused query for a reverse-lookup name that names no single address,
+// or any other name, keeps the name as the record's hostname.
+func TestBlockedQueryEvent(t *testing.T) {
+	for domain, want := range map[string]events.AuditEvent{
+		"7.2.0.192.in-addr.arpa":           {EventType: events.EventDNSBlocked, DstIP: "192.0.2.7"},
+		reverseName(t, "2001:db8:abcd::1"): {EventType: events.EventDNSBlocked, DstIP: "2001:db8:abcd::1"},
+		ip6ArpaName("::ffff:192.0.2.7"):    {EventType: events.EventDNSBlocked, DstIP: "192.0.2.7"},
+		"exfil.payload.in-addr.arpa":       {EventType: events.EventDNSBlocked, DstHostname: "exfil.payload.in-addr.arpa"},
+		"2.0.192.in-addr.arpa":             {EventType: events.EventDNSBlocked, DstHostname: "2.0.192.in-addr.arpa"},
+		"evil.example.com":                 {EventType: events.EventDNSBlocked, DstHostname: "evil.example.com"},
+		"7.2.0.192.in-addr.arpa.example":   {EventType: events.EventDNSBlocked, DstHostname: "7.2.0.192.in-addr.arpa.example"},
+	} {
+		assert.Equal(t, want, blockedQueryEvent(domain), domain)
 	}
 }

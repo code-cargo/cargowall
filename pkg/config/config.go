@@ -492,7 +492,7 @@ func normalizeSearchDomains(domains []string) []string {
 		}
 		normalized[i] = d
 	}
-	return mergeNormalizedSearchDomains(nil, normalized)
+	return dropReverseZoneSearchDomains(mergeNormalizedSearchDomains(nil, normalized))
 }
 
 // validateSearchDomain rejects a single normalized suffix that would be too
@@ -548,7 +548,7 @@ func validateSearchDomain(d string) error {
 	if eTLD, _ := publicsuffix.PublicSuffix(bare); eTLD == bare {
 		return fmt.Errorf("search domain %q is a public suffix (per Mozilla PSL); use a more specific private suffix", d)
 	}
-	return reverseZoneSearchDomain(d, bare)
+	return nil
 }
 
 // validateSearchDomains validates a batch of normalized suffixes, returning
@@ -2122,7 +2122,7 @@ func (cm *Manager) AddSearchDomains(domains []string, logger *slog.Logger) {
 		}
 		valid = append(valid, d)
 	}
-	if len(valid) == 0 {
+	if valid = dropReverseZoneSearchDomains(valid); len(valid) == 0 {
 		return
 	}
 

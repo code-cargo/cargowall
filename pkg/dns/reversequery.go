@@ -27,6 +27,15 @@ import (
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
+// enforcesAnswer reports whether the answer to query r may change
+// enforcement state: that of any query but a PTR query. A PTR answer names
+// hosts, never addresses to map or allow, so no address record, CNAME
+// target or other record in one is learned or installed, whatever the
+// response carries.
+func enforcesAnswer(r *dns.Msg) bool {
+	return len(r.Question) > 0 && r.Question[0].Qtype != dns.TypePTR
+}
+
 // blockedQueryEvent is the dns_blocked record of a refused query for domain.
 // A refused reverse lookup records the address it asked about as the
 // destination IP, with no hostname, as a denial of that address would be:

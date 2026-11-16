@@ -581,7 +581,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	// the canonical lowercase form (rather than the raw wire case) keeps
 	// DNS-path output consistent with the connection-event path, which logs
 	// the lowercase hostname from the IP->hostname mapping (#65).
-	if len(r.Question) > 0 && resp.Rcode == dns.RcodeSuccess {
+	if enforcesAnswer(r) && resp.Rcode == dns.RcodeSuccess {
 		s.enforceDNSResponse(strings.ToLower(strings.TrimSuffix(r.Question[0].Name, ".")), resp, 0, wireAnswer)
 	}
 

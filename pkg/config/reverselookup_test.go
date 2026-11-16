@@ -17,8 +17,8 @@
 package config
 
 import (
+	"log/slog"
 	"net/netip"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -156,19 +156,45 @@ func TestLocalAddress(t *testing.T) {
 	}
 }
 
-// A search domain under a reverse-lookup zone is refused, wherever it is
-// configured: a reverse lookup is answered for an address the run allows,
-// never by a search domain.
-func TestValidateSearchDomain_ReverseLookupZones(t *testing.T) {
-	for d, want := range map[string]string{
-		".100.51.198.in-addr.arpa":  "under a reverse-lookup zone",
-		".8.b.d.0.1.0.0.2.ip6.arpa": "under a reverse-lookup zone",
-		".in-addr.arpa":             "is a public suffix", // the zone apexes are public suffixes
-		".IP6.ARPA":                 "is a public suffix",
-	} {
-		err := validateSearchDomain(strings.ToLower(d))
-		require.Error(t, err, d)
-		assert.Contains(t, err.Error(), want, d)
+// A search domain under a reverse-lookup zone is dropped with one warning,
+// from every loader and from the auto-added ones, and the rest of the
+// policy loads, enforcing. A reverse-lookup name is decided by the address
+// it asks about, so the entry could never take effect.
+func TestSearchDomainsUnderReverseZonesDropped(t *testing.T) {
+	const dropped = "A search domain under a reverse-lookup zone is dropped: reverse-lookup names are decided by the address they ask about"
+	reverse := []string{".100.51.198.in-addr.arpa", "in-addr.arpa", ".8.b.d.0.1.0.0.2.IP6.ARPA"}
+
+	logs := captureLogs(t)
+	cm := NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromCargoWall(&cargowallv1pb.CargoWallPolicy{
+		Mode:          datapb.CargoWallMode_CARGO_WALL_MODE_ENFORCE,
+		DefaultAction: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY,
+		SearchDomains: append([]string{".corp.internal"}, reverse...),
+	}))
+	assert.False(t, cm.IsAuditMode(), "the policy loads, enforcing")
+	assert.Equal(t, []string{".corp.internal"}, cm.GetSearchDomains())
+	ws := warns(*logs)
+	require.Len(t, ws, len(reverse))
+	for _, w := range ws {
+		assert.Contains(t, w, dropped)
 	}
-	assert.NoError(t, validateSearchDomain(".compute.internal"))
+
+	*logs = nil
+	cm = NewConfigManager()
+	require.NoError(t, cm.LoadConfig(writeJSONConfig(t, `{"defaultAction": "deny", "searchDomains": [".corp.internal", ".100.51.198.in-addr.arpa"]}`)))
+	assert.Equal(t, []string{".corp.internal"}, cm.GetSearchDomains())
+	assert.Len(t, warns(*logs), 1)
+
+	*logs = nil
+	t.Setenv("CARGOWALL_SEARCH_DOMAINS", ".corp.internal,.ip6.arpa")
+	cm = NewConfigManager()
+	require.NoError(t, cm.LoadFromEnv())
+	assert.Equal(t, []string{".corp.internal"}, cm.GetSearchDomains())
+	assert.Len(t, warns(*logs), 1)
+
+	*logs = nil
+	cm = NewConfigManager()
+	cm.AddSearchDomains([]string{".internal.cloudapp.net", ".100.51.198.in-addr.arpa"}, slog.Default())
+	assert.Equal(t, []string{".internal.cloudapp.net"}, cm.GetSearchDomains())
+	assert.Len(t, warns(*logs), 1)
 }

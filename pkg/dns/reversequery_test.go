@@ -18,6 +18,7 @@ package dns
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"strings"
@@ -323,25 +324,86 @@ func TestIsQueryAllowed_ReverseZoneDenyUnderAnAllowDefault(t *testing.T) {
 	assert.True(t, server.isQueryAllowed(reverseName(t, "2001:db8:abcd::1"), dns.TypePTR), "no deny: the default allows it")
 }
 
-// A search domain under a reverse zone is refused at load, from a local
-// file or the environment, so it can never allow a reverse-lookup name.
-func TestSearchDomainsUnderReverseZonesAreRefused(t *testing.T) {
-	for d, want := range map[string]string{
-		".100.51.198.in-addr.arpa":          "under a reverse-lookup zone",
-		".d.c.b.a.8.b.d.0.1.0.0.2.ip6.arpa": "under a reverse-lookup zone",
-		".in-addr.arpa":                     "is a public suffix", // a zone apex
-	} {
-		cfg := config.NewConfigManager()
-		path := t.TempDir() + "/policy.json"
-		require.NoError(t, os.WriteFile(path, []byte(`{"defaultAction": "deny", "searchDomains": ["`+d+`"]}`), 0o600))
-		err := cfg.LoadConfig(path)
-		require.Error(t, err, d)
-		assert.Contains(t, err.Error(), want, d)
+// A search domain under a reverse zone is dropped at load, from a local
+// file or the environment, and the rest of the policy loads: it could never
+// allow a reverse-lookup name, which the address gate decides.
+func TestSearchDomainsUnderReverseZonesAreDropped(t *testing.T) {
+	cfg := config.NewConfigManager()
+	path := t.TempDir() + "/policy.json"
+	require.NoError(t, os.WriteFile(path, []byte(`{"defaultAction": "deny", "searchDomains":
+		[".100.51.198.in-addr.arpa", ".in-addr.arpa", ".d.c.b.a.8.b.d.0.1.0.0.2.ip6.arpa", ".corp.internal"]}`), 0o600))
+	require.NoError(t, cfg.LoadConfig(path))
+	assert.Equal(t, []string{".corp.internal"}, cfg.GetSearchDomains())
+	server := newTestServer(t, cfg, firewall.NewMockFirewall(t))
+	server.filterQueries = true
+	assert.False(t, server.isQueryAllowed(reverseName(t, "198.51.100.7"), dns.TypePTR))
+	assert.True(t, server.isQueryAllowed("db.corp.internal", dns.TypeA), "the rest loaded")
+
+	t.Setenv("CARGOWALL_SEARCH_DOMAINS", ".100.51.198.in-addr.arpa,.corp.internal")
+	cfg = config.NewConfigManager()
+	require.NoError(t, cfg.LoadFromEnv())
+	assert.Equal(t, []string{".corp.internal"}, cfg.GetSearchDomains())
+}
+
+// The answer to a PTR query never changes enforcement state, whatever
+// records it carries: an address record or CNAME target in it, here behind
+// a known address's reverse name and a rule above the reverse zones, is
+// neither mapped, learned nor installed. The same records answering an
+// address query are.
+func TestHandleDNSQuery_PTRAnswerInstallsNothing(t *testing.T) {
+	answerWith := func(qname string, qtype uint16) *dns.Msg {
+		q := new(dns.Msg)
+		q.SetQuestion(qname, qtype)
+		resp := new(dns.Msg)
+		resp.SetReply(q)
+		resp.Answer = []dns.RR{
+			&dns.CNAME{Hdr: dns.RR_Header{Name: qname, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300}, Target: "evil.example.net."},
+			&dns.A{Hdr: dns.RR_Header{Name: "evil.example.net.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300}, A: net.ParseIP("6.6.6.6")},
+		}
+		return resp
 	}
-	t.Setenv("CARGOWALL_SEARCH_DOMAINS", ".100.51.198.in-addr.arpa")
-	err := config.NewConfigManager().LoadFromEnv()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "under a reverse-lookup zone")
+	newServer := func(t *testing.T, fw firewall.Firewall) *Server {
+		cfg := config.NewConfigManager()
+		require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+			{Type: config.RuleTypeCIDR, Value: "203.0.113.0/24", Action: config.ActionAllow},
+			{Type: config.RuleTypeHostname, Value: "arpa", Action: config.ActionAllow},
+			{Type: config.RuleTypeHostname, Value: "known.example.com", Action: config.ActionAllow},
+		}, config.ActionDeny))
+		server := newTestServer(t, cfg, fw)
+		server.filterQueries = true
+		return server
+	}
+	query := func(server *Server, qname string, qtype uint16) *dns.Msg {
+		resp := answerWith(qname, qtype)
+		q := new(dns.Msg)
+		q.SetQuestion(qname, qtype)
+		server.dnsCache.Put(server.generateCacheKey(q), &dnsCacheEntry{msg: resp}, 5*time.Minute)
+		w := &MockResponseWriter{}
+		w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+		server.handleDNSQuery(w, q)
+		w.AssertExpectations(t)
+		return w.msg
+	}
+
+	// The mock firewall fails the test on any call.
+	server := newServer(t, firewall.NewMockFirewall(t))
+	msg := query(server, reverseName(t, "203.0.113.9")+".", dns.TypePTR)
+	require.NotNil(t, msg)
+	assert.Equal(t, dns.RcodeSuccess, msg.Rcode, "the known address's lookup is answered")
+	assert.Len(t, msg.Answer, 2, "and the answer reaches the job as it came")
+	assert.Empty(t, server.config.LookupHostnameByIP("6.6.6.6"), "no address in it is mapped")
+	_, learned := server.cnameAllowed.Get("evil.example.net")
+	assert.False(t, learned, "no CNAME target in it is learned")
+	assert.False(t, server.isQueryAllowed("evil.example.net", dns.TypeA))
+
+	// The control: the same records answering an address query are applied.
+	fw := firewall.NewMockFirewall(t)
+	fw.On("AddIP", mock.Anything, mock.Anything, mock.Anything).Return(true, nil).Maybe()
+	server = newServer(t, fw)
+	require.NotNil(t, query(server, "known.example.com.", dns.TypeA))
+	assert.NotEmpty(t, server.config.LookupHostnameByIP("6.6.6.6"))
+	_, learned = server.cnameAllowed.Get("evil.example.net")
+	assert.True(t, learned)
 }
 
 // An unknown address's reverse lookup is judged by the rules like any

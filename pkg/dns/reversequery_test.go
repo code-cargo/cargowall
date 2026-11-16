@@ -159,20 +159,40 @@ func TestIsQueryAllowed_ReverseLookupsOfKnownAddressesOnly(t *testing.T) {
 	assert.False(t, server.isQueryAllowed(reverseName(t, "192.0.2.10"), dns.TypeTXT))
 }
 
-// An address cargowall auto-allows as infrastructure (EnsureInfraAllowed)
-// or as its DNS upstream (EnsureDNSAllowed) is inside an allow CIDR, so its
-// reverse lookup passes the gate. One auto-allowed nowhere is refused, and
-// so is one an explicit deny covers, where the auto-allow is skipped.
+// An address cargowall auto-allows as infrastructure (EnsureInfraAllowed,
+// as autoAllowAzure calls it) or as its DNS upstream (EnsureDNSAllowed, v4
+// and v6) is inside an allow CIDR, so its reverse lookup passes the gate.
+// The allow is exact: an address never allowed, and the neighbour of an
+// auto-allowed /32 or /128, stay refused, as does any other query type for
+// an auto-allowed address's reverse name. An explicit deny over the address
+// keeps it unknown, since the auto-allow is skipped there.
 func TestIsQueryAllowed_ReverseLookupsOfAutoAllowedAddresses(t *testing.T) {
 	cfg := config.NewConfigManager()
 	require.NoError(t, cfg.LoadConfigFromRules(nil, config.ActionDeny))
-	cfg.EnsureInfraAllowed([]string{"168.63.129.16"}, []config.Port{{Port: 80, Protocol: config.ProtocolTCP}},
-		config.AutoAddedTypeAzureInfrastructure)
-	cfg.EnsureDNSAllowed([]string{"9.9.9.9", "2620:fe::fe"})
 	server := newTestServer(t, cfg, firewall.NewMockFirewall(t))
 	server.filterQueries = true
-	for ip, want := range map[string]bool{"168.63.129.16": true, "9.9.9.9": true, "2620:fe::fe": true, "8.8.4.4": false} {
+	wireserver := reverseName(t, "168.63.129.16")
+	require.False(t, server.isQueryAllowed(wireserver, dns.TypePTR), "before any allow")
+
+	// autoAllowAzure's calls, ports and all.
+	cfg.EnsureInfraAllowed([]string{"168.63.129.16"},
+		[]config.Port{config.PortDNS, config.PortHTTP, config.PortWireServer}, config.AutoAddedTypeAzureInfrastructure)
+	cfg.EnsureInfraAllowed([]string{"168.63.129.16"}, []config.Port{config.PortICMP}, config.AutoAddedTypeAzureInfrastructure)
+	cfg.EnsureDNSAllowed([]string{"8.8.4.4", "2001:4860:4860::8844"})
+
+	for ip, want := range map[string]bool{
+		"168.63.129.16":        true,
+		"8.8.4.4":              true,
+		"2001:4860:4860::8844": true,
+		"9.9.9.9":              false, // never allowed
+		"168.63.129.17":        false, // the /32's neighbour
+		"8.8.4.5":              false, // the /32's neighbour
+		"2001:4860:4860::8845": false, // the /128's neighbour
+	} {
 		assert.Equal(t, want, server.isQueryAllowed(reverseName(t, ip), dns.TypePTR), ip)
+	}
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeTXT} {
+		assert.False(t, server.isQueryAllowed(wireserver, qtype), "%s of the wireserver's reverse name", dns.TypeToString[qtype])
 	}
 
 	denied := config.NewConfigManager()
@@ -182,8 +202,7 @@ func TestIsQueryAllowed_ReverseLookupsOfAutoAllowedAddresses(t *testing.T) {
 	denied.EnsureInfraAllowed([]string{"168.63.129.16"}, nil, config.AutoAddedTypeAzureInfrastructure)
 	server = newTestServer(t, denied, firewall.NewMockFirewall(t))
 	server.filterQueries = true
-	assert.False(t, server.isQueryAllowed(reverseName(t, "168.63.129.16"), dns.TypePTR),
-		"an explicit deny keeps the address unknown")
+	assert.False(t, server.isQueryAllowed(wireserver, dns.TypePTR), "an explicit deny keeps the address unknown")
 }
 
 // An unknown address's reverse lookup is judged by the rules like any

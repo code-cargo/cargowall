@@ -23,32 +23,40 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/code-cargo/cargowall/pkg/events"
 	"github.com/code-cargo/cargowall/pkg/network"
 )
 
+// markDNSProxySocket sets DNSProxyFWMark on a socket, as a Dialer.Control, so
+// the redirect exempts it and it reaches the upstream directly.
+func markDNSProxySocket(_, _ string, c syscall.RawConn) error {
+	var sErr error
+	if err := c.Control(func(fd uintptr) {
+		sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_MARK, network.DNSProxyFWMark)
+	}); err != nil {
+		return err
+	}
+	return sErr
+}
+
 // newUpstreamReverseResolver resolves straight to the DNS upstream, marking
-// its socket (DNSProxyFWMark) so the redirect exempts it and it bypasses the
-// proxy. cargowall's own reverse and confirming lookups use it, the lazy
-// ones on denials and the startup round over existing connections: the
-// proxy's filter answers a reverse lookup only for an address the run
-// allows, and would refuse them, as would systemd-resolved's stub, whose
-// own upstream query the redirect sends through the proxy.
+// its socket so the redirect exempts it and it bypasses the proxy.
+// cargowall's own reverse and confirming lookups use it, the lazy ones on
+// denials and the startup round over existing connections: the proxy's
+// filter answers a reverse lookup only for an address the run knows, and
+// would refuse them, as would systemd-resolved's stub, whose own upstream
+// query the redirect sends through the proxy.
 func newUpstreamReverseResolver(upstream string) *net.Resolver {
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, proto, _ string) (net.Conn, error) {
-			d := &net.Dialer{
-				Control: func(_, _ string, c syscall.RawConn) error {
-					var sErr error
-					if err := c.Control(func(fd uintptr) {
-						sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_MARK, network.DNSProxyFWMark)
-					}); err != nil {
-						return err
-					}
-					return sErr
-				},
-			}
-			return d.DialContext(ctx, proto, upstream)
+			return (&net.Dialer{Control: markDNSProxySocket}).DialContext(ctx, proto, upstream)
 		},
 	}
+}
+
+// configureOwnLookupResolver points cargowall's own reverse lookups at a
+// resolver that reaches the DNS upstream directly, bypassing the proxy.
+func configureOwnLookupResolver(upstream string) {
+	events.SetReverseDNSResolver(newUpstreamReverseResolver(upstream))
 }

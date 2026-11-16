@@ -251,8 +251,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			logger.Info("DNS query filtering enabled (blocks DNS tunneling)")
 		}
 
-		// cargowall's own reverse lookups bypass the proxy (newUpstreamReverseResolver).
-		events.SetReverseDNSResolver(newUpstreamReverseResolver(upstream))
+		configureOwnLookupResolver(upstream)
 
 		if cmd.DockerDNSInterception {
 			var err error

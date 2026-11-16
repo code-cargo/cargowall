@@ -114,7 +114,11 @@ func useReverseDNS(t *testing.T, r *net.Resolver) {
 	reverseDNSCache = make(map[string]time.Time)
 	reverseDNSRetried = make(map[string]int)
 	reverseDNSMu.Unlock()
-	t.Cleanup(func() { reverseDNSResolver = prev })
+	reverseDNSBudgetState.reset()
+	t.Cleanup(func() {
+		reverseDNSResolver = prev
+		reverseDNSBudgetState.reset()
+	})
 }
 
 // denySYNs reports n denied SYNs to dstIP:443, the client's first attempt and

@@ -209,6 +209,7 @@ func TestHandleDNSQuery_ReverseLookupRecordedByAddress(t *testing.T) {
 				require.Len(t, evs, 1)
 				assert.Equal(t, netip.MustParseAddr(tc.ip).String(), evs[0].DstIP)
 				assert.Empty(t, evs[0].DstHostname)
+				assert.WithinDuration(t, time.Now(), evs[0].Timestamp, time.Minute, "the record is stamped when it is logged")
 			} else {
 				assert.Equal(t, dns.RcodeSuccess, w.msg.Rcode)
 				assert.Empty(t, readFile(t, auditFile))

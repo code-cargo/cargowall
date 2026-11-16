@@ -73,8 +73,6 @@ func TestProcessEvent_ReverseLookupBudget(t *testing.T) {
 	var ptrs atomic.Int32
 	lab := &dnsLab{ptr: []string{"unrelated.example.net"}}
 	useReverseDNS(t, ptrCountingResolver(t, lab, &ptrs))
-	reverseDNSBudgetState.reset()
-	t.Cleanup(reverseDNSBudgetState.reset)
 	cm := githubPolicy(t)
 	fw := &mockFirewallUpdater{}
 

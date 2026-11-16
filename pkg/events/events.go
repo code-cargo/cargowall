@@ -254,7 +254,7 @@ func reverseDNSRetry(ip string) bool {
 // the forward lookups that confirm them. cargowall points it at a resolver
 // that reaches the DNS upstream directly (SetReverseDNSResolver), so its own
 // lookups never pass through the proxy, whose filter answers a reverse
-// lookup only for an address the run allows and would refuse them.
+// lookup only for an address the run knows and would refuse them.
 var reverseDNSResolver HostResolverFull = net.DefaultResolver
 
 // HostResolverFull is the resolver surface the lazy reverse lookups use: a
@@ -268,6 +268,12 @@ type HostResolverFull interface {
 // events flow.
 func SetReverseDNSResolver(r HostResolverFull) {
 	reverseDNSResolver = r
+}
+
+// ReverseDNSResolver returns the resolver the lazy reverse lookups use, for
+// confirming the wiring in a test.
+func ReverseDNSResolver() HostResolverFull {
+	return reverseDNSResolver
 }
 
 // ipProtoToConfigProtocol maps the L4 protocol byte from a BpfBlockedEvent to

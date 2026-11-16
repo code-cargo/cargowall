@@ -75,7 +75,9 @@ func jobCIDRDenies(rules []config.ResolvedRule) []jobDeny {
 			continue
 		}
 		ones, bits := r.IPNet.Mask.Size()
-		ports := expandPorts(r.Ports)
+		// An unknown protocol leaves ports nil, every port, as the sync
+		// keeps such a deny (rulePorts).
+		ports, _ := expandPorts(r.Ports)
 		if ones == 0 && len(ports) > 0 || ones == bits {
 			continue // a wildcard entry, or a host route: never hidden
 		}
@@ -229,7 +231,11 @@ func (f *FirewallImpl) writeStepCIDRsLocked(sr config.StepRules) {
 		if rule.Type != config.RuleTypeCIDR || rule.IPNet == nil {
 			continue
 		}
-		if allow, deny, ok := f.gateStepLocked(sr.Policy, rule.IPNet, expandPorts(rule.Ports)); ok {
+		ports, ok := f.rulePorts(rule.Ports, 1, rule.Value)
+		if !ok {
+			continue
+		}
+		if allow, deny, ok := f.gateStepLocked(sr.Policy, rule.IPNet, ports); ok {
 			planned = append(planned, stepPrefix{label: rule.Value, net: rule.IPNet, allow: allow, deny: deny})
 		}
 	}

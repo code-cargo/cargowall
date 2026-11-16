@@ -17,7 +17,6 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -698,9 +697,9 @@ func (cm *Manager) LoadConfig(path string) error {
 		return fmt.Errorf("read config file: %w", err)
 	}
 
-	var config FirewallConfig
-	if err := json.Unmarshal(data, &config); err != nil {
-		return fmt.Errorf("parse config: %w", err)
+	config, err := decodeLocalConfig(data)
+	if err != nil {
+		return err
 	}
 
 	config.SearchDomains = normalizeSearchDomains(config.SearchDomains)
@@ -708,7 +707,7 @@ func (cm *Manager) LoadConfig(path string) error {
 		return err
 	}
 
-	if err := cm.applyLoadedConfig(&config); err != nil {
+	if err := cm.applyLoadedConfig(config); err != nil {
 		return err
 	}
 	slog.Info("Config loaded successfully",
@@ -736,9 +735,9 @@ func (cm *Manager) LoadFromEnv() error {
 	blockedCIDRs := os.Getenv("CARGOWALL_BLOCKED_CIDRS")
 	searchDomains := os.Getenv("CARGOWALL_SEARCH_DOMAINS")
 
-	// If no env vars are set, return an error to fall back to file config
-	if defaultAction == "" && allowedHosts == "" && allowedCIDRs == "" && blockedHosts == "" && blockedCIDRs == "" && searchDomains == "" {
-		return fmt.Errorf("no environment configuration found")
+	// If no env vars are set, return ErrNoEnvConfig to fall back to file config
+	if len(SetEnvConfigVars()) == 0 {
+		return ErrNoEnvConfig
 	}
 
 	// Set default action
@@ -787,8 +786,8 @@ func (cm *Manager) LoadFromEnv() error {
 	}
 
 	// strings.Split (not splitAndTrim) so empty / whitespace-only entries
-	// reach validation — CARGOWALL_SEARCH_DOMAINS=" " or a trailing comma
-	// should fail loud rather than silently parse as no-config.
+	// reach validation — a trailing comma, or CARGOWALL_SEARCH_DOMAINS=" "
+	// beside another variable, fails loud (a blank value alone sets none).
 	var rawSearchDomains []string
 	if searchDomains != "" {
 		rawSearchDomains = strings.Split(searchDomains, ",")

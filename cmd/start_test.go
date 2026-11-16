@@ -142,11 +142,11 @@ func TestLoadCIConfig_ApiFailureModes(t *testing.T) {
 				Token:          "test-token",
 				ApiFailureMode: tc.failureMode,
 				FailureFile:    failurePath,
-				Config:         filepath.Join(t.TempDir(), "no-config.json"),
 			}
 
 			cm := config.NewConfigManager()
-			loaded := loadCIConfig(context.Background(), cmd, cm, nil, quietLogger())
+			loaded, err := loadCIConfig(context.Background(), cmd, cm, nil, quietLogger())
+			require.NoError(t, err, "the default path not loading leaves deny-all, not a startup failure")
 
 			assert.Equal(t, tc.wantLoaded, loaded)
 			assert.Equal(t, tc.wantAuditMode, cm.IsAuditMode(), "posture lives on the config manager")
@@ -284,7 +284,8 @@ func TestLoadCIConfig_CancelledContextSkipsPostureHandling(t *testing.T) {
 		FailureFile:    failurePath,
 	}
 	cm := config.NewConfigManager()
-	loaded := loadCIConfig(ctx, cmd, cm, nil, quietLogger())
+	loaded, err := loadCIConfig(ctx, cmd, cm, nil, quietLogger())
+	require.NoError(t, err)
 
 	assert.False(t, loaded)
 	assert.False(t, cmd.policyLockdown, "cancellation must not enter lockdown")

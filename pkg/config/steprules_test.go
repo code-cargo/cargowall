@@ -81,13 +81,13 @@ func TestLoadConfig_StepRejects(t *testing.T) {
 		steps string
 		want  string
 	}{
-		{"unknown step key", `[{"id": "a", "rule": []}]`, `unknown field "rule"`},
-		{"unknown rule key", `[{"id": "a", "rules": [{"type": "hostname", "value": "x.com", "port": [{"port": 443, "protocol": "tcp"}]}]}]`, `unknown field "port"`},
-		{"unknown port key", `[{"id": "a", "rules": [{"type": "hostname", "value": "x.com", "ports": [{"port": 443, "proto": "tcp"}]}]}]`, `unknown field "proto"`},
+		{"unknown step key", `[{"id": "a", "rule": []}]`, `key cargowall doesn't read: "rule"`},
+		{"unknown rule key", `[{"id": "a", "rules": [{"type": "hostname", "value": "x.com", "port": [{"port": 443, "protocol": "tcp"}]}]}]`, `key cargowall doesn't read: "port"`},
+		{"unknown port key", `[{"id": "a", "rules": [{"type": "hostname", "value": "x.com", "ports": [{"port": 443, "proto": "tcp"}]}]}]`, `key cargowall doesn't read: "proto"`},
 		{"deny rule", `[{"id": "a", "rules": [{"type": "hostname", "value": "x.com", "action": "deny"}]}]`, "step rules only allow"},
 		{"autoAddedType", `[{"id": "a", "rules": [{"type": "hostname", "value": "x.com", "autoAddedType": "dns"}]}]`, "autoAddedType"},
-		{"missing protocol", `[{"id": "a", "rules": [{"type": "hostname", "value": "x.com", "ports": [{"port": 443}]}]}]`, "unknown protocol"},
-		{"unknown protocol", `[{"id": "a", "rules": [{"type": "hostname", "value": "x.com", "ports": [{"port": 443, "protocol": "sctp"}]}]}]`, "unknown protocol"},
+		{"missing protocol", `[{"id": "a", "rules": [{"type": "hostname", "value": "x.com", "ports": [{"port": 443}]}]}]`, `protocol "" must be`},
+		{"unknown protocol", `[{"id": "a", "rules": [{"type": "hostname", "value": "x.com", "ports": [{"port": 443, "protocol": "sctp"}]}]}]`, `protocol "sctp" must be`},
 		{"ICMP with a port", `[{"id": "a", "rules": [{"type": "cidr", "value": "10.0.0.0/8", "ports": [{"port": 8, "protocol": "icmp"}]}]}]`, "port=0"},
 		{"ICMP on IPv6", `[{"id": "a", "rules": [{"type": "cidr", "value": "2001:db8::/32", "ports": [{"port": 0, "protocol": "icmp"}]}]}]`, "IPv4-only"},
 		{"empty id", `[{"id": "", "rules": []}]`, "step id is empty"},
@@ -101,9 +101,9 @@ func TestLoadConfig_StepRejects(t *testing.T) {
 		{"catch-all *.*", `[{"id": "a", "rules": [{"type": "hostname", "value": "*.*"}]}]`, "needs a literal label"},
 		{"catch-all **.*", `[{"id": "a", "rules": [{"type": "hostname", "value": "**.*"}]}]`, "needs a literal label"},
 		{"partial wildcard", `[{"id": "a", "rules": [{"type": "hostname", "value": "api-*.example.com"}]}]`, "partial wildcard"},
-		{"empty hostname", `[{"id": "a", "rules": [{"type": "hostname", "value": ""}]}]`, "no value"},
+		{"empty hostname", `[{"id": "a", "rules": [{"type": "hostname", "value": ""}]}]`, "needs a value"},
 		{"bad CIDR", `[{"id": "a", "rules": [{"type": "cidr", "value": "10.0.0.0/33"}]}]`, "not a CIDR"},
-		{"unknown type", `[{"id": "a", "rules": [{"type": "url", "value": "x.com"}]}]`, "unknown type"},
+		{"unknown type", `[{"id": "a", "rules": [{"type": "url", "value": "x.com"}]}]`, `unknown rule type "url"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

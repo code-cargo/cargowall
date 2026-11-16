@@ -338,9 +338,13 @@ func TestUpdateAllowlistTC_StepRules(t *testing.T) {
 }
 
 // writeStepConfig writes a JSON policy with job rules and steps, for
-// LoadConfig, the loader that takes steps.
+// LoadConfig, the loader that takes steps. No rules are written as an empty
+// list, since the loader refuses a null, which a nil list marshals to.
 func writeStepConfig(t *testing.T, rules []config.Rule, steps []config.StepConfig) string {
 	t.Helper()
+	if rules == nil {
+		rules = []config.Rule{}
+	}
 	cfg := config.FirewallConfig{DefaultAction: config.ActionDeny, Rules: rules, Steps: steps}
 	data, err := json.Marshal(cfg)
 	require.NoError(t, err)

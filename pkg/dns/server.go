@@ -181,9 +181,9 @@ func (s *Server) EnableQueryFiltering(enable bool) {
 //
 // Precedence, in order:
 //  1. Filtering disabled → allow.
-//  2. Canonical PTR queries (Qtype=PTR, a well-formed in-addr.arpa /
-//     ip6.arpa name) for an address the run knows → allow. Any other PTR
-//     query is judged by the steps below, like any other name.
+//  2. A reverse-lookup name (in-addr.arpa / ip6.arpa) is decided by
+//     reverseNameVerdict alone: the address gate, a deny rule or the
+//     default action. None of the steps below applies to it.
 //  3. Explicit hostname rule. MatchHostnameRule handles search-domain
 //     stripping internally and can return a mixed verdict (one form deny,
 //     other form allow). At the DNS gate we allow the query if ANY allow
@@ -211,13 +211,11 @@ func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 		return true
 	}
 
-	// Allow reverse DNS lookups only as true PTR queries of canonical shape
-	// (exactly 4 numeric octets for IPv4, exactly 32 hex nibbles for IPv6),
-	// and only for an address the run already knows (reverseQueryKnown).
-	// The Qtype gate keeps TXT/A/NS queries of PTR-shaped names out, the
-	// shape gate shortened or padded labels, and the address gate the rest.
-	if qtype == dns.TypePTR && isValidReverseDNS(domain) && s.reverseQueryKnown(domain) {
-		return true
+	// A reverse-lookup name is decided by the address gate, a deny rule or
+	// the default action alone (reverseNameVerdict); any other name by the
+	// rules below.
+	if allowed, decided := s.reverseNameVerdict(domain, qtype); decided {
+		return allowed
 	}
 
 	verdict := s.config.MatchHostnameRule(domain)

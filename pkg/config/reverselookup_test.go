@@ -18,6 +18,7 @@ package config
 
 import (
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -153,4 +154,16 @@ func TestLocalAddress(t *testing.T) {
 	} {
 		assert.Equal(t, want, LocalAddress(netip.MustParseAddr(ip)), ip)
 	}
+}
+
+// A search domain under a reverse-lookup zone is refused, wherever it is
+// configured: a reverse lookup is answered for an address the run allows,
+// never by a search domain.
+func TestValidateSearchDomain_ReverseLookupZones(t *testing.T) {
+	for _, d := range []string{".100.51.198.in-addr.arpa", ".in-addr.arpa", ".8.b.d.0.1.0.0.2.ip6.arpa", ".IP6.ARPA"} {
+		err := validateSearchDomain(strings.ToLower(d))
+		require.Error(t, err, d)
+		assert.Contains(t, err.Error(), "under a reverse-lookup zone", d)
+	}
+	assert.NoError(t, validateSearchDomain(".compute.internal"))
 }

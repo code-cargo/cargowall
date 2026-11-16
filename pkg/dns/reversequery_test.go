@@ -228,6 +228,118 @@ func TestIsQueryAllowed_ReverseLookupHostRulesOpenNothing(t *testing.T) {
 	assert.True(t, server.isQueryAllowed(reverseName(t, "203.0.113.9"), dns.TypePTR), "an allowed address")
 }
 
+// A reverse-lookup name is decided only by the address gate or the default
+// action, whatever rule would match it: a rule above the reverse zones, a
+// pattern whose top labels are wildcards, a job's or a step's. Under a deny
+// default, an unknown address's reverse lookup is refused with a
+// dns_blocked record, as is any other query type under the name; a known
+// or CIDR-allowed address's reverse lookup passes. Each rule stays live for
+// the names it was written for, so home.arpa still resolves under arpa.
+func TestIsQueryAllowed_OnlyTheAddressGateOrTheDefaultDecidesReverseNames(t *testing.T) {
+	v4, v6 := "192.0.2.7", "2001:db8:abcd::1"
+	for _, tc := range []struct {
+		rule    string
+		matches string // a reverse name the rule matches, proving it loaded
+		unknown []string
+	}{
+		{"arpa", "x.in-addr.arpa", []string{v4, v6}},
+		{"**.arpa", "x.ip6.arpa", []string{v4, v6}},
+		{"**.in-addr.*", "7.2.0.192.in-addr.arpa", []string{v4}},
+		{"*.*.*.*.in-addr.*", "7.2.0.192.in-addr.arpa", []string{v4}},
+		{"**.ip6.*", "x.ip6.arpa", []string{v6}},
+	} {
+		for _, step := range []bool{false, true} {
+			name := tc.rule + " (job rule)"
+			rule := `{"type": "hostname", "value": "` + tc.rule + `", "action": "allow"}`
+			policy := `{"defaultAction": "deny", "rules": [` + rule + `, {"type": "cidr", "value": "203.0.113.0/24", "action": "allow"}]}`
+			if step {
+				name = tc.rule + " (step rule)"
+				policy = `{"defaultAction": "deny", "rules": [{"type": "cidr", "value": "203.0.113.0/24", "action": "allow"}],
+					"steps": [{"id": "build", "rules": [{"type": "hostname", "value": "` + tc.rule + `"}]}]}`
+			}
+			t.Run(name, func(t *testing.T) {
+				cfg := config.NewConfigManager()
+				loadStepPolicy(t, cfg, policy)
+				if step {
+					require.True(t, cfg.StepAllowsHostname(tc.matches), "the step rule is live")
+				} else {
+					require.True(t, cfg.MatchHostnameRule(tc.matches).HasAllow(), "the job rule is live")
+				}
+				cfg.UpdateDNSMapping("named.example.com", "192.0.2.10")
+				cfg.UpdateDNSMapping("named6.example.com", "2001:db8:3::10")
+				server := newTestServer(t, cfg, firewall.NewMockFirewall(t))
+				server.filterQueries = true
+				auditFile := t.TempDir() + "/audit.json"
+				auditLogger, err := events.NewAuditLogger(auditFile, false)
+				require.NoError(t, err)
+				t.Cleanup(func() { auditLogger.Close() })
+				server.auditLogger = auditLogger
+
+				for _, ip := range tc.unknown {
+					rev := reverseName(t, ip)
+					assert.False(t, server.isQueryAllowed(rev, dns.TypePTR), "PTR %s", ip)
+					assert.False(t, server.isQueryAllowed(rev, dns.TypeTXT), "TXT %s", ip)
+					assert.False(t, server.isQueryAllowed("data."+rev, dns.TypeTXT), "TXT under %s", ip)
+					assert.False(t, server.isQueryAllowed("a.b."+rev, dns.TypeA), "A under %s", ip)
+
+					q := new(dns.Msg)
+					q.SetQuestion(rev+".", dns.TypePTR)
+					w := &MockResponseWriter{}
+					w.On("WriteMsg", mock.AnythingOfType("*dns.Msg")).Return(nil).Once()
+					server.handleDNSQuery(w, q)
+					require.NotNil(t, w.msg)
+					assert.Equal(t, dns.RcodeRefused, w.msg.Rcode, "PTR %s through the proxy", ip)
+				}
+				evs := readDNSAuditEvents(t, auditFile)
+				require.Len(t, evs, len(tc.unknown))
+				for _, ev := range evs {
+					assert.Equal(t, events.EventDNSBlocked, ev.EventType)
+				}
+
+				for _, ip := range []string{"192.0.2.10", "2001:db8:3::10", "203.0.113.9"} {
+					assert.True(t, server.isQueryAllowed(reverseName(t, ip), dns.TypePTR), "a known address %s", ip)
+				}
+				if tc.rule == "arpa" || tc.rule == "**.arpa" {
+					assert.True(t, server.isQueryAllowed("printer.home.arpa", dns.TypeA), "home.arpa still resolves")
+				}
+			})
+		}
+	}
+}
+
+// Under an allow default, a deny rule for a reverse zone still refuses an
+// unknown address's reverse lookup, and a known address's passes.
+func TestIsQueryAllowed_ReverseZoneDenyUnderAnAllowDefault(t *testing.T) {
+	cfg := config.NewConfigManager()
+	require.NoError(t, cfg.LoadConfigFromRules([]config.Rule{
+		{Type: config.RuleTypeHostname, Value: "in-addr.arpa", Action: config.ActionDeny},
+		{Type: config.RuleTypeHostname, Value: "arpa", Action: config.ActionAllow},
+	}, config.ActionAllow))
+	cfg.UpdateDNSMapping("named.example.com", "192.0.2.10")
+	server := newTestServer(t, cfg, firewall.NewMockFirewall(t))
+	server.filterQueries = true
+	assert.False(t, server.isQueryAllowed(reverseName(t, "192.0.2.7"), dns.TypePTR), "the deny refuses it")
+	assert.True(t, server.isQueryAllowed(reverseName(t, "192.0.2.10"), dns.TypePTR), "a known address")
+	assert.True(t, server.isQueryAllowed(reverseName(t, "2001:db8:abcd::1"), dns.TypePTR), "no deny: the default allows it")
+}
+
+// A search domain under a reverse zone is refused at load, from a local
+// file or the environment, so it can never allow a reverse-lookup name.
+func TestSearchDomainsUnderReverseZonesAreRefused(t *testing.T) {
+	for _, d := range []string{".100.51.198.in-addr.arpa", ".in-addr.arpa", ".d.c.b.a.8.b.d.0.1.0.0.2.ip6.arpa"} {
+		cfg := config.NewConfigManager()
+		path := t.TempDir() + "/policy.json"
+		require.NoError(t, os.WriteFile(path, []byte(`{"defaultAction": "deny", "searchDomains": ["`+d+`"]}`), 0o600))
+		err := cfg.LoadConfig(path)
+		require.Error(t, err, d)
+		assert.Contains(t, err.Error(), "under a reverse-lookup zone", d)
+	}
+	t.Setenv("CARGOWALL_SEARCH_DOMAINS", ".100.51.198.in-addr.arpa")
+	err := config.NewConfigManager().LoadFromEnv()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "under a reverse-lookup zone")
+}
+
 // An unknown address's reverse lookup is judged by the rules like any
 // other name, so a default allow allows it.
 func TestIsQueryAllowed_ReverseLookupOfUnknownAddressFollowsTheDefault(t *testing.T) {

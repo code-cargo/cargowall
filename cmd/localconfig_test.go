@@ -172,6 +172,12 @@ func TestLoadCIConfig_EnvConfigRefusals(t *testing.T) {
 			"are both set",
 		},
 		{
+			"beside --config, with CARGOWALL_CONFIG naming another file",
+			map[string]string{"CARGOWALL_CONFIG": filepath.Join(t.TempDir(), "other.json"), "CARGOWALL_DEFAULT_ACTION": "deny"},
+			allow,
+			"the config file " + allow + " and the environment configuration (CARGOWALL_DEFAULT_ACTION) are both set",
+		},
+		{
 			"beside a file CARGOWALL_CONFIG names",
 			map[string]string{"CARGOWALL_CONFIG": allow, "CARGOWALL_DEFAULT_ACTION": "deny"},
 			allow,
@@ -194,9 +200,10 @@ func TestLoadCIConfig_EnvConfigRefusals(t *testing.T) {
 }
 
 // When the environment configuration applies, a file at the default path
-// is left unread, and a Warn names it; with none there, nothing is warned.
-// A variable of only whitespace sets no environment configuration, so it
-// neither leaves a file unread nor counts beside --config.
+// is left unread, and a Warn names it and the variables set; with none
+// there, a dangling symlink included, nothing is warned. A variable of only
+// whitespace sets no environment configuration, so it neither leaves a file
+// unread nor counts beside --config, and a Warn names it as ignored.
 func TestLoadCIConfig_EnvConfigAndFiles(t *testing.T) {
 	redirectStateFiles(t)
 	allow := filepath.Join(t.TempDir(), "allow.json")
@@ -209,31 +216,54 @@ func TestLoadCIConfig_EnvConfigAndFiles(t *testing.T) {
 		_, err := loadCIConfig(context.Background(), cmd, cm, nil, slog.New(slog.NewTextHandler(&logs, nil)))
 		return cm, logs.String(), err
 	}
+	line := func(logs, msg string) string {
+		for l := range strings.SplitSeq(logs, "\n") {
+			if strings.Contains(l, msg) {
+				return l
+			}
+		}
+		return ""
+	}
 
-	t.Setenv("CARGOWALL_ALLOWED_HOSTS", "github.com")
 	defaultConfigPath = allow
 	cm, logs, err := load(&StartCmd{GithubAction: true})
 	require.NoError(t, err)
+	assert.Equal(t, config.ActionAllow, cm.GetDefaultAction(), "no variable is set, so the file applies")
+	assert.NotContains(t, logs, "Ignoring", "nothing is set, so nothing is ignored")
+
+	t.Setenv("CARGOWALL_ALLOWED_HOSTS", "github.com")
+	cm, logs, err = load(&StartCmd{GithubAction: true})
+	require.NoError(t, err)
 	assert.Equal(t, config.ActionDeny, cm.GetDefaultAction(), "the environment applies")
-	assert.Contains(t, logs, "Ignoring the config file at the default path")
-	assert.Contains(t, logs, "path="+allow)
+	ignored := line(logs, "Ignoring the config file at the default path")
+	assert.Contains(t, ignored, "path="+allow)
+	assert.Contains(t, ignored, "variables=[CARGOWALL_ALLOWED_HOSTS]")
+	assert.NotContains(t, logs, "Ignoring blank", "no variable is blank")
 
 	defaultConfigPath = filepath.Join(t.TempDir(), "missing.json")
 	_, logs, err = load(&StartCmd{GithubAction: true})
 	require.NoError(t, err)
 	assert.NotContains(t, logs, "Ignoring the config file")
 
+	defaultConfigPath = filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.Symlink(filepath.Join(t.TempDir(), "gone.json"), defaultConfigPath))
+	_, logs, err = load(&StartCmd{GithubAction: true})
+	require.NoError(t, err)
+	assert.NotContains(t, logs, "Ignoring the config file", "a dangling symlink counts as no file")
+
 	t.Setenv("CARGOWALL_ALLOWED_HOSTS", " ")
 	cmd := &StartCmd{GithubAction: true, Config: allow}
-	cm, _, err = load(cmd)
+	cm, logs, err = load(cmd)
 	require.NoError(t, err, "a blank variable doesn't count beside --config")
 	assert.Equal(t, config.ActionAllow, cm.GetDefaultAction(), "the file applies")
 	assert.Empty(t, cmd.refusedPosture)
+	assert.Contains(t, line(logs, "Ignoring blank environment configuration variables"), "variables=[CARGOWALL_ALLOWED_HOSTS]")
 
 	defaultConfigPath = allow
-	cm, _, err = load(&StartCmd{GithubAction: true})
+	cm, logs, err = load(&StartCmd{GithubAction: true})
 	require.NoError(t, err)
 	assert.Equal(t, config.ActionAllow, cm.GetDefaultAction(), "a blank variable leaves the default file to apply")
+	assert.Contains(t, line(logs, "Ignoring blank environment configuration variables"), "variables=[CARGOWALL_ALLOWED_HOSTS]")
 }
 
 // When a CodeCargo policy loads, or the run is in policy lockdown, the

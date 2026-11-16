@@ -51,3 +51,15 @@ func SetEnvConfigVars() []string {
 	}
 	return set
 }
+
+// BlankEnvConfigVars returns the names of the variables LoadFromEnv reads
+// that are set to only whitespace, which SetEnvConfigVars leaves out.
+func BlankEnvConfigVars() []string {
+	var blank []string
+	for _, name := range envConfigVars {
+		if v := os.Getenv(name); v != "" && strings.TrimSpace(v) == "" {
+			blank = append(blank, name)
+		}
+	}
+	return blank
+}

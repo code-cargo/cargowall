@@ -88,11 +88,15 @@ func loadConfigFile(cmd *StartCmd, configMgr *config.Manager) (unloaded, fatal e
 // doesn't load is refused as a file that doesn't load is, rather than
 // leaving the file to apply in its place; and one beside a file --config
 // names is refused, since either could be the one meant to apply. A file
-// at the default path, which the environment's leaves unread, is warned of.
+// at the default path, which the environment's leaves unread, is warned
+// of, as are variables set blank, which set nothing.
 func loadLocalConfig(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger) error {
 	err := configMgr.LoadFromEnv()
 	switch {
 	case errors.Is(err, config.ErrNoEnvConfig):
+		if blank := config.BlankEnvConfigVars(); len(blank) > 0 {
+			logger.Warn("Ignoring blank environment configuration variables", "variables", blank)
+		}
 	case cmd.Config != "":
 		cmd.refusedPosture = refusedConfig
 		return fmt.Errorf("the config file %s and the environment configuration (%s) are both set; set one",

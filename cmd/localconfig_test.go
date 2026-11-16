@@ -17,8 +17,10 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -169,6 +171,12 @@ func TestLoadCIConfig_EnvConfigRefusals(t *testing.T) {
 			allow,
 			"are both set",
 		},
+		{
+			"beside a file CARGOWALL_CONFIG names",
+			map[string]string{"CARGOWALL_CONFIG": allow, "CARGOWALL_DEFAULT_ACTION": "deny"},
+			allow,
+			"the config file " + allow + " (from CARGOWALL_CONFIG) and the environment configuration (CARGOWALL_DEFAULT_ACTION) are both set",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for k, v := range tc.env {
@@ -183,6 +191,49 @@ func TestLoadCIConfig_EnvConfigRefusals(t *testing.T) {
 			assert.NotEqual(t, config.ActionAllow, cm.GetDefaultAction(), "the file at the default path was never read")
 		})
 	}
+}
+
+// When the environment configuration applies, a file at the default path
+// is left unread, and a Warn names it; with none there, nothing is warned.
+// A variable of only whitespace sets no environment configuration, so it
+// neither leaves a file unread nor counts beside --config.
+func TestLoadCIConfig_EnvConfigAndFiles(t *testing.T) {
+	redirectStateFiles(t)
+	allow := filepath.Join(t.TempDir(), "allow.json")
+	require.NoError(t, os.WriteFile(allow, []byte(`{"defaultAction": "allow"}`), 0o600))
+	old := defaultConfigPath
+	t.Cleanup(func() { defaultConfigPath = old })
+	load := func(cmd *StartCmd) (*config.Manager, string, error) {
+		var logs bytes.Buffer
+		cm := config.NewConfigManager()
+		_, err := loadCIConfig(context.Background(), cmd, cm, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+		return cm, logs.String(), err
+	}
+
+	t.Setenv("CARGOWALL_ALLOWED_HOSTS", "github.com")
+	defaultConfigPath = allow
+	cm, logs, err := load(&StartCmd{GithubAction: true})
+	require.NoError(t, err)
+	assert.Equal(t, config.ActionDeny, cm.GetDefaultAction(), "the environment applies")
+	assert.Contains(t, logs, "Ignoring the config file at the default path")
+	assert.Contains(t, logs, "path="+allow)
+
+	defaultConfigPath = filepath.Join(t.TempDir(), "missing.json")
+	_, logs, err = load(&StartCmd{GithubAction: true})
+	require.NoError(t, err)
+	assert.NotContains(t, logs, "Ignoring the config file")
+
+	t.Setenv("CARGOWALL_ALLOWED_HOSTS", " ")
+	cmd := &StartCmd{GithubAction: true, Config: allow}
+	cm, _, err = load(cmd)
+	require.NoError(t, err, "a blank variable doesn't count beside --config")
+	assert.Equal(t, config.ActionAllow, cm.GetDefaultAction(), "the file applies")
+	assert.Empty(t, cmd.refusedPosture)
+
+	defaultConfigPath = allow
+	cm, _, err = load(&StartCmd{GithubAction: true})
+	require.NoError(t, err)
+	assert.Equal(t, config.ActionAllow, cm.GetDefaultAction(), "a blank variable leaves the default file to apply")
 }
 
 // When a CodeCargo policy loads, or the run is in policy lockdown, the

@@ -19,6 +19,7 @@ package config
 import (
 	"errors"
 	"os"
+	"strings"
 )
 
 // envConfigVars are the variables LoadFromEnv reads. Any one of them set
@@ -38,11 +39,13 @@ var envConfigVars = []string{
 var ErrNoEnvConfig = errors.New("no environment configuration found")
 
 // SetEnvConfigVars returns the names of the variables LoadFromEnv reads
-// that are set, in the order it reads them.
+// that are set, in the order it reads them. A value of only whitespace
+// sets nothing: a variable left blank shouldn't make the environment the
+// local configuration, leaving a config file unread.
 func SetEnvConfigVars() []string {
 	var set []string
 	for _, name := range envConfigVars {
-		if os.Getenv(name) != "" {
+		if strings.TrimSpace(os.Getenv(name)) != "" {
 			set = append(set, name)
 		}
 	}

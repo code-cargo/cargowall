@@ -786,8 +786,8 @@ func (cm *Manager) LoadFromEnv() error {
 	}
 
 	// strings.Split (not splitAndTrim) so empty / whitespace-only entries
-	// reach validation — CARGOWALL_SEARCH_DOMAINS=" " or a trailing comma
-	// should fail loud rather than silently parse as no-config.
+	// reach validation — a trailing comma, or CARGOWALL_SEARCH_DOMAINS=" "
+	// beside another variable, fails loud (a blank value alone sets none).
 	var rawSearchDomains []string
 	if searchDomains != "" {
 		rawSearchDomains = strings.Split(searchDomains, ",")

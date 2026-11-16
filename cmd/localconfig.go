@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"os"
 	"strings"
 
 	"github.com/code-cargo/cargowall/pkg/config"
@@ -37,6 +38,16 @@ func (c *StartCmd) configFile() string {
 		return c.Config
 	}
 	return defaultConfigPath
+}
+
+// explicitConfigFile names the file --config or CARGOWALL_CONFIG names, and
+// which, for a message: a CARGOWALL_CONFIG set in a runner's environment is
+// easy to miss, as kong reads it in the flag's place.
+func (c *StartCmd) explicitConfigFile() string {
+	if c.Config != "" && os.Getenv("CARGOWALL_CONFIG") == c.Config {
+		return c.Config + " (from CARGOWALL_CONFIG)"
+	}
+	return c.Config
 }
 
 // refusedConfig names a local configuration that didn't load, a file's or
@@ -76,7 +87,8 @@ func loadConfigFile(cmd *StartCmd, configMgr *config.Manager) (unloaded, fatal e
 // when none is. The two never combine. An environment configuration that
 // doesn't load is refused as a file that doesn't load is, rather than
 // leaving the file to apply in its place; and one beside a file --config
-// names is refused, since either could be the one meant to apply.
+// names is refused, since either could be the one meant to apply. A file
+// at the default path, which the environment's leaves unread, is warned of.
 func loadLocalConfig(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logger) error {
 	err := configMgr.LoadFromEnv()
 	switch {
@@ -84,11 +96,15 @@ func loadLocalConfig(cmd *StartCmd, configMgr *config.Manager, logger *slog.Logg
 	case cmd.Config != "":
 		cmd.refusedPosture = refusedConfig
 		return fmt.Errorf("the config file %s and the environment configuration (%s) are both set; set one",
-			cmd.Config, strings.Join(config.SetEnvConfigVars(), ", "))
+			cmd.explicitConfigFile(), strings.Join(config.SetEnvConfigVars(), ", "))
 	case err != nil:
 		cmd.refusedPosture = refusedConfig
 		return fmt.Errorf("environment configuration did not load: %w", err)
 	default:
+		if _, err := os.Stat(defaultConfigPath); err == nil {
+			logger.Warn("Ignoring the config file at the default path: the environment configuration applies",
+				"path", defaultConfigPath, "variables", config.SetEnvConfigVars())
+		}
 		return nil
 	}
 	logger.Debug("No environment config found, trying file")

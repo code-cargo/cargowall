@@ -17,6 +17,7 @@
 package config
 
 import (
+	"errors"
 	"log/slog"
 	"net"
 	"os"
@@ -2018,16 +2019,20 @@ func TestLoadFromEnv_SearchDomains_Invalid(t *testing.T) {
 	}
 }
 
-// CARGOWALL_SEARCH_DOMAINS=" " (whitespace) is the user setting the var
-// but with no real value — fail loud instead of silently parsing as
-// no-config.
+// CARGOWALL_SEARCH_DOMAINS=" " (whitespace) alone sets no environment
+// configuration, so a config file still applies; beside another variable,
+// it is the user setting the var with no real value, and fails loud.
 func TestLoadFromEnv_SearchDomains_WhitespaceOnly(t *testing.T) {
 	clearOtherCargowallEnv(t)
 	t.Setenv("CARGOWALL_SEARCH_DOMAINS", " ")
 	cm := NewConfigManager()
+	if err := cm.LoadFromEnv(); !errors.Is(err, ErrNoEnvConfig) {
+		t.Errorf("LoadFromEnv() with whitespace-only alone = %v, want ErrNoEnvConfig", err)
+	}
+	t.Setenv("CARGOWALL_DEFAULT_ACTION", "deny")
 	err := cm.LoadFromEnv()
 	if err == nil || !strings.Contains(err.Error(), "CARGOWALL_SEARCH_DOMAINS") {
-		t.Errorf("LoadFromEnv() with whitespace-only = %v, want error mentioning CARGOWALL_SEARCH_DOMAINS", err)
+		t.Errorf("LoadFromEnv() with whitespace-only beside another = %v, want error mentioning CARGOWALL_SEARCH_DOMAINS", err)
 	}
 }
 

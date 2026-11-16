@@ -354,6 +354,7 @@ sequenceDiagram
 - `AddIP(ip, action, ports)` — adds /32 or /128 entry with duplicate detection; returns whether entry was added
 - `RemoveIP(ip)` — removes LPM entry and all associated port map entries
 - Wildcard CIDR handling: `0.0.0.0/0` and `::/0` with specific ports add only port map entries (no LPM entry)
+- A rule that names ports never reaches the maps on every port when none of them has a known protocol (`rulePorts`), whatever its source: an allow is refused, and a deny keeps every port, the closed side, each with an Error. The loaders refuse such a port first; this guards against a gap in them
 - Tracks IP-to-port associations (`ipPorts` map) for accurate cleanup on removal
 - Writes each step's own rules under its policy, never policy 0: `AddPolicyIP(policy, ip, ports)` for the DNS path, and the steps' CIDR rules in `UpdateAllowlistTC`. Each (policy, IP) accumulates on its own, and step writes are charged to a step budget, each rule map's size less the job's 4096 entries (`policy.go`); the maps are sized at load for the policy's steps (`bpf.SizeRuleMaps`). Every step write is gated on the job's CIDR denies the last sync wrote, and each sync rebuilds the step tier (`stepgate.go`)
 - Thread-safe with `sync.RWMutex`
@@ -385,6 +386,8 @@ sequenceDiagram
 - `EnsureInfraAllowed(ips, ports)` — adds allow rules for infrastructure (Azure IMDS, K8s API, etc.)
 - `EnsureHostnameAllowed(hostname)` — adds hostname allow rule for auto-discovered infrastructure
 - Per-step allow rules (`steps`, `steprules.go`), validated strictly at load; `MatchStepHostname` matches each step's rules on their own, and the job's matchers never see them
+- A local config file (`LoadConfig`, `localfile.go`) is read strictly, since it's hand-written and a loose read is wider than it reads: the top level must be an object; every key, at every level, must be exactly one of `FirewallConfig`'s JSON keys, each given once (Go's decoder would fill a field from another case and merge a repeated key); every port entry needs a known protocol and `ports` can't be an empty list; and a rule resolve would drop (an unknown type, a job rule's unknown or missing action, a CIDR that doesn't parse, a pattern that doesn't compile) fails the load rather than vanishing. A rule for the unspecified address with ports is still dropped with a warning. The SaaS and environment loaders are unchanged
+- A config file that is there and doesn't load fails startup (`cmd/localconfig.go`), through the failure sentinel, when the local configuration applies: no CodeCargo policy loaded and the run isn't in policy lockdown. That holds for a file `--config` names, which must also be there, and for one at the default path; only no file at the default path leaves deny-all
 
 ### Event Handler (`pkg/events`)
 - Processes both blocked and allowed events from ring buffer (`ip_version`, `allowed`, ports, IPs)

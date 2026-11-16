@@ -26,6 +26,7 @@
 package events
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -152,9 +153,12 @@ func tryLateAllow(configMgr *config.Manager, fw FirewallUpdater, l7 L7LateRegist
 		// Surface the failure for triage — the event falls through to the
 		// blocked branch (lateAllowed stays false), so absence of this log
 		// plus a "Connection blocked" entry means the firewall write is the
-		// proximate cause.
-		logger.Error("Late-resolved IP add failed",
-			"ip", dstIP, "hostname", hostname, "error", err)
+		// proximate cause. A rule with no known port the firewall logs once
+		// itself: this runs for every blocked packet.
+		if !errors.Is(err, config.ErrNoKnownPort) {
+			logger.Error("Late-resolved IP add failed",
+				"ip", dstIP, "hostname", hostname, "error", err)
+		}
 		return false, matchedRule
 	}
 

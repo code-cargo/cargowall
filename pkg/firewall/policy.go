@@ -169,7 +169,7 @@ func (f *FirewallImpl) AddPolicyIP(policy uint32, ip net.IP, ports []config.Port
 	}
 	expanded, ok := f.rulePorts(ports, 1, ipStr)
 	if !ok {
-		return false, errNoKnownPort
+		return false, config.ErrNoKnownPort
 	}
 	allow, deny, ok := f.gateStepLocked(policy, dst, expanded)
 	if !ok {

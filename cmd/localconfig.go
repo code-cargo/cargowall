@@ -17,7 +17,9 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 
 	"github.com/code-cargo/cargowall/pkg/config"
@@ -36,22 +38,24 @@ func (c *StartCmd) configFile() string {
 	return defaultConfigPath
 }
 
-// loadConfigFile loads the local config file. A file --config named that
-// doesn't load is a startup failure: the caller asked for that
-// configuration, and running on without it would leave it waiting on a
-// firewall that enforces something else. The default path not loading
-// leaves the deny-all default in place, as it always has; its load error is
-// returned as unloaded for the caller to report.
+// loadConfigFile loads the local config file. A file that is there and
+// doesn't load is a startup failure, whether --config named it or it sits
+// at the default path: either way it is the configuration meant to apply,
+// and running on without it would leave a caller waiting on a firewall that
+// enforces something else. A file --config names must also be there. Only
+// a default path with no file at it leaves the deny-all default in place,
+// as it always has; that load error is returned as unloaded for the caller
+// to report.
 func loadConfigFile(cmd *StartCmd, configMgr *config.Manager) (unloaded, fatal error) {
 	path := cmd.configFile()
 	err := configMgr.LoadConfig(path)
 	switch {
 	case err == nil:
 		return nil, nil
-	case cmd.Config != "":
-		return nil, fmt.Errorf("--config %s did not load: %w", path, err)
-	default:
+	case cmd.Config == "" && errors.Is(err, fs.ErrNotExist):
 		return err, nil
+	default:
+		return nil, fmt.Errorf("config file %s did not load: %w", path, err)
 	}
 }
 

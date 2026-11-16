@@ -123,6 +123,8 @@ type FirewallImpl struct {
 	// unspecifiedWarned holds the unspecified addresses already refused as
 	// host entries and logged (unspecified.go).
 	unspecifiedWarned map[string]struct{}
+	// unexpandedLogged holds the action and port lists rulePorts has logged.
+	unexpandedLogged map[string]struct{}
 }
 
 // portProto carries a port number and its IANA protocol number for BPF map keys.
@@ -513,19 +515,26 @@ func (f *FirewallImpl) addCIDRv6(policy uint32, ip6 net.IP, prefixLen uint32, ac
 	return nil
 }
 
-// errNoKnownPort refuses an allow none of whose ports has a known protocol.
-var errNoKnownPort = errors.New("no port the rule names has a protocol cargowall knows")
-
 // rulePorts expands a rule's ports for the maps. A rule that names ports,
 // none of which has a protocol cargowall knows, must never reach the maps
 // on every port: an allow is refused (ok false), and a deny keeps every
 // port, which is the closed side. The loaders refuse such a port, so this
-// is the firewall's own guard against a gap in them, and logs an Error.
+// is the firewall's own guard against a gap in them. It logs an Error once
+// per action and port list, since the DNS and late-allow paths ask again
+// for every answer and every blocked packet. Must be called with f.mu held.
 func (f *FirewallImpl) rulePorts(ports []config.Port, actionVal uint8, label string) ([]portProto, bool) {
 	pp := expandPorts(ports)
 	if len(ports) == 0 || len(pp) > 0 {
 		return pp, true
 	}
+	key := fmt.Sprint(actionVal, ports)
+	if _, logged := f.unexpandedLogged[key]; logged {
+		return nil, actionVal != 1
+	}
+	if f.unexpandedLogged == nil {
+		f.unexpandedLogged = make(map[string]struct{})
+	}
+	f.unexpandedLogged[key] = struct{}{}
 	if actionVal == 1 {
 		f.logger.Error("Refusing an allow rule none of whose ports has a known protocol, which would allow every port",
 			"rule", label, "ports", ports)
@@ -625,18 +634,16 @@ func (f *FirewallImpl) AddIP(ip net.IP, action config.Action, ports []config.Por
 	if action == config.ActionAllow {
 		actionVal = 1
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	pp, ok := f.rulePorts(ports, actionVal, ip.String())
 	if !ok {
-		return false, errNoKnownPort
+		return false, config.ErrNoKnownPort
 	}
 	if ip4 := ip.To4(); ip4 != nil {
-		f.mu.Lock()
-		defer f.mu.Unlock()
 		return f.addIPv4Locked(bpf.PolicyJob, ip4, ip.String(), actionVal, pp)
 	}
 	if ip6 := ip.To16(); ip6 != nil {
-		f.mu.Lock()
-		defer f.mu.Unlock()
 		return f.addIPv6Locked(bpf.PolicyJob, ip6, ip.String(), actionVal, pp)
 	}
 	return false, fmt.Errorf("invalid IP: %s", ip.String())

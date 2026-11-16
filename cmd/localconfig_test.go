@@ -57,13 +57,36 @@ func TestLoadCIConfig_ExplicitConfigThatDoesNotLoadFails(t *testing.T) {
 			loaded, err := loadCIConfig(context.Background(), cmd, config.NewConfigManager(), nil, quietLogger())
 			require.Error(t, err)
 			assert.False(t, loaded)
-			assert.Contains(t, err.Error(), "--config "+path+" did not load")
+			assert.Contains(t, err.Error(), "config file "+path+" did not load")
 		})
 	}
 }
 
-// Without --config, the default path not loading leaves deny-all, as
-// before, and an environment configuration is read ahead of any file.
+// A file at the default path is the configuration meant to apply as much as
+// one --config names: when it's there and doesn't load, startup fails, and
+// the failure sentinel names it. Only a default path with no file at it
+// leaves deny-all.
+func TestLoadCIConfig_BrokenDefaultFileFails(t *testing.T) {
+	redirectStateFiles(t)
+	old := defaultConfigPath
+	defaultConfigPath = badConfig(t)
+	t.Cleanup(func() { defaultConfigPath = old })
+
+	cmd := &StartCmd{GithubAction: true}
+	loaded, err := loadCIConfig(context.Background(), cmd, config.NewConfigManager(), nil, quietLogger())
+	require.Error(t, err)
+	assert.False(t, loaded)
+	sentinel := filepath.Join(t.TempDir(), "cargowall-failed")
+	publishStartupFailure(sentinel, err, cmd.refusedPosture, quietLogger())
+	data, rerr := os.ReadFile(sentinel)
+	require.NoError(t, rerr)
+	assert.Contains(t, string(data), "config file "+defaultConfigPath+" did not load")
+
+	require.Error(t, loadPlainConfig(&StartCmd{}, config.NewConfigManager(), quietLogger()), "plain mode too")
+}
+
+// Without --config, the default path with no file at it leaves deny-all,
+// as before, and an environment configuration is read ahead of any file.
 func TestLoadCIConfig_DefaultPathAndEnvUnchanged(t *testing.T) {
 	redirectStateFiles(t)
 	cm := config.NewConfigManager()
@@ -124,7 +147,7 @@ func TestBadConfigStartupFailure(t *testing.T) {
 	publishStartupFailure(sentinel, err, cmd.refusedPosture, quietLogger())
 	data, rerr := os.ReadFile(sentinel)
 	require.NoError(t, rerr)
-	assert.Contains(t, string(data), "cargowall startup failed: --config "+cmd.Config+" did not load")
+	assert.Contains(t, string(data), "cargowall startup failed: config file "+cmd.Config+" did not load")
 	assert.NotContains(t, string(data), "refused=")
 
 	exit := refusalExit(err, cmd)

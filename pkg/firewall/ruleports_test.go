@@ -18,6 +18,7 @@ package firewall
 
 import (
 	"bytes"
+	"encoding/binary"
 	"log/slog"
 	"net"
 	"testing"
@@ -61,7 +62,7 @@ func TestRulePorts_NoKnownProtocolFailsClosed(t *testing.T) {
 
 	// The DNS path: an allow is refused with an error; a deny is all ports.
 	_, err := fw.AddIP(net.IPv4(93, 184, 216, 34), config.ActionAllow, unknownPorts)
-	require.ErrorIs(t, err, errNoKnownPort)
+	require.ErrorIs(t, err, config.ErrNoKnownPort)
 	assert.Len(t, maps[ruleMapCIDRs].store, 1, "the refused allow wrote nothing")
 	_, err = fw.AddIP(net.IPv4(93, 184, 216, 35), config.ActionDeny, unknownPorts)
 	require.NoError(t, err)
@@ -72,7 +73,7 @@ func TestRulePorts_NoKnownProtocolFailsClosed(t *testing.T) {
 	// step's own CIDR rule at the sync: both are allows, so both refused.
 	scoped := false
 	_, err = fw.AddPolicyIP(1, net.IPv4(93, 184, 216, 36), unknownPorts, func() error { scoped = true; return nil })
-	require.ErrorIs(t, err, errNoKnownPort)
+	require.ErrorIs(t, err, config.ErrNoKnownPort)
 	assert.False(t, scoped)
 	fw.writeStepCIDRsLocked(config.StepRules{StepID: "a", Policy: 1, Rules: []config.ResolvedRule{{
 		Type: config.RuleTypeCIDR, Value: "10.3.0.1/32", Action: config.ActionAllow, Ports: unknownPorts, IPNet: host(10, 3, 0, 1),
@@ -83,6 +84,46 @@ func TestRulePorts_NoKnownProtocolFailsClosed(t *testing.T) {
 	assert.Contains(t, logs.String(), "level=ERROR")
 	assert.Contains(t, logs.String(), "Refusing an allow rule none of whose ports has a known protocol")
 	assert.Contains(t, logs.String(), "Keeping a deny rule none of whose ports has a known protocol on every port")
+}
+
+// The sync's hostname rules take the same guard: a policy loader that let
+// an unknown protocol through would still install no allow on every port.
+func TestRulePorts_SyncHostnameRule(t *testing.T) {
+	fw, maps := newStepTestFirewall(ruleMapEntries, slog.New(slog.DiscardHandler))
+	cm := config.NewConfigManager()
+	rules := []config.Rule{
+		{Type: config.RuleTypeHostname, Value: "allow.example.com", Action: config.ActionAllow, Ports: unknownPorts},
+		{Type: config.RuleTypeHostname, Value: "deny.example.com", Action: config.ActionDeny, Ports: unknownPorts},
+	}
+	require.NoError(t, cm.LoadConfigFromRules(rules, config.ActionAllow))
+	cm.UpdateDNSMapping("allow.example.com", "93.184.216.34")
+	cm.UpdateDNSMapping("deny.example.com", "93.184.216.35")
+	require.NoError(t, cm.LoadConfigFromRules(rules, config.ActionAllow))
+	require.NoError(t, fw.UpdateAllowlistTC(cm))
+
+	require.Len(t, maps[ruleMapCIDRs].store, 1, "only the deny reaches the maps")
+	for k, v := range maps[ruleMapCIDRs].store {
+		assert.Equal(t, bpf.RuleKey(bpf.PolicyJob, 32, binaryIP(93, 184, 216, 35)), k)
+		assert.Equal(t, uint8(0), v.(bpf.TcBpfLpmVal).Action)
+		assert.Equal(t, uint8(0), v.(bpf.TcBpfLpmVal).PortSpecific, "the deny is on every port")
+	}
+	assert.Empty(t, maps[ruleMapPorts].store)
+}
+
+// The guard's Error is logged once per action and port list: the DNS path
+// asks again for every answer, and the late allow for every blocked packet.
+func TestRulePorts_LogsOncePerPortList(t *testing.T) {
+	var logs bytes.Buffer
+	fw, _ := newStepTestFirewall(ruleMapEntries, slog.New(slog.NewTextHandler(&logs, nil)))
+	for _, ip := range []net.IP{net.IPv4(93, 184, 216, 34), net.IPv4(93, 184, 216, 35), net.IPv4(93, 184, 216, 34)} {
+		_, err := fw.AddIP(ip, config.ActionAllow, unknownPorts)
+		require.ErrorIs(t, err, config.ErrNoKnownPort)
+	}
+	_, err := fw.AddIP(net.IPv4(93, 184, 216, 36), config.ActionAllow, []config.Port{{Port: 80, Protocol: "TCP"}})
+	require.ErrorIs(t, err, config.ErrNoKnownPort)
+	_, err = fw.AddIP(net.IPv4(93, 184, 216, 37), config.ActionDeny, unknownPorts)
+	require.NoError(t, err)
+	assert.Equal(t, 3, bytes.Count(logs.Bytes(), []byte("level=ERROR")), "one per action and port list: %s", logs.String())
 }
 
 // Ports that do expand pass through unchanged, a partly known list keeping
@@ -96,3 +137,6 @@ func TestRulePorts_KnownPortsUnchanged(t *testing.T) {
 	assert.True(t, ok)
 	assert.Nil(t, pp)
 }
+
+// binaryIP is an IPv4 address as the rule maps key it.
+func binaryIP(a, b, c, d byte) uint32 { return binary.NativeEndian.Uint32([]byte{a, b, c, d}) }

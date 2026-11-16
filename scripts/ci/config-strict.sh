@@ -57,7 +57,7 @@ for f in "$dir"/*.json; do
     cat "$dir/$name.log"
     exit 1
   fi
-  if ! sudo grep -F -- "--config $f did not load" "$FAILED"; then
+  if ! sudo grep -F -- "config file $f did not load" "$FAILED"; then
     echo "::error::the failure sentinel for $name doesn't name the file"
     sudo cat "$FAILED" 2>/dev/null || true
     exit 1

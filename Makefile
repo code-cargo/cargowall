@@ -74,6 +74,8 @@ test-ci:
 	go run gotest.tools/gotestsum@latest --junitfile test-results.xml --format testdox -- ./...
 	@printf "${GREEN}Running BPF tests with sudo...${RESET}\n"
 	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/
+	@printf "${GREEN}Running cmd's root-only tests with sudo...${RESET}\n"
+	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-cmd-root.xml --format testdox -- -count=1 -run 'NewUpstreamReverseResolver|MarkDNSProxySocket|ConfigureOwnLookupResolver' ./cmd/
 
 vet:
 	$(call check_tool,staticcheck)

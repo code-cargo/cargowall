@@ -110,3 +110,59 @@ func TestMarkDNSProxySocket(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, network.DNSProxyFWMark, mark)
 }
+
+// The resolver's own dialer marks its socket with DNSProxyFWMark, so the
+// redirect exempts it. Reading the mark needs CAP_NET_ADMIN.
+func TestNewUpstreamReverseResolver_MarksItsSocket(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("marking a socket needs CAP_NET_ADMIN")
+	}
+	conn, err := newUpstreamReverseResolver("127.0.0.1:9").Dial(context.Background(), "udp", "ignored:53")
+	require.NoError(t, err)
+	defer conn.Close()
+	rc, err := conn.(syscall.Conn).SyscallConn()
+	require.NoError(t, err)
+	var mark int
+	require.NoError(t, rc.Control(func(fd uintptr) {
+		mark, err = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_MARK)
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, network.DNSProxyFWMark, mark)
+}
+
+// configureOwnLookupResolver installs a resolver that reaches the upstream
+// it is given: a reverse lookup through cargowall's own-lookup resolver
+// reaches that server and returns its name.
+func TestConfigureOwnLookupResolver_ReachesItsUpstream(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("marking a socket needs CAP_NET_ADMIN")
+	}
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	started := make(chan struct{})
+	srv := &dns.Server{
+		PacketConn:        pc,
+		NotifyStartedFunc: func() { close(started) },
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+			m := new(dns.Msg)
+			m.SetReply(r)
+			m.Answer = []dns.RR{&dns.PTR{
+				Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 60},
+				Ptr: "peer.example.net.",
+			}}
+			_ = w.WriteMsg(m)
+		}),
+	}
+	go func() { _ = srv.ActivateAndServe() }()
+	<-started
+	t.Cleanup(func() { _ = srv.Shutdown(); _ = pc.Close() })
+	prev := events.ReverseDNSResolver()
+	t.Cleanup(func() { events.SetReverseDNSResolver(prev) })
+
+	configureOwnLookupResolver(pc.LocalAddr().String())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	names, err := events.ReverseDNSResolver().LookupAddr(ctx, "192.0.2.7")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"peer.example.net."}, names)
+}

@@ -85,7 +85,7 @@ func TestReverseDNSExistingConnections_OnlyForwardConfirmedNames(t *testing.T) {
 	https := []config.Port{{Port: 443, Protocol: config.ProtocolTCP}}
 	conns := existingConns{"203.0.113.6": https, "203.0.113.66": https}
 
-	reverseDNSExistingConnections(context.Background(), conns, cm, ptrServer(t, "203.0.113.6"), quietLogger())
+	reverseDNSExistingConnections(context.Background(), conns, cm, upstreamResolver{ptrServer(t, "203.0.113.6")}, quietLogger())
 
 	assert.Equal(t, "edge.cdn.example.net", cm.LookupHostnameByIP("203.0.113.6"), "a confirmed PTR name is recorded")
 	assert.Empty(t, cm.LookupHostnameByIP("203.0.113.66"), "a forged PTR name is not")

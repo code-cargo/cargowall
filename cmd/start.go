@@ -1411,7 +1411,7 @@ func autoAllowCodeCargoAPI(apiURL string, configMgr *config.Manager, logger *slo
 // opens a named IP on its rule's ports, so a forged PTR record must not
 // choose the rule. Derives from ctx so a startup-window shutdown signal
 // drains the lookup loop promptly.
-func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, resolver *net.Resolver, logger *slog.Logger) {
+func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, resolver upstreamResolver, logger *slog.Logger) {
 	if len(conns) == 0 {
 		return
 	}

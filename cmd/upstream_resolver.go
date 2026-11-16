@@ -39,6 +39,11 @@ func markDNSProxySocket(_, _ string, c syscall.RawConn) error {
 	return sErr
 }
 
+// upstreamResolver is a resolver that reaches the DNS upstream directly,
+// bypassing the proxy (newUpstreamReverseResolver). Its own type, so the
+// lookups that must bypass the proxy can take nothing else.
+type upstreamResolver struct{ *net.Resolver }
+
 // newUpstreamReverseResolver resolves straight to the DNS upstream, marking
 // its socket so the redirect exempts it and it bypasses the proxy.
 // cargowall's own reverse and confirming lookups use it, the lazy ones on
@@ -46,13 +51,13 @@ func markDNSProxySocket(_, _ string, c syscall.RawConn) error {
 // filter answers a reverse lookup only for an address the run knows, and
 // would refuse them, as would systemd-resolved's stub, whose own upstream
 // query the redirect sends through the proxy.
-func newUpstreamReverseResolver(upstream string) *net.Resolver {
-	return &net.Resolver{
+func newUpstreamReverseResolver(upstream string) upstreamResolver {
+	return upstreamResolver{&net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, proto, _ string) (net.Conn, error) {
 			return (&net.Dialer{Control: markDNSProxySocket}).DialContext(ctx, proto, upstream)
 		},
-	}
+	}}
 }
 
 // configureOwnLookupResolver points cargowall's own reverse lookups at a

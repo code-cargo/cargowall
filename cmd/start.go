@@ -39,7 +39,6 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
-	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/code-cargo/cargowall/bpf"
@@ -252,11 +251,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			logger.Info("DNS query filtering enabled (blocks DNS tunneling)")
 		}
 
-		// cargowall's own reverse lookups of blocked destinations, and the
-		// forward lookups that confirm their names, go to the upstream
-		// directly: with query filtering on, the proxy answers a reverse
-		// lookup only for an address the run allows, so a lookup through it
-		// would be refused.
+		// cargowall's own reverse lookups bypass the proxy (newUpstreamReverseResolver).
 		events.SetReverseDNSResolver(newUpstreamReverseResolver(upstream))
 
 		if cmd.DockerDNSInterception {
@@ -571,8 +566,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		dnsServer.ApplyRulesToTrackedHostnames()
 
 		// Shared resolver that uses the systemd-resolved stub listener for
-		// looking up cached DNS entries. Used for existing-connection reverse
-		// DNS and Phase 1 cache population.
+		// looking up cached DNS entries: Phase 1 cache population. Existing
+		// connections' reverse names go upstream-direct instead.
 		cacheResolver := &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -583,7 +578,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		existing := scanExistingForStartup(cmd, logger)
 
 		if cmd.PrepopulateDNSCache {
-			reverseDNSExistingConnections(ctx, existing, configMgr, cacheResolver, logger)
+			reverseDNSExistingConnections(ctx, existing, configMgr, newUpstreamReverseResolver(cmd.DNSUpstream), logger)
 			prePopulateDNSCache(ctx, configMgr, dnsServer, cacheResolver, logger)
 		}
 
@@ -1409,39 +1404,15 @@ func autoAllowCodeCargoAPI(apiURL string, configMgr *config.Manager, logger *slo
 	logger.Info("Auto-allowed CodeCargo API hostname", "hostname", u.Hostname())
 }
 
-// newUpstreamReverseResolver resolves straight to the DNS upstream, marking
-// its socket (DNSProxyFWMark) so the redirect exempts it and it bypasses the
-// proxy. cargowall's own reverse and confirming lookups use it, since the
-// proxy's filter would refuse a reverse lookup of a blocked destination.
-func newUpstreamReverseResolver(upstream string) *net.Resolver {
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, proto, _ string) (net.Conn, error) {
-			d := &net.Dialer{
-				Control: func(_, _ string, c syscall.RawConn) error {
-					var sErr error
-					if err := c.Control(func(fd uintptr) {
-						sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_MARK, network.DNSProxyFWMark)
-					}); err != nil {
-						return err
-					}
-					return sErr
-				},
-			}
-			return d.DialContext(ctx, proto, upstream)
-		},
-	}
-}
-
 // reverseDNSExistingConnections performs reverse DNS lookups for each
-// scanned existing-connection IP via the cache resolver, updating the config
+// scanned existing-connection IP via resolver, updating the config
 // manager's DNS mappings. Only a name a rule allows, whose forward lookup
 // leads back to the IP, is recorded (see events.UsableReverseNames and
 // events.ConfirmReverseName): gateExistingConnections
 // opens a named IP on its rule's ports, so a forged PTR record must not
 // choose the rule. Derives from ctx so a startup-window shutdown signal
 // drains the lookup loop promptly.
-func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) {
+func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, resolver *net.Resolver, logger *slog.Logger) {
 	if len(conns) == 0 {
 		return
 	}
@@ -1449,10 +1420,10 @@ func reverseDNSExistingConnections(ctx context.Context, conns existingConns, con
 	lookupCtx, lookupCancel := context.WithTimeout(ctx, 10*time.Second)
 	for ip := range conns {
 		rCtx, rCancel := context.WithTimeout(lookupCtx, 1*time.Second)
-		if names, err := cacheResolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
+		if names, err := resolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
 			var hostname string
 			if usable := events.UsableReverseNames(configMgr, names); len(usable) > 0 {
-				hostname, _, _ = events.ConfirmReverseName(rCtx, cacheResolver, ip, usable)
+				hostname, _, _ = events.ConfirmReverseName(rCtx, resolver, ip, usable)
 			}
 			if hostname != "" {
 				configMgr.UpdateDNSMapping(hostname, ip)

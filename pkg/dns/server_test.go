@@ -985,20 +985,23 @@ func TestIsQueryAllowed(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:          "PTR query for IPv4 reverse DNS (in-addr.arpa) is allowed",
+			// A reverse lookup is answered on its shape alone only for an
+			// address the run knows (reversequery_test.go); with no rules a
+			// public address is unknown.
+			name:          "PTR query for an unknown IPv4 address is refused",
 			filterEnabled: true,
 			defaultAction: config.ActionDeny,
 			domain:        "16.129.63.168.in-addr.arpa",
 			qtype:         dns.TypePTR,
-			expected:      true,
+			expected:      false,
 		},
 		{
-			name:          "PTR query for IPv6 reverse DNS (ip6.arpa) is allowed",
+			name:          "PTR query for an unknown IPv6 address is refused",
 			filterEnabled: true,
 			defaultAction: config.ActionDeny,
 			domain:        "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa",
 			qtype:         dns.TypePTR,
-			expected:      true,
+			expected:      false,
 		},
 		{
 			// Non-PTR query against a PTR-shaped name does NOT bypass —

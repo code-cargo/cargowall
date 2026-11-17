@@ -107,6 +107,12 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	// An event with no timestamp is stamped now, so every record carries
+	// the time it was logged.
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now()
+	}
+
 	// Set the block status based on audit mode.
 	// Skip for events that set their own flags (allowed, existing connection,
 	// late-allowed — where the connection was initially dropped by BPF but a

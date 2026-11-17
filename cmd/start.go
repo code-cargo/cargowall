@@ -251,6 +251,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			logger.Info("DNS query filtering enabled (blocks DNS tunneling)")
 		}
 
+		configureOwnLookupResolver(upstream)
+
 		if cmd.DockerDNSInterception {
 			var err error
 			dockerBridgeIP, err = network.GetDockerBridgeIP()
@@ -563,8 +565,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		dnsServer.ApplyRulesToTrackedHostnames()
 
 		// Shared resolver that uses the systemd-resolved stub listener for
-		// looking up cached DNS entries. Used for existing-connection reverse
-		// DNS and Phase 1 cache population.
+		// looking up cached DNS entries: Phase 1 cache population. Existing
+		// connections' reverse names go upstream-direct instead.
 		cacheResolver := &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -575,7 +577,7 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		existing := scanExistingForStartup(cmd, logger)
 
 		if cmd.PrepopulateDNSCache {
-			reverseDNSExistingConnections(ctx, existing, configMgr, cacheResolver, logger)
+			reverseDNSExistingConnections(ctx, existing, configMgr, newUpstreamReverseResolver(cmd.DNSUpstream), logger)
 			prePopulateDNSCache(ctx, configMgr, dnsServer, cacheResolver, logger)
 		}
 
@@ -1402,14 +1404,14 @@ func autoAllowCodeCargoAPI(apiURL string, configMgr *config.Manager, logger *slo
 }
 
 // reverseDNSExistingConnections performs reverse DNS lookups for each
-// scanned existing-connection IP via the cache resolver, updating the config
+// scanned existing-connection IP via resolver, updating the config
 // manager's DNS mappings. Only a name a rule allows, whose forward lookup
 // leads back to the IP, is recorded (see events.UsableReverseNames and
 // events.ConfirmReverseName): gateExistingConnections
 // opens a named IP on its rule's ports, so a forged PTR record must not
 // choose the rule. Derives from ctx so a startup-window shutdown signal
 // drains the lookup loop promptly.
-func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, cacheResolver *net.Resolver, logger *slog.Logger) {
+func reverseDNSExistingConnections(ctx context.Context, conns existingConns, configMgr *config.Manager, resolver upstreamResolver, logger *slog.Logger) {
 	if len(conns) == 0 {
 		return
 	}
@@ -1417,10 +1419,10 @@ func reverseDNSExistingConnections(ctx context.Context, conns existingConns, con
 	lookupCtx, lookupCancel := context.WithTimeout(ctx, 10*time.Second)
 	for ip := range conns {
 		rCtx, rCancel := context.WithTimeout(lookupCtx, 1*time.Second)
-		if names, err := cacheResolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
+		if names, err := resolver.LookupAddr(rCtx, ip); err == nil && len(names) > 0 {
 			var hostname string
 			if usable := events.UsableReverseNames(configMgr, names); len(usable) > 0 {
-				hostname, _, _ = events.ConfirmReverseName(rCtx, cacheResolver, ip, usable)
+				hostname, _, _ = events.ConfirmReverseName(rCtx, resolver, ip, usable)
 			}
 			if hostname != "" {
 				configMgr.UpdateDNSMapping(hostname, ip)

@@ -164,7 +164,7 @@ func (s *Server) serveSynthetic(w dns.ResponseWriter, r *dns.Msg) bool {
 		return false
 	}
 	resp.Id = r.Id
-	if class == trackedAlias && resp.Rcode == dns.RcodeSuccess {
+	if class == trackedAlias && enforcesAnswer(r) && resp.Rcode == dns.RcodeSuccess {
 		s.enforceDNSResponse(name, resp, 0, localAnswer)
 	}
 	w.WriteMsg(resp)

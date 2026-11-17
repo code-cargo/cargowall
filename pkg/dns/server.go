@@ -171,7 +171,7 @@ func (s *Server) SetRecentBlocks(rb *events.RecentBlocks) {
 }
 
 // EnableQueryFiltering enables DNS query filtering.
-// When enabled, only queries for domains that match allowed hostname rules will be forwarded.
+// When enabled, only queries for domains that match allowed hostname rules, and reverse lookups of known addresses, will be forwarded.
 // Queries for non-allowed domains will receive REFUSED responses.
 // This prevents DNS tunneling attacks where data is exfiltrated via DNS queries.
 func (s *Server) EnableQueryFiltering(enable bool) {
@@ -182,9 +182,9 @@ func (s *Server) EnableQueryFiltering(enable bool) {
 //
 // Precedence, in order:
 //  1. Filtering disabled → allow.
-//  2. Canonical PTR queries (Qtype=PTR and well-formed in-addr.arpa /
-//     ip6.arpa name) → allow. The double gate (Qtype + shape) is what
-//     prevents using PTR-shaped names as a tunneling channel via TXT/A/etc.
+//  2. A reverse-lookup name (in-addr.arpa / ip6.arpa) is decided by
+//     reverseNameVerdict alone: the address gate, a deny rule or the
+//     default action. None of the steps below applies to it.
 //  3. Explicit hostname rule. MatchHostnameRule handles search-domain
 //     stripping internally and can return a mixed verdict (one form deny,
 //     other form allow). At the DNS gate we allow the query if ANY allow
@@ -212,13 +212,11 @@ func (s *Server) isQueryAllowed(domain string, qtype uint16) bool {
 		return true
 	}
 
-	// Allow reverse DNS lookups, but only true PTR queries with the
-	// canonical shape (exactly 4 numeric octets for IPv4, exactly 32 hex
-	// nibbles for IPv6). The Qtype gate stops TXT/A/NS queries against
-	// PTR-shaped names from slipping through this exception; the shape gate
-	// stops shortened/padded labels from carrying tunneled data.
-	if qtype == dns.TypePTR && isValidReverseDNS(domain) {
-		return true
+	// A reverse-lookup name is decided by the address gate, a deny rule or
+	// the default action alone (reverseNameVerdict); any other name by the
+	// rules below.
+	if allowed, decided := s.reverseNameVerdict(domain, qtype); decided {
+		return allowed
 	}
 
 	verdict := s.config.MatchHostnameRule(domain)
@@ -494,10 +492,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 			isAuditMode := s.config.IsAuditMode()
 
 			attr := s.attributeClient(w)
-			ev := events.AuditEvent{
-				EventType:   events.EventDNSBlocked,
-				DstHostname: domain,
-			}
+			ev := blockedQueryEvent(domain)
 			attr.apply(&ev)
 
 			logAttrs := attr.logAttrs("domain", domain, "from", w.RemoteAddr().String())
@@ -587,7 +582,7 @@ func (s *Server) handleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	// the canonical lowercase form (rather than the raw wire case) keeps
 	// DNS-path output consistent with the connection-event path, which logs
 	// the lowercase hostname from the IP->hostname mapping (#65).
-	if len(r.Question) > 0 && resp.Rcode == dns.RcodeSuccess {
+	if enforcesAnswer(r) && resp.Rcode == dns.RcodeSuccess {
 		s.enforceDNSResponse(strings.ToLower(strings.TrimSuffix(r.Question[0].Name, ".")), resp, 0, wireAnswer)
 	}
 

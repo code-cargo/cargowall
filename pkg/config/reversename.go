@@ -28,15 +28,8 @@ package config
 func (cm *Manager) RecordReverseName(hostname, ip string) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	if _, named := cm.ipToHostname[ip]; named {
+	if cm.ipNamedLocked(ip) {
 		return false
-	}
-	for _, ips := range cm.hostnameCache {
-		for _, cached := range ips {
-			if cached.String() == ip {
-				return false
-			}
-		}
 	}
 	cm.updateDNSMappingLocked(hostname, ip)
 	return true

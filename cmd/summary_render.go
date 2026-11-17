@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/events"
 )
 
@@ -339,7 +340,14 @@ func (c *SummaryCmd) generateAllowlistSuggestions(stepEvents []StepEvents) {
 			// the already-allowed origin its edge IP resolves to.
 			switch event.EventType {
 			case events.EventConnectionBlocked, events.EventDNSBlocked, events.EventL7Blocked:
-				destCounts[event.ReportedDestName()]++
+				// A refused reverse lookup, recorded by its address, isn't a
+				// host the run needed; nor is any reverse-lookup name.
+				if event.EventType == events.EventDNSBlocked && event.DstHostname == "" {
+					continue
+				}
+				if name := event.ReportedDestName(); !config.ReverseLookupName(name) {
+					destCounts[name]++
+				}
 			}
 		}
 	}

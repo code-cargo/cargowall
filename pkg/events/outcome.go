@@ -64,7 +64,12 @@ func resolveDestination(configMgr *config.Manager, dstIP string, denial bool, lo
 	if hostname == "" {
 		switch claimed, first := reverseDNS.begin(dstIP, denial); {
 		case claimed && first:
-			hostname = lookupReverseName(reverseDNS, reverseDNSResolver, configMgr, dstIP, logger)
+			if denial && !reverseDNS.budget.take(dstIP, logger) {
+				// Past a cap (reverseDNSBudget): unnamed, with no lookup.
+				reverseDNS.finish(dstIP, true)
+			} else {
+				hostname = lookupReverseName(reverseDNS, reverseDNSResolver, configMgr, dstIP, logger)
+			}
 			// If PTR failed, try forward-matching all tracked hostnames.
 			if hostname == "" {
 				if match := configMgr.ForwardMatchIP(dstIP); match != "" {

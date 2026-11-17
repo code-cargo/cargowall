@@ -84,7 +84,9 @@ func withFakeStub(t *testing.T) func() []dns.Question {
 			switch {
 			case !known:
 				m.Rcode = dns.RcodeNameError
-			case q.Qtype == dns.TypeA:
+			// A PTR query gets the address record too: an answer to a PTR
+			// query that carries one, which must change nothing.
+			case q.Qtype == dns.TypeA || q.Qtype == dns.TypePTR:
 				m.Answer = append(m.Answer, &dns.A{
 					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0},
 					A:   net.ParseIP(ip).To4(),
@@ -304,6 +306,23 @@ func TestServeSynthetic_AllowDoesNotL7Scope(t *testing.T) {
 	assert.Empty(t, rec.scopes, "a synthetic name must not L7-scope its address")
 	assert.False(t, s.config.NameResolvedToIP("_gateway", "192.168.5.2"), "no forward-resolution evidence for an alias")
 	assert.Equal(t, "_gateway", s.config.LookupHostnameByIP("192.168.5.2"), "attribution still applies")
+}
+
+// The answer to a PTR query never changes enforcement state, on the
+// synthetic path as on the wire: an address record in resolved's answer is
+// neither mapped nor installed, even for a name a rule allows, and the
+// answer reaches the client as it came. The mock firewall fails the test on
+// any call.
+func TestServeSynthetic_PTRAnswerInstallsNothing(t *testing.T) {
+	s, seen := syntheticServer(t, config.Rule{Type: config.RuleTypeHostname, Value: "_gateway", Action: config.ActionAllow})
+	m := askName(t, s, "_gateway.", dns.TypePTR)
+	assert.Equal(t, dns.RcodeSuccess, m.Rcode)
+	require.Len(t, m.Answer, 1, "relayed as it came")
+	require.Len(t, seen(), 1)
+	assert.Empty(t, s.config.LookupHostnameByIP("192.168.5.2"), "no address in it is mapped")
+	s.hostnameIPsMutex.RLock()
+	defer s.hostnameIPsMutex.RUnlock()
+	assert.NotContains(t, s.hostnameIPs, "_gateway")
 }
 
 // Whatever resolved says is what the client gets: NODATA for a family it

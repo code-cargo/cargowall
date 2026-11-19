@@ -113,7 +113,7 @@ jobs:
           # traffic is actually blocked, so runner infrastructure (results
           # upload, Azure metadata, ...) cannot break. The collector endpoint
           # is loopback, which the TC egress filter never sees.
-          sudo -E ./bin/cargowall start \
+          bash scripts/ci/sudo-env.sh ./bin/cargowall start \
             --config /etc/cargowall/config.json \
             --dns-upstream 8.8.8.8:53 \
             --dns-redirect-iptables \
@@ -247,7 +247,7 @@ jobs:
           OTEL_SERVICE_NAME: cargowall-e2e
           OTEL_RESOURCE_ATTRIBUTES: test.run.id=${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          sudo -E ./bin/cargowall start \
+          bash scripts/ci/sudo-env.sh ./bin/cargowall start \
             --config /etc/cargowall/config.json \
             --dns-upstream 8.8.8.8:53 \
             --dns-redirect-iptables \

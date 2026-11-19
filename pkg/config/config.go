@@ -1641,140 +1641,6 @@ func (cm *Manager) EnsureInfraAllowed(ips []string, ports []Port, autoAddedType 
 	cm.ensureAllowed(ips, ports, autoAddedType)
 }
 
-// ensureAllowed adds CIDR allow rules for the given IPs with the specified ports.
-// If ports is nil, traffic on all ports is allowed.
-func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoAddedType) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if cm.config == nil {
-		return
-	}
-
-	for _, ip := range ips {
-		if ip == "" {
-			continue
-		}
-
-		// Check if a rule already covers this IP
-		if len(ports) == 0 {
-			if cm.hasCIDRRuleAllPorts(ip) {
-				slog.Debug("Allow rule already exists (all ports)", "ip", ip)
-				continue
-			}
-		} else {
-			covered := true
-			for _, p := range ports {
-				if !cm.hasCIDRRule(ip, p) {
-					covered = false
-					break
-				}
-			}
-			if covered {
-				slog.Debug("Allow rule already exists", "ip", ip, "ports", ports)
-				continue
-			}
-		}
-
-		parsedIP := net.ParseIP(ip)
-		if parsedIP == nil {
-			continue
-		}
-		ip4 := parsedIP.To4()
-		if ip4 == nil {
-			continue // skip IPv6
-		}
-
-		cidr := ip + "/32"
-		cm.config.Rules = append(cm.config.Rules, Rule{
-			Type:          RuleTypeCIDR,
-			Value:         cidr,
-			Ports:         ports,
-			Action:        ActionAllow,
-			AutoAddedType: autoAddedType,
-		})
-		cm.resolvedRules = append(cm.resolvedRules, ResolvedRule{
-			Type:          RuleTypeCIDR,
-			Value:         cidr,
-			Ports:         ports,
-			Action:        ActionAllow,
-			AutoAddedType: autoAddedType,
-			IPNet: &net.IPNet{
-				IP:   ip4,
-				Mask: net.CIDRMask(32, 32),
-			},
-		})
-
-		slog.Info("Auto-added allow rule", "cidr", cidr, "ports", ports, "autoAddedType", autoAddedType)
-	}
-}
-
-// hasCIDRRuleAllPorts checks if an existing CIDR rule already covers the given
-// IP on all ports (i.e. has an empty/nil Ports list). Must be called with cm.mu held.
-func (cm *Manager) hasCIDRRuleAllPorts(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-
-	for _, rule := range cm.config.Rules {
-		if rule.Type != RuleTypeCIDR || rule.Action != ActionAllow {
-			continue
-		}
-
-		// normalizeRules promotes bare IPs to explicit /32 or /128 prefixes at
-		// load time, so every valid CIDR rule parses and host routes match via
-		// Contains; the only remaining ParseCIDR failure is a malformed value
-		// resolveRules already skipped, so skip it here too.
-		_, ipnet, err := net.ParseCIDR(rule.Value)
-		if err != nil || !ipnet.Contains(ip) {
-			continue
-		}
-
-		// IP matches — only return true if this rule covers ALL ports
-		if len(rule.Ports) == 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// hasCIDRRule checks if an existing CIDR rule already covers the given IP and port+protocol.
-// Must be called with cm.mu held.
-func (cm *Manager) hasCIDRRule(ipStr string, port Port) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-
-	for _, rule := range cm.config.Rules {
-		if rule.Type != RuleTypeCIDR {
-			continue
-		}
-
-		// normalizeRules promotes bare IPs to explicit /32 or /128 prefixes at
-		// load time, so every valid CIDR rule parses and host routes match via
-		// Contains; the only remaining ParseCIDR failure is a malformed value
-		// resolveRules already skipped, so skip it here too.
-		_, ipnet, err := net.ParseCIDR(rule.Value)
-		if err != nil || !ipnet.Contains(ip) {
-			continue
-		}
-
-		// IP matches — check if ports cover our target port+protocol
-		if len(rule.Ports) == 0 {
-			// No port restriction means all ports are covered
-			return true
-		}
-		for _, p := range rule.Ports {
-			if p.Port == port.Port && ProtocolsOverlap(p.Protocol, port.Protocol) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // EnsureHostnameAllowed adds an allow rule for a hostname so that it (and
 // its subdomains) are permitted through the firewall. This is used in
 // GitHub Actions mode to auto-allow infrastructure like the Actions service.
@@ -1864,7 +1730,7 @@ func (cm *Manager) GetIPToHostnameMap() map[string]string {
 // protocol — that matches any rule that also uses ProtocolAll, plus TCP
 // and UDP rules with the same port. Passing a specific protocol (TCP /
 // UDP / ICMP) narrows the match to rules whose protocol overlaps via
-// ProtocolsOverlap (consistent with hasCIDRRule).
+// ProtocolsOverlap.
 //
 // Hostname rules are checked first, then CIDR rules. This matters when an
 // IP is covered by BOTH (e.g. github.com's resolved IP also falls inside

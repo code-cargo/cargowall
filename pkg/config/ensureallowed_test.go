@@ -22,6 +22,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/code-cargo/cargowall/pkg/tcmaps"
 )
 
 const upstreamIP = "10.0.0.2"
@@ -36,20 +38,21 @@ func cidrRule(value string, action Action, ports ...Port) Rule {
 	return Rule{Type: RuleTypeCIDR, Value: value, Ports: ports, Action: action}
 }
 
-// tcAllows is the modelled TC verdict for a packet to ip under cm's rules.
-func tcAllows(cm *Manager, ip string, p tcProbe) bool {
+// tcAllows is the TC verdict for a packet to ip under cm's rules, from the
+// compile the firewall writes.
+func tcAllows(cm *Manager, ip string, p tcmaps.PortProto) bool {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	return newTCModel(cm.resolvedRules, cm.config.DefaultAction).allows(netip.MustParseAddr(ip), p)
+	return tcmaps.Compile(tcRules(cm.resolvedRules)).Allows(netip.MustParseAddr(ip), p, cm.config.DefaultAction == ActionAllow)
 }
 
 var (
-	probeUDP53  = tcProbe{53, tcProtoUDP}
-	probeTCP53  = tcProbe{53, tcProtoTCP}
-	probeTCP443 = tcProbe{443, tcProtoTCP}
-	probeTCP22  = tcProbe{22, tcProtoTCP}
-	probeICMP   = tcProbe{0, tcProtoICMP}
-	otherProbes = []tcProbe{probeTCP53, probeTCP443, probeTCP22, probeICMP}
+	probeUDP53  = tcmaps.PortProto{Port: 53, Proto: tcmaps.ProtoUDP}
+	probeTCP53  = tcmaps.PortProto{Port: 53, Proto: tcmaps.ProtoTCP}
+	probeTCP443 = tcmaps.PortProto{Port: 443, Proto: tcmaps.ProtoTCP}
+	probeTCP22  = tcmaps.PortProto{Port: 22, Proto: tcmaps.ProtoTCP}
+	probeICMP   = tcmaps.PortProto{Port: 0, Proto: tcmaps.ProtoICMP}
+	otherProbes = []tcmaps.PortProto{probeTCP53, probeTCP443, probeTCP22, probeICMP}
 )
 
 func autoAdded(cm *Manager) []string {
@@ -119,6 +122,13 @@ func TestEnsureDNSAllowed_ByTCVerdict(t *testing.T) {
 			wantAdded: false, wantUDP53: true,
 		},
 		{
+			// The wildcard deny answers every host with no entry of its
+			// own; the host's /32 port entry answers ahead of it.
+			name:  "port-scoped 0.0.0.0/0 deny does not suppress it",
+			rules: []Rule{cidrRule("0.0.0.0/0", ActionDeny, udp53...)}, defaultAction: ActionDeny,
+			wantAdded: true, wantUDP53: true,
+		},
+		{
 			name:  "port-scoped 0.0.0.0/0 allows it everywhere",
 			rules: []Rule{cidrRule("0.0.0.0/0", ActionAllow, udp53...)}, defaultAction: ActionDeny,
 			wantAdded: false, wantUDP53: true,
@@ -164,7 +174,7 @@ func TestEnsureDNSAllowed_ByTCVerdict(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cm := NewConfigManager()
 			require.NoError(t, cm.LoadConfigFromRules(tt.rules, tt.defaultAction))
-			before := make(map[tcProbe]bool)
+			before := make(map[tcmaps.PortProto]bool)
 			for _, p := range otherProbes {
 				before[p] = tcAllows(cm, upstreamIP, p)
 			}
@@ -191,7 +201,7 @@ func TestEnsureInfraAllowed_AllPortsOverPortSpecificHost(t *testing.T) {
 	require.NoError(t, cm.LoadConfigFromRules([]Rule{cidrRule("169.254.169.254/32", ActionAllow, tcp443...)}, ActionDeny))
 	cm.EnsureInfraAllowed([]string{"169.254.169.254"}, nil, AutoAddedTypeCloudMetadata)
 	assert.Equal(t, []string{"169.254.169.254/32"}, autoAdded(cm))
-	for _, p := range []tcProbe{probeTCP22, probeUDP53, probeICMP} {
+	for _, p := range []tcmaps.PortProto{probeTCP22, probeUDP53, probeICMP} {
 		assert.True(t, tcAllows(cm, "169.254.169.254", p), "%+v", p)
 	}
 }

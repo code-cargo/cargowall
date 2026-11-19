@@ -19,7 +19,10 @@ package config
 import (
 	"log/slog"
 	"net"
+	"net/netip"
 	"slices"
+
+	"github.com/code-cargo/cargowall/pkg/tcmaps"
 )
 
 // ensureAllowed adds /32 allow rules for the given IPs with the specified
@@ -76,46 +79,52 @@ func (cm *Manager) ensureAllowed(ips []string, ports []Port, autoAddedType AutoA
 }
 
 // autoAllowNeededLocked decides whether the /32 allow in rule should be added,
-// by the verdict the TC program would give (tcModel) rather than by whether
-// some rule's network contains the address:
-//   - Already allowed on every port the rule names: nothing to add.
-//   - Denied by a rule keyed on this address and port, or still denied with
-//     the rule added (a covering all-ports deny holds for every host inside
-//     it): the deny is kept, and the skip is logged.
-//   - Otherwise the rule is added only if it changes nothing but the ports it
-//     names, since a /32 written for the address decides its other ports too.
+// by the verdict the TC program would give (tcmaps, the compile the firewall
+// writes) rather than by whether some rule's network contains the address:
+//   - Already allowed on every port the rule names, or on all ports for an
+//     all-ports rule: nothing to add.
+//   - Denied by a port entry keyed on this address and port, which the add
+//     would overwrite, or still denied with the rule added (a covering
+//     all-ports deny the host folds in): the deny is kept, and the skip is
+//     logged.
+//
+// Otherwise the /32 only gains the named ports. A covering all-ports grant
+// is folded into the host on first touch, a port-specific /32 that already
+// shadows a broader rule only gains new port keys, and a port-specific subnet
+// answers for no address but its own, so no other port's verdict moves.
 //
 // Must be called with cm.mu held.
 func (cm *Manager) autoAllowNeededLocked(rule ResolvedRule, autoAddedType AutoAddedType) bool {
-	defaultAction := cm.config.DefaultAction
-	if defaultAction == "" {
-		defaultAction = ActionDeny
-	}
-	before := newTCModel(cm.resolvedRules, defaultAction)
-	after := newTCModel(append(slices.Clip(cm.resolvedRules), rule), defaultAction)
+	defaultAllow := cm.config.DefaultAction == ActionAllow
+	before := tcmaps.Compile(tcRules(cm.resolvedRules))
+	after := tcmaps.Compile(tcRules(append(slices.Clip(cm.resolvedRules), rule)))
 	addr, _ := tcAddr(rule.IPNet.IP)
 
-	want := tcProbes(rule.Ports)
-	if len(want) == 0 {
-		want = after.probes()
+	ports := TCPorts(rule.Ports)
+	var covered, denied bool
+	if len(ports) == 0 {
+		covered = allowsAllPorts(before, addr)
+		denied = !allowsAllPorts(after, addr)
+	} else {
+		covered = !slices.ContainsFunc(ports, func(p tcmaps.PortProto) bool { return !before.Allows(addr, p, defaultAllow) })
+		denied = slices.ContainsFunc(ports, func(p tcmaps.PortProto) bool {
+			return before.PortDenied(addr, p) || !after.Allows(addr, p, defaultAllow)
+		})
 	}
-
-	if !slices.ContainsFunc(want, func(p tcProbe) bool { return !before.allows(addr, p) }) {
+	switch {
+	case covered:
 		slog.Debug("Allow rule already exists", "cidr", rule.Value, "ports", rule.Ports)
 		return false
-	}
-	if slices.ContainsFunc(want, func(p tcProbe) bool { return before.portDenied(addr, p) || !after.allows(addr, p) }) {
+	case denied:
 		slog.Warn("Skipping auto-allow: a deny rule covers this address",
 			"cidr", rule.Value, "ports", rule.Ports, "autoAddedType", autoAddedType)
 		return false
 	}
-	for _, p := range append(before.probes(), after.probes()...) {
-		if !slices.Contains(want, p) && before.allows(addr, p) != after.allows(addr, p) {
-			slog.Warn("Skipping auto-allow: it would change the verdict for other traffic to this address",
-				"cidr", rule.Value, "ports", rule.Ports, "autoAddedType", autoAddedType,
-				"port", p.port, "proto", p.proto)
-			return false
-		}
-	}
 	return true
+}
+
+// allowsAllPorts reports whether the LPM answers addr with an all-ports allow.
+func allowsAllPorts(m *tcmaps.Maps, addr netip.Addr) bool {
+	e, ok := m.Lookup(addr)
+	return ok && !e.PortSpecific && e.Allow
 }

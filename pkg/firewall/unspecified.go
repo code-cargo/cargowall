@@ -36,18 +36,19 @@ func (f *FirewallImpl) refuseUnspecifiedLocked(ip net.IP, ipStr string) bool {
 	if !ip.IsUnspecified() {
 		return false
 	}
-	if f.unspecifiedWarned == nil {
-		f.unspecifiedWarned = make(map[string]struct{})
-	}
-	if _, warned := f.unspecifiedWarned[ipStr]; !warned {
-		f.unspecifiedWarned[ipStr] = struct{}{}
-		f.logger.Warn("Not installing the unspecified address as a destination: a port entry keyed on "+
-			"the zero address is the entry for every destination", "ip", ipStr)
-	}
+	f.warnUnspecifiedLocked(ipStr)
 	return true
 }
 
-// isZeroV6 reports whether ip6's 16 bytes are all zero.
-func isZeroV6(ip6 net.IP) bool {
-	return net.IP(ip6).Equal(net.IPv6unspecified)
+// warnUnspecifiedLocked logs, once per label, that a zero-address host or
+// network was not installed. Must be called with f.mu held.
+func (f *FirewallImpl) warnUnspecifiedLocked(label string) {
+	if f.unspecifiedWarned == nil {
+		f.unspecifiedWarned = make(map[string]struct{})
+	}
+	if _, warned := f.unspecifiedWarned[label]; !warned {
+		f.unspecifiedWarned[label] = struct{}{}
+		f.logger.Warn("Not installing the unspecified address as a destination: a port entry keyed on "+
+			"the zero address is the entry for every destination", "ip", label)
+	}
 }

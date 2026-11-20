@@ -600,45 +600,6 @@ func TestUpdateAllowlistTC_Hostname_CreatesPerIPEntries(t *testing.T) {
 	assert.Len(t, mocks["ports"].updates, 6, "should add port+protocol entry per resolved IP")
 }
 
-// --- expandPorts protocol translation ---
-
-func TestExpandPorts_ICMP(t *testing.T) {
-	got := expandPorts([]config.Port{{Port: 0, Protocol: config.ProtocolICMP}})
-	assert.Equal(t, []portProto{{Port: 0, Proto: protoICMP}}, got)
-}
-
-func TestExpandPorts_AllIncludesICMP(t *testing.T) {
-	got := expandPorts([]config.Port{{Port: 443, Protocol: config.ProtocolAll}})
-	assert.Equal(t, []portProto{
-		{Port: 0, Proto: protoICMP},
-		{Port: 443, Proto: protoTCP},
-		{Port: 443, Proto: protoUDP},
-	}, got)
-}
-
-func TestExpandPorts_MixedICMPAndTCP(t *testing.T) {
-	got := expandPorts([]config.Port{
-		{Port: 0, Protocol: config.ProtocolICMP},
-		{Port: 443, Protocol: config.ProtocolTCP},
-	})
-	assert.Equal(t, []portProto{
-		{Port: 0, Proto: protoICMP},
-		{Port: 443, Proto: protoTCP},
-	}, got)
-}
-
-func TestStripICMPForV6_NilInput(t *testing.T) {
-	filtered, dropped := stripICMPForV6(nil)
-	assert.Nil(t, filtered)
-	assert.False(t, dropped)
-}
-
-func TestStripICMPForV6_EmptyInput(t *testing.T) {
-	filtered, dropped := stripICMPForV6([]portProto{})
-	assert.Empty(t, filtered)
-	assert.False(t, dropped)
-}
-
 // --- UpdateAllowlistTC ICMP rules ---
 
 func TestUpdateAllowlistTC_ICMPRule_WritesICMPPortEntry(t *testing.T) {

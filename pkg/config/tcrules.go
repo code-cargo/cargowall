@@ -50,11 +50,10 @@ func tcRules(rules []ResolvedRule) []tcmaps.Rule {
 				continue
 			}
 			out = append(out, tcmaps.Rule{
-				Prefix:   netip.PrefixFrom(addr, ones),
-				Allow:    allow,
-				Ports:    ports,
-				Wildcard: len(ports) > 0 && (r.Value == "0.0.0.0/0" || r.Value == "::/0"),
-				Label:    r.Value,
+				Prefix: netip.PrefixFrom(addr, ones),
+				Allow:  allow,
+				Ports:  ports,
+				Label:  r.Value,
 			})
 		case RuleTypeHostname:
 			for _, ip := range r.IPs {

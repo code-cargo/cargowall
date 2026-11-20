@@ -63,11 +63,10 @@ type Rule struct {
 	// single address. IPv4 is held unmapped.
 	Prefix netip.Prefix
 	Allow  bool
-	// Ports is empty for a rule on all ports.
+	// Ports is empty for a rule on all ports. A port-scoped /0 is the
+	// any-destination wildcard: it writes port entries at the zero address
+	// rather than an LPM entry.
 	Ports []PortProto
-	// Wildcard marks a port-scoped 0.0.0.0/0 or ::/0 rule, which writes the
-	// any-destination port entries rather than an LPM entry.
-	Wildcard bool
 	// Label names the rule in Notes.
 	Label string
 }
@@ -143,7 +142,7 @@ func Compile(rules []Rule) *Maps {
 
 func (m *Maps) add(r Rule) {
 	addr := r.Prefix.Addr()
-	if r.Wildcard {
+	if r.Prefix.Bits() == 0 && len(r.Ports) > 0 {
 		zero := netip.IPv4Unspecified()
 		if addr.Is6() {
 			zero = netip.IPv6Unspecified()

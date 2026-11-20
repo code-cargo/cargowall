@@ -28,11 +28,7 @@ var (
 )
 
 func rule(prefix string, allow bool, ports ...PortProto) Rule {
-	p := netip.MustParsePrefix(prefix)
-	return Rule{
-		Prefix: p, Allow: allow, Ports: ports, Label: prefix,
-		Wildcard: len(ports) > 0 && p.Bits() == 0,
-	}
+	return Rule{Prefix: netip.MustParsePrefix(prefix), Allow: allow, Ports: ports, Label: prefix}
 }
 
 func addr(s string) netip.Addr { return netip.MustParseAddr(s) }
@@ -134,4 +130,48 @@ func TestLookup_HostAheadOfSubnet(t *testing.T) {
 	assert.Equal(t, LPM{Allow: true}, e)
 	_, ok = m.Lookup(addr("2001:db8::1"))
 	assert.False(t, ok, "families don't mix")
+}
+
+// StripICMP returns its input unchanged when it holds no ICMP, drops ICMP
+// from a mixed list, and reports a list of only ICMP as one to skip.
+func TestStripICMP(t *testing.T) {
+	filtered, skip := StripICMP(nil)
+	assert.Nil(t, filtered)
+	assert.False(t, skip)
+
+	filtered, skip = StripICMP([]PortProto{})
+	assert.Empty(t, filtered)
+	assert.False(t, skip)
+
+	icmp := PortProto{0, ProtoICMP}
+	in := []PortProto{icmp, tcp443[0]}
+	filtered, skip = StripICMP(in)
+	assert.Equal(t, tcp443, filtered)
+	assert.False(t, skip)
+	assert.Equal(t, []PortProto{icmp, tcp443[0]}, in, "the input is not modified")
+
+	filtered, skip = StripICMP([]PortProto{icmp})
+	assert.Empty(t, filtered)
+	assert.True(t, skip)
+}
+
+// The wildcard is a port-scoped /0, decided from the prefix: a /0 on all
+// ports is an ordinary LPM entry, and a port-scoped prefix wider than zero
+// bits never writes at the zero address.
+func TestCompile_WildcardIsPortScopedSlashZero(t *testing.T) {
+	m := Compile([]Rule{rule("0.0.0.0/0", true), rule("::/0", false)})
+	assert.Equal(t, map[netip.Prefix]LPM{
+		netip.MustParsePrefix("0.0.0.0/0"): {Allow: true},
+		netip.MustParsePrefix("::/0"):      {Allow: false},
+	}, m.Subnets)
+	assert.Empty(t, m.Ports)
+
+	m = Compile([]Rule{rule("128.0.0.0/1", true, udp53...)})
+	assert.Equal(t, map[PortKey]bool{{addr("128.0.0.0"), udp53[0]}: true}, m.Ports)
+	assert.False(t, m.Allows(addr("192.0.2.1"), udp53[0], false))
+
+	// ICMP on the v6 wildcard is kept: the wildcard path writes every port.
+	m = Compile([]Rule{rule("::/0", true, PortProto{0, ProtoICMP}, tcp443[0])})
+	assert.Len(t, m.Ports, 2)
+	assert.Empty(t, m.Notes)
 }

@@ -73,7 +73,7 @@ test-ci:
 	@printf "${GREEN}Running CI tests...${RESET}\n"
 	go run gotest.tools/gotestsum@latest --junitfile test-results.xml --format testdox -- ./...
 	@printf "${GREEN}Running BPF tests with sudo...${RESET}\n"
-	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/
+	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-bpf.xml --format testdox -- -count=1 ./bpf/ ./pkg/tc/ ./pkg/network/ ./pkg/firewall/
 	@printf "${GREEN}Running cmd's root-only tests with sudo...${RESET}\n"
 	sudo go run gotest.tools/gotestsum@latest --junitfile test-results-cmd-root.xml --format testdox -- -count=1 -run 'NewUpstreamReverseResolver|MarkDNSProxySocket|ConfigureOwnLookupResolver' ./cmd/
 

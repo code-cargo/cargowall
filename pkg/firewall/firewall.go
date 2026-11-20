@@ -22,12 +22,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/cilium/ebpf"
 
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/tcmaps"
 )
 
 // Firewall defines the interface for managing eBPF-based network filtering
@@ -89,105 +91,38 @@ type FirewallImpl struct {
 	unspecifiedWarned map[string]struct{}
 }
 
-// portProto carries a port number and its IANA protocol number for BPF map keys.
-type portProto struct {
-	Port  uint16
-	Proto uint8 // protoTCP=6, protoUDP=17, protoICMP=1
-}
+// portProto is one port entry's port and IANA protocol number.
+type portProto = tcmaps.PortProto
 
 const (
-	protoICMP uint8 = 1
-	protoTCP  uint8 = 6
-	protoUDP  uint8 = 17
+	protoICMP = tcmaps.ProtoICMP
+	protoTCP  = tcmaps.ProtoTCP
+	protoUDP  = tcmaps.ProtoUDP
 )
 
-// ipPortState accumulates every firewall contribution for a single host IP
-// (/32 or /128) across the AddIP and UpdateAllowlistTC write paths, so the
-// effective BPF LPM entry reflects the union of all rules that resolved to it
-// rather than only the most recent call.
-//
-// A shared CDN/edge IP is routinely added under several hostname rules with
-// different port scopes — e.g. an all-ports OCSP/CRL responder and a
-// port-specific content host. The LPM entry can express only "all ports"
-// (PortSpecific=0, governed by Action) or "consult map_ports" (PortSpecific=1);
-// it cannot say "these ports AND all ports". Tracking the contributors here lets
-// addIPv4Locked/addIPv6Locked recompute the single correct LPM value on every
-// call so an all-ports grant is not silently narrowed by a later port-specific
-// add, and a port-specific grant's entries are not deleted by a later all-ports
-// add (issue #71).
-//
-// Precedence when contributions conflict (inherent to the BPF model, which
-// can't express "allow all except port N"):
-//   - all-ports DENY wins over all-ports ALLOW: a host the policy denies
-//     outright must not be re-opened by an unrelated hostname sharing the IP.
-//   - an all-ports grant wins over a port-specific contribution of the opposite
-//     action — the per-port entry is written but inert under PortSpecific=0.
-//     This keeps issue #71's "don't block legitimately-allowed traffic"
-//     guarantee, at the cost of a port-specific deny being unenforceable on a
-//     shared all-ports-allowed IP. addIPv4Locked/addIPv6Locked log a Warn when
-//     this drops a rule's intent so it isn't silent.
-//
-// Both flags are sticky for the IP's lifetime (cleared only by a whole-IP
-// RemoveIP), matching the firewall's add-only model elsewhere (UpdateAllowlistTC
-// never removes; RemoveIP has no runtime callers). They are bools, not counts,
-// because DNS re-resolution re-issues the same AddIP on every TTL refresh — a
-// count would inflate without bound while a single RemoveIP clears the whole IP.
-type ipPortState struct {
-	allPortsAllow bool
-	allPortsDeny  bool
-	// ports is the union of every port-specific (port, proto) entry written to
-	// map_ports for this IP, retained so RemoveIP can delete the full set. Port
-	// entries that would be inert (added while an all-ports grant is already
-	// active) are neither written nor tracked here.
-	ports []portProto
+// ipPortState accumulates every contribution to one host entry (/32 or
+// /128), across UpdateAllowlistTC and AddIP: see tcmaps.Host for the
+// precedence. UpdateAllowlistTC installs the compile's accumulators, so a
+// later AddIP folds into the same state the rules produced.
+type ipPortState = tcmaps.Host
+
+func actionVal(allow bool) uint8 {
+	if allow {
+		return 1
+	}
+	return 0
 }
 
-// seedFromLPM initializes the sticky all-ports flags from an LPM entry that
-// already exists in BPF when this process first tracks the IP — e.g. one written
-// by an earlier UpdateAllowlistTC pass. Without this, a port-specific add
-// arriving before the all-ports hostname re-resolves would start from empty
-// state and flip an existing PortSpecific=0 grant back to PortSpecific=1,
-// re-introducing the narrowing bug.
-func (st *ipPortState) seedFromLPM(existing bpf.TcBpfLpmVal) {
-	if existing.PortSpecific != 0 {
-		return
+func lpmVal(v tcmaps.LPM) bpf.TcBpfLpmVal {
+	val := bpf.TcBpfLpmVal{Action: actionVal(v.Allow)}
+	if v.PortSpecific {
+		val.PortSpecific = 1
 	}
-	if existing.Action == 1 {
-		st.allPortsAllow = true
-	} else {
-		st.allPortsDeny = true
-	}
+	return val
 }
 
-// hasAllPorts reports whether any all-ports grant is active for the IP, in which
-// case a port-specific add would be inert (BPF ignores map_ports under
-// PortSpecific=0).
-func (st *ipPortState) hasAllPorts() bool {
-	return st.allPortsAllow || st.allPortsDeny
-}
-
-// recordAllPorts marks an all-ports grant of the given action.
-func (st *ipPortState) recordAllPorts(actionVal uint8) {
-	if actionVal == 1 {
-		st.allPortsAllow = true
-	} else {
-		st.allPortsDeny = true
-	}
-}
-
-// effectiveLPMVal computes the single LPM value representing all accumulated
-// contributors. callActionVal is used only for the port-specific case: BPF
-// ignores the LPM action when PortSpecific=1 (it decides per packet from
-// map_ports), so we carry the current call's action purely for a readable map.
-func (st *ipPortState) effectiveLPMVal(callActionVal uint8) bpf.TcBpfLpmVal {
-	switch {
-	case st.allPortsDeny:
-		return bpf.TcBpfLpmVal{Action: 0, PortSpecific: 0}
-	case st.allPortsAllow:
-		return bpf.TcBpfLpmVal{Action: 1, PortSpecific: 0}
-	default:
-		return bpf.TcBpfLpmVal{Action: callActionVal, PortSpecific: 1}
-	}
+func fromLPMVal(v bpf.TcBpfLpmVal) tcmaps.LPM {
+	return tcmaps.LPM{Allow: v.Action == 1, PortSpecific: v.PortSpecific != 0}
 }
 
 // actionName renders a BPF action byte for human-readable logs.
@@ -244,286 +179,116 @@ func (f *FirewallImpl) SetAuditMode(enabled bool) error {
 	return nil
 }
 
-// UpdateAllowlistTC updates the eBPF LPM trie and port maps for firewall rules.
-// NOTE: This is add-only — it does not remove stale entries from previous calls.
-// Callers should be aware that entries accumulate across invocations.
+// UpdateAllowlistTC writes the maps tcmaps.Compile builds from the resolved
+// rules, and installs the compile's host accumulators so a later AddIP folds
+// into them. It is add-only: keys a previous call wrote and this rule set
+// doesn't are left in place.
 func (f *FirewallImpl) UpdateAllowlistTC(configMgr *config.Manager) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// Process all resolved rules - both CIDR and resolved hostnames
-	for _, rule := range configMgr.GetResolvedRules() {
-		// Determine action value
-		var actionVal uint8 = 0
-		if rule.Action == config.ActionAllow {
-			actionVal = 1
+
+	maps := tcmaps.Compile(configMgr.TCRules())
+	f.logNotesLocked(maps.Notes)
+
+	for prefix, v := range maps.Subnets {
+		if err := f.writeLPM(prefix, v); err != nil {
+			return err
 		}
-
-		// Process based on rule type
-		switch rule.Type {
-		case config.RuleTypeCIDR:
-			if rule.IPNet == nil {
-				continue // Skip invalid CIDR rules
-			}
-
-			ones, _ := rule.IPNet.Mask.Size()
-
-			// Expand ports with protocol info for BPF maps
-			portValues := expandPorts(rule.Ports)
-
-			// Check if this is an IPv6 CIDR
-			if ip4 := rule.IPNet.IP.To4(); ip4 != nil {
-				// IPv4 CIDR
-
-				// Special handling for 0.0.0.0/0 with specific ports
-				// Don't add to LPM trie, only to port map
-				if rule.Value == "0.0.0.0/0" && len(portValues) > 0 {
-					for _, pp := range portValues {
-						portKey := bpf.TcBpfPortKey{
-							Ip:    0,
-							Port:  pp.Port,
-							Proto: pp.Proto,
-						}
-						portVal := bpf.TcBpfPortVal{
-							Action: actionVal,
-						}
-						if err := f.portsMap.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-							return fmt.Errorf("update port map for wildcard port %d proto %d: %w", pp.Port, pp.Proto, err)
-						}
-					}
-					continue
-				}
-
-				if err := f.addCIDRv4(ip4, uint32(ones), actionVal, portValues, rule.Value); err != nil {
-					return err
-				}
-			} else {
-				// IPv6 CIDR
-				ip6 := rule.IPNet.IP.To16()
-				if ip6 == nil {
-					continue
-				}
-
-				// Special handling for ::/0 with specific ports
-				if rule.Value == "::/0" && len(portValues) > 0 {
-					for _, pp := range portValues {
-						portKey := bpf.TcBpfPortKeyV6{
-							Port:  pp.Port,
-							Proto: pp.Proto,
-						}
-						portVal := bpf.TcBpfPortVal{
-							Action: actionVal,
-						}
-						if err := f.portsV6Map.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-							return fmt.Errorf("update v6 port map for wildcard port %d proto %d: %w", pp.Port, pp.Proto, err)
-						}
-					}
-					continue
-				}
-
-				if err := f.addCIDRv6(ip6, uint32(ones), actionVal, portValues, rule.Value); err != nil {
-					return err
-				}
-			}
-
-		case config.RuleTypeHostname:
-			// Resolved hostnames are added as /32 or /128 entries
-			hostPortValues := expandPorts(rule.Ports)
-			for _, ip := range rule.IPs {
-				if ip4 := ip.To4(); ip4 != nil {
-					if err := f.addCIDRv4(ip4, 32, actionVal, hostPortValues, rule.Value); err != nil {
-						return err
-					}
-				} else if ip6 := ip.To16(); ip6 != nil {
-					if err := f.addCIDRv6(ip6, 128, actionVal, hostPortValues, rule.Value); err != nil {
-						return err
-					}
-				}
+	}
+	for addr, h := range maps.Hosts {
+		if h.Installed {
+			if err := f.writeLPM(netip.PrefixFrom(addr, addr.BitLen()), h.LPM); err != nil {
+				return err
 			}
 		}
 	}
-
-	return nil
-}
-
-// addCIDRv4 adds an IPv4 CIDR to the BPF LPM trie and optional port maps.
-// Must be called with f.mu held.
-func (f *FirewallImpl) addCIDRv4(ip4 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
-	// Host routes (/32) share the per-IP accumulator with AddIP so a shared IP
-	// contributed by both a static rule and a DNS resolution keeps the union of
-	// all its rules instead of last-write-wins narrowing (issue #71). Genuine
-	// subnets fall through to a direct LPM write — their port entries are keyed
-	// by the network address, a separate pre-existing concern.
-	if prefixLen == 32 {
-		_, err := f.addIPv4Locked(ip4, ip4.String(), actionVal, ports)
-		return err
-	}
-
-	// NativeEndian so the uint32 bytes in the map key are in network byte order,
-	// which is required for LPM trie prefix matching.
-	ipUint32 := binary.NativeEndian.Uint32(ip4)
-
-	// A port entry at the zero network address is the any-destination
-	// wildcard, so a port-scoped subnet at 0.0.0.0 (any prefix but /0, which
-	// UpdateAllowlistTC writes as the real wildcard) is refused here as a
-	// backstop for the auto-allows that bypass the load-time drop.
-	if ipUint32 == 0 && len(ports) > 0 && f.refuseUnspecifiedLocked(ip4, label) {
-		return nil
-	}
-
-	key := bpf.TcBpfLpmKey{
-		Prefixlen: prefixLen,
-		Ip:        ipUint32,
-	}
-	val := bpf.TcBpfLpmVal{
-		Action:       actionVal,
-		PortSpecific: 0,
-	}
-
-	if len(ports) > 0 {
-		val.PortSpecific = 1
-		for _, pp := range ports {
-			portKey := bpf.TcBpfPortKey{
-				Ip:    ipUint32,
-				Port:  pp.Port,
-				Proto: pp.Proto,
-			}
-			portVal := bpf.TcBpfPortVal{
-				Action: actionVal,
-			}
-			if err := f.portsMap.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-				return fmt.Errorf("update port map for %s port %d proto %d: %w", label, pp.Port, pp.Proto, err)
-			}
+	for k, allow := range maps.Ports {
+		if err := f.writePort(k, allow); err != nil {
+			return err
 		}
 	}
 
-	if err := f.cidrsMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update LPM trie for %s: %w", label, err)
+	f.ipPorts = make(map[string]*ipPortState, len(maps.Hosts))
+	for addr, h := range maps.Hosts {
+		f.ipPorts[addr.String()] = h
 	}
 	return nil
 }
 
-// addCIDRv6 adds an IPv6 CIDR to the BPF v6 LPM trie and optional port maps.
-// Must be called with f.mu held.
-func (f *FirewallImpl) addCIDRv6(ip6 net.IP, prefixLen uint32, actionVal uint8, ports []portProto, label string) error {
-	// Host routes (/128) share the per-IP accumulator with AddIP — see addCIDRv4.
-	// addIPv6Locked applies prepV6Ports itself, so pass the unfiltered ports.
-	if prefixLen == 128 {
-		_, err := f.addIPv6Locked(ip6, ip6.String(), actionVal, ports)
-		return err
-	}
-
-	ports, skip := f.prepV6Ports(ports, "label", label)
-	if skip {
-		return nil
-	}
-
-	if isZeroV6(ip6) && len(ports) > 0 && f.refuseUnspecifiedLocked(ip6, label) {
-		return nil
-	}
-
-	var key bpf.TcBpfLpmKeyV6
-	key.Prefixlen = prefixLen
-	copy(key.Ip[:], ip6)
-
-	val := bpf.TcBpfLpmVal{
-		Action:       actionVal,
-		PortSpecific: 0,
-	}
-
-	if len(ports) > 0 {
-		val.PortSpecific = 1
-		for _, pp := range ports {
-			var portKey bpf.TcBpfPortKeyV6
-			copy(portKey.Ip[:], ip6)
-			portKey.Port = pp.Port
-			portKey.Proto = pp.Proto
-			portVal := bpf.TcBpfPortVal{
-				Action: actionVal,
-			}
-			if err := f.portsV6Map.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
-				return fmt.Errorf("update v6 port map for %s port %d proto %d: %w", label, pp.Port, pp.Proto, err)
-			}
+func (f *FirewallImpl) writeLPM(prefix netip.Prefix, v tcmaps.LPM) error {
+	val := lpmVal(v)
+	if prefix.Addr().Is4() {
+		key := bpf.TcBpfLpmKey{Prefixlen: uint32(prefix.Bits()), Ip: addrU32(prefix.Addr())}
+		if err := f.cidrsMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update LPM trie for %s: %w", prefix, err)
 		}
+		return nil
 	}
-
+	key := bpf.TcBpfLpmKeyV6{Prefixlen: uint32(prefix.Bits()), Ip: prefix.Addr().As16()}
 	if err := f.cidrsV6Map.Update(&key, &val, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update v6 LPM trie for %s: %w", label, err)
+		return fmt.Errorf("update v6 LPM trie for %s: %w", prefix, err)
 	}
 	return nil
 }
 
-// expandPorts converts config.Port entries into portProto values for BPF map keys.
-// ProtocolAll expands to ICMP, TCP, and UDP entries so that the BPF lookup
-// (which always uses the packet's exact protocol) matches correctly.
-func expandPorts(ports []config.Port) []portProto {
-	if len(ports) == 0 {
+func (f *FirewallImpl) writePort(k tcmaps.PortKey, allow bool) error {
+	val := bpf.TcBpfPortVal{Action: actionVal(allow)}
+	if k.Addr.Is4() {
+		key := bpf.TcBpfPortKey{Ip: addrU32(k.Addr), Port: k.Port, Proto: k.Proto}
+		if err := f.portsMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update port map for %s port %d proto %d: %w", k.Addr, k.Port, k.Proto, err)
+		}
 		return nil
 	}
-	result := make([]portProto, 0, len(ports)*3)
-	for _, p := range ports {
-		switch p.Protocol {
-		case config.ProtocolTCP:
-			result = append(result, portProto{Port: p.Port, Proto: protoTCP})
-		case config.ProtocolUDP:
-			result = append(result, portProto{Port: p.Port, Proto: protoUDP})
-		case config.ProtocolICMP:
-			result = append(result, portProto{Port: 0, Proto: protoICMP})
-		case config.ProtocolAll:
-			result = append(result, portProto{Port: 0, Proto: protoICMP})
-			result = append(result, portProto{Port: p.Port, Proto: protoTCP})
-			result = append(result, portProto{Port: p.Port, Proto: protoUDP})
-		default:
-			slog.Warn("Unknown protocol in port rule, skipping", "port", p.Port, "protocol", p.Protocol)
-		}
+	key := bpf.TcBpfPortKeyV6{Ip: k.Addr.As16(), Port: k.Port, Proto: k.Proto}
+	if err := f.portsV6Map.Update(&key, &val, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update v6 port map for %s port %d proto %d: %w", k.Addr, k.Port, k.Proto, err)
 	}
-	return result
+	return nil
 }
 
-// stripICMPForV6 removes ICMP entries from a port list destined for the v6 BPF
-// maps. The v6 BPF data path (bpf/tcbpf.c, IPPROTO_ICMPV6 early-return)
-// unconditionally allows ICMPv6 before consulting the port map for NDP, so a
-// v6 port-map entry with proto=ICMP is dead and leaving PortSpecific=1 on the
-// LPM entry silently blackholes TCP/UDP. Returns the input slice unchanged in
-// the common case where no ICMP entries are present; otherwise allocates a
-// new slice (rule-load is not a hot path).
-func stripICMPForV6(ports []portProto) ([]portProto, bool) {
-	hasICMP := false
-	for _, pp := range ports {
-		if pp.Proto == protoICMP {
-			hasICMP = true
-			break
-		}
-	}
-	if !hasICMP {
-		return ports, false
-	}
-	filtered := make([]portProto, 0, len(ports)-1)
-	for _, pp := range ports {
-		if pp.Proto == protoICMP {
-			continue
-		}
-		filtered = append(filtered, pp)
-	}
-	return filtered, true
+// addrU32 is an IPv4 address as the maps key it: its bytes in network order,
+// read natively, which LPM prefix matching requires.
+func addrU32(a netip.Addr) uint32 {
+	b := a.As4()
+	return binary.NativeEndian.Uint32(b[:])
 }
 
-// prepV6Ports applies stripICMPForV6, logs when entries are dropped, and
-// reports whether the caller should skip the v6 write entirely (ICMP-only
-// rule — ICMPv6 is already unconditionally allowed by BPF, so writing a
-// PortSpecific=0 LPM entry would silently broaden to allow-all TCP/UDP and
-// PortSpecific=1 with no port entries would blackhole TCP/UDP).
+// logNotesLocked logs the contributions the compile dropped, as the per-rule
+// writers did. Must be called with f.mu held.
+func (f *FirewallImpl) logNotesLocked(notes []tcmaps.Note) {
+	for _, n := range notes {
+		switch n.Kind {
+		case tcmaps.NoteUnspecified:
+			f.warnUnspecifiedLocked(n.Label)
+		case tcmaps.NoteV6ICMPOnly:
+			key := "label"
+			if n.Host {
+				key = "ip"
+			}
+			f.logger.Warn("Skipping v6 rule: ICMP-only and ICMPv6 is unconditionally allowed", key, n.Label)
+		case tcmaps.NoteInertPorts:
+			f.logger.Warn("Port-specific rule has no effect: IP already has an all-ports grant",
+				"ip", n.Label,
+				"all_ports_action", actionName(actionVal(n.HostAllow)),
+				"rule_action", actionName(actionVal(n.Allow)),
+				"ignored_ports", n.Ports)
+		}
+	}
+}
+
+// prepV6Ports strips ICMP from a v6 host's ports (tcmaps.StripICMP) and logs
+// what it dropped. skip is an ICMP-only contribution, which installs nothing:
+// the v6 program passes ICMPv6 before the maps, so its intent is already met.
 func (f *FirewallImpl) prepV6Ports(ports []portProto, labelKey, labelVal string) ([]portProto, bool) {
-	filtered, dropped := stripICMPForV6(ports)
-	skip := dropped && len(filtered) == 0
+	filtered, skip := tcmaps.StripICMP(ports)
 	switch {
 	case skip:
-		// Whole rule is ICMP-only on v6: user's explicit intent is being satisfied
-		// only by the unconditional ICMPv6 allow in BPF. Worth surfacing so an
-		// operator debugging "why does v6 ICMP still work with cargowall?" or
-		// "why doesn't my ICMP rule restrict anything?" sees why.
+		// Worth surfacing, so an operator asking why v6 ICMP still works, or
+		// why an ICMP rule restricts nothing, sees why.
 		f.logger.Warn("Skipping v6 rule: ICMP-only and ICMPv6 is unconditionally allowed", labelKey, labelVal)
-	case dropped:
-		// ICMP mixed with TCP/UDP — common under ProtocolAll expansion; noisy.
+	case len(filtered) < len(ports):
+		// ICMP mixed with TCP/UDP: common under ProtocolAll expansion, so noisy.
 		f.logger.Debug("Dropping ICMP port(s) from v6 rule; ICMPv6 is always allowed", labelKey, labelVal)
 	}
 	return filtered, skip
@@ -537,167 +302,80 @@ func (f *FirewallImpl) prepV6Ports(ports []portProto, labelKey, labelVal string)
 // all-ports grant, returns (false, nil). See the Firewall interface for the
 // accumulation and all-ports-stickiness semantics.
 func (f *FirewallImpl) AddIP(ip net.IP, action config.Action, ports []config.Port) (bool, error) {
-	pp := expandPorts(ports)
-	var actionVal uint8 = 0
-	if action == config.ActionAllow {
-		actionVal = 1
-	}
+	pp := config.TCPorts(ports)
+	allow := action == config.ActionAllow
 	if ip4 := ip.To4(); ip4 != nil {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		return f.addIPv4Locked(ip4, ip.String(), actionVal, pp)
+		return f.addIPv4Locked(ip4, ip.String(), allow, pp)
 	}
 	if ip6 := ip.To16(); ip6 != nil {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		return f.addIPv6Locked(ip6, ip.String(), actionVal, pp)
+		return f.addIPv6Locked(ip6, ip.String(), allow, pp)
 	}
 	return false, fmt.Errorf("invalid IP: %s", ip.String())
 }
 
-// addIPv4Locked is the shared accumulator core for IPv4 /32 host entries, used
-// by both AddIP and UpdateAllowlistTC (via addCIDRv4). Must be called with
-// f.mu held.
-func (f *FirewallImpl) addIPv4Locked(ip4 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
+// existingLocked is the LPM's answer for a host before an add: its own entry
+// if this firewall installed one, else the map's longest covering entry.
+// Must be called with f.mu held.
+func (f *FirewallImpl) existingLocked(st *ipPortState, lookup func(*bpf.TcBpfLpmVal) error) (tcmaps.LPM, bool) {
+	if st != nil && st.Installed {
+		return st.LPM, true
+	}
+	var v bpf.TcBpfLpmVal
+	if lookup(&v) != nil {
+		return tcmaps.LPM{}, false
+	}
+	return fromLPMVal(v), true
+}
+
+// addIPv4Locked folds one contribution into an IPv4 host entry through its
+// tcmaps.Host, the accumulator UpdateAllowlistTC installs. Must be called
+// with f.mu held.
+func (f *FirewallImpl) addIPv4Locked(ip4 net.IP, ipStr string, allow bool, ports []portProto) (bool, error) {
 	if f.refuseUnspecifiedLocked(ip4, ipStr) {
 		return false, nil
 	}
 	ipUint32 := binary.NativeEndian.Uint32(ip4)
+	key := bpf.TcBpfLpmKey{Prefixlen: 32, Ip: ipUint32}
 
-	key := bpf.TcBpfLpmKey{
-		Prefixlen: 32,
-		Ip:        ipUint32,
-	}
-
-	var existingVal bpf.TcBpfLpmVal
-	ipExists := f.cidrsMap.Lookup(&key, &existingVal) == nil
-
-	// Fetch or create this IP's accumulator. On first touch, seed the sticky
-	// all-ports flags from any pre-existing LPM entry so a PortSpecific=0 grant
-	// isn't flipped back to PortSpecific=1 by this add.
 	st := f.ipPorts[ipStr]
+	existing, exists := f.existingLocked(st, func(v *bpf.TcBpfLpmVal) error { return f.cidrsMap.Lookup(&key, v) })
 	if st == nil {
-		st = &ipPortState{}
-		if ipExists {
-			st.seedFromLPM(existingVal)
-		}
+		st = tcmaps.NewHost(existing, exists)
 		f.ipPorts[ipStr] = st
 	}
-
-	portsChanged, err := f.writePortsV4(ipUint32, ipStr, actionVal, ports, st)
-	if err != nil {
-		return false, err
-	}
-
-	val := st.effectiveLPMVal(actionVal)
-	if ipExists && existingVal.Action == val.Action && existingVal.PortSpecific == val.PortSpecific {
-		return portsChanged, nil
-	}
-
-	if err := f.cidrsMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
-		return false, fmt.Errorf("failed to add IP to LPM trie: %w", err)
-	}
-
-	return true, nil
-}
-
-// writePortsV4 folds one contribution's ports into st and writes the effective
-// per-port entries to map_ports, returning whether any were new/different.
-//
-// An empty port set marks an all-ports grant. A port-specific set whose entries
-// would be inert (an all-ports grant is already active, so BPF ignores
-// map_ports under PortSpecific=0) is neither written nor tracked — writing it
-// would be a wasted syscall, a permanent inert slot in the bounded map, and a
-// spurious `changed=true`. When such a contribution's action conflicts with the
-// active grant, the dropped intent is logged so it isn't silent (issue #71).
-//
-// Otherwise the per-port entries are written unconditionally, before the LPM
-// no-op check: a shared IP added under two rules with disjoint port sets must
-// still get the second rule's entries even when the LPM value is unchanged, or
-// the retry on the new port is blackholed. Map writes are idempotent.
-func (f *FirewallImpl) writePortsV4(ipUint32 uint32, ipStr string, actionVal uint8, ports []portProto, st *ipPortState) (bool, error) {
-	if len(ports) == 0 {
-		st.recordAllPorts(actionVal)
-		return false, nil
-	}
-	if st.hasAllPorts() {
-		f.warnInertPorts(ipStr, actionVal, ports, st)
-		return false, nil
+	w := st.Add(allow, ports, existing, exists)
+	if w.Inert {
+		f.warnInertPorts(ipStr, allow, ports, st)
 	}
 
 	var portsChanged bool
-	for _, pp := range ports {
-		portKey := bpf.TcBpfPortKey{
-			Ip:    ipUint32,
-			Port:  pp.Port,
-			Proto: pp.Proto,
-		}
-		var existingPortVal bpf.TcBpfPortVal
-		if errLookup := f.portsMap.Lookup(&portKey, &existingPortVal); errLookup != nil || existingPortVal.Action != actionVal {
-			portsChanged = true
-		}
-		portVal := bpf.TcBpfPortVal{
-			Action: actionVal,
-		}
-		if err := f.portsMap.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
+	for _, pp := range w.Ports {
+		portKey := bpf.TcBpfPortKey{Ip: ipUint32, Port: pp.Port, Proto: pp.Proto}
+		changed, err := f.updatePort(f.portsMap, &portKey, allow)
+		if err != nil {
 			return false, fmt.Errorf("failed to add port %d proto %d to map: %w", pp.Port, pp.Proto, err)
 		}
+		portsChanged = portsChanged || changed
 	}
-	st.ports = mergePorts(st.ports, ports)
-	return portsChanged, nil
+
+	if !w.WriteLPM {
+		return portsChanged, nil
+	}
+	val := lpmVal(w.LPM)
+	if err := f.cidrsMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
+		return false, fmt.Errorf("failed to add IP to LPM trie: %w", err)
+	}
+	st.LPM, st.Installed = w.LPM, true
+	return true, nil
 }
 
-// warnInertPorts logs when a port-specific contribution is dropped because an
-// all-ports grant already governs the IP and its action conflicts with that
-// grant (the BPF model can't express "allow all except port N"). A same-action
-// contribution (e.g. a port-specific allow under an all-ports allow) is a
-// harmless no-op and stays silent.
-func (f *FirewallImpl) warnInertPorts(ipStr string, actionVal uint8, ports []portProto, st *ipPortState) {
-	effective := uint8(1)
-	if st.allPortsDeny {
-		effective = 0
-	}
-	if effective == actionVal {
-		return
-	}
-	f.logger.Warn("Port-specific rule has no effect: IP already has an all-ports grant",
-		"ip", ipStr,
-		"all_ports_action", actionName(effective),
-		"rule_action", actionName(actionVal),
-		"ignored_ports", ports)
-}
-
-// mergePorts returns the union of two []portProto slices (set semantics),
-// preserving existing-first ordering and appending only entries not already
-// present. Used by writePortsV4/writePortsV6 to track the cumulative port set
-// written for an IP across multiple AddIP calls.
-//
-// Always returns a freshly-allocated slice — never aliases the inputs — so a
-// future caller that retains either input can't accidentally observe mutations
-// when the result grows.
-func mergePorts(existing, additions []portProto) []portProto {
-	out := make([]portProto, 0, len(existing)+len(additions))
-	out = append(out, existing...)
-	if len(existing) == 0 {
-		return append(out, additions...)
-	}
-	seen := make(map[portProto]bool, len(existing))
-	for _, pp := range existing {
-		seen[pp] = true
-	}
-	for _, pp := range additions {
-		if !seen[pp] {
-			out = append(out, pp)
-			seen[pp] = true
-		}
-	}
-	return out
-}
-
-// addIPv6Locked is the shared accumulator core for IPv6 /128 host entries, used
-// by both AddIP and UpdateAllowlistTC (via addCIDRv6). Must be called with
-// f.mu held.
-func (f *FirewallImpl) addIPv6Locked(ip6 net.IP, ipStr string, actionVal uint8, ports []portProto) (bool, error) {
+// addIPv6Locked is the IPv6 twin of addIPv4Locked. Must be called with f.mu
+// held.
+func (f *FirewallImpl) addIPv6Locked(ip6 net.IP, ipStr string, allow bool, ports []portProto) (bool, error) {
 	if f.refuseUnspecifiedLocked(ip6, ipStr) {
 		return false, nil
 	}
@@ -705,72 +383,62 @@ func (f *FirewallImpl) addIPv6Locked(ip6 net.IP, ipStr string, actionVal uint8, 
 	if skip {
 		return false, nil
 	}
+	key := bpf.TcBpfLpmKeyV6{Prefixlen: 128, Ip: [16]byte(ip6.To16())}
 
-	var key bpf.TcBpfLpmKeyV6
-	key.Prefixlen = 128
-	copy(key.Ip[:], ip6)
-
-	var existingVal bpf.TcBpfLpmVal
-	ipExists := f.cidrsV6Map.Lookup(&key, &existingVal) == nil
-
-	// See addIPv4Locked for the accumulator/seeding rationale.
 	st := f.ipPorts[ipStr]
+	existing, exists := f.existingLocked(st, func(v *bpf.TcBpfLpmVal) error { return f.cidrsV6Map.Lookup(&key, v) })
 	if st == nil {
-		st = &ipPortState{}
-		if ipExists {
-			st.seedFromLPM(existingVal)
-		}
+		st = tcmaps.NewHost(existing, exists)
 		f.ipPorts[ipStr] = st
 	}
-
-	portsChanged, err := f.writePortsV6(ip6, ipStr, actionVal, ports, st)
-	if err != nil {
-		return false, err
-	}
-
-	val := st.effectiveLPMVal(actionVal)
-	if ipExists && existingVal.Action == val.Action && existingVal.PortSpecific == val.PortSpecific {
-		return portsChanged, nil
-	}
-
-	if err := f.cidrsV6Map.Update(&key, &val, ebpf.UpdateAny); err != nil {
-		return false, fmt.Errorf("failed to add IPv6 to LPM trie: %w", err)
-	}
-
-	return true, nil
-}
-
-// writePortsV6 is the IPv6 twin of writePortsV4 — see it for the inert-port
-// skip, conflict warning, and disjoint-port rationale.
-func (f *FirewallImpl) writePortsV6(ip6 net.IP, ipStr string, actionVal uint8, ports []portProto, st *ipPortState) (bool, error) {
-	if len(ports) == 0 {
-		st.recordAllPorts(actionVal)
-		return false, nil
-	}
-	if st.hasAllPorts() {
-		f.warnInertPorts(ipStr, actionVal, ports, st)
-		return false, nil
+	w := st.Add(allow, ports, existing, exists)
+	if w.Inert {
+		f.warnInertPorts(ipStr, allow, ports, st)
 	}
 
 	var portsChanged bool
-	for _, pp := range ports {
-		var portKey bpf.TcBpfPortKeyV6
-		copy(portKey.Ip[:], ip6)
-		portKey.Port = pp.Port
-		portKey.Proto = pp.Proto
-		var existingPortVal bpf.TcBpfPortVal
-		if errLookup := f.portsV6Map.Lookup(&portKey, &existingPortVal); errLookup != nil || existingPortVal.Action != actionVal {
-			portsChanged = true
-		}
-		portVal := bpf.TcBpfPortVal{
-			Action: actionVal,
-		}
-		if err := f.portsV6Map.Update(&portKey, &portVal, ebpf.UpdateAny); err != nil {
+	for _, pp := range w.Ports {
+		portKey := bpf.TcBpfPortKeyV6{Ip: key.Ip, Port: pp.Port, Proto: pp.Proto}
+		changed, err := f.updatePort(f.portsV6Map, &portKey, allow)
+		if err != nil {
 			return false, fmt.Errorf("failed to add v6 port %d proto %d to map: %w", pp.Port, pp.Proto, err)
 		}
+		portsChanged = portsChanged || changed
 	}
-	st.ports = mergePorts(st.ports, ports)
-	return portsChanged, nil
+
+	if !w.WriteLPM {
+		return portsChanged, nil
+	}
+	val := lpmVal(w.LPM)
+	if err := f.cidrsV6Map.Update(&key, &val, ebpf.UpdateAny); err != nil {
+		return false, fmt.Errorf("failed to add IPv6 to LPM trie: %w", err)
+	}
+	st.LPM, st.Installed = w.LPM, true
+	return true, nil
+}
+
+// updatePort writes one port entry, reporting whether it was new or
+// different. The entry is written unconditionally: a shared IP added under
+// two rules with disjoint port sets must get the second rule's entries even
+// when its LPM entry is unchanged.
+func (f *FirewallImpl) updatePort(m mapOps, key any, allow bool) (bool, error) {
+	var existing bpf.TcBpfPortVal
+	changed := m.Lookup(key, &existing) != nil || existing.Action != actionVal(allow)
+	if err := m.Update(key, &bpf.TcBpfPortVal{Action: actionVal(allow)}, ebpf.UpdateAny); err != nil {
+		return false, err
+	}
+	return changed, nil
+}
+
+// warnInertPorts logs a port-specific contribution dropped because an
+// all-ports grant of the opposite action already governs the IP (the BPF
+// model can't express "allow all except port N").
+func (f *FirewallImpl) warnInertPorts(ipStr string, allow bool, ports []portProto, st *ipPortState) {
+	f.logger.Warn("Port-specific rule has no effect: IP already has an all-ports grant",
+		"ip", ipStr,
+		"all_ports_action", actionName(actionVal(!st.AllPortsDeny)),
+		"rule_action", actionName(actionVal(allow)),
+		"ignored_ports", ports)
 }
 
 // RemoveIP removes a single IP from the BPF maps
@@ -809,7 +477,7 @@ func (f *FirewallImpl) removeIPv4(ip4 net.IP, origIP net.IP) error {
 
 	ipStr := origIP.String()
 	if st, exists := f.ipPorts[ipStr]; exists {
-		for _, pp := range st.ports {
+		for _, pp := range st.Ports {
 			portKey := bpf.TcBpfPortKey{
 				Ip:    ipUint32,
 				Port:  pp.Port,
@@ -851,7 +519,7 @@ func (f *FirewallImpl) removeIPv6(ip6 net.IP, origIP net.IP) error {
 
 	ipStr := origIP.String()
 	if st, exists := f.ipPorts[ipStr]; exists {
-		for _, pp := range st.ports {
+		for _, pp := range st.Ports {
 			var portKey bpf.TcBpfPortKeyV6
 			copy(portKey.Ip[:], ip6)
 			portKey.Port = pp.Port

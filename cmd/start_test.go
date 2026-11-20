@@ -160,7 +160,7 @@ func TestLoadCIConfig_ApiFailureModes(t *testing.T) {
 			}
 
 			cm := config.NewConfigManager()
-			loaded := loadCIConfig(context.Background(), cmd, cm, nil, "", quietLogger())
+			loaded := loadCIConfig(context.Background(), cmd, cm, nil, quietLogger())
 
 			assert.Equal(t, tc.wantLoaded, loaded)
 			assert.Equal(t, tc.wantAuditMode, cm.IsAuditMode(), "posture lives on the config manager")
@@ -237,7 +237,7 @@ func TestLoadCIConfig_LockdownSkipsLocalConfig(t *testing.T) {
 				FailureFile:    filepath.Join(t.TempDir(), "cargowall-failed"),
 			}
 			cm := config.NewConfigManager()
-			loadCIConfig(context.Background(), cmd, cm, nil, "", quietLogger())
+			loadCIConfig(context.Background(), cmd, cm, nil, quietLogger())
 
 			assert.Equal(t, tc.wantAction, cm.GetDefaultAction())
 		})
@@ -264,7 +264,7 @@ func TestLoadCIConfig_CancelledContextSkipsPostureHandling(t *testing.T) {
 		FailureFile:    failurePath,
 	}
 	cm := config.NewConfigManager()
-	loaded := loadCIConfig(ctx, cmd, cm, nil, "", quietLogger())
+	loaded := loadCIConfig(ctx, cmd, cm, nil, quietLogger())
 
 	assert.False(t, loaded)
 	assert.False(t, cmd.policyLockdown, "cancellation must not enter lockdown")
@@ -315,7 +315,7 @@ func TestLoadCIConfig_FailureModesSyncAuditLogger(t *testing.T) {
 			// Mirror StartCargoWall: the CLI flag seeds the manager.
 			cm := config.NewConfigManager()
 			cm.SetAuditMode(tc.initialAudit)
-			loadCIConfig(context.Background(), cmd, cm, auditLogger, "", quietLogger())
+			loadCIConfig(context.Background(), cmd, cm, auditLogger, quietLogger())
 
 			assert.Equal(t, tc.wantAuditMode, cm.IsAuditMode())
 			assert.Equal(t, tc.wantAuditMode, auditLogger.IsAuditMode(), "audit logger must be re-synced with the effective posture")
@@ -1140,13 +1140,15 @@ func TestLoadCIConfig_LockdownBootstrapsWithHostnamelessApiUrl(t *testing.T) {
 		DNSUpstream:    "8.8.8.8:53",
 	}
 	cm := config.NewConfigManager()
-	loadCIConfig(context.Background(), cmd, cm, nil, "", quietLogger())
+	_, _, _, err := loadStartupPolicy(context.Background(), cmd, nil, cm, nil, "", quietLogger())
+	require.NoError(t, err)
 
 	require.True(t, cmd.policyLockdown, "an unsupported scheme is a transport failure")
 	assert.Equal(t, config.ActionDeny, cm.GetDefaultAction())
-	// EnsureDNSAllowed runs at the end of loadCIConfig; it no-ops on a nil
-	// config, so a non-empty rule set proves the bootstrap happened.
-	assert.NotEmpty(t, cm.GetResolvedRules(), "lockdown must still carry the DNS/infra allows it advertises")
+	// The DNS allows no-op on a nil config, so their presence proves the
+	// bootstrap happened.
+	assert.Equal(t, config.AutoAddedTypeDNS, cm.GetAutoAllowedType("8.8.8.8", 53, config.ProtocolUDP, ""),
+		"lockdown must still carry the DNS/infra allows it advertises")
 }
 
 // The pid stamped into a sentinel identifies its run exactly — a leftover

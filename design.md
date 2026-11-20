@@ -338,14 +338,19 @@ sequenceDiagram
 
 ### Firewall Manager (`pkg/firewall`)
 - Manages 8 eBPF maps: `map_cidrs`, `map_cidrs_v6`, `map_ports`, `map_ports_v6`, `map_default_action`, `map_audit_mode`, `map_events`, `map_sock_pid`
-- Separate IPv4/IPv6 methods (`addCIDRv4`, `addCIDRv6`) with appropriate key types
+- `UpdateAllowlistTC(configMgr)` — writes the maps `tcmaps.Compile` builds from the resolved rules (IPv4 and IPv6 key types), add-only
 - `SetDefaultAction(action)` — sets `map_default_action[0]` to 0 (deny) or 1 (allow)
 - `SetAuditMode(enabled)` — sets `map_audit_mode[0]` to 0 (enforce) or 1 (audit)
 - `AddIP(ip, action, ports)` — adds /32 or /128 entry with duplicate detection; returns whether entry was added
 - `RemoveIP(ip)` — removes LPM entry and all associated port map entries
-- Wildcard CIDR handling: `0.0.0.0/0` and `::/0` with specific ports add only port map entries (no LPM entry)
-- Tracks IP-to-port associations (`ipPorts` map) for accurate cleanup on removal
+- Wildcard CIDR handling (in the compile): a port-scoped `0.0.0.0/0` or `::/0` adds only port map entries at the zero address (no LPM entry)
+- Tracks each host's accumulated state (`ipPorts`, a `tcmaps.Host` per address): installed by `UpdateAllowlistTC`, folded by `AddIP`, used for cleanup on removal
 - Thread-safe with `sync.RWMutex`
+
+### TC Map Compile (`pkg/tcmaps`)
+- `Compile(rules)` — the LPM, host and port entries a rule set writes, in order: longest match decides, subnet port entries keyed by the network address, host accumulation (`Host`) with first-touch folding of a covering all-ports entry, ICMP stripped from IPv6 rules
+- `Maps.Allows(addr, port, defaultAllow)` — the verdict `tc_egress` gives; the infrastructure auto-allows (`pkg/config` `ensureAllowed`) decide from it
+- Checked against the program by `TestTCMapsMatchKernel` (root, `make test-ci`)
 
 ### DNS Proxy Server (`pkg/dns`)
 - Primary listen address `127.0.0.1:53`, with additional addresses (e.g., Docker bridge IP) via `AddListenAddr()`

@@ -280,7 +280,7 @@ func TestAddIP_SharedIP_DifferentPorts_StillWritesPortEntries(t *testing.T) {
 
 	// ipPorts must accumulate (set semantics) so RemoveIP later cleans up
 	// every (port, proto) ever written for this IP.
-	assert.Equal(t, []portProto{{Port: 8080, Proto: 6}}, fw.ipPorts[ip.String()].ports)
+	assert.Equal(t, []portProto{{Port: 8080, Proto: 6}}, fw.ipPorts[ip.String()].Ports)
 }
 
 // IPv6 sibling — same pattern, same bug, same fix.
@@ -303,7 +303,7 @@ func TestAddIPv6_SharedIP_DifferentPorts_StillWritesPortEntries(t *testing.T) {
 	portKey := mocks["portsV6"].updates[0].key.(*bpf.TcBpfPortKeyV6)
 	assert.Equal(t, uint16(8080), portKey.Port)
 	assert.Equal(t, uint8(6), portKey.Proto)
-	assert.Equal(t, []portProto{{Port: 8080, Proto: 6}}, fw.ipPorts[ip.String()].ports)
+	assert.Equal(t, []portProto{{Port: 8080, Proto: 6}}, fw.ipPorts[ip.String()].Ports)
 }
 
 // True duplicate — same (action, ports), all per-port entries already match.
@@ -326,12 +326,12 @@ func TestAddIP_TrueDuplicateWithPorts_ReportsUnchanged(t *testing.T) {
 		return nil
 	}
 	// Pre-populate ipPorts so the merge is a no-op too.
-	fw.ipPorts[ip.String()] = &ipPortState{ports: []portProto{{Port: 443, Proto: 6}}}
+	fw.ipPorts[ip.String()] = &ipPortState{Ports: []portProto{{Port: 443, Proto: 6}}}
 
 	changed, err := fw.AddIP(ip, config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolTCP}})
 	require.NoError(t, err)
 	assert.False(t, changed, "true duplicate with matching state must report no change")
-	assert.Equal(t, []portProto{{Port: 443, Proto: 6}}, fw.ipPorts[ip.String()].ports, "ipPorts unchanged")
+	assert.Equal(t, []portProto{{Port: 443, Proto: 6}}, fw.ipPorts[ip.String()].Ports, "ipPorts unchanged")
 }
 
 // Two AddIP calls with disjoint port sets must accumulate both into ipPorts so
@@ -346,7 +346,7 @@ func TestAddIP_SharedIP_IpPortsAccumulatesAcrossCalls(t *testing.T) {
 	changed, err := fw.AddIP(ip, config.ActionAllow, []config.Port{{Port: 443, Protocol: config.ProtocolTCP}})
 	require.NoError(t, err)
 	assert.True(t, changed)
-	assert.Equal(t, []portProto{{Port: 443, Proto: 6}}, fw.ipPorts[ip.String()].ports)
+	assert.Equal(t, []portProto{{Port: 443, Proto: 6}}, fw.ipPorts[ip.String()].Ports)
 
 	// Second AddIP: same IP, different port [8080]. Configure cidrs lookup
 	// to return the LPM entry from the first call.
@@ -369,7 +369,7 @@ func TestAddIP_SharedIP_IpPortsAccumulatesAcrossCalls(t *testing.T) {
 	// BOTH ports tracked — RemoveIP will clean up both.
 	assert.ElementsMatch(t,
 		[]portProto{{Port: 443, Proto: 6}, {Port: 8080, Proto: 6}},
-		fw.ipPorts[ip.String()].ports,
+		fw.ipPorts[ip.String()].Ports,
 		"ipPorts must accumulate disjoint port sets across calls")
 }
 
@@ -389,7 +389,7 @@ func TestAddIP_TransitionToAllPorts_KeepsPortEntriesAndIsSticky(t *testing.T) {
 		{Port: 8080, Protocol: config.ProtocolTCP},
 	})
 	require.NoError(t, err)
-	require.ElementsMatch(t, []portProto{{Port: 443, Proto: 6}, {Port: 8080, Proto: 6}}, fw.ipPorts[ip.String()].ports)
+	require.ElementsMatch(t, []portProto{{Port: 443, Proto: 6}, {Port: 8080, Proto: 6}}, fw.ipPorts[ip.String()].Ports)
 
 	// Second call: transition to all-ports.
 	changed, err := fw.AddIP(ip, config.ActionAllow, nil)
@@ -403,9 +403,9 @@ func TestAddIP_TransitionToAllPorts_KeepsPortEntriesAndIsSticky(t *testing.T) {
 	// The IP is now all-ports allow and the union is retained for cleanup.
 	st := fw.ipPorts[ip.String()]
 	require.NotNil(t, st)
-	assert.True(t, st.allPortsAllow, "all-ports allow grant recorded")
-	assert.False(t, st.allPortsDeny)
-	assert.ElementsMatch(t, []portProto{{Port: 443, Proto: 6}, {Port: 8080, Proto: 6}}, st.ports)
+	assert.True(t, st.AllPortsAllow, "all-ports allow grant recorded")
+	assert.False(t, st.AllPortsDeny)
+	assert.ElementsMatch(t, []portProto{{Port: 443, Proto: 6}, {Port: 8080, Proto: 6}}, st.Ports)
 
 	// Every port is now allowed (PortSpecific=0), including one never added.
 	assert.True(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], ip, 443, protoTCP, false))
@@ -464,7 +464,7 @@ func TestAddIP_WithPorts_TracksIPPorts(t *testing.T) {
 	added, err := fw.AddIP(ip, config.ActionAllow, ports)
 	require.NoError(t, err)
 	assert.True(t, added)
-	assert.Equal(t, []portProto{{Port: 80, Proto: 6}, {Port: 443, Proto: 6}}, fw.ipPorts[ip.String()].ports)
+	assert.Equal(t, []portProto{{Port: 80, Proto: 6}, {Port: 443, Proto: 6}}, fw.ipPorts[ip.String()].Ports)
 }
 
 // An all-ports AddIP over an IP that previously had port-specific entries keeps
@@ -476,7 +476,7 @@ func TestAddIP_WithoutPorts_KeepsRetainedPortsAndRecordsAllPorts(t *testing.T) {
 	ip := net.ParseIP("10.0.0.1")
 
 	// Pre-populate ipPorts as if a previous call added ports.
-	fw.ipPorts[ip.String()] = &ipPortState{ports: []portProto{{Port: 80, Proto: 6}}}
+	fw.ipPorts[ip.String()] = &ipPortState{Ports: []portProto{{Port: 80, Proto: 6}}}
 
 	added, err := fw.AddIP(ip, config.ActionAllow, nil)
 	require.NoError(t, err)
@@ -484,9 +484,9 @@ func TestAddIP_WithoutPorts_KeepsRetainedPortsAndRecordsAllPorts(t *testing.T) {
 
 	st := fw.ipPorts[ip.String()]
 	require.NotNil(t, st, "ipPorts entry must be retained so RemoveIP can clean up the union")
-	assert.True(t, st.allPortsAllow, "all-ports allow grant recorded")
-	assert.False(t, st.allPortsDeny)
-	assert.Equal(t, []portProto{{Port: 80, Proto: 6}}, st.ports, "previously-written ports retained for cleanup")
+	assert.True(t, st.AllPortsAllow, "all-ports allow grant recorded")
+	assert.False(t, st.AllPortsDeny)
+	assert.Equal(t, []portProto{{Port: 80, Proto: 6}}, st.Ports, "previously-written ports retained for cleanup")
 }
 
 func TestRemoveIP_WithTrackedPorts(t *testing.T) {
@@ -494,7 +494,7 @@ func TestRemoveIP_WithTrackedPorts(t *testing.T) {
 	ip := net.ParseIP("10.0.0.1")
 
 	// Pre-populate ipPorts
-	fw.ipPorts[ip.String()] = &ipPortState{ports: []portProto{{Port: 80, Proto: 6}, {Port: 443, Proto: 6}}}
+	fw.ipPorts[ip.String()] = &ipPortState{Ports: []portProto{{Port: 80, Proto: 6}, {Port: 443, Proto: 6}}}
 
 	err := fw.RemoveIP(ip)
 	require.NoError(t, err)
@@ -522,8 +522,15 @@ func TestUpdateAllowlistTC_IPv4Wildcard_OnlyPortsMap(t *testing.T) {
 	err = fw.UpdateAllowlistTC(cm)
 	require.NoError(t, err)
 
-	// ProtocolAll expands to ICMP+TCP+UDP → 3 entries per port × 2 ports = 6.
-	assert.Len(t, mocks["ports"].updates, 6, "should update portsMap for each port+protocol combo")
+	// ProtocolAll expands to ICMP+TCP+UDP per port. ICMP has no port, so both
+	// ports share its key: 5 distinct wildcard entries.
+	keys := map[bpf.TcBpfPortKey]bool{}
+	for _, u := range mocks["ports"].updates {
+		k := u.key.(*bpf.TcBpfPortKey)
+		assert.Zero(t, k.Ip, "a wildcard entry is keyed on the zero address")
+		keys[*k] = true
+	}
+	assert.Len(t, keys, 5, "one entry per distinct port+protocol")
 	assert.Empty(t, mocks["cidrs"].updates, "should NOT update cidrsMap for wildcard with ports")
 }
 
@@ -591,45 +598,6 @@ func TestUpdateAllowlistTC_Hostname_CreatesPerIPEntries(t *testing.T) {
 	// (ProtocolAll expands to ICMP+TCP+UDP → 3 protocols × 1 port × 2 IPs = 6).
 	assert.Len(t, mocks["cidrs"].updates, 2, "should add /32 LPM entry per resolved IP")
 	assert.Len(t, mocks["ports"].updates, 6, "should add port+protocol entry per resolved IP")
-}
-
-// --- expandPorts protocol translation ---
-
-func TestExpandPorts_ICMP(t *testing.T) {
-	got := expandPorts([]config.Port{{Port: 0, Protocol: config.ProtocolICMP}})
-	assert.Equal(t, []portProto{{Port: 0, Proto: protoICMP}}, got)
-}
-
-func TestExpandPorts_AllIncludesICMP(t *testing.T) {
-	got := expandPorts([]config.Port{{Port: 443, Protocol: config.ProtocolAll}})
-	assert.Equal(t, []portProto{
-		{Port: 0, Proto: protoICMP},
-		{Port: 443, Proto: protoTCP},
-		{Port: 443, Proto: protoUDP},
-	}, got)
-}
-
-func TestExpandPorts_MixedICMPAndTCP(t *testing.T) {
-	got := expandPorts([]config.Port{
-		{Port: 0, Protocol: config.ProtocolICMP},
-		{Port: 443, Protocol: config.ProtocolTCP},
-	})
-	assert.Equal(t, []portProto{
-		{Port: 0, Proto: protoICMP},
-		{Port: 443, Proto: protoTCP},
-	}, got)
-}
-
-func TestStripICMPForV6_NilInput(t *testing.T) {
-	filtered, dropped := stripICMPForV6(nil)
-	assert.Nil(t, filtered)
-	assert.False(t, dropped)
-}
-
-func TestStripICMPForV6_EmptyInput(t *testing.T) {
-	filtered, dropped := stripICMPForV6([]portProto{})
-	assert.Empty(t, filtered)
-	assert.False(t, dropped)
 }
 
 // --- UpdateAllowlistTC ICMP rules ---
@@ -1009,7 +977,7 @@ func TestAddIP_PortSpecificDeny_InertUnderAllPortsAllow_V4(t *testing.T) {
 	// The deny is neither written to map_ports nor tracked in the union.
 	_, denyWritten := mocks["ports"].store[bpf.TcBpfPortKey{Ip: binary.NativeEndian.Uint32(ip.To4()), Port: 8080, Proto: protoTCP}]
 	assert.False(t, denyWritten, "inert per-port entry must not be written")
-	assert.Empty(t, fw.ipPorts[ip.String()].ports, "inert ports must not be tracked")
+	assert.Empty(t, fw.ipPorts[ip.String()].Ports, "inert ports must not be tracked")
 
 	// 8080 stays allowed (all-ports allow wins) — issue #71 priority preserved.
 	assert.True(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], ip, 8080, protoTCP, false))
@@ -1090,7 +1058,7 @@ func TestRemoveIP_CleansFullUnion_LeavesOtherIPsIntact_V4(t *testing.T) {
 
 	// Y is untouched.
 	require.NotNil(t, fw.ipPorts[y.String()])
-	assert.Equal(t, []portProto{{Port: 443, Proto: protoTCP}}, fw.ipPorts[y.String()].ports)
+	assert.Equal(t, []portProto{{Port: 443, Proto: protoTCP}}, fw.ipPorts[y.String()].Ports)
 	assert.True(t, bpfDecideV4(mocks["cidrs"], mocks["ports"], y, 443, protoTCP, false), "unrelated IP stays allowed")
 }
 

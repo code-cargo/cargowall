@@ -376,40 +376,16 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 	}
 
 	// Now load configuration (DNS proxy is running so hostname resolution will work)
-	var apiPolicyLoaded bool
-	if cmd.CIMode() != CIModeNone {
-		apiPolicyLoaded = loadCIConfig(ctx, cmd, configMgr, auditLogger, dockerBridgeIP, logger)
-	} else if hooks != nil && hooks.LoadPolicy != nil {
-		// Extension hook: load policy from external source (e.g., NATS state machine)
-		policy, hookSmClient, cleanup, err := hooks.LoadPolicy(ctx, cmd)
-		if err != nil {
-			return fmt.Errorf("failed to load policy via hook: %w", err)
-		}
-		if cleanup != nil {
-			defer cleanup()
-		}
-
-		if policy != nil {
-			if err := configMgr.LoadConfigFromCargoWall(policy); err != nil {
-				return fmt.Errorf("failed to load CargoWall config: %w", err)
-			}
-			// LoadConfigFromCargoWall mapped the policy's mode onto the
-			// manager's posture; re-sync the logger's event labeling.
-			if auditLogger != nil {
-				auditLogger.SetAuditMode(configMgr.IsAuditMode())
-			}
-		}
-
-		if hookSmClient != nil {
-			notificationTracker = events.NewNotificationTracker(hookSmClient, logger)
-			logger.Info("CargoWall block notifications enabled via hook")
-		}
-	} else {
-		// Load from file (original behavior)
-		if err := configMgr.LoadConfig(cmd.Config); err != nil {
-			logger.Error("Failed to load config", "error", err, "path", cmd.Config)
-			// Continue with default deny-all policy
-		}
+	apiPolicyLoaded, hookSmClient, policyCleanup, err := loadStartupPolicy(ctx, cmd, hooks, configMgr, auditLogger, dockerBridgeIP, logger)
+	if policyCleanup != nil {
+		defer policyCleanup()
+	}
+	if err != nil {
+		return err
+	}
+	if hookSmClient != nil {
+		notificationTracker = events.NewNotificationTracker(hookSmClient, logger)
+		logger.Info("CargoWall block notifications enabled via hook")
 	}
 
 	// Late-allow reconciliation (#83): buffer recently blocked connections so
@@ -967,11 +943,11 @@ func writeModeFile(auditMode bool, logger *slog.Logger) {
 
 // loadCIConfig handles CI config priority:
 // (1) SaaS API fetch + bootstrap + mode override + state file,
-// (2) env vars, (3) config file. Calls EnsureDNSAllowed at end.
+// (2) env vars, (3) config file.
 // Returns true if SaaS API policy was loaded. Posture changes land on
 // configMgr (the single source of truth); under --api-failure-mode=fail
 // cmd.policyLockdown is set in place.
-func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, dockerBridgeIP string, logger *slog.Logger) bool {
+func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager, auditLogger *events.AuditLogger, logger *slog.Logger) bool {
 	logger.Info("Running in CI mode", "mode", string(cmd.CIMode()))
 
 	var apiPolicyLoaded bool
@@ -1044,17 +1020,6 @@ func loadCIConfig(ctx context.Context, cmd *StartCmd, configMgr *config.Manager,
 			}
 		}
 	}
-
-	// Auto-allow DNS infrastructure IPs on port 53 so the DNS proxy
-	// can reach the upstream and local processes/containers can resolve.
-	dnsIPs := []string{"127.0.0.1"}
-	if dnsUpstreamHost, _, err := net.SplitHostPort(cmd.DNSUpstream); err == nil {
-		dnsIPs = append(dnsIPs, dnsUpstreamHost)
-	}
-	if dockerBridgeIP != "" {
-		dnsIPs = append(dnsIPs, dockerBridgeIP)
-	}
-	configMgr.EnsureDNSAllowed(dnsIPs)
 
 	return apiPolicyLoaded
 }

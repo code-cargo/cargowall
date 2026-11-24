@@ -37,6 +37,30 @@ will never accept) it copies to a ringbuf and, under enforce, drops. The oracle
 the recovered name against policy, and writes the verdict into `map_l7_flow`;
 the client's retransmit is then admitted or dropped by the kernel.
 
+**A verdict can land while the kernel is still committing the punt it
+answers.** The kernel submits a punt, then `l7_commit_pending` looks the flow
+entry up and writes `PENDING` unless it finds a terminal verdict; a verdict
+landing between that lookup and the update is overwritten. The kernel's
+re-lookup narrows that window and can't close it. For QUIC the oracle repairs
+it already: a retransmitted Initial is never deduplicated, so it re-punts and
+the oracle re-asserts the decided verdict (`reassertVerdict`). A TCP
+retransmit has the punt's sequence number and length, so the kernel
+deduplicates it and nothing reaches the oracle: the connection stalled with
+every retransmit dropped, about one fresh connection in 1,300 in a VM stress
+run. So after writing a TCP verdict the oracle reads the entry back about 5 ms
+and again about 150 ms later (`pkg/origin/l7_recheck.go`); the clobbering
+update follows within the rest of one run of the kernel program, and a
+client's first retransmit comes no sooner than 200 ms. It writes the verdict
+again only when the entry is `PENDING` with the deciding punt's sequence
+number (so it is that punt's own commit, and no further punt is on its way)
+and the oracle's record for the flow is still the cycle that decided it.
+Anything else, a `NEED_HELLO` or a `PENDING` of another sequence number above
+all, belongs to a later connection of the socket and is left alone: the old
+verdict there would admit a first flight nobody adjudicated. The queue is
+bounded and never blocks the punt reader; a full queue drops the re-check.
+`verdicts_repaired` and `verdict_rechecks_dropped` on the oracle's teardown
+line count both. No kernel change was needed, so no verifier budget is spent.
+
 **There is deliberately no in-kernel name match.** An earlier inline TLS fast
 path over a name-keyed allow map was removed: a no-expiry kernel name cache is
 a weaker second copy of the matcher, and every lifecycle it lacked — derived

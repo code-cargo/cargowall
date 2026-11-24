@@ -53,6 +53,7 @@ const l7CfgKeyMode = uint32(2)
 // Flow-state values written back to map_l7_flow (sni.h L7_STATE_*).
 const (
 	l7StateNeedHello uint8 = 0
+	l7StatePending   uint8 = 1
 	l7StateAllowed   uint8 = 2
 	l7StateDenied    uint8 = 3
 )
@@ -131,6 +132,16 @@ type L7 struct {
 	mu        sync.Mutex
 	flows     map[bpf.OriginBpfL7FlowKey]*l7flow
 	lastSweep time.Time
+	// cycles numbers decided cycles (l7flow.gen), under mu.
+	cycles uint64
+
+	// recheckCh feeds the verdict re-check (l7_recheck.go); nil when the
+	// oracle is driven synchronously. recheckDone closes when both stages
+	// have exited.
+	recheckCh        chan l7Recheck
+	recheckDone      chan struct{}
+	recheckDropped   atomic.Uint64
+	verdictsRepaired atomic.Uint64
 
 	// sinkCh decouples sink invocations (audit encode+fsync, procfs reads)
 	// from the ringbuf reader: a burst of denials must never stall the reader
@@ -174,6 +185,12 @@ func (l *L7) start() error {
 	l.reader = rd
 	l.sinkCh = make(chan L7Outcome, 512)
 	l.sinkDone = make(chan struct{})
+	l.recheckCh = make(chan l7Recheck, l7RecheckQueue)
+	second := make(chan l7Recheck, l7RecheckQueue)
+	firstDone, secondDone := make(chan struct{}), make(chan struct{})
+	l.recheckDone = secondDone
+	go l.recheckLoop(l.recheckCh, l7RecheckFirst, second, firstDone)
+	go l.recheckLoop(second, l7RecheckSecond, nil, secondDone)
 	go l.sinkLoop()
 	go l.run()
 	return nil
@@ -400,6 +417,10 @@ func (l *L7) close() {
 		close(l.sinkCh)
 		<-l.sinkDone
 	}
+	if l.recheckCh != nil {
+		close(l.recheckCh) // run() was its only sender
+		<-l.recheckDone
+	}
 	if n := l.sinkDropped.Load(); n > 0 && l.logger != nil {
 		l.logger.Warn("L7 outcome reports dropped by a saturated sink", "dropped", n)
 	}
@@ -456,7 +477,12 @@ func (l *L7) logStats() {
 		// Packets on an alternate HTTPS/HTTP port that carried no TLS/HTTP
 		// identity and were PASSED rather than refused. Reported so the
 		// widened scope's residual is visible next to the refusals.
-		"alt_port_ungated", sum(l7StatAltUngated))
+		"alt_port_ungated", sum(l7StatAltUngated),
+		// TCP verdicts the kernel's commit of the punt they answered wrote
+		// PENDING over, written again by the re-check (l7_recheck.go); and
+		// re-checks a full queue dropped.
+		"verdicts_repaired", l.verdictsRepaired.Load(),
+		"verdict_rechecks_dropped", l.recheckDropped.Load())
 	if puntDropped > 0 || budget > 0 {
 		l.logger.Warn("L7 flows were dropped without an audit record "+
 			"(full punt ring or exhausted punt budget fails closed in enforce)",

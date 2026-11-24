@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/config"
@@ -128,10 +129,14 @@ type l7flow struct {
 	decided bool
 	// verdict and dcid are what writeFlowState stamped, kept so a stale punt
 	// that clobbered the kernel entry back to PENDING can re-assert instead of
-	// stranding the flow (see l7_commit_pending for the race the kernel
-	// narrows but cannot close).
-	verdict  uint8
-	dcid     []byte
+	// stranding the flow. A clobber by the commit of the deciding punt itself
+	// sends no stale punt for TCP; the verdict re-check repairs that one
+	// (l7_recheck.go).
+	verdict uint8
+	dcid    []byte
+	// gen numbers the decided cycle, so a re-check can tell the cycle it
+	// checks from a later one that reached the same verdict.
+	gen      uint64
 	lastSeen time.Time
 }
 
@@ -217,6 +222,9 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 	// assembler; the TTL sweep collects the entry.
 	st.decided = true
 	st.verdict = l7FlowState(out.Allowed)
+	l.cycles++
+	st.gen = l.cycles
+	recheck := l7Recheck{key: fk, verdict: st.verdict, seq: ev.Seq, punted: ev.Timestamp, gen: st.gen}
 	// The QUIC connection-attempt identity the verdict pins, taken from the
 	// kernel-extracted event field so there is exactly ONE decoder of the
 	// Initial's long header. Stamped with BOTH verdicts: on ALLOWED so the
@@ -235,6 +243,12 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 	l.mu.Unlock()
 
 	l.finish(ev, flowProto, out, dcid)
+	// TCP only: a QUIC retransmit is never deduplicated, so it re-punts and
+	// reassertVerdict repairs a clobbered verdict from it.
+	if ev.IpProto == unix.IPPROTO_TCP {
+		recheck.written = time.Now()
+		l.queueRecheck(recheck)
+	}
 }
 
 // eventDCID returns the sample's QUIC connection-attempt identity, or nil for
@@ -503,7 +517,9 @@ func refusalReason(ev *bpf.L7Event) L7Reason {
 // already assembled and stall its handshake until the client retransmits. The
 // lookup narrows the race the same way the kernel's commit re-lookup does;
 // neither closes it, and the converging repin/re-assert cycle repairs the
-// remainder. TCP verdicts carry no DCID and always re-assert.
+// remainder. TCP verdicts carry no DCID and always re-assert. A TCP verdict
+// clobbered by the commit of the deciding punt itself is repaired by the
+// verdict re-check (l7_recheck.go), since no stale punt follows it.
 func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte, punted uint64) error {
 	if len(dcid) > 0 {
 		var cur bpf.OriginBpfL7FlowVal

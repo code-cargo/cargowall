@@ -91,10 +91,12 @@ type useListenerRun struct {
 	undosAtRecovery int
 	restored        int
 	recoveries      int
+	restarts        int
 	undo            func()
 	d               *dockerDNS
 	teardowns       *teardownList
 	log             string
+	buf             *bytes.Buffer
 }
 
 // runUseListener runs useListener for an answering daemon of the given kind
@@ -122,25 +124,38 @@ func runUseListenerFor(dockerd podenv.Dockerd, errs bindErrs, redirect, leftover
 			run.undosAtRecovery = len(run.teardowns.fns)
 			return leftover, nil
 		},
-		logger: slog.New(slog.NewTextHandler(&buf, nil)),
+		restartDocker: func(*slog.Logger) error { run.restarts++; return nil },
+		logger:        slog.New(slog.NewTextHandler(&buf, nil)),
 	}
+	run.buf = &buf
 	run.undo = run.d.useListener(run.teardowns, redirect)
 	run.log = buf.String()
 	return run
 }
 
-// Only a listener the proxy holds is put to use: for a local daemon,
-// daemon.json is rewritten to point at the IPv4 one, with the undo
-// registered first, and the restart that applies it is due; the rewrite
-// undoes a previous run's leftover itself. A foreign daemon is left alone,
-// and its line claims no redirect: whether one is in place is the
-// redirect's to say once it is.
+// settle runs settleDaemon on the run's dockerDNS with redirect, and
+// refreshes the log.
+func (run *useListenerRun) settle(redirect *dnsRedirect) {
+	run.d.settleDaemon(redirect)
+	run.log = run.buf.String()
+}
+
+// Only a listener the proxy holds is put to use: for a local daemon with
+// no redirect, daemon.json is rewritten to point at the IPv4 one once the
+// redirect's result is known (settleDaemon), with the undo registered
+// first, and the daemon is restarted onto it; the rewrite undoes a previous
+// run's leftover itself. A foreign daemon is left alone, and its line
+// claims no redirect: whether one is in place is the redirect's to say once
+// it is.
 func TestDockerDNS_UseListenerBound(t *testing.T) {
 	run := runUseListener(podenv.DockerdLocal, bindErrs{}, true, true)
+	assert.Empty(t, run.configured, "the rewrite waits on the redirect")
+	run.settle(nil)
 	assert.Equal(t, []string{"169.254.0.53"}, run.configured)
 	assert.Equal(t, 1, run.undosBefore, "the undo must be registered before the rewrite")
 	assert.Zero(t, run.recoveries, "the rewrite recovers a leftover on its way")
 	assert.True(t, run.d.restart)
+	assert.Equal(t, 1, run.restarts)
 	assert.Contains(t, run.log, "Docker DNS interception enabled")
 	assert.Contains(t, run.log, "listen=169.254.0.53:53")
 	run.undo()
@@ -148,7 +163,9 @@ func TestDockerDNS_UseListenerBound(t *testing.T) {
 
 	for _, redirect := range []bool{true, false} {
 		run = runUseListener(podenv.DockerdForeign, bindErrs{}, redirect, true)
+		run.settle(nil)
 		assert.Empty(t, run.configured, "a foreign daemon's config is not ours")
+		assert.Zero(t, run.restarts)
 		assert.Zero(t, run.recoveries, "nor is a foreign daemon's leftover")
 		assert.Empty(t, run.teardowns.fns)
 		assert.False(t, run.d.restart)
@@ -267,7 +284,9 @@ func TestDockerDNS_UseListenerPending(t *testing.T) {
 	pending := podenv.Dockerd{Kind: podenv.DockerdLocal}
 	for _, errs := range []bindErrs{{}, {listen4: errRefused4}} {
 		run := runUseListenerFor(pending, errs, true, true)
+		run.settle(nil)
 		assert.Empty(t, run.configured)
+		assert.Zero(t, run.restarts)
 		assert.Zero(t, run.recoveries, "a pending daemon's leftover is left too")
 		assert.False(t, run.d.restart)
 		assert.Empty(t, run.teardowns.fns)
@@ -316,6 +335,61 @@ func TestDNSInfraIPs(t *testing.T) {
 func TestDockerDNS_UseListenerOff(t *testing.T) {
 	assert.NotPanics(t, func() {
 		(*dockerDNS)(nil).useListener(&teardownList{}, true)()
-		(*dockerDNS)(nil).restartDaemon()
+		(*dockerDNS)(nil).settleDaemon(&dnsRedirect{active: true})
 	})
+}
+
+// For a local daemon whose IPv4 listener the proxy holds, the redirect's
+// result decides: in place and whole, it already sends every container's
+// DNS to the listener, so daemon.json is left alone and Docker is not
+// restarted, with one Info saying so; a previous run's leftover is still
+// undone, and the restart that applies the original still runs. Absent,
+// not installed, or leaving a gap for containers or for IPv6, daemon.json
+// is the only thing pointing containers at the proxy, and is rewritten
+// and the daemon restarted as before.
+func TestDockerDNS_SettleDaemon(t *testing.T) {
+	gap := errors.New("container DNS is not redirected")
+	for _, c := range []struct {
+		name     string
+		redirect *dnsRedirect
+		rewrite  bool
+	}{
+		{"redirect whole", &dnsRedirect{active: true}, false},
+		{"no redirect requested", nil, true},
+		{"redirect not installed", &dnsRedirect{err: gap}, true},
+		{"container gap", &dnsRedirect{active: true, applied: dnsRedirectHost, err: gap}, true},
+		{"IPv6 gap", &dnsRedirect{active: true, applied: dnsRedirectIPv4, err: gap}, true},
+		{"both gaps", &dnsRedirect{active: true, applied: dnsRedirectHostIPv4, err: gap}, true},
+	} {
+		for _, leftover := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/leftover=%v", c.name, leftover), func(t *testing.T) {
+				run := runUseListener(podenv.DockerdLocal, bindErrs{}, c.redirect != nil, leftover)
+				require.Len(t, run.teardowns.fns, 1, "the restore is registered either way")
+				run.settle(c.redirect)
+				skipped := "Container DNS reaches the proxy through the DNS redirect"
+				if c.rewrite {
+					assert.Equal(t, []string{"169.254.0.53"}, run.configured)
+					assert.Equal(t, 1, run.restarts)
+					assert.Zero(t, run.recoveries, "the rewrite recovers a leftover on its way")
+					assert.NotContains(t, run.log, skipped)
+					return
+				}
+				assert.Empty(t, run.configured, "the redirect covers the containers")
+				assert.Equal(t, 1, run.recoveries, "a previous run's leftover is still looked for")
+				assert.Equal(t, leftover, run.restarts == 1, "a restart runs only to undo a leftover")
+				require.Equal(t, 1, strings.Count(run.log, skipped), run.log)
+				assert.Equal(t, !leftover, strings.Contains(run.log, "daemon.json is left alone and Docker is not restarted"))
+				assert.Equal(t, leftover, strings.Contains(run.log, "restarted only to undo the rewrite a previous run left"))
+				assert.NotContains(t, run.log, "level=WARN")
+				run.undo()
+				assert.Equal(t, 1, run.restored, "the registered restore runs, and finds nothing of this run's")
+			})
+		}
+	}
+
+	// Settled once: a second call rewrites nothing more.
+	run := runUseListener(podenv.DockerdLocal, bindErrs{}, false, false)
+	run.settle(nil)
+	run.settle(nil)
+	assert.Len(t, run.configured, 1)
 }

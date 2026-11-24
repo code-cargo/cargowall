@@ -16,7 +16,9 @@
 # Asserts, once cargowall has exited, that it gave Docker its DNS back: no
 # daemon.json records left beside it, a daemon restart queued at teardown for
 # the one startup ran onto the rewrite, and a container started now gets a
-# real nameserver. A daemon restarted onto cargowall's rewrite keeps pointing
+# real nameserver. Where the DNS redirect covered container DNS, startup
+# left daemon.json alone and restarted nothing, so there is no restart to
+# have queued: cargowall's log says which of the two happened. A daemon restarted onto cargowall's rewrite keeps pointing
 # containers at cargowall's listener until it restarts again, and one only
 # reloaded after the restore hands them "nameserver invalid IP". The image
 # must be pulled beforehand: the container only reads its resolv.conf, so
@@ -33,12 +35,20 @@ for record in /etc/docker/daemon.json.cargowall.{bak,absent,rewrite}; do
   fi
 done
 
-# A restart onto the rewrite at startup, and one queued onto the original at
-# teardown.
-for line in "Docker daemon ready after restart" "Queued a Docker daemon restart off cargowall's daemon.json rewrite"; do
-  grep -q "$line" "$log" \
-    || { echo "::error::cargowall never logged \"$line\" $when"; tail -30 "$log"; exit 1; }
-done
+# Either the redirect covered container DNS, and daemon.json was never
+# rewritten, or a restart onto the rewrite at startup and one queued onto the
+# original at teardown.
+if grep -q "Container DNS reaches the proxy through the DNS redirect" "$log"; then
+  if grep -q "Configuring Docker DNS" "$log"; then
+    echo "::error::cargowall rewrote daemon.json although the redirect covered container DNS $when"; exit 1
+  fi
+  echo "daemon.json was left alone: the DNS redirect covered container DNS"
+else
+  for line in "Docker daemon ready after restart" "Queued a Docker daemon restart off cargowall's daemon.json rewrite"; do
+    grep -q "$line" "$log" \
+      || { echo "::error::cargowall never logged \"$line\" $when"; tail -30 "$log"; exit 1; }
+  done
+fi
 if grep -qE "Failed to (restart|queue a) Docker daemon" "$log"; then
   echo "::error::a Docker daemon restart failed $when"
   grep -E "Failed to (restart|queue a) Docker daemon" "$log"; exit 1

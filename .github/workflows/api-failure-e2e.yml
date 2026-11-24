@@ -387,11 +387,12 @@ jobs:
 
       - name: Stop cargowall and assert clean teardown
         run: |
-          # The block above can land before startup restarts Docker onto the
-          # daemon.json rewrite. Stopping only after that restart gives the
-          # teardown one to undo.
+          # The block above can land before startup has settled Docker's
+          # DNS: restarted onto the daemon.json rewrite, or left alone where
+          # the DNS redirect covers container DNS. Stopping only after that
+          # gives the teardown the state it is to undo.
           for i in $(seq 1 60); do
-            grep -q "Docker daemon ready after restart" /tmp/cargowall.log && break
+            grep -qE "Docker daemon ready after restart|Container DNS reaches the proxy through the DNS redirect" /tmp/cargowall.log && break
             sleep 1
           done
           sudo ./bin/cargowall stop --pidfile /tmp/cargowall.pid

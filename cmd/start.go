@@ -827,8 +827,8 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 		return nil
 	}
 
-	// Restart Docker daemon so containers pick up the rewritten daemon.json.
-	containerDNS.restartDaemon()
+	// Point a local daemon at the proxy, unless the redirect already does, and restart it onto that.
+	containerDNS.settleDaemon(redirect)
 
 	// Container attribution, userspace half — after the dockerd restart
 	// above, for the ordering reasons containerAttribution documents.

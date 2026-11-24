@@ -41,7 +41,12 @@ const dockerSocket = "/var/run/docker.sock"
 // and restarting the daemon only work for one that runs here: a dind sidecar
 // reads its own daemon.json and no service manager of ours manages it, so
 // for a foreign daemon both are skipped and the redirect alone catches its
-// containers' DNS.
+// containers' DNS. For a local daemon they are skipped too wherever the
+// redirect is in place and whole (settleDaemon): it already sends every
+// container's DNS to the listener, and the restart costs startup up to a
+// minute and stops the containers already running, the job's services:
+// among them. daemon.json is rewritten only where nothing else points
+// containers at the proxy.
 //
 // Each address is added (network.OwnedAddrs), with the guard that keeps it
 // from the uplink and every link but lo and a bridge, only once the proxy holds
@@ -57,14 +62,20 @@ type dockerDNS struct {
 	// bound (dns.Server.BindError).
 	proxy interface{ BindError(addr string) error }
 	// configure rewrites daemon.json to point the daemon's containers at the
-	// listener, restore undoes it, and recover undoes only one a previous run
-	// left: network.ConfigureDockerDNS, RestoreDockerDNS and
-	// RecoverDockerDNS, which a test stands in for.
-	configure func(dnsIP string, logger *slog.Logger) error
-	restore   func(logger *slog.Logger) error
-	recover   func(logger *slog.Logger) (bool, error)
-	restart   bool // daemon.json changed: the daemon restart applies it
-	logger    *slog.Logger
+	// listener, restore undoes it, recover undoes only one a previous run
+	// left, and restartDocker restarts the daemon onto daemon.json:
+	// network.ConfigureDockerDNS, RestoreDockerDNS, RecoverDockerDNS and
+	// RestartDockerDaemon, which a test stands in for.
+	configure     func(dnsIP string, logger *slog.Logger) error
+	restore       func(logger *slog.Logger) error
+	recover       func(logger *slog.Logger) (bool, error)
+	restartDocker func(logger *slog.Logger) error
+	// rewriteDue marks a local daemon whose IPv4 listener the proxy holds:
+	// whether daemon.json is pointed at it waits on the redirect's result
+	// (settleDaemon).
+	rewriteDue bool
+	restart    bool // daemon.json changed: the daemon restart applies it
+	logger     *slog.Logger
 }
 
 // containerListenAddr is the proxy's listener for container DNS at addr.
@@ -87,7 +98,8 @@ func startDockerDNS(cmd *StartCmd, dnsServer *dns.Server, dockerd podenv.Dockerd
 	}
 	d := &dockerDNS{
 		dockerd: dockerd, proxy: dnsServer, configure: network.ConfigureDockerDNS,
-		restore: network.RestoreDockerDNS, recover: network.RecoverDockerDNS, logger: logger,
+		restore: network.RestoreDockerDNS, recover: network.RecoverDockerDNS,
+		restartDocker: network.RestartDockerDaemon, logger: logger,
 	}
 	upstream, _ := netip.ParseAddrPort(cmd.DNSUpstream)
 	// An interface not found leaves the guards nothing to drop on by name;
@@ -111,8 +123,9 @@ func startDockerDNS(cmd *StartCmd, dnsServer *dns.Server, dockerd podenv.Dockerd
 // useListener puts the IPv4 container listener to use once the proxy is
 // ready, or warns that the proxy could not bind it, which with the redirect
 // requested is a lost dns-redirect posture too (startDNSRedirect). Only for
-// a daemon proven local, and only onto a bound listener, is daemon.json
-// rewritten, to point containers at it: a foreign or unidentified daemon is
+// a daemon proven local, and only onto a bound listener, may daemon.json be
+// rewritten, to point containers at it, and whether it is waits on the
+// redirect (settleDaemon): a foreign or unidentified daemon is
 // left alone, and whether the redirect sends its containers' DNS to the
 // listener is the redirect's to say once it is in place ("DNS redirect
 // installed"). daemon.json takes one address, and the redirect sends IPv6
@@ -160,13 +173,8 @@ func (d *dockerDNS) useListener(teardowns *teardownList, redirect bool) func() {
 			"only through the DNS redirect or by naming its listener", "dockerd", d.dockerd.Kind.String(), "reason", d.dockerd.Reason)
 		return func() {}
 	}
-	undo := d.restoreUndo(teardowns)
-	if err := d.configure(d.listeningIP(), d.logger); err != nil {
-		d.logger.Warn("Failed to configure Docker DNS", "error", err)
-		return undo
-	}
-	d.restart = true
-	return undo
+	d.rewriteDue = true
+	return d.restoreUndo(teardowns)
 }
 
 // restoreUndo registers the undo that restores daemon.json and restarts a
@@ -320,13 +328,48 @@ func dnsInfraIPs(upstream string, containerDNS *dockerDNS) []string {
 	return ips
 }
 
-// restartDaemon applies the daemon.json rewrite: Docker's SIGHUP handler
-// does not reload DNS settings, so only a full restart does. Nil-safe.
-func (d *dockerDNS) restartDaemon() {
-	if d == nil || !d.restart {
+// settleDaemon points a local daemon's containers at the listener, unless
+// the redirect, now in place or not, already sends their DNS there, and
+// restarts the daemon onto the result: Docker's SIGHUP handler does not
+// reload DNS settings, so only a full restart does. Where the redirect
+// covers the containers, daemon.json is left alone and the daemon is not
+// restarted, but a rewrite a previous run left is still undone, and then
+// the restart that applies the original is still due. The restore
+// useListener registered finds nothing of this run's to undo. Without a
+// redirect, or with one that leaves a gap, daemon.json is the only thing
+// pointing containers at the proxy, and is rewritten as before. Nil-safe.
+func (d *dockerDNS) settleDaemon(redirect *dnsRedirect) {
+	if d == nil {
 		return
 	}
-	if err := network.RestartDockerDaemon(d.logger); err != nil {
+	if d.rewriteDue {
+		d.rewriteDue = false
+		d.pointDaemon(redirect.coversContainers())
+	}
+	if !d.restart {
+		return
+	}
+	if err := d.restartDocker(d.logger); err != nil {
 		d.logger.Warn("Failed to restart Docker daemon for DNS config", "error", err)
 	}
+}
+
+// pointDaemon rewrites daemon.json to point the daemon's containers at the
+// IPv4 listener, or, where the redirect covers them (redirected), leaves it
+// alone and says so, undoing only a previous run's leftover.
+func (d *dockerDNS) pointDaemon(redirected bool) {
+	if !redirected {
+		if err := d.configure(d.listeningIP(), d.logger); err != nil {
+			d.logger.Warn("Failed to configure Docker DNS", "error", err)
+			return
+		}
+		d.restart = true
+		return
+	}
+	msg := "Container DNS reaches the proxy through the DNS redirect; daemon.json is left alone and Docker is not restarted"
+	if d.recoverLeftover() {
+		msg = "Container DNS reaches the proxy through the DNS redirect; daemon.json is not pointed at the proxy, " +
+			"and Docker is restarted only to undo the rewrite a previous run left"
+	}
+	d.logger.Info(msg, "listen", containerListenAddr(network.ContainerDNSIPv4))
 }

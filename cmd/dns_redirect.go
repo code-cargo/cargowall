@@ -215,6 +215,13 @@ func notInstalled(err error, logger *slog.Logger) *dnsRedirect {
 // least. Nil-safe: nil is the redirect not requested.
 func (r *dnsRedirect) isActive() bool { return r != nil && r.active }
 
+// coversContainers reports whether the redirect is in place and whole, so
+// every container's DNS, whatever resolver it names, reaches the proxy
+// through the prerouting chain. A redirect with any gap does not count: a
+// container gap leaves that family's container DNS alone, and an IPv6 gap
+// leaves the containers' IPv6 DNS alone with the host's. Nil-safe.
+func (r *dnsRedirect) coversContainers() bool { return r.isActive() && r.err == nil }
+
 // settle hands a failed setup to the ledger, which owns the log line and
 // decides whether startup fails; one in place but not whole is recorded at
 // what it covers. Nil-safe.

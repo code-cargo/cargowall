@@ -551,9 +551,10 @@ func validateSearchDomain(d string) error {
 }
 
 // validateSearchDomains validates a batch of normalized suffixes, returning
-// on the first invalid entry. Used by user-supplied config paths (proto,
-// JSON, env) where a typo should fail loudly. The in-process auto-allow path
-// uses validateSearchDomain directly so it can skip-and-warn per entry.
+// on the first invalid entry. Used by the local config file and env paths,
+// where a typo should fail loudly. The CodeCargo policy loader
+// (filterPolicySearchDomains) and the in-process auto-allow path use
+// validateSearchDomain directly so they can drop per entry.
 func validateSearchDomains(domains []string) error {
 	for _, d := range domains {
 		if err := validateSearchDomain(d); err != nil {
@@ -601,10 +602,7 @@ func (cm *Manager) LoadConfigFromCargoWall(cargoWall *cargowallv1pb.CargoWallPol
 		rules = append(rules, rule)
 	}
 
-	searchDomains := normalizeSearchDomains(cargoWall.GetSearchDomains())
-	if err := validateSearchDomains(searchDomains); err != nil {
-		return err
-	}
+	searchDomains := filterPolicySearchDomains(normalizeSearchDomains(cargoWall.GetSearchDomains()))
 
 	defaultAction := convertAction(cargoWall.DefaultAction)
 

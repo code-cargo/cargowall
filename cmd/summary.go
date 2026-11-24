@@ -122,15 +122,17 @@ func (c *SummaryCmd) Run() error {
 		case events.EventStepBoundary:
 			stepBoundaries = append(stepBoundaries, event)
 		case events.EventContainerAttribution, events.EventCgroupWouldBlock,
-			events.EventL7WouldBlock:
+			events.EventL7WouldBlock, events.EventL7Passed:
 			// Telemetry markers, not connection outcomes. Container/exec
 			// tagging describes no connection at all; a cgroup or L7
 			// would-block describes traffic that was NOT blocked (shadow or
 			// observe mode), so counting it as a block would overstate what
 			// the firewall did — and for l7_would_block would poison the very
-			// observe-mode measurement that gates --tls-sni=enforce. The
-			// audit log carries all three for CI assertions and blast-radius
-			// measurement; the summary renders nothing from them yet.
+			// observe-mode measurement that gates --tls-sni=enforce. An
+			// l7_passed is a flow L7 passed, so it is no block either, and
+			// never an allowlist suggestion. The audit log carries them all
+			// for CI assertions and blast-radius measurement; the summary
+			// renders nothing from them yet.
 			// (l7_blocked is a REAL enforce-mode drop and stays a regular
 			// connection outcome.)
 		default:

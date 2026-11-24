@@ -57,7 +57,7 @@ func ScopeAllowedIP(l7 L7LateRegistrar, hostname string, ip net.IP, allowPorts [
 }
 
 // L7Record is one denied L7 (SNI/Host/QUIC) adjudication reported by the
-// oracle. The caller has already resolved the punt's socket cookie to
+// oracle, or one it passed for a reason other than an allowed name (Passed). The caller has already resolved the punt's socket cookie to
 // pid/step through the same join origin records use, so an L7 denial carries
 // the identical attribution as its sibling L4 outcomes.
 type L7Record struct {
@@ -71,6 +71,9 @@ type L7Record struct {
 	L7Protocol  string // "tls" | "http" | "quic"
 	Reason      string // origin.L7Reason vocabulary
 	Enforced    bool   // true: the flow was dropped; false: observe/audit would-block
+	// Passed marks a flow L7 passed whose name no rule allows (a bare-label
+	// SNI). Reported as l7_passed; Enforced is ignored.
+	Passed bool
 	// Decorate optionally adds identity the oracle cannot know — container
 	// id/origin, supplied by pkg/containers. Nil when no decorator is wired.
 	Decorate func(*AuditEvent)
@@ -87,9 +90,14 @@ type L7Record struct {
 func ReportL7(rec L7Record, configMgr *config.Manager, auditLogger *AuditLogger,
 	notificationTracker *NotificationTracker, logger *slog.Logger,
 ) {
-	evtType := EventL7WouldBlock
-	if rec.Enforced {
-		evtType = EventL7Blocked
+	evtType, msg := EventL7WouldBlock, "L7 identity would be blocked"
+	switch {
+	case rec.Passed:
+		// Neither a drop nor a would-drop: never notified, never Blocked or
+		// WouldDeny.
+		evtType, msg, rec.Enforced = EventL7Passed, "L7 identity passed as a bare label", false
+	case rec.Enforced:
+		evtType, msg = EventL7Blocked, "L7 identity blocked"
 	}
 	var hostname string
 	if configMgr != nil {
@@ -108,17 +116,13 @@ func ReportL7(rec L7Record, configMgr *config.Manager, auditLogger *AuditLogger,
 		L7Name:      rec.Name,
 		L7Protocol:  rec.L7Protocol,
 		L7Reason:    rec.Reason,
-		WouldDeny:   !rec.Enforced,
+		WouldDeny:   !rec.Enforced && !rec.Passed,
 	}
 	if rec.Decorate != nil {
 		rec.Decorate(&audit)
 	}
 
 	if logger != nil {
-		msg := "L7 identity would be blocked"
-		if rec.Enforced {
-			msg = "L7 identity blocked"
-		}
 		logConnEvent(logger, msg, &audit,
 			"src", rec.SrcIP, "dst_ip", rec.DstIP, "dst_port", rec.DstPort,
 			"l7_protocol", rec.L7Protocol, "l7_name", rec.Name, "reason", rec.Reason)

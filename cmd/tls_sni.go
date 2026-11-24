@@ -134,10 +134,11 @@ func (f *l7Feature) registrar() events.L7LateRegistrar {
 	return r
 }
 
-// l7Sink adapts denied oracle outcomes onto the shared reporting helper. Only
-// denials are reported: an l7_blocked when the flow was dropped, or an
-// l7_would_block when observe mode or audit posture passed it. Admitted flows
-// produce no per-flow record — the kernel stats already count them. The punt's
+// l7Sink adapts denied oracle outcomes onto the shared reporting helper:
+// an l7_blocked when the flow was dropped, or an l7_would_block when observe
+// mode or audit posture passed it. Admitted flows produce no per-flow record
+// (the kernel stats already count them), except a bare-label pass, reported
+// as l7_passed because no rule names what it admitted. The punt's
 // socket cookie resolves to pid/step through the same join origin records use,
 // so an L7 denial carries the identical attribution as its sibling L4 outcomes.
 func l7Sink(obs *origin.Observer, enricher *containers.Enricher, configMgr *config.Manager,
@@ -148,7 +149,8 @@ func l7Sink(obs *origin.Observer, enricher *containers.Enricher, configMgr *conf
 		// Admitted flows produce no record — except one the per-IP binding
 		// WOULD have denied, which is the measurement deciding whether pinning
 		// is safe to turn on.
-		if o.Allowed && !o.WouldNarrow {
+		passed := o.Reason == origin.L7BareLabel
+		if o.Allowed && !o.WouldNarrow && !passed {
 			return
 		}
 		pid, ordinal := obs.ResolveCookie(o.Cookie)
@@ -165,6 +167,7 @@ func l7Sink(obs *origin.Observer, enricher *containers.Enricher, configMgr *conf
 			// A would-narrow passed the packet whatever the posture, so it
 			// reports as telemetry, never as a drop that happened.
 			Enforced: o.Enforce && !o.WouldNarrow,
+			Passed:   passed,
 			Decorate: func(audit *events.AuditEvent) {
 				enricher.DecorateVerdict(audit, origin.Record{
 					Cookie:   o.Cookie,

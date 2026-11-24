@@ -148,7 +148,7 @@ func TestBindingEvidenceIsBounded(t *testing.T) {
 		cm.RecordForwardResolution(fmt.Sprintf("host%d.wildcard.example", i), edge)
 	}
 	cm.bindMu.Lock()
-	n := len(cm.nameToIPs)
+	n := len(cm.bindings.byName)
 	cm.bindMu.Unlock()
 	if n > maxBindingNames {
 		t.Errorf("nameToIPs grew to %d, want <= %d", n, maxBindingNames)
@@ -159,7 +159,7 @@ func TestBindingEvidenceIsBounded(t *testing.T) {
 		cm2.RecordForwardResolution("rr.example", fmt.Sprintf("10.0.%d.%d", i/256, i%256))
 	}
 	cm2.bindMu.Lock()
-	m := len(cm2.nameToIPs["rr.example"].ips)
+	m := len(cm2.bindings.byName["rr.example"].ips)
 	cm2.bindMu.Unlock()
 	if m > maxBindingIPsPerName {
 		t.Errorf("per-name IPs grew to %d, want <= %d", m, maxBindingIPsPerName)

@@ -80,6 +80,9 @@ while L7 runs, so a step's installs are always scoped; under
 `--tls-sni=observe`, which drops nothing, a bound step's exposure at a shared
 edge address is the job's own there, no more.
 
+A single-label SNI no tier allows can still pass at a public address an
+allowed name resolved to; see Bare-label SNI below.
+
 A duplicate-SNI hello (two `server_name` extensions, or two `host_name` list
 entries) is rejected as malformed rather than resolved first- or last-wins:
 with two names in flight, the enforcer and the server could pick different
@@ -421,6 +424,59 @@ that name, so the dimension is **always measured and separately gated**: with
 `name_not_at_ip` and drops nothing. That rate is what decides whether
 `=enforce-pinned` is safe to enable; enabling it only turns the would-narrow
 outcome into a deny.
+
+## Bare-label SNI
+
+Some clients dial a dedicated host by address and present an opaque
+per-machine label as the SNI. Depot's CLI does this: its API hands back a
+builder's address and a `ServerName` such as `kq563vfqzm`, and the CLI dials
+the address over mutual TLS with that label. No rule can name the label, and
+it changes per machine, so every such flow to a scoped builder address was
+denied `name_mismatch`.
+
+`config.L7Policy.MatchName` passes one as `bare_label` when the presented name
+matches none of the allow tiers, no deny rule covers it on this port, and all
+of these hold (`bareLabelAdmitted`):
+
+1. it is a single label: no dot (pkg/sni has already lowercased it and
+   stripped a trailing dot);
+2. it is a TLS or QUIC SNI, not an HTTP Host (`L7Request.SNI`, set by the
+   oracle from the flow's parsed protocol);
+3. the destination is globally routable: not private, loopback, link-local,
+   unique-local or carrier-grade NAT (`config.LocalAddress`);
+4. some name the binding store holds for this destination is allowed on this
+   port and protocol by the tiers a presented name goes through: the job's
+   rules (and not denied by them on this port), the derived CNAME set, or the
+   flow's step policy (`Manager.BoundNameAllowed`, over a reverse index of the
+   binding store kept in step at every write and eviction).
+
+The argument is the one pinning rests on: a shared edge routes by the
+presented DNS name, and a bare label names no tenant there, while condition 4
+means the address itself is one an allowed name forward-resolved to. A bare
+label a hostname rule names goes through the ordinary tiers, a dotted name
+that matches nothing is still `name_mismatch`, and `no_name` and `ech` are
+unchanged. Reverse names still mint no binding evidence, so an address
+known only by a confirmed reverse name cannot satisfy condition 4 (and is not
+scoped in the first place).
+
+Conditions 2 and 3 go beyond what the issue asked for, deliberately. A
+plain-HTTP shared edge can route a single-label Host to another tenant (an
+S3 website endpoint serves the bucket the Host names), so the Host dimension
+keeps the old behaviour. Inside a private network a shared ingress commonly
+serves single-label virtual hosts (`vault`, `grafana`) routed by SNI;
+admitting a bare label there would reopen exactly the swap this layer closes.
+
+The pass is reported, since no rule names what it admitted: an `l7_passed`
+audit record with `l7_reason=bare_label`, the presented label in `l7_name`
+and the usual identity fields, and one Info line in the ops log. It is
+telemetry in every posture, never a block or a would-block: the audit
+normalization leaves `blocked`/`would_deny` false, the summary neither counts
+nor pushes it nor suggests it, and OTLP skips it as it skips `l7_would_block`.
+
+What it leaves open: at a public address an allowed name resolved to, any
+bare label passes, so a server there that routes by single-label SNI could be
+reached by a label the policy never named. That is a host-local routing
+choice of a server the policy already trusts by name, not a shared edge's.
 
 ## Residual risk, stated honestly
 

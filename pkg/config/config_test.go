@@ -1913,9 +1913,10 @@ func TestAddSearchDomains_KeepsValidSkipsInvalid(t *testing.T) {
 	cm := NewConfigManager()
 	cm.config = &FirewallConfig{}
 	// ".com" is invalid (a public suffix) — it should be skipped while
-	// ".compute.internal" is still added. User-supplied config paths
-	// (proto/JSON/env) still fail-loud via validateSearchDomains; only the
-	// in-process auto-allow path is tolerant.
+	// ".compute.internal" is still added. The local file and env paths
+	// still fail loud via validateSearchDomains; the in-process auto-allow
+	// path and the CodeCargo policy loader (filterPolicySearchDomains) drop
+	// per entry.
 	cm.AddSearchDomains([]string{".compute.internal", ".com"}, slog.Default())
 
 	got := cm.GetSearchDomains()

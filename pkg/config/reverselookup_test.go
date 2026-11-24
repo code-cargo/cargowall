@@ -173,17 +173,19 @@ func TestSearchDomainsUnderReverseZonesDropped(t *testing.T) {
 	}))
 	assert.False(t, cm.IsAuditMode(), "the policy loads, enforcing")
 	assert.Equal(t, []string{".corp.internal"}, cm.GetSearchDomains())
+	// The policy loader reports its reverse-zone drops with its others, on
+	// one line.
 	ws := warns(*logs)
-	require.Len(t, ws, len(reverse))
-	for _, w := range ws {
-		assert.Contains(t, w, dropped)
-	}
+	require.Len(t, ws, 1)
+	assert.Contains(t, ws[0], "count=3")
+	assert.Contains(t, ws[0], "under a reverse-lookup zone")
 
 	*logs = nil
 	cm = NewConfigManager()
 	require.NoError(t, cm.LoadConfig(writeJSONConfig(t, `{"defaultAction": "deny", "searchDomains": [".corp.internal", ".100.51.198.in-addr.arpa"]}`)))
 	assert.Equal(t, []string{".corp.internal"}, cm.GetSearchDomains())
-	assert.Len(t, warns(*logs), 1)
+	require.Len(t, warns(*logs), 1)
+	assert.Contains(t, warns(*logs)[0], dropped, "the local file keeps its own line per entry")
 
 	*logs = nil
 	t.Setenv("CARGOWALL_SEARCH_DOMAINS", ".corp.internal,.ip6.arpa")

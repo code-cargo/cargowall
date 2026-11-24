@@ -17,8 +17,10 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
-	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -31,34 +33,64 @@ import (
 // and CARGOWALL_SEARCH_DOMAINS are written by the operator of this one run,
 // where a typo should stop the run instead; they keep validateSearchDomains.
 
-// filterPolicySearchDomains returns the normalized domains that
-// validateSearchDomain accepts, in order. An always-active Kubernetes
-// suffix is dropped at Info, since stripping it happens anyway; every other
-// refused entry is dropped, and all of them are named with their reasons on
-// one Warn line (Warn lines become job annotations, so one per entry would
-// flood the job).
-func filterPolicySearchDomains(domains []string) []string {
-	var kept, alwaysActive, dropped []string
-	for _, d := range domains {
-		// Tested first: validateSearchDomain refuses this class with the
-		// same error type as a real misconfiguration.
-		if slices.Contains(kubernetesSearchDomains, d) {
+// maxReportedSearchDomains caps the entries one report line names, so a
+// policy merged across levels with dozens of refused entries still makes a
+// readable annotation; the rest are counted.
+const maxReportedSearchDomains = 10
+
+// filterPolicySearchDomains normalizes a CodeCargo policy's search domains
+// and returns those validateSearchDomain accepts, in order, with report,
+// which logs what was dropped. The caller calls report only once the policy
+// has loaded, so a line never says a policy applies that then fails to.
+//
+// An always-active Kubernetes suffix is reported at Info, since stripping it
+// happens anyway. Every other drop, an entry under a reverse-lookup zone
+// included, shares one Warn line, each entry with a short reason: Warn lines
+// become job annotations, so one per entry would flood the job.
+func filterPolicySearchDomains(raw []string) (kept []string, report func()) {
+	var alwaysActive, dropped []string
+	for _, d := range normalizeSearchDomainsKeepingReverse(raw) {
+		if ReverseLookupName(d) {
+			dropped = append(dropped, strconv.Quote(d)+": under a reverse-lookup zone, which no search domain decides")
+			continue
+		}
+		err := validateSearchDomain(d)
+		switch {
+		case err == nil:
+			kept = append(kept, d)
+		case errors.Is(err, errSearchDomainAlwaysActive):
 			alwaysActive = append(alwaysActive, d)
-			continue
+		default:
+			dropped = append(dropped, strconv.Quote(d)+": "+searchDomainClass(err))
 		}
-		if err := validateSearchDomain(d); err != nil {
-			dropped = append(dropped, err.Error())
-			continue
+	}
+	return kept, func() {
+		if len(alwaysActive) > 0 {
+			slog.Info("Search domains in the CodeCargo policy are dropped: they are always active for stripping",
+				"domains", alwaysActive)
 		}
-		kept = append(kept, d)
+		if len(dropped) > 0 {
+			slog.Warn("Search domains in the CodeCargo policy are dropped; the rest of the policy loaded",
+				"count", len(dropped), "dropped", cappedList(dropped))
+		}
 	}
-	if len(alwaysActive) > 0 {
-		slog.Info("Search domains in the CodeCargo policy are dropped: they are always active for stripping",
-			"domains", alwaysActive)
+}
+
+// searchDomainClass is err's short reason: its class, or the whole message
+// for an error validateSearchDomain did not classify.
+func searchDomainClass(err error) string {
+	var sd *searchDomainError
+	if errors.As(err, &sd) {
+		return sd.class.Error()
 	}
-	if len(dropped) > 0 {
-		slog.Warn("Search domains in the CodeCargo policy are dropped; the rest of the policy applies",
-			"count", len(dropped), "dropped", strings.Join(dropped, "; "))
+	return err.Error()
+}
+
+// cappedList joins entries, naming at most maxReportedSearchDomains.
+func cappedList(entries []string) string {
+	if len(entries) <= maxReportedSearchDomains {
+		return strings.Join(entries, "; ")
 	}
-	return kept
+	return strings.Join(entries[:maxReportedSearchDomains], "; ") +
+		fmt.Sprintf("; and %d more", len(entries)-maxReportedSearchDomains)
 }

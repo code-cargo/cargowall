@@ -30,7 +30,6 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
-	"golang.org/x/sys/unix"
 
 	"github.com/code-cargo/cargowall/bpf"
 	"github.com/code-cargo/cargowall/pkg/config"
@@ -143,7 +142,9 @@ type l7flow struct {
 // onSample accumulates one punt into its flow's reassembly buffer and, once
 // the handshake is complete, adjudicates it and writes the verdict back. The
 // QUIC decrypt runs under l.mu, in accumulate, so a stale punt is dropped
-// before paying for it; this goroutine is the mutex's only contended locker.
+// before paying for it. The verdict re-check's workers also take l.mu, for
+// the length of one map lookup and one update each (l7_recheck.go), so a
+// repair can wait behind a decrypt, and this goroutine behind a repair.
 func (l *L7) onSample(ev *bpf.L7Event) {
 	// An identity-gate refusal record: report-only. The kernel already
 	// answered the packet and parked nothing, so there is no cycle to open.
@@ -224,7 +225,7 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 	st.verdict = l7FlowState(out.Allowed)
 	l.cycles++
 	st.gen = l.cycles
-	recheck := l7Recheck{key: fk, verdict: st.verdict, seq: ev.Seq, punted: ev.Timestamp, gen: st.gen}
+	recheck := l7Recheck{key: fk, verdict: st.verdict, seq: ev.Seq, gen: st.gen}
 	// The QUIC connection-attempt identity the verdict pins, taken from the
 	// kernel-extracted event field so there is exactly ONE decoder of the
 	// Initial's long header. Stamped with BOTH verdicts: on ALLOWED so the
@@ -245,9 +246,9 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 	l.finish(ev, flowProto, out, dcid)
 	// TCP only: a QUIC retransmit is never deduplicated, so it re-punts and
 	// reassertVerdict repairs a clobbered verdict from it.
-	if ev.IpProto == unix.IPPROTO_TCP {
+	if ev.Flags&l7PuntQUIC == 0 {
 		recheck.written = time.Now()
-		l.queueRecheck(recheck)
+		l.rechecks.queue(recheck)
 	}
 }
 

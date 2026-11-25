@@ -135,13 +135,9 @@ type L7 struct {
 	// cycles numbers decided cycles (l7flow.gen), under mu.
 	cycles uint64
 
-	// recheckCh feeds the verdict re-check (l7_recheck.go); nil when the
-	// oracle is driven synchronously. recheckDone closes when both stages
-	// have exited.
-	recheckCh        chan l7Recheck
-	recheckDone      chan struct{}
-	recheckDropped   atomic.Uint64
-	verdictsRepaired atomic.Uint64
+	// rechecks is the verdict re-check (l7_recheck.go); nil when the oracle
+	// is driven synchronously, and then onSample queues none.
+	rechecks *l7Rechecker
 
 	// sinkCh decouples sink invocations (audit encode+fsync, procfs reads)
 	// from the ringbuf reader: a burst of denials must never stall the reader
@@ -185,12 +181,7 @@ func (l *L7) start() error {
 	l.reader = rd
 	l.sinkCh = make(chan L7Outcome, 512)
 	l.sinkDone = make(chan struct{})
-	l.recheckCh = make(chan l7Recheck, l7RecheckQueue)
-	second := make(chan l7Recheck, l7RecheckQueue)
-	firstDone, secondDone := make(chan struct{}), make(chan struct{})
-	l.recheckDone = secondDone
-	go l.recheckLoop(l.recheckCh, l7RecheckFirst, second, firstDone)
-	go l.recheckLoop(second, l7RecheckSecond, nil, secondDone)
+	l.rechecks = newL7Rechecker(l, l7RecheckDelays, l7RecheckQueue)
 	go l.sinkLoop()
 	go l.run()
 	return nil
@@ -417,10 +408,7 @@ func (l *L7) close() {
 		close(l.sinkCh)
 		<-l.sinkDone
 	}
-	if l.recheckCh != nil {
-		close(l.recheckCh) // run() was its only sender
-		<-l.recheckDone
-	}
+	l.rechecks.stop() // run() was its only producer and has exited
 	if n := l.sinkDropped.Load(); n > 0 && l.logger != nil {
 		l.logger.Warn("L7 outcome reports dropped by a saturated sink", "dropped", n)
 	}
@@ -465,7 +453,7 @@ func (l *L7) logStats() {
 	puntDropped, budget := sum(l7StatPuntDropped), sum(l7StatBudget)
 	gateRefused, pendingNoID := sum(l7StatGateRefused), sum(l7StatPendingNoID)
 	gateNoState := sum(l7StatGateNoState)
-	l.logger.Info("L7 oracle closed",
+	attrs := []any{
 		"punts", sum(l7StatPunt), "punts_dropped_ring_full", puntDropped,
 		"quic_punts", sum(l7StatQUIC), "budget_exhausted", budget,
 		"allowed", sum(l7StatAllowed), "denied", sum(l7StatDenied),
@@ -478,11 +466,12 @@ func (l *L7) logStats() {
 		// identity and were PASSED rather than refused. Reported so the
 		// widened scope's residual is visible next to the refusals.
 		"alt_port_ungated", sum(l7StatAltUngated),
-		// TCP verdicts the kernel's commit of the punt they answered wrote
-		// PENDING over, written again by the re-check (l7_recheck.go); and
-		// re-checks a full queue dropped.
-		"verdicts_repaired", l.verdictsRepaired.Load(),
-		"verdict_rechecks_dropped", l.recheckDropped.Load())
+	}
+	// The verdict re-check (l7_recheck.go): TCP verdicts the kernel's commit
+	// of the punt they answered wrote PENDING over and the re-check wrote
+	// again; such entries found with no oracle record to repair them from;
+	// and re-checks a full queue dropped, before their first read and after.
+	l.logger.Info("L7 oracle closed", append(attrs, l.rechecks.statsAttrs()...)...)
 	if puntDropped > 0 || budget > 0 {
 		l.logger.Warn("L7 flows were dropped without an audit record "+
 			"(full punt ring or exhausted punt budget fails closed in enforce)",

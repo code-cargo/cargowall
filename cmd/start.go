@@ -394,24 +394,12 @@ func startCargoWall(cmd *StartCmd, hooks *StartHooks, teardowns *teardownList) e
 			return err
 		}
 	} else if hooks != nil && hooks.LoadPolicy != nil {
-		// Extension hook: load policy from external source (e.g., NATS state machine)
-		policy, hookSmClient, cleanup, err := hooks.LoadPolicy(ctx, cmd)
+		hookSmClient, cleanup, err := loadHookPolicy(ctx, cmd, hooks, configMgr, auditLogger)
 		if err != nil {
-			return fmt.Errorf("failed to load policy via hook: %w", err)
+			return err
 		}
 		if cleanup != nil {
 			defer cleanup()
-		}
-
-		if policy != nil {
-			if err := configMgr.LoadConfigFromCargoWall(policy); err != nil {
-				return fmt.Errorf("failed to load CargoWall config: %w", err)
-			}
-			// LoadConfigFromCargoWall mapped the policy's mode onto the
-			// manager's posture; re-sync the logger's event labeling.
-			if auditLogger != nil {
-				auditLogger.SetAuditMode(configMgr.IsAuditMode())
-			}
 		}
 
 		if hookSmClient != nil {

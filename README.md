@@ -123,7 +123,7 @@ Each user-configured suffix has two effects:
 
 Matching is case-insensitive; when configured suffixes overlap, the longest match wins. The Kubernetes suffixes (`.cluster.local`, `.svc.cluster.local`, `.default.svc.cluster.local`) are always active for stripping only — they don't grant the filter bypass, so K8s service names must still match a hostname rule after stripping.
 
-Suffixes must have at least two labels **and** must not themselves be public suffixes per [Mozilla's PSL](https://publicsuffix.org/); `.com`, `.co.uk`, `.com.au`, `.github.io`, and similar TLD-equivalents are rejected at config load.
+Suffixes must have at least two labels **and** must not themselves be public suffixes per [Mozilla's PSL](https://publicsuffix.org/); `.com`, `.co.uk`, `.com.au`, `.github.io`, and similar TLD-equivalents are rejected, and so are the Kubernetes suffixes above. In a local config file or `CARGOWALL_SEARCH_DOMAINS`, one such entry fails the load. In a CodeCargo policy, whose search domains merge down from the organization to the job, each such entry is dropped and the rest of the policy loads: one Warn line names the dropped entries and why, and a Kubernetes suffix, which is active anyway, is dropped at Info.
 
 The runner's own `resolv.conf` search list is honoured automatically, for **stripping only**: a stub resolver asks `myservice.corp.lan` before `myservice` on a host with `search corp.lan`, so that expanded form is judged as `myservice`. It never grants the bypass — `resolv.conf` is written by DHCP, not by you — and public suffixes on it are ignored. It is read when the proxy starts, and it is an *additional* form to match, so a host suffix never displaces the form your rules already match through the Kubernetes or configured suffixes.
 

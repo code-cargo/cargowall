@@ -258,7 +258,9 @@ func TestReportedSearchDomain(t *testing.T) {
 	blank := reportedSearchDomain(strings.Repeat(" ", 5000))
 	assert.Equal(t, strconv.Quote(strings.Repeat(" ", maxReportedSearchDomainLen))+"…", blank)
 	tabs := reportedSearchDomain(strings.Repeat("\t", 5000))
-	assert.Less(t, len(tabs), 3*maxReportedSearchDomainLen)
+	assert.LessOrEqual(t, len(tabs), 4*maxReportedSearchDomainLen+5)
+	binary := reportedSearchDomain(strings.Repeat("\xff", 5000))
+	assert.LessOrEqual(t, len(binary), 4*maxReportedSearchDomainLen+5, "the stated bound holds for the worst escape")
 	// "é" is two bytes; one straddles the cut.
 	wide := strings.Repeat("a", maxReportedSearchDomainLen-1) + "é" + "b.example"
 	got := reportedSearchDomain(wide)
@@ -293,4 +295,21 @@ func TestReverseZoneSearchDomainDroppedByLocalLoaders(t *testing.T) {
 	require.Len(t, ws, 1)
 	assert.Contains(t, ws[0], "Skipping invalid auto-added search domain")
 	assert.Contains(t, ws[0], "under a reverse-lookup zone")
+}
+
+// An entry repeated down the merge chain is named once, so repeats don't
+// use up the cap.
+func TestLoadConfigFromCargoWall_SearchDomainRepeatsCollapsed(t *testing.T) {
+	logs := captureLogs(t)
+	domains := []string{"corp", "corp", "corp", "co.uk", "co.uk"}
+	for i := 0; i < maxReportedSearchDomains; i++ {
+		domains = append(domains, "corp")
+	}
+	require.NoError(t, NewConfigManager().LoadConfigFromCargoWall(enforcingPolicy(domains...)))
+	ws := warns(*logs)
+	require.Len(t, ws, 1)
+	assert.Contains(t, ws[0], "count=2")
+	assert.Equal(t, 1, strings.Count(ws[0], `\"corp\": a single label`))
+	assert.Contains(t, ws[0], `\"co.uk\": a public suffix`)
+	assert.NotContains(t, ws[0], "more")
 }

@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -110,6 +111,15 @@ func TestLoadHookPolicy_RefusedSearchDomainStillLoadsPolicy(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to load CargoWall config")
 	assert.Equal(t, 1, cleaned)
+
+	// The hook itself fails, with a cleanup beside the error: it runs.
+	hooks.LoadPolicy = func(context.Context, *StartCmd) (*cargowallv1pb.CargoWallPolicy, events.StateMachineClient, func(), error) {
+		return nil, nil, func() { cleaned++ }, errors.New("state machine unreachable")
+	}
+	_, _, err = loadHookPolicy(context.Background(), &StartCmd{}, hooks, config.NewConfigManager(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to load policy via hook")
+	assert.Equal(t, 2, cleaned)
 }
 
 // Under --github-action the Warn is written by GitHubActionsHandler, which

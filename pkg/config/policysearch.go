@@ -19,6 +19,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -62,9 +63,11 @@ func filterPolicySearchDomains(raw []string) (kept []string, report func()) {
 		case searchDomainOK:
 			kept = append(kept, d)
 		case searchDomainAlwaysActive:
-			alwaysActive = append(alwaysActive, reportedSearchDomain(r))
+			alwaysActive = appendNew(alwaysActive, reportedSearchDomain(r))
 		default:
-			dropped = append(dropped, reportedSearchDomain(r)+": "+c.String())
+			// An entry repeated down the merge chain is named once, so
+			// repeats don't use up the cap.
+			dropped = appendNew(dropped, reportedSearchDomain(r)+": "+c.String())
 		}
 	}
 	kept = mergeNormalizedSearchDomains(nil, kept)
@@ -80,9 +83,19 @@ func filterPolicySearchDomains(raw []string) (kept []string, report func()) {
 	}
 }
 
+// appendNew appends s unless entries already holds it.
+func appendNew(entries []string, s string) []string {
+	if slices.Contains(entries, s) {
+		return entries
+	}
+	return append(entries, s)
+}
+
 // reportedSearchDomain is an entry as the operator wrote it, quoted so its
-// bounds and any whitespace show, and shortened to at most
-// maxReportedSearchDomainLen bytes at a rune boundary.
+// bounds and any whitespace show: at most maxReportedSearchDomainLen bytes of
+// it, cut at a rune boundary, which strconv.Quote then escapes to at most
+// four bytes each (\xNN), so a reported entry is at most
+// 4*maxReportedSearchDomainLen+5 bytes, the quotes and "…" included.
 func reportedSearchDomain(raw string) string {
 	if len(raw) <= maxReportedSearchDomainLen {
 		return strconv.Quote(raw)

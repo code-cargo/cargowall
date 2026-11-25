@@ -35,6 +35,9 @@ func loadHookPolicy(ctx context.Context, cmd *StartCmd, hooks *StartHooks, confi
 ) (events.StateMachineClient, func(), error) {
 	policy, smClient, cleanup, err := hooks.LoadPolicy(ctx, cmd)
 	if err != nil {
+		if cleanup != nil {
+			cleanup()
+		}
 		return nil, nil, fmt.Errorf("failed to load policy via hook: %w", err)
 	}
 	if policy == nil {

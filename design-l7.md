@@ -37,6 +37,50 @@ will never accept) it copies to a ringbuf and, under enforce, drops. The oracle
 the recovered name against policy, and writes the verdict into `map_l7_flow`;
 the client's retransmit is then admitted or dropped by the kernel.
 
+**A verdict can land while the kernel is still committing the punt it
+answers.** The kernel submits a punt, then `l7_commit_pending` looks the flow
+entry up and writes `PENDING` unless it finds a terminal verdict; a verdict
+landing between that lookup and the update is overwritten. The kernel's
+re-lookup narrows that window and can't close it. For QUIC the oracle repairs
+it already: a retransmitted Initial is never deduplicated, so it re-punts and
+the oracle re-asserts the decided verdict (`reassertVerdict`). A TCP retransmit
+has the punt's sequence number and length, so the kernel deduplicates it and
+nothing reaches the oracle: the connection stalled with every retransmit
+dropped, about one fresh connection in 1,300 in a VM stress run. So after
+writing a TCP verdict the oracle reads the entry back about 5 ms, 150 ms and a
+second later (`pkg/origin/l7_recheck.go`): the clobbering update follows within
+the rest of one run of the kernel program, a client's first retransmit comes no
+sooner than 200 ms, and the last read catches a commit delayed by a preempted
+or starved vCPU before the client's later retransmits. It writes the verdict
+again only when the entry is `PENDING` with the deciding punt's sequence number
+(so it is that punt's own commit, and no further punt is on its way) and the
+oracle's record for the flow is still the cycle that decided it, or is gone,
+evicted from a full table: a punt processed since would have made a new one.
+The first read is unlocked, since nearly every one finds the verdict in place;
+one showing the deciding punt's `PENDING` takes the oracle's lock, reads again,
+checks the record and writes under it, so no later cycle is decided in between.
+Under observe nothing is queued: the kernel passes a `PENDING` flow's packets
+there, and its next segment re-punts. Anything else is left alone: a
+`NEED_HELLO` belongs to a later connection of the socket, and a `PENDING` of
+another sequence number to a later connection or a later segment of this one,
+whose stale punt the re-assert path handles; the old verdict on a later
+connection's entry would admit a first flight nobody adjudicated. Each stage's
+queue is bounded by how long entries stay in it (16,384 verdicts a second times
+its span, at least 1,024) and never blocks the punt reader. No kernel change
+was needed, so no verifier budget is spent.
+
+This narrows the race to what it cannot reach, and those residuals are counted
+rather than silent: a commit delayed past the last read still strands its
+connection; a read or repair write that fails (other than a missing entry,
+which is an eviction) is counted `verdict_rechecks_failed`, warned once, and
+read again at the next stage while there is one; a re-check a full queue drops
+is counted `verdict_rechecks_dropped_unchecked` or `_checked` and warned once;
+and a later connection's SYN or punt landing between the read and the write, a
+window of one map update, is the same one `writeFlowState` leaves.
+`verdicts_repaired` counts the repairs, `verdict_rechecks_unowned` those of
+them made with no oracle record left, on the oracle's teardown line with the
+others.
+
 **There is deliberately no in-kernel name match.** An earlier inline TLS fast
 path over a name-keyed allow map was removed: a no-expiry kernel name cache is
 a weaker second copy of the matcher, and every lifecycle it lacked — derived

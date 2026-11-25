@@ -128,17 +128,23 @@ type l7flow struct {
 	decided bool
 	// verdict and dcid are what writeFlowState stamped, kept so a stale punt
 	// that clobbered the kernel entry back to PENDING can re-assert instead of
-	// stranding the flow (see l7_commit_pending for the race the kernel
-	// narrows but cannot close).
-	verdict  uint8
-	dcid     []byte
+	// stranding the flow. A clobber by the commit of the deciding punt itself
+	// sends no stale punt for TCP; the verdict re-check repairs that one
+	// (l7_recheck.go).
+	verdict uint8
+	dcid    []byte
+	// gen numbers the decided cycle, so a re-check can tell the cycle it
+	// checks from a later one that reached the same verdict.
+	gen      uint64
 	lastSeen time.Time
 }
 
 // onSample accumulates one punt into its flow's reassembly buffer and, once
 // the handshake is complete, adjudicates it and writes the verdict back. The
 // QUIC decrypt runs under l.mu, in accumulate, so a stale punt is dropped
-// before paying for it; this goroutine is the mutex's only contended locker.
+// before paying for it. The verdict re-check's workers also take l.mu, for
+// the length of one map lookup and one update each (l7_recheck.go), so a
+// repair can wait behind a decrypt, and this goroutine behind a repair.
 func (l *L7) onSample(ev *bpf.L7Event) {
 	// An identity-gate refusal record: report-only. The kernel already
 	// answered the packet and parked nothing, so there is no cycle to open.
@@ -217,6 +223,9 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 	// assembler; the TTL sweep collects the entry.
 	st.decided = true
 	st.verdict = l7FlowState(out.Allowed)
+	l.cycles++
+	st.gen = l.cycles
+	recheck := l7Recheck{key: fk, verdict: st.verdict, seq: ev.Seq, gen: st.gen}
 	// The QUIC connection-attempt identity the verdict pins, taken from the
 	// kernel-extracted event field so there is exactly ONE decoder of the
 	// Initial's long header. Stamped with BOTH verdicts: on ALLOWED so the
@@ -235,6 +244,14 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 	l.mu.Unlock()
 
 	l.finish(ev, flowProto, out, dcid)
+	// TCP only: a QUIC retransmit is never deduplicated, so it re-punts and
+	// reassertVerdict repairs a clobbered verdict from it. And not in
+	// observe mode, where the kernel passes a PENDING flow's packets and its
+	// next segment re-punts, so a clobbered verdict strands nothing.
+	if ev.Flags&(l7PuntQUIC|l7PuntObserve) == 0 {
+		recheck.written = time.Now()
+		l.rechecks.queue(recheck)
+	}
 }
 
 // eventDCID returns the sample's QUIC connection-attempt identity, or nil for
@@ -503,7 +520,9 @@ func refusalReason(ev *bpf.L7Event) L7Reason {
 // already assembled and stall its handshake until the client retransmits. The
 // lookup narrows the race the same way the kernel's commit re-lookup does;
 // neither closes it, and the converging repin/re-assert cycle repairs the
-// remainder. TCP verdicts carry no DCID and always re-assert.
+// remainder. TCP verdicts carry no DCID and always re-assert. A TCP verdict
+// clobbered by the commit of the deciding punt itself is repaired by the
+// verdict re-check (l7_recheck.go), since no stale punt follows it.
 func (l *L7) reassertVerdict(key bpf.OriginBpfL7FlowKey, state uint8, dcid []byte, punted uint64) error {
 	if len(dcid) > 0 {
 		var cur bpf.OriginBpfL7FlowVal

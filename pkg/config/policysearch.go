@@ -19,9 +19,9 @@ package config
 import (
 	"fmt"
 	"log/slog"
-	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // A CodeCargo policy's search domains are merged down the org, repository,
@@ -71,7 +71,7 @@ func filterPolicySearchDomains(raw []string) (kept []string, report func()) {
 	return kept, func() {
 		if len(alwaysActive) > 0 {
 			slog.Info("Search domains in the CodeCargo policy are dropped: they are always active for stripping",
-				"domains", alwaysActive)
+				"domains", cappedList(alwaysActive))
 		}
 		if len(dropped) > 0 {
 			slog.Warn("Search domains in the CodeCargo policy are dropped; the rest of the policy loaded",
@@ -80,24 +80,28 @@ func filterPolicySearchDomains(raw []string) (kept []string, report func()) {
 	}
 }
 
-// reportedSearchDomain is an entry as the operator wrote it, shortened to
-// maxReportedSearchDomainLen bytes, and `""` for an empty one.
+// reportedSearchDomain is an entry as the operator wrote it, quoted so its
+// bounds and any whitespace show, and shortened to at most
+// maxReportedSearchDomainLen bytes at a rune boundary.
 func reportedSearchDomain(raw string) string {
-	if strings.TrimSpace(raw) == "" {
+	if len(raw) <= maxReportedSearchDomainLen {
 		return strconv.Quote(raw)
 	}
-	if len(raw) > maxReportedSearchDomainLen {
-		return raw[:maxReportedSearchDomainLen] + "…"
+	n := maxReportedSearchDomainLen
+	for n > 0 && !utf8.RuneStart(raw[n]) {
+		n-- // never cut a rune in two
 	}
-	return raw
+	return strconv.Quote(raw[:n]) + "…"
 }
 
-// cappedList is entries with at most maxReportedSearchDomains named and the
-// rest counted.
-func cappedList(entries []string) []string {
+// cappedList joins entries with "; ", naming at most
+// maxReportedSearchDomains and counting the rest. One string, not a list:
+// the GitHub Actions handler prints a list with %v, space-separated, which
+// can't be told from the spaces inside an entry.
+func cappedList(entries []string) string {
 	if len(entries) <= maxReportedSearchDomains {
-		return entries
+		return strings.Join(entries, "; ")
 	}
-	return append(slices.Clone(entries[:maxReportedSearchDomains]),
-		fmt.Sprintf("and %d more", len(entries)-maxReportedSearchDomains))
+	return strings.Join(entries[:maxReportedSearchDomains], "; ") +
+		fmt.Sprintf("; and %d more", len(entries)-maxReportedSearchDomains)
 }

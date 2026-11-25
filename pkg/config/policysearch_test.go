@@ -18,8 +18,11 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -68,7 +71,7 @@ func TestLoadConfigFromCargoWall_InvalidSearchDomainDropped(t *testing.T) {
 
 	ws := warns(*logs)
 	require.Len(t, ws, 1)
-	assert.Contains(t, ws[0], "corp: a single label", "the Warn names the entry and its reason")
+	assert.Contains(t, ws[0], `\"corp\": a single label`, "the Warn names the entry and its reason")
 	assert.Contains(t, ws[0], "the rest of the policy loaded")
 }
 
@@ -124,7 +127,7 @@ func TestLoadConfigFromCargoWall_SearchDomainDropClasses(t *testing.T) {
 			}
 		}
 		require.Len(t, dropped, 1)
-		assert.Contains(t, dropped[0], "domains=[svc.cluster.local]", "as the operator wrote it")
+		assert.Contains(t, dropped[0], `domains="\"svc.cluster.local\""`, "as the operator wrote it")
 	})
 
 	t.Run("all together", func(t *testing.T) {
@@ -135,7 +138,7 @@ func TestLoadConfigFromCargoWall_SearchDomainDropClasses(t *testing.T) {
 		assert.Equal(t, []string{".compute.internal"}, cm.GetSearchDomains())
 		ws := warns(*logs)
 		require.Len(t, ws, 1, "one Warn covers every refused entry")
-		for _, d := range []string{"corp: a single label", "home.arpa: a public suffix", "co.uk: a public suffix"} {
+		for _, d := range []string{`\"corp\": a single label`, `\"home.arpa\": a public suffix`, `\"co.uk\": a public suffix`} {
 			assert.Contains(t, ws[0], d)
 		}
 		assert.Contains(t, ws[0], "count=3")
@@ -175,7 +178,7 @@ func TestLoadConfigFromCargoWall_ReverseZoneAndRefusedShareOneWarn(t *testing.T)
 	ws := warns(*logs)
 	require.Len(t, ws, 1, "one Warn for every drop: %v", ws)
 	assert.Contains(t, ws[0], "count=4")
-	for _, d := range []string{"10.in-addr.arpa: under", "168.192.in-addr.arpa: under", "ip6.arpa: under", "corp: a single label"} {
+	for _, d := range []string{`\"10.in-addr.arpa\": under`, `\"168.192.in-addr.arpa\": under`, `\"ip6.arpa\": under`, `\"corp\": a single label`} {
 		assert.Contains(t, ws[0], d)
 	}
 }
@@ -193,8 +196,8 @@ func TestLoadConfigFromCargoWall_SearchDomainWarnIsCapped(t *testing.T) {
 	require.Len(t, ws, 1)
 	assert.Contains(t, ws[0], fmt.Sprintf("count=%d", maxReportedSearchDomains+5))
 	assert.Contains(t, ws[0], "and 5 more")
-	assert.Contains(t, ws[0], "corp9: a single label")
-	assert.NotContains(t, ws[0], "corp10:")
+	assert.Contains(t, ws[0], `\"corp9\": a single label; and 5 more`)
+	assert.NotContains(t, ws[0], `\"corp10\"`)
 }
 
 // A policy that fails to load after its search domains were filtered, in
@@ -233,8 +236,7 @@ func TestLoadConfigFromCargoWall_SearchDomainReportsWhatWasWritten(t *testing.T)
 	ws := warns(*logs)
 	require.Len(t, ws, 1)
 	assert.Contains(t, ws[0], "count=2")
-	assert.Contains(t, ws[0], "Corp: a single label")
-	assert.Contains(t, ws[0], " corp : a single label")
+	assert.Contains(t, ws[0], `\"Corp\": a single label; \" corp \": a single label`)
 }
 
 // Each named entry is cut to maxReportedSearchDomainLen bytes, so an
@@ -245,6 +247,50 @@ func TestLoadConfigFromCargoWall_SearchDomainEntryTruncated(t *testing.T) {
 	require.NoError(t, NewConfigManager().LoadConfigFromCargoWall(enforcingPolicy(long)))
 	ws := warns(*logs)
 	require.Len(t, ws, 1)
-	assert.Contains(t, ws[0], strings.Repeat("x", maxReportedSearchDomainLen)+"…")
+	assert.Contains(t, ws[0], strings.Repeat("x", maxReportedSearchDomainLen)+`\"…`)
 	assert.Less(t, len(ws[0]), 1000)
+}
+
+// A blank entry is cut like any other, and a cut never splits a rune.
+func TestReportedSearchDomain(t *testing.T) {
+	assert.Equal(t, `"corp"`, reportedSearchDomain("corp"))
+	assert.Equal(t, `""`, reportedSearchDomain(""))
+	blank := reportedSearchDomain(strings.Repeat(" ", 5000))
+	assert.Equal(t, strconv.Quote(strings.Repeat(" ", maxReportedSearchDomainLen))+"…", blank)
+	tabs := reportedSearchDomain(strings.Repeat("\t", 5000))
+	assert.Less(t, len(tabs), 3*maxReportedSearchDomainLen)
+	// "é" is two bytes; one straddles the cut.
+	wide := strings.Repeat("a", maxReportedSearchDomainLen-1) + "é" + "b.example"
+	got := reportedSearchDomain(wide)
+	assert.True(t, utf8.ValidString(got), "the cut must not split a rune: %q", got)
+	assert.Equal(t, strconv.Quote(strings.Repeat("a", maxReportedSearchDomainLen-1))+"…", got)
+}
+
+// The local file and the environment drop an entry under a reverse-lookup
+// zone rather than fail on it, though validateSearchDomain refuses one: they
+// drop it in normalization, before they validate. AddSearchDomains skips it
+// with its usual warning.
+func TestReverseZoneSearchDomainDroppedByLocalLoaders(t *testing.T) {
+	cm := NewConfigManager()
+	require.NoError(t, cm.LoadConfig(writeJSONConfig(t,
+		`{"defaultAction": "deny", "searchDomains": [".10.in-addr.arpa", ".compute.internal"]}`)), "local file")
+	assert.Equal(t, []string{".compute.internal"}, cm.GetSearchDomains())
+
+	clearOtherCargowallEnv(t)
+	t.Setenv("CARGOWALL_SEARCH_DOMAINS", ".10.in-addr.arpa,.compute.internal")
+	cm = NewConfigManager()
+	require.NoError(t, cm.LoadFromEnv(), "environment")
+	assert.Equal(t, []string{".compute.internal"}, cm.GetSearchDomains())
+
+	require.Error(t, validateSearchDomains([]string{".10.in-addr.arpa"}),
+		"validating a reverse-zone entry directly fails: the loaders must drop it first")
+
+	logs := captureLogs(t)
+	cm = NewConfigManager()
+	cm.AddSearchDomains([]string{".10.in-addr.arpa", ".internal.cloudapp.net"}, slog.Default())
+	assert.Equal(t, []string{".internal.cloudapp.net"}, cm.GetSearchDomains())
+	ws := warns(*logs)
+	require.Len(t, ws, 1)
+	assert.Contains(t, ws[0], "Skipping invalid auto-added search domain")
+	assert.Contains(t, ws[0], "under a reverse-lookup zone")
 }

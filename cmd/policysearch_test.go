@@ -18,10 +18,13 @@ package cmd
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -107,4 +110,38 @@ func TestLoadHookPolicy_RefusedSearchDomainStillLoadsPolicy(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to load CargoWall config")
 	assert.Equal(t, 1, cleaned)
+}
+
+// Under --github-action the Warn is written by GitHubActionsHandler, which
+// prints attributes with %v: each dropped entry must still read as one, its
+// bounds and spaces shown.
+func TestSearchDomainWarnUnderGitHubActionsHandler(t *testing.T) {
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	stderr := os.Stderr
+	os.Stderr = w
+	orig := slog.Default()
+	slog.SetDefault(slog.New(NewGitHubActionsHandler(false)))
+	t.Cleanup(func() {
+		os.Stderr = stderr
+		slog.SetDefault(orig)
+	})
+
+	cm := config.NewConfigManager()
+	require.NoError(t, cm.LoadConfigFromCargoWall(&cargowallv1pb.CargoWallPolicy{
+		DefaultAction: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY,
+		SearchDomains: []string{"corp", " corp ", "co.uk", ".compute.internal"},
+	}))
+	require.NoError(t, w.Close())
+	out, err := io.ReadAll(r)
+	require.NoError(t, err)
+
+	var warning string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "::warning::") {
+			warning = line
+		}
+	}
+	assert.Equal(t, `::warning::Search domains in the CodeCargo policy are dropped; the rest of the policy loaded `+
+		`count=3 dropped="corp": a single label; " corp ": a single label; "co.uk": a public suffix`, warning)
 }

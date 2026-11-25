@@ -73,9 +73,11 @@ func (c searchDomainClass) String() string {
 	}
 }
 
-// normalizeSearchDomain is THE normalization of one entry: lowercased,
+// normalizeSearchDomain is the normalization of one operator or policy
+// entry, shared by every loader of those and AddSearchDomains: lowercased,
 // trimmed of whitespace and of a trailing dot (a suffix written as an
-// FQDN), with a leading dot. An entry of only whitespace or dots stays "",
+// FQDN), with a leading dot. (The host's resolv.conf list has rules of its
+// own, SetHostSearchDomains.) An entry of only whitespace or a lone dot is "",
 // which classifies as empty: dropping it silently would let explicit
 // misconfigs like `searchDomains: [""]` or `CARGOWALL_SEARCH_DOMAINS=" "`
 // pass unnoticed.
@@ -137,10 +139,13 @@ func validateSearchDomain(d string) error {
 
 // classifySearchDomain is validateSearchDomain with the class of what it
 // found. An entry under a reverse-lookup zone is classed apart before any
-// other test: every loader drops it with a warning rather than failing on
-// it, since it could never take effect.
+// other test, since it could never take effect: no loader fails on one. The
+// local file and env loaders drop it, with a warning each, before they
+// validate (normalizeSearchDomains); the policy loader reports it with its
+// other drops; AddSearchDomains skips it with its usual warning, as
+// validateSearchDomain refuses it.
 func classifySearchDomain(d string) (searchDomainClass, error) {
-	if d == "" || d == "." {
+	if d == "" {
 		return searchDomainEmpty, fmt.Errorf("search domain must not be empty")
 	}
 	if ReverseLookupName(d) {
@@ -182,8 +187,9 @@ func classifySearchDomain(d string) (searchDomainClass, error) {
 // validateSearchDomains validates a batch of normalized suffixes, returning
 // on the first invalid entry. Used by the local config file and env paths,
 // where a typo should fail loudly. The CodeCargo policy loader
-// (filterPolicySearchDomains) and the in-process auto-allow path use
-// validateSearchDomain directly so they can drop per entry.
+// (filterPolicySearchDomains, through classifySearchDomain) and the
+// in-process auto-allow path (validateSearchDomain) check each entry
+// themselves so they can drop per entry.
 func validateSearchDomains(domains []string) error {
 	for _, d := range domains {
 		if err := validateSearchDomain(d); err != nil {

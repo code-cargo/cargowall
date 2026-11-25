@@ -63,6 +63,11 @@ const (
 	// have dropped the flow, but the packet was passed. Phase-A telemetry that
 	// gates turning enforcement on — the L7 analogue of cgroup_would_block.
 	EventL7WouldBlock AuditEventType = "l7_would_block"
+	// EventL7Passed is a flow L7 passed for a reason other than its name
+	// being allowed: today only a bare-label SNI (l7_reason=bare_label) at a
+	// public address an allowed name resolved to. Telemetry, never a block or
+	// a would-block: it keeps visible the flows that rule admits.
+	EventL7Passed AuditEventType = "l7_passed"
 )
 
 // Step-ordinal sentinels, mirroring STEP_ORD_* in tcbpf.c. Real workflow
@@ -114,7 +119,7 @@ func (et AuditEventType) IsAllowedOutcome() bool {
 // config already allows. The IP is the only identity such a flow actually
 // established.
 func (e *AuditEvent) ReportedDestName() string {
-	if e.EventType == EventL7Blocked || e.EventType == EventL7WouldBlock {
+	if e.EventType == EventL7Blocked || e.EventType == EventL7WouldBlock || e.EventType == EventL7Passed {
 		if e.L7Name != "" {
 			return e.L7Name
 		}
@@ -206,9 +211,10 @@ type AuditEvent struct {
 	StepClass       StepClass       `json:"step_class,omitempty"`        // step_boundary only: what the step root is; empty for a root that exited without exec'ing
 
 	// L7 (TLS SNI / HTTP Host / QUIC) enforcement. All additive/omitempty. On
-	// l7_blocked/l7_would_block: L7Name is the SNI/Host the flow presented (may
-	// be attacker-chosen — distinct from the DNS-resolved DstHostname),
-	// L7Protocol is tls|http|quic, and L7Reason is why it was denied.
+	// l7_blocked/l7_would_block/l7_passed: L7Name is the SNI/Host the flow
+	// presented (may be attacker-chosen — distinct from the DNS-resolved
+	// DstHostname), L7Protocol is tls|http|quic, and L7Reason is why it was
+	// denied, or for l7_passed why it passed.
 	L7Name     string `json:"l7_name,omitempty"`
 	L7Protocol string `json:"l7_protocol,omitempty"`
 	L7Reason   string `json:"l7_reason,omitempty"`
@@ -302,7 +308,8 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 	// l7_would_block, like cgroup_would_block, is telemetry: the packet passed
 	// (observe mode, or enforce under audit posture), so it sets its own flags
 	// and must not be stamped Blocked from the run's enforce posture. l7_blocked
-	// is a real drop and is normalized like any other block.
+	// is a real drop and is normalized like any other block. l7_passed passed
+	// the packet in every posture, so it is neither.
 	if event.EventType != EventConnectionAllowed &&
 		event.EventType != EventConnectionLateAllowed &&
 		event.EventType != EventDNSQueryLateAllowed &&
@@ -310,7 +317,8 @@ func (a *AuditLogger) LogEvent(event AuditEvent) error {
 		event.EventType != EventStepBoundary &&
 		event.EventType != EventContainerAttribution &&
 		event.EventType != EventCgroupWouldBlock &&
-		event.EventType != EventL7WouldBlock {
+		event.EventType != EventL7WouldBlock &&
+		event.EventType != EventL7Passed {
 		if a.auditMode {
 			event.WouldDeny = true
 			event.Blocked = false

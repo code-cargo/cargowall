@@ -37,7 +37,7 @@ func l7Rec(enforced bool) L7Record {
 		Name:        "evil.example",
 		L7Protocol:  "tls",
 		Reason:      "name_mismatch",
-		Enforced:    enforced,
+		Disposition: map[bool]L7Disposition{true: L7Dropped, false: L7WouldDrop}[enforced],
 	}
 }
 

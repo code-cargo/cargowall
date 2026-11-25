@@ -19,6 +19,8 @@ package cmd
 import (
 	"log/slog"
 	"net"
+	"net/netip"
+	"sync"
 
 	"github.com/code-cargo/cargowall/pkg/config"
 	"github.com/code-cargo/cargowall/pkg/containers"
@@ -134,22 +136,38 @@ func (f *l7Feature) registrar() events.L7LateRegistrar {
 	return r
 }
 
-// l7Sink adapts denied oracle outcomes onto the shared reporting helper. Only
-// denials are reported: an l7_blocked when the flow was dropped, or an
-// l7_would_block when observe mode or audit posture passed it. Admitted flows
-// produce no per-flow record — the kernel stats already count them. The punt's
+// l7Sink adapts denied oracle outcomes onto the shared reporting helper:
+// an l7_blocked when the flow was dropped, or an l7_would_block when observe
+// mode or audit posture passed it. Admitted flows produce no per-flow record
+// (the kernel stats already count them), except a bare-label pass, reported
+// as l7_passed because no rule names what it admitted, once per destination
+// and name (l7PassedOnce). The punt's
 // socket cookie resolves to pid/step through the same join origin records use,
 // so an L7 denial carries the identical attribution as its sibling L4 outcomes.
 func l7Sink(obs *origin.Observer, enricher *containers.Enricher, configMgr *config.Manager,
 	auditLogger *events.AuditLogger, notificationTracker *events.NotificationTracker,
 	logger *slog.Logger,
 ) func(origin.L7Outcome) {
+	passedOnce := newL7PassedOnce()
 	return func(o origin.L7Outcome) {
 		// Admitted flows produce no record — except one the per-IP binding
 		// WOULD have denied, which is the measurement deciding whether pinning
-		// is safe to turn on.
-		if o.Allowed && !o.WouldNarrow {
+		// is safe to turn on, and a bare-label pass.
+		var disposition events.L7Disposition
+		switch {
+		case o.Reason == origin.L7BareLabel:
+			if !passedOnce.first(o) {
+				return
+			}
+			disposition = events.L7Passed
+		case o.Allowed && !o.WouldNarrow:
 			return
+		// A would-narrow passed the packet whatever the posture, so it
+		// reports as telemetry, never as a drop that happened.
+		case o.Enforce && !o.WouldNarrow:
+			disposition = events.L7Dropped
+		default:
+			disposition = events.L7WouldDrop
 		}
 		pid, ordinal := obs.ResolveCookie(o.Cookie)
 		events.ReportL7(events.L7Record{
@@ -162,9 +180,7 @@ func l7Sink(obs *origin.Observer, enricher *containers.Enricher, configMgr *conf
 			Name:        o.Name,
 			L7Protocol:  o.Protocol.String(),
 			Reason:      string(o.Reason),
-			// A would-narrow passed the packet whatever the posture, so it
-			// reports as telemetry, never as a drop that happened.
-			Enforced: o.Enforce && !o.WouldNarrow,
+			Disposition: disposition,
 			Decorate: func(audit *events.AuditEvent) {
 				enricher.DecorateVerdict(audit, origin.Record{
 					Cookie:   o.Cookie,
@@ -174,6 +190,45 @@ func l7Sink(obs *origin.Observer, enricher *containers.Enricher, configMgr *conf
 			},
 		}, configMgr, auditLogger, notificationTracker, logger)
 	}
+}
+
+// l7PassedOnceMax bounds the destinations and names a run's bare-label
+// passes are remembered by. Past it the set starts over, so a workload
+// cycling through labels re-reports at most one record per new pair.
+const l7PassedOnceMax = 4096
+
+// l7PassedOnce is which bare-label passes have been reported: a client that
+// opens a connection per request (a build's CLI talking to its builder)
+// would otherwise write an Info line and an audit record per connection,
+// crowding the log tail job logs show with flows that were admitted.
+type l7PassedOnce struct {
+	mu   sync.Mutex
+	seen map[l7PassedKey]struct{}
+}
+
+type l7PassedKey struct {
+	dst  netip.Addr
+	port uint16
+	name string
+}
+
+func newL7PassedOnce() *l7PassedOnce {
+	return &l7PassedOnce{seen: make(map[l7PassedKey]struct{})}
+}
+
+// first reports whether o is the first pass of its destination and name.
+func (p *l7PassedOnce) first(o origin.L7Outcome) bool {
+	k := l7PassedKey{dst: o.DstIP, port: o.DstPort, name: o.Name}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.seen[k]; ok {
+		return false
+	}
+	if len(p.seen) >= l7PassedOnceMax {
+		clear(p.seen)
+	}
+	p.seen[k] = struct{}{}
+	return true
 }
 
 // l7LateRegistrar routes the L4 paths' scope writes through the one seam the

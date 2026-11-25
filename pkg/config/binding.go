@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// The L7 per-IP binding evidence store (Manager.nameToIPs): every (name, IP)
+// The L7 per-IP binding evidence store (Manager.bindings): every (name, IP)
 // pair this daemon observed FORWARD-resolving, with a last-seen/last-used
 // time. It is its own store because the neighboring maps drop or forge
 // evidence a security check needs — hostnameCache is keyed by rule.Value, so a
@@ -52,6 +52,40 @@ const (
 	maxBindingNames = 8192
 )
 
+// bindingStore is the evidence keyed both ways. byName is the store proper;
+// byIP is its reverse index (the names bound to each address), kept in step
+// at every write and eviction so that "which names are bound here" is a map
+// lookup rather than a scan of every name under the oracle's mutex. Both are
+// guarded by Manager.bindMu.
+type bindingStore struct {
+	byName map[string]*nameBinding
+	byIP   map[string]map[string]struct{}
+}
+
+func newBindingStore() bindingStore {
+	return bindingStore{
+		byName: make(map[string]*nameBinding),
+		byIP:   make(map[string]map[string]struct{}),
+	}
+}
+
+func (s *bindingStore) link(name, ip string) {
+	names := s.byIP[ip]
+	if names == nil {
+		names = make(map[string]struct{})
+		s.byIP[ip] = names
+	}
+	names[name] = struct{}{}
+}
+
+func (s *bindingStore) unlink(name, ip string) {
+	names := s.byIP[ip]
+	delete(names, name)
+	if len(names) == 0 {
+		delete(s.byIP, ip)
+	}
+}
+
 // nameBinding is one name's addresses with the time each was last seen or
 // used. newest is maintained on every write as the max over ips, so eviction
 // scans names alone: recomputing it per name made the overflow scan
@@ -69,23 +103,27 @@ func (cm *Manager) recordBindingLocked(name, ip string, now time.Time) {
 	if name == "" || ip == "" {
 		return
 	}
-	b := cm.nameToIPs[name]
+	b := cm.bindings.byName[name]
 	if b == nil {
-		if len(cm.nameToIPs) >= maxBindingNames {
+		if len(cm.bindings.byName) >= maxBindingNames {
 			cm.evictOldestBindingNameLocked()
 		}
 		b = &nameBinding{ips: make(map[string]time.Time)}
-		cm.nameToIPs[name] = b
+		cm.bindings.byName[name] = b
 	}
-	if _, exists := b.ips[ip]; !exists && len(b.ips) >= maxBindingIPsPerName {
-		var oldestIP string
-		var oldestT time.Time
-		for k, t := range b.ips {
-			if oldestIP == "" || t.Before(oldestT) {
-				oldestIP, oldestT = k, t
+	if _, exists := b.ips[ip]; !exists {
+		if len(b.ips) >= maxBindingIPsPerName {
+			var oldestIP string
+			var oldestT time.Time
+			for k, t := range b.ips {
+				if oldestIP == "" || t.Before(oldestT) {
+					oldestIP, oldestT = k, t
+				}
 			}
+			delete(b.ips, oldestIP)
+			cm.bindings.unlink(name, oldestIP)
 		}
-		delete(b.ips, oldestIP)
+		cm.bindings.link(name, ip)
 	}
 	b.ips[ip] = now
 	if now.After(b.newest) {
@@ -98,13 +136,16 @@ func (cm *Manager) recordBindingLocked(name, ip string, now time.Time) {
 func (cm *Manager) evictOldestBindingNameLocked() {
 	var oldestName string
 	var oldestNewest time.Time
-	for name, b := range cm.nameToIPs {
+	for name, b := range cm.bindings.byName {
 		if oldestName == "" || b.newest.Before(oldestNewest) {
 			oldestName, oldestNewest = name, b.newest
 		}
 	}
 	if oldestName != "" {
-		delete(cm.nameToIPs, oldestName)
+		for ip := range cm.bindings.byName[oldestName].ips {
+			cm.bindings.unlink(oldestName, ip)
+		}
+		delete(cm.bindings.byName, oldestName)
 	}
 }
 
@@ -138,7 +179,7 @@ func (cm *Manager) NameResolvedToIP(hostname, ip string) bool {
 	cm.bindMu.Lock()
 	defer cm.bindMu.Unlock()
 
-	b := cm.nameToIPs[hostname]
+	b := cm.bindings.byName[hostname]
 	if b == nil {
 		return false
 	}
@@ -152,4 +193,37 @@ func (cm *Manager) NameResolvedToIP(hostname, ip string) bool {
 		b.newest = now
 	}
 	return true
+}
+
+// BoundNameAllowed reports whether some name the store holds as having
+// forward-resolved to ip satisfies allowed, and returns the first that does.
+// Only that name's binding has its recency refreshed: the others were not
+// used, and refreshing them would keep stale evidence from ever aging out.
+//
+// allowed runs with no lock of this store held. It is the L7 policy's allow
+// tiers, which take Manager.mu and the proxy's own locks, and the lock order
+// is cm.mu before bindMu (RecordCNAMEChain), so calling it under bindMu
+// could deadlock. The names are copied out first; one evicted meanwhile
+// fails the refresh below and is passed over.
+//
+// The copy is bounded by maxBindingNames, but only an address many names
+// resolve to (a shared edge) comes near it, and the names bound there are
+// mostly ones the policy allows, so the loop ends early.
+func (cm *Manager) BoundNameAllowed(ip string, allowed func(name string) bool) (string, bool) {
+	if ip == "" {
+		return "", false
+	}
+	cm.bindMu.Lock()
+	names := make([]string, 0, len(cm.bindings.byIP[ip]))
+	for name := range cm.bindings.byIP[ip] {
+		names = append(names, name)
+	}
+	cm.bindMu.Unlock()
+
+	for _, name := range names {
+		if allowed(name) && cm.NameResolvedToIP(name, ip) {
+			return name, true
+		}
+	}
+	return "", false
 }

@@ -191,6 +191,32 @@ func TestExporter_ContainerAttributionNotExported(t *testing.T) {
 		"only the connection event may reach the collector")
 }
 
+// L7 telemetry describes traffic that was not blocked: a would-block that
+// observe mode passed, or a bare-label SNI L7 passed. Exported as connection
+// outcomes they would read as enforcement.
+func TestExporter_L7TelemetryNotExported(t *testing.T) {
+	c := newCollector(t)
+	e := New(testConfig(c.server.URL), "test", discardLogger())
+
+	for _, et := range []events.AuditEventType{events.EventL7WouldBlock, events.EventL7Passed} {
+		e.Consume(events.AuditEvent{
+			Timestamp:  time.Now(),
+			EventType:  et,
+			DstIP:      "54.80.12.34",
+			DstPort:    443,
+			L7Name:     "kq563vfqzm",
+			L7Protocol: "tls",
+		})
+	}
+	e.Consume(testEvent())
+	require.NoError(t, e.Shutdown(context.Background()))
+
+	reqs := c.recorded()
+	require.Len(t, reqs, 1)
+	assert.Len(t, reqs[0].ResourceLogs[0].ScopeLogs[0].LogRecords, 1,
+		"only the connection event may reach the collector")
+}
+
 func TestExporter_BatchesBySize(t *testing.T) {
 	c := newCollector(t)
 	e := New(testConfig(c.server.URL), "test", discardLogger())

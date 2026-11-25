@@ -109,11 +109,13 @@ func (e *Exporter) Consume(ev events.AuditEvent) {
 	// correlation keys that matter; a proper marker schema can come with
 	// the SaaS step tier. The cgroup/L7 would-blocks are shadow/observe
 	// telemetry for traffic that was NOT blocked — exporting them as
-	// connection outcomes would make observe mode look like enforcement.
+	// connection outcomes would make observe mode look like enforcement. An
+	// l7_passed is the same kind of telemetry, for a flow L7 passed.
 	if ev.EventType == events.EventStepBoundary ||
 		ev.EventType == events.EventContainerAttribution ||
 		ev.EventType == events.EventCgroupWouldBlock ||
-		ev.EventType == events.EventL7WouldBlock {
+		ev.EventType == events.EventL7WouldBlock ||
+		ev.EventType == events.EventL7Passed {
 		return
 	}
 	e.mu.Lock()

@@ -16,6 +16,11 @@
 
 package config
 
+import (
+	"net/netip"
+	"strings"
+)
+
 // L7Request is one destination identity recovered from an L7 handshake (SNI,
 // Host, QUIC) awaiting a policy decision.
 type L7Request struct {
@@ -26,6 +31,8 @@ type L7Request struct {
 	// Policy is the step policy the flow's socket is judged by, as the
 	// kernel read it with the punt; 0 (the job's) for none.
 	Policy uint32
+	// SNI marks Name as a TLS or QUIC server name; false for an HTTP Host.
+	SNI bool
 }
 
 // L7Match is the answer MatchName gives. Three states rather than a bool
@@ -42,6 +49,10 @@ const (
 	// L7MatchElsewhere: allowed by name and port, but never seen resolving to
 	// this destination.
 	L7MatchElsewhere
+	// L7MatchBareLabel: the name is a single-label SNI no tier allows, at a
+	// public address that a name the policy allows here forward-resolved to.
+	// See bareLabelAdmitted.
+	L7MatchBareLabel
 )
 
 // L7Policy is the whole L7 name authority: the rules a Manager holds plus the
@@ -81,46 +92,146 @@ func (p L7Policy) WithSteps(steps func(policy uint32, name string) ([]Port, bool
 // (Server.isQueryAllowed) plus a port dimension: a name allowed only on a
 // non-web port (an ssh host on :22) must not validate as an SNI on a shared
 // edge IP that some 443 rule scoped, or an attacker presents it and the flow
-// is admitted.
+// is admitted. A name no tier allows is L7NoMatch, unless it passes as a
+// bare label (bareLabelAdmitted).
 func (p L7Policy) MatchName(q L7Request) L7Match {
-	cm, derived := p.cm, p.derived
-	v := cm.MatchHostnameRule(q.Name)
-
-	// A deny rule wins ON THE PORTS IT NAMES (empty = all ports), exactly as
-	// tryLateAllow and the BPF per-port entries resolve a mixed verdict:
-	// `example.com: allow 443` + `example.com: deny 80` must still admit TLS.
-	// A covering deny beats every allow tier, including a derived one.
-	if v.HasDeny() && DstPortAllowedByRule(q.DstPort, q.Proto, v.DenyPorts) {
+	allowed, denied := p.nameAllowed(q.Name, q)
+	if denied {
 		return L7NoMatch
 	}
-
-	// The allow tiers COMPOSE: a rule whose ports don't cover this flow does
-	// not shadow a derived allow that does (a name can be both — an :22-only
-	// rule for a host that is also a learned CNAME target of an allowed web
-	// origin inheriting all ports).
-	allowedByName := v.HasAllow() && DstPortAllowedByRule(q.DstPort, q.Proto, v.AllowPorts)
-	if !allowedByName && derived != nil {
-		if ports, ok := derived(q.Name); ok {
-			allowedByName = DstPortAllowedByRule(q.DstPort, q.Proto, ports)
+	if !allowed {
+		if p.bareLabelAdmitted(q) {
+			return L7MatchBareLabel
 		}
-	}
-	// Then the flow's step, as its packets are judged: its own rules and
-	// chains add to the job's, never past a job deny. A name the job's
-	// rules deny on any port is no step's, as the DNS path withholds it.
-	if !allowedByName && q.Policy != 0 && p.steps != nil && !v.HasDeny() {
-		if ports, ok := p.steps(q.Policy, q.Name); ok {
-			allowedByName = DstPortAllowedByRule(q.DstPort, q.Proto, ports)
-		}
-	}
-	if !allowedByName {
 		return L7NoMatch
 	}
 
 	// The name passes policy. Now: is it bound to THIS destination? Without
 	// this an allowed name is a passphrase that opens every L7-scoped IP,
 	// including one where an attacker runs a server that ignores SNI.
-	if cm.NameResolvedToIP(q.Name, q.DstIP) {
+	if p.cm.NameResolvedToIP(q.Name, q.DstIP) {
 		return L7MatchOK
 	}
 	return L7MatchElsewhere
+}
+
+// nameAllowed applies the allow tiers to name on q's port, protocol and step
+// policy: allowed when a tier admits it there, denied when a deny rule
+// covers it on this port, which beats every tier. THE one implementation,
+// shared by the presented name and the bound names bareLabelAdmitted tries,
+// so the two can never be judged by different rules.
+func (p L7Policy) nameAllowed(name string, q L7Request) (allowed, denied bool) {
+	v := p.cm.MatchHostnameRule(name)
+
+	// A deny rule wins ON THE PORTS IT NAMES (empty = all ports), exactly as
+	// tryLateAllow and the BPF per-port entries resolve a mixed verdict:
+	// `example.com: allow 443` + `example.com: deny 80` must still admit TLS.
+	// A covering deny beats every allow tier, including a derived one.
+	if v.HasDeny() && DstPortAllowedByRule(q.DstPort, q.Proto, v.DenyPorts) {
+		return false, true
+	}
+
+	// The allow tiers COMPOSE: a rule whose ports don't cover this flow does
+	// not shadow a derived allow that does (a name can be both — an :22-only
+	// rule for a host that is also a learned CNAME target of an allowed web
+	// origin inheriting all ports).
+	allowed = v.HasAllow() && DstPortAllowedByRule(q.DstPort, q.Proto, v.AllowPorts)
+	if !allowed && p.derived != nil {
+		if ports, ok := p.derived(name); ok {
+			allowed = DstPortAllowedByRule(q.DstPort, q.Proto, ports)
+		}
+	}
+	// Then the flow's step, as its packets are judged: its own rules and
+	// chains add to the job's, never past a job deny. A name the job's
+	// rules deny on any port is no step's, as the DNS path withholds it.
+	if !allowed && q.Policy != 0 && p.steps != nil && !v.HasDeny() {
+		if ports, ok := p.steps(q.Policy, name); ok {
+			allowed = DstPortAllowedByRule(q.DstPort, q.Proto, ports)
+		}
+	}
+	return allowed, false
+}
+
+// bareLabelAdmitted reports whether a presented name no tier allows passes
+// anyway as a bare label: a client that dials a dedicated host by address
+// and presents an opaque per-machine label as its SNI (Depot's CLI dials its
+// builders that way). Such a label is no DNS name, so no rule can name it,
+// and a shared edge routes by DNS name, so it cannot select another tenant
+// there. All of these must hold:
+//
+//   - the name is a single label. pkg/sni has already normalized it to
+//     lowercase [a-z0-9._-] without a trailing dot, so no dot is the whole
+//     test;
+//   - it is a TLS or QUIC SNI, not an HTTP Host: a plain-HTTP shared edge
+//     can route a single-label Host to another tenant (an S3 website
+//     endpoint serves the bucket the Host names);
+//   - the destination is globally routable (globallyRoutable). Inside a
+//     private network a shared ingress commonly serves single-label virtual
+//     hosts (vault, grafana) by SNI, and admitting a bare label there would
+//     reopen the very swap this layer closes;
+//   - some name that forward-resolved to this destination is allowed on
+//     this port and protocol by the same tiers, deny rules included. A
+//     reverse name never mints binding evidence, so it cannot satisfy this.
+func (p L7Policy) bareLabelAdmitted(q L7Request) bool {
+	if !q.SNI || q.Name == "" || strings.Contains(q.Name, ".") {
+		return false
+	}
+	addr, err := netip.ParseAddr(q.DstIP)
+	if err != nil || !globallyRoutable(addr) {
+		return false
+	}
+	// The store is keyed by the spelling the DNS layer recorded, which is
+	// the spelling q carries (the same lookup the L7MatchOK check makes).
+	_, ok := p.cm.BoundNameAllowed(q.DstIP, func(name string) bool {
+		allowed, _ := p.nameAllowed(name, q)
+		return allowed
+	})
+	return ok
+}
+
+// notGloballyRoutable are the special-purpose ranges IsGlobalUnicast and
+// LocalAddress leave in, none of them reachable on the public internet
+// (IANA's special-purpose registries, "Globally Reachable: False"): an
+// address there is a private network's, however it is numbered. A cluster
+// can number its ingress from 240.0.0.0/4 or 198.18.0.0/15, and a single
+// label routed by SNI there is the swap the bare-label pass must not
+// reopen.
+var notGloballyRoutable = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+// nat64WellKnown is the NAT64 well-known prefix (RFC 6052): an address in
+// it stands for the IPv4 address in its last 32 bits, which a DNS64 network
+// hands out for every IPv4 destination, internal ones included.
+var nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")
+
+// globallyRoutable reports whether addr is a public internet address: a
+// global unicast address outside every local (LocalAddress) and
+// special-purpose range. A NAT64 address is judged by the IPv4 address it
+// carries, and an IPv4-mapped one by its IPv4 address.
+func globallyRoutable(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if nat64WellKnown.Contains(addr) {
+		b := addr.As16()
+		addr = netip.AddrFrom4([4]byte(b[12:16]))
+	}
+	if !addr.IsGlobalUnicast() || LocalAddress(addr) {
+		return false
+	}
+	for _, p := range notGloballyRoutable {
+		if p.Contains(addr) {
+			return false
+		}
+	}
+	return true
 }

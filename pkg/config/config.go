@@ -182,11 +182,11 @@ type Manager struct {
 	// see hostsearch.go.
 	hostSearchDomains []string
 
-	// nameToIPs is the L7 per-IP binding evidence, populated only by the
+	// bindings is the L7 per-IP binding evidence, populated only by the
 	// forward-resolution paths. Guarded by bindMu, NOT mu — its lookups sit on
 	// the DNS answer and L7 punt hot paths. See binding.go.
-	nameToIPs map[string]*nameBinding
-	bindMu    sync.Mutex
+	bindings bindingStore
+	bindMu   sync.Mutex
 
 	// auditMode is the run's enforcement posture and lives here — next to
 	// DefaultAction — as the single source of truth both datapaths consult:
@@ -207,7 +207,7 @@ func NewConfigManager() *Manager {
 		ipToCNAMEOrigins: make(map[string][]cnameOriginRecord),
 		ipLastSeen:       make(map[string]time.Time),
 		trackedHostnames: make(map[string]Action),
-		nameToIPs:        make(map[string]*nameBinding),
+		bindings:         newBindingStore(),
 		maxCacheSize:     10000, // Default max cache size
 	}
 }
@@ -1000,7 +1000,7 @@ func (cm *Manager) updateDNSMappingLocked(hostname string, ip string) {
 	if ip != "" {
 		cm.ipToHostname[ip] = hostname
 		cm.ipLastSeen[ip] = time.Now()
-		// NOTE: this does NOT seed the L7 binding evidence (nameToIPs). This
+		// NOTE: this does NOT seed the L7 binding evidence (bindings). This
 		// method is called with names from reverse-DNS PTR lookups and
 		// ForwardMatchIP (pkg/events/outcome.go, cmd/start.go), which an
 		// attacker who controls the destination IP can forge — a self-set
@@ -1184,7 +1184,7 @@ func (cm *Manager) cleanupOldEntries() {
 		cm.forgetIP(ip)
 	}
 
-	// nameToIPs (the L7 binding evidence) is deliberately NOT swept here: its
+	// bindings (the L7 binding evidence) is deliberately NOT swept here: its
 	// lifecycle is count-bounded LRU with refresh-on-use (see
 	// NameResolvedToIP), because a TTL expiry would deadlock cached-IP
 	// clients while the never-expiring L4/scope entries keep them eligible.

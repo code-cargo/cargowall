@@ -41,6 +41,8 @@ ALLOWED_URL="https://$ALLOWED/github/gitignore/main/README.md"
 # Only ever PRESENTED — as the SNI or Host of a flow to the allowed edge —
 # never resolved or allowed.
 DENIED=example.com
+# An opaque per-machine label, the shape Depot's CLI presents to a builder.
+BARE_LABEL=kq563vfqzm
 AUDIT_LOG=/tmp/cargowall-audit.json
 
 # http_code prints the HTTP status a request got, 000 when none came back.
@@ -85,6 +87,20 @@ verify_http() {
     return 1
   fi
   echo "✅ Host $DENIED to $ip:80 dropped"
+}
+
+# A single-label SNI is no DNS name, so a shared edge cannot route it to
+# another tenant: at a public address an allowed name resolved to, it passes
+# as a bare label and is reported as l7_passed, never dropped. Whether the
+# edge then answers is the edge's business (one may refuse an unknown SNI at
+# the handshake), so this only presents the label; verify_events judges
+# cargowall's verdict from its record.
+verify_bare_label() {
+  step "TLS: a bare-label SNI to an allowed public address"
+  local ip code
+  ip=$(edge_ip)
+  code=$(http_code -k --resolve "$BARE_LABEL:443:$ip" "https://$BARE_LABEL/")
+  echo "SNI $BARE_LABEL to $ip: HTTP $code (the edge's answer; the verdict is checked in the audit log)"
 }
 
 # container_probe presents a name to the edge address from a container
@@ -163,6 +179,15 @@ verify_events() {
   echo "l7_blocked on allowed names (expected 0): $n"
   [ "$n" -eq 0 ] || valid=false
 
+  # The bare label passed, reported as telemetry and never as a drop.
+  n=$(jq -s --arg name "$BARE_LABEL" \
+    '[.[] | select(.event_type == "l7_passed" and .l7_name == $name and .l7_reason == "bare_label" and .blocked == false and .would_deny == false)] | length' "$AUDIT_LOG")
+  echo "l7_passed bare_label $BARE_LABEL: $n"
+  [ "$n" -gt 0 ] || valid=false
+  n=$(jq -s --arg name "$BARE_LABEL" '[.[] | select((.event_type == "l7_blocked" or .event_type == "l7_would_block") and .l7_name == $name)] | length' "$AUDIT_LOG")
+  echo "l7 denials of $BARE_LABEL (expected 0): $n"
+  [ "$n" -eq 0 ] || valid=false
+
   echo "--- l7 events ---"
   jq -c 'select(.event_type | startswith("l7_")) | {event_type, dst_ip, dst_port, l7_protocol, l7_name, l7_reason, container_id}' "$AUDIT_LOG" | head -20
 
@@ -173,6 +198,7 @@ verify_events() {
 verify() {
   verify_tls
   verify_http
+  verify_bare_label
   verify_container
   verify_events
 }

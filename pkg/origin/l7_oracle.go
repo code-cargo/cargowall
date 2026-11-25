@@ -76,6 +76,11 @@ const (
 	// allowed at all" from "name allowed, but not here" to decide whether the
 	// binding is safe to enforce.
 	L7NameNotAtIP L7Reason = "name_not_at_ip"
+	// L7BareLabel: a single-label SNI no rule allows, passed because the
+	// destination is a public address a name the policy allows there
+	// resolved to (config.L7MatchBareLabel). An allowed outcome in every
+	// mode, reported so the flows it passes stay visible.
+	L7BareLabel L7Reason = "bare_label"
 )
 
 // L7Matcher is the name authority. Its vocabulary is pkg/config's, not a
@@ -392,9 +397,14 @@ func adjudicate(proto sni.Protocol, buf []byte, q config.L7Request, m L7Matcher,
 		return false, L7Outcome{Reason: L7NoName}
 	}
 	q.Name = hello.ServerName
+	// Which dimension the name came from: a bare label is judged apart only
+	// as a server name, never as an HTTP Host.
+	q.SNI = proto == sni.ProtoTLS || proto == sni.ProtoQUIC
 	switch m.MatchName(q) {
 	case config.L7MatchOK:
 		return false, L7Outcome{Name: hello.ServerName, Reason: L7Allowed, Allowed: true}
+	case config.L7MatchBareLabel:
+		return false, L7Outcome{Name: hello.ServerName, Reason: L7BareLabel, Allowed: true}
 	case config.L7MatchElsewhere:
 		// Allowed by name and port, but this daemon never saw the name resolve
 		// to this destination. Under pinning that is a deny; otherwise the

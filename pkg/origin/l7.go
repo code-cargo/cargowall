@@ -469,8 +469,9 @@ func (l *L7) logStats() {
 	}
 	// The verdict re-check (l7_recheck.go): TCP verdicts the kernel's commit
 	// of the punt they answered wrote PENDING over and the re-check wrote
-	// again; such entries found with no oracle record to repair them from;
-	// and re-checks a full queue dropped, before their first read and after.
+	// again; those of them repaired with no oracle record left; reads and
+	// repair writes that failed; and re-checks a full queue dropped, before
+	// their first read and after.
 	l.logger.Info("L7 oracle closed", append(attrs, l.rechecks.statsAttrs()...)...)
 	if puntDropped > 0 || budget > 0 {
 		l.logger.Warn("L7 flows were dropped without an audit record "+

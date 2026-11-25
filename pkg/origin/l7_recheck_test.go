@@ -180,21 +180,20 @@ func TestL7RecheckSkipsAResetFlow(t *testing.T) {
 }
 
 // A clobbered entry whose record the oracle no longer holds (evicted from
-// a full table) is counted and warned once, never repaired: nothing
-// vouches for the verdict.
-func TestL7RecheckCountsAnUnownedClobber(t *testing.T) {
-	l, objs, logs := recheckOracle(t, 4)
+// a full table) is repaired, and counted apart: a punt processed since the
+// eviction would have made a record, so none means no later cycle.
+func TestL7RecheckRepairsAnUnownedClobber(t *testing.T) {
+	l, objs, _ := recheckOracle(t, 4)
 	for cookie := uint64(1); cookie <= 2; cookie++ {
 		ev := tlsHello(cookie, 1000, l7PuntNewConn)
 		r := decide(t, l, ev)
 		delete(l.flows, ev.FlowKey())
 		clobber(t, objs, ev, ev.Seq)
 		assert.Equal(t, recheckUnowned, l.rechecks.recheck(r))
-		assert.Equal(t, l7StatePending, entryState(objs, ev))
+		assert.Equal(t, l7StateAllowed, entryState(objs, ev))
 	}
 	assert.Equal(t, uint64(2), l.rechecks.unowned.Load())
-	assert.Zero(t, l.rechecks.repaired.Load())
-	_ = logs // the worker warns, once; TestL7RecheckLoopWarnsOnce covers it
+	assert.Equal(t, uint64(2), l.rechecks.repaired.Load())
 }
 
 // The read, the record check and the write happen under l.mu, so no cycle
@@ -247,8 +246,9 @@ func TestL7RecheckQueueFullDoesNotBlock(t *testing.T) {
 // release them, one re-check at a time, instead of on the clock. A stage
 // announces on entered[stage] when a re-check reaches its wait, which also
 // says the stage before it has finished its read.
-func gatedRechecker(t *testing.T, l *L7, stages int) (gates, entered []chan struct{}) {
+func gatedRechecker(t *testing.T, l *L7, caps []int) (gates, entered []chan struct{}) {
 	t.Helper()
+	stages := len(caps)
 	gates = make([]chan struct{}, stages)
 	entered = make([]chan struct{}, stages)
 	for i := range gates {
@@ -265,10 +265,6 @@ func gatedRechecker(t *testing.T, l *L7, stages int) (gates, entered []chan stru
 			return false
 		}
 	}
-	caps := make([]int, stages)
-	for i := range caps {
-		caps[i] = 16
-	}
 	rc.start(make([]time.Duration, stages), caps)
 	l.rechecks = rc
 	t.Cleanup(rc.stop)
@@ -281,7 +277,7 @@ func gatedRechecker(t *testing.T, l *L7, stages int) (gates, entered []chan stru
 // re-check is not read again.
 func TestL7RecheckLoopStages(t *testing.T) {
 	l, objs, _ := recheckOracle(t, 16)
-	gates, entered := gatedRechecker(t, l, 3)
+	gates, entered := gatedRechecker(t, l, []int{16, 16, 16})
 	reach := func(stage int) {
 		t.Helper()
 		select {
@@ -373,29 +369,12 @@ func TestRecheckStageCaps(t *testing.T) {
 }
 
 // A re-check the next stage has no room for is dropped, counted as checked,
-// and warned once; and the worker warns once for unowned clobbers and
-// failures, never under l.mu.
+// and warned once; one whose repair write failed is warned once and moved to
+// the next stage. The worker warns, never under l.mu.
 func TestL7RecheckLoopWarnsOnce(t *testing.T) {
-	l, objs, logs := recheckOracle(t, 16)
-	gates := make([]chan struct{}, 2)
-	entered := make([]chan struct{}, 2)
-	for i := range gates {
-		gates[i] = make(chan struct{})
-		entered[i] = make(chan struct{}, 16)
-	}
-	rc := &l7Rechecker{l: l, quit: make(chan struct{})}
-	rc.wait = func(stage int, _ time.Duration) bool {
-		entered[stage] <- struct{}{}
-		select {
-		case <-gates[stage]:
-			return true
-		case <-rc.quit:
-			return false
-		}
-	}
-	rc.start(make([]time.Duration, 2), []int{16, 1})
-	l.rechecks = rc
-	t.Cleanup(rc.stop)
+	l, _, logs := recheckOracle(t, 16)
+	gates, entered := gatedRechecker(t, l, []int{16, 1})
+	rc := l.rechecks
 	reach := func(stage int) {
 		t.Helper()
 		select {
@@ -417,21 +396,58 @@ func TestL7RecheckLoopWarnsOnce(t *testing.T) {
 	}
 	require.Eventually(t, func() bool { return rc.droppedChecked.Load() == 1 }, 5*time.Second, time.Millisecond)
 	assert.Zero(t, rc.droppedUnchecked.Load())
-
-	// Two unowned clobbers: one Warn.
-	for cookie := uint64(10); cookie <= 11; cookie++ {
-		ev := tlsHello(cookie, 1000, l7PuntNewConn)
-		l.onSample(ev)
-		l.mu.Lock()
-		delete(l.flows, ev.FlowKey())
-		l.mu.Unlock()
-		clobber(t, objs, ev, ev.Seq)
-		reach(0)
-		gates[0] <- struct{}{}
-	}
-	require.Eventually(t, func() bool { return rc.unowned.Load() == 2 }, 5*time.Second, time.Millisecond)
-	require.Eventually(t, func() bool {
-		return strings.Count(logs.String(), "no oracle record left to repair it from") == 1
-	}, 5*time.Second, time.Millisecond)
 	assert.Equal(t, 1, strings.Count(logs.String(), "L7 verdict re-check dropped"))
+}
+
+// A failed repair write is warned once and the re-check moved to the next
+// stage, where it is read again.
+func TestL7RecheckLoopForwardsAFailure(t *testing.T) {
+	l, objs, logs := recheckOracle(t, 16)
+	gates, entered := gatedRechecker(t, l, []int{16, 16})
+	reach := func(stage int) {
+		t.Helper()
+		select {
+		case <-entered[stage]:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no re-check reached stage %d", stage+1)
+		}
+	}
+	flow, err := objs.MapL7Flow.Clone()
+	require.NoError(t, err)
+
+	ev := tlsHello(1, 1000, l7PuntNewConn)
+	l.onSample(ev)
+	reach(0)
+	clobber(t, objs, ev, ev.Seq)
+	// The write fails: stage 1 reads through the clone, which is closed just
+	// before its write. Both are set before the gate releases the stage.
+	l.flow = flow
+	l.rechecks.beforeWrite = func() { _ = flow.Close() }
+	gates[0] <- struct{}{}
+	reach(1) // stage 1 is done with it: forwarded
+	assert.Equal(t, uint64(1), l.rechecks.failed.Load())
+	require.Eventually(t, func() bool {
+		return strings.Count(logs.String(), "L7 verdict re-check failed") == 1
+	}, 5*time.Second, time.Millisecond)
+
+	// Back on the live map before stage 2 is released.
+	l.flow = objs.MapL7Flow
+	l.rechecks.beforeWrite = nil
+	gates[1] <- struct{}{}
+	require.Eventually(t, func() bool { return l.rechecks.repaired.Load() == 1 }, 5*time.Second, time.Millisecond,
+		"the next stage reads it again and repairs it")
+	assert.Equal(t, l7StateAllowed, entryState(objs, ev))
+}
+
+// A stop discards what is queued and ends a wait whose delay is already
+// past.
+func TestL7RecheckStopDiscardsOverdue(t *testing.T) {
+	l, _, _ := recheckOracle(t, 16)
+	rc := &l7Rechecker{l: l, quit: make(chan struct{}), timers: []*time.Timer{time.NewTimer(time.Hour)}}
+	st := &recheckStage{max: 4, wake: make(chan struct{}, 1)}
+	require.True(t, st.push(l7Recheck{}))
+	close(rc.quit)
+	_, ok := st.pop(rc.quit)
+	assert.False(t, ok, "a stopped stage pops nothing")
+	assert.False(t, rc.sleep(0, -time.Second), "an overdue wait ends on a stop")
 }

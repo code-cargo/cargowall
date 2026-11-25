@@ -106,15 +106,17 @@ const (
 	// recheckFailed: the read or the repair's write failed. Counted, warned
 	// once, and read again at the next stage, if there is one.
 	recheckFailed
-	// recheckUnowned: the entry is the deciding punt's commit, but the
-	// oracle holds no record of the flow (evicted from a full table), so
-	// nothing vouches for the verdict. Counted and warned, never repaired.
+	// recheckUnowned: the entry was the deciding punt's commit, and the
+	// oracle held no record of the flow (evicted from a full table); the
+	// verdict was written again, and counted apart. A punt processed since
+	// the eviction would have made a record, so none means no later cycle
+	// has been seen, which is what a matching cycle number proves.
 	recheckUnowned
 )
 
 // l7Rechecker runs the stages. Each holds re-checks in due order, since
 // every one in it has the same delay, and passes on to the next those
-// whose entry still held the verdict.
+// whose entry still held the verdict or whose read or write failed.
 type l7Rechecker struct {
 	l      *L7
 	stages []*recheckStage
@@ -123,6 +125,8 @@ type l7Rechecker struct {
 	// wait sleeps stage's worker for d, reporting false when quit closes
 	// first. A field so a test can release the stages itself.
 	wait func(stage int, d time.Duration) bool
+	// timers are the default wait's, one per stage: a worker reuses its own.
+	timers []*time.Timer
 	// beforeWrite, when set, runs just before a repair's write, with l.mu
 	// held. Tests only.
 	beforeWrite func()
@@ -133,7 +137,6 @@ type l7Rechecker struct {
 	droppedUnchecked atomic.Uint64 // dropped before the first read
 	droppedChecked   atomic.Uint64 // dropped after a read found the verdict in place
 	warnedDrop       atomic.Bool
-	warnedUnowned    atomic.Bool
 	warnedFailed     atomic.Bool
 }
 
@@ -150,6 +153,11 @@ type recheckStage struct {
 func newL7Rechecker(l *L7, delays []time.Duration) *l7Rechecker {
 	rc := &l7Rechecker{l: l, quit: make(chan struct{})}
 	rc.wait = rc.sleep
+	for range delays {
+		t := time.NewTimer(time.Hour)
+		t.Stop()
+		rc.timers = append(rc.timers, t)
+	}
 	return rc.start(delays, recheckStageCaps(delays))
 }
 
@@ -185,6 +193,11 @@ func (s *recheckStage) push(r l7Recheck) bool {
 // pop takes the head, waiting for one; false once quit closes.
 func (s *recheckStage) pop(quit <-chan struct{}) (l7Recheck, bool) {
 	for {
+		select {
+		case <-quit:
+			return l7Recheck{}, false // a stop discards what is queued
+		default:
+		}
 		s.mu.Lock()
 		if len(s.q) > 0 {
 			r := s.q[0]
@@ -246,15 +259,11 @@ func (rc *l7Rechecker) run(i int) {
 			return
 		}
 		switch rc.recheck(r) {
-		case recheckUnowned:
-			rc.warnOnce(&rc.warnedUnowned, "L7 verdict overwritten by the kernel's punt commit, with no oracle "+
-				"record left to repair it from (the flow table was full); that connection stalls under enforce")
-			continue
 		case recheckFailed:
 			rc.warnOnce(&rc.warnedFailed, "L7 verdict re-check failed to read or repair its flow entry; a TCP "+
 				"verdict the kernel's punt commit overwrote may go unrepaired; the teardown line counts them")
 		case recheckHeld:
-		default: // repaired or superseded: done
+		default: // repaired, unowned (repaired too) or superseded: done
 			continue
 		}
 		if i+1 == len(rc.stages) {
@@ -267,17 +276,24 @@ func (rc *l7Rechecker) run(i int) {
 	}
 }
 
-// sleep is the default wait.
-func (rc *l7Rechecker) sleep(_ int, d time.Duration) bool {
+// sleep is the default wait, on one timer per stage. A stop ends it at once,
+// for a delay already past too.
+func (rc *l7Rechecker) sleep(stage int, d time.Duration) bool {
+	select {
+	case <-rc.quit:
+		return false
+	default:
+	}
 	if d <= 0 {
 		return true
 	}
-	t := time.NewTimer(d)
-	defer t.Stop()
+	t := rc.timers[stage]
+	t.Reset(d)
 	select {
 	case <-t.C:
 		return true
 	case <-rc.quit:
+		t.Stop()
 		return false
 	}
 }
@@ -320,10 +336,14 @@ func (rc *l7Rechecker) statsAttrs() []any {
 // and the write, a window of one map update, which writeFlowState leaves
 // open the same way.
 //
-// Anything else is left alone. A NEED_HELLO entry, or a PENDING one with
-// another sequence number, belongs to a later connection of the socket, and
-// writing the old verdict over it would admit a first flight nobody
-// adjudicated. A record whose cycle number differs (a NEW_CONN, NO_STATE or
+// Anything else is left alone. A NEED_HELLO entry belongs to a later
+// connection of the socket, and a PENDING one with another sequence number
+// to a later connection or to a later segment of this one, whose stale punt
+// the re-assert path handles; writing the old verdict over a later
+// connection's entry would admit a first flight nobody adjudicated. No
+// record at all (evicted from a full table) is repaired, and counted apart:
+// a punt processed since the eviction would have made one. A record whose
+// cycle number differs (a NEW_CONN, NO_STATE or
 // REPIN punt started a new cycle; a reset zeroes it, and each decision
 // draws a fresh one) means the verdict no longer answers for the flow.
 func (rc *l7Rechecker) recheck(r l7Recheck) recheckResult {
@@ -337,11 +357,7 @@ func (rc *l7Rechecker) recheck(r l7Recheck) recheckResult {
 		return res
 	}
 	st := l.flows[r.key]
-	if st == nil {
-		rc.unowned.Add(1)
-		return recheckUnowned
-	}
-	if st.gen != r.gen {
+	if st != nil && st.gen != r.gen {
 		return recheckSuperseded
 	}
 	if rc.beforeWrite != nil {
@@ -352,6 +368,10 @@ func (rc *l7Rechecker) recheck(r l7Recheck) recheckResult {
 		return recheckFailed
 	}
 	rc.repaired.Add(1)
+	if st == nil {
+		rc.unowned.Add(1)
+		return recheckUnowned
+	}
 	return recheckRepaired
 }
 

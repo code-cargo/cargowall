@@ -39,6 +39,7 @@
 package origin
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,14 +53,27 @@ import (
 // each.
 var l7RecheckDelays = []time.Duration{5 * time.Millisecond, 150 * time.Millisecond, time.Second}
 
-// recheckBeforeWrite, when set, runs just before a repair's write, with
-// l.mu held. Tests only.
-var recheckBeforeWrite func(*L7)
-
-// l7RecheckQueue bounds each stage's queue. A full queue drops the re-check,
+// l7RecheckRate is the sustained rate of TCP verdicts the stages are sized
+// for. An entry stays in a stage for that stage's delay less the one
+// before (5 ms, 145 ms, 850 ms), so each holds at most this rate times that
+// span, and l7RecheckMinQueue at the least. Past it a re-check is dropped,
 // counted and warned once, rather than block the ring-buffer reader. A
 // queue's memory is only what it holds.
-const l7RecheckQueue = 4096
+const (
+	l7RecheckRate     = 16384
+	l7RecheckMinQueue = 1024
+)
+
+// recheckStageCaps sizes each stage by how long entries stay in it.
+func recheckStageCaps(delays []time.Duration) []int {
+	caps := make([]int, len(delays))
+	var prev time.Duration
+	for i, d := range delays {
+		caps[i] = max(l7RecheckMinQueue, int(float64(l7RecheckRate)*(d-prev).Seconds()+0.5))
+		prev = d
+	}
+	return caps
+}
 
 // l7Recheck is one verdict to check: the flow, what was written, and what
 // identifies the punt it answered and the oracle's cycle that decided it.
@@ -80,8 +94,8 @@ type l7Recheck struct {
 type recheckResult uint8
 
 const (
-	// recheckHeld: the entry still holds the verdict, or the repair's write
-	// failed. Read again at the next stage.
+	// recheckHeld: the entry still holds the verdict. Read again at the
+	// next stage.
 	recheckHeld recheckResult = iota
 	// recheckRepaired: the entry was the deciding punt's own commit, and the
 	// verdict was written again.
@@ -89,6 +103,9 @@ const (
 	// recheckSuperseded: the entry or the oracle's record belongs to a later
 	// connection or cycle, or the entry is gone. Never read again.
 	recheckSuperseded
+	// recheckFailed: the read or the repair's write failed. Counted, warned
+	// once, and read again at the next stage, if there is one.
+	recheckFailed
 	// recheckUnowned: the entry is the deciding punt's commit, but the
 	// oracle holds no record of the flow (evicted from a full table), so
 	// nothing vouches for the verdict. Counted and warned, never repaired.
@@ -106,13 +123,18 @@ type l7Rechecker struct {
 	// wait sleeps stage's worker for d, reporting false when quit closes
 	// first. A field so a test can release the stages itself.
 	wait func(stage int, d time.Duration) bool
+	// beforeWrite, when set, runs just before a repair's write, with l.mu
+	// held. Tests only.
+	beforeWrite func()
 
 	repaired         atomic.Uint64
 	unowned          atomic.Uint64
+	failed           atomic.Uint64 // reads and repair writes that failed
 	droppedUnchecked atomic.Uint64 // dropped before the first read
 	droppedChecked   atomic.Uint64 // dropped after a read found the verdict in place
 	warnedDrop       atomic.Bool
 	warnedUnowned    atomic.Bool
+	warnedFailed     atomic.Bool
 }
 
 type recheckStage struct {
@@ -123,17 +145,19 @@ type recheckStage struct {
 	wake  chan struct{}
 }
 
-// newL7Rechecker starts one worker per delay.
-func newL7Rechecker(l *L7, delays []time.Duration, maxQueued int) *l7Rechecker {
+// newL7Rechecker starts one worker per delay, each stage sized by how long
+// its entries stay (recheckStageCaps).
+func newL7Rechecker(l *L7, delays []time.Duration) *l7Rechecker {
 	rc := &l7Rechecker{l: l, quit: make(chan struct{})}
 	rc.wait = rc.sleep
-	return rc.start(delays, maxQueued)
+	return rc.start(delays, recheckStageCaps(delays))
 }
 
-// start adds a stage per delay and starts their workers.
-func (rc *l7Rechecker) start(delays []time.Duration, maxQueued int) *l7Rechecker {
-	for _, d := range delays {
-		rc.stages = append(rc.stages, &recheckStage{delay: d, max: maxQueued, wake: make(chan struct{}, 1)})
+// start adds a stage per delay, holding at most caps[i], and starts their
+// workers.
+func (rc *l7Rechecker) start(delays []time.Duration, caps []int) *l7Rechecker {
+	for i, d := range delays {
+		rc.stages = append(rc.stages, &recheckStage{delay: d, max: caps[i], wake: make(chan struct{}, 1)})
 	}
 	for i := range rc.stages {
 		rc.wg.Add(1)
@@ -195,9 +219,14 @@ func (rc *l7Rechecker) queue(r l7Recheck) {
 }
 
 func (rc *l7Rechecker) warnDrop() {
-	if rc.warnedDrop.CompareAndSwap(false, true) && rc.l.logger != nil {
-		rc.l.logger.Warn("L7 verdict re-check dropped: its queue is full, so a TCP verdict the kernel's punt " +
-			"commit overwrote may go unrepaired and that connection stall under enforce; the teardown line counts them")
+	rc.warnOnce(&rc.warnedDrop, "L7 verdict re-check dropped: its queue is full, so a TCP verdict the kernel's "+
+		"punt commit overwrote may go unrepaired and that connection stall under enforce; the teardown line counts them")
+}
+
+// warnOnce logs msg the first time flag is set. Never called with l.mu held.
+func (rc *l7Rechecker) warnOnce(flag *atomic.Bool, msg string) {
+	if flag.CompareAndSwap(false, true) && rc.l.logger != nil {
+		rc.l.logger.Warn(msg)
 	}
 }
 
@@ -216,7 +245,19 @@ func (rc *l7Rechecker) run(i int) {
 		if !rc.wait(i, time.Until(r.written.Add(st.delay))) {
 			return
 		}
-		if rc.l.recheck(r, rc) != recheckHeld || i+1 == len(rc.stages) {
+		switch rc.recheck(r) {
+		case recheckUnowned:
+			rc.warnOnce(&rc.warnedUnowned, "L7 verdict overwritten by the kernel's punt commit, with no oracle "+
+				"record left to repair it from (the flow table was full); that connection stalls under enforce")
+			continue
+		case recheckFailed:
+			rc.warnOnce(&rc.warnedFailed, "L7 verdict re-check failed to read or repair its flow entry; a TCP "+
+				"verdict the kernel's punt commit overwrote may go unrepaired; the teardown line counts them")
+		case recheckHeld:
+		default: // repaired or superseded: done
+			continue
+		}
+		if i+1 == len(rc.stages) {
 			continue
 		}
 		if !rc.stages[i+1].push(r) {
@@ -258,6 +299,7 @@ func (rc *l7Rechecker) statsAttrs() []any {
 	return []any{
 		"verdicts_repaired", rc.repaired.Load(),
 		"verdict_rechecks_unowned", rc.unowned.Load(),
+		"verdict_rechecks_failed", rc.failed.Load(),
 		"verdict_rechecks_dropped_unchecked", rc.droppedUnchecked.Load(),
 		"verdict_rechecks_dropped_checked", rc.droppedChecked.Load(),
 	}
@@ -267,54 +309,70 @@ func (rc *l7Rechecker) statsAttrs() []any {
 // the entry is the commit of the very punt the verdict answered and the
 // oracle still stands by that verdict.
 //
-// It holds l.mu across the read of the entry, the record check and the
-// write. The oracle changes a flow's record only under l.mu, so a later
-// cycle has either changed the record before this looks, and is left
-// alone, or decides after this write, and overwrites it with its own
-// verdict. What l.mu cannot hold off is the kernel: a later connection's
-// SYN or punt landing between the read and the write, a window of one map
-// update, which writeFlowState leaves open the same way.
+// The first read is unlocked: all but about one in a thousand find the
+// verdict in place, and the punt reader needs l.mu for every punt. Only an
+// entry showing the deciding punt's PENDING takes l.mu, and is read again
+// under it, with the record check and the write. The oracle changes a
+// flow's record only under l.mu, so a later cycle has either changed the
+// record before this looks, and is left alone, or decides after this
+// write, and overwrites it with its own verdict. What l.mu cannot hold off
+// is the kernel: a later connection's SYN or punt landing between the read
+// and the write, a window of one map update, which writeFlowState leaves
+// open the same way.
 //
 // Anything else is left alone. A NEED_HELLO entry, or a PENDING one with
 // another sequence number, belongs to a later connection of the socket, and
 // writing the old verdict over it would admit a first flight nobody
-// adjudicated. A record reset since (a NEW_CONN, NO_STATE or REPIN punt
-// started a new cycle) means the verdict no longer answers for the flow.
-func (l *L7) recheck(r l7Recheck, rc *l7Rechecker) recheckResult {
+// adjudicated. A record whose cycle number differs (a NEW_CONN, NO_STATE or
+// REPIN punt started a new cycle; a reset zeroes it, and each decision
+// draws a fresh one) means the verdict no longer answers for the flow.
+func (rc *l7Rechecker) recheck(r l7Recheck) recheckResult {
+	l := rc.l
+	if res, clobbered := rc.read(r); !clobbered {
+		return res
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	var cur bpf.OriginBpfL7FlowVal
-	if err := l.flow.Lookup(&r.key, &cur); err != nil {
-		return recheckSuperseded // evicted: no entry left to strand the flow
-	}
-	if cur.State == r.verdict {
-		return recheckHeld
-	}
-	if cur.State != l7StatePending || cur.LastPuntSeq != r.seq {
-		return recheckSuperseded
+	if res, clobbered := rc.read(r); !clobbered {
+		return res
 	}
 	st := l.flows[r.key]
 	if st == nil {
 		rc.unowned.Add(1)
-		if rc.warnedUnowned.CompareAndSwap(false, true) && l.logger != nil {
-			l.logger.Warn("L7 verdict overwritten by the kernel's punt commit, with no oracle record left to " +
-				"repair it from (the flow table was full); that connection stalls under enforce")
-		}
 		return recheckUnowned
 	}
-	if !st.decided || st.gen != r.gen || st.verdict != r.verdict {
+	if st.gen != r.gen {
 		return recheckSuperseded
 	}
-	if recheckBeforeWrite != nil {
-		recheckBeforeWrite(l)
+	if rc.beforeWrite != nil {
+		rc.beforeWrite()
 	}
 	if err := l.flow.Update(r.key, bpf.OriginBpfL7FlowVal{State: r.verdict}, ebpf.UpdateAny); err != nil {
-		if l.logger != nil {
-			l.logger.Warn("L7 verdict repair failed; read again at the next stage", "err", err)
-		}
-		return recheckHeld
+		rc.failed.Add(1)
+		return recheckFailed
 	}
 	rc.repaired.Add(1)
 	return recheckRepaired
+}
+
+// read looks r's entry up and reports whether it is the deciding punt's
+// own commit (PENDING with its sequence number); otherwise what that makes
+// the re-check. Only a missing entry means evicted: any other lookup error
+// is a failure, read again at the next stage.
+func (rc *l7Rechecker) read(r l7Recheck) (recheckResult, bool) {
+	var cur bpf.OriginBpfL7FlowVal
+	if err := rc.l.flow.Lookup(&r.key, &cur); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return recheckSuperseded, false // evicted: no entry left to strand the flow
+		}
+		rc.failed.Add(1)
+		return recheckFailed, false
+	}
+	if cur.State == r.verdict {
+		return recheckHeld, false
+	}
+	if cur.State != l7StatePending || cur.LastPuntSeq != r.seq {
+		return recheckSuperseded, false
+	}
+	return 0, true
 }

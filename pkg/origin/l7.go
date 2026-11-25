@@ -181,7 +181,7 @@ func (l *L7) start() error {
 	l.reader = rd
 	l.sinkCh = make(chan L7Outcome, 512)
 	l.sinkDone = make(chan struct{})
-	l.rechecks = newL7Rechecker(l, l7RecheckDelays, l7RecheckQueue)
+	l.rechecks = newL7Rechecker(l, l7RecheckDelays)
 	go l.sinkLoop()
 	go l.run()
 	return nil

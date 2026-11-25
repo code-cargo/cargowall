@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,17 +34,35 @@ import (
 // recheckOracle is an oracle driven synchronously whose re-checks are
 // queued to one stage with no worker, so a test can clobber the kernel
 // entry and run each read itself.
-func recheckOracle(t *testing.T, queue int) (*L7, *bpf.OriginBpfObjects, *bytes.Buffer) {
+func recheckOracle(t *testing.T, queue int) (*L7, *bpf.OriginBpfObjects, *syncBuffer) {
 	t.Helper()
 	objs := loadL7Objects(t)
-	var logs bytes.Buffer
+	logs := &syncBuffer{}
 	l := newL7(objs, L7Options{Matcher: allowSet{"auth.docker.io": true, "example.com": true}},
-		slog.New(slog.NewTextHandler(&logs, nil)))
+		slog.New(slog.NewTextHandler(logs, nil)))
 	l.rechecks = &l7Rechecker{
 		l: l, quit: make(chan struct{}),
 		stages: []*recheckStage{{max: queue, wake: make(chan struct{}, 1)}},
 	}
-	return l, objs, &logs
+	return l, objs, logs
+}
+
+// syncBuffer is a log buffer the workers write while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func tlsHello(cookie uint64, seq uint32, flags uint8) *bpf.L7Event {
@@ -94,11 +113,11 @@ func TestL7RecheckRepairsClobberedVerdict(t *testing.T) {
 	r := decide(t, l, ev)
 	require.Equal(t, l7StateAllowed, entryState(objs, ev))
 
-	assert.Equal(t, recheckHeld, l.recheck(r, l.rechecks), "not clobbered: read again later")
+	assert.Equal(t, recheckHeld, l.rechecks.recheck(r), "not clobbered: read again later")
 	assert.Zero(t, l.rechecks.repaired.Load())
 
 	clobber(t, objs, ev, ev.Seq)
-	assert.Equal(t, recheckRepaired, l.recheck(r, l.rechecks))
+	assert.Equal(t, recheckRepaired, l.rechecks.recheck(r))
 	assert.Equal(t, l7StateAllowed, entryState(objs, ev))
 	assert.Equal(t, uint64(1), l.rechecks.repaired.Load())
 
@@ -107,7 +126,7 @@ func TestL7RecheckRepairsClobberedVerdict(t *testing.T) {
 	denied := tlsHello(2, 2000, l7PuntNewConn)
 	r = decide(t, l, denied)
 	clobber(t, objs, denied, denied.Seq)
-	assert.Equal(t, recheckRepaired, l.recheck(r, l.rechecks))
+	assert.Equal(t, recheckRepaired, l.rechecks.recheck(r))
 	assert.Equal(t, l7StateDenied, entryState(objs, denied))
 }
 
@@ -120,18 +139,18 @@ func TestL7RecheckLeavesOtherEntriesAlone(t *testing.T) {
 	r := decide(t, l, ev)
 
 	clobber(t, objs, ev, ev.Seq+7)
-	assert.Equal(t, recheckSuperseded, l.recheck(r, l.rechecks))
+	assert.Equal(t, recheckSuperseded, l.rechecks.recheck(r))
 	assert.Equal(t, l7StatePending, entryState(objs, ev), "another punt's PENDING is left alone")
 
 	require.NoError(t, objs.MapL7Flow.Put(ev.FlowKey(), bpf.OriginBpfL7FlowVal{State: l7StateNeedHello, Ts: 9000}))
-	assert.Equal(t, recheckSuperseded, l.recheck(r, l.rechecks))
+	assert.Equal(t, recheckSuperseded, l.rechecks.recheck(r))
 	assert.Equal(t, l7StateNeedHello, entryState(objs, ev), "a NEED_HELLO is left alone")
 
 	require.NoError(t, objs.MapL7Flow.Put(ev.FlowKey(), bpf.OriginBpfL7FlowVal{State: l7StateDenied}))
-	assert.Equal(t, recheckSuperseded, l.recheck(r, l.rechecks), "another verdict is a later cycle's")
+	assert.Equal(t, recheckSuperseded, l.rechecks.recheck(r), "another verdict is a later cycle's")
 
 	require.NoError(t, objs.MapL7Flow.Delete(ev.FlowKey()))
-	assert.Equal(t, recheckSuperseded, l.recheck(r, l.rechecks), "an evicted entry strands nothing")
+	assert.Equal(t, recheckSuperseded, l.rechecks.recheck(r), "an evicted entry strands nothing")
 	assert.Zero(t, l.rechecks.repaired.Load())
 }
 
@@ -146,7 +165,7 @@ func TestL7RecheckSkipsAResetFlow(t *testing.T) {
 	r := decide(t, l, ev)
 	_ = decide(t, l, tlsHello(1, 3000, l7PuntNewConn))
 	clobber(t, objs, ev, ev.Seq)
-	assert.Equal(t, recheckSuperseded, l.recheck(r, l.rechecks), "a later cycle owns the flow")
+	assert.Equal(t, recheckSuperseded, l.rechecks.recheck(r), "a later cycle owns the flow")
 
 	// Reset and still assembling.
 	ev = tlsHello(2, 1000, l7PuntNewConn)
@@ -156,7 +175,7 @@ func TestL7RecheckSkipsAResetFlow(t *testing.T) {
 	partial.Flags |= l7PuntNoState
 	l.onSample(partial)
 	clobber(t, objs, ev, ev.Seq)
-	assert.Equal(t, recheckSuperseded, l.recheck(r, l.rechecks), "an undecided cycle owns the flow")
+	assert.Equal(t, recheckSuperseded, l.rechecks.recheck(r), "an undecided cycle owns the flow")
 	assert.Zero(t, l.rechecks.repaired.Load())
 }
 
@@ -170,12 +189,12 @@ func TestL7RecheckCountsAnUnownedClobber(t *testing.T) {
 		r := decide(t, l, ev)
 		delete(l.flows, ev.FlowKey())
 		clobber(t, objs, ev, ev.Seq)
-		assert.Equal(t, recheckUnowned, l.recheck(r, l.rechecks))
+		assert.Equal(t, recheckUnowned, l.rechecks.recheck(r))
 		assert.Equal(t, l7StatePending, entryState(objs, ev))
 	}
 	assert.Equal(t, uint64(2), l.rechecks.unowned.Load())
 	assert.Zero(t, l.rechecks.repaired.Load())
-	assert.Equal(t, 1, strings.Count(logs.String(), "no oracle record left to repair it from"))
+	_ = logs // the worker warns, once; TestL7RecheckLoopWarnsOnce covers it
 }
 
 // The read, the record check and the write happen under l.mu, so no cycle
@@ -188,15 +207,14 @@ func TestL7RecheckWritesUnderTheOracleLock(t *testing.T) {
 	clobber(t, objs, ev, ev.Seq)
 
 	held := false
-	recheckBeforeWrite = func(l *L7) {
+	l.rechecks.beforeWrite = func() {
 		if l.mu.TryLock() {
 			l.mu.Unlock()
 			return
 		}
 		held = true
 	}
-	t.Cleanup(func() { recheckBeforeWrite = nil })
-	require.Equal(t, recheckRepaired, l.recheck(r, l.rechecks))
+	require.Equal(t, recheckRepaired, l.rechecks.recheck(r))
 	assert.True(t, held, "the repair's write must happen with l.mu held")
 }
 
@@ -247,7 +265,11 @@ func gatedRechecker(t *testing.T, l *L7, stages int) (gates, entered []chan stru
 			return false
 		}
 	}
-	rc.start(make([]time.Duration, stages), 16)
+	caps := make([]int, stages)
+	for i := range caps {
+		caps[i] = 16
+	}
+	rc.start(make([]time.Duration, stages), caps)
 	l.rechecks = rc
 	t.Cleanup(rc.stop)
 	return gates, entered
@@ -301,9 +323,115 @@ func TestL7RecheckLoopStages(t *testing.T) {
 // Stopping does not wait out the delays.
 func TestL7RecheckStopDoesNotSleep(t *testing.T) {
 	l, _, _ := recheckOracle(t, 16)
-	rc := newL7Rechecker(l, []time.Duration{time.Hour}, 16)
+	rc := newL7Rechecker(l, []time.Duration{time.Hour})
 	rc.queue(l7Recheck{written: time.Now()})
 	start := time.Now()
 	rc.stop()
 	assert.Less(t, time.Since(start), time.Second)
+}
+
+// A failed read other than a missing entry, or a failed repair write, is
+// counted and read again, never taken for an eviction.
+func TestL7RecheckCountsFailures(t *testing.T) {
+	l, objs, _ := recheckOracle(t, 4)
+	ev := tlsHello(1, 1000, l7PuntNewConn)
+	r := decide(t, l, ev)
+	clobber(t, objs, ev, ev.Seq)
+
+	// The write fails: the map is closed under it.
+	flow, err := objs.MapL7Flow.Clone()
+	require.NoError(t, err)
+	l.flow = flow
+	l.rechecks.beforeWrite = func() { _ = flow.Close() }
+	assert.Equal(t, recheckFailed, l.rechecks.recheck(r))
+	assert.Equal(t, uint64(1), l.rechecks.failed.Load())
+
+	// The read fails, with something other than a missing key.
+	l.rechecks.beforeWrite = nil
+	assert.Equal(t, recheckFailed, l.rechecks.recheck(r))
+	assert.Equal(t, uint64(2), l.rechecks.failed.Load())
+	assert.Zero(t, l.rechecks.repaired.Load())
+
+	// Back on the live map, the entry is still the clobber, and is repaired.
+	l.flow = objs.MapL7Flow
+	assert.Equal(t, recheckRepaired, l.rechecks.recheck(r))
+	assert.Equal(t, l7StateAllowed, entryState(objs, ev))
+}
+
+// In observe mode the kernel passes a PENDING flow's packets and its next
+// segment re-punts, so a clobber strands nothing: no re-check is queued.
+func TestL7RecheckNotQueuedUnderObserve(t *testing.T) {
+	l, _, _ := recheckOracle(t, 4)
+	l.onSample(tlsHello(1, 1000, l7PuntNewConn|l7PuntObserve))
+	assert.Empty(t, l.rechecks.stages[0].q)
+}
+
+// Each stage is sized by how long entries stay in it, so the last, which
+// holds them longest, is not the first to fill.
+func TestRecheckStageCaps(t *testing.T) {
+	assert.Equal(t, []int{1024, 2376, 13926}, recheckStageCaps(l7RecheckDelays))
+}
+
+// A re-check the next stage has no room for is dropped, counted as checked,
+// and warned once; and the worker warns once for unowned clobbers and
+// failures, never under l.mu.
+func TestL7RecheckLoopWarnsOnce(t *testing.T) {
+	l, objs, logs := recheckOracle(t, 16)
+	gates := make([]chan struct{}, 2)
+	entered := make([]chan struct{}, 2)
+	for i := range gates {
+		gates[i] = make(chan struct{})
+		entered[i] = make(chan struct{}, 16)
+	}
+	rc := &l7Rechecker{l: l, quit: make(chan struct{})}
+	rc.wait = func(stage int, _ time.Duration) bool {
+		entered[stage] <- struct{}{}
+		select {
+		case <-gates[stage]:
+			return true
+		case <-rc.quit:
+			return false
+		}
+	}
+	rc.start(make([]time.Duration, 2), []int{16, 1})
+	l.rechecks = rc
+	t.Cleanup(rc.stop)
+	reach := func(stage int) {
+		t.Helper()
+		select {
+		case <-entered[stage]:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no re-check reached stage %d", stage+1)
+		}
+	}
+
+	// Three verdicts in place: the first fills stage 2 (it waits at its
+	// gate), the second takes the one slot, the third has none.
+	for cookie := uint64(1); cookie <= 3; cookie++ {
+		l.onSample(tlsHello(cookie, 1000, l7PuntNewConn))
+		reach(0)
+		gates[0] <- struct{}{}
+		if cookie == 1 {
+			reach(1) // stage 2 has taken it and holds it at its gate
+		}
+	}
+	require.Eventually(t, func() bool { return rc.droppedChecked.Load() == 1 }, 5*time.Second, time.Millisecond)
+	assert.Zero(t, rc.droppedUnchecked.Load())
+
+	// Two unowned clobbers: one Warn.
+	for cookie := uint64(10); cookie <= 11; cookie++ {
+		ev := tlsHello(cookie, 1000, l7PuntNewConn)
+		l.onSample(ev)
+		l.mu.Lock()
+		delete(l.flows, ev.FlowKey())
+		l.mu.Unlock()
+		clobber(t, objs, ev, ev.Seq)
+		reach(0)
+		gates[0] <- struct{}{}
+	}
+	require.Eventually(t, func() bool { return rc.unowned.Load() == 2 }, 5*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool {
+		return strings.Count(logs.String(), "no oracle record left to repair it from") == 1
+	}, 5*time.Second, time.Millisecond)
+	assert.Equal(t, 1, strings.Count(logs.String(), "L7 verdict re-check dropped"))
 }

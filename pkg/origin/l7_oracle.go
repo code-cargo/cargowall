@@ -245,8 +245,10 @@ func (l *L7) onSample(ev *bpf.L7Event) {
 
 	l.finish(ev, flowProto, out, dcid)
 	// TCP only: a QUIC retransmit is never deduplicated, so it re-punts and
-	// reassertVerdict repairs a clobbered verdict from it.
-	if ev.Flags&l7PuntQUIC == 0 {
+	// reassertVerdict repairs a clobbered verdict from it. And not in
+	// observe mode, where the kernel passes a PENDING flow's packets and its
+	// next segment re-punts, so a clobbered verdict strands nothing.
+	if ev.Flags&(l7PuntQUIC|l7PuntObserve) == 0 {
 		recheck.written = time.Now()
 		l.rechecks.queue(recheck)
 	}

@@ -55,12 +55,17 @@ delayed by a preempted or starved vCPU before the client's later
 retransmits. It writes the verdict again only when the entry is `PENDING`
 with the deciding punt's sequence number (so it is that punt's own commit,
 and no further punt is on its way) and the oracle's record for the flow is
-still the cycle that decided it, and it reads the entry, checks the record
-and writes under the oracle's lock, so no later cycle is decided in
-between. Anything else, a `NEED_HELLO` or a `PENDING` of another sequence
+still the cycle that decided it. The first read is unlocked, since nearly
+every one finds the verdict in place; one showing the deciding punt's
+`PENDING` takes the oracle's lock, reads again, checks the record and
+writes under it, so no later cycle is decided in between. Under observe
+nothing is queued: the kernel passes a `PENDING` flow's packets there, and
+its next segment re-punts. Anything else, a `NEED_HELLO` or a `PENDING` of another sequence
 number above all, belongs to a later connection of the socket and is left
 alone: the old verdict there would admit a first flight nobody adjudicated.
-The queues are bounded and never block the punt reader. No kernel change
+Each stage's queue is bounded by how long entries stay in it (16,384
+verdicts a second times its span, at least 1,024) and never blocks the
+punt reader. No kernel change
 was needed, so no verifier budget is spent.
 
 This narrows the race to what it cannot reach, and those residuals are
@@ -68,7 +73,10 @@ counted rather than silent: a commit delayed past the last read still
 strands its connection; a clobbered flow whose oracle record was evicted
 from a full table (more than 16,384 flows inside the 30 s tombstone TTL) is
 counted `verdict_rechecks_unowned` and warned once, never repaired, since
-nothing vouches for the verdict; a re-check a full queue drops is counted
+nothing vouches for the verdict; a read or repair write that fails (other
+than a missing entry, which is an eviction) is counted
+`verdict_rechecks_failed`, warned once, and read again at the next stage
+while there is one; a re-check a full queue drops is counted
 `verdict_rechecks_dropped_unchecked` or `_checked` and warned once; and a
 later connection's SYN or punt landing between the read and the write, a
 window of one map update, is the same one `writeFlowState` leaves.

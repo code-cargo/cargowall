@@ -165,10 +165,10 @@ func (p L7Policy) nameAllowed(name string, q L7Request) (allowed, denied bool) {
 //   - it is a TLS or QUIC SNI, not an HTTP Host: a plain-HTTP shared edge
 //     can route a single-label Host to another tenant (an S3 website
 //     endpoint serves the bucket the Host names);
-//   - the destination is globally routable. Inside a private network a
-//     shared ingress commonly serves single-label virtual hosts (vault,
-//     grafana) by SNI, and admitting a bare label there would reopen the
-//     very swap this layer closes;
+//   - the destination is globally routable (globallyRoutable). Inside a
+//     private network a shared ingress commonly serves single-label virtual
+//     hosts (vault, grafana) by SNI, and admitting a bare label there would
+//     reopen the very swap this layer closes;
 //   - some name that forward-resolved to this destination is allowed on
 //     this port and protocol by the same tiers, deny rules included. A
 //     reverse name never mints binding evidence, so it cannot satisfy this.
@@ -177,7 +177,7 @@ func (p L7Policy) bareLabelAdmitted(q L7Request) bool {
 		return false
 	}
 	addr, err := netip.ParseAddr(q.DstIP)
-	if err != nil || !addr.Unmap().IsGlobalUnicast() || LocalAddress(addr) {
+	if err != nil || !globallyRoutable(addr) {
 		return false
 	}
 	// The store is keyed by the spelling the DNS layer recorded, which is
@@ -187,4 +187,51 @@ func (p L7Policy) bareLabelAdmitted(q L7Request) bool {
 		return allowed
 	})
 	return ok
+}
+
+// notGloballyRoutable are the special-purpose ranges IsGlobalUnicast and
+// LocalAddress leave in, none of them reachable on the public internet
+// (IANA's special-purpose registries, "Globally Reachable: False"): an
+// address there is a private network's, however it is numbered. A cluster
+// can number its ingress from 240.0.0.0/4 or 198.18.0.0/15, and a single
+// label routed by SNI there is the swap the bare-label pass must not
+// reopen.
+var notGloballyRoutable = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+// nat64WellKnown is the NAT64 well-known prefix (RFC 6052): an address in
+// it stands for the IPv4 address in its last 32 bits, which a DNS64 network
+// hands out for every IPv4 destination, internal ones included.
+var nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")
+
+// globallyRoutable reports whether addr is a public internet address: a
+// global unicast address outside every local (LocalAddress) and
+// special-purpose range. A NAT64 address is judged by the IPv4 address it
+// carries, and an IPv4-mapped one by its IPv4 address.
+func globallyRoutable(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if nat64WellKnown.Contains(addr) {
+		b := addr.As16()
+		addr = netip.AddrFrom4([4]byte(b[12:16]))
+	}
+	if !addr.IsGlobalUnicast() || LocalAddress(addr) {
+		return false
+	}
+	for _, p := range notGloballyRoutable {
+		if p.Contains(addr) {
+			return false
+		}
+	}
+	return true
 }

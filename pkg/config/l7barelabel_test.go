@@ -19,6 +19,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -285,5 +286,60 @@ func TestBindingIndexConsistentAcrossEvictions(t *testing.T) {
 	cm.bindMu.Unlock()
 	if rrKept || rrIndexed {
 		t.Errorf("the least-recent name survived the name cap: store %v, index %v", rrKept, rrIndexed)
+	}
+}
+
+// Only a public internet address counts: the special-purpose ranges
+// IsGlobalUnicast leaves in are a private network's, and a NAT64 address is
+// judged by the IPv4 address it carries.
+func TestGloballyRoutable(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"54.80.12.34":          true,
+		"2606:4700::6810:84e5": true,
+		"64:ff9b::3650:c22":    true, // NAT64 of 54.80.12.34
+		"::ffff:54.80.12.34":   true,
+		"10.1.2.3":             false,
+		"100.64.3.4":           false,
+		"169.254.1.1":          false,
+		"127.0.0.1":            false,
+		"0.1.2.3":              false,
+		"192.0.0.8":            false,
+		"192.0.2.7":            false,
+		"198.18.0.5":           false,
+		"198.51.100.7":         false,
+		"203.0.113.7":          false,
+		"240.0.0.9":            false,
+		"255.255.255.255":      false,
+		"64:ff9b::a01:203":     false, // NAT64 of 10.1.2.3
+		"64:ff9b:1::a01:203":   false,
+		"100::1":               false,
+		"2001:db8::5":          false,
+		"2001:2::1":            false,
+		"fd00::10":             false,
+		"fe80::1":              false,
+		"::1":                  false,
+		"ff02::1":              false,
+	} {
+		if got := globallyRoutable(netip.MustParseAddr(addr)); got != want {
+			t.Errorf("globallyRoutable(%s) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
+// The matcher applies it: a bare label to an internal ingress behind NAT64,
+// or numbered from 240/4 or 198.18/15, is no bare-label pass.
+func TestMatchL7_BareLabelSpecialPurposeRefused(t *testing.T) {
+	cm := bareLabelManager(t, allowBuilders)
+	for _, ip := range []string{"64:ff9b::a01:203", "240.0.0.9", "198.18.0.5", "64:ff9b::3650:c22"} {
+		cm.RecordForwardResolution(builderName, ip)
+	}
+	p := NewL7Policy(cm, nil)
+	for _, ip := range []string{"64:ff9b::a01:203", "240.0.0.9", "198.18.0.5"} {
+		if got := p.MatchName(sniAt("grafana", ip)); got != L7NoMatch {
+			t.Errorf("bare label at %s = %v, want L7NoMatch", ip, got)
+		}
+	}
+	if got := p.MatchName(sniAt("kq563vfqzm", "64:ff9b::3650:c22")); got != L7MatchBareLabel {
+		t.Errorf("bare label at the NAT64 form of a public address = %v, want L7MatchBareLabel", got)
 	}
 }

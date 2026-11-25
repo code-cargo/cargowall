@@ -19,12 +19,14 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,13 +83,37 @@ func TestL7Sink_BareLabelPass(t *testing.T) {
 		assert.False(t, ev.WouldDeny, "enforce=%v: a pass is no would-block", enforce)
 		assert.Contains(t, logs.String(), "level=INFO msg=\"L7 identity passed as a bare label\"")
 
-		// Under an audit posture too, normalization must leave it alone.
-		al.SetAuditMode(true)
+		// The same destination and name again: not reported again.
 		sink(passed)
+		require.Len(t, capture.events, 1, "a pass is reported once per destination and name")
+		assert.Equal(t, 1, strings.Count(logs.String(), "passed as a bare label"))
+
+		// Under an audit posture too, normalization must leave it alone;
+		// another name at the same destination is a record of its own.
+		al.SetAuditMode(true)
+		other := passed
+		other.Name = "zz9plural"
+		sink(other)
 		require.Len(t, capture.events, 2)
+		assert.Equal(t, "zz9plural", capture.events[1].L7Name)
 		assert.False(t, capture.events[1].Blocked)
 		assert.False(t, capture.events[1].WouldDeny)
 	}
+}
+
+// The set of reported passes is bounded: past l7PassedOnceMax it starts
+// over rather than growing with a workload's labels.
+func TestL7PassedOnce_Bounded(t *testing.T) {
+	p := newL7PassedOnce()
+	o := origin.L7Outcome{DstIP: netip.MustParseAddr("54.80.12.34"), DstPort: 443}
+	for i := 0; i < l7PassedOnceMax+10; i++ {
+		o.Name = fmt.Sprintf("label%d", i)
+		require.True(t, p.first(o))
+	}
+	assert.LessOrEqual(t, len(p.seen), l7PassedOnceMax)
+	o.Name = "label0"
+	assert.True(t, p.first(o), "the set started over")
+	assert.False(t, p.first(o))
 }
 
 // The summary treats l7_passed as telemetry: not counted, not pushed, never

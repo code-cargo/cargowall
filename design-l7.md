@@ -442,8 +442,13 @@ of these hold (`bareLabelAdmitted`):
    stripped a trailing dot);
 2. it is a TLS or QUIC SNI, not an HTTP Host (`L7Request.SNI`, set by the
    oracle from the flow's parsed protocol);
-3. the destination is globally routable: not private, loopback, link-local,
-   unique-local or carrier-grade NAT (`config.LocalAddress`);
+3. the destination is globally routable (`globallyRoutable`): not private,
+   loopback, link-local, unique-local or carrier-grade NAT
+   (`config.LocalAddress`), nor in a special-purpose range the public
+   internet does not route (0/8, 192.0.0/24, the documentation ranges,
+   198.18/15, 240/4, 64:ff9b:1::/48, 100::/64, 2001::/23, 2001:db8::/32). A
+   NAT64 address (64:ff9b::/96) is judged by the IPv4 address it carries, so
+   an internal ingress reached through DNS64 is no more public than it is;
 4. some name the binding store holds for this destination is allowed on this
    port and protocol by the tiers a presented name goes through: the job's
    rules (and not denied by them on this port), the derived CNAME set, or the
@@ -468,7 +473,9 @@ admitting a bare label there would reopen exactly the swap this layer closes.
 
 The pass is reported, since no rule names what it admitted: an `l7_passed`
 audit record with `l7_reason=bare_label`, the presented label in `l7_name`
-and the usual identity fields, and one Info line in the ops log. It is
+and the usual identity fields, and one Info line in the ops log, once per
+destination and label (a bounded set, which starts over past 4,096 pairs),
+so a client that connects per request does not flood the job's log tail. It is
 telemetry in every posture, never a block or a would-block: the audit
 normalization leaves `blocked`/`would_deny` false, the summary neither counts
 nor pushes it nor suggests it, and OTLP skips it as it skips `l7_would_block`.

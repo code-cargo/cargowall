@@ -91,17 +91,16 @@ verify_http() {
 
 # A single-label SNI is no DNS name, so a shared edge cannot route it to
 # another tenant: at a public address an allowed name resolved to, it passes
-# as a bare label and is reported as l7_passed, never dropped.
+# as a bare label and is reported as l7_passed, never dropped. Whether the
+# edge then answers is the edge's business (one may refuse an unknown SNI at
+# the handshake), so this only presents the label; verify_events judges
+# cargowall's verdict from its record.
 verify_bare_label() {
-  step "TLS: a bare-label SNI to an allowed public address passes"
+  step "TLS: a bare-label SNI to an allowed public address"
   local ip code
   ip=$(edge_ip)
   code=$(http_code -k --resolve "$BARE_LABEL:443:$ip" "https://$BARE_LABEL/")
-  if [ "$code" = "000" ]; then
-    echo "❌ SNI $BARE_LABEL to $ip got no response"
-    return 1
-  fi
-  echo "✅ SNI $BARE_LABEL to $ip answered (HTTP $code)"
+  echo "SNI $BARE_LABEL to $ip: HTTP $code (the edge's answer; the verdict is checked in the audit log)"
 }
 
 # container_probe presents a name to the edge address from a container

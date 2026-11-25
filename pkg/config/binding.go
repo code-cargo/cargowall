@@ -17,7 +17,6 @@
 package config
 
 import (
-	"slices"
 	"strings"
 	"time"
 )
@@ -220,9 +219,6 @@ func (cm *Manager) BoundNameAllowed(ip string, allowed func(name string) bool) (
 		names = append(names, name)
 	}
 	cm.bindMu.Unlock()
-	// Sorted so which name answers, and so which binding is refreshed, does
-	// not depend on map order.
-	slices.Sort(names)
 
 	for _, name := range names {
 		if allowed(name) && cm.NameResolvedToIP(name, ip) {

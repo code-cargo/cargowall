@@ -56,10 +56,26 @@ func ScopeAllowedIP(l7 L7LateRegistrar, hostname string, ip net.IP, allowPorts [
 	l7.RegisterLateAllow(hostname, ip, allowPorts)
 }
 
-// L7Record is one denied L7 (SNI/Host/QUIC) adjudication reported by the
-// oracle, or one it passed for a reason other than an allowed name (Passed). The caller has already resolved the punt's socket cookie to
-// pid/step through the same join origin records use, so an L7 denial carries
-// the identical attribution as its sibling L4 outcomes.
+// L7Disposition is what became of a reported L7 flow, and so which event
+// it is recorded as.
+type L7Disposition uint8
+
+const (
+	// L7WouldDrop: denied, but passed (observe mode, an audit posture, or a
+	// per-IP binding only measured). Recorded as l7_would_block.
+	L7WouldDrop L7Disposition = iota
+	// L7Dropped: denied and dropped. Recorded as l7_blocked, and notified.
+	L7Dropped
+	// L7Passed: passed although no rule allows the name it presented (a
+	// bare-label SNI). Recorded as l7_passed; never a block or a would-block.
+	L7Passed
+)
+
+// L7Record is one L7 (SNI/Host/QUIC) adjudication the oracle reports: a
+// denial, or a flow it passed for a reason other than an allowed name. The
+// caller has already resolved the punt's socket cookie to pid/step through
+// the same join origin records use, so the record carries the identical
+// attribution as its sibling L4 outcomes.
 type L7Record struct {
 	SrcIP       string
 	DstIP       string
@@ -70,17 +86,14 @@ type L7Record struct {
 	Name        string // SNI/Host the flow presented ("" when none was recovered)
 	L7Protocol  string // "tls" | "http" | "quic"
 	Reason      string // origin.L7Reason vocabulary
-	Enforced    bool   // true: the flow was dropped; false: observe/audit would-block
-	// Passed marks a flow L7 passed whose name no rule allows (a bare-label
-	// SNI). Reported as l7_passed; Enforced is ignored.
-	Passed bool
+	Disposition L7Disposition
 	// Decorate optionally adds identity the oracle cannot know — container
 	// id/origin, supplied by pkg/containers. Nil when no decorator is wired.
 	Decorate func(*AuditEvent)
 }
 
-// ReportL7 turns one denied L7 adjudication into a log line, an audit record,
-// and — for an enforced drop — the same operator notification an equivalent
+// ReportL7 turns one reported L7 adjudication into a log line, an audit
+// record, and — for a drop — the same operator notification an equivalent
 // L4 block raises, with the same identity fields (process, step, container,
 // hostname) as the L4 outcome pipeline. Deliberately NOT routed through
 // emitOutcome: an L7 denial's destination IP is already L4-allowed by
@@ -91,12 +104,12 @@ func ReportL7(rec L7Record, configMgr *config.Manager, auditLogger *AuditLogger,
 	notificationTracker *NotificationTracker, logger *slog.Logger,
 ) {
 	evtType, msg := EventL7WouldBlock, "L7 identity would be blocked"
-	switch {
-	case rec.Passed:
+	switch rec.Disposition {
+	case L7Passed:
 		// Neither a drop nor a would-drop: never notified, never Blocked or
 		// WouldDeny.
-		evtType, msg, rec.Enforced = EventL7Passed, "L7 identity passed as a bare label", false
-	case rec.Enforced:
+		evtType, msg = EventL7Passed, "L7 identity passed as a bare label"
+	case L7Dropped:
 		evtType, msg = EventL7Blocked, "L7 identity blocked"
 	}
 	var hostname string
@@ -116,7 +129,7 @@ func ReportL7(rec L7Record, configMgr *config.Manager, auditLogger *AuditLogger,
 		L7Name:      rec.Name,
 		L7Protocol:  rec.L7Protocol,
 		L7Reason:    rec.Reason,
-		WouldDeny:   !rec.Enforced && !rec.Passed,
+		WouldDeny:   rec.Disposition == L7WouldDrop,
 	}
 	if rec.Decorate != nil {
 		rec.Decorate(&audit)
@@ -137,7 +150,7 @@ func ReportL7(rec L7Record, configMgr *config.Manager, auditLogger *AuditLogger,
 	// SNI, a parse failure) would blame and deduplicate against a destination
 	// policy permits. SendNotification falls back to the IP for an empty name,
 	// which is the correct attribution here.
-	if rec.Enforced && notificationTracker != nil {
+	if rec.Disposition == L7Dropped && notificationTracker != nil {
 		notificationTracker.SendNotification(rec.Name, rec.DstIP, rec.DstPort)
 	}
 }

@@ -151,7 +151,7 @@ func TestBindingEvidenceIsBounded(t *testing.T) {
 	n := len(cm.bindings.byName)
 	cm.bindMu.Unlock()
 	if n > maxBindingNames {
-		t.Errorf("nameToIPs grew to %d, want <= %d", n, maxBindingNames)
+		t.Errorf("bindings.byName grew to %d, want <= %d", n, maxBindingNames)
 	}
 
 	cm2 := NewConfigManager()

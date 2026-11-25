@@ -27,7 +27,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	cargowallv1pb "github.com/code-cargo/cargowall/pb/cargowall/v1"
+	datapb "github.com/code-cargo/cargowall/pb/cargowall/v1/data"
 	"github.com/code-cargo/cargowall/pkg/config"
+	"github.com/code-cargo/cargowall/pkg/events"
 )
 
 // A fetched policy carrying a search domain cargowall refuses loads, the
@@ -70,4 +73,38 @@ func TestLoadCIConfig_RefusedSearchDomainStillLoadsPolicy(t *testing.T) {
 			assert.Equal(t, "enforce", string(data))
 		})
 	}
+}
+
+// The SaaS sidecar loads its policy through the extension hook, not the
+// policy fetch: there a search domain cargowall refuses used to fail
+// startup outright. It is dropped there too, and the policy loads.
+func TestLoadHookPolicy_RefusedSearchDomainStillLoadsPolicy(t *testing.T) {
+	cleaned := 0
+	hooks := &StartHooks{
+		LoadPolicy: func(context.Context, *StartCmd) (*cargowallv1pb.CargoWallPolicy, events.StateMachineClient, func(), error) {
+			return &cargowallv1pb.CargoWallPolicy{
+				Mode:          datapb.CargoWallMode_CARGO_WALL_MODE_ENFORCE,
+				DefaultAction: datapb.CargoWallActionType_CARGO_WALL_ACTION_TYPE_DENY,
+				SearchDomains: []string{"corp", ".compute.internal"},
+			}, nil, func() { cleaned++ }, nil
+		},
+	}
+	cm := config.NewConfigManager()
+	_, cleanup, err := loadHookPolicy(context.Background(), &StartCmd{}, hooks, cm, nil)
+	require.NoError(t, err, "a refused search domain no longer fails the hook path")
+	require.NotNil(t, cleanup)
+	assert.Equal(t, []string{".compute.internal"}, cm.GetSearchDomains())
+	assert.False(t, cm.IsAuditMode())
+	assert.Zero(t, cleaned, "the caller owns the cleanup on success")
+
+	// A policy that fails to load still fails the hook path, and the hook's
+	// cleanup has run.
+	hooks.LoadPolicy = func(context.Context, *StartCmd) (*cargowallv1pb.CargoWallPolicy, events.StateMachineClient, func(), error) {
+		return &cargowallv1pb.CargoWallPolicy{Rules: []*cargowallv1pb.CargoWallPolicy_Rule{{Value: "1.2.3.4/32"}}},
+			nil, func() { cleaned++ }, nil
+	}
+	_, _, err = loadHookPolicy(context.Background(), &StartCmd{}, hooks, config.NewConfigManager(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to load CargoWall config")
+	assert.Equal(t, 1, cleaned)
 }

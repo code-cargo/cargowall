@@ -62,7 +62,7 @@ func dropReverseLookupHosts(rules []Rule) []Rule {
 // entry from failing a whole policy's load.
 func dropReverseZoneSearchDomains(domains []string) []string {
 	return slices.DeleteFunc(slices.Clone(domains), func(d string) bool {
-		if !ReverseLookupName(d) {
+		if c, _ := classifySearchDomain(d); c != searchDomainReverseZone {
 			return false
 		}
 		slog.Warn("A search domain under a reverse-lookup zone is dropped: reverse-lookup names are decided by "+

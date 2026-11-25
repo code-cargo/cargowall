@@ -17,9 +17,9 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -33,37 +33,41 @@ import (
 // and CARGOWALL_SEARCH_DOMAINS are written by the operator of this one run,
 // where a typo should stop the run instead; they keep validateSearchDomains.
 
-// maxReportedSearchDomains caps the entries one report line names, so a
-// policy merged across levels with dozens of refused entries still makes a
-// readable annotation; the rest are counted.
-const maxReportedSearchDomains = 10
+// maxReportedSearchDomains caps the entries one report line names, and
+// maxReportedSearchDomainLen the length each is named with, so a policy
+// merged across levels with dozens of refused entries, or one carrying an
+// oversized entry, still makes a readable annotation.
+const (
+	maxReportedSearchDomains   = 10
+	maxReportedSearchDomainLen = 64
+)
 
-// filterPolicySearchDomains normalizes a CodeCargo policy's search domains
-// and returns those validateSearchDomain accepts, in order, with report,
-// which logs what was dropped. The caller calls report only once the policy
-// has loaded, so a line never says a policy applies that then fails to.
+// filterPolicySearchDomains returns the CodeCargo policy's search domains
+// classifySearchDomain accepts, normalized and deduplicated, in order, with
+// report, which logs what was dropped. The caller calls report only once
+// the policy has loaded, so a line never says a policy applies that then
+// fails to.
 //
 // An always-active Kubernetes suffix is reported at Info, since stripping it
 // happens anyway. Every other drop, an entry under a reverse-lookup zone
-// included, shares one Warn line, each entry with a short reason: Warn lines
-// become job annotations, so one per entry would flood the job.
+// included, shares one Warn line, each entry as the operator wrote it with
+// a short reason: Warn lines become job annotations, so one per entry would
+// flood the job, and the normalized form is not what the operator can
+// search the policy for.
 func filterPolicySearchDomains(raw []string) (kept []string, report func()) {
 	var alwaysActive, dropped []string
-	for _, d := range normalizeSearchDomainsKeepingReverse(raw) {
-		if ReverseLookupName(d) {
-			dropped = append(dropped, strconv.Quote(d)+": under a reverse-lookup zone, which no search domain decides")
-			continue
-		}
-		err := validateSearchDomain(d)
-		switch {
-		case err == nil:
+	for _, r := range raw {
+		d := normalizeSearchDomain(r)
+		switch c, _ := classifySearchDomain(d); c {
+		case searchDomainOK:
 			kept = append(kept, d)
-		case errors.Is(err, errSearchDomainAlwaysActive):
-			alwaysActive = append(alwaysActive, d)
+		case searchDomainAlwaysActive:
+			alwaysActive = append(alwaysActive, reportedSearchDomain(r))
 		default:
-			dropped = append(dropped, strconv.Quote(d)+": "+searchDomainClass(err))
+			dropped = append(dropped, reportedSearchDomain(r)+": "+c.String())
 		}
 	}
+	kept = mergeNormalizedSearchDomains(nil, kept)
 	return kept, func() {
 		if len(alwaysActive) > 0 {
 			slog.Info("Search domains in the CodeCargo policy are dropped: they are always active for stripping",
@@ -76,21 +80,24 @@ func filterPolicySearchDomains(raw []string) (kept []string, report func()) {
 	}
 }
 
-// searchDomainClass is err's short reason: its class, or the whole message
-// for an error validateSearchDomain did not classify.
-func searchDomainClass(err error) string {
-	var sd *searchDomainError
-	if errors.As(err, &sd) {
-		return sd.class.Error()
+// reportedSearchDomain is an entry as the operator wrote it, shortened to
+// maxReportedSearchDomainLen bytes, and `""` for an empty one.
+func reportedSearchDomain(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return strconv.Quote(raw)
 	}
-	return err.Error()
+	if len(raw) > maxReportedSearchDomainLen {
+		return raw[:maxReportedSearchDomainLen] + "…"
+	}
+	return raw
 }
 
-// cappedList joins entries, naming at most maxReportedSearchDomains.
-func cappedList(entries []string) string {
+// cappedList is entries with at most maxReportedSearchDomains named and the
+// rest counted.
+func cappedList(entries []string) []string {
 	if len(entries) <= maxReportedSearchDomains {
-		return strings.Join(entries, "; ")
+		return entries
 	}
-	return strings.Join(entries[:maxReportedSearchDomains], "; ") +
-		fmt.Sprintf("; and %d more", len(entries)-maxReportedSearchDomains)
+	return append(slices.Clone(entries[:maxReportedSearchDomains]),
+		fmt.Sprintf("and %d more", len(entries)-maxReportedSearchDomains))
 }

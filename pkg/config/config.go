@@ -2017,17 +2017,14 @@ func (cm *Manager) AddSearchDomains(domains []string, logger *slog.Logger) {
 	// indices, attributing a validation error to the wrong entry.
 	valid := make([]string, 0, len(domains))
 	for _, raw := range domains {
-		d := strings.ToLower(strings.TrimSpace(raw))
-		if d != "" && !strings.HasPrefix(d, ".") {
-			d = "." + d
-		}
+		d := normalizeSearchDomain(raw)
 		if err := validateSearchDomain(d); err != nil {
 			logger.Warn("Skipping invalid auto-added search domain", "domain", raw, "error", err)
 			continue
 		}
 		valid = append(valid, d)
 	}
-	if valid = dropReverseZoneSearchDomains(valid); len(valid) == 0 {
+	if len(valid) == 0 {
 		return
 	}
 

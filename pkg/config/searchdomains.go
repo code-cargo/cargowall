@@ -17,7 +17,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -25,59 +24,85 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
-// Operator search domains: normalization and validation, shared by every
-// loader. The CodeCargo policy loader's per-entry drop is policysearch.go.
+// Operator search domains: normalization and classification, shared by
+// every loader. The CodeCargo policy loader's per-entry drop is
+// policysearch.go.
 
-// The classes of search domain validateSearchDomain refuses. Each is also
-// the short reason a dropped entry is reported with.
-var (
-	errSearchDomainEmpty        = errors.New("empty")
-	errSearchDomainAlwaysActive = errors.New("always active for stripping")
-	errSearchDomainSingleLabel  = errors.New("a single label")
-	errSearchDomainBadLabel     = errors.New("an invalid label")
-	errSearchDomainPublicSuffix = errors.New("a public suffix")
+// searchDomainClass is what classifySearchDomain makes of an entry: usable,
+// or the reason it is not. Its String is the short reason a dropped entry
+// is reported with.
+type searchDomainClass uint8
+
+const (
+	searchDomainOK searchDomainClass = iota
+	searchDomainEmpty
+	searchDomainReverseZone
+	searchDomainAlwaysActive
+	searchDomainSingleLabel
+	searchDomainEmptyLabel
+	searchDomainLongLabel
+	searchDomainHyphenLabel
+	searchDomainBadCharacter
+	searchDomainPublicSuffix
 )
 
-// searchDomainError is a refusal with its full message and its class.
-type searchDomainError struct {
-	class error
-	msg   string
+func (c searchDomainClass) String() string {
+	switch c {
+	case searchDomainOK:
+		return "usable"
+	case searchDomainEmpty:
+		return "empty"
+	case searchDomainReverseZone:
+		return "under a reverse-lookup zone, which no search domain decides"
+	case searchDomainAlwaysActive:
+		return "always active for stripping"
+	case searchDomainSingleLabel:
+		return "a single label"
+	case searchDomainEmptyLabel:
+		return "an empty label"
+	case searchDomainLongLabel:
+		return "a label longer than 63 octets"
+	case searchDomainHyphenLabel:
+		return "a label that starts or ends with a hyphen"
+	case searchDomainBadCharacter:
+		return "a character outside a-z, 0-9 and hyphen"
+	case searchDomainPublicSuffix:
+		return "a public suffix"
+	default:
+		return "refused"
+	}
 }
 
-func (e *searchDomainError) Error() string { return e.msg }
-
-func (e *searchDomainError) Unwrap() error { return e.class }
-
-func searchDomainErr(class error, format string, args ...any) error {
-	return &searchDomainError{class: class, msg: fmt.Sprintf(format, args...)}
+// normalizeSearchDomain is THE normalization of one entry: lowercased,
+// trimmed of whitespace and of a trailing dot (a suffix written as an
+// FQDN), with a leading dot. An entry of only whitespace or dots stays "",
+// which classifies as empty: dropping it silently would let explicit
+// misconfigs like `searchDomains: [""]` or `CARGOWALL_SEARCH_DOMAINS=" "`
+// pass unnoticed.
+func normalizeSearchDomain(raw string) string {
+	d := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
+	if d != "" && !strings.HasPrefix(d, ".") {
+		d = "." + d
+	}
+	if d == "." {
+		return ""
+	}
+	return d
 }
 
-// normalizeSearchDomains lowercases, trims whitespace, ensures a leading dot,
-// and deduplicates. Order is preserved by first occurrence.
-//
-// Empty/whitespace-only entries are PRESERVED (as "") so validateSearchDomains
-// can reject them — silently dropping them would let explicit misconfigs like
-// `searchDomains: [""]` or `CARGOWALL_SEARCH_DOMAINS=" "` pass unnoticed.
+// normalizeSearchDomains normalizes each entry, deduplicates (order by
+// first occurrence), and drops those under a reverse-lookup zone with a
+// warning each (dropReverseZoneSearchDomains). Used by the local config
+// file and env loaders, which then validate the rest.
 func normalizeSearchDomains(domains []string) []string {
-	return dropReverseZoneSearchDomains(normalizeSearchDomainsKeepingReverse(domains))
-}
-
-// normalizeSearchDomainsKeepingReverse is normalizeSearchDomains without
-// the reverse-zone drop, for the policy loader, which reports those drops
-// with its others (filterPolicySearchDomains).
-func normalizeSearchDomainsKeepingReverse(domains []string) []string {
 	if len(domains) == 0 {
 		return nil
 	}
 	normalized := make([]string, len(domains))
 	for i, d := range domains {
-		d = strings.ToLower(strings.TrimSpace(d))
-		if d != "" && !strings.HasPrefix(d, ".") {
-			d = "." + d
-		}
-		normalized[i] = d
+		normalized[i] = normalizeSearchDomain(d)
 	}
-	return mergeNormalizedSearchDomains(nil, normalized)
+	return dropReverseZoneSearchDomains(mergeNormalizedSearchDomains(nil, normalized))
 }
 
 // validateSearchDomain rejects a single normalized suffix that would be too
@@ -102,34 +127,46 @@ func normalizeSearchDomainsKeepingReverse(domains []string) []string {
 //     CodeCargo policy drops it, since it changes nothing there
 //     (filterPolicySearchDomains).
 //
-// Each error carries its class (errors.Is against the errSearchDomain*
-// sentinels), so a caller can tell an always-active suffix from a
-// misconfiguration and report a short reason.
+// classifySearchDomain gives the class of a refusal too, so a caller can
+// tell an always-active suffix from a misconfiguration and report a short
+// reason.
 func validateSearchDomain(d string) error {
+	_, err := classifySearchDomain(d)
+	return err
+}
+
+// classifySearchDomain is validateSearchDomain with the class of what it
+// found. An entry under a reverse-lookup zone is classed apart before any
+// other test: every loader drops it with a warning rather than failing on
+// it, since it could never take effect.
+func classifySearchDomain(d string) (searchDomainClass, error) {
 	if d == "" || d == "." {
-		return searchDomainErr(errSearchDomainEmpty, "search domain must not be empty")
+		return searchDomainEmpty, fmt.Errorf("search domain must not be empty")
+	}
+	if ReverseLookupName(d) {
+		return searchDomainReverseZone, fmt.Errorf("search domain %q is under a reverse-lookup zone, which no search domain decides", d)
 	}
 	if slices.Contains(kubernetesSearchDomains, d) {
-		return searchDomainErr(errSearchDomainAlwaysActive, "search domain %q is always active for stripping; do not add it to user search domains (would inadvertently grant DNS-filter bypass for all K8s service names)", d)
+		return searchDomainAlwaysActive, fmt.Errorf("search domain %q is always active for stripping; do not add it to user search domains (would inadvertently grant DNS-filter bypass for all K8s service names)", d)
 	}
 	bare := strings.TrimPrefix(d, ".")
 	labels := strings.Split(bare, ".")
 	if len(labels) < 2 {
-		return searchDomainErr(errSearchDomainSingleLabel, "search domain %q must have at least two labels (e.g. \".compute.internal\")", d)
+		return searchDomainSingleLabel, fmt.Errorf("search domain %q must have at least two labels (e.g. \".compute.internal\")", d)
 	}
 	for _, label := range labels {
 		if label == "" {
-			return searchDomainErr(errSearchDomainBadLabel, "search domain %q has an empty label", d)
+			return searchDomainEmptyLabel, fmt.Errorf("search domain %q has an empty label", d)
 		}
 		if len(label) > 63 {
-			return searchDomainErr(errSearchDomainBadLabel, "search domain %q has label %q longer than 63 octets", d, label)
+			return searchDomainLongLabel, fmt.Errorf("search domain %q has label %q longer than 63 octets", d, label)
 		}
 		if label[0] == '-' || label[len(label)-1] == '-' {
-			return searchDomainErr(errSearchDomainBadLabel, "search domain %q label %q must not start or end with '-'", d, label)
+			return searchDomainHyphenLabel, fmt.Errorf("search domain %q label %q must not start or end with '-'", d, label)
 		}
 		for _, r := range label {
 			if !(r == '-' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z')) {
-				return searchDomainErr(errSearchDomainBadLabel, "search domain %q contains invalid character %q", d, r)
+				return searchDomainBadCharacter, fmt.Errorf("search domain %q contains invalid character %q", d, r)
 			}
 		}
 	}
@@ -137,9 +174,9 @@ func validateSearchDomain(d string) error {
 	// for the input. If the user's suffix IS that public suffix, they're
 	// trying to use a TLD-equivalent as a bypass — reject.
 	if eTLD, _ := publicsuffix.PublicSuffix(bare); eTLD == bare {
-		return searchDomainErr(errSearchDomainPublicSuffix, "search domain %q is a public suffix (per Mozilla PSL); use a more specific private suffix", d)
+		return searchDomainPublicSuffix, fmt.Errorf("search domain %q is a public suffix (per Mozilla PSL); use a more specific private suffix", d)
 	}
-	return nil
+	return searchDomainOK, nil
 }
 
 // validateSearchDomains validates a batch of normalized suffixes, returning
